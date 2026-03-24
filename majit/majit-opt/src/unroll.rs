@@ -1069,9 +1069,19 @@ impl OptUnroll {
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
         let exported_short_boxes = ctx.exported_short_boxes.clone();
 
+        // RPython unroll.py:467: next_iteration_args preserves the
+        // pre-forwarding identity of each position so Phase 2 import
+        // keeps distinct inputargs independent. Using end_args (which
+        // has get_replacement/force applied) can collapse two distinct
+        // inputargs into the same OpRef, creating false aliases in Phase 2.
+        let next_iter_args = if let Some(ref pre_force) = ctx.pre_force_jump_args {
+            pre_force.clone()
+        } else {
+            original_label_args.to_vec()
+        };
         let mut es = ExportedState::new(
             label_args.clone(),
-            end_args,
+            next_iter_args,
             virtual_state,
             infos,
             exported_short_ops,

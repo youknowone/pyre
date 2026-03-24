@@ -488,13 +488,12 @@ impl<S: JitState> JitDriver<S> {
             } => {
                 // RPython pyjitpl.py reached_loop_header(): the compiled
                 // loop should use the back-edge target PC as merge_pc.
-                // Currently disabled: the optimizer's virtual state matching
-                // can produce false aliases when the trace entry PC differs
-                // from the loop header PC. Until the alias bug is fixed,
-                // keep merge_pc at the trace entry PC. The incompatible-state
-                // abort protects against the faulty compiled code.
+                // Currently disabled: false alias fix (next_iteration_args)
+                // is necessary but not sufficient. The Phase 2 body still
+                // produces collapsed JUMP args through assemble_jump's
+                // start_remap mechanism. Full fix requires ensuring
+                // assemble_jump preserves distinct label args.
                 //
-                // TODO: re-enable when Phase 2 alias propagation is fixed:
                 // if let Some(target_pc) = loop_header_pc {
                 //     if let Some(ref mut meta) = self.trace_meta {
                 //         S::update_meta_merge_pc(meta, target_pc);
