@@ -3550,7 +3550,9 @@ impl<M: Clone> MetaInterp<M> {
             .guard_failures
             .get(&(trace_id, fail_index))
             .is_some_and(|info| {
-                !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
+                // RPython: bridge_compiled is checked by the backend (has_bridge
+                // on fail_descr). Here we only check the fail count threshold.
+                self.warm_state.should_compile_bridge(info.fail_count)
             })
     }
 
