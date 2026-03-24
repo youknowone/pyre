@@ -485,11 +485,12 @@ impl HeapCache {
         self.need_guard_not_invalidated
     }
 
-    /// Reset but keep likely-virtual markers.
-    /// heapcache.py: reset_keep_likely_virtuals()
     /// heapcache.py: reset_keep_likely_virtuals — clear caches but
     /// preserve likely_virtual flags and loopinvariant results.
-    /// Called after non-elidable calls that release the GIL.
+    ///
+    /// In RPython, called after non-elidable calls that release the GIL.
+    /// pyre has no GIL (no-GIL Python), so this method has no production
+    /// call site — kept for API parity and potential future use.
     pub fn reset_keep_likely_virtuals(&mut self) {
         self.field_cache.clear();
         self.array_cache.clear();
