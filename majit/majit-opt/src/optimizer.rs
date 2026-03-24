@@ -1385,13 +1385,31 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            // RPython unroll.py passes the actual old-label targetargs into
-            // import_state(). In majit's phase-2 entry there is no concrete
-            // Label op yet, so we synthesize placeholder inputargs matching
-            // the exported next-iteration contract rather than blindly using
-            // `num_inputs`, which can diverge after bridge/retrace rewriting.
-            let targetargs: Vec<OpRef> = (0..exported_state.next_iteration_args.len())
-                .map(|i| OpRef(i as u32))
+            // RPython uses distinct Box objects for Phase 2 targetargs,
+            // so forwarding from source → target never collides with
+            // another slot's PtrInfo. In pyre's flat OpRef namespace,
+            // collision occurs when target[i] == source[j] for i≠j.
+            // Allocate fresh OpRefs for colliding positions only,
+            // forwarding the original position to the fresh one.
+            let nia = &exported_state.next_iteration_args;
+            let n = nia.len();
+            let source_set: std::collections::HashSet<OpRef> =
+                (0..n).map(|i| OpRef(i as u32)).collect();
+            let targetargs: Vec<OpRef> = (0..n)
+                .map(|i| {
+                    let source = OpRef(i as u32);
+                    let target = nia[i];
+                    if target != source && source_set.contains(&target) {
+                        // Collision: target is also another slot's source.
+                        // Use a fresh OpRef so this slot's info doesn't
+                        // collide with the other slot's forwarding chain.
+                        let fresh = ctx.alloc_op_position();
+                        ctx.replace_op(source, fresh);
+                        fresh
+                    } else {
+                        source
+                    }
+                })
                 .collect();
             let (label_args, source_slots) = crate::unroll::import_state_with_source_slots(
                 &targetargs,
@@ -1565,8 +1583,28 @@ impl Optimizer {
                         let mut op = Op::new(same_as, &[orig]);
                         op.pos = fresh;
                         ctx.emit(op);
+                        // Copy PtrInfo with fresh field OpRefs for virtuals
+                        // so each slot has independent field identities in
+                        // the Phase 2 label. Fields forward to originals.
                         if let Some(info) = ctx.get_ptr_info(orig).cloned() {
-                            ctx.set_ptr_info(fresh, info);
+                            let fresh_info = match info {
+                                crate::info::PtrInfo::Virtual(mut vinfo) => {
+                                    for field in &mut vinfo.fields {
+                                        let orig_field = field.1;
+                                        let ff = ctx.alloc_op_position();
+                                        ctx.replace_op(ff, orig_field);
+                                        if let Some(val) =
+                                            ctx.get_constant(orig_field).cloned()
+                                        {
+                                            ctx.make_constant(ff, val);
+                                        }
+                                        field.1 = ff;
+                                    }
+                                    crate::info::PtrInfo::Virtual(vinfo)
+                                }
+                                other => other,
+                            };
+                            ctx.set_ptr_info(fresh, fresh_info);
                         }
                         *arg = fresh;
                     }
