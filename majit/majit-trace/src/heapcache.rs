@@ -136,10 +136,11 @@ impl HeapCache {
         self.field_cache.insert((obj, field_index), value);
     }
 
-    /// Invalidate all caches. Called when a side-effecting operation occurs
-    /// that could modify heap state (e.g., an unknown CALL).
-    pub fn invalidate_caches(&mut self) {
-        self.field_cache.clear();
+    /// heapcache.py: EF_RANDOM_EFFECTS path — invalidate ALL caches
+    /// including unescaped objects. Called for operations with unknown
+    /// effects that could modify any heap state.
+    pub fn invalidate_all_caches(&mut self) {
+        self.reset_keep_likely_virtuals();
     }
 
     /// heapcache.py: invalidate_unescaped — clear cached values for
