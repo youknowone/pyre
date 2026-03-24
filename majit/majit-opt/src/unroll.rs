@@ -523,7 +523,7 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
-        let combined = assemble_peeled_trace_with_jump_args(
+        let mut combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &body_ops,
             &label_args,
@@ -543,6 +543,17 @@ impl UnrollOptimizer {
                 .last()
                 .map(|target| target.as_jump_target_descr()),
         );
+        // RPython Box parity: drop duplicate-position ops. In RPython
+        // each Box is unique so collisions can't happen. Keep first.
+        {
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            combined.retain(|op| {
+                if op.pos.is_none() || op.result_type() == Type::Void {
+                    return true;
+                }
+                seen.insert(op.pos.0)
+            });
+        }
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("--- peeled trace (assembled) ---");
             eprint!("{}", majit_ir::format_trace(&combined, &consts_p2));
@@ -2293,14 +2304,22 @@ fn assemble_peeled_trace_with_jump_args(
         result.push(op.clone());
     }
 
-    // Extra SameAs aliases live at the end of the preamble, before the loop
-    // label, matching compile.py's `loop_info.extra_same_as + [label_op]`.
-    let mut max_pos = result
+    // max_pos must account for ALL p1_ops positions, including SameAs
+    // ops AFTER the Jump that weren't copied into result. These positions
+    // are referenced by the body Label args and must not be reused.
+    let result_max = result
         .iter()
         .map(|op| op.pos.0)
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(body_num_inputs as u32);
+    let p1_all_max = p1_ops
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(0);
+    let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
     let mut alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
     for alias in imported_short_aliases {
@@ -2348,11 +2367,16 @@ fn assemble_peeled_trace_with_jump_args(
         .iter()
         .map(|s| (s.result, s.source))
         .collect();
-    // Use a separate position counter for extra SameAs ops, starting after
-    // label_pos to avoid colliding with it or with imported_short_aliases.
-    // Do NOT modify max_pos — it's used by body-use-before-def below and
-    // changing it breaks int loops where no extra SameAs is generated.
-    let mut extra_pos = next_free_pos(label_pos.saturating_add(1));
+    // Use a separate position counter for extra SameAs ops. Must start
+    // AFTER all preamble positions (including p1_ops SameAs) to avoid
+    // colliding with existing definitions.
+    let preamble_max = result
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(0);
+    let mut extra_pos = next_free_pos(preamble_max.max(label_pos).saturating_add(1));
     for &arg in &filtered_extra_label_args {
         let mapped = alias_remap.get(&arg).copied().unwrap_or(arg);
         if !preamble_defs.contains(&mapped) {
@@ -2368,6 +2392,9 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
     }
+    // Synchronize max_pos with extra_pos so that body-use-before-def
+    // positions don't collide with the extra SameAs ops allocated above.
+    max_pos = max_pos.max(extra_pos);
     let extra_label_start_idx = full_label_args.len();
     full_label_args.extend(
         filtered_extra_label_args

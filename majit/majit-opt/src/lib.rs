@@ -416,6 +416,9 @@ impl OptContext {
     pub fn emit(&mut self, mut op: Op) -> OpRef {
         if op.pos.is_none() {
             op.pos = self.reserve_pos();
+        } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
+            // RPython Box parity: reassign position to avoid collision.
+            op.pos = self.reserve_pos();
         } else {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
