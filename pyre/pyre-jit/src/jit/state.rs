@@ -559,6 +559,21 @@ fn try_trace_const_boxed_float(
     }
 }
 
+/// pyjitpl.py:750-758: read container length with heapcache arraylen
+/// caching. Uses GetfieldGcI (pyre's length fields are struct fields,
+/// not RPython's GC array headers) but caches via heapcache.arraylen
+/// for separate-from-field-cache semantics.
+fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heap_cache().arraylen(obj, descr_idx) {
+        return cached;
+    }
+    let result = trace_gc_object_int_field(ctx, obj, descr.clone());
+    ctx.heap_cache_mut()
+        .arraylen_now_known(obj, descr_idx, result);
+    result
+}
+
 fn trace_gc_object_int_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     if let Some(folded) = try_trace_const_pure_int_field(ctx, obj, &descr) {
         return folded;
@@ -2258,7 +2273,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, expected_type);
         self.guard_int_like_value(ctx, key, concrete_index as i64);
-        let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
+        let len = trace_arraylen_gc(ctx, obj, items_len_descr);
         self.guard_len_gt_index(ctx, len, concrete_index);
         let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
         let index = ctx.const_int(concrete_index as i64);
@@ -2279,7 +2294,7 @@ impl MIFrame {
         let normalized = (concrete_len as i64 + concrete_key) as usize;
         self.guard_object_class(ctx, obj, expected_type);
         self.guard_int_like_value(ctx, key, concrete_key);
-        let len = trace_gc_object_int_field(ctx, obj, items_len_descr);
+        let len = trace_arraylen_gc(ctx, obj, items_len_descr);
         self.guard_len_eq(ctx, len, concrete_len);
         let items_ptr = trace_gc_object_int_field(ctx, obj, items_ptr_descr);
         let index = ctx.const_int(normalized as i64);
@@ -2295,7 +2310,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 0);
-        let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
         trace_raw_array_getitem_value(ctx, items_ptr, index)
@@ -2311,7 +2326,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 0);
-        let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
         trace_raw_array_getitem_value(ctx, items_ptr, index)
@@ -2326,7 +2341,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 1);
-        let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
@@ -2344,7 +2359,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 1);
-        let len = trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
         let raw = trace_raw_int_array_getitem_value(ctx, items_ptr, index);
@@ -2361,7 +2376,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 2);
-        let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_index as i64);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
@@ -2379,7 +2394,7 @@ impl MIFrame {
     ) -> OpRef {
         self.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
         self.guard_list_strategy(ctx, obj, 2);
-        let len = trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+        let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
         let index = self.trace_dynamic_list_index(ctx, key, len, concrete_key);
         let items_ptr = trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
         let raw = trace_raw_float_array_getitem_value(ctx, items_ptr, index);
@@ -2398,7 +2413,7 @@ impl MIFrame {
     ) -> Vec<OpRef> {
         self.guard_object_class(ctx, seq, expected_type);
 
-        let len = trace_gc_object_int_field(ctx, seq, items_len_descr);
+        let len = trace_arraylen_gc(ctx, seq, items_len_descr);
         self.guard_value(ctx, len, count as i64);
 
         let items_ptr = trace_gc_object_int_field(ctx, seq, items_ptr_descr);
@@ -2870,7 +2885,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 0);
-                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
@@ -2886,7 +2901,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 0);
-                            let len = trace_gc_object_int_field(ctx, obj, list_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_items_ptr_descr());
@@ -2908,8 +2923,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 1);
-                            let len =
-                                trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
@@ -2938,8 +2952,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 1);
-                            let len =
-                                trace_gc_object_int_field(ctx, obj, list_int_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_int_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
@@ -2974,8 +2987,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 2);
-                            let len =
-                                trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
@@ -3004,8 +3016,7 @@ impl MIFrame {
                         return self.with_ctx(|this, ctx| {
                             this.guard_object_class(ctx, obj, &LIST_TYPE as *const PyType);
                             this.guard_list_strategy(ctx, obj, 2);
-                            let len =
-                                trace_gc_object_int_field(ctx, obj, list_float_items_len_descr());
+                            let len = trace_arraylen_gc(ctx, obj, list_float_items_len_descr());
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
@@ -3055,7 +3066,7 @@ impl MIFrame {
                         );
                         this.guard_value(ctx, heap_cap, 0);
                     } else {
-                        let len = trace_gc_object_int_field(ctx, list, list_items_len_descr());
+                        let len = trace_arraylen_gc(ctx, list, list_items_len_descr());
                         this.guard_value(ctx, len, concrete_len as i64);
                     }
                     let items_ptr = trace_gc_object_int_field(ctx, list, list_items_ptr_descr());
@@ -3085,7 +3096,7 @@ impl MIFrame {
                         );
                         this.guard_value(ctx, heap_cap, 0);
                     } else {
-                        let len = trace_gc_object_int_field(ctx, list, list_int_items_len_descr());
+                        let len = trace_arraylen_gc(ctx, list, list_int_items_len_descr());
                         this.guard_value(ctx, len, concrete_len as i64);
                     }
                     let items_ptr =
@@ -3129,8 +3140,7 @@ impl MIFrame {
                         );
                         this.guard_value(ctx, heap_cap, 0);
                     } else {
-                        let len =
-                            trace_gc_object_int_field(ctx, list, list_float_items_len_descr());
+                        let len = trace_arraylen_gc(ctx, list, list_float_items_len_descr());
                         this.guard_value(ctx, len, concrete_len as i64);
                     }
                     let items_ptr =
@@ -3199,7 +3209,7 @@ impl MIFrame {
             if is_str(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &pyre_object::STR_TYPE as *const PyType);
-                    let len = trace_gc_object_int_field(ctx, value, str_len_descr());
+                    let len = trace_arraylen_gc(ctx, value, str_len_descr());
                     this.remember_value_type(len, Type::Int);
                     Ok(len)
                 });
@@ -3207,7 +3217,7 @@ impl MIFrame {
             if is_dict(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &DICT_TYPE as *const PyType);
-                    let len = trace_gc_object_int_field(ctx, value, dict_len_descr());
+                    let len = trace_arraylen_gc(ctx, value, dict_len_descr());
                     this.remember_value_type(len, Type::Int);
                     Ok(len)
                 });
@@ -3217,13 +3227,13 @@ impl MIFrame {
                     this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
                     let len = if w_list_uses_object_storage(concrete_value) {
                         this.guard_list_strategy(ctx, value, 0);
-                        trace_gc_object_int_field(ctx, value, list_items_len_descr())
+                        trace_arraylen_gc(ctx, value, list_items_len_descr())
                     } else if w_list_uses_int_storage(concrete_value) {
                         this.guard_list_strategy(ctx, value, 1);
-                        trace_gc_object_int_field(ctx, value, list_int_items_len_descr())
+                        trace_arraylen_gc(ctx, value, list_int_items_len_descr())
                     } else if w_list_uses_float_storage(concrete_value) {
                         this.guard_list_strategy(ctx, value, 2);
-                        trace_gc_object_int_field(ctx, value, list_float_items_len_descr())
+                        trace_arraylen_gc(ctx, value, list_float_items_len_descr())
                     } else {
                         let boxed_value = box_value_for_python_helper(this, ctx, value);
                         return crate::jit::helpers::emit_trace_call_known_builtin(
@@ -3239,7 +3249,7 @@ impl MIFrame {
             if is_tuple(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = trace_gc_object_int_field(ctx, value, tuple_items_len_descr());
+                    let len = trace_arraylen_gc(ctx, value, tuple_items_len_descr());
                     this.remember_value_type(len, Type::Int);
                     Ok(len)
                 });

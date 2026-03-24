@@ -1462,13 +1462,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) {
-        let _ = self.call_family_typed(
-            OpCode::call_loopinvariant_for_type(Type::Void),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Void,
-        );
+        let _ = self.call_loopinvariant_impl(func_ptr, args, arg_types, Type::Void);
     }
 
     pub fn call_loopinvariant_int_typed(
@@ -1477,13 +1471,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        self.call_family_typed(
-            OpCode::call_loopinvariant_for_type(Type::Int),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Int,
-        )
+        self.call_loopinvariant_impl(func_ptr, args, arg_types, Type::Int)
     }
 
     pub fn call_loopinvariant_ref_typed(
@@ -1492,13 +1480,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        self.call_family_typed(
-            OpCode::call_loopinvariant_for_type(Type::Ref),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Ref,
-        )
+        self.call_loopinvariant_impl(func_ptr, args, arg_types, Type::Ref)
     }
 
     pub fn call_loopinvariant_float_typed(
@@ -1507,13 +1489,39 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        self.call_family_typed(
-            OpCode::call_loopinvariant_for_type(Type::Float),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Float,
-        )
+        self.call_loopinvariant_impl(func_ptr, args, arg_types, Type::Float)
+    }
+
+    /// pyjitpl.py:2081-2104: loop-invariant call with heapcache caching.
+    /// Pure-like: does NOT invalidate caches. Result cached by (descr, arg0).
+    fn call_loopinvariant_impl(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+    ) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr_index = func_ref.0;
+        let arg0_int = args.first().map(|a| a.0 as i64).unwrap_or(0);
+        // heapcache: check loop-invariant cache
+        if let Some(cached) = self
+            .heap_cache
+            .call_loopinvariant_lookup(descr_index, arg0_int)
+        {
+            return cached;
+        }
+        let opcode = OpCode::call_loopinvariant_for_type(ret_type);
+        let descr = make_call_descr(arg_types, ret_type);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr);
+        // Loop-invariant calls don't invalidate caches (like pure calls).
+        self.heap_cache
+            .call_loopinvariant_cache(descr_index, arg0_int, result);
+        result
     }
 
     // ── CALL_ASSEMBLER ────────────────────────────────────────────
