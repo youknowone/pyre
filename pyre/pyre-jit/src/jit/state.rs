@@ -1677,11 +1677,16 @@ impl MIFrame {
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
         let concrete_slot_type = self.concrete_at(idx).map(concrete_virtualizable_slot_type);
+        // RPython parity: only unbox Ref→Int when concrete_locals confirms
+        // the slot holds an int. When concrete_locals is Null (no concrete
+        // tracking, e.g. after binary_int_value without concrete), the boxed
+        // Ref from box_traced_raw_int must stay Ref for JUMP args.
+        let concrete_local_valid = !self.sym().concrete_value_at(idx).is_null();
         match (concrete_slot_type, vtype) {
-            (Some(Type::Int), Type::Ref) => {
+            (Some(Type::Int), Type::Ref) if concrete_local_valid => {
                 value = self.trace_guarded_int_payload(ctx, value);
             }
-            (Some(Type::Float), Type::Ref) => {
+            (Some(Type::Float), Type::Ref) if concrete_local_valid => {
                 // Inline unbox with record_guard for correct fail_arg types.
                 let float_type_addr = &FLOAT_TYPE as *const _ as i64;
                 if value.0 < 10_000 && !ctx.heap_cache().is_class_known(value) {
@@ -2621,15 +2626,18 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let (lhs, rhs) = unsafe {
+        // RPython intobject.py:588 descr_add: type-based dispatch via GuardClass + unbox.
+        // Extract concrete int values for range checks (FloorDiv, Mod, Shift).
+        let concrete = unsafe {
             if concrete_lhs.is_null()
                 || concrete_rhs.is_null()
                 || !is_int(concrete_lhs)
                 || !is_int(concrete_rhs)
             {
-                return self.trace_binary_value(a, b, op);
+                None
+            } else {
+                Some((w_int_get_value(concrete_lhs), w_int_get_value(concrete_rhs)))
             }
-            (w_int_get_value(concrete_lhs), w_int_get_value(concrete_rhs))
         };
 
         let op_code = match op {
@@ -2637,12 +2645,18 @@ impl MIFrame {
             BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::IntSubOvf,
             BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::IntMulOvf,
             BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+                let Some((lhs, rhs)) = concrete else {
+                    return self.trace_binary_value(a, b, op);
+                };
                 if lhs < 0 || rhs <= 0 {
                     return self.trace_binary_value(a, b, op);
                 }
                 OpCode::IntFloorDiv
             }
             BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+                let Some((lhs, rhs)) = concrete else {
+                    return self.trace_binary_value(a, b, op);
+                };
                 if lhs < 0 || rhs <= 0 {
                     return self.trace_binary_value(a, b, op);
                 }
@@ -2652,15 +2666,21 @@ impl MIFrame {
             BinaryOperator::Or | BinaryOperator::InplaceOr => OpCode::IntOr,
             BinaryOperator::Xor | BinaryOperator::InplaceXor => OpCode::IntXor,
             BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+                let Some((_lhs, rhs)) = concrete else {
+                    return self.trace_binary_value(a, b, op);
+                };
                 let Ok(shift) = u32::try_from(rhs) else {
                     return self.trace_binary_value(a, b, op);
                 };
-                if shift >= i64::BITS || lhs.checked_shl(shift).is_none() {
+                if shift >= i64::BITS {
                     return self.trace_binary_value(a, b, op);
                 }
                 OpCode::IntLshift
             }
             BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+                let Some((_lhs, rhs)) = concrete else {
+                    return self.trace_binary_value(a, b, op);
+                };
                 let Ok(shift) = u32::try_from(rhs) else {
                     return self.trace_binary_value(a, b, op);
                 };
@@ -2671,10 +2691,6 @@ impl MIFrame {
             }
             _ => return self.trace_binary_value(a, b, op),
         };
-
-        // concrete_result no longer needed — generated trace functions
-        // handle boxing without concrete values.
-        let _ = (lhs, rhs); // suppress unused warnings for edge-case validation above
 
         let has_overflow = matches!(
             op_code,

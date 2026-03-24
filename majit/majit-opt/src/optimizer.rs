@@ -1419,6 +1419,53 @@ impl Optimizer {
             self.install_imported_virtuals(&mut ctx);
         }
 
+        // RPython Box identity: for each inputarg that shares a target
+        // with an installed virtual but didn't get its own PtrInfo
+        // (because import_box was skipped for duplicates), clone the
+        // virtual with independent field OpRefs.
+        if let Some(ref exported) = self.imported_loop_state {
+            let nargs = exported.next_iteration_args.len();
+            let mut target_to_first_source: std::collections::HashMap<OpRef, OpRef> =
+                std::collections::HashMap::new();
+            for i in 0..nargs {
+                let source = OpRef(i as u32);
+                let target = exported.next_iteration_args[i];
+                if let Some(&first) = target_to_first_source.get(&target) {
+                    // Duplicate: `source` shares target with `first`.
+                    // `first` got import_box forwarding → get_replacement → target head.
+                    // `source` was skipped → get_replacement = source itself.
+                    let first_head = ctx.get_replacement(first);
+                    if crate::majit_log_enabled() {
+                        let has_info = ctx.get_ptr_info(first_head).is_some();
+                        let is_virt = ctx
+                            .get_ptr_info(first_head)
+                            .map_or(false, |p| p.is_virtual());
+                        eprintln!(
+                            "[jit] dup_clone: source={source:?} first={first:?} first_head={first_head:?} has_info={has_info} is_virt={is_virt}"
+                        );
+                    }
+                    if let Some(info) = ctx.get_ptr_info(first_head).cloned() {
+                        if info.is_virtual() {
+                            // Clone with fresh field OpRefs (no forwarding).
+                            let fresh_info = match info {
+                                crate::info::PtrInfo::Virtual(mut vinfo) => {
+                                    for field in &mut vinfo.fields {
+                                        let fresh = ctx.alloc_op_position();
+                                        field.1 = fresh;
+                                    }
+                                    crate::info::PtrInfo::Virtual(vinfo)
+                                }
+                                other => other,
+                            };
+                            ctx.set_ptr_info(source, fresh_info);
+                        }
+                    }
+                } else {
+                    target_to_first_source.insert(target, source);
+                }
+            }
+        }
+
         // RPython optimizer.py:536-556: JUMP/FINISH is separated from
         // the main loop. With flush=False (Phase 2), JUMP is NOT processed
         // through the passes — it's returned as last_op for the caller.
