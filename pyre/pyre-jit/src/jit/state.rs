@@ -2712,6 +2712,7 @@ impl MIFrame {
         b: OpRef,
         op: BinaryOperator,
     ) -> Result<OpRef, PyError> {
+        let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
         let op_code = match op {
             BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
             BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
@@ -2721,6 +2722,7 @@ impl MIFrame {
             }
             BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => OpCode::FloatMod,
             BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
+            BinaryOperator::Power | BinaryOperator::InplacePower => OpCode::FloatMul, // placeholder
             _ => return self.trace_binary_value(a, b, op),
         };
 
@@ -2760,7 +2762,20 @@ impl MIFrame {
             } else {
                 unbox_float(this, ctx, b)
             };
-            let result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+            let result = if is_power {
+                // Emit CallPureF(pow, lhs, rhs) with raw float args.
+                // Avoids boxing floats for a residual Python-level call.
+                extern "C" fn float_pow(x: f64, y: f64) -> f64 {
+                    x.powf(y)
+                }
+                ctx.call_elidable_float_typed(
+                    float_pow as *const (),
+                    &[lhs_raw, rhs_raw],
+                    &[Type::Float, Type::Float],
+                )
+            } else {
+                ctx.record_op(op_code, &[lhs_raw, rhs_raw])
+            };
             this.remember_value_type(result, Type::Float);
             // RPython parity: wrapfloat(space, z) re-boxes the raw float result.
             // pypy/objspace/std/floatobject.py
@@ -5279,6 +5294,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
                         {
                             lhs_f % rhs_f
                         }
+                        BinaryOperator::Power | BinaryOperator::InplacePower => lhs_f.powf(rhs_f),
                         _ => f64::NAN,
                     };
                     if !result.is_nan()
