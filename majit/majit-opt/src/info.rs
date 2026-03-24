@@ -493,9 +493,11 @@ impl PtrInfo {
                         .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
-                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = descr;
-                    emit_op(ctx, set_op);
+                    if let Some(descr) = descr {
+                        let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                        set_op.descr = Some(descr);
+                        emit_op(ctx, set_op);
+                    }
                 }
                 alloc_ref
             }
@@ -525,9 +527,11 @@ impl PtrInfo {
                         .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
-                    let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
-                    set_op.descr = descr;
-                    emit_op(ctx, set_op);
+                    if let Some(descr) = descr {
+                        let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
+                        set_op.descr = Some(descr);
+                        emit_op(ctx, set_op);
+                    }
                 }
                 alloc_ref
             }
