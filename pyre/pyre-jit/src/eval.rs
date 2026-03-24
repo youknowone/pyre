@@ -12,7 +12,7 @@ use crate::jit::trace::trace_bytecode;
 use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
 
 use majit_gc::trace::TypeInfo;
@@ -86,10 +86,8 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
-thread_local! {
-    /// Call depth at which the current trace started.
-    static JIT_TRACING_DEPTH: Cell<u32> = Cell::new(0);
-}
+// JIT_TRACING_DEPTH removed — now MetaInterp.tracing_call_depth field.
+// RPython portal_call_depth parity: state colocated with tracing context.
 
 /// Read the call depth from pyre-interp's CALL_DEPTH TLS.
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
@@ -209,15 +207,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // RPython MetaInterp._interpret() takes over execution entirely.
-        // In pyre, full-loop tracing runs inside trace_bytecode, but
-        // jit_merge_point_hook must still fire at the correct call depth
-        // to start the trace. JIT_TRACING_DEPTH ensures nested concrete
-        // calls (call_user_function_plain) don't trigger merge_point.
+        // RPython portal_call_depth parity: only fire merge_point at the
+        // call depth where tracing started. Nested concrete calls skip it.
         if is_portal {
-            let tracing_depth = JIT_TRACING_DEPTH.with(|t| t.get());
-            if tracing_depth != 0 {
-                let current_depth = call_depth();
-                if current_depth == tracing_depth {
+            let tracing_depth = driver.meta_interp().tracing_call_depth;
+            if let Some(depth) = tracing_depth {
+                if call_depth() == depth {
                     if let Some(loop_result) =
                         jit_merge_point_hook(frame, code, pc, driver, info, &env)
                     {
@@ -321,7 +316,8 @@ fn jit_merge_point_hook(
         env,
         || {},
         |ctx, sym| {
-            JIT_TRACING_DEPTH.with(|t| t.set(current_depth));
+            let (driver, _) = driver_pair();
+            driver.meta_interp_mut().tracing_call_depth = Some(current_depth);
             let mut trace_frame = frame.snapshot_for_tracing();
             let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
             let _ = concrete_frame;
@@ -334,9 +330,9 @@ fn jit_merge_point_hook(
             JitAction::Continue => {}
         }
     }
-    // Trace completed or aborted — clear tracing depth if it was us.
+    // Trace completed or aborted — clear tracing depth.
     if !driver.is_tracing() {
-        JIT_TRACING_DEPTH.with(|t| t.set(0));
+        driver.meta_interp_mut().tracing_call_depth = None;
     }
     None
 }
@@ -396,7 +392,7 @@ fn can_enter_jit_hook(
             || {},
         );
         if !was_tracing && driver.is_tracing() {
-            JIT_TRACING_DEPTH.with(|d| d.set(call_depth()));
+            driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
         }
         result
     } else {
@@ -422,7 +418,7 @@ fn can_enter_jit_hook(
             JitAction::Continue => {}
         }
     }
-    JIT_TRACING_DEPTH.with(|t| t.set(0));
+    driver.meta_interp_mut().tracing_call_depth = None;
     None
 }
 

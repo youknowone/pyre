@@ -286,6 +286,11 @@ pub struct MetaInterp<M: Clone> {
     /// When a box helper feeds directly into create_frame, the box+create
     /// can be folded into a single create_frame_raw_int call.
     pub(crate) create_frame_raw_map: HashMap<i64, i64>,
+    /// RPython portal_call_depth parity: call depth at which the current
+    /// trace started. When Some(depth), only merge_point at that depth fires.
+    /// Replaces the pyre-jit TLS JIT_TRACING_DEPTH — state colocated with
+    /// tracing context for single source of truth.
+    pub tracing_call_depth: Option<u32>,
     /// PyPy warmspot.py max_unroll_recursion (default 7).
     pub(crate) max_unroll_recursion: usize,
     /// RPython parity: `prepare_trace_segmenting()` marks the next tracing run
@@ -598,6 +603,7 @@ impl<M: Clone> MetaInterp<M> {
             raw_int_box_helpers: HashSet::new(),
             raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
+            tracing_call_depth: None,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
             partial_trace: None,
