@@ -644,6 +644,11 @@ impl OptContext {
 
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
         let result = self.get_replacement(result);
+        // In RPython, preamble_result maps to the original preamble Box.
+        // In pyre, the preamble source OpRef can be overridden by Phase 2
+        // body processing (e.g., Virtualize sets forwarding on the same
+        // position). Use the imported result directly to avoid stale
+        // forwarding from body ops.
         let preamble_result = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_result).is_some();
         if self.imported_short_preamble_used.insert(preamble_result) {
@@ -678,7 +683,9 @@ impl OptContext {
                 }
             }
         }
-        preamble_result
+        // Return the imported result (not preamble source) to avoid stale
+        // forwarding from Phase 2 body ops that reuse preamble OpRef positions.
+        result
     }
 
     pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
@@ -767,13 +774,17 @@ impl OptContext {
     }
 
     /// RPython Box identity: set per-value forwarding for import_state.
-    /// This does NOT use the flat forwarding table, preventing chains.
-    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
-        // Use replace_op: forwarding[source] = target.
-        // With ptr_info stop in get_replacement, import_boxes is no longer
-        // needed — target has ptr_info set by apply_exported_info, so
-        // get_replacement(source) → target (stops at ptr_info).
-        self.replace_op(source, target);
+    ///
+    /// When `skip_forwarding` is true, the replace_op forwarding is omitted.
+    /// This is needed when `target` is also a Phase 2 inputarg that will
+    /// receive its own PtrInfo from another slot's import — forwarding
+    /// through it would cause get_replacement to stop at the wrong PtrInfo.
+    /// (In RPython, Phase 1 targets are distinct Box objects from Phase 2
+    /// sources, so this collision cannot occur.)
+    pub fn set_import_box(&mut self, source: OpRef, target: OpRef, skip_forwarding: bool) {
+        if !skip_forwarding {
+            self.replace_op(source, target);
+        }
     }
 
     /// RPython get_box_replacement: follow forwarding chain, stop when the

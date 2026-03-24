@@ -1546,6 +1546,33 @@ impl Optimizer {
                     .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                     .collect(),
             );
+            // RPython Box identity: each frame slot carries a distinct Box
+            // even when two slots hold the same Python object (e.g. `b = t`
+            // in fib_loop). In pyre, duplicate OpRefs in preamble_end_args
+            // cause Phase 2 import to merge their virtual PtrInfo. Dedup by
+            // emitting SameAs ops for duplicates — these survive into the
+            // assembled trace and give Phase 2 distinct import targets.
+            if let Some(mut end_args) = ctx.preamble_end_args.take() {
+                let mut seen = std::collections::HashSet::new();
+                for arg in end_args.iter_mut() {
+                    if arg.0 >= 10_000 || *arg == OpRef::NONE {
+                        continue;
+                    }
+                    if !seen.insert(*arg) {
+                        let orig = *arg;
+                        let same_as = OpCode::SameAsR;
+                        let fresh = ctx.alloc_op_position();
+                        let mut op = Op::new(same_as, &[orig]);
+                        op.pos = fresh;
+                        ctx.emit(op);
+                        if let Some(info) = ctx.get_ptr_info(orig).cloned() {
+                            ctx.set_ptr_info(fresh, info);
+                        }
+                        *arg = fresh;
+                    }
+                }
+                ctx.preamble_end_args = Some(end_args);
+            }
             // RPython parity: nested virtuals in output ops should be
             // forced by force_box_for_end_of_preamble's recursive walk.
             // Additional force is handled by the undefined-ref cleanup below
