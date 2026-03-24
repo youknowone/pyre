@@ -813,12 +813,7 @@ impl OptContext {
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
         }
-        self.constants[idx] = Some(value.clone());
-        // Sync to forwarded.
-        if idx >= self.forwarded.len() {
-            self.forwarded.resize(idx + 1, Forwarded::None);
-        }
-        self.forwarded[idx] = Forwarded::Constant(value);
+        self.constants[idx] = Some(value);
     }
 
     /// Get the constant value for an operation, if known.
@@ -978,22 +973,7 @@ impl OptContext {
         if idx >= self.ptr_info.len() {
             self.ptr_info.resize(idx + 1, None);
         }
-        self.ptr_info[idx] = Some(info.clone());
-        // Sync to forwarded — store Info only if no Op forwarding exists.
-        // RPython: set_forwarded(info) overwrites _forwarded, but we keep
-        // Op forwarding in a separate slot to avoid losing the chain.
-        if idx >= self.forwarded.len() {
-            self.forwarded.resize(idx + 1, Forwarded::None);
-        }
-        match self.forwarded[idx] {
-            Forwarded::Op(_) => {
-                // Op forwarding exists — don't overwrite. Info is in ptr_info.
-            }
-            _ => {
-                let info_ref = self.info_arena.alloc(info);
-                self.forwarded[idx] = Forwarded::Info(info_ref);
-            }
-        }
+        self.ptr_info[idx] = Some(info);
     }
 
     /// optimizer.py: replace_op_with(old, new_op, ctx)
