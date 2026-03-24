@@ -1583,6 +1583,10 @@ impl Optimizer {
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
+        // RPython store_final_boxes_in_guard parity: re-encode late virtuals
+        // in guard fail_args before forcing remaining virtuals.
+        Self::rescan_guard_virtuals(&mut ctx);
+
         // Force any remaining virtual refs in output ops before forwarding resolve.
         // RPython: virtuals are forced during preamble export or JUMP handling.
         // In majit, skip_flush=true may leave some virtual refs un-forced in
@@ -1591,12 +1595,7 @@ impl Optimizer {
             let all_refs: Vec<OpRef> = ctx
                 .new_operations
                 .iter()
-                .flat_map(|op| {
-                    op.args
-                        .iter()
-                        .copied()
-                        .chain(op.fail_args.iter().flat_map(|fa| fa.iter().copied()))
-                })
+                .flat_map(|op| op.args.iter().copied())
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
@@ -2404,6 +2403,36 @@ impl Optimizer {
         Self::encode_guard_virtuals_impl(op, ctx)
     }
 
+    /// RPython store_final_boxes_in_guard parity: after all ops are processed,
+    /// re-scan emitted guards for fail_args that became virtual after initial
+    /// encoding. RPython's shared mutable forwarding graph makes this implicit;
+    /// majit needs an explicit re-scan.
+    fn rescan_guard_virtuals(ctx: &mut OptContext) {
+        let len = ctx.new_operations.len();
+        for i in 0..len {
+            let op = &ctx.new_operations[i];
+            if !op.opcode.is_guard() || op.fail_args.is_none() {
+                continue;
+            }
+            let has_late_virtual = op.fail_args.as_ref().unwrap().iter().any(|&fa| {
+                if fa.is_none() {
+                    return false;
+                }
+                let resolved = ctx.get_replacement(fa);
+                ctx.get_ptr_info(resolved)
+                    .is_some_and(|info| info.is_virtual())
+            });
+            if !has_late_virtual {
+                continue;
+            }
+            // Take the op out, re-encode virtuals, put it back.
+            let placeholder = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[majit_ir::OpRef(0)]);
+            let op = std::mem::replace(&mut ctx.new_operations[i], placeholder);
+            let updated = Self::encode_guard_virtuals_impl(op, ctx);
+            ctx.new_operations[i] = updated;
+        }
+    }
+
     #[allow(dead_code)]
     fn encode_guard_virtuals_impl(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::info::PtrInfo;
@@ -2414,10 +2443,14 @@ impl Optimizer {
         };
 
         let original_len = fail_args.len();
-        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+        let mut virtual_entries: Vec<GuardVirtualEntry> = op.rd_virtuals.take().unwrap_or_default();
         let mut extra_fail_args: Vec<OpRef> = Vec::new();
 
         for fa_idx in 0..original_len {
+            // Already encoded as virtual in a previous pass — skip.
+            if fail_args[fa_idx].is_none() {
+                continue;
+            }
             let resolved = ctx.get_replacement(fail_args[fa_idx]);
             let info = ctx.get_ptr_info(resolved).cloned();
             let Some(info) = info else {
