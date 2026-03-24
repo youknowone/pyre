@@ -315,7 +315,7 @@ pub(crate) struct MIFrame {
     /// PyPy capture_resumedata: parent frame fail_args for multi-frame guards.
     pub(crate) parent_fail_args: Option<Vec<OpRef>>,
     pub(crate) parent_fail_arg_types: Option<Vec<Type>>,
-    pending_inline_frame: Option<PendingInlineFrame>,
+    pub(crate) pending_inline_frame: Option<PendingInlineFrame>,
 }
 
 fn code_has_backward_jump(code: &CodeObject) -> bool {
@@ -954,7 +954,7 @@ fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -> OpRef {
     }
 }
 
-fn pending_inline_result_from_concrete(
+pub(crate) fn pending_inline_result_from_concrete(
     result_type: Type,
     concrete_result: PyObjectRef,
 ) -> PendingInlineResult {
@@ -967,7 +967,7 @@ fn pending_inline_result_from_concrete(
     }
 }
 
-fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
+pub(crate) fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
     match result {
         PendingInlineResult::Ref(result) => result,
         PendingInlineResult::Int(value) => w_int_new(value),
@@ -8169,18 +8169,18 @@ struct InlineMIFrame {
     caller_result_stack_idx: Option<usize>,
 }
 
-struct PendingInlineFrame {
-    sym: PyreSym,
-    concrete_frame: pyre_interp::frame::PyFrame,
-    drop_frame_opref: Option<OpRef>,
-    green_key: u64,
-    parent_fail_args: Vec<OpRef>,
-    parent_fail_arg_types: Vec<Type>,
-    nargs: usize,
-    caller_result_stack_idx: Option<usize>,
+pub(crate) struct PendingInlineFrame {
+    pub(crate) sym: PyreSym,
+    pub(crate) concrete_frame: pyre_interp::frame::PyFrame,
+    pub(crate) drop_frame_opref: Option<OpRef>,
+    pub(crate) green_key: u64,
+    pub(crate) parent_fail_args: Vec<OpRef>,
+    pub(crate) parent_fail_arg_types: Vec<Type>,
+    pub(crate) nargs: usize,
+    pub(crate) caller_result_stack_idx: Option<usize>,
 }
 
-enum InlineTraceStepAction {
+pub(crate) enum InlineTraceStepAction {
     Trace(TraceAction),
     PushFrame(PendingInlineFrame),
 }
