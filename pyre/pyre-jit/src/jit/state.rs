@@ -1719,6 +1719,13 @@ impl MIFrame {
         if let Some(value) = self.sym().symbolic_namespace_slots.get(&idx).copied() {
             return Ok(value);
         }
+        // pyjitpl.py:1075-1089: quasi-immutable field pattern.
+        // Module globals are effectively quasi-immutable — they rarely change
+        // during hot loops. Emit GUARD_NOT_INVALIDATED on first global access
+        // so compiled code is invalidated if globals mutate.
+        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+            self.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
+        }
         let frame = self.sym().frame;
         let namespace = frame_namespace_ptr(ctx, frame);
         let len = ctx.record_op_with_descr(
