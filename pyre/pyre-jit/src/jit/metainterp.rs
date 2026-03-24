@@ -1,7 +1,7 @@
 //! PyreMetaInterp — RPython MetaInterp (pyjitpl.py:2371) parity.
 //!
 //! The MetaInterp takes over execution during tracing. It maintains a
-//! framestack of PyreMetaFrames and runs bytecodes through its own
+//! framestack of MetaInterpFrames and runs bytecodes through its own
 //! dispatch loop, simultaneously computing concrete results (via executor)
 //! and recording IR operations (via TraceCtx).
 //!
@@ -19,11 +19,11 @@ use majit_meta::TraceCtx;
 use pyre_bytecode::CodeObject;
 use pyre_object::PyObjectRef;
 
-use super::state::{ConcreteValue, PyreSym, TracedBox as FrontendOp};
+use super::state::{ConcreteValue, FrontendOp, PyreSym};
 
 /// RPython ChangeFrame / DoneWithThisFrame* parity.
 ///
-/// Returned by PyreMetaFrame::run_one_step() to signal frame transitions.
+/// Returned by MetaInterpFrame::run_one_step() to signal frame transitions.
 #[derive(Debug)]
 pub enum StepAction {
     /// Continue executing in the current frame.
@@ -47,7 +47,7 @@ pub enum StepAction {
 ///
 /// Each frame in the MetaInterp's framestack tracks both symbolic
 /// (PyreSym) and concrete (ConcreteValue arrays) state.
-pub struct PyreMetaFrame {
+pub struct MetaInterpFrame {
     /// Symbolic + concrete state (PyreSym owns concrete_locals/concrete_stack).
     pub sym: PyreSym,
     /// Code object being traced (RPython MIFrame.jitcode).
@@ -66,7 +66,7 @@ pub struct PyreMetaFrame {
 /// trace context.
 pub struct PyreMetaInterp {
     /// Stack of execution frames (RPython MetaInterp.framestack).
-    pub framestack: Vec<PyreMetaFrame>,
+    pub framestack: Vec<MetaInterpFrame>,
     /// Recursive portal call depth.
     pub portal_call_depth: i32,
     /// Root code object.
@@ -133,7 +133,7 @@ impl PyreMetaInterp {
             }
         }
 
-        let frame = PyreMetaFrame {
+        let frame = MetaInterpFrame {
             sym,
             jitcode: callee_code,
             pc: 0,
@@ -174,7 +174,7 @@ impl PyreMetaInterp {
     pub fn generate_guard(&self, _ctx: &mut TraceCtx, _opcode: majit_ir::OpCode, _args: &[OpRef]) {
         // Placeholder — guard recording requires fail_descr creation
         // which depends on TraceCtx internal API. Will be wired up when
-        // PyreMetaInterp replaces TraceFrameState as the active tracer.
+        // PyreMetaInterp replaces MIFrame as the active tracer.
         let _fail_args = self.capture_resumedata();
     }
 
@@ -192,7 +192,7 @@ impl PyreMetaInterp {
     }
 }
 
-impl PyreMetaFrame {
+impl MetaInterpFrame {
     /// Push a FrontendOp onto the operand stack.
     fn push(&mut self, op: FrontendOp) {
         self.sym.symbolic_stack.push(op.opref);
@@ -256,10 +256,10 @@ impl PyreMetaFrame {
     /// RPython MIFrame.run_one_step() parity — concrete dispatch.
     ///
     /// Computes concrete results for each opcode. Symbolic IR recording
-    /// is delegated to TraceFrameState::trace_code_step via the
+    /// is delegated to MIFrame::trace_code_step via the
     /// trace_bytecode loop.
     ///
-    /// When this is used as the primary dispatch (replacing TraceFrameState),
+    /// When this is used as the primary dispatch (replacing MIFrame),
     /// execute_and_record handles both concrete + symbolic in one call.
     pub fn run_one_step(
         &mut self,
