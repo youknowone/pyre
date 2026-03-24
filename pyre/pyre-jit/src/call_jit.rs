@@ -404,41 +404,26 @@ extern "C" fn jit_call_user_function_from_frame(
 
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-
-    // RPython resume_in_blackhole parity: reset frame to function entry
-    // and restore locals from the original CALL_ASSEMBLER inputs. The
-    // compiled code's virtualizable writeback may have corrupted the frame.
-    let nlocals = unsafe { &*frame.code }.varnames.len();
     let _ = majit_codegen_cranelift::take_pending_frame_restore();
     let pending = majit_codegen_cranelift::take_pending_force_local0();
+
+    // Lazy frame (RPython parity): when CallR(create_frame) is elided,
+    // frame_ptr is the CALLER frame. pending_force_local0 contains the
+    // raw int arg. Create callee frame lazily and execute it.
+    if let Some(raw_local0) = pending {
+        return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
+    }
+
+    // Non-lazy: frame_ptr IS the callee frame (legacy path)
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let nlocals = unsafe { &*frame.code }.varnames.len();
     frame.next_instr = 0;
     frame.valuestackdepth = nlocals;
-
-    // Restore local0 from the original CALL_ASSEMBLER input if available.
-    if let Some(raw_local0) = pending {
-        let addr = raw_local0 as usize;
-        let is_heap = addr >= 0x1_0000 && addr < (1usize << 56) && (addr & 7) == 0;
-        let restored = if is_heap {
-            raw_local0 as PyObjectRef
-        } else {
-            pyre_object::intobject::w_int_new(raw_local0)
-        };
-        if frame.locals_cells_stack_w.len() > 0 {
-            frame.locals_cells_stack_w[0] = restored;
-        }
-    }
-    // Re-establish array pointer after potential corruption
     frame.fix_array_ptrs();
-
-    // RPython warmspot.py:941 portal_runner parity:
-    // bhimpl_recursive_call → portal_runner → CAN enter JIT.
 
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    // RPython blackhole: use plain interpreter in force_fn to prevent
-    // CALL_ASSEMBLER re-entry. Disable JIT eval override temporarily.
     pyre_interp::call::register_eval_override(pyre_interp::eval::eval_frame_plain);
     let result = match pyre_interp::eval::eval_frame_plain(frame) {
         Ok(r) => r,
@@ -446,19 +431,13 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     };
     pyre_interp::call::register_eval_override(crate::eval::eval_with_jit);
 
-    // Process deferred bridge compile requests. force_fn is called
-    // outside MetaInterp borrow scope, so compile_bridge is safe here.
-    // Pending bridge compile requests are processed by
-    // try_function_entry_jit (eval.rs), not here, to avoid
-    // drain by nested force_fn calls.
-    let value = match protocol {
+    match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
             w_int_get_value(result)
         },
         FinishProtocol::RawInt => result as i64,
         FinishProtocol::Boxed => result as i64,
-    };
-    value
+    }
 }
 
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
