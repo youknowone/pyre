@@ -1983,21 +1983,29 @@ impl MIFrame {
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
-        let expected = ctx.const_int(expected);
-        self.record_guard(ctx, OpCode::GuardValue, &[value, expected]);
+        let expected_ref = ctx.const_int(expected);
+        self.record_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
+        // pyjitpl.py:3512: replace_box — update heapcache to map old box
+        // to the constant, so subsequent field reads on this value use the
+        // constant directly.
+        ctx.heap_cache_mut().replace_box(value, expected_ref);
     }
 
     /// Guard value == expected Ref constant (heap pointer).
     /// Uses const_ref so guard fail_args preserve the Ref type.
     pub(crate) fn guard_value_ref(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
-        let expected = ctx.const_ref(expected);
-        self.record_guard(ctx, OpCode::GuardValue, &[value, expected]);
+        let expected_ref = ctx.const_ref(expected);
+        self.record_guard(ctx, OpCode::GuardValue, &[value, expected_ref]);
+        ctx.heap_cache_mut().replace_box(value, expected_ref);
     }
 
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
-        // heapcache.py: skip if nullity already known
+        // heapcache.py:561-565: skip if nullity or class already known
         if ctx.heap_cache().is_nullity_known(value) == Some(true) {
             return;
+        }
+        if ctx.heap_cache().is_class_known(value) {
+            return; // class known implies nonnull
         }
         self.record_guard(ctx, OpCode::GuardNonnull, &[value]);
         ctx.heap_cache_mut().nullity_now_known(value, true);
