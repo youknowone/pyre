@@ -146,17 +146,62 @@ impl OptRewrite {
             }
         }
 
-        // x + 0 -> x
+        // add_zero: int_add(x, 0) => x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
             return OptimizationResult::Remove;
         }
-        // 0 + x -> x
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.replace_op(op.pos, arg1);
             return OptimizationResult::Remove;
         }
-        // x + x -> x << 1 (strength reduction)
+
+        // add_reassoc_consts: int_add(int_add(x, C1), C2) => int_add(x, C1+C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntAdd {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
+                        let mut new_op = Op::new(OpCode::IntAdd, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // add_sub_x_c_c: int_add(int_sub(x, C1), C2) => int_add(x, C2-C1)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntSub {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
+                        let mut new_op = Op::new(OpCode::IntAdd, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // add_sub_c_x_c: int_add(int_sub(C1, x), C2) => int_sub(C1+C2, x)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntSub {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(0)) {
+                        let x = inner.arg(1);
+                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
+                        let mut new_op = Op::new(OpCode::IntSub, &[c, x]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // x + x -> x << 1
         if arg0 == arg1 {
             let one = self.emit_constant_int(ctx, 1);
             let mut new_op = Op::new(OpCode::IntLshift, &[arg0, one]);
@@ -181,15 +226,87 @@ impl OptRewrite {
             }
         }
 
-        // x - 0 -> x
+        // sub_zero: int_sub(x, 0) => x
         if let Some(0) = ctx.get_constant_int(arg1) {
             ctx.replace_op(op.pos, arg0);
             return OptimizationResult::Remove;
         }
-        // x - x -> 0
+        // sub_from_zero: int_sub(0, x) => int_neg(x)
+        if let Some(0) = ctx.get_constant_int(arg0) {
+            let mut new_op = Op::new(OpCode::IntNeg, &[arg1]);
+            new_op.pos = op.pos;
+            return OptimizationResult::Emit(new_op);
+        }
+        // sub_x_x: int_sub(x, x) => 0
         if arg0 == arg1 {
             ctx.make_constant(op.pos, Value::Int(0));
             return OptimizationResult::Remove;
+        }
+
+        // sub_add_consts: int_sub(int_add(x, C1), C2) => int_sub(x, C2-C1)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntAdd {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c2.wrapping_sub(c1));
+                        let mut new_op = Op::new(OpCode::IntSub, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // sub_add: int_sub(int_add(x, y), y) => x
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg1 {
+                ctx.replace_op(op.pos, inner.arg(0));
+                return OptimizationResult::Remove;
+            }
+        }
+
+        // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
+        if let Some(inner) = ctx.get_producing_op(arg1) {
+            if inner.opcode == OpCode::IntAdd && inner.arg(1) == arg0 {
+                let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
+                new_op.pos = op.pos;
+                return OptimizationResult::Emit(new_op);
+            }
+        }
+
+        // sub_sub_left_x_c_c: int_sub(int_sub(x, C1), C2) => int_sub(x, C1+C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntSub {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c1.wrapping_add(c2));
+                        let mut new_op = Op::new(OpCode::IntSub, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                    // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(0)) {
+                        let x = inner.arg(1);
+                        let c = self.emit_constant_int(ctx, c1.wrapping_sub(c2));
+                        let mut new_op = Op::new(OpCode::IntSub, &[c, x]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // sub_invert_one: int_sub(int_invert(x), -1) => int_neg(x)
+        if let Some(-1) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntInvert {
+                    let mut new_op = Op::new(OpCode::IntNeg, &[inner.arg(0)]);
+                    new_op.pos = op.pos;
+                    return OptimizationResult::Emit(new_op);
+                }
+            }
         }
 
         OptimizationResult::PassOn
@@ -270,6 +387,17 @@ impl OptRewrite {
                 let mut neg = Op::new(OpCode::IntNeg, &[arg1]);
                 neg.pos = op.pos;
                 return OptimizationResult::Replace(neg);
+            }
+        }
+
+        // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
+        if let Some(inner) = ctx.get_producing_op(arg1) {
+            if inner.opcode == OpCode::IntLshift {
+                if let Some(1) = ctx.get_constant_int(inner.arg(0)) {
+                    let mut new_op = Op::new(OpCode::IntLshift, &[arg0, inner.arg(1)]);
+                    new_op.pos = op.pos;
+                    return OptimizationResult::Emit(new_op);
+                }
             }
         }
 
@@ -421,10 +549,33 @@ impl OptRewrite {
             ctx.replace_op(op.pos, arg1);
             return OptimizationResult::Remove;
         }
-        // x & x -> x
+        // and_x_x: int_and(a, a) => a
         if arg0 == arg1 {
             ctx.replace_op(op.pos, arg0);
             return OptimizationResult::Remove;
+        }
+
+        // and_reassoc_consts: int_and(int_and(x, C1), C2) => int_and(x, C1&C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntAnd {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c1 & c2);
+                        let mut new_op = Op::new(OpCode::IntAnd, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
+        if let Some(inner) = ctx.get_producing_op(arg1) {
+            if inner.opcode == OpCode::IntAnd && inner.arg(0) == arg0 {
+                ctx.replace_op(op.pos, arg1);
+                return OptimizationResult::Remove;
+            }
         }
 
         OptimizationResult::PassOn
@@ -462,10 +613,54 @@ impl OptRewrite {
             ctx.make_constant(op.pos, Value::Int(-1));
             return OptimizationResult::Remove;
         }
-        // x | x -> x
+        // or_x_x: int_or(a, a) => a
         if arg0 == arg1 {
             ctx.replace_op(op.pos, arg0);
             return OptimizationResult::Remove;
+        }
+
+        // or_reassoc_consts: int_or(int_or(x, C1), C2) => int_or(x, C1|C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntOr {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c1 | c2);
+                        let mut new_op = Op::new(OpCode::IntOr, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
+        if let Some(inner) = ctx.get_producing_op(arg1) {
+            if inner.opcode == OpCode::IntOr && inner.arg(0) == arg0 {
+                ctx.replace_op(op.pos, arg1);
+                return OptimizationResult::Remove;
+            }
+        }
+
+        // or_and_two_parts: int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C1|C2)
+        if let (Some(inner0), Some(inner1)) =
+            (ctx.get_producing_op(arg0), ctx.get_producing_op(arg1))
+        {
+            if inner0.opcode == OpCode::IntAnd
+                && inner1.opcode == OpCode::IntAnd
+                && inner0.arg(0) == inner1.arg(0)
+            {
+                if let (Some(c1), Some(c2)) = (
+                    ctx.get_constant_int(inner0.arg(1)),
+                    ctx.get_constant_int(inner1.arg(1)),
+                ) {
+                    let x = inner0.arg(0);
+                    let c = self.emit_constant_int(ctx, c1 | c2);
+                    let mut new_op = Op::new(OpCode::IntAnd, &[x, c]);
+                    new_op.pos = op.pos;
+                    return OptimizationResult::Emit(new_op);
+                }
+            }
         }
 
         OptimizationResult::PassOn
@@ -511,6 +706,29 @@ impl OptRewrite {
             return OptimizationResult::Emit(new_op);
         }
 
+        // xor_reassoc_consts: int_xor(int_xor(x, C1), C2) => int_xor(x, C1^C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntXor {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        let x = inner.arg(0);
+                        let c = self.emit_constant_int(ctx, c1 ^ c2);
+                        let mut new_op = Op::new(OpCode::IntXor, &[x, c]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
+        // xor_absorb: int_xor(int_xor(a, b), b) => a
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntXor && inner.arg(1) == arg1 {
+                ctx.replace_op(op.pos, inner.arg(0));
+                return OptimizationResult::Remove;
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -539,6 +757,50 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
+        // lshift_rshift_c_c: int_lshift(int_rshift(x, C1), C1) => int_and(x, -1<<C1)
+        if let Some(c1) = ctx.get_constant_int(arg1) {
+            if (0..64).contains(&c1) {
+                if let Some(inner) = ctx.get_producing_op(arg0) {
+                    if inner.opcode == OpCode::IntRshift {
+                        if ctx.get_constant_int(inner.arg(1)) == Some(c1) {
+                            let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
+                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask]);
+                            new_op.pos = op.pos;
+                            return OptimizationResult::Emit(new_op);
+                        }
+                    }
+                    // lshift_urshift_c_c: int_lshift(uint_rshift(x, C1), C1)
+                    if inner.opcode == OpCode::UintRshift {
+                        if ctx.get_constant_int(inner.arg(1)) == Some(c1) {
+                            let mask = self.emit_constant_int(ctx, (-1i64).wrapping_shl(c1 as u32));
+                            let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask]);
+                            new_op.pos = op.pos;
+                            return OptimizationResult::Emit(new_op);
+                        }
+                    }
+                }
+            }
+        }
+
+        // lshift_lshift_c_c: int_lshift(int_lshift(x, C1), C2) => int_lshift(x, C1+C2)
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntLshift {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        if (0..64).contains(&c1) && (0..64).contains(&c2) {
+                            let c = c1 + c2;
+                            if c < 64 {
+                                let cv = self.emit_constant_int(ctx, c);
+                                let mut new_op = Op::new(OpCode::IntLshift, &[inner.arg(0), cv]);
+                                new_op.pos = op.pos;
+                                return OptimizationResult::Emit(new_op);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -565,6 +827,23 @@ impl OptRewrite {
         if let Some(0) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(0));
             return OptimizationResult::Remove;
+        }
+
+        // rshift_rshift_c_c: int_rshift(int_rshift(x, C1), C2) => int_rshift(x, min(C1+C2, 63))
+        if let Some(c2) = ctx.get_constant_int(arg1) {
+            if let Some(inner) = ctx.get_producing_op(arg0) {
+                if inner.opcode == OpCode::IntRshift {
+                    if let Some(c1) = ctx.get_constant_int(inner.arg(1)) {
+                        if (0..64).contains(&c1) && (0..64).contains(&c2) {
+                            let c = (c1 + c2).min(63);
+                            let cv = self.emit_constant_int(ctx, c);
+                            let mut new_op = Op::new(OpCode::IntRshift, &[inner.arg(0), cv]);
+                            new_op.pos = op.pos;
+                            return OptimizationResult::Emit(new_op);
+                        }
+                    }
+                }
+            }
         }
 
         OptimizationResult::PassOn
@@ -611,6 +890,14 @@ impl OptRewrite {
             }
         }
 
+        // neg_neg: int_neg(int_neg(x)) => x
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntNeg {
+                ctx.replace_op(op.pos, inner.arg(0));
+                return OptimizationResult::Remove;
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -621,6 +908,14 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             if let Some(result) = self.try_fold_unary_int(OpCode::IntInvert, a) {
                 ctx.make_constant(op.pos, Value::Int(result));
+                return OptimizationResult::Remove;
+            }
+        }
+
+        // invert_invert: int_invert(int_invert(x)) => x
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntInvert {
+                ctx.replace_op(op.pos, inner.arg(0));
                 return OptimizationResult::Remove;
             }
         }
@@ -695,6 +990,33 @@ impl OptRewrite {
             if let Some(result) = self.try_fold_binary_int(op.opcode, a, b) {
                 ctx.make_constant(op.pos, Value::Int(result));
                 return OptimizationResult::Remove;
+            }
+        }
+
+        // eq_same: int_eq(x, x) => 1
+        if op.opcode == OpCode::IntEq && arg0 == arg1 {
+            ctx.make_constant(op.pos, Value::Int(1));
+            return OptimizationResult::Remove;
+        }
+        // ne_same: int_ne(x, x) => 0
+        if op.opcode == OpCode::IntNe && arg0 == arg1 {
+            ctx.make_constant(op.pos, Value::Int(0));
+            return OptimizationResult::Remove;
+        }
+        // eq_zero: int_eq(x, 0) => int_is_zero(x)
+        if op.opcode == OpCode::IntEq {
+            if let Some(0) = ctx.get_constant_int(arg1) {
+                let mut new_op = Op::new(OpCode::IntIsZero, &[arg0]);
+                new_op.pos = op.pos;
+                return OptimizationResult::Emit(new_op);
+            }
+        }
+        // ne_zero: int_ne(x, 0) => int_is_true(x)
+        if op.opcode == OpCode::IntNe {
+            if let Some(0) = ctx.get_constant_int(arg1) {
+                let mut new_op = Op::new(OpCode::IntIsTrue, &[arg0]);
+                new_op.pos = op.pos;
+                return OptimizationResult::Emit(new_op);
             }
         }
 
