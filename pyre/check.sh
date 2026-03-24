@@ -57,6 +57,10 @@ run_bench() {
     local elapsed
     elapsed=$(time_user "$PYRE" "$script")
 
+    # Compute pyre/pypy ratio for comparison table
+    local ratio
+    ratio=$(python3 -c "print('%.1fx' % ($elapsed / $t_pypy) if float('$t_pypy') > 0 else 'N/A')" 2>/dev/null || echo "N/A")
+
     if [ "$output" != "$expected" ]; then
         RESULTS+=("$(red "FAIL") $name  wrong output")
         printf "$(red WRONG)  got: %s\n" "$(echo "$output" | head -c 60)"
@@ -72,7 +76,7 @@ run_bench() {
             RESULTS+=("$(red "FAIL") $name  ${elapsed}s > ${max_sec}s limit")
             printf "$(red SLOW)  ${elapsed}s (limit ${max_sec}s)\n"
             FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss' "$name" "$t_cpython" "$t_pypy" "$elapsed")")
+            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
             return
         fi
     fi
@@ -84,7 +88,7 @@ run_bench() {
             RESULTS+=("$(red "FAIL") $name  ${elapsed}s > cpython ${t_cpython}s x${margin}")
             printf "$(red "SLOWER")  pyre ${elapsed}s > cpython ${t_cpython}s x${margin}\n"
             FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss' "$name" "$t_cpython" "$t_pypy" "$elapsed")")
+            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
             return
         fi
     fi
@@ -96,7 +100,7 @@ run_bench() {
             RESULTS+=("$(red "FAIL") $name  ${elapsed}s > pypy ${t_pypy}s x${margin}")
             printf "$(red "SLOWER")  pyre ${elapsed}s > pypy ${t_pypy}s x${margin}\n"
             FAIL=$((FAIL + 1))
-            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss' "$name" "$t_cpython" "$t_pypy" "$elapsed")")
+            COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
             return
         fi
     fi
@@ -104,7 +108,7 @@ run_bench() {
     RESULTS+=("$(green "PASS") $name  ${elapsed}s")
     printf "$(green PASS)  ${elapsed}s\n"
     PASS=$((PASS + 1))
-    COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss' "$name" "$t_cpython" "$t_pypy" "$elapsed")")
+    COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre %5ss  (%s vs pypy)' "$name" "$t_cpython" "$t_pypy" "$elapsed" "$ratio")")
 }
 
 echo ""
@@ -141,8 +145,8 @@ fi
 echo "$(green "ALL PASSED"): $PASS/$PASS"
 echo ""
 bold "Comparison"; echo ""
-printf '  %-20s  %10s  %9s  %9s\n' "benchmark" "cpython" "pypy" "pyre"
-echo "  ────────────────────────────────────────────────────────"
+printf '  %-20s  %10s  %9s  %9s  %s\n' "benchmark" "cpython" "pypy" "pyre" ""
+echo "  ──────────────────────────────────────────────────────────────────"
 for c in "${COMPARISONS[@]}"; do echo "$c"; done
 echo ""
 exit 0
