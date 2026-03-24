@@ -477,10 +477,13 @@ impl VirtualState {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
             Self::enum_inputarg_source_slots(info, opref, true, &mut sources, &mut next_slot);
         }
+        // Keep NONE entries to maintain positional correspondence with
+        // make_inputargs(). Filtering them out made source_slots shorter
+        // than label_args, causing assemble_peeled_trace's input_remap to
+        // fall back to sequential OpRef(i)→label_args[i] mapping which
+        // produces false aliases when constants/virtuals are present.
+        sources.truncate(next_slot);
         sources
-            .into_iter()
-            .filter(|opref| !opref.is_none())
-            .collect()
     }
 
     /// virtualstate.py: make_inputargs_and_virtuals(oprefs)
