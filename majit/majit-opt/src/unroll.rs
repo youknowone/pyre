@@ -224,6 +224,19 @@ impl UnrollOptimizer {
                 }
             }
         };
+        // Determine types of end_args from Phase 1's output ops.
+        {
+            let op_types: HashMap<OpRef, Type> = p1_ops
+                .iter()
+                .filter(|op| !op.pos.is_none())
+                .map(|op| (op.pos, op.opcode.result_type()))
+                .collect();
+            exported_state.end_arg_types = exported_state
+                .end_args
+                .iter()
+                .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
+                .collect();
+        }
         self.ensure_preamble_target_token();
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
         // RPython import_state: phase 2 starts from the original trace input
