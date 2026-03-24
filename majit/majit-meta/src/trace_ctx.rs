@@ -365,6 +365,36 @@ impl TraceCtx {
         self.constants.as_ref().get(&opref.0).copied()
     }
 
+    /// Constant-fold a pure field read on a constant object pointer.
+    /// If `obj` is a constant and `descr` is immutable, reads the field
+    /// at runtime and returns the value as a constant OpRef.
+    pub fn try_const_fold_pure_field(
+        &mut self,
+        obj: OpRef,
+        descr: &dyn majit_ir::Descr,
+    ) -> Option<OpRef> {
+        if !descr.is_always_pure() {
+            return None;
+        }
+        let obj_ptr = self.const_value(obj)? as usize;
+        if obj_ptr == 0 {
+            return None;
+        }
+        let fd = descr.as_field_descr()?;
+        let offset = fd.offset();
+        let field_size = fd.field_size();
+        let value = unsafe {
+            let base = obj_ptr as *const u8;
+            match field_size {
+                8 => *(base.add(offset) as *const i64),
+                4 if fd.is_field_signed() => *(base.add(offset) as *const i32) as i64,
+                4 => *(base.add(offset) as *const u32) as i64,
+                _ => return None,
+            }
+        };
+        Some(self.const_int(value))
+    }
+
     /// Record a regular IR operation.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         self.recorder.record_op(opcode, args)

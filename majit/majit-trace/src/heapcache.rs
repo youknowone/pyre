@@ -584,7 +584,7 @@ mod tests {
         cache.getfield_now_known(OpRef(0), 1, OpRef(10));
         cache.getfield_now_known(OpRef(1), 2, OpRef(20));
 
-        cache.invalidate_caches();
+        cache.invalidate_all_caches();
         assert_eq!(cache.getfield_cached(OpRef(0), 1), None);
         assert_eq!(cache.getfield_cached(OpRef(1), 2), None);
     }
