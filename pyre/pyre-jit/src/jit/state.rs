@@ -1885,7 +1885,38 @@ impl TraceFrameState {
             let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
             args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
         }
+        // pyjitpl.py:2954 remove_consts_and_duplicates: replace constant
+        // and duplicate OpRefs with SameAs ops. This ensures each JUMP arg
+        // is a unique non-constant reference, matching the optimizer's
+        // expectation that JUMP args are live input values.
+        let mut slot_types: Vec<Type> = Vec::with_capacity(args.len() - 3);
+        slot_types.extend(local_types.iter().copied());
+        slot_types.extend(stack_types.iter().copied());
+        Self::remove_consts_and_duplicates(&mut args, 3, &slot_types, ctx);
         args
+    }
+
+    /// pyjitpl.py:2934 remove_consts_and_duplicates
+    fn remove_consts_and_duplicates(
+        args: &mut [OpRef],
+        start: usize,
+        slot_types: &[Type],
+        ctx: &mut TraceCtx,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for i in start..args.len() {
+            let opref = args[i];
+            if opref == OpRef::NONE {
+                continue;
+            }
+            let is_const = opref.0 >= 10_000;
+            if is_const || !seen.insert(opref) {
+                let tp = slot_types.get(i - start).copied().unwrap_or(Type::Ref);
+                let same_as_opcode = majit_ir::OpCode::same_as_for_type(tp);
+                let fresh = ctx.record_op(same_as_opcode, &[opref]);
+                args[i] = fresh;
+            }
+        }
     }
 
     /// Build the current fail_args for guards: [frame, ni, vsd, locals..., stack...]
