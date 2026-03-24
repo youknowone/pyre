@@ -45,7 +45,37 @@ pub fn trace_bytecode(
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
     metainterp.framestack.push(frame);
 
-    metainterp.interpret(ctx)
+    // RPython pyjitpl.py:2971-2973: register the initial merge point so
+    // reached_loop_header recognizes the trace start backedge and closes
+    // the loop instead of unrolling it as a first-visit inner loop.
+    let start_key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
+    {
+        let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
+            .map(|i| majit_ir::OpRef(i as u32))
+            .collect();
+        let input_types = ctx.inputarg_types();
+        ctx.add_merge_point(start_key, input_args, input_types);
+    }
+
+    let action = metainterp.interpret(ctx);
+
+    // Retarget green key based on back-edge target.
+    match &action {
+        TraceAction::CloseLoopWithArgs {
+            loop_header_pc: Some(target_pc),
+            ..
+        } => {
+            let key = crate::eval::make_green_key(code as *const CodeObject, *target_pc);
+            ctx.set_green_key(key);
+        }
+        TraceAction::CloseLoop => {
+            let key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
+            ctx.set_green_key(key);
+        }
+        _ => {}
+    }
+
+    action
 }
 
 #[cfg(test)]
