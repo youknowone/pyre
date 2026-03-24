@@ -631,11 +631,15 @@ pub(crate) fn frame_namespace_ptr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
 /// Uses GcR (Ref-typed) to match RPython's GETARRAYITEM_GC_R,
 /// ensuring the optimizer knows these are boxed pointers.
 pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index: OpRef) -> OpRef {
-    ctx.record_op_with_descr(
-        OpCode::GetarrayitemGcR,
-        &[array, index],
-        pyobject_array_descr(),
-    )
+    let descr = pyobject_array_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(array, index, descr_idx) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
+    ctx.heap_cache_mut()
+        .getarrayitem_now_known(array, index, descr_idx, result);
+    result
 }
 
 /// Read from frame's locals_cells_stack_w — namespace access path.
@@ -644,11 +648,15 @@ pub(crate) fn trace_raw_array_getitem_value(
     array: OpRef,
     index: OpRef,
 ) -> OpRef {
-    ctx.record_op_with_descr(
-        OpCode::GetarrayitemGcR,
-        &[array, index],
-        pyobject_array_descr(),
-    )
+    let descr = pyobject_array_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(array, index, descr_idx) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
+    ctx.heap_cache_mut()
+        .getarrayitem_now_known(array, index, descr_idx, result);
+    result
 }
 
 pub(crate) fn trace_raw_int_array_getitem_value(
@@ -679,11 +687,11 @@ pub(crate) fn trace_raw_array_setitem_value(
     index: OpRef,
     value: OpRef,
 ) {
-    ctx.record_op_with_descr(
-        OpCode::SetarrayitemGc,
-        &[array, index, value],
-        pyobject_array_descr(),
-    );
+    let descr = pyobject_array_descr();
+    let descr_idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
+    ctx.heap_cache_mut()
+        .setarrayitem_cache(array, index, descr_idx, value);
 }
 
 pub(crate) fn trace_raw_int_array_setitem_value(
@@ -1635,11 +1643,13 @@ impl MIFrame {
             (Some(Type::Float), Type::Ref) => {
                 // Inline unbox with record_guard for correct fail_arg types.
                 let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                if value.0 < 10_000 {
+                if value.0 < 10_000 && !ctx.heap_cache().is_class_known(value) {
                     let ob_type =
                         trace_gc_object_int_field(ctx, value, crate::jit::descr::ob_type_descr());
                     let type_const = ctx.const_int(float_type_addr);
                     self.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                    ctx.heap_cache_mut()
+                        .class_now_known(value, majit_ir::GcRef(float_type_addr as usize));
                 }
                 let ff_descr = crate::jit::descr::float_floatval_descr();
                 let ff_idx = ff_descr.index();
@@ -2104,8 +2114,14 @@ impl MIFrame {
     }
 
     fn guard_object_class(&mut self, ctx: &mut TraceCtx, obj: OpRef, expected_type: *const PyType) {
-        let expected_type = ctx.const_int(expected_type as usize as i64);
-        self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type]);
+        // heapcache.py: skip guard if class already known for this object
+        if ctx.heap_cache().is_class_known(obj) {
+            return;
+        }
+        let expected_type_const = ctx.const_int(expected_type as usize as i64);
+        self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        ctx.heap_cache_mut()
+            .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
@@ -2648,11 +2664,13 @@ impl MIFrame {
             // fail_arg types (generated trace_unbox_float hardcodes all types
             // as Int, losing Float type info needed for guard recovery).
             let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                if obj.0 < 10_000 {
+                if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
                     let ob_type =
                         trace_gc_object_int_field(ctx, obj, crate::jit::descr::ob_type_descr());
                     let type_const = ctx.const_int(float_type_addr);
                     this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                    ctx.heap_cache_mut()
+                        .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
                 }
                 {
                     let ff_descr = crate::jit::descr::float_floatval_descr();
@@ -3501,6 +3519,7 @@ impl MIFrame {
                         )?;
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
                         Ok(result)
                     });
@@ -3742,6 +3761,7 @@ impl MIFrame {
                                 )?;
                                 this.push_call_replay_stack(ctx, callable, args, call_pc);
                                 this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                                ctx.heap_cache_mut().invalidate_caches_for_escaped();
                                 this.pop_call_replay_stack(ctx, args.len())?;
                                 Ok(result)
                             });
@@ -3881,6 +3901,7 @@ impl MIFrame {
                     )?;
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                     Ok(result)
                 });
@@ -4200,6 +4221,7 @@ impl MIFrame {
                     } else if !this.sync_standard_virtualizable_after_residual_call() {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
                     }
                     result
@@ -4214,6 +4236,7 @@ impl MIFrame {
                     if !this.sync_standard_virtualizable_after_residual_call() {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
                         this.pop_call_replay_stack(ctx, args.len())?;
                     }
                     result
@@ -4232,6 +4255,7 @@ impl MIFrame {
                     // GuardNotForced fail → interpreter must re-execute CALL.
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
                     this.pop_call_replay_stack(ctx, args.len())?;
                 }
                 ctx.call_void(
@@ -4737,6 +4761,10 @@ impl TraceHelperAccess for MIFrame {
     fn trace_record_not_forced_guard(&mut self) {
         self.with_ctx(|this, ctx| {
             this.record_guard(ctx, OpCode::GuardNotForced, &[]);
+            // heapcache.py: invalidate_caches after non-pure calls.
+            // The call may have mutated heap state, so cached field
+            // values for escaped objects are no longer reliable.
+            ctx.heap_cache_mut().invalidate_caches_for_escaped();
         });
     }
 
