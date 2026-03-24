@@ -486,9 +486,6 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc,
             } => {
-                // Green key is no longer retargeted in trace.rs, so
-                // merge_pc stays consistent with the trace entry PC.
-                // No update needed.
                 let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
