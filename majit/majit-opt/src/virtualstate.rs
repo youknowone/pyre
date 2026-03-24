@@ -766,7 +766,14 @@ impl VirtualState {
             VirtualStateInfo::Constant(_) => Ok(()),
             VirtualStateInfo::Virtual { fields, .. }
             | VirtualStateInfo::VirtualStruct { fields, .. } => {
+                // RPython virtualstate.py:185: if not info.is_virtual() → VirtualStatesCantMatch
                 let resolved = ctx.get_replacement(opref);
+                let is_virtual = ctx
+                    .get_ptr_info(resolved)
+                    .map_or(false, |pi| pi.is_virtual());
+                if !is_virtual && !force_boxes {
+                    return Err(());
+                }
                 for (field_idx, field_state) in fields {
                     let field_ref = ctx
                         .get_ptr_info(resolved)
