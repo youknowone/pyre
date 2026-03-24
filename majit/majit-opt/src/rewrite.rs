@@ -778,6 +778,34 @@ impl OptRewrite {
                             return OptimizationResult::Emit(new_op);
                         }
                     }
+                    // lshift_and_rshift: int_lshift(int_and(int_rshift(x, C1), C2), C1)
+                    if inner.opcode == OpCode::IntAnd {
+                        if let Some(c2) = ctx.get_constant_int(inner.arg(1)) {
+                            if let Some(inner2) = ctx.get_producing_op(inner.arg(0)) {
+                                if inner2.opcode == OpCode::IntRshift
+                                    && ctx.get_constant_int(inner2.arg(1)) == Some(c1)
+                                {
+                                    let mask =
+                                        self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
+                                    let mut new_op =
+                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), mask]);
+                                    new_op.pos = op.pos;
+                                    return OptimizationResult::Emit(new_op);
+                                }
+                                // lshift_and_urshift
+                                if inner2.opcode == OpCode::UintRshift
+                                    && ctx.get_constant_int(inner2.arg(1)) == Some(c1)
+                                {
+                                    let mask =
+                                        self.emit_constant_int(ctx, c2.wrapping_shl(c1 as u32));
+                                    let mut new_op =
+                                        Op::new(OpCode::IntAnd, &[inner2.arg(0), mask]);
+                                    new_op.pos = op.pos;
+                                    return OptimizationResult::Emit(new_op);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -874,6 +902,23 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
+        // urshift_lshift_x_c_c: uint_rshift(int_lshift(x, C), C) => int_and(x, mask)
+        if let Some(c) = ctx.get_constant_int(arg1) {
+            if (0..64).contains(&c) {
+                if let Some(inner) = ctx.get_producing_op(arg0) {
+                    if inner.opcode == OpCode::IntLshift
+                        && ctx.get_constant_int(inner.arg(1)) == Some(c)
+                    {
+                        let mask = ((-1i64 as u64).wrapping_shl(c as u32) >> (c as u32)) as i64;
+                        let mask_ref = self.emit_constant_int(ctx, mask);
+                        let mut new_op = Op::new(OpCode::IntAnd, &[inner.arg(0), mask_ref]);
+                        new_op.pos = op.pos;
+                        return OptimizationResult::Emit(new_op);
+                    }
+                }
+            }
+        }
+
         OptimizationResult::PassOn
     }
 
@@ -943,6 +988,18 @@ impl OptRewrite {
         if let Some(a) = ctx.get_constant_int(arg0) {
             ctx.make_constant(op.pos, Value::Int(if a != 0 { 1 } else { 0 }));
             return OptimizationResult::Remove;
+        }
+
+        // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
+        if let Some(inner) = ctx.get_producing_op(arg0) {
+            if inner.opcode == OpCode::IntAnd {
+                if ctx.get_constant_int(inner.arg(1)) == Some(i64::MIN) {
+                    let zero = self.emit_constant_int(ctx, 0);
+                    let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), zero]);
+                    new_op.pos = op.pos;
+                    return OptimizationResult::Emit(new_op);
+                }
+            }
         }
 
         OptimizationResult::PassOn
