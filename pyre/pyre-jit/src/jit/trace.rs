@@ -41,8 +41,6 @@ pub fn trace_bytecode(
     let action = metainterp.interpret(ctx);
 
     // Retarget green key based on back-edge target.
-    // Done here (not inside interpret) because start_pc is needed
-    // for CloseLoop — metainterp doesn't track the trace entry PC.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
