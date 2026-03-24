@@ -1318,7 +1318,20 @@ where
         Instruction::LoadAttr { namei } => {
             let attr = namei.get(op_arg);
             let name_idx = attr.name_idx() as usize;
-            OpcodeStepExecutor::load_attr(executor, code.names[name_idx].as_ref())?;
+            let name = code.names[name_idx].as_ref();
+            // When is_method() is true, CALL expects [NULL_or_self, method, args...].
+            // Since pyre does not implement bound-method lookup, push NULL + attr.
+            if attr.is_method() {
+                let obj = executor.pop_value()?;
+                let attr_val = SharedOpcodeHandler::load_attr(executor, obj, name)?;
+                let null = executor.null_value()?;
+                // Stack layout for CALL: [callable, null_or_self, args...]
+                // Push callable (attr) first, then NULL on top.
+                executor.push_value(attr_val)?;
+                executor.push_value(null)?;
+            } else {
+                OpcodeStepExecutor::load_attr(executor, name)?;
+            }
             Ok(StepResult::Continue)
         }
 

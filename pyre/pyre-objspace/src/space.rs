@@ -942,8 +942,25 @@ thread_local! {
 
 /// Get an attribute from an object: `obj.name`.
 ///
-/// Looks up the attribute in the per-object side table.
+/// For module objects, looks up the name in the module's namespace dict
+/// (PyPy: Module.getdict → w_dict lookup).
+/// For other objects, looks up the attribute in the per-object side table.
 pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
+    // Module objects: look up in module namespace
+    // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
+    unsafe {
+        if is_module(obj) {
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut pyre_runtime::PyNamespace;
+            if !ns_ptr.is_null() {
+                if let Some(&value) = (*ns_ptr).get(name) {
+                    if !value.is_null() {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+    }
+
     ATTR_TABLE.with(|table| {
         let table = table.borrow();
         let key = obj as usize;

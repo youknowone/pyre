@@ -473,23 +473,34 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    // ── Import (Phase 1: stub) ──
-
+    // ── Import ──
+    // PyPy: pyopcode.py IMPORT_NAME
+    // Stack: [level, fromlist] → pops both, pushes module object.
     fn import_name(&mut self, name: &str) -> Result<(), Self::Error> {
-        // Phase 1: pop level and fromlist, push a namespace object
-        let _fromlist = self.pop();
-        let _level = self.pop();
-        // Create a simple namespace as the "module"
-        let module = pyre_object::w_none();
+        let w_fromlist = self.pop();
+        let w_level = self.pop();
+        let level = if unsafe { pyre_object::is_int(w_level) } {
+            unsafe { pyre_object::w_int_get_value(w_level) }
+        } else {
+            0
+        };
+
+        let module = crate::importing::importhook(
+            name,
+            PY_NULL, // w_globals (not used for absolute imports)
+            w_fromlist,
+            level,
+            self.execution_context,
+        )?;
         self.push(module);
-        // TODO: actual module loading
         Ok(())
     }
 
+    // PyPy: pyopcode.py IMPORT_FROM
+    // Stack: [module] → peek module, push getattr(module, name)
     fn import_from(&mut self, name: &str) -> Result<(), Self::Error> {
-        // Phase 1: peek module (TOS), get attribute
         let module = self.peek();
-        let attr = pyre_objspace::space::py_getattr(module, name).unwrap_or(pyre_object::w_none());
+        let attr = crate::importing::import_from(module, name)?;
         self.push(attr);
         Ok(())
     }
@@ -867,7 +878,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: IMPORT_STAR — merge module's public names into current namespace.
     fn import_star(&mut self) -> Result<(), Self::Error> {
         let module = self.pop();
-        let _ = module;
+        crate::importing::import_all_from(module, self.namespace);
         Ok(())
     }
 

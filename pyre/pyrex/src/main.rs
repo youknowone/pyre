@@ -1,6 +1,7 @@
 //! pyre — A Rust meta-tracing JIT Python interpreter.
 
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::rc::Rc;
 
 use lexopt::Arg::*;
@@ -8,6 +9,7 @@ use lexopt::ValueExt;
 
 use pyre_bytecode::*;
 use pyre_interp::frame::PyFrame;
+use pyre_interp::importing;
 use pyre_jit::eval::eval_with_jit;
 use pyre_runtime::{PyDisplay, PyExecutionContext};
 
@@ -88,6 +90,9 @@ fn real_main() {
 
     match mode {
         RunMode::Command(cmd) => {
+            // Initialize sys.path with CWD for -c mode.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            importing::init_sys_path(&cwd);
             run_source(&cmd, Mode::Exec);
             if inspect {
                 run_repl(true);
@@ -101,12 +106,24 @@ fn real_main() {
                     std::process::exit(1);
                 }
             };
+            // Initialize sys.path with the script's directory.
+            let script_dir = Path::new(&path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .canonicalize()
+                .unwrap_or_else(|_| Path::new(".").to_path_buf());
+            importing::init_sys_path(&script_dir);
             run_source(&source, Mode::Exec);
             if inspect {
                 run_repl(true);
             }
         }
-        RunMode::Repl => run_repl(quiet),
+        RunMode::Repl => {
+            // Initialize sys.path with CWD for REPL mode.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            importing::init_sys_path(&cwd);
+            run_repl(quiet);
+        }
     }
 }
 
