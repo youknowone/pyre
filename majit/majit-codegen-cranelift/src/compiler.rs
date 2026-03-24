@@ -1887,7 +1887,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
             let gk = target._green_key;
-            // RPython rd_numb parity: outputs[1] = vable_next_instr (bytecode PC)
+            // Extract resume_pc from guard's fail_args output.
+            // Position 1 in fail_args is the next_instr (bytecode PC).
             let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
             notify_bridge_threshold(gk, target.trace_id, fail_index, resume_pc);
         }
@@ -4034,6 +4035,8 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
             if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
                 let gk = compiled.green_key;
+                // Extract resume_pc from guard's fail_args output.
+                // Position 1 in fail_args is the next_instr (bytecode PC).
                 let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
                 notify_bridge_threshold(gk, compiled.trace_id, fail_index, resume_pc);
             }

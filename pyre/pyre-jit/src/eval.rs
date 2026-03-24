@@ -711,33 +711,20 @@ fn restore_guard_failure_for_loop(
     // are stored as extra fail_args. Reconstruct the concrete PyObject
     // from the field values and replace the null slot.
     materialize_recovery_virtuals(&mut typed, exit_layout);
-    // Safety: if any null Ref slots remain after materialization,
-    // the frame state is unsafe for the interpreter. Return None
-    // (= not restored) so the interpreter ignores the guard result
-    // and continues from scratch rather than dereferencing null.
+    // After materialization, check for remaining null Ref slots.
+    // These represent either uninitialized locals or virtual objects
+    // that couldn't be materialized. Don't invalidate — just skip
+    // the restore and let the interpreter continue from scratch.
     let has_null_ref = typed
         .iter()
         .skip(3)
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
         if majit_meta::majit_log_enabled() {
-            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
+            eprintln!(
+                "[jit] guard-fail: unmaterialized null Ref in restored values, skipping restore"
+            );
         }
-        // Blacklist all compiled keys AND the originating trace key.
-        // Clear loop_tokens so counter_would_fire returns false.
-        let (driver, _) = driver_pair();
-        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
-        for key in keys {
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .abort_tracing(key, true);
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .clear_loop_token(key);
-        }
-        driver.invalidate_all_compiled();
         return None;
     }
     // RPython resume_in_blackhole parity: bridge guard failures are
@@ -752,41 +739,10 @@ fn restore_guard_failure_for_loop(
         );
     }
 
-    // RPython compile.py:696 handle_fail parity: compile bridge
-    // SYNCHRONOUSLY while the frame state is still valid.
-    // The bridge threshold callback (on_bridge_threshold_reached)
-    // stores a single request in PENDING_BRIDGE_REQUEST TLS.
-    // Consume it here where the frame is fully restored.
-    if restored {
-        if let Some((gk, tid, fi, resume_pc)) =
-            crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take())
-        {
-            let frame = unsafe { &mut *(jit_state.frame as *mut pyre_interp::frame::PyFrame) };
-            frame.next_instr = jit_state.next_instr;
-            frame.valuestackdepth = jit_state.valuestackdepth;
-
-            let effective_gk = if gk == 0 {
-                make_green_key(frame.code, 0)
-            } else {
-                gk
-            };
-            let effective_rpc = if resume_pc == 0 {
-                jit_state.next_instr
-            } else {
-                resume_pc
-            };
-            crate::call_jit::jit_bridge_compile_for_guard(
-                effective_gk,
-                tid,
-                fi,
-                frame,
-                effective_rpc,
-            );
-
-            frame.next_instr = jit_state.next_instr;
-            frame.valuestackdepth = jit_state.valuestackdepth;
-        }
-    }
+    // Discard any pending Cranelift-level bridge requests.
+    // Bridge compilation is deferred until guard recovery properly
+    // handles mixed-type fail_args (including Float types).
+    crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
 }

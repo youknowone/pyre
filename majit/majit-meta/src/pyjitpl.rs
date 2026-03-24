@@ -1704,6 +1704,7 @@ impl<M: Clone> MetaInterp<M> {
         token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2160,6 +2161,7 @@ impl<M: Clone> MetaInterp<M> {
         token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2419,6 +2421,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut token = JitCellToken::new(token_num);
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         // Extend inputargs if the optimizer added virtual inputs (virtualizable)
         let final_num_inputs = optimizer.final_num_inputs();
@@ -3920,6 +3923,7 @@ impl<M: Clone> MetaInterp<M> {
 
         self.backend.set_constants(constants);
         self.backend.set_next_trace_id(bridge_trace_id);
+        self.backend.set_next_header_pc(green_key);
 
         let result = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();

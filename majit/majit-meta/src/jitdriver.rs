@@ -491,9 +491,8 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc,
+                loop_header_pc: _,
             } => {
-                let _ = loop_header_pc;
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
