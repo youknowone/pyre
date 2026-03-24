@@ -1312,11 +1312,6 @@ impl MIFrame {
         self.sym().frame
     }
 
-    /// PyPy interp_jit.py:89 — hint(self.valuestackdepth, promote=True).
-    /// No-op: GuardValue on vsd causes segfault in finish traces.
-    /// The virtualizable mechanism implicitly promotes via JUMP args.
-    pub(crate) fn promote_valuestackdepth(&mut self, _concrete_frame: usize) {}
-
     fn materialize_fail_arg_slot(
         &mut self,
         ctx: &mut TraceCtx,

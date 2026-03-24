@@ -1,22 +1,23 @@
 //! PyreMetaInterp — RPython MetaInterp (pyjitpl.py:2371) parity.
 //!
-//! The MetaInterp takes over execution during tracing. It maintains a
-//! framestack of MetaInterpFrames and runs bytecodes through its own
-//! dispatch loop, simultaneously computing concrete results (via executor)
-//! and recording IR operations (via TraceCtx).
+//! The MetaInterp drives the tracing loop via interpret(), which
+//! repeatedly calls MIFrame::trace_code_step() on the top frame.
+//! Each step computes concrete results AND records symbolic IR.
 //!
 //! RPython control flow:
 //!   MetaInterp._interpret():
 //!     while True:
 //!       framestack[-1].run_one_step()
 //!
-//! Frame transitions use StepAction enum (RPython ChangeFrame exception):
-//!   perform_call() → push frame → StepAction::ChangeFrame
-//!   finishframe()  → pop frame  → StepAction::ChangeFrame or DoneWithThisFrame
+//! Currently the root frame delegates to MIFrame (state.rs) for
+//! dispatch. Inline call tracing uses a separate framestack in
+//! inline_trace_and_execute (state.rs). Future: unify via
+//! perform_call() / finishframe().
 
 use majit_ir::OpRef;
 use majit_meta::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
+use pyre_bytecode::bytecode::Instruction;
 
 use super::state::{ConcreteValue, FrontendOp, MIFrame, PyreSym};
 
@@ -112,8 +113,6 @@ impl PyreMetaInterp {
             // concrete execution and symbolic IR recording.
             let fallthrough_pc = semantic_fallthrough_pc(code, pc);
             let mut frame_state = MIFrame::from_sym(ctx, sym, top.concrete_frame, fallthrough_pc);
-            frame_state.promote_valuestackdepth(top.concrete_frame);
-
             let action = frame_state.trace_code_step(code, pc);
 
             match action {
@@ -145,6 +144,9 @@ impl PyreMetaInterp {
     /// RPython MetaInterp.perform_call() parity.
     ///
     /// Create a new frame for the callee and push it onto the framestack.
+    /// Currently unused — inline tracing uses inline_trace_and_execute.
+    /// Will be activated when inline tracing migrates to framestack pattern.
+    #[allow(dead_code)]
     pub fn perform_call(
         &mut self,
         callee_code: *const CodeObject,
@@ -183,6 +185,7 @@ impl PyreMetaInterp {
     /// RPython MetaInterp.finishframe() parity.
     ///
     /// Pop the top frame and store the result in the parent frame.
+    #[allow(dead_code)]
     pub fn finishframe(&mut self, result: FrontendOp) -> StepAction {
         if let Some(popped) = self.framestack.pop() {
             // Drop the heap-allocated PyreSym if it was created by perform_call.
@@ -219,8 +222,7 @@ impl PyreMetaInterp {
     }
 }
 
-fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
-    use pyre_bytecode::bytecode::Instruction;
+pub(crate) fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
     loop {
         match pyre_runtime::decode_instruction_at(code, next_pc) {
