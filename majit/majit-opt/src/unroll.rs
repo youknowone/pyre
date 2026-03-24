@@ -1123,13 +1123,13 @@ impl OptUnroll {
             return;
         }
         let info = self.collect_exported_info(resolved, ctx, exported_int_bounds);
-        let has_fields = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
+        let is_virtual = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual());
         infos.insert(resolved, info.clone());
         // Also store under the original (unresolved) key.
         if arg != resolved {
             infos.insert(arg, info);
         }
-        if has_fields {
+        if is_virtual {
             self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
     }
@@ -1148,12 +1148,6 @@ impl OptUnroll {
                 v.fields.iter().map(|(_, r)| *r).collect()
             }
             Some(crate::info::PtrInfo::VirtualArray(v)) => v.items.clone(),
-            Some(crate::info::PtrInfo::Instance(v)) if !v.fields.is_empty() => {
-                v.fields.iter().map(|(_, r)| *r).collect()
-            }
-            Some(crate::info::PtrInfo::Struct(v)) if !v.fields.is_empty() => {
-                v.fields.iter().map(|(_, r)| *r).collect()
-            }
             _ => return,
         };
         for field in fields {
