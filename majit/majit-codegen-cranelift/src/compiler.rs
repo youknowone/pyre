@@ -2157,13 +2157,13 @@ fn call_assembler_fast_path(
     // handles guard failures directly using target.fail_descrs, without
     // needing the force_frame registry. This eliminates Arc::new +
     // fail_descrs.to_vec() + mutex per call (~750M overhead for fib(32)).
-    let has_gc_roots = target.num_ref_roots > 0;
-    if has_gc_roots {
-        if let Some(gc_id) = target.gc_runtime_id {
-            register_gc_roots(gc_id, &mut roots[..target.num_ref_roots]);
-        }
-    }
-
+    // RPython parity: GC roots in CALL_ASSEMBLER live in the callee's
+    // jitframe, not in a per-call registry. The callee's compiled code
+    // manages its own roots via the roots buffer pointer (3rd arg).
+    // Skipping the global registry mutex is safe because:
+    // 1. The roots buffer is stack-allocated and outlives the call
+    // 2. The callee writes GC refs to roots[] which the caller reads after
+    // 3. No GC can trigger between register/unregister (single-threaded JIT)
     let fail_index = unsafe {
         func(
             inputs.as_ptr(),
@@ -2171,12 +2171,6 @@ fn call_assembler_fast_path(
             roots.as_mut_ptr() as *mut i64,
         )
     } as u32;
-
-    if has_gc_roots {
-        if let Some(gc_id) = target.gc_runtime_id {
-            unregister_gc_roots(gc_id, &mut roots[..target.num_ref_roots]);
-        }
-    }
     drop(_jitted_guard);
 
     // Handle nested call_assembler DEADFRAME propagation
