@@ -425,10 +425,23 @@ impl UnrollOptimizer {
                             self.retraced_count, self.retrace_limit
                         );
                     }
-                    // RPython _jump_to_existing_trace() keeps the redirected
-                    // JUMP emitted by jump_ctx; it does not replace it with a
-                    // synthetic body self-loop.
-                    jumped = false;
+                    // RPython: when force_boxes=false fails, retry with
+                    // force_boxes=true to materialize virtual args before
+                    // the JUMP. This matches RPython's self-loop compilation
+                    // where the JUMP goes through the optimizer's JUMP handler
+                    // which forces all virtuals.
+                    jump_ctx.clear_newoperations();
+                    jumped = opt_unroll
+                        .jump_to_existing_trace(
+                            &body_jump_args,
+                            Some(&current_label_args),
+                            &mut self.target_tokens,
+                            &mut opt_p2,
+                            &mut jump_ctx,
+                            true,
+                            Some(&runtime_boxes),
+                        )
+                        .is_none();
                 } else {
                     // unroll.py:220-226: limit reached, try force_boxes=true
                     jump_ctx.clear_newoperations();
@@ -1475,6 +1488,13 @@ impl OptUnroll {
         // RPython Box identity: shared seen across all imports so that
         // duplicate virtual field OpRefs are detected and given fresh positions.
         let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        // Detect targets that collide with Phase 2 inputarg positions.
+        // In RPython, Phase 1 targets and Phase 2 sources are distinct Box
+        // objects, so forwarding never collides. In pyre, they share the
+        // OpRef namespace, causing get_replacement to stop at the wrong
+        // PtrInfo. Skip replace_op forwarding for colliding targets —
+        // apply_exported_info copies info directly to source instead.
+        let source_set: std::collections::HashSet<OpRef> = targetargs.iter().copied().collect();
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][import] next_iteration_args={:?}",
@@ -1485,7 +1505,12 @@ impl OptUnroll {
             let source = targetargs[i];
             let is_dup = !seen_targets.insert(*target);
             if !is_dup {
-                ctx.set_import_box(source, *target);
+                // Skip replace_op when target is also a Phase 2 inputarg
+                // (different slot) — forwarding would collide with that
+                // slot's PtrInfo. The import_target_map is still recorded
+                // for the assembler's use.
+                let collides = *target != source && source_set.contains(target);
+                ctx.set_import_box(source, *target, collides);
             }
             if let Some(info) = exported_state.exported_infos.get(target) {
                 self.apply_exported_info_recursive(
