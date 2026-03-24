@@ -176,7 +176,7 @@ impl VirtualStateInfo {
             // Unknown accepts anything
             (VirtualStateInfo::Unknown, _) => true,
 
-            // Constants must match
+            // Constants must match exactly.
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) => a == b,
             (VirtualStateInfo::Constant(_), _) => false,
 
@@ -318,14 +318,19 @@ impl VirtualStateInfo {
                     })
             }
 
-            // KnownClass: other must have the same class (or be virtual with matching class)
+            // KnownClass: other must have the same class (or be virtual with matching class).
+            // RPython: KnownClass does NOT accept Unknown/NonNull in pure
+            // compatibility check (raises VirtualStatesCantMatch). Guard
+            // generation with runtime_box is needed for that.
             (VirtualStateInfo::KnownClass { class_ptr: c1 }, other_info) => match other_info {
                 VirtualStateInfo::KnownClass { class_ptr: c2 } => c1 == c2,
                 VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref() == Some(c1),
                 _ => false,
             },
 
-            // NonNull: other must be nonnull (virtual is always nonnull)
+            // NonNull: other must be nonnull (virtual is always nonnull).
+            // RPython: NonNull does NOT accept Unknown in pure compatibility
+            // check (raises VirtualStatesCantMatch).
             (VirtualStateInfo::NonNull, other_info) => match other_info {
                 VirtualStateInfo::NonNull
                 | VirtualStateInfo::KnownClass { .. }
@@ -338,13 +343,11 @@ impl VirtualStateInfo {
                 _ => false,
             },
 
-            // IntBounded: other must have tighter or equal bounds
+            // IntBounded: other must have tighter or equal bounds.
             (VirtualStateInfo::IntBounded(b1), VirtualStateInfo::IntBounded(b2)) => {
-                // b2 must fit entirely within b1
                 b2.lower >= b1.lower && b2.upper <= b1.upper
             }
             (VirtualStateInfo::IntBounded(b), VirtualStateInfo::Constant(Value::Int(v))) => {
-                // A constant is always within bounds if the bound contains it
                 b.contains(*v)
             }
             (VirtualStateInfo::IntBounded(_), _) => false,
