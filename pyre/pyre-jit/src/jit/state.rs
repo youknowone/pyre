@@ -4110,53 +4110,6 @@ impl MIFrame {
         })
     }
 
-    /// PyPy perform_call + _interpret: trace INTO callee body.
-    ///
-    /// Instead of emitting an opaque CallMayForce, traces each callee
-    /// bytecode instruction into the current trace. Simple functions
-    /// like `add(a,b): return a+b` become `IntAdd(a,b)` in the trace.
-    #[allow(dead_code)]
-    fn trace_through_callee(
-        &mut self,
-        callable: OpRef,
-        args: &[OpRef],
-        concrete_callable: PyObjectRef,
-        callee_key: u64,
-    ) -> Result<OpRef, PyError> {
-        let pending =
-            self.build_pending_inline_frame(callable, args, concrete_callable, callee_key)?;
-        let (driver, _) = crate::eval::driver_pair();
-        driver.enter_inline_frame(callee_key);
-
-        let ctx_ptr = self.ctx;
-        let ctx = unsafe { &mut *ctx_ptr };
-        let result = inline_trace_and_execute(ctx, pending);
-        let (driver, _) = crate::eval::driver_pair();
-        driver.leave_inline_frame();
-        let (result_opref, result_type, concrete_result) = result?;
-        if majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit][trace-through] key={} result_opref={:?} result_type={:?} concrete_result={:#x}",
-                callee_key, result_opref, result_type, concrete_result as usize,
-            );
-        }
-        self.remember_value_type(result_opref, result_type);
-
-        // RPython finishframe()/ChangeFrame parity: once the inlined callee
-        // has concretely returned, store its result in the parent frame and
-        // advance that caller past the CALL immediately. Do not route the
-        // MIFrame Box tracking: store concrete result for next push.
-        // In full-loop tracing, the concrete_frame snapshot is stale, so we
-        // track results via pending_concrete_push instead of frame stack ops.
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(concrete_result));
-
-        // RPython finishframe parity: result is stored via pending_concrete_push.
-        // No concrete_frame stack manipulation needed — MIFrame Box tracking
-        // handles all concrete state internally.
-
-        Ok(result_opref)
-    }
-
     /// CallMayForce-based inline: opaque helper call.
     /// Fallback for self-recursion or when trace-through is not available.
     fn inline_function_call(
@@ -4503,7 +4456,11 @@ impl MIFrame {
             if is_list(concrete_value) && w_list_uses_object_storage(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &LIST_TYPE as *const PyType);
-                    let len = trace_arraylen_gc(ctx, value, list_items_len_descr());
+                    let len = ctx.record_op_with_descr(
+                        OpCode::GetfieldRawI,
+                        &[value],
+                        list_items_len_descr(),
+                    );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
                 });
@@ -4511,7 +4468,11 @@ impl MIFrame {
             if is_tuple(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, value, &TUPLE_TYPE as *const PyType);
-                    let len = trace_arraylen_gc(ctx, value, tuple_items_len_descr());
+                    let len = ctx.record_op_with_descr(
+                        OpCode::GetfieldRawI,
+                        &[value],
+                        tuple_items_len_descr(),
+                    );
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[len, zero]))
                 });
@@ -8315,24 +8276,6 @@ mod tests {
 // so the tracer can compute the same offsets without depending on
 // `pyre-interp`. Driver registration still happens in `pyre-interp/src/eval.rs`.
 
-/// Mini eval loop that traces AND executes callee bytecodes on the
-/// same TraceCtx as the caller, implementing trace-through inlining.
-/// A frame on the inline tracing stack (PyPy's MIFrame equivalent).
-///
-/// PyPy pyjitpl.py: MIFrame holds jitcode + registers + pc + greenkey.
-/// Ours holds PyreSym (symbolic state) + concrete PyFrame + OpArgState.
-#[allow(dead_code)]
-struct InlineMIFrame {
-    sym: PyreSym,
-    concrete_frame: pyre_interp::frame::PyFrame,
-    drop_frame_opref: Option<OpRef>,
-    green_key: u64,
-    arg_state: pyre_bytecode::bytecode::OpArgState,
-    parent_fail_args: Vec<OpRef>,
-    parent_fail_arg_types: Vec<Type>,
-    caller_result_stack_idx: Option<usize>,
-}
-
 pub(crate) struct PendingInlineFrame {
     pub(crate) sym: PyreSym,
     pub(crate) concrete_frame: pyre_interp::frame::PyFrame,
@@ -8372,259 +8315,7 @@ pub(crate) fn execute_inline_residual_call(
     Ok(())
 }
 
-/// PyPy pyjitpl.py `_interpret()` equivalent for inlined calls.
-///
-/// Uses a framestack (Vec<InlineMIFrame>) instead of recursive Rust calls.
-/// When trace_code_step encounters a call that should be inlined,
-/// it pushes a new MIFrame. When RETURN_VALUE is traced, it pops
-/// and stores the result in the parent via make_result_of_lastop.
-///
-/// This matches PyPy's ChangeFrame exception pattern:
-/// - perform_call → newframe + push + ChangeFrame
-/// - finishframe → popframe + make_result_of_lastop + ChangeFrame
-#[allow(dead_code)]
-fn inline_trace_and_execute(
-    ctx: &mut majit_meta::TraceCtx,
-    pending: PendingInlineFrame,
-) -> Result<(OpRef, Type, PyObjectRef), pyre_runtime::PyError> {
-    use pyre_runtime::StepResult;
-    let _inline_call_override = pyre_interp::call::inline_call_override_guard();
-    let inline_trace_base = ctx.inline_trace_depth();
-    ctx.push_inline_trace_position(pending.green_key);
-    let mut framestack: Vec<InlineMIFrame> = vec![InlineMIFrame {
-        sym: pending.sym,
-        concrete_frame: pending.concrete_frame,
-        drop_frame_opref: pending.drop_frame_opref,
-        green_key: pending.green_key,
-        arg_state: pyre_bytecode::bytecode::OpArgState::default(),
-        parent_fail_args: pending.parent_fail_args,
-        parent_fail_arg_types: pending.parent_fail_arg_types,
-        caller_result_stack_idx: pending.caller_result_stack_idx,
-    }];
-
-    // PyPy _interpret(): while True: framestack[-1].run_one_step()
-    loop {
-        let top = framestack.last_mut().unwrap();
-        let code = unsafe { &*top.concrete_frame.code };
-        let pc = top.concrete_frame.next_instr;
-        if pc >= code.instructions.len() {
-            return Err(pyre_runtime::PyError::type_error(
-                "inline callee fell off end of bytecode",
-            ));
-        }
-
-        // ── run_one_step: TRACE ──
-        let pfa = top.parent_fail_args.clone();
-        let pfa_types = top.parent_fail_arg_types.clone();
-        let trace_action = {
-            let mut fs = MIFrame::from_sym(
-                ctx,
-                &mut top.sym,
-                &top.concrete_frame as *const _ as usize,
-                pc + 1,
-            );
-            // PyPy capture_resumedata: callee guards use parent fail_args
-            fs.parent_fail_args = Some(pfa);
-            fs.parent_fail_arg_types = Some(pfa_types);
-            fs.trace_code_step_inline(code, pc)
-        };
-
-        match trace_action {
-            InlineTraceStepAction::PushFrame(pending) => {
-                if majit_meta::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][inline] push frame depth={} green_key={} nargs={}",
-                        framestack.len(),
-                        pending.green_key,
-                        pending.nargs
-                    );
-                }
-                {
-                    let parent = framestack.last_mut().unwrap();
-                    for _ in 0..pending.nargs {
-                        let value = parent.concrete_frame.pop();
-                        if value.is_null() {
-                            panic!("inline framestack popped null concrete arg");
-                        }
-                    }
-                    let _null_or_self = parent.concrete_frame.pop();
-                    let concrete_callable = parent.concrete_frame.pop();
-                    if concrete_callable.is_null() {
-                        panic!("inline framestack lost concrete callable");
-                    }
-                    parent.concrete_frame.next_instr = pc + 1;
-                }
-                let (driver, _) = crate::eval::driver_pair();
-                driver.enter_inline_frame(pending.green_key);
-                ctx.push_inline_trace_position(pending.green_key);
-                framestack.push(InlineMIFrame {
-                    sym: pending.sym,
-                    concrete_frame: pending.concrete_frame,
-                    drop_frame_opref: pending.drop_frame_opref,
-                    green_key: pending.green_key,
-                    arg_state: pyre_bytecode::bytecode::OpArgState::default(),
-                    parent_fail_args: pending.parent_fail_args,
-                    parent_fail_arg_types: pending.parent_fail_arg_types,
-                    caller_result_stack_idx: pending.caller_result_stack_idx,
-                });
-                continue;
-            }
-            InlineTraceStepAction::Trace(majit_meta::TraceAction::Continue) => {}
-            InlineTraceStepAction::Trace(majit_meta::TraceAction::Finish {
-                finish_args, ..
-            }) => {
-                // PyPy finishframe(): pop frame, store result in parent
-                let result_opref = finish_args[0];
-
-                // Concrete execute the RETURN_VALUE
-                let top = framestack.last_mut().unwrap();
-                let code = unsafe { &*top.concrete_frame.code };
-                let ni = top.concrete_frame.next_instr;
-                let code_unit = code.instructions[ni];
-                let (instruction, op_arg) = top.arg_state.get(code_unit);
-                top.concrete_frame.next_instr = ni + 1;
-                let next = top.concrete_frame.next_instr;
-                let step = pyre_runtime::execute_opcode_step(
-                    &mut top.concrete_frame,
-                    code,
-                    instruction,
-                    op_arg,
-                    next,
-                )?;
-
-                match step {
-                    StepResult::Return(concrete_result) => {
-                        // popframe()
-                        let popped = framestack.pop().unwrap();
-                        let result_type = popped.sym.value_type_of(result_opref);
-                        let concrete_result = materialize_pending_inline_result(
-                            pending_inline_result_from_concrete(result_type, concrete_result),
-                        );
-                        ctx.pop_inline_trace_position();
-
-                        // Drop callee frame in trace
-                        if let Some(frame_opref) = popped.drop_frame_opref {
-                            ctx.call_void(
-                                crate::call_jit::jit_drop_callee_frame as *const (),
-                                &[frame_opref],
-                            );
-                        }
-
-                        if framestack.is_empty() {
-                            // Outermost inline frame returned
-                            if majit_meta::majit_log_enabled() {
-                                eprintln!("[jit][inline] return outermost");
-                            }
-                            ctx.truncate_inline_trace_positions(inline_trace_base);
-                            return Ok((result_opref, result_type, concrete_result));
-                        }
-
-                        let (driver, _) = crate::eval::driver_pair();
-                        driver.leave_inline_frame();
-                        if majit_meta::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][inline] pop frame, resume parent depth={}",
-                                framestack.len()
-                            );
-                        }
-
-                        // make_result_of_lastop: store result in parent
-                        let resume_depth = framestack.len();
-                        let parent = framestack.last_mut().unwrap();
-                        let result_idx = popped
-                            .caller_result_stack_idx
-                            .expect("inline child frame lost caller result slot");
-                        if majit_meta::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][inline] write result depth={} idx={} opref={:?} type={:?}",
-                                resume_depth, result_idx, result_opref, result_type,
-                            );
-                        }
-                        let slot = parent
-                            .sym
-                            .symbolic_stack
-                            .get_mut(result_idx)
-                            .expect("inline caller result slot out of bounds");
-                        *slot = result_opref;
-                        if result_idx >= parent.sym.symbolic_stack_types.len() {
-                            parent
-                                .sym
-                                .symbolic_stack_types
-                                .resize(result_idx + 1, Type::Ref);
-                        }
-                        parent.sym.symbolic_stack_types[result_idx] = result_type;
-                        parent
-                            .sym
-                            .transient_value_types
-                            .insert(result_opref, result_type);
-                        parent.concrete_frame.push(concrete_result);
-                        continue; // ChangeFrame: resume parent
-                    }
-                    other => {
-                        return Err(pyre_runtime::PyError::type_error(
-                            "expected concrete return after trace finish",
-                        ));
-                    }
-                }
-            }
-            InlineTraceStepAction::Trace(
-                majit_meta::TraceAction::Abort | majit_meta::TraceAction::AbortPermanent,
-            ) => {
-                ctx.truncate_inline_trace_positions(inline_trace_base);
-                return Err(pyre_runtime::PyError::type_error("inline trace aborted"));
-            }
-            InlineTraceStepAction::Trace(
-                majit_meta::TraceAction::CloseLoop
-                | majit_meta::TraceAction::CloseLoopWithArgs { .. },
-            ) => {
-                ctx.truncate_inline_trace_positions(inline_trace_base);
-                return Err(pyre_runtime::PyError::type_error(
-                    "inline callee has loop (not supported)",
-                ));
-            }
-        }
-
-        // ── run_one_step: EXECUTE ──
-        let top = framestack.last_mut().unwrap();
-        let code = unsafe { &*top.concrete_frame.code };
-        let ni = top.concrete_frame.next_instr;
-        let code_unit = code.instructions[ni];
-        let (instruction, op_arg) = top.arg_state.get(code_unit);
-        top.concrete_frame.next_instr = ni + 1;
-        let next = top.concrete_frame.next_instr;
-        if let Instruction::Call { argc } = instruction {
-            if pyre_interp::call::replay_pending_inline_call(
-                &mut top.concrete_frame,
-                argc.get(op_arg) as usize,
-            ) {
-                continue;
-            }
-            execute_inline_residual_call(&mut top.concrete_frame, argc.get(op_arg) as usize)?;
-            continue;
-        }
-        match pyre_runtime::execute_opcode_step(
-            &mut top.concrete_frame,
-            code,
-            instruction,
-            op_arg,
-            next,
-        )? {
-            StepResult::Continue => {}
-            StepResult::Return(_) | StepResult::Yield(_) => {
-                ctx.truncate_inline_trace_positions(inline_trace_base);
-                return Err(pyre_runtime::PyError::type_error(
-                    "concrete return/yield without trace finish",
-                ));
-            }
-            StepResult::CloseLoop {
-                jump_args: _,
-                loop_header_pc: _,
-            } => {
-                ctx.truncate_inline_trace_positions(inline_trace_base);
-                return Err(pyre_runtime::PyError::type_error(
-                    "inline callee has loop (not supported)",
-                ));
-            }
-        }
-    }
-}
+// inline_trace_and_execute removed — replaced by PyreMetaInterp.interpret()
+// which uses a single framestack for both root and inline frames.
+// trace_through_callee removed — replaced by build_pending_inline_frame +
+// MetaInterp.push_inline_frame (RPython perform_call parity).
