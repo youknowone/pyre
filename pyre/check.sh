@@ -29,10 +29,19 @@ time_user() {
     { /usr/bin/time -p "$@" >/dev/null; } 2>&1 | awk '/^user/{printf "%.2f\n", $2}'
 }
 
-# run_bench NAME SCRIPT EXPECTED TIMEOUT [MAX_SEC] [beat_cpython_margin] [beat_pypy_margin]
+# run_bench NAME SCRIPT TIMEOUT [MAX_SEC] [beat_cpython_margin] [beat_pypy_margin]
 run_bench() {
-    local name="$1" script="$2" expected="$3" timeout="$4" max_sec="${5:-}" beat_cpython="${6:-}" beat_pypy="${7:-}"
+    local name="$1" script="$2" timeout="$3" max_sec="${4:-}" beat_cpython="${5:-}" beat_pypy="${6:-}"
     printf "  %-20s" "$name"
+
+    local cpython_output
+    if ! cpython_output="$(python3 "$script")"; then
+        RESULTS+=("$(red "FAIL") $name  cpython crash (exit $? from python)")
+        printf "$(red WRONG)  CPython execution failed\n"
+        FAIL=$((FAIL + 1))
+        COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  FAIL' "$name" "-" "-")")
+        return
+    fi
 
     # Measure cpython/pypy user CPU time
     local t_cpython t_pypy
@@ -61,9 +70,12 @@ run_bench() {
     local ratio
     ratio=$(python3 -c "print('%.1fx' % ($elapsed / $t_pypy) if float('$t_pypy') > 0 else 'N/A')" 2>/dev/null || echo "N/A")
 
-    if [ "$output" != "$expected" ]; then
+    if [ "$output" != "$cpython_output" ]; then
         RESULTS+=("$(red "FAIL") $name  wrong output")
-        printf "$(red WRONG)  got: %s\n" "$(echo "$output" | head -c 60)"
+        local expected_preview actual_preview
+        expected_preview=$(echo "$cpython_output" | head -c 60)
+        actual_preview=$(echo "$output" | head -c 60)
+        printf "$(red WRONG)  got: %s expected: %s\n" "$actual_preview" "$expected_preview"
         FAIL=$((FAIL + 1))
         COMPARISONS+=("$(printf '  %-20s  cpython %5ss  pypy %5ss  pyre  WRONG' "$name" "$t_cpython" "$t_pypy")")
         return
@@ -123,15 +135,14 @@ pypy3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
 "$PYRE" "$BENCH/int_loop.py" >/dev/null 2>&1 || true
 printf "$(dim done)\n"
 
-#                NAME             SCRIPT                         EXPECTED                     TIMEOUT  MAX_SEC  BEAT_CPYTHON
-run_bench       "int_loop"       "$BENCH/int_loop.py"           "799999980000000"              30       ""       1       1.5
-run_bench       "fib_loop"       "$BENCH/fib_loop.py"           "967618232"                   30       ""       1
-run_bench       "inline_helper"  "$BENCH/inline_helper.py"      "8999999999999000000"         30       ""       1       1.5
-run_bench       "fib_recursive34" "$BENCH/fib_recursive.py"      "5702887"                       30       ""       1       3
-run_bench       "fib_recursive32" "$BENCH/fib_recursive_32.py"  "2178309"                       30       ""       1       4
-run_bench       "nbody"          "$BENCH/nbody_50k.py"          "-0.035132020348426815"        30       ""       10
-run_bench       "fannkuch"       "$BENCH/fannkuch_9.py"         "$(printf '8629\n30')"          30
-run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"   "1142858"                       30
+#                NAME             SCRIPT                         TIMEOUT  MAX_SEC  BEAT_CPYTHON
+run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""       1       1.5
+run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""       1
+run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""       1       1.5
+run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       3
+run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       10
+run_bench       "fannkuch"       "$BENCH/fannkuch.py"          5
+run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     5
 
 echo ""
 echo "─────────────────────────────────"
