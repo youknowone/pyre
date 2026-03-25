@@ -2023,6 +2023,10 @@ impl MIFrame {
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
+            // Materialize NONE slots from concrete frame before boxing.
+            // RPython's live_arg_boxes never contains holes at loop closure
+            // because MIFrame.run_one_step always updates all live registers.
+            let value = self.materialize_fail_arg_slot(ctx, value, target_type, idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
         for (stack_idx, value) in stack.into_iter().enumerate() {
@@ -2030,6 +2034,8 @@ impl MIFrame {
                 .get(3 + nlocals + stack_idx)
                 .copied()
                 .unwrap_or(Type::Ref);
+            let value =
+                self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
         args
