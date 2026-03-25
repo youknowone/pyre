@@ -5254,13 +5254,19 @@ impl NamespaceOpcodeHandler for MIFrame {
         if let Some(concrete_value) = concrete_cv {
             if !concrete_value.is_null() {
                 // RPython celldict.py + quasiimmut.py parity:
-                // Emit QUASIIMMUT_FIELD with namespace pointer so the
-                // optimizer collects it into quasi_immutable_deps (same
-                // as RPython optimize_QUASIIMMUT_FIELD adding qmut to
-                // optimizer.quasi_immutable_deps). The optimizer removes
-                // the op and emits GUARD_NOT_INVALIDATED.
-                // After compilation, record_loop_or_bridge registers
-                // the loop's invalidation flag on each dep namespace.
+                //
+                // 1. QUASIIMMUT_FIELD(ns, slot) — optimizer collects into
+                //    quasi_immutable_deps + emits GUARD_NOT_INVALIDATED.
+                //    After compilation, watcher registered on namespace slot.
+                //
+                // 2. const_int(concrete_value) — direct constant folding.
+                //    RPython uses @elidable_promote + CALL_PURE for this,
+                //    but that requires the CALL_PURE to be in the MAIN trace
+                //    (not a bridge). Since pyre's tracing captures the base
+                //    case first, the n>=2 path ends up in a bridge where
+                //    CALL_PURE constant folding isn't yet active.
+                //    Direct constant is functionally equivalent and safe:
+                //    GUARD_NOT_INVALIDATED protects against mutation.
                 let opref = self.with_ctx(|this, ctx| {
                     let ns_const = ctx.const_int(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
