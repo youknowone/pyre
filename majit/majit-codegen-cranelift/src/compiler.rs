@@ -4311,26 +4311,20 @@ impl CraneliftBackend {
             .collect();
         let has_entry_label = label_indices.first().copied() == Some(0);
 
-        // RPython compile.py sends loops to the backend as:
-        // [start_label] + preamble_ops + [loop_label] + body_ops.
-        // When a trace starts with LABEL, its box namespace is defined by the
-        // LABEL block params, not by a parallel "input var" namespace.
-        // Keep the input buffer as raw incoming values and bind them only when
-        // entering the first LABEL block.
-        if !has_entry_label {
-            for i in 0..num_inputs {
-                if debug_declares {
-                    eprintln!("[jit][declare] input var{}", i);
-                }
-                builder.declare_var(var(i as u32), cl_types::I64);
+        // Always declare inputarg variables, even when the trace starts
+        // with a LABEL (preamble peeling). Preamble guards reference
+        // inputarg OpRefs in fail_args and need declared variables.
+        // The LABEL block later overrides these via block params + def_var.
+        for i in 0..num_inputs {
+            if debug_declares {
+                eprintln!("[jit][declare] input var{}", i);
             }
+            builder.declare_var(var(i as u32), cl_types::I64);
         }
         // Declare variables for op results
         let mut declared_vars = std::collections::HashSet::new();
-        if !has_entry_label {
-            for i in 0..num_inputs {
-                declared_vars.insert(i as u32);
-            }
+        for i in 0..num_inputs {
+            declared_vars.insert(i as u32);
         }
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
@@ -4399,10 +4393,8 @@ impl CraneliftBackend {
 
         // Save op-result positions for resolve_opref collision handling.
         let mut op_result_positions = std::collections::HashSet::new();
-        if !has_entry_label {
-            for i in 0..num_inputs {
-                op_result_positions.insert(i as u32);
-            }
+        for i in 0..num_inputs {
+            op_result_positions.insert(i as u32);
         }
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
@@ -4424,10 +4416,11 @@ impl CraneliftBackend {
             })
             .collect();
 
-        if !has_entry_label {
-            for (i, val) in entry_input_vals.iter().copied().enumerate() {
-                builder.def_var(var(i as u32), val);
-            }
+        // Always def_var inputargs in the entry block. When the trace
+        // starts with LABEL, the LABEL block will override these via
+        // block params. Preamble guards need the entry block values.
+        for (i, val) in entry_input_vals.iter().copied().enumerate() {
+            builder.def_var(var(i as u32), val);
         }
 
         // RPython parity: GC roots are registered by run_compiled_code()
