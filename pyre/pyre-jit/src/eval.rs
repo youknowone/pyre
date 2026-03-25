@@ -844,10 +844,60 @@ fn restore_guard_failure_for_loop(
         driver.meta_interp_mut().warm_state_mut().decay_counters();
         return None;
     }
-    // Preserve typed fail_args for blackhole resume (RPython parity:
-    // blackhole_from_resumedata loads from deadframe, not from frame).
+    // RPython compile.py:710 handle_fail parity:
+    // Try blackhole FIRST, before restoring frame state. The blackhole
+    // uses typed fail_args (deadframe) directly without touching the frame.
+    // Only fall back to frame restore if blackhole can't run.
     LAST_GUARD_TYPED.with(|c| *c.borrow_mut() = Some(typed.clone()));
 
+    // RPython: resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
+    // This never returns in RPython — raises ContinueRunningNormally.
+    // In pyre, we try blackhole and return the merge_pc on success.
+    let merge_pc = jit_state.next_instr; // loop_header_pc set by can_enter_jit_hook
+    let bh_result = {
+        let frame_ptr = jit_state.frame as *mut PyFrame;
+        if !frame_ptr.is_null() {
+            let frame = unsafe { &mut *frame_ptr };
+            crate::call_jit::resume_in_blackhole_from_fail_args(frame, &typed, merge_pc)
+        } else {
+            crate::call_jit::BlackholeResult::Failed
+        }
+    };
+
+    match bh_result {
+        crate::call_jit::BlackholeResult::MergePoint => {
+            // RPython ContinueRunningNormally: blackhole reached the
+            // merge point. Frame is at merge_pc with correct state.
+            // Do NOT call restore_guard_failure_values — blackhole
+            // already set the frame correctly.
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard-fail: blackhole reached merge point pc={}",
+                    merge_pc
+                );
+            }
+            crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
+            return Some(merge_pc);
+        }
+        crate::call_jit::BlackholeResult::Finished(result) => {
+            // RPython DoneWithThisFrame: blackhole completed the function.
+            // Store result for caller. Frame state is irrelevant.
+            if majit_meta::majit_log_enabled() {
+                eprintln!("[jit] guard-fail: blackhole finished function");
+            }
+            crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
+            // Return None — the function finished, but the callback API
+            // requires returning the resume PC. The caller (jitdriver)
+            // will see restored=false and handle accordingly.
+            // TODO: propagate Finished result through the callback chain.
+            return Some(merge_pc);
+        }
+        crate::call_jit::BlackholeResult::Failed => {
+            // Blackhole couldn't run. Fall back to frame restore.
+        }
+    }
+
+    // Fallback: restore frame state for interpreter continuation.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
         eprintln!(
@@ -856,15 +906,6 @@ fn restore_guard_failure_for_loop(
         );
     }
 
-    // Discard pending bridge requests from call_assembler_guard_failure.
-    // MetaInterp bridge compilation (RPython handle_fail →
-    // _trace_and_compile_from_bridge) requires the jitdriver-level
-    // guard failure counting path (run_compiled_detailed_with_bridge_keyed
-    // → should_compile_bridge_in_trace → start_bridge_tracing) which
-    // is the orthodox RPython bridge entry point.
-    // The PENDING_BRIDGE_REQUEST path (Cranelift shim → pyre callback)
-    // bypasses RPython's control flow and causes infinite guard-fail
-    // loops when the bridge doesn't match the expected trace structure.
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
