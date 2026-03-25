@@ -84,6 +84,9 @@ pub struct MergePoint {
     /// Types of original_boxes. RPython Box carries type implicitly;
     /// majit stores types alongside OpRefs for compile_retrace parity.
     pub original_box_types: Vec<Type>,
+    /// Bytecode PC of this loop header. Used by cut_trace_from to update
+    /// meta.merge_pc when the trace closes at a different loop.
+    pub header_pc: usize,
 }
 
 impl TraceCtx {
@@ -100,13 +103,20 @@ impl TraceCtx {
     /// RPython allows multiple merge points with the same green key
     /// (representing different loop iterations or inlining depths).
     /// Always appends; has_merge_point checks if any match exists.
-    pub fn add_merge_point(&mut self, key: u64, live_args: Vec<OpRef>, live_arg_types: Vec<Type>) {
+    pub fn add_merge_point(
+        &mut self,
+        key: u64,
+        live_args: Vec<OpRef>,
+        live_arg_types: Vec<Type>,
+        header_pc: usize,
+    ) {
         let position = self.recorder.get_position();
         self.current_merge_points.push(MergePoint {
             green_key: key,
             position,
             original_boxes: live_args,
             original_box_types: live_arg_types,
+            header_pc,
         });
     }
 
@@ -211,6 +221,7 @@ impl TraceCtx {
                 position: initial_position,
                 original_box_types: initial_types,
                 original_boxes: initial_boxes.clone(),
+                header_pc: 0,
             }],
             heap_cache: HeapCache::new(),
         }
@@ -245,6 +256,7 @@ impl TraceCtx {
                 position: initial_position,
                 original_box_types: initial_boxes.iter().map(|_| Type::Ref).collect(),
                 original_boxes: initial_boxes.clone(),
+                header_pc: 0,
             }],
             heap_cache: HeapCache::new(),
         }

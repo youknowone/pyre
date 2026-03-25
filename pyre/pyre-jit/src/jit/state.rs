@@ -5405,7 +5405,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     );
                     types
                 };
-                ctx.add_merge_point(back_edge_key, live_args, live_types);
+                ctx.add_merge_point(back_edge_key, live_args, live_types, target);
                 MIFrame::set_next_instr(this, ctx, target);
                 if majit_meta::majit_log_enabled() {
                     eprintln!(
@@ -6279,6 +6279,22 @@ impl JitState for PyreJitState {
 
     fn update_meta_merge_pc(meta: &mut Self::Meta, new_pc: usize) {
         meta.merge_pc = new_pc;
+    }
+
+    fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
+        meta.merge_pc = header_pc;
+        // Update valuestackdepth from the merge point's box layout.
+        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+        if original_box_types.len() >= 3 {
+            let new_vsd = original_box_types.len() - 3;
+            // Adjust slot_types length if valuestackdepth changed.
+            if new_vsd < meta.valuestackdepth && meta.slot_types.len() > new_vsd {
+                meta.slot_types.truncate(new_vsd);
+            } else if new_vsd > meta.valuestackdepth && meta.slot_types.len() < new_vsd {
+                meta.slot_types.resize(new_vsd, Type::Ref);
+            }
+            meta.valuestackdepth = new_vsd;
+        }
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
