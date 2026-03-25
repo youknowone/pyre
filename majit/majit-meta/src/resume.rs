@@ -14,80 +14,100 @@ use majit_codegen::{
 };
 use majit_ir::{GcRef, Type};
 
-// RPython resume.py:94-126 parity — tag encoding.
-const TAG_MASK: i64 = 0b11;
-/// TAGCONST = 0: constant pool index.
-const TAGCONST: i64 = 0;
-/// TAGINT = 1: inline small integer.
-const TAGINT: i64 = 1;
-/// TAGBOX = 2: live box reference (fail_args index).
-const TAGBOX: i64 = 2;
-/// TAGVIRTUAL = 3: virtual object index.
-const TAGVIRTUAL: i64 = 3;
+// ═══════════════════════════════════════════════════════════════
+// RPython resume.py:96-139 — structural port (i16 tags).
+// ═══════════════════════════════════════════════════════════════
 
-// RPython resume.py:128-132 — special tagged sentinels.
-// RPython uses i16 tags with 13-bit value range. We use i64 but
-// preserve the same sentinel VALUES for structural parity.
-/// tag(-1 << 13, TAGBOX) — unassigned box sentinel.
-const UNASSIGNED: i64 = tag_const(-(1 << 13), TAGBOX);
-/// tag(-1 << 13, TAGVIRTUAL) — unassigned virtual sentinel.
-const UNASSIGNEDVIRTUAL: i64 = tag_const(-(1 << 13), TAGVIRTUAL);
-/// tag(-1, TAGCONST) — null reference.
-const NULLREF: i64 = tag_const(-1, TAGCONST);
-/// tag(-2, TAGCONST) — uninitialized slot.
-const UNINITIALIZED: i64 = tag_const(-2, TAGCONST);
-const TAG_CONST_OFFSET: i64 = 0;
+// resume.py:96-97
+#[derive(Debug)]
+pub struct TagOverflow;
 
-// Legacy names for existing code.
-const ENCODED_UNINITIALIZED: i64 = -2;
-const ENCODED_UNAVAILABLE: i64 = -3;
-
-/// Const fn version of tag for use in const declarations.
-const fn tag_const(value: i64, tagbits: i64) -> i64 {
-    (value << 2) | tagbits
+// resume.py:99-104
+pub fn tag(value: i32, tagbits: u8) -> Result<i16, TagOverflow> {
+    debug_assert!(tagbits <= 3);
+    let sx = value >> 13;
+    if sx != 0 && sx != -1 {
+        return Err(TagOverflow);
+    }
+    Ok(((value << 2) | tagbits as i32) as i16)
 }
 
-/// RPython resume.py:134 NumberingState(resumecode.Writer).
-/// Extends Writer with per-guard numbering state.
+// resume.py:106-109
+pub fn untag(value: i16) -> (i32, u8) {
+    let widened = value as i32;
+    let tagbits = (widened & TAGMASK as i32) as u8;
+    (widened >> 2, tagbits)
+}
+
+// resume.py:111-113
+#[inline]
+pub fn tagged_eq(x: i16, y: i16) -> bool {
+    (x as i32) == (y as i32)
+}
+
+// resume.py:115-121
+pub fn tagged_list_eq(tl1: &[i16], tl2: &[i16]) -> bool {
+    if tl1.len() != tl2.len() {
+        return false;
+    }
+    tl1.iter().zip(tl2.iter()).all(|(&a, &b)| tagged_eq(a, b))
+}
+
+// resume.py:123-132
+pub const TAGCONST: u8 = 0;
+pub const TAGINT: u8 = 1;
+pub const TAGBOX: u8 = 2;
+pub const TAGVIRTUAL: u8 = 3;
+const TAGMASK: u8 = 3;
+
+pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;
+pub const UNASSIGNEDVIRTUAL: i16 = ((-1i32 << 13) << 2 | TAGVIRTUAL as i32) as i16;
+pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
+pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
+pub const TAG_CONST_OFFSET: i32 = 0;
+
+// resume.py:134-139
 pub struct NumberingState {
-    /// resumecode.Writer fields (inlined, not inherited).
     pub writer: crate::resumecode::Writer,
-    /// resume.py:137 liveboxes — box → tagged number mapping.
     pub liveboxes: HashMap<u32, i16>,
-    /// resume.py:138 num_boxes — count of TAGBOX-numbered boxes.
     pub num_boxes: i32,
-    /// resume.py:139 num_virtuals — count of TAGVIRTUAL-numbered virtuals.
     pub num_virtuals: i32,
 }
 
 impl NumberingState {
-    pub fn new(size_hint: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         NumberingState {
-            writer: crate::resumecode::Writer::new(size_hint),
+            writer: crate::resumecode::Writer::new(size),
             liveboxes: HashMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
         }
     }
-
-    /// Delegate to writer.
     pub fn append_short(&mut self, item: i16) {
         self.writer.append_short(item as i32);
     }
-
     pub fn append_int(&mut self, item: i32) {
         self.writer.append_int(item);
     }
-
     pub fn patch_current_size(&mut self, index: usize) {
         self.writer.patch_current_size(index);
     }
-
-    /// Create the final encoded numbering bytes.
     pub fn create_numbering(&self) -> Vec<u8> {
         self.writer.create_numbering()
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Legacy i64 tags — used by existing EncodedResumeData code.
+// Will be replaced as Phases 3-5 migrate to i16 tags above.
+// ═══════════════════════════════════════════════════════════════
+const LEGACY_TAGMASK: i64 = 0b11;
+const LEGACY_TAGCONST: i64 = 0;
+const LEGACY_TAGINT: i64 = 1;
+const LEGACY_TAGBOX: i64 = 2;
+const LEGACY_TAGVIRTUAL: i64 = 3;
+const ENCODED_UNINITIALIZED: i64 = -2;
+const ENCODED_UNAVAILABLE: i64 = -3;
 
 // Two low bits are reserved for the tag.
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
@@ -753,10 +773,9 @@ fn can_inline_tagged(value: i64) -> bool {
     (INLINE_TAGGED_MIN..=INLINE_TAGGED_MAX).contains(&value)
 }
 
-/// RPython resume.py:99 tag(value, tagbits).
-/// Encode value + tag into a single i64 (RPython uses i16).
-fn tag(value: i64, tagbits: i64) -> i64 {
-    debug_assert!((TAGCONST..=TAGVIRTUAL).contains(&tagbits));
+/// Legacy i64 tag — used by existing EncodedResumeData code.
+fn tag_value(value: i64, tagbits: i64) -> i64 {
+    debug_assert!((LEGACY_TAGCONST..=LEGACY_TAGVIRTUAL).contains(&tagbits));
     debug_assert!(
         can_inline_tagged(value),
         "tagged resume value {value} exceeds inline range"
@@ -764,20 +783,9 @@ fn tag(value: i64, tagbits: i64) -> i64 {
     (value << 2) | tagbits
 }
 
-/// RPython resume.py:106 untag(value).
-/// Decode (value, tagbits) from a tagged i64.
-fn untag(encoded: i64) -> (i64, i64) {
-    (encoded >> 2, encoded & TAG_MASK)
-}
-
-// Legacy aliases for existing callers.
-#[inline]
-fn tag_value(value: i64, tagbits: i64) -> i64 {
-    tag(value, tagbits)
-}
-#[inline]
+/// Legacy i64 untag — used by existing EncodedResumeData code.
 fn untag_value(encoded: i64) -> (i64, i64) {
-    untag(encoded)
+    (encoded >> 2, encoded & LEGACY_TAGMASK)
 }
 
 fn encode_len(value: usize) -> i64 {
@@ -1241,10 +1249,10 @@ impl EncodedResumeData {
                     next_index
                 });
                 *num_fail_args = fail_arg_positions.len();
-                tag_value(encode_len(compact_index), TAGBOX)
+                tag_value(encode_len(compact_index), LEGACY_TAGBOX)
             }
             ResumeValueSource::Constant(value) if can_inline_tagged(*value) => {
-                tag_value(*value, TAGINT)
+                tag_value(*value, LEGACY_TAGINT)
             }
             ResumeValueSource::Constant(value) => {
                 let next_index = consts.len();
@@ -1252,11 +1260,11 @@ impl EncodedResumeData {
                     consts.push(*value);
                     next_index
                 });
-                tag_value(encode_len(index), TAGCONST)
+                tag_value(encode_len(index), LEGACY_TAGCONST)
             }
-            ResumeValueSource::Virtual(index) => tag_value(encode_len(*index), TAGVIRTUAL),
-            ResumeValueSource::Uninitialized => tag_value(ENCODED_UNINITIALIZED, TAGCONST),
-            ResumeValueSource::Unavailable => tag_value(ENCODED_UNAVAILABLE, TAGCONST),
+            ResumeValueSource::Virtual(index) => tag_value(encode_len(*index), LEGACY_TAGVIRTUAL),
+            ResumeValueSource::Uninitialized => tag_value(ENCODED_UNINITIALIZED, LEGACY_TAGCONST),
+            ResumeValueSource::Unavailable => tag_value(ENCODED_UNAVAILABLE, LEGACY_TAGCONST),
         }
     }
 
@@ -1452,8 +1460,8 @@ impl EncodedResumeData {
     fn decode_source(&self, encoded: i64) -> ResumeValueSource {
         let (value, tag) = untag_value(encoded);
         match tag {
-            TAGINT => ResumeValueSource::Constant(value),
-            TAGBOX => {
+            LEGACY_TAGINT => ResumeValueSource::Constant(value),
+            LEGACY_TAGBOX => {
                 let compact_index = decode_len(value);
                 let raw_index = *self
                     .fail_arg_positions
@@ -1461,8 +1469,8 @@ impl EncodedResumeData {
                     .expect("resume fail-arg position out of bounds");
                 ResumeValueSource::FailArg(raw_index)
             }
-            TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
-            TAGCONST => match value {
+            LEGACY_TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
+            LEGACY_TAGCONST => match value {
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
                 index if index >= 0 => ResumeValueSource::Constant(
@@ -2474,7 +2482,7 @@ impl ResumeDataLoopMemo {
         // Try inline TAGINT (-8191..8190 in RPython's i16 range).
         let shifted = val >> 13;
         if shifted == 0 || shifted == -1 {
-            return (((val << 2) | TAGINT) as i16);
+            return (((val << 2) | TAGINT as i64) as i16);
         }
         // Large int: check cache.
         if let Some(&tagged) = self.large_ints.get(&val) {
@@ -2488,7 +2496,7 @@ impl ResumeDataLoopMemo {
     /// resume.py:173 getconst for REF type.
     pub fn getconst_ref(&mut self, val: i64) -> i16 {
         if val == 0 {
-            return NULLREF as i16;
+            return NULLREF;
         }
         if let Some(&tagged) = self.refs.get(&val) {
             return tagged;
@@ -2500,9 +2508,9 @@ impl ResumeDataLoopMemo {
 
     /// resume.py:185 _newconst — add to consts pool, return TAGCONST-tagged.
     fn newconst(&mut self, val: i64) -> i16 {
-        let index = self.consts.len() as i64 + TAG_CONST_OFFSET;
+        let index = self.consts.len() as i32 + TAG_CONST_OFFSET;
         self.consts.push(val);
-        ((index << 2) | TAGCONST) as i16
+        ((index << 2) | TAGCONST as i32) as i16
     }
 
     /// resume.py:264 assign_number_to_box — returns a negative number.
@@ -2815,14 +2823,17 @@ mod tests {
 
         // Header: [size, fail_arg_count, num_frames, pc, slot_count, ...slots]
         let slot_words = &encoded.code[5..10];
-        assert_eq!(untag_value(slot_words[0]), (0, TAGBOX));
-        assert_eq!(untag_value(slot_words[1]), (7, TAGINT));
-        assert_eq!(untag_value(slot_words[2]), (1, TAGVIRTUAL));
+        assert_eq!(untag_value(slot_words[0]), (0, LEGACY_TAGBOX));
+        assert_eq!(untag_value(slot_words[1]), (7, LEGACY_TAGINT));
+        assert_eq!(untag_value(slot_words[2]), (1, LEGACY_TAGVIRTUAL));
         assert_eq!(
             untag_value(slot_words[3]),
-            (ENCODED_UNINITIALIZED, TAGCONST)
+            (ENCODED_UNINITIALIZED, LEGACY_TAGCONST)
         );
-        assert_eq!(untag_value(slot_words[4]), (ENCODED_UNAVAILABLE, TAGCONST));
+        assert_eq!(
+            untag_value(slot_words[4]),
+            (ENCODED_UNAVAILABLE, LEGACY_TAGCONST)
+        );
     }
 
     #[test]
