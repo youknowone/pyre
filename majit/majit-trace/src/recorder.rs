@@ -27,6 +27,48 @@ pub struct TracePosition {
 }
 
 /// The trace recorder: accumulates operations during tracing.
+/// opencoder.py Snapshot parity: per-guard snapshot of the interpreter
+/// frame state, encoded as tagged references to boxes.
+///
+/// RPython stores snapshots inline in the trace byte stream. majit stores
+/// them in a side table indexed by snapshot_id. Each snapshot captures
+/// the live variables of each frame in the call stack at the guard point.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    /// Frames in the snapshot, outermost first.
+    pub frames: Vec<SnapshotFrame>,
+    /// Virtualizable box references (tagged).
+    pub vable_boxes: Vec<SnapshotTagged>,
+    /// VirtualRef box references (tagged).
+    pub vref_boxes: Vec<SnapshotTagged>,
+}
+
+/// One frame in a snapshot — corresponds to one MIFrame/JitCode position.
+#[derive(Clone, Debug)]
+pub struct SnapshotFrame {
+    /// Index of the jitcode (or 0 for the root portal).
+    pub jitcode_index: u32,
+    /// Program counter within the jitcode.
+    pub pc: u32,
+    /// Tagged references to the live boxes in this frame.
+    pub boxes: Vec<SnapshotTagged>,
+}
+
+/// opencoder.py tag parity: tagged reference to a box value.
+///
+/// TAGBOX(n)    → value lives in fail_args[n] (deadframe slot n)
+/// TAGCONST(v)  → compile-time constant (i64 value)
+/// TAGVIRTUAL(n)→ virtual object index n (materialized on resume)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotTagged {
+    /// Value from deadframe fail_args slot.
+    Box(u32),
+    /// Compile-time constant value.
+    Const(i64),
+    /// Virtual object to be materialized.
+    Virtual(u32),
+}
+
 pub struct Trace {
     /// Recorded operations.
     ops: Vec<Op>,
@@ -40,6 +82,9 @@ pub struct Trace {
     finalized: bool,
     /// Whether the trace was aborted.
     aborted: bool,
+    /// opencoder.py parity: per-guard snapshots of interpreter frame state.
+    /// Indexed by snapshot_id (set on guard ops as rd_resume_position).
+    snapshots: Vec<Snapshot>,
 }
 
 impl Trace {
@@ -57,6 +102,7 @@ impl Trace {
             trace_limit,
             finalized: false,
             aborted: false,
+            snapshots: Vec::new(),
         }
     }
 
@@ -172,6 +218,14 @@ impl Trace {
         opref
     }
 
+    /// Set rd_resume_position on the last recorded op.
+    /// Called after record_guard* to associate a snapshot.
+    pub fn set_last_op_resume_position(&mut self, snapshot_id: i32) {
+        if let Some(op) = self.ops.last_mut() {
+            op.rd_resume_position = snapshot_id;
+        }
+    }
+
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
@@ -241,6 +295,29 @@ impl Trace {
     ///
     /// Used by compile_trace to save position before recording a JUMP,
     /// and by reached_loop_header to record merge points.
+    /// opencoder.py:819 parity: capture a snapshot of the current
+    /// interpreter frame state. Returns a snapshot_id that should be
+    /// stored in the guard op's `rd_resume_position`.
+    pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> i32 {
+        let id = self.snapshots.len() as i32;
+        self.snapshots.push(snapshot);
+        id
+    }
+
+    /// Get a snapshot by id.
+    pub fn get_snapshot(&self, id: i32) -> Option<&Snapshot> {
+        if id >= 0 {
+            self.snapshots.get(id as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Access all snapshots.
+    pub fn snapshots(&self) -> &[Snapshot] {
+        &self.snapshots
+    }
+
     pub fn get_position(&self) -> TracePosition {
         TracePosition {
             op_count: self.op_count,
