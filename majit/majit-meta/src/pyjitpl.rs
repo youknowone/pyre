@@ -3782,31 +3782,50 @@ impl<M: Clone> MetaInterp<M> {
     /// `green_key` identifies the parent loop.
     /// `trace_id` and `fail_index` identify the guard to attach the bridge to.
     /// `finish_args` are the symbolic values at the bridge end (loop header state).
-    pub fn close_bridge(
+    /// RPython compile.py compile_trace parity: single bridge compilation
+    /// entry point with `ends_with_jump` flag.
+    ///
+    /// - `ends_with_jump=true`: bridge JUMP to loop header (close_loop).
+    ///   Uses BridgeCompileData (inline_short_preamble=true).
+    /// - `ends_with_jump=false`: bridge returns a value (Finish).
+    ///   Uses SimpleCompileData.
+    pub fn compile_bridge_trace(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         finish_args: &[OpRef],
+        finish_arg_types: Vec<Type>,
+        ends_with_jump: bool,
     ) -> bool {
-        let finish_arg_types = {
-            let compiled = match self.compiled_loops.get(&green_key) {
-                Some(c) => c,
-                None => return false,
-            };
-            let norm_trace_id = Self::normalize_trace_id(compiled, trace_id);
-            let (_, trace_data) = match Self::trace_for_exit(compiled, norm_trace_id) {
-                Some(t) => t,
-                None => return false,
-            };
-            trace_data
-                .inputargs
-                .iter()
-                .map(|arg| arg.tp)
-                .collect::<Vec<_>>()
-        };
-        if finish_arg_types.len() != finish_args.len() {
-            return false;
+        if ends_with_jump {
+            // Validate JUMP target exists.
+            let has_targets = self
+                .compiled_loops
+                .get(&green_key)
+                .map_or(false, |c| !c.front_target_tokens.is_empty());
+            if !has_targets {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_bridge_trace: no target tokens for key={}, aborting",
+                        green_key
+                    );
+                }
+                return false;
+            }
+            // Validate arg count matches loop inputargs.
+            let input_len = self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|c| {
+                    let norm = Self::normalize_trace_id(c, trace_id);
+                    Self::trace_for_exit(c, norm)
+                })
+                .map(|(_, t)| t.inputargs.len())
+                .unwrap_or(0);
+            if input_len != finish_args.len() {
+                return false;
+            }
         }
 
         self.forced_virtualizable = None;
@@ -3816,40 +3835,28 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let mut recorder = ctx.recorder;
-        // RPython parity: bridge must JUMP to existing target_tokens.
-        // If no target tokens, bridge compilation fails (RPython: retrace request).
-        let has_targets = self
-            .compiled_loops
-            .get(&green_key)
-            .map_or(false, |c| !c.front_target_tokens.is_empty());
-        if has_targets {
+        if ends_with_jump {
             recorder.close_loop(finish_args);
         } else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] close_bridge: no target tokens for key={}, aborting",
-                    green_key
-                );
-            }
-            return false;
+            recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         }
         let trace = recorder.get_trace();
-
         let constants = ctx.constants.into_inner();
 
+        let label = if ends_with_jump { "jump" } else { "finish" };
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] close_bridge: key={}, trace_id={}, guard={}, ops={}",
+                "[jit] compile_bridge_trace({}): key={}, trace_id={}, guard={}, ops={}",
+                label,
                 green_key,
                 trace_id,
                 fail_index,
                 trace.ops.len()
             );
-            eprintln!("--- bridge trace (before opt) ---");
+            eprintln!("--- bridge trace ({}, before opt) ---", label);
             eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
         }
 
-        // Look up the guard's fail_arg_types to build the fail_descr for the bridge
         let fail_descr = {
             let compiled = match self.compiled_loops.get(&green_key) {
                 Some(c) => c,
@@ -3872,12 +3879,18 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
-    /// compile.py:714 _trace_and_compile_from_bridge — Finish variant.
-    ///
-    /// Close the current bridge trace with an explicit Finish op (e.g. when
-    /// the bridge path returns a value instead of jumping back to the loop
-    /// header). The Finish op is appended to the recorded ops before
-    /// optimization and compilation.
+    /// Legacy wrapper: close_bridge = compile_bridge_trace(ends_with_jump=true)
+    pub fn close_bridge(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+    ) -> bool {
+        self.compile_bridge_trace(green_key, trace_id, fail_index, finish_args, vec![], true)
+    }
+
+    /// Legacy wrapper: finish_bridge = compile_bridge_trace(ends_with_jump=false)
     pub fn finish_bridge(
         &mut self,
         green_key: u64,
@@ -3886,49 +3899,13 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
     ) -> bool {
-        self.forced_virtualizable = None;
-        let ctx = match self.tracing.take() {
-            Some(ctx) => ctx,
-            None => return false,
-        };
-
-        let mut recorder = ctx.recorder;
-        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
-        let trace = recorder.get_trace();
-
-        let constants = ctx.constants.into_inner();
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] finish_bridge: key={}, trace_id={}, guard={}, ops={}",
-                green_key,
-                trace_id,
-                fail_index,
-                trace.ops.len()
-            );
-            eprintln!("--- bridge trace (finish, before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
-        }
-
-        let fail_descr = {
-            let compiled = match self.compiled_loops.get(&green_key) {
-                Some(c) => c,
-                None => return false,
-            };
-            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
-                Some(descr) => descr,
-                None => return false,
-            };
-            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
-        };
-
-        self.compile_bridge(
+        self.compile_bridge_trace(
             green_key,
+            trace_id,
             fail_index,
-            &*fail_descr,
-            &trace.ops,
-            &trace.inputargs,
-            constants,
+            finish_args,
+            finish_arg_types,
+            false,
         )
     }
 }
