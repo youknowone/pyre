@@ -291,15 +291,21 @@ pub fn str_method_lower(args: &[PyObjectRef]) -> PyObjectRef {
     w_str_new(&unsafe { w_str_get_value(args[0]) }.to_lowercase())
 }
 
+/// PyPy: unicodeobject.py descr_format
+/// Requires format spec parser — correct for no-arg case only.
 pub fn str_method_format(args: &[PyObjectRef]) -> PyObjectRef {
-    // Simplified: return self as-is (format not yet implemented)
     assert!(!args.is_empty());
-    args[0]
+    if args.len() == 1 {
+        return args[0]; // no format args = return self (correct)
+    }
+    panic!("str.format() with arguments not yet implemented (requires format spec parser)");
 }
 
+/// PyPy: unicodeobject.py descr_encode
+/// W_BytesObject not yet implemented — returns str as placeholder.
 pub fn str_method_encode(args: &[PyObjectRef]) -> PyObjectRef {
-    // Simplified: return str as-is (bytes not yet implemented)
     assert!(!args.is_empty());
+    // Stub: bytes type not yet implemented
     args[0]
 }
 

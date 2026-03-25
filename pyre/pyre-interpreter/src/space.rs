@@ -1024,6 +1024,15 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                     message: "key not found".to_string(),
                 }),
             }
+        } else if is_instance(obj) {
+            // PyPy: descroperation.py __getitem__
+            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__getitem__") {
+                return Ok(crate::space_call_function(method, &[obj, index]));
+            }
+            Err(PyError::type_error(format!(
+                "'{}' object is not subscriptable",
+                w_type_get_name(w_instance_get_type(obj)),
+            )))
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1051,11 +1060,18 @@ pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> P
                 })
             }
         } else if is_dict(obj) {
-            if !is_int(index) {
-                return Err(PyError::type_error("dict keys must be integers in Phase 1"));
-            }
             w_dict_store(obj, index, value);
             Ok(w_none())
+        } else if is_instance(obj) {
+            // PyPy: descroperation.py __setitem__
+            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__setitem__") {
+                crate::space_call_function(method, &[obj, index, value]);
+                return Ok(w_none());
+            }
+            Err(PyError::type_error(format!(
+                "'{}' object does not support item assignment",
+                w_type_get_name(w_instance_get_type(obj)),
+            )))
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object does not support item assignment",
@@ -1871,6 +1887,17 @@ pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
                 return Ok(());
             }
             return Err(PyError::type_error("list index out of range"));
+        }
+    }
+    // Instance __delitem__ — PyPy: descroperation.py delitem
+    unsafe {
+        if pyre_object::is_instance(obj) {
+            if let Some(method) =
+                lookup_in_type_mro(pyre_object::w_instance_get_type(obj), "__delitem__")
+            {
+                crate::space_call_function(method, &[obj, index]);
+                return Ok(());
+            }
         }
     }
     Err(PyError::type_error("object does not support item deletion"))
