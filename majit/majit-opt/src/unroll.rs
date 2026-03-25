@@ -1261,8 +1261,10 @@ impl OptUnroll {
             };
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args) {
-                    // unroll.py:336-337: copy rd_resume_position from patchguardop
-                    // and set descr to ResumeAtPositionDescr()
+                    // RPython unroll.py:336-337: copy rd_resume_position from
+                    // patchguardop and set descr to ResumeAtPositionDescr().
+                    // store_final_boxes_in_guard resolves fail_args from
+                    // patchguardop via rd_resume_position (snapshot lookup).
                     if let Some(ref patch) = ctx.patchguardop {
                         guard_op.rd_resume_position = patch.rd_resume_position;
                     }
