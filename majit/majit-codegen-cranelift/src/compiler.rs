@@ -975,6 +975,29 @@ pub fn register_bridge_threshold_callback(f: BridgeThresholdFn) {
     let _ = BRIDGE_THRESHOLD_FN.set(f);
 }
 
+// ── Inline frame arena for self-recursive CallAssemblerI ────────────
+
+/// Stable addresses for inline arena take/put in Cranelift IR.
+#[derive(Clone)]
+pub struct InlineFrameArenaInfo {
+    pub buf_base_addr: usize,
+    pub top_addr: usize,
+    pub initialized_addr: usize,
+    pub frame_size: usize,
+    pub frame_code_offset: usize,
+    pub frame_next_instr_offset: usize,
+    pub frame_vable_token_offset: usize,
+    pub create_fn_addr: usize,
+    pub drop_fn_addr: usize,
+    pub arena_cap: usize,
+}
+
+static INLINE_ARENA: OnceLock<InlineFrameArenaInfo> = OnceLock::new();
+
+pub fn register_inline_frame_arena(info: InlineFrameArenaInfo) {
+    let _ = INLINE_ARENA.set(info);
+}
+
 fn notify_bridge_threshold(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
     if let Some(f) = BRIDGE_THRESHOLD_FN.get() {
         f(green_key, trace_id, fail_index, resume_pc);
@@ -5295,6 +5318,30 @@ impl CraneliftBackend {
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN => {
+                    // Inline arena take/put: replace create_frame/drop_frame
+                    // indirect calls with inline loads/stores when possible.
+                    if let Some(arena) = INLINE_ARENA.get() {
+                        let func_addr_key = op.arg(0).0;
+                        let func_addr = constants.get(&func_addr_key).copied().unwrap_or(-1);
+
+                        if op.opcode == OpCode::CallR && func_addr == arena.create_fn_addr as i64 {
+                            let result = emit_inline_arena_take(
+                                &mut builder,
+                                &constants,
+                                arena,
+                                op,
+                                ptr_type,
+                            );
+                            builder.def_var(var(vi), result);
+                            continue;
+                        }
+
+                        if op.opcode == OpCode::CallN && func_addr == arena.drop_fn_addr as i64 {
+                            emit_inline_arena_put(&mut builder, &constants, arena, op, ptr_type);
+                            continue;
+                        }
+                    }
+
                     let descr = op.descr.as_ref().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
@@ -8655,6 +8702,212 @@ impl majit_codegen::Backend for CraneliftBackend {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Inline arena take/put — replaces indirect calls to create_frame / drop_frame
+// with direct load/store instructions in the Cranelift IR.
+// ---------------------------------------------------------------------------
+
+/// Emit inline arena_take: allocate a frame from the global arena.
+///
+/// Fast path (hot): top < cap AND was_init AND same code → 2 stores + return ptr
+/// Slow path (cold): call the original create_frame helper
+fn emit_inline_arena_take(
+    builder: &mut FunctionBuilder,
+    constants: &std::collections::HashMap<u32, i64>,
+    arena: &InlineFrameArenaInfo,
+    op: &majit_ir::Op,
+    ptr_type: cranelift_codegen::ir::Type,
+) -> CValue {
+    let flags = MemFlags::trusted();
+    // Resolve args: create_frame(caller_frame, raw_arg)
+    let caller_frame = resolve_opref(builder, constants, op.arg(1));
+    let raw_arg = resolve_opref(builder, constants, op.arg(2));
+
+    // Load global arena state
+    let top_addr = builder.ins().iconst(ptr_type, arena.top_addr as i64);
+    let top = builder.ins().load(ptr_type, flags, top_addr, 0);
+    let cap = builder.ins().iconst(ptr_type, arena.arena_cap as i64);
+    let within_cap = builder.ins().icmp(IntCC::UnsignedLessThan, top, cap);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, ptr_type);
+
+    builder
+        .ins()
+        .brif(within_cap, fast_block, &[], slow_block, &[]);
+
+    // ── fast path ──
+    builder.switch_to_block(fast_block);
+    builder.seal_block(fast_block);
+
+    // frame_ptr = buf_base + top * frame_size
+    let buf_base_addr = builder.ins().iconst(ptr_type, arena.buf_base_addr as i64);
+    let buf_base = builder.ins().load(ptr_type, flags, buf_base_addr, 0);
+    let frame_size = builder.ins().iconst(ptr_type, arena.frame_size as i64);
+    let offset = builder.ins().imul(top, frame_size);
+    let frame_ptr = builder.ins().iadd(buf_base, offset);
+
+    // Check was_init: top < initialized
+    let init_addr = builder
+        .ins()
+        .iconst(ptr_type, arena.initialized_addr as i64);
+    let initialized = builder.ins().load(ptr_type, flags, init_addr, 0);
+    let was_init = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, top, initialized);
+
+    let reinit_block = builder.create_block();
+    builder
+        .ins()
+        .brif(was_init, reinit_block, &[], slow_block, &[]);
+
+    // ── reinit path (was_init=true) ──
+    builder.switch_to_block(reinit_block);
+    builder.seal_block(reinit_block);
+
+    // Check f.code == caller.code (self-recursive fast path)
+    let caller_code = builder.ins().load(
+        ptr_type,
+        flags,
+        caller_frame,
+        arena.frame_code_offset as i32,
+    );
+    let frame_code = builder
+        .ins()
+        .load(ptr_type, flags, frame_ptr, arena.frame_code_offset as i32);
+    let same_code = builder.ins().icmp(IntCC::Equal, frame_code, caller_code);
+
+    let ultra_fast_block = builder.create_block();
+    builder
+        .ins()
+        .brif(same_code, ultra_fast_block, &[], slow_block, &[]);
+
+    // ── ultra fast path: only 2 stores + bump top ──
+    builder.switch_to_block(ultra_fast_block);
+    builder.seal_block(ultra_fast_block);
+
+    let zero = builder.ins().iconst(ptr_type, 0);
+    builder
+        .ins()
+        .store(flags, zero, frame_ptr, arena.frame_next_instr_offset as i32);
+    builder.ins().store(
+        flags,
+        zero,
+        frame_ptr,
+        arena.frame_vable_token_offset as i32,
+    );
+
+    // top += 1
+    let one = builder.ins().iconst(ptr_type, 1);
+    let new_top = builder.ins().iadd(top, one);
+    builder.ins().store(flags, new_top, top_addr, 0);
+
+    builder.ins().jump(merge_block, &[frame_ptr]);
+
+    // ── slow path: call original helper ──
+    builder.switch_to_block(slow_block);
+    builder.seal_block(slow_block);
+
+    let create_sig = {
+        let cc = builder.func.signature.call_conv;
+        builder.func.import_signature(Signature {
+            params: vec![AbiParam::new(ptr_type), AbiParam::new(ptr_type)],
+            returns: vec![AbiParam::new(ptr_type)],
+            call_conv: cc,
+        })
+    };
+    let create_fn_addr = builder.ins().iconst(ptr_type, arena.create_fn_addr as i64);
+    let slow_result =
+        builder
+            .ins()
+            .call_indirect(create_sig, create_fn_addr, &[caller_frame, raw_arg]);
+    let slow_frame = builder.inst_results(slow_result)[0];
+    builder.ins().jump(merge_block, &[slow_frame]);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit inline arena_put: return a frame to the global arena.
+///
+/// Fast path: just decrement top.
+/// Slow path (non-LIFO or tagged pointer): call original drop helper.
+fn emit_inline_arena_put(
+    builder: &mut FunctionBuilder,
+    constants: &std::collections::HashMap<u32, i64>,
+    arena: &InlineFrameArenaInfo,
+    op: &majit_ir::Op,
+    ptr_type: cranelift_codegen::ir::Type,
+) {
+    let flags = MemFlags::trusted();
+    // Resolve arg: drop_frame(frame_ptr)
+    let frame_ptr = resolve_opref(builder, constants, op.arg(1));
+
+    // Check tagged pointer (bit 0)
+    let one = builder.ins().iconst(ptr_type, 1);
+    let tag_bit = builder.ins().band(frame_ptr, one);
+    let zero_val = builder.ins().iconst(ptr_type, 0);
+    let is_tagged = builder.ins().icmp(IntCC::NotEqual, tag_bit, zero_val);
+
+    let check_lifo_block = builder.create_block();
+    let done_block = builder.create_block();
+
+    builder
+        .ins()
+        .brif(is_tagged, done_block, &[], check_lifo_block, &[]);
+
+    // ── check LIFO ──
+    builder.switch_to_block(check_lifo_block);
+    builder.seal_block(check_lifo_block);
+
+    let top_addr = builder.ins().iconst(ptr_type, arena.top_addr as i64);
+    let top = builder.ins().load(ptr_type, flags, top_addr, 0);
+    let new_top = builder.ins().isub(top, one);
+
+    // expected = buf_base + new_top * frame_size
+    let buf_base_addr = builder.ins().iconst(ptr_type, arena.buf_base_addr as i64);
+    let buf_base = builder.ins().load(ptr_type, flags, buf_base_addr, 0);
+    let frame_size = builder.ins().iconst(ptr_type, arena.frame_size as i64);
+    let offset = builder.ins().imul(new_top, frame_size);
+    let expected = builder.ins().iadd(buf_base, offset);
+    let is_lifo = builder.ins().icmp(IntCC::Equal, frame_ptr, expected);
+
+    let fast_put_block = builder.create_block();
+    let slow_put_block = builder.create_block();
+    builder
+        .ins()
+        .brif(is_lifo, fast_put_block, &[], slow_put_block, &[]);
+
+    // ── fast put: just store new_top ──
+    builder.switch_to_block(fast_put_block);
+    builder.seal_block(fast_put_block);
+    builder.ins().store(flags, new_top, top_addr, 0);
+    builder.ins().jump(done_block, &[]);
+
+    // ── slow put: call original helper ──
+    builder.switch_to_block(slow_put_block);
+    builder.seal_block(slow_put_block);
+    let drop_sig = {
+        let cc = builder.func.signature.call_conv;
+        builder.func.import_signature(Signature {
+            params: vec![AbiParam::new(ptr_type)],
+            returns: vec![],
+            call_conv: cc,
+        })
+    };
+    let drop_fn_addr = builder.ins().iconst(ptr_type, arena.drop_fn_addr as i64);
+    builder
+        .ins()
+        .call_indirect(drop_sig, drop_fn_addr, &[frame_ptr]);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 

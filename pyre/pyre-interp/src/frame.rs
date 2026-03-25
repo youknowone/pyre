@@ -106,6 +106,9 @@ pub struct Block {
 // inside a PyFrame, so it can read/write them via raw pointer arithmetic.
 // Equivalent to PyPy's `_virtualizable_` descriptor on pyframe.py.
 
+/// Byte offset of `code` in `PyFrame`.
+pub const PYFRAME_CODE_OFFSET: usize = std::mem::offset_of!(PyFrame, code);
+
 /// Byte offset of `vable_token` in `PyFrame`.
 pub const PYFRAME_VABLE_TOKEN_OFFSET: usize = std::mem::offset_of!(PyFrame, vable_token);
 
