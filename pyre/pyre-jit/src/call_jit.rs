@@ -896,6 +896,12 @@ pub fn install_jit_call_bridge() {
 /// fail count reaches the bridge threshold. The frame state is still
 /// valid at this point (not yet reset by force_fn).
 fn on_bridge_threshold_reached(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][bridge-threshold] gk={} trace={} fail={} resume_pc={}",
+            green_key, trace_id, fail_index, resume_pc
+        );
+    }
     // Store the bridge request for synchronous processing in
     // restore_guard_failure_for_loop, which has access to the
     // restored frame state.
