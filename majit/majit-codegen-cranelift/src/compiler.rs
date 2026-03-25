@@ -1000,6 +1000,8 @@ pub struct InlineFrameArenaInfo {
     pub create_fn_addr: usize,
     pub drop_fn_addr: usize,
     pub arena_cap: usize,
+    /// JitFrame field descriptors for GC rewriter handle_call_assembler.
+    pub jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
 }
 
 static INLINE_ARENA: OnceLock<InlineFrameArenaInfo> = OnceLock::new();
@@ -3982,18 +3984,25 @@ impl CraneliftBackend {
                 jit_wb_cards_set: gc_flags::CARDS_SET,
                 jit_wb_card_page_shift: 0,
             },
+            jitframe_info: INLINE_ARENA
+                .get()
+                .and_then(|arena| arena.jitframe_descrs.clone()),
         }))
     }
 
-    fn prepare_ops_for_compile(&mut self, inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+    fn prepare_ops_for_compile(
+        &mut self,
+        inputargs: &[InputArg],
+        ops: &[Op],
+        constants: &HashMap<u32, i64>,
+    ) -> Vec<Op> {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
-        let result = if let Some(rewriter) = self.gc_rewriter() {
-            rewriter.rewrite_for_gc(&normalized)
+        if let Some(rewriter) = self.gc_rewriter() {
+            rewriter.rewrite_for_gc_with_constants(&normalized, constants)
         } else {
             normalized
-        };
-        result
+        }
     }
 
     /// Execute a compiled bridge, returning the DeadFrame from the bridge's
@@ -4197,7 +4206,7 @@ impl CraneliftBackend {
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
-        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
+        let prepared_ops = self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
         let ops = prepared_ops.as_slice();
         let trace_id = self.next_trace_id.take().unwrap_or_else(|| {
             let trace_id = self.trace_counter;
