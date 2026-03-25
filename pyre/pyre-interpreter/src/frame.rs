@@ -362,14 +362,9 @@ impl PyFrame {
         use num_traits::ToPrimitive;
         use pyre_bytecode::bytecode::ConstantData;
         let code = self.code();
-        // Access constants by building a synthetic instruction.
-        // code.constants is indexed by ConstIdx, which we can obtain by
-        // decoding a LoadConst instruction with the raw index as OpArg.
-        let mut state = pyre_bytecode::bytecode::OpArgState::default();
-        // Walk all constants to the idx-th one.
+        // RPython: constants are in JitCode.constants_r. In pyre, we resolve
+        // from the CodeObject's constant table at runtime.
         let constants: &[ConstantData] = unsafe {
-            // CodeObject.constants is a BorrowedConstantBag indexable by ConstIdx.
-            // We access the underlying storage directly.
             std::slice::from_raw_parts(
                 code.constants.as_ptr() as *const ConstantData,
                 code.constants.len(),
