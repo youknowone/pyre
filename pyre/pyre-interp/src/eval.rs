@@ -413,9 +413,19 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Closures / cells ──
 
+    /// PyPy: pyopcode.py LOAD_DEREF
+    ///
+    /// Reads cell/free variable. If the slot holds a cell object (from
+    /// closure tuple via COPY_FREE_VARS), dereferences it. Otherwise
+    /// reads the raw value (pyre's direct storage for cellvars).
     fn load_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
         let nlocals = self.nlocals();
-        let value = self.locals_cells_stack_w[nlocals + idx];
+        let slot = self.locals_cells_stack_w[nlocals + idx];
+        let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+            unsafe { pyre_object::w_cell_get(slot) }
+        } else {
+            slot
+        };
         if value == PY_NULL {
             return Err(PyError::type_error(
                 "free variable referenced before assignment",
@@ -425,16 +435,37 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    /// PyPy: pyopcode.py STORE_DEREF
     fn store_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
         let nlocals = self.nlocals();
         let value = self.pop();
-        self.locals_cells_stack_w[nlocals + idx] = value;
+        let slot = self.locals_cells_stack_w[nlocals + idx];
+        if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+            unsafe { pyre_object::w_cell_set(slot, value) };
+        } else {
+            self.locals_cells_stack_w[nlocals + idx] = value;
+        }
         Ok(())
     }
 
+    /// PyPy: pyopcode.py LOAD_CLOSURE → push the cell object itself
+    /// (not its contents — the cell is captured by the inner function's closure)
     fn load_closure(&mut self, idx: usize) -> Result<(), Self::Error> {
-        // Push the cell value itself (same as load_deref for Phase 1)
-        self.load_deref(idx)
+        let nlocals = self.nlocals();
+        let cell = self.locals_cells_stack_w[nlocals + idx];
+        // Push the cell object itself (or the raw value for legacy non-cell path)
+        self.push(cell);
+        Ok(())
+    }
+
+    /// MAKE_CELL — no-op in pyre.
+    ///
+    /// RustPython bytecode uses LOAD_CLOSURE + LOAD_DEREF for cell
+    /// variable access. Cell slots in locals_cells_stack_w (indices
+    /// nlocals..nlocals+ncells) are populated by STORE_DEREF or
+    /// COPY_FREE_VARS, not by MAKE_CELL.
+    fn make_cell(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), Self::Error> {

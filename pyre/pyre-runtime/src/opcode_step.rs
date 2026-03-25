@@ -905,6 +905,11 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // Closures 3.11+
+    /// MAKE_CELL i — create a cell object in slot i.
+    /// PyPy: pyframe.py MAKE_CELL
+    fn make_cell(&mut self, _idx: usize) -> Result<(), Self::Error> {
+        Ok(()) // default no-op for JIT tracer
+    }
     fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -1504,7 +1509,7 @@ where
 
         // ── Closure 3.11+ ──
         Instruction::MakeCell { i } => {
-            // Phase 1: no-op (cell slots initialized in frame constructor)
+            executor.make_cell(i.get(op_arg).as_usize())?;
             Ok(StepResult::Continue)
         }
         Instruction::CopyFreeVars { n } => {
