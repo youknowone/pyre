@@ -1723,36 +1723,6 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
         let optimized_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
-        // RPython parity: fail_args must not contain NONE. The symbolic
-        // tracker may lose slots (e.g., inner loop modifies locals not tracked
-        // by the outer trace). Replace NONE with a null constant so the
-        // Cranelift backend writes 0 (PY_NULL) instead of undefined garbage.
-        let null_const_key = 10_099u32;
-        let optimized_ops = {
-            let mut ops = optimized_ops;
-            let mut needs_null = false;
-            for op in &ops {
-                if let Some(ref fa) = op.fail_args {
-                    if fa.iter().any(|a| a.is_none()) {
-                        needs_null = true;
-                        break;
-                    }
-                }
-            }
-            if needs_null {
-                constants.entry(null_const_key).or_insert(0i64);
-                for op in &mut ops {
-                    if let Some(ref mut fa) = op.fail_args {
-                        for arg in fa.iter_mut() {
-                            if arg.is_none() {
-                                *arg = OpRef(null_const_key);
-                            }
-                        }
-                    }
-                }
-            }
-            ops
-        };
 
         if crate::majit_log_enabled() {
             eprintln!("--- trace (after opt) ---");
