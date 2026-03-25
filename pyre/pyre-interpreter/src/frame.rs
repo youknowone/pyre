@@ -355,6 +355,41 @@ impl PyFrame {
     pub fn fix_array_ptrs(&mut self) {
         self.locals_cells_stack_w.fix_ptr();
     }
+
+    /// Load a constant from the code object by raw index.
+    /// Used by the blackhole interpreter's bh_load_const_fn.
+    pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
+        use num_traits::ToPrimitive;
+        use pyre_bytecode::bytecode::ConstantData;
+        let code = self.code();
+        // Access constants by building a synthetic instruction.
+        // code.constants is indexed by ConstIdx, which we can obtain by
+        // decoding a LoadConst instruction with the raw index as OpArg.
+        let mut state = pyre_bytecode::bytecode::OpArgState::default();
+        // Walk all constants to the idx-th one.
+        let constants: &[ConstantData] = unsafe {
+            // CodeObject.constants is a BorrowedConstantBag indexable by ConstIdx.
+            // We access the underlying storage directly.
+            std::slice::from_raw_parts(
+                code.constants.as_ptr() as *const ConstantData,
+                code.constants.len(),
+            )
+        };
+        if idx >= constants.len() {
+            return pyre_object::w_none();
+        }
+        match &constants[idx] {
+            ConstantData::Integer { value } => {
+                pyre_object::intobject::w_int_new(value.to_i64().unwrap_or(0))
+            }
+            ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
+            ConstantData::Boolean { value } => {
+                pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
+            }
+            ConstantData::None => pyre_object::w_none(),
+            _ => pyre_object::w_none(),
+        }
+    }
 }
 
 // Virtualizable configuration is in jit/frame_layout.rs

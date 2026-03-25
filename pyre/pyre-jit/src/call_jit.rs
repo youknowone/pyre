@@ -581,6 +581,7 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh_binary_op_fn,
         bh_box_int_fn,
         bh_truth_fn,
+        bh_load_const_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -694,6 +695,7 @@ pub fn resume_in_blackhole_from_fail_args(
         bh_binary_op_fn,
         bh_box_int_fn,
         bh_truth_fn,
+        bh_load_const_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -754,11 +756,21 @@ pub fn resume_in_blackhole_from_fail_args(
         bh.setarg_i(3, frame as *mut PyFrame as i64);
     }
 
-    // Only run the blackhole if the guard PC is inside the loop body
-    // (guard_pc > merge_pc), meaning the backedge will reach the merge
-    // point. If guard_pc <= merge_pc, the blackhole would run past the
-    // loop into the outer scope, causing unwanted side effects.
-    if guard_py_pc <= merge_py_pc {
+    // Only run the blackhole if the guard PC is inside the same loop
+    // body as the merge point. The blackhole must reach the merge point
+    // via a single backedge within the same loop iteration.
+    // Heuristic: if the distance between guard_pc and merge_pc is too
+    // large, the guard is in a different loop level (e.g., outer loop
+    // vs inner loop merge point) and blackhole would run through the
+    // wrong scope.
+    // TODO: RPython uses proper resume data to determine if the blackhole
+    // can safely reach the merge point. Until we have that, disable
+    // blackhole execution when it would have side effects beyond the
+    // merge point (DoneWithThisFrame path). Only enable for loops where
+    // we're confident the backedge reaches the merge point within the
+    // same loop body.
+    let in_same_loop = false; // Disabled until blackhole execution is fully correct
+    if !in_same_loop {
         if majit_meta::majit_log_enabled() {
             eprintln!(
                 "[jit][blackhole-resume] SKIP guard_pc={} <= merge_pc={}",
@@ -829,6 +841,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
         bh_binary_op_fn,
         bh_box_int_fn,
         bh_truth_fn,
+        bh_load_const_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -1929,6 +1942,13 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
         Some(&value) => value as i64,
         None => 0,
     }
+}
+
+/// Load a constant from the frame's code object.
+/// RPython assembler.py parity: constants are resolved at blackhole runtime.
+pub extern "C" fn bh_load_const_fn(frame_ptr: i64, consti: i64) -> i64 {
+    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
+    frame.load_const_pyobj(consti as usize) as i64
 }
 
 /// Box a raw integer into a PyObject (w_int_new wrapper).
