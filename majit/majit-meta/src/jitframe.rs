@@ -259,6 +259,26 @@ impl JitFrame {
     pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
         (*ptr).jf_savedata = value;
     }
+
+    // ── warmspot.py:1021 assembler_call_helper parity ────────────
+
+    /// Check if jf_descr indicates a "done with this frame" finish.
+    ///
+    /// compile.py:626-656 — DoneWithThisFrameDescr*.handle_fail
+    /// raises DoneWithThisFrame{Void,Int,Ref,Float} JitException.
+    ///
+    /// Returns true if jf_descr matches a known finish descr.
+    pub unsafe fn is_done_with_this_frame(ptr: *const JitFrame, done_descr: usize) -> bool {
+        (*ptr).jf_descr == done_descr
+    }
+
+    /// Read the integer result from a finished jitframe.
+    ///
+    /// compile.py:632-638 — DoneWithThisFrameDescrInt.get_result
+    /// reads `cpu.get_int_value(deadframe, 0)`.
+    pub unsafe fn get_finish_result_int(ptr: *const JitFrame) -> isize {
+        Self::get_int_value(ptr, 0)
+    }
 }
 
 // ── jitframe_trace (jitframe.py:104-136) ────────────────────────────
