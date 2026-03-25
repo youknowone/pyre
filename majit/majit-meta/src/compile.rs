@@ -1218,12 +1218,8 @@ pub(crate) fn elide_create_frame_for_call_assembler(
     _constants: &HashMap<u32, i64>,
     _create_frame_raw_map: &HashMap<i64, i64>,
 ) -> Vec<Op> {
-    // Disabled: lazy frame elision causes regression for fib(33+).
-    // When guard fails before bridge is compiled, force_fn receives
-    // caller_frame and re-executes it in a costly loop. Requires
-    // RPython jitframe architecture (inline frame in compiled code)
-    // to work correctly. Keep the function for future use.
-    return ops;
+    // RPython parity: elide frame creation for self-recursive calls.
+    // Force_fn uses PENDING_FORCE_LOCAL0 for lazy callee frame creation.
 
     #[allow(unreachable_code)]
     {
