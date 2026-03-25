@@ -3297,6 +3297,10 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, trace_id, fail_index, fail_count
                     );
                 }
+                // RPython compile.py:697 parity: mark bridge_compiled AFTER
+                // the bridge hook runs. If compilation fails, the flag stays
+                // true to prevent infinite retries (RPython sets ST_BUSY_FLAG
+                // before compile, clears on success or keeps on failure).
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
                         info.bridge_compiled = true;
@@ -4013,26 +4017,24 @@ impl<M: Clone> MetaInterp<M> {
             bridge_knowledge.as_ref(),
         );
         if retrace_requested {
-            // unroll.py:217: cell_token.retraced_count += 1
+            // RPython compile.py:1068-1073 parity: InvalidLoop during bridge
+            // optimization → abort bridge compilation. Add target token for
+            // future retrace attempts, but do NOT compile this bridge.
             compiled.retraced_count += 1;
-            // unroll.py:231-236: export_state creates a new target token.
-            // The optimizer's exported_loop_state has the virtual state for
-            // the new specialization. Add a new target token to
-            // front_target_tokens so future bridges/loops can match it.
             if let Some(exported) = optimizer.exported_loop_state.take() {
                 let mut new_token = majit_opt::unroll::TargetToken::new_preamble(
                     compiled.front_target_tokens.len() as u64,
                 );
                 new_token.virtual_state = Some(exported.virtual_state);
                 compiled.front_target_tokens.push(new_token);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] bridge retrace: added target_token #{}, total={}",
-                        compiled.front_target_tokens.len() - 1,
-                        compiled.front_target_tokens.len()
-                    );
-                }
             }
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] bridge retrace needed (InvalidLoop): key={} — aborting bridge",
+                    green_key
+                );
+            }
+            return false;
         }
 
         // RPython parity: unbox the Finish result in bridges too.
