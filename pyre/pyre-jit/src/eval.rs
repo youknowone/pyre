@@ -1038,11 +1038,12 @@ fn materialize_from_recovery_layout(
                 } else if ob_type == w_int_type {
                     pyre_object::intobject::w_int_new(val_raw) as usize
                 } else {
-                    w_none() as usize
+                    // Unknown virtual type — cannot materialize safely.
+                    return false;
                 };
                 materialized.push(obj);
             }
-            _ => materialized.push(w_none() as usize),
+            _ => return false,
         }
     }
 
