@@ -544,6 +544,21 @@ impl GcRewriter for GcRewriterImpl {
                     self.handle_setarrayitem_gc(op, &mut st);
                 }
 
+                // ── call_assembler: rewrite.py:414 handle_call_assembler ──
+                // Currently a pass-through (frame allocation is handled by
+                // CallR(create_frame) emitted during tracing). When JitFrame
+                // nursery allocation is wired (Phase 3), this handler will
+                // inject CallMallocNurseryVarsizeFrame + field init ops.
+                OpCode::CallAssemblerI
+                | OpCode::CallAssemblerR
+                | OpCode::CallAssemblerF
+                | OpCode::CallAssemblerN => {
+                    st.flush_pending_zeros();
+                    st.emitting_can_collect();
+                    let rewritten = st.rewrite_op(op);
+                    st.emit_rewritten_from(op, rewritten);
+                }
+
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
                     st.flush_pending_zeros();
