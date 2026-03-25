@@ -2912,6 +2912,17 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] run_compiled_exit: gk={} fi={} tid={} result.finish={} layout.finish={} effective={}",
+                green_key,
+                fail_index,
+                trace_id,
+                result.is_finish,
+                exit_layout.is_finish,
+                effective_is_finish
+            );
+        }
 
         let mut guard_fail_count = None;
         if !effective_is_finish {
@@ -3026,6 +3037,17 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] run_compiled_exit: gk={} fi={} tid={} result.finish={} layout.finish={} effective={}",
+                green_key,
+                fail_index,
+                trace_id,
+                result.is_finish,
+                exit_layout.is_finish,
+                effective_is_finish
+            );
+        }
 
         let mut guard_fail_count = None;
         if !effective_is_finish {

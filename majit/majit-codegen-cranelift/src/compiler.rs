@@ -1995,7 +1995,18 @@ extern "C" fn call_assembler_guard_failure(
         let _ = bridge_fail_index;
         return bridge_outputs[0];
     } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
-        compile_base_case_bridge(target, fail_index);
+        // RPython: bridge compilation goes through MetaInterp, not the
+        // backend. Notify the bridge threshold callback so the JIT driver
+        // can trace and compile a proper bridge.
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        // Resume PC from guard's fail_args[1] (next_instr).
+        let resume_pc = if !outputs_ptr.is_null() && fail_descr.fail_arg_types.len() > 1 {
+            unsafe { *outputs_ptr.add(1) as usize }
+        } else {
+            0
+        };
+        notify_bridge_threshold(green_key, trace_id, fail_index, resume_pc);
     }
 
     // RPython resume_in_blackhole parity: resume execution from the guard
