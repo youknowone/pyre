@@ -18,6 +18,11 @@ pub const PYNAMESPACE_VALUES_LEN_OFFSET: usize =
 pub struct PyNamespace {
     names: Vec<String>,
     values: PyObjectArray,
+    /// JIT invalidation watchers. When a namespace slot is overwritten,
+    /// all watchers are notified (AtomicBool set to true) so that
+    /// compiled code using constant-folded globals is invalidated.
+    /// RPython parity: quasi-immutable field invalidation for module dicts.
+    watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
 }
 
 impl Clone for PyNamespace {
@@ -25,6 +30,7 @@ impl Clone for PyNamespace {
         let mut namespace = Self {
             names: self.names.clone(),
             values: PyObjectArray::from_vec(self.values.to_vec()),
+            watchers: Vec::new(), // cloned namespace is a new identity
         };
         namespace.fix_ptr();
         namespace
@@ -42,6 +48,7 @@ impl PyNamespace {
         let mut namespace = Self {
             names: Vec::new(),
             values: PyObjectArray::from_vec(Vec::new()),
+            watchers: Vec::new(),
         };
         namespace.fix_ptr();
         namespace
@@ -90,6 +97,9 @@ impl PyNamespace {
         if let Some(idx) = self.slot_of(&name) {
             let old = self.values[idx];
             self.values[idx] = value;
+            if old != value {
+                self.notify_watchers();
+            }
             Some(old)
         } else {
             self.names.push(name);
@@ -100,11 +110,37 @@ impl PyNamespace {
 
     #[inline]
     pub fn set_slot(&mut self, idx: usize, value: PyObjectRef) -> bool {
-        let Some(slot) = self.values.as_mut_slice().get_mut(idx) else {
+        let slice = self.values.as_mut_slice();
+        let Some(slot) = slice.get_mut(idx) else {
             return false;
         };
+        let old = *slot;
         *slot = value;
+        if old != value {
+            self.notify_watchers();
+        }
         true
+    }
+
+    /// Register a JIT invalidation watcher. When any namespace slot
+    /// is overwritten, the flag is set to true, causing
+    /// GUARD_NOT_INVALIDATED to fail in compiled code.
+    pub fn register_watcher(&mut self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.watchers.push(std::sync::Arc::downgrade(flag));
+    }
+
+    fn notify_watchers(&mut self) {
+        if self.watchers.is_empty() {
+            return;
+        }
+        self.watchers.retain(|w| {
+            if let Some(flag) = w.upgrade() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     #[inline]

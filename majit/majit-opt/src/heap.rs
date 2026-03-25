@@ -952,26 +952,37 @@ impl OptHeap {
 
         // RPython optimizer.py:783: constant_fold — read immutable field
         // from a constant object at optimization time.
+        // Safety: only fold when the object's class is known (via GuardClass
+        // or GuardValue). This prevents folding field reads on function
+        // pointers or other objects whose memory layout doesn't match
+        // the field descriptor.
         if let Some(descr) = &op.descr {
             if descr.is_always_pure() {
                 let obj_ref = op.arg(0);
-                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
-                    if !ptr_val.is_null() {
-                        if let Some((offset, field_size, _field_type)) =
-                            majit_ir::unpack_fielddescr(descr)
-                        {
-                            let addr = ptr_val.0 + offset;
-                            let folded = match field_size {
-                                8 => Some(unsafe { *(addr as *const i64) }),
-                                4 => Some(unsafe { *(addr as *const i32) as i64 }),
-                                2 => Some(unsafe { *(addr as *const i16) as i64 }),
-                                1 => Some(unsafe { *(addr as *const u8) as i64 }),
-                                _ => None,
-                            };
-                            if let Some(value) = folded {
-                                let const_ref = ctx.make_constant_int(value);
-                                ctx.replace_op(op.pos, const_ref);
-                                return OptimizationResult::Remove;
+                let class_known = ctx
+                    .get_ptr_info(obj_ref)
+                    .and_then(|info| info.get_known_class())
+                    .is_some();
+                if class_known {
+                    if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned()
+                    {
+                        if !ptr_val.is_null() {
+                            if let Some((offset, field_size, _field_type)) =
+                                majit_ir::unpack_fielddescr(descr)
+                            {
+                                let addr = ptr_val.0 + offset;
+                                let folded = match field_size {
+                                    8 => Some(unsafe { *(addr as *const i64) }),
+                                    4 => Some(unsafe { *(addr as *const i32) as i64 }),
+                                    2 => Some(unsafe { *(addr as *const i16) as i64 }),
+                                    1 => Some(unsafe { *(addr as *const u8) as i64 }),
+                                    _ => None,
+                                };
+                                if let Some(value) = folded {
+                                    let const_ref = ctx.make_constant_int(value);
+                                    ctx.replace_op(op.pos, const_ref);
+                                    return OptimizationResult::Remove;
+                                }
                             }
                         }
                     }

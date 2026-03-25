@@ -12,7 +12,7 @@ use crate::jit::trace::trace_bytecode;
 use pyre_interp::frame::PyFrame;
 use pyre_object::w_none;
 use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashSet;
 
 use majit_gc::trace::TypeInfo;
@@ -105,6 +105,25 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
 
 // JIT_CALL_DEPTH removed — pyre-interp::call::CALL_DEPTH is the single
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
+
+/// TLS: invalidation flag for the current trace being recorded.
+/// Set at trace start, read by load_name_value to register namespace watchers.
+thread_local! {
+    static TRACING_INVALIDATION_FLAG: Cell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { Cell::new(None) };
+}
+
+pub fn set_tracing_invalidation_flag(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    TRACING_INVALIDATION_FLAG.with(|c| c.set(flag));
+}
+
+pub fn get_tracing_invalidation_flag() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    TRACING_INVALIDATION_FLAG.with(|c| {
+        let v = c.take();
+        c.set(v.clone());
+        v
+    })
+}
 
 /// RPython rstack.stack_almost_full() parity.
 #[inline]
@@ -419,6 +438,9 @@ fn can_enter_jit_hook(
         );
         if !was_tracing && driver.is_tracing() {
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
+            set_tracing_invalidation_flag(Some(std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )));
         }
         result
     } else {
@@ -591,6 +613,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
     if driver.is_tracing() {
+        // Set the invalidation flag for namespace watcher registration.
+        // This flag will be connected to the JitCellToken after compilation.
+        set_tracing_invalidation_flag(Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
         // RPython warmstate.py:429 decay_all_counters:
         // called once after tracing starts to prevent burst compilation.
         driver.meta_interp_mut().warm_state_mut().decay_counters();
@@ -721,10 +748,21 @@ fn restore_guard_failure_for_loop(
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
         if majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit] guard-fail: unmaterialized null Ref in restored values, skipping restore"
-            );
+            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
         }
+        let (driver, _) = driver_pair();
+        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
+        for key in keys {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .abort_tracing(key, true);
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .clear_loop_token(key);
+        }
+        driver.invalidate_all_compiled();
         return None;
     }
     // RPython resume_in_blackhole parity: bridge guard failures are
