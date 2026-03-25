@@ -1434,9 +1434,6 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
-            // Don't invalidate: the compiled code may be entered from a
-            // compatible state later (e.g., function-entry trace created
-            // merge_pc mismatch, but direct back-edge entry matches).
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,

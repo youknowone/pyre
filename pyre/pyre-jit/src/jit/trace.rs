@@ -59,7 +59,12 @@ pub fn trace_bytecode(
 
     let action = metainterp.interpret(ctx);
 
-    // Retarget green key based on back-edge target.
+    // RPython pyjitpl.py:3000 uses original_boxes[:num_green_args] (= start_pc).
+    // pyre deviates: CloseLoopWithArgs retargets to target_pc because pyre
+    // starts traces from can_enter_jit (inner back-edge), not jit_merge_point
+    // (outer loop header). Without retarget, the compiled code's merge_pc
+    // wouldn't match any can_enter_jit entry point. Removing this requires
+    // per-guard resume data + blackhole interpreter for safe guard recovery.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
