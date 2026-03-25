@@ -106,23 +106,47 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
 // JIT_CALL_DEPTH removed — pyre-interp::call::CALL_DEPTH is the single
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
-/// TLS: invalidation flag for the current trace being recorded.
-/// Set at trace start, read by load_name_value to register namespace watchers.
+/// TLS: namespace pointers that the current trace depends on.
+/// RPython compile.py parity: quasi-immutable field dependencies are
+/// registered after compilation so GUARD_NOT_INVALIDATED fails when
+/// the namespace mutates.
 thread_local! {
-    static TRACING_INVALIDATION_FLAG: Cell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
-        const { Cell::new(None) };
+    static TRACING_NAMESPACE_DEPS: std::cell::RefCell<Vec<*mut pyre_runtime::PyNamespace>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-pub fn set_tracing_invalidation_flag(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
-    TRACING_INVALIDATION_FLAG.with(|c| c.set(flag));
+/// Record a namespace dependency during tracing.
+/// Called from load_name_value when a function is constant-folded.
+pub fn record_namespace_dependency(ns: *mut pyre_runtime::PyNamespace) {
+    TRACING_NAMESPACE_DEPS.with(|c| {
+        let mut deps = c.borrow_mut();
+        if !deps.contains(&ns) {
+            deps.push(ns);
+        }
+    });
 }
 
-pub fn get_tracing_invalidation_flag() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-    TRACING_INVALIDATION_FLAG.with(|c| {
-        let v = c.take();
-        c.set(v.clone());
-        v
-    })
+/// Take all recorded namespace dependencies (clears the list).
+fn take_namespace_deps() -> Vec<*mut pyre_runtime::PyNamespace> {
+    TRACING_NAMESPACE_DEPS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Register a compiled loop's invalidation flag with all dependent namespaces.
+/// RPython quasiimmut.py:register_loop_token parity.
+fn register_namespace_watchers(green_key: u64) {
+    let deps = take_namespace_deps();
+    if deps.is_empty() {
+        return;
+    }
+    let (driver, _) = driver_pair();
+    let Some(token) = driver.get_loop_token(green_key) else {
+        return;
+    };
+    let flag = token.invalidation_flag();
+    for ns_ptr in deps {
+        let ns = unsafe { &mut *ns_ptr };
+        ns.register_watcher(&flag);
+    }
 }
 
 /// RPython rstack.stack_almost_full() parity.
@@ -391,6 +415,10 @@ fn jit_merge_point_hook(
     // Trace completed or aborted — clear tracing depth.
     if !driver.is_tracing() {
         driver.meta_interp_mut().tracing_call_depth = None;
+        // RPython compile.py:205 parity: register namespace watchers
+        // after compilation. If compilation succeeded, the loop token
+        // exists and we connect its invalidation flag to namespaces.
+        register_namespace_watchers(green_key);
     }
     None
 }
@@ -442,6 +470,7 @@ fn can_enter_jit_hook(
             return None;
         }
         let was_tracing = driver.is_tracing();
+        let had_compiled = driver.has_compiled_loop(green_key);
         let result = driver.back_edge_or_run_compiled_keyed(
             green_key,
             loop_header_pc,
@@ -451,9 +480,12 @@ fn can_enter_jit_hook(
         );
         if !was_tracing && driver.is_tracing() {
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
-            set_tracing_invalidation_flag(Some(std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            )));
+            take_namespace_deps(); // clear deps for new trace
+        }
+        // RPython compile.py:205 parity: after compilation succeeds,
+        // register the loop's invalidation flag with dependent namespaces.
+        if !had_compiled && driver.has_compiled_loop(green_key) {
+            register_namespace_watchers(green_key);
         }
         result
     } else {
@@ -626,11 +658,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
     if driver.is_tracing() {
-        // Set the invalidation flag for namespace watcher registration.
-        // This flag will be connected to the JitCellToken after compilation.
-        set_tracing_invalidation_flag(Some(std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
-        )));
+        take_namespace_deps(); // clear deps for new trace
         // RPython warmstate.py:429 decay_all_counters:
         // called once after tracing starts to prevent burst compilation.
         driver.meta_interp_mut().warm_state_mut().decay_counters();

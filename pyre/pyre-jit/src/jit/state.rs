@@ -5244,9 +5244,15 @@ impl NamespaceOpcodeHandler for MIFrame {
         if let Some(concrete_value) = concrete_cv {
             unsafe {
                 if is_func(concrete_value) || is_builtin_func(concrete_value) {
+                    // RPython celldict.py + quasiimmut.py parity:
+                    // constant-fold the function lookup, protected by
+                    // GUARD_NOT_INVALIDATED. Namespace watcher is registered
+                    // after compilation via record_namespace_dependency.
+                    crate::eval::record_namespace_dependency(ns);
                     let opref = self.with_ctx(|this, ctx| {
-                        let loaded = MIFrame::load_namespace_value(this, ctx, slot)?;
-                        this.guard_value(ctx, loaded, concrete_value as i64);
+                        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+                            this.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
+                        }
                         let const_value = ctx.const_int(concrete_value as i64);
                         this.sym_mut()
                             .symbolic_namespace_slots
