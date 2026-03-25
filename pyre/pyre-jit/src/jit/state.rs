@@ -6946,6 +6946,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state.with_ctx(|this, ctx| {
@@ -6976,6 +6978,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
@@ -7237,6 +7241,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
@@ -7265,6 +7271,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
@@ -7307,6 +7315,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state
@@ -7342,6 +7352,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let raw_index = state.with_ctx(|this, ctx| this.trace_dynamic_list_index(ctx, key, len, 2));
@@ -7371,6 +7383,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
@@ -7410,6 +7424,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let _ = state
@@ -7472,6 +7488,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7554,6 +7572,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7644,6 +7664,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         assert!(
@@ -7710,6 +7732,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let action = state.trace_code_step(&code, compare_pc + 1);
@@ -7754,6 +7778,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         assert!(
@@ -7790,6 +7816,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let truth = state
@@ -7844,6 +7872,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state.with_ctx(|this, ctx| {
@@ -7903,6 +7933,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state.sym_mut().pending_branch_value = Some(OpRef::NONE);
@@ -7952,6 +7984,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state.with_ctx(|this, ctx| {
@@ -7994,6 +8028,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
@@ -8042,6 +8078,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
@@ -8089,6 +8127,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let len = state
@@ -8151,6 +8191,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let result =
@@ -8213,6 +8255,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state
@@ -8303,6 +8347,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         state
@@ -8380,6 +8426,8 @@ mod tests {
             parent_fail_args: None,
             parent_fail_arg_types: None,
             pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
         };
 
         let next = MIFrame::iter_next_value(&mut state, iter)

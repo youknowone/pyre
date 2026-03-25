@@ -413,8 +413,7 @@ mod tests {
         let mut sources = Vec::new();
         for dir in [
             base.join("pyre-object/src"),
-            base.join("pyre-runtime/src"),
-            base.join("pyre-interp/src"),
+            base.join("pyre-interpreter/src"),
         ] {
             collect_rs_files(&dir, &mut sources);
         }
@@ -423,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_analyze_opcode_step() {
-        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
         let result = analyze_multiple_pipeline_with_config(
             &[&source],
             &crate::test_support::pyre_analyze_config(),
@@ -654,14 +653,14 @@ mod tests {
     fn test_graph_pipeline_on_pyre_source() {
         // Run the full graph pipeline on actual pyre interpreter source.
         // This validates that the pipeline handles real-world Rust code.
-        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
         let parsed = parse::parse_source(&source);
         let program = front::build_semantic_program(&parsed);
 
         let config = passes::PipelineConfig::default();
         let result = passes::analyze_program(&program, &config);
 
-        eprintln!("=== Graph Pipeline on pyre-runtime ===");
+        eprintln!("=== Graph Pipeline on pyre-interpreter ===");
         eprintln!("Functions analyzed: {}", result.functions.len());
         eprintln!("Total blocks: {}", result.total_blocks);
         eprintln!("Total flat ops: {}", result.total_ops);
@@ -690,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_analyze_pipeline_runs_canonical_graph_path() {
-        let source = read_pyre_file("pyre-runtime/src/opcode_step.rs");
+        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
         let graph_result = analyze_pipeline(&source);
 
         // Graph pipeline should analyze functions
