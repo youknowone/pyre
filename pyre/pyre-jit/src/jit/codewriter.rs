@@ -60,6 +60,8 @@ pub struct CodeWriter {
     pub box_int_fn: extern "C" fn(i64) -> i64,
     /// Truthiness check: PyObjectRef → raw 0 or 1.
     pub truth_fn: extern "C" fn(i64) -> i64,
+    /// Load constant from frame's code object.
+    pub load_const_fn: extern "C" fn(i64, i64) -> i64,
 }
 
 impl CodeWriter {
@@ -70,6 +72,7 @@ impl CodeWriter {
         binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
         box_int_fn: extern "C" fn(i64) -> i64,
         truth_fn: extern "C" fn(i64) -> i64,
+        load_const_fn: extern "C" fn(i64, i64) -> i64,
     ) -> Self {
         Self {
             call_fn,
@@ -78,6 +81,7 @@ impl CodeWriter {
             binary_op_fn,
             box_int_fn,
             truth_fn,
+            load_const_fn,
         }
     }
 
@@ -119,6 +123,7 @@ impl CodeWriter {
         let binary_op_fn_idx = assembler.add_fn_ptr(self.binary_op_fn as *const ());
         let box_int_fn_idx = assembler.add_fn_ptr(self.box_int_fn as *const ());
         let truth_fn_idx = assembler.add_fn_ptr(self.truth_fn as *const ());
+        let load_const_fn_idx = assembler.add_fn_ptr(self.load_const_fn as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -182,11 +187,20 @@ impl CodeWriter {
                 }
 
                 Instruction::LoadConst { consti } => {
-                    // RPython assembler.py: emit_const() deduplicates constants.
-                    // For now, push null placeholder; blackhole caller
-                    // materializes concrete consts from the frame.
-                    let _idx = consti.get(op_arg);
-                    assembler.push_r(null_ref_reg);
+                    // RPython assembler.py: emit_const() stores constants in
+                    // the jitcode constant pool. For pyre, load from the
+                    // frame's code object at runtime via a helper call.
+                    let idx = consti.get(op_arg).as_usize();
+                    assembler.load_const_i_value(int_tmp0, idx as i64);
+                    assembler.call_ref_typed(
+                        load_const_fn_idx,
+                        &[
+                            majit_meta::jitcode::JitCallArg::int(frame_reg),
+                            majit_meta::jitcode::JitCallArg::int(int_tmp0),
+                        ],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
                 }
 
                 Instruction::PopTop => {

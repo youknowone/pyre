@@ -366,17 +366,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     {
                         return loop_result;
                     }
-                    // Counter reset only for null-ref invalidation path.
-                    // When blackhole reaches merge point, counter stays high
-                    // so the next backedge re-enters compiled code immediately
-                    // (RPython warmstate.py bound_reached parity).
-                    if !driver.has_compiled_loop(green_key) {
-                        driver
-                            .meta_interp_mut()
-                            .warm_state_mut()
-                            .counter
-                            .reset(green_key);
-                    }
+                    // TODO: remove this reset once blackhole resume_in_blackhole
+                    // is fully active (RPython parity: no counter reset after
+                    // guard failure, blackhole handles re-entry).
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .counter
+                        .reset(green_key);
                     if false {
                         pending_trace = Some((green_key, loop_header_pc));
                     }
@@ -777,7 +774,10 @@ fn handle_jit_outcome(
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
             // RPython compile.py:710 handle_fail → resume_in_blackhole.
-            JitAction::ContinueRunningNormally
+            // TODO: activate blackhole once codewriter↔blackhole execution
+            // is fully correct for all bytecodes. Currently disabled to
+            // avoid side-effect issues on the Finished (DoneWithThisFrame) path.
+            JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
