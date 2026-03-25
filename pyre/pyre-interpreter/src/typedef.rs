@@ -262,6 +262,101 @@ fn init_str_typedef(ns: &mut PyNamespace) {
         "zfill",
         w_builtin_func_new("zfill", crate::type_methods::str_method_zfill),
     );
+    namespace_store(
+        ns,
+        "count",
+        w_builtin_func_new("count", crate::type_methods::str_method_count),
+    );
+    namespace_store(
+        ns,
+        "index",
+        w_builtin_func_new("index", crate::type_methods::str_method_index),
+    );
+    namespace_store(
+        ns,
+        "title",
+        w_builtin_func_new("title", crate::type_methods::str_method_title),
+    );
+    namespace_store(
+        ns,
+        "capitalize",
+        w_builtin_func_new("capitalize", crate::type_methods::str_method_capitalize),
+    );
+    namespace_store(
+        ns,
+        "swapcase",
+        w_builtin_func_new("swapcase", crate::type_methods::str_method_swapcase),
+    );
+    namespace_store(
+        ns,
+        "center",
+        w_builtin_func_new("center", crate::type_methods::str_method_center),
+    );
+    namespace_store(
+        ns,
+        "ljust",
+        w_builtin_func_new("ljust", crate::type_methods::str_method_ljust),
+    );
+    namespace_store(
+        ns,
+        "rjust",
+        w_builtin_func_new("rjust", crate::type_methods::str_method_rjust),
+    );
+    namespace_store(
+        ns,
+        "isspace",
+        w_builtin_func_new("isspace", crate::type_methods::str_method_isspace),
+    );
+    namespace_store(
+        ns,
+        "isupper",
+        w_builtin_func_new("isupper", crate::type_methods::str_method_isupper),
+    );
+    namespace_store(
+        ns,
+        "islower",
+        w_builtin_func_new("islower", crate::type_methods::str_method_islower),
+    );
+    namespace_store(
+        ns,
+        "isalnum",
+        w_builtin_func_new("isalnum", crate::type_methods::str_method_isalnum),
+    );
+    namespace_store(
+        ns,
+        "isascii",
+        w_builtin_func_new("isascii", crate::type_methods::str_method_isascii),
+    );
+    namespace_store(
+        ns,
+        "partition",
+        w_builtin_func_new("partition", crate::type_methods::str_method_partition),
+    );
+    namespace_store(
+        ns,
+        "rpartition",
+        w_builtin_func_new("rpartition", crate::type_methods::str_method_rpartition),
+    );
+    namespace_store(
+        ns,
+        "splitlines",
+        w_builtin_func_new("splitlines", crate::type_methods::str_method_splitlines),
+    );
+    namespace_store(
+        ns,
+        "removeprefix",
+        w_builtin_func_new("removeprefix", crate::type_methods::str_method_removeprefix),
+    );
+    namespace_store(
+        ns,
+        "removesuffix",
+        w_builtin_func_new("removesuffix", crate::type_methods::str_method_removesuffix),
+    );
+    namespace_store(
+        ns,
+        "expandtabs",
+        w_builtin_func_new("expandtabs", crate::type_methods::str_method_expandtabs),
+    );
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────

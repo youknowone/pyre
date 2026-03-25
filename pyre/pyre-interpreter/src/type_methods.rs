@@ -326,6 +326,269 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> PyObjectRef {
     w_str_new(&format!("{padding}{s}"))
 }
 
+/// PyPy: unicodeobject.py descr_count
+pub fn str_method_count(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sub = unsafe { w_str_get_value(args[1]) };
+    w_int_new(s.matches(sub).count() as i64)
+}
+
+/// PyPy: unicodeobject.py descr_index
+pub fn str_method_index(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sub = unsafe { w_str_get_value(args[1]) };
+    match s.find(sub) {
+        Some(i) => w_int_new(i as i64),
+        None => panic!("ValueError: substring not found"),
+    }
+}
+
+/// PyPy: unicodeobject.py descr_title
+pub fn str_method_title(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let mut result = String::with_capacity(s.len());
+    let mut prev_is_sep = true;
+    for c in s.chars() {
+        if prev_is_sep {
+            for u in c.to_uppercase() {
+                result.push(u);
+            }
+        } else {
+            for l in c.to_lowercase() {
+                result.push(l);
+            }
+        }
+        prev_is_sep = !c.is_alphanumeric();
+    }
+    w_str_new(&result)
+}
+
+/// PyPy: unicodeobject.py descr_capitalize
+pub fn str_method_capitalize(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let mut chars = s.chars();
+    let result = match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let upper: String = first.to_uppercase().collect();
+            let lower: String = chars.flat_map(|c| c.to_lowercase()).collect();
+            format!("{upper}{lower}")
+        }
+    };
+    w_str_new(&result)
+}
+
+/// PyPy: unicodeobject.py descr_swapcase
+pub fn str_method_swapcase(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let result: String = s
+        .chars()
+        .flat_map(|c| {
+            if c.is_uppercase() {
+                c.to_lowercase().collect::<Vec<_>>()
+            } else {
+                c.to_uppercase().collect::<Vec<_>>()
+            }
+        })
+        .collect();
+    w_str_new(&result)
+}
+
+/// PyPy: unicodeobject.py descr_center
+pub fn str_method_center(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let width = unsafe { w_int_get_value(args[1]) } as usize;
+    let fillchar = if args.len() > 2 {
+        unsafe { w_str_get_value(args[2]) }
+            .chars()
+            .next()
+            .unwrap_or(' ')
+    } else {
+        ' '
+    };
+    if s.len() >= width {
+        return args[0];
+    }
+    let total_pad = width - s.len();
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    let result = format!(
+        "{}{}{}",
+        fillchar.to_string().repeat(left),
+        s,
+        fillchar.to_string().repeat(right)
+    );
+    w_str_new(&result)
+}
+
+/// PyPy: unicodeobject.py descr_ljust
+pub fn str_method_ljust(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let width = unsafe { w_int_get_value(args[1]) } as usize;
+    let fillchar = if args.len() > 2 {
+        unsafe { w_str_get_value(args[2]) }
+            .chars()
+            .next()
+            .unwrap_or(' ')
+    } else {
+        ' '
+    };
+    if s.len() >= width {
+        return args[0];
+    }
+    let pad = fillchar.to_string().repeat(width - s.len());
+    w_str_new(&format!("{s}{pad}"))
+}
+
+/// PyPy: unicodeobject.py descr_rjust
+pub fn str_method_rjust(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let width = unsafe { w_int_get_value(args[1]) } as usize;
+    let fillchar = if args.len() > 2 {
+        unsafe { w_str_get_value(args[2]) }
+            .chars()
+            .next()
+            .unwrap_or(' ')
+    } else {
+        ' '
+    };
+    if s.len() >= width {
+        return args[0];
+    }
+    let pad = fillchar.to_string().repeat(width - s.len());
+    w_str_new(&format!("{pad}{s}"))
+}
+
+/// PyPy: unicodeobject.py descr_isspace
+pub fn str_method_isspace(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    w_bool_from(!s.is_empty() && s.chars().all(|c| c.is_whitespace()))
+}
+
+/// PyPy: unicodeobject.py descr_isupper
+pub fn str_method_isupper(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let has_cased = s.chars().any(|c| c.is_alphabetic());
+    w_bool_from(
+        has_cased
+            && s.chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_uppercase()),
+    )
+}
+
+/// PyPy: unicodeobject.py descr_islower
+pub fn str_method_islower(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let has_cased = s.chars().any(|c| c.is_alphabetic());
+    w_bool_from(
+        has_cased
+            && s.chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_lowercase()),
+    )
+}
+
+/// PyPy: unicodeobject.py descr_isalnum
+pub fn str_method_isalnum(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    w_bool_from(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric()))
+}
+
+/// PyPy: unicodeobject.py descr_isascii
+pub fn str_method_isascii(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    w_bool_from(s.is_ascii())
+}
+
+/// PyPy: unicodeobject.py descr_partition
+pub fn str_method_partition(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sep = unsafe { w_str_get_value(args[1]) };
+    match s.find(sep) {
+        Some(i) => w_tuple_new(vec![
+            w_str_new(&s[..i]),
+            w_str_new(sep),
+            w_str_new(&s[i + sep.len()..]),
+        ]),
+        None => w_tuple_new(vec![args[0], w_str_new(""), w_str_new("")]),
+    }
+}
+
+/// PyPy: unicodeobject.py descr_rpartition
+pub fn str_method_rpartition(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sep = unsafe { w_str_get_value(args[1]) };
+    match s.rfind(sep) {
+        Some(i) => w_tuple_new(vec![
+            w_str_new(&s[..i]),
+            w_str_new(sep),
+            w_str_new(&s[i + sep.len()..]),
+        ]),
+        None => w_tuple_new(vec![w_str_new(""), w_str_new(""), args[0]]),
+    }
+}
+
+/// PyPy: unicodeobject.py descr_splitlines
+pub fn str_method_splitlines(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let parts: Vec<PyObjectRef> = s.lines().map(|line| w_str_new(line)).collect();
+    w_list_new(parts)
+}
+
+/// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
+pub fn str_method_removeprefix(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let prefix = unsafe { w_str_get_value(args[1]) };
+    if s.starts_with(prefix) {
+        w_str_new(&s[prefix.len()..])
+    } else {
+        args[0]
+    }
+}
+
+/// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
+pub fn str_method_removesuffix(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let suffix = unsafe { w_str_get_value(args[1]) };
+    if s.ends_with(suffix) {
+        w_str_new(&s[..s.len() - suffix.len()])
+    } else {
+        args[0]
+    }
+}
+
+/// PyPy: unicodeobject.py descr_expandtabs
+pub fn str_method_expandtabs(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let tabsize = if args.len() > 1 {
+        (unsafe { w_int_get_value(args[1]) }) as usize
+    } else {
+        8
+    };
+    let result = s.replace('\t', &" ".repeat(tabsize));
+    w_str_new(&result)
+}
+
 // ── Dict methods ─────────────────────────────────────────────────────
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> PyObjectRef {
