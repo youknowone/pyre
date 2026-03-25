@@ -660,9 +660,10 @@ pub enum BlackholeResult {
     Failed,
 }
 
-/// RPython blackhole.py:resume_in_blackhole + blackhole_from_resumedata.
+/// RPython blackhole.py:1782 resume_in_blackhole parity.
 ///
-/// Builds a blackhole from typed fail_args (deadframe), NOT from frame.
+/// Extracts the callee frame from typed_values[0], compiles the callee's
+/// CodeObject to JitCode, builds a blackhole, and runs to merge point.
 /// Codewriter register layout:
 ///   ref registers:  [0..nlocals) = locals, nlocals+ = temps
 ///   int registers:  [0]=tmp0, [1]=tmp1, [2]=opcode, [3]=frame_ptr
@@ -670,19 +671,31 @@ pub enum BlackholeResult {
 ///
 /// typed_values layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
 pub fn resume_in_blackhole_from_fail_args(
-    frame: &mut PyFrame,
+    _caller_frame: &mut PyFrame,
     typed_values: &[majit_ir::Value],
     merge_py_pc: usize,
 ) -> BlackholeResult {
     use majit_ir::Value;
 
-    let code = unsafe { &*frame.code };
-    let nlocals = code.varnames.len();
-
-    let guard_py_pc = match typed_values.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+    // RPython blackhole_from_resumedata: extract callee frame from
+    // deadframe. typed_values[0] = Ref(callee_frame_ptr).
+    let callee_frame_ptr = match typed_values.get(0) {
+        Some(Value::Ref(r)) => r.as_usize() as *mut PyFrame,
+        Some(Value::Int(v)) => *v as *mut PyFrame,
         _ => return BlackholeResult::Failed,
     };
+    if callee_frame_ptr.is_null() {
+        return BlackholeResult::Failed;
+    }
+    let callee_frame = unsafe { &mut *callee_frame_ptr };
+    let code = unsafe { &*callee_frame.code };
+    let nlocals = code.varnames.len();
+
+    // RPython: resume data encodes per-frame (jitcode, pc). In pyre,
+    // restore_guard_failure_values already synced the callee frame via
+    // virtualizable, so callee_frame.next_instr is the correct resume PC.
+    // typed_values[1] may contain the caller's PC, not the callee's.
+    let guard_py_pc = callee_frame.next_instr;
     let vsd = match typed_values.get(2) {
         Some(Value::Int(v)) => *v as usize,
         _ => return BlackholeResult::Failed,
@@ -753,9 +766,9 @@ pub fn resume_in_blackhole_from_fail_args(
             bh.runtime_stack_push(0, ptr);
         }
     }
-    // int register 3 = frame pointer
+    // int register 3 = callee frame pointer
     if 3 < bh.registers_i.len() {
-        bh.setarg_i(3, frame as *mut PyFrame as i64);
+        bh.setarg_i(3, callee_frame_ptr as i64);
     }
 
     let in_same_loop = guard_py_pc > merge_py_pc;
@@ -786,26 +799,26 @@ pub fn resume_in_blackhole_from_fail_args(
         return BlackholeResult::Finished(Ok(result));
     }
 
-    // Write back ref registers → frame locals.
+    // Write back ref registers → callee frame locals.
     for i in 0..nlocals {
-        if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
-            frame.locals_cells_stack_w[i] = bh.registers_r[i] as pyre_object::PyObjectRef;
+        if i < bh.registers_r.len() && i < callee_frame.locals_cells_stack_w.len() {
+            callee_frame.locals_cells_stack_w[i] = bh.registers_r[i] as pyre_object::PyObjectRef;
         }
     }
     let stack = bh.runtime_stack_drain(0);
-    frame.valuestackdepth = nlocals + stack.len();
+    callee_frame.valuestackdepth = nlocals + stack.len();
     for (i, val) in stack.iter().enumerate() {
         let idx = nlocals + i;
-        if idx < frame.locals_cells_stack_w.len() {
-            frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
+        if idx < callee_frame.locals_cells_stack_w.len() {
+            callee_frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
         }
     }
-    frame.next_instr = merge_py_pc;
+    callee_frame.next_instr = merge_py_pc;
 
     if majit_meta::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole-resume] reached merge point ni={}",
-            frame.next_instr
+            callee_frame.next_instr
         );
     }
 
