@@ -312,6 +312,31 @@ fn self_recursive_dispatch(green_key: u64) -> (FinishProtocol, Option<u64>) {
 // handles recursive dispatch natively.
 
 // ── Callee frame arena (RPython nursery bump equivalent) ─────────
+// ── Global arena pointers for Cranelift inline access ──────────────
+//
+// Single-threaded JIT invariant: only one thread executes compiled code
+// at a time, so these globals need no synchronization.
+static mut ARENA_BUF_BASE: *mut u8 = std::ptr::null_mut();
+static mut ARENA_TOP: usize = 0;
+static mut ARENA_INITIALIZED: usize = 0;
+
+/// Returns addresses of the global arena state variables and frame
+/// layout constants needed by Cranelift to inline arena take/put.
+pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
+    majit_codegen_cranelift::InlineFrameArenaInfo {
+        buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
+        top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
+        initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
+        frame_size: std::mem::size_of::<pyre_interp::frame::PyFrame>(),
+        frame_code_offset: pyre_interp::frame::PYFRAME_CODE_OFFSET,
+        frame_next_instr_offset: pyre_interp::frame::PYFRAME_NEXT_INSTR_OFFSET,
+        frame_vable_token_offset: pyre_interp::frame::PYFRAME_VABLE_TOKEN_OFFSET,
+        create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as usize,
+        drop_fn_addr: jit_drop_callee_frame as usize,
+        arena_cap: ARENA_CAP,
+    }
+}
+
 //
 // LIFO stack of pre-allocated PyFrame slots. Recursive call/return
 // order is naturally LIFO, so arena_take/arena_put are O(1).
@@ -330,11 +355,19 @@ struct FrameArena {
 
 impl FrameArena {
     fn new() -> Self {
-        Self {
+        let mut arena = Self {
             buf: Box::new([const { MaybeUninit::uninit() }; ARENA_CAP]),
             top: 0,
             initialized: 0,
+        };
+        // Publish stable pointers so Cranelift-generated code can
+        // inline arena take/put without going through TLS.
+        unsafe {
+            ARENA_BUF_BASE = arena.buf.as_mut_ptr() as *mut u8;
+            ARENA_TOP = 0;
+            ARENA_INITIALIZED = 0;
         }
+        arena
     }
 
     /// Take the next frame slot. Returns (ptr, was_previously_initialized).
@@ -343,6 +376,9 @@ impl FrameArena {
         if self.top < ARENA_CAP {
             let idx = self.top;
             self.top += 1;
+            unsafe {
+                ARENA_TOP = self.top;
+            }
             let ptr = self.buf[idx].as_mut_ptr();
             let was_init = idx < self.initialized;
             Some((ptr, was_init))
@@ -356,6 +392,9 @@ impl FrameArena {
     fn put(&mut self, ptr: *mut PyFrame) -> bool {
         if self.top > 0 && ptr == self.buf[self.top - 1].as_mut_ptr() {
             self.top -= 1;
+            unsafe {
+                ARENA_TOP = self.top;
+            }
             return true;
         }
         // Check if within arena range — don't free, but mark as non-LIFO.
@@ -370,6 +409,9 @@ impl FrameArena {
     fn mark_initialized(&mut self) {
         if self.top > self.initialized {
             self.initialized = self.top;
+            unsafe {
+                ARENA_INITIALIZED = self.top;
+            }
         }
     }
 }
@@ -964,6 +1006,7 @@ pub fn install_jit_call_bridge() {
         // callback invoked synchronously when guard fail count reaches
         // threshold. Replaces the deferred pending queue.
         majit_codegen_cranelift::register_bridge_threshold_callback(on_bridge_threshold_reached);
+        majit_codegen_cranelift::register_inline_frame_arena(arena_global_info());
         // TODO: register MetaInterp-level bridge threshold hook for guards
         // hit via run_compiled_detailed_with_values (try_function_entry_jit).
         // Currently disabled — bridge compilation from this path needs
