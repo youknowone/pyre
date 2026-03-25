@@ -305,6 +305,8 @@ pub fn call_callable_inline_residual(
 pub fn register_build_class() {
     pyre_runtime::register_build_class_impl(real_build_class);
     pyre_runtime::register_space_call_function(space_call_function_impl);
+    // Install TypeDef registry for builtin types (PyPy: typedef.py)
+    pyre_runtime::typedef::install_builtin_typedefs();
 }
 
 /// Unified `space.call_function(callable, *args)` implementation.

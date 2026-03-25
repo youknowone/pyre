@@ -977,8 +977,11 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_classmethod(d) => obj,
                     _ => PY_NULL,
                 }
-            } else if pyre_runtime::is_builtin_func(attr) && !pyre_object::is_module(obj) {
-                obj // builtin type method: bind self
+            } else if pyre_runtime::typedef::type_of(obj).is_some() && !pyre_object::is_module(obj)
+            {
+                // Builtin type method (list.append, etc.) found via TypeDef.
+                // PyPy: LOOKUP_METHOD binds self for builtin type methods.
+                obj
             } else {
                 PY_NULL
             }

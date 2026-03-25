@@ -11,6 +11,7 @@ pub mod opcode_step;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod space;
+pub mod typedef;
 
 pub use builtinfunc::*;
 pub use builtins::*;
