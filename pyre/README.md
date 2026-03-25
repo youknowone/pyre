@@ -1,6 +1,6 @@
 # pyre
 
-**Python Yet Reforged Entirely** — a no-GIL Python implementation in Rust, with a meta-tracing JIT compiler ported from PyPy.
+**Py**thon **Re**written — a no-GIL Python implementation in Rust, with a meta-tracing JIT compiler ported from PyPy.
 
 ## Why pyre?
 
@@ -22,6 +22,8 @@ Measured on Apple M-series, single core:
 | inline_helper(1M) | 0.11s | 0.02s | 0.21s | **1.9x** |
 
 pyre matches PyPy on tight integer loops and is consistently faster than CPython where the JIT fires.
+
+Run `pyre/check.sh` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
 ## Building & running
 
@@ -69,9 +71,15 @@ pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/o
 
 [majit](../majit/) (**M**eta-tr**A**cing **JIT**) is a standalone Rust port of RPython's JIT infrastructure. It is a general-purpose framework — any Rust bytecode interpreter annotated with `#[jit_interp]` gets a tracing JIT for free. pyre is majit's primary consumer, but majit has no dependency on pyre.
 
-## Contributing
+## Roadmap
 
-pyre tracks PyPy's codebase closely. When contributing, check the corresponding PyPy source to understand the expected behavior and naming. See the [module mapping](../CLAUDE.md) for the full correspondence table.
+What's next, roughly in priority order:
+
+- **Float-heavy JIT paths** — nbody and fannkuch run correctly but don't yet JIT-compile float operations; closing this gap is the biggest performance unlock remaining.
+- **More Python built-ins** — str methods, dict operations, list comprehensions, generators.
+- **Exception-heavy JIT** — raise/catch inside traced loops (raise_catch benchmark works interpreted, JIT bridge in progress).
+- **Multi-threaded execution** — the no-GIL foundation is there; actual parallel thread scheduling is not.
+- **CPython C extension compatibility** — long-term goal, likely via HPy or similar ABI layer.
 
 ## Name
 
