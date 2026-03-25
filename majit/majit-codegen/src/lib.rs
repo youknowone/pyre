@@ -423,9 +423,15 @@ impl std::fmt::Debug for LoopVersionInfo {
 }
 
 /// Token identifying a compiled loop. Bridges are attached to this.
+/// RPython history.py JitCellToken parity — green_key carried on token
+/// so the backend can identify the parent loop for bridge compilation.
 pub struct JitCellToken {
     /// Unique number for this token.
     pub number: u64,
+    /// Green key hash identifying the loop entry point.
+    /// Set by MetaInterp before compile_loop. Used by the backend's
+    /// bridge threshold callback to find the compiled loop metadata.
+    pub green_key: u64,
     /// Types of the input arguments.
     pub inputarg_types: Vec<Type>,
     /// Backend-specific compiled data.
@@ -442,6 +448,7 @@ impl JitCellToken {
     pub fn new(number: u64) -> Self {
         JitCellToken {
             number,
+            green_key: 0,
             inputarg_types: Vec::new(),
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),

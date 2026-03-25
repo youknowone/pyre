@@ -1695,9 +1695,9 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.alloc_token_number()
         };
         let mut token = JitCellToken::new(token_num);
+        token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
-        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2151,9 +2151,9 @@ impl<M: Clone> MetaInterp<M> {
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
+        token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
-        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -2430,7 +2430,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
-        self.backend.set_next_header_pc(green_key);
+        token.green_key = green_key;
 
         match self
             .backend
@@ -3649,9 +3649,8 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let mut recorder = ctx.recorder;
-        // RPython parity: if the target loop has compiled target_tokens,
-        // close with JUMP (so optimize_bridge can jump_to_existing_trace).
-        // Otherwise fall back to Finish.
+        // RPython parity: bridge must JUMP to existing target_tokens.
+        // If no target tokens, bridge compilation fails (RPython: retrace request).
         let has_targets = self
             .compiled_loops
             .get(&green_key)
@@ -3659,7 +3658,13 @@ impl<M: Clone> MetaInterp<M> {
         if has_targets {
             recorder.close_loop(finish_args);
         } else {
-            recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] close_bridge: no target tokens for key={}, aborting",
+                    green_key
+                );
+            }
+            return false;
         }
         let trace = recorder.get_trace();
 

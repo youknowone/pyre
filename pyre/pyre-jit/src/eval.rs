@@ -718,26 +718,10 @@ fn restore_guard_failure_for_loop(
         driver.invalidate_all_compiled();
         return None;
     }
-    // Safety: bridge guards have fail_arg types assigned by the optimizer
-    // which may not match the pre-opcode state (where all values are boxed
-    // Refs). Until the optimizer preserves pre-opcode types, skip restore
-    // for bridge guard failures. The bridge still runs its fast path — only
-    // the guard failure fallback goes to the interpreter.
-    {
-        let (driver, _) = driver_pair();
-        let is_bridge_guard = driver
-            .meta_interp()
-            .is_bridge_trace_id(exit_layout.trace_id);
-        if is_bridge_guard {
-            if majit_meta::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard-fail: bridge guard (trace_id={}), skipping restore (type mismatch)",
-                    exit_layout.trace_id
-                );
-            }
-            return None;
-        }
-    }
+    // RPython resume_in_blackhole parity: bridge guard failures are
+    // restored normally (same as root guard failures). With all-Ref
+    // fail_arg types on bridge traces, restore correctly interprets
+    // all values as boxed Python object references.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
         eprintln!(
