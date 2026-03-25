@@ -406,7 +406,7 @@ impl<S: JitState> JitDriver<S> {
         }
         if self.sym.is_none() || self.trace_meta.is_none() {
             if crate::majit_log_enabled() {
-                eprintln!("[mp] abort:sym_none bridge={}", self.bridge_info.is_some());
+                eprintln!("[mp] abort:sym_none");
             }
             self.meta.abort_trace(false);
             self.sym = None;
@@ -1988,6 +1988,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let mut live_values = live_values;
+        let mut on_guard_failure = Some(on_guard_failure);
         loop {
             let result = self
                 .meta
@@ -2028,35 +2029,63 @@ impl<S: JitState> JitDriver<S> {
                 return Some(target_pc);
             }
 
+            // Try to restore interpreter state from guard failure values.
+            let resume_pc = on_guard_failure
+                .take()
+                .and_then(|f| f(state, &result_meta, &raw_values, &exit_layout));
+
+            // Guard failures where restore returns None (e.g. GuardNotInvalidated
+            // with insufficient fail_args for full restore): re-enter compiled
+            // code instead of falling back to the interpreter. This avoids the
+            // JIT entry/exit overhead for periodic epoch invalidation.
+            let Some(resume_pc) = resume_pc else {
+                state.restore_values(&result_meta, &typed_values);
+                self.sync_after(state, &result_meta, descriptor.as_ref());
+                // Try to re-enter compiled code
+                if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
+                    if state.is_compatible(meta) {
+                        let meta = meta.clone();
+                        let nd = self.driver_descriptor_for(state, &meta);
+                        if self.sync_before(state, &meta, nd.as_ref()) {
+                            let nl = state.extract_live_values(&meta);
+                            if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
+                                if let Some(v) = self.extend_compiled_live_values(
+                                    key_hash,
+                                    state,
+                                    &meta,
+                                    nd.as_ref(),
+                                    nl,
+                                ) {
+                                    live_values = v;
+                                    continue; // re-enter compiled code
+                                }
+                            }
+                        }
+                    }
+                }
+                return Some(target_pc);
+            };
+
+            materialize_pending_fields(&exit_layout, &raw_values);
+            self.sync_after(state, &result_meta, descriptor.as_ref());
+
             let should_bridge = self
                 .meta
                 .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
             if should_bridge {
-                if let Some(resume_pc) =
-                    on_guard_failure(state, &result_meta, &raw_values, &exit_layout)
-                {
-                    materialize_pending_fields(&exit_layout, &raw_values);
-                    self.sync_after(state, &result_meta, descriptor.as_ref());
-                    let bridge_ok = self.start_bridge_tracing(
-                        key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
+                let bridge_ok = self.start_bridge_tracing(
+                    key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
+                );
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
+                        key_hash, trace_id, fail_index, resume_pc, bridge_ok
                     );
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[bridge] start_bridge_tracing key={} trace_id={} fail={} resume_pc={} target_pc={} ok={}",
-                            key_hash, trace_id, fail_index, resume_pc, target_pc, bridge_ok
-                        );
-                    }
-                    return Some(resume_pc);
                 }
-                return None;
+                return Some(resume_pc);
             }
 
-            let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
-            if resume_pc.is_some() {
-                materialize_pending_fields(&exit_layout, &raw_values);
-                self.sync_after(state, &result_meta, descriptor.as_ref());
-            }
-            return resume_pc;
+            return Some(resume_pc);
         } // end loop { run_compiled ... }
     }
 }
