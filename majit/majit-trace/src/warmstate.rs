@@ -578,6 +578,24 @@ impl WarmEnterState {
         self.counter.decay_all_counters();
     }
 
+    /// Reset the hot counter for a specific green key to zero.
+    pub fn reset_counter(&mut self, green_key_hash: u64) {
+        self.counter.reset(green_key_hash);
+    }
+
+    /// Reset ALL counters to zero. Used after invalidation with incomplete
+    /// resume data (NONE fail_args) to prevent immediate recompilation.
+    pub fn decay_all_counters_to_zero(&mut self) {
+        self.counter.decay_all_counters_by(0.0);
+    }
+
+    /// Check if a green key is marked DontTraceHere.
+    pub fn is_dont_trace_here(&self, green_key_hash: u64) -> bool {
+        self.cells
+            .get(&green_key_hash)
+            .is_some_and(|c| c.state == BaseJitCellState::DontTraceHere)
+    }
+
     /// Get a reference to the BaseJitCell for a green key, if it exists.
     pub fn get_cell(&self, green_key_hash: u64) -> Option<&BaseJitCell> {
         self.cells.get(&green_key_hash)
