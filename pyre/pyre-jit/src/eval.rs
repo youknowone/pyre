@@ -123,7 +123,8 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
 /// fails when the namespace mutates.
 fn register_quasi_immutable_deps(green_key: u64) {
     let (driver, _) = driver_pair();
-    let deps: Vec<u64> = std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
+    let deps: Vec<(u64, u32)> =
+        std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
     if deps.is_empty() {
         return;
     }
@@ -131,9 +132,9 @@ fn register_quasi_immutable_deps(green_key: u64) {
         return;
     };
     let flag = token.invalidation_flag();
-    for dep_ptr in deps {
-        let ns = unsafe { &mut *(dep_ptr as *mut pyre_interpreter::PyNamespace) };
-        ns.register_watcher(&flag);
+    for (ns_ptr, slot) in deps {
+        let ns = unsafe { &mut *(ns_ptr as *mut pyre_interpreter::PyNamespace) };
+        ns.register_slot_watcher(slot as usize, &flag);
     }
 }
 

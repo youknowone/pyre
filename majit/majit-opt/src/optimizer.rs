@@ -105,11 +105,11 @@ pub struct Optimizer {
     /// optimizer.py: `can_replace_guards` — flag to enable/disable guard sharing.
     can_replace_guards: bool,
     /// optimizer.py: `quasi_immutable_deps` — quasi-immutable field dependencies.
-    /// RPython: dict[QuasiImmut → None]. We store raw pointers (u64) to
-    /// namespace/quasi-immutable objects that compiled code depends on.
-    /// After compilation, each dependency gets the loop's invalidation
-    /// flag registered as a watcher.
-    pub quasi_immutable_deps: std::collections::HashSet<u64>,
+    /// RPython: dict[QuasiImmut → None]. We store (object_ptr, field_index)
+    /// pairs identifying the specific quasi-immutable slot that compiled
+    /// code depends on. After compilation, each dependency gets the loop's
+    /// invalidation flag registered as a per-slot watcher.
+    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
     /// optimizer.py: `resumedata_memo` — shared constant map for resume data.
     /// Maps constant values to shared indices to reduce resume data size.
     /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
@@ -999,11 +999,10 @@ impl Optimizer {
     }
 
     /// optimizer.py: quasi_immutable_deps[qmut] = None
-    /// Track a quasi-immutable field dependency. `dep` is a raw pointer
-    /// to the quasi-immutable object (e.g., PyNamespace) that the compiled
-    /// loop depends on. After compilation, each dep gets the loop's
-    /// invalidation flag registered as a watcher.
-    pub fn add_quasi_immutable_dep(&mut self, dep: u64) {
+    /// Track a quasi-immutable field dependency. `dep` is (object_ptr,
+    /// field_index) identifying the specific slot the compiled loop
+    /// depends on. After compilation, a per-slot watcher is registered.
+    pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
         self.quasi_immutable_deps.insert(dep);
     }
 

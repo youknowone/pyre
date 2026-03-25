@@ -1903,15 +1903,22 @@ impl Optimization for OptHeap {
                 }
                 let obj = op.arg(0);
                 // RPython optimize_QUASIIMMUT_FIELD: collect quasi-immutable
-                // dependencies. If obj is a constant (e.g., namespace pointer),
-                // add it to quasi_immutable_deps for post-compile watcher
-                // registration (compile.py:record_loop_or_bridge parity).
-                if let Some(dep_ptr) = ctx.get_constant_int(obj) {
-                    ctx.add_quasi_immutable_dep(dep_ptr as u64);
-                }
-                if let Some(descr) = &op.descr {
-                    let field_idx = descr.index();
-                    self.quasi_immut_cache.insert((obj, field_idx), OpRef::NONE);
+                // dependencies. Add (obj_ptr, field_idx) to quasi_immutable_deps
+                // for per-slot watcher registration after compilation.
+                // field_idx comes from descr (GC object fields) or arg(1)
+                // (namespace slot index).
+                let field_idx = if let Some(descr) = &op.descr {
+                    Some(descr.index())
+                } else if op.args.len() > 1 {
+                    ctx.get_constant_int(op.arg(1)).map(|v| v as u32)
+                } else {
+                    None
+                };
+                if let Some(idx) = field_idx {
+                    if let Some(dep_ptr) = ctx.get_constant_int(obj) {
+                        ctx.add_quasi_immutable_dep((dep_ptr as u64, idx));
+                    }
+                    self.quasi_immut_cache.insert((obj, idx), OpRef::NONE);
                 }
                 OptimizationResult::Remove
             }
