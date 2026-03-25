@@ -142,6 +142,18 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     crate::call_jit::install_jit_call_bridge();
     frame.fix_array_ptrs();
 
+    // RPython blackhole.py parity: during bridge tracing, concrete
+    // (force helper) calls must use the plain interpreter to avoid
+    // corrupting the bridge trace's symbolic state via eval_loop_jit's
+    // jit_merge_point_hook. RPython's blackhole interpreter has no
+    // JIT hooks; pyre's equivalent is eval_frame_plain.
+    {
+        let (drv, _) = driver_pair();
+        if drv.is_bridge_tracing() {
+            return pyre_interp::eval::eval_frame_plain(frame);
+        }
+    }
+
     // RPython warmspot.py ll_portal_runner:
     //   maybe_compile_and_run(increment_threshold, *args)
     //   return portal_ptr(*args)
