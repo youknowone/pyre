@@ -11,6 +11,30 @@ use std::ptr;
 
 use crate::header::GcHeader;
 
+// ── Global nursery pointers for Cranelift inline bump allocation ──
+//
+// RPython x86/assembler.py:2567 malloc_cond_varsize_frame parity:
+// ecx = load(nursery_free_adr)
+// edx = ecx + size
+// cmp edx, load(nursery_top_adr)
+// ja slow_path
+// store(nursery_free_adr, edx)
+//
+// Single-threaded JIT invariant: only one thread allocates.
+static mut NURSERY_FREE_ADDR: *mut u8 = std::ptr::null_mut();
+static mut NURSERY_TOP_ADDR: *const u8 = std::ptr::null();
+
+/// Get the stable addresses of the nursery free/top pointers
+/// for Cranelift inline bump allocation.
+pub fn nursery_global_addrs() -> (usize, usize) {
+    unsafe {
+        (
+            std::ptr::addr_of!(NURSERY_FREE_ADDR) as usize,
+            std::ptr::addr_of!(NURSERY_TOP_ADDR) as usize,
+        )
+    }
+}
+
 /// Default nursery size: 896KB, matching incminimark's TRANSLATION_PARAMS.
 pub const DEFAULT_NURSERY_SIZE: usize = 896 * 1024;
 
@@ -37,12 +61,17 @@ impl Nursery {
         if start.is_null() {
             alloc::handle_alloc_error(layout);
         }
-        Nursery {
+        let nursery = Nursery {
             start,
             free: start,
             top: unsafe { start.add(size) },
             size,
+        };
+        unsafe {
+            NURSERY_FREE_ADDR = nursery.free;
+            NURSERY_TOP_ADDR = nursery.top;
         }
+        nursery
     }
 
     /// Try to allocate `total_size` bytes (header + payload) from the nursery.
@@ -65,6 +94,9 @@ impl Nursery {
         }
         let result = self.free;
         self.free = new_free;
+        unsafe {
+            NURSERY_FREE_ADDR = self.free;
+        }
         result
     }
 
@@ -74,6 +106,9 @@ impl Nursery {
             ptr::write_bytes(self.start, 0, self.size);
         }
         self.free = self.start;
+        unsafe {
+            NURSERY_FREE_ADDR = self.free;
+        }
     }
 
     /// Current free pointer.

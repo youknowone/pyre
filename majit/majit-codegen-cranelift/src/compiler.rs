@@ -6084,24 +6084,68 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    // RPython x86/assembler.py:2567 malloc_cond_varsize_frame:
+                    // Inline nursery bump allocation.
+                    //   ecx = load(nursery_free_adr)
+                    //   edx = ecx + size
+                    //   cmp edx, load(nursery_top_adr)
+                    //   ja slow_path
+                    //   store(nursery_free_adr, edx)
+                    //   ; ecx = allocated pointer
+                    let (nf_addr, nt_addr) = majit_gc::nursery::nursery_global_addrs();
+                    let flags = MemFlags::trusted();
                     let size_total =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
+
+                    let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
+                    let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
+                    let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                    let new_free = builder.ins().iadd(free, size_total);
+                    let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
+                    let fits = builder
+                        .ins()
+                        .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+
+                    let fast_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, ptr_type);
+
+                    builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
+
+                    // fast: bump free pointer, return old free
+                    builder.switch_to_block(fast_block);
+                    builder.seal_block(fast_block);
+                    builder.ins().store(flags, new_free, nf_ptr, 0);
+                    // Return pointer past GC header
+                    let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
+                    let obj_ptr = builder.ins().iadd(free, header_size);
+                    builder.ins().jump(merge_block, &[obj_ptr]);
+
+                    // slow: call shim (triggers minor collection)
+                    builder.switch_to_block(slow_block);
+                    builder.seal_block(slow_block);
+                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let runtime_id_val = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
-                    let result = emit_collecting_gc_call(
+                    let slow_result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
                         roots_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
-                        runtime_id,
+                        runtime_id_val,
                         gc_alloc_nursery_shim as *const () as usize,
                         &[size],
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
+                    builder.ins().jump(merge_block, &[slow_result]);
+
+                    builder.switch_to_block(merge_block);
+                    builder.seal_block(merge_block);
+                    let result = builder.block_params(merge_block)[0];
                     builder.def_var(var(vi), result);
                 }
 
