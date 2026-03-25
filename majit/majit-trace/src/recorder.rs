@@ -281,7 +281,7 @@ impl Trace {
             "trace must be finalized with close_loop() or finish() before calling get_trace()"
         );
         assert!(!self.aborted, "cannot get trace from aborted recorder");
-        TreeLoop::new(self.inputargs, self.ops)
+        TreeLoop::with_snapshots(self.inputargs, self.ops, self.snapshots)
     }
 
     /// Abort the current trace, discarding all recorded operations.
