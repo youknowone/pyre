@@ -20,6 +20,14 @@ use majit_ir::Value;
 use majit_meta::blackhole::ExceptionState;
 use majit_meta::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
+/// RPython resume_in_blackhole parity: preserve typed fail_args from
+/// the last guard failure so the blackhole can load registers directly
+/// from them (blackhole_from_resumedata loads from deadframe, not frame).
+thread_local! {
+    static LAST_GUARD_TYPED: std::cell::RefCell<Option<Vec<Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 enum LoopResult {
     Done(PyResult),
@@ -358,15 +366,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     {
                         return loop_result;
                     }
-                    // TODO: remove this reset once blackhole resume data
-                    // properly materializes virtuals. Until then, the reset
-                    // prevents infinite trace→invalidate loops from null-ref
-                    // guard failures.
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .counter
-                        .reset(green_key);
+                    // Counter reset only for null-ref invalidation path.
+                    // When blackhole reaches merge point, counter stays high
+                    // so the next backedge re-enters compiled code immediately
+                    // (RPython warmstate.py bound_reached parity).
+                    if !driver.has_compiled_loop(green_key) {
+                        driver
+                            .meta_interp_mut()
+                            .warm_state_mut()
+                            .counter
+                            .reset(green_key);
+                    }
                     if false {
                         pending_trace = Some((green_key, loop_header_pc));
                     }
@@ -523,7 +533,36 @@ fn can_enter_jit_hook(
         }
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
-            JitAction::ContinueRunningNormally => return Some(LoopResult::ContinueRunningNormally),
+            JitAction::ContinueRunningNormally => {
+                // RPython compile.py:710 handle_fail → resume_in_blackhole.
+                // Run blackhole from guard PC to merge point using typed
+                // fail_args directly (not from frame).
+                let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+                if let Some(ref vals) = typed {
+                    match crate::call_jit::resume_in_blackhole_from_fail_args(
+                        frame,
+                        vals,
+                        loop_header_pc,
+                    ) {
+                        crate::call_jit::BlackholeResult::MergePoint => {
+                            // bhimpl_jit_merge_point → ContinueRunningNormally.
+                            // Frame is at loop_header_pc with correct state.
+                            // Return None so eval_loop_jit continues from the
+                            // loop header where the next backedge can re-enter
+                            // compiled code immediately.
+                        }
+                        crate::call_jit::BlackholeResult::Finished(result) => {
+                            // RPython DoneWithThisFrame: blackhole completed
+                            // the function. The result is final.
+                            return Some(LoopResult::Done(result));
+                        }
+                        crate::call_jit::BlackholeResult::Failed => {
+                            // Blackhole couldn't run. Interpreter continues
+                            // from the restored frame state.
+                        }
+                    }
+                }
+            }
             JitAction::Continue => {}
         }
     }
@@ -737,12 +776,8 @@ fn handle_jit_outcome(
             JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // RPython: guard failure → resume_in_blackhole → interprets
-            // from guard PC to loop header → ContinueRunningNormally.
-            // For now, fall through to interpreter. The blackhole merge
-            // point infrastructure is ready for when traces capture the
-            // correct loop body path.
-            JitAction::Continue
+            // RPython compile.py:710 handle_fail → resume_in_blackhole.
+            JitAction::ContinueRunningNormally
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
@@ -813,10 +848,10 @@ fn restore_guard_failure_for_loop(
         driver.meta_interp_mut().warm_state_mut().decay_counters();
         return None;
     }
-    // RPython resume_in_blackhole parity: bridge guard failures are
-    // restored normally (same as root guard failures). With all-Ref
-    // fail_arg types on bridge traces, restore correctly interprets
-    // all values as boxed Python object references.
+    // Preserve typed fail_args for blackhole resume (RPython parity:
+    // blackhole_from_resumedata loads from deadframe, not from frame).
+    LAST_GUARD_TYPED.with(|c| *c.borrow_mut() = Some(typed.clone()));
+
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_meta::majit_log_enabled() {
         eprintln!(
