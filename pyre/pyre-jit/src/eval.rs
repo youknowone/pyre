@@ -349,8 +349,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     {
                         return loop_result;
                     }
-                    // warmstate.py: counter reset only on trace start,
-                    // not on guard failure — immediate re-entry next tick.
+                    // TODO: remove this reset once blackhole resume data
+                    // properly materializes virtuals. Until then, the reset
+                    // prevents infinite trace→invalidate loops from null-ref
+                    // guard failures.
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .counter
+                        .reset(green_key);
                     if false {
                         pending_trace = Some((green_key, loop_header_pc));
                     }
@@ -766,6 +773,11 @@ fn restore_guard_failure_for_loop(
     }
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
     materialize_recovery_virtuals(&mut typed, exit_layout);
+    // After materialization, remaining null Ref slots represent
+    // virtual objects that couldn't be materialized. Invalidate
+    // compiled code so the loop re-traces. RPython handles this
+    // via proper resume data in the blackhole; until full resume
+    // parity, this conservative fallback prevents stale-state bugs.
     let has_null_ref = typed
         .iter()
         .skip(3)
@@ -787,6 +799,10 @@ fn restore_guard_failure_for_loop(
                 .clear_loop_token(key);
         }
         driver.invalidate_all_compiled();
+        // warmstate.py:429 decay_all_counters — after invalidation,
+        // decay counters so the loop doesn't immediately re-trace on
+        // every backedge tick.
+        driver.meta_interp_mut().warm_state_mut().decay_counters();
         return None;
     }
     // RPython resume_in_blackhole parity: bridge guard failures are
