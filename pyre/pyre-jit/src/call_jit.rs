@@ -1365,6 +1365,31 @@ pub fn jit_bridge_compile_for_guard(
         return;
     }
 
+    // RPython pyjitpl.py:3101 _prepare_exception_resumption +
+    // pyjitpl.py:3132 prepare_resume_from_failure parity:
+    // For exception guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION),
+    // emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start, then
+    // RESTORE_EXCEPTION before the guard. The exception class/value
+    // are read from the TLS exception state set by Cranelift codegen.
+    if driver.last_bridge_is_exception_guard {
+        let exc_class = majit_codegen_cranelift::jit_exc_class_raw();
+        let exc_value = majit_codegen_cranelift::jit_exc_value_raw();
+        if exc_class != 0 {
+            // RPython pyjitpl.py:3125-3126 + 3138:
+            // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
+            driver
+                .meta_interp_mut()
+                .emit_exception_bridge_prologue(exc_class, exc_value);
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
+                    exc_class, exc_value
+                );
+            }
+        }
+        driver.last_bridge_is_exception_guard = false;
+    }
+
     // pyjitpl.py:2841 interpret(): trace bytecodes from guard failure PC
     // until the bridge path terminates (Finish or CloseLoop).
     let mut trace_frame = Box::new(frame.snapshot_for_tracing());
