@@ -4333,7 +4333,7 @@ impl MIFrame {
         &mut self,
         iter: OpRef,
         concrete_iter: PyObjectRef,
-    ) -> Result<OpRef, PyError> {
+    ) -> Result<FrontendOp, PyError> {
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
             unsafe { (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).step };
@@ -4343,7 +4343,8 @@ impl MIFrame {
         let concrete_step_positive = concrete_step > 0;
         if concrete_continues {
             if concrete_current.checked_add(concrete_step).is_none() {
-                return self.trace_iter_next_value(iter);
+                let opref = self.trace_iter_next_value(iter)?;
+                return Ok(FrontendOp::opref_only(opref));
             }
         }
 
@@ -4366,7 +4367,7 @@ impl MIFrame {
 
             if !concrete_continues {
                 this.remember_value_type(zero, Type::Int);
-                return Ok(zero);
+                return Ok(FrontendOp::new(zero, ConcreteValue::Int(0)));
             }
 
             let next_current = ctx.record_op(OpCode::IntAddOvf, &[current, step]);
@@ -4377,7 +4378,10 @@ impl MIFrame {
             ctx.heap_cache_mut()
                 .setfield_cached(iter, ri_descr_idx, next_current);
             this.remember_value_type(current, Type::Int);
-            Ok(current)
+            Ok(FrontendOp::new(
+                current,
+                ConcreteValue::Int(concrete_current),
+            ))
         })
     }
 
@@ -5179,9 +5183,7 @@ impl IterOpcodeHandler for MIFrame {
 
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
         let concrete_iter = iter.concrete.to_pyobj();
-        let opref = MIFrame::iter_next_value(self, iter.opref, concrete_iter)?;
-        // iter_next returns the next int value from range iterator
-        Ok(FrontendOp::opref_only(opref))
+        MIFrame::iter_next_value(self, iter.opref, concrete_iter)
     }
 
     fn guard_optional_value(&mut self, next: Self::Value, continues: bool) -> Result<(), PyError> {
