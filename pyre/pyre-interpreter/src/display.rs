@@ -38,6 +38,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
 /// # Safety
 /// `obj` must be a valid pointer to a known Python object type.
 pub unsafe fn py_repr(obj: PyObjectRef) -> String {
+    let obj = crate::space::unwrap_cell(obj);
     if obj.is_null() {
         return "NULL".to_string();
     }
@@ -133,6 +134,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
 
 /// Format for str() — tries __str__ first, then __repr__.
 pub unsafe fn py_str(obj: PyObjectRef) -> String {
+    let obj = crate::space::unwrap_cell(obj);
     if obj.is_null() {
         return "NULL".to_string();
     }

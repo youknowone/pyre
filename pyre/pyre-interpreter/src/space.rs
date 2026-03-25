@@ -20,6 +20,23 @@ pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
 
+// ── Cell unwrap ──────────────────────────────────────────────────────
+// CPython 3.13 unified locals+cells means LoadFast can return cell
+// objects. All operations must transparently unwrap cells.
+// PyPy: each opcode implementation calls space.unwrap_cell() implicitly.
+
+/// Unwrap a cell object to its contents. Non-cells pass through.
+#[inline(always)]
+pub fn unwrap_cell(obj: PyObjectRef) -> PyObjectRef {
+    if !obj.is_null() && unsafe { is_cell(obj) } {
+        let inner = unsafe { w_cell_get(obj) };
+        if !inner.is_null() {
+            return inner;
+        }
+    }
+    obj
+}
+
 // ── BigInt helpers ──────────────────────────────────────────────────
 
 /// Extract a BigInt from an int or long object.
@@ -485,6 +502,8 @@ unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult>
 /// The JIT traces through this function, recording `GuardClass` on operand types.
 
 pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_add(a, b);
@@ -517,6 +536,8 @@ pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_sub(a, b);
@@ -539,6 +560,8 @@ pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_mul(a, b);
@@ -574,6 +597,8 @@ pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_floordiv(a, b);
@@ -596,6 +621,8 @@ pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_mod(a, b);
@@ -620,6 +647,8 @@ pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// True division (`/` operator) — always produces a float result.
 
 pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
@@ -640,6 +669,8 @@ pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Power operation dispatch (`**` operator).
 
 pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_pow(a, b);
@@ -664,6 +695,8 @@ pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Left shift dispatch (`<<` operator).
 
 pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_lshift(a, b);
@@ -685,6 +718,8 @@ pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Right shift dispatch (`>>` operator).
 
 pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_rshift(a, b);
@@ -706,6 +741,8 @@ pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Bitwise AND dispatch (`&` operator).
 
 pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_bitand(a, b);
@@ -727,6 +764,8 @@ pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_bitor(a, b);
@@ -748,6 +787,8 @@ pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Bitwise XOR dispatch (`^` operator).
 
 pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return int_bitxor(a, b);
@@ -769,6 +810,8 @@ pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Comparison operation dispatch.
 
 pub fn py_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    let a = unwrap_cell(a);
+    let b = unwrap_cell(b);
     unsafe {
         if is_int(a) && is_int(b) {
             return match op {
@@ -860,6 +903,7 @@ pub enum CompareOp {
 /// - int → nonzero
 
 pub fn py_is_true(obj: PyObjectRef) -> bool {
+    let obj = unwrap_cell(obj);
     unsafe {
         if is_bool(obj) {
             return w_bool_get_value(obj);
@@ -913,6 +957,7 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
 /// Unary negation.
 
 pub fn py_negative(a: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
     unsafe {
         if is_int(a) {
             let v = w_int_get_value(a);
@@ -941,6 +986,7 @@ pub fn py_negative(a: PyObjectRef) -> PyResult {
 /// Unary bitwise inversion.
 
 pub fn py_invert(a: PyObjectRef) -> PyResult {
+    let a = unwrap_cell(a);
     unsafe {
         if is_int(a) {
             return Ok(w_int_new(!w_int_get_value(a)));
@@ -965,6 +1011,8 @@ pub fn py_invert(a: PyObjectRef) -> PyResult {
 /// Dispatches based on the type of `obj`.
 
 pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    let index = unwrap_cell(index);
     unsafe {
         if is_list(obj) {
             if is_slice(index) {
@@ -1045,6 +1093,9 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 /// Set item by index: `obj[index] = value`.
 
 pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    let index = unwrap_cell(index);
+    let value = unwrap_cell(value);
     unsafe {
         if is_list(obj) {
             if !is_int(index) {
@@ -1128,6 +1179,7 @@ thread_local! {
 /// For other objects, looks up the attribute in the per-object side table.
 
 pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
+    let obj = unwrap_cell(obj);
     // Module objects: look up in module namespace
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
@@ -1501,6 +1553,8 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
 /// PyPy: descroperation.py descr__setattr__
 
 pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    let value = unwrap_cell(value);
     // Data descriptor __set__ takes priority (PyPy: descr__setattr__ step 1)
     unsafe {
         if is_instance(obj) {
