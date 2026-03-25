@@ -371,14 +371,10 @@ fn instruction_may_raise(instruction: Instruction) -> bool {
         instruction,
         // RPython exc=True: external calls and attribute access that
         // may invoke arbitrary Python code (__getattr__, descriptors).
-        // TODO: re-enable CALL guards when Cranelift backend fuses
-        // GUARD_NO_EXCEPTION into the preceding CALL (RPython backend
-        // handles this as a single fused check-after-call, not a
-        // separate guard instruction).
-        // Instruction::Call { .. }
-        //     | Instruction::CallKw { .. }
-        //     | Instruction::CallFunctionEx { .. }
-        Instruction::StoreAttr { .. }
+        Instruction::Call { .. }
+            | Instruction::CallKw { .. }
+            | Instruction::CallFunctionEx { .. }
+            | Instruction::StoreAttr { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::StoreSubscr
             | Instruction::DeleteSubscr
