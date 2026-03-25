@@ -1,7 +1,7 @@
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)
 # Ported for pyre: while-loop only, no range/list/enumerate
 
-DEFAULT_ARG = 10
+DEFAULT_ARG = 9
 
 def fannkuch(n):
     p = [0] * n
