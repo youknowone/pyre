@@ -62,6 +62,8 @@ pub struct CodeWriter {
     pub truth_fn: extern "C" fn(i64) -> i64,
     /// Load constant from frame's code object.
     pub load_const_fn: extern "C" fn(i64, i64) -> i64,
+    /// Store subscript: obj[key] = value.
+    pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
 }
 
 impl CodeWriter {
@@ -73,6 +75,7 @@ impl CodeWriter {
         box_int_fn: extern "C" fn(i64) -> i64,
         truth_fn: extern "C" fn(i64) -> i64,
         load_const_fn: extern "C" fn(i64, i64) -> i64,
+        store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
     ) -> Self {
         Self {
             call_fn,
@@ -82,6 +85,7 @@ impl CodeWriter {
             box_int_fn,
             truth_fn,
             load_const_fn,
+            store_subscr_fn,
         }
     }
 
@@ -124,6 +128,7 @@ impl CodeWriter {
         let box_int_fn_idx = assembler.add_fn_ptr(self.box_int_fn as *const ());
         let truth_fn_idx = assembler.add_fn_ptr(self.truth_fn as *const ());
         let load_const_fn_idx = assembler.add_fn_ptr(self.load_const_fn as *const ());
+        let store_subscr_fn_idx = assembler.add_fn_ptr(self.store_subscr_fn as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -201,6 +206,31 @@ impl CodeWriter {
                         obj_tmp0,
                     );
                     assembler.push_r(obj_tmp0);
+                }
+
+                // Superinstruction: two consecutive LoadFastBorrow
+                Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                    let pair = var_nums.get(op_arg);
+                    let reg_a = u32::from(pair.idx_1()) as u16;
+                    let reg_b = u32::from(pair.idx_2()) as u16;
+                    assembler.push_r(reg_a);
+                    assembler.push_r(reg_b);
+                }
+
+                // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
+                Instruction::StoreSubscr => {
+                    assembler.pop_r(obj_tmp1); // key
+                    assembler.pop_r(obj_tmp0); // obj
+                    // value is still on stack; pop to arg_regs_start
+                    assembler.pop_r(arg_regs_start);
+                    assembler.call_may_force_void_typed_args(
+                        store_subscr_fn_idx,
+                        &[
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_meta::jitcode::JitCallArg::reference(arg_regs_start),
+                        ],
+                    );
                 }
 
                 Instruction::PopTop => {

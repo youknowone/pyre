@@ -1328,7 +1328,7 @@ impl BlackholeInterpreter {
             | BC_CALL_LOOPINVARIANT_VOID
             | BC_CALL_ASSEMBLER_VOID => {
                 let fn_ptr_idx = self.next_u16() as usize;
-                let _dst = self.next_u16(); // ignored for void
+                // void calls have no dst field in bytecode (call_void_like encoding)
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
