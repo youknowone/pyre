@@ -315,6 +315,8 @@ pub(crate) struct MIFrame {
     sym: *mut PyreSym,
     ob_type_fd: DescrRef,
     fallthrough_pc: usize,
+    /// Concrete PyFrame address for exception table lookup.
+    concrete_frame_addr: usize,
     /// RPython pyjitpl.py orgpc parity: the PC at the START of the current
     /// opcode. All guards within one opcode capture this as their resume PC
     /// so that guard failure re-executes the opcode from the beginning.
@@ -1346,6 +1348,7 @@ impl MIFrame {
             sym,
             ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
+            concrete_frame_addr: concrete_frame,
             orgpc,
             parent_fail_args: None,
             parent_fail_arg_types: None,
@@ -4663,7 +4666,76 @@ impl MIFrame {
             s.pre_opcode_stack = None;
             s.pre_opcode_stack_types = None;
         }
-        self.into_trace_action(step_result)
+        match step_result {
+            Err(err) => {
+                let cf = self.concrete_frame_addr;
+                self.handle_possible_exception(code, pc, err, cf)
+            }
+            other => self.into_trace_action(other),
+        }
+    }
+
+    /// RPython pyjitpl.py:3380 handle_possible_exception.
+    pub(crate) fn handle_possible_exception(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        err: PyError,
+        concrete_frame_addr: usize,
+    ) -> TraceAction {
+        if let Some(entry) =
+            pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+        {
+            let handler_pc = entry.target as usize;
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][handle_possible_exception] pc={} handler={} err={}",
+                    pc, handler_pc, err
+                );
+            }
+            self.with_ctx(|this, ctx| {
+                this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+            });
+
+            let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interp::frame::PyFrame) };
+            let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
+            while frame.valuestackdepth > target_depth {
+                frame.pop();
+            }
+            if entry.push_lasti {
+                frame.push(w_int_new(pc as i64));
+            }
+            let exc_obj = err.to_exc_object();
+            frame.push(exc_obj);
+
+            let exc_opref = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
+            let sym = self.sym_mut();
+            let target_stack_only = target_depth.saturating_sub(sym.nlocals);
+            sym.symbolic_stack.truncate(target_stack_only);
+            sym.symbolic_stack_types.truncate(target_stack_only);
+            sym.concrete_stack.truncate(target_stack_only);
+            if entry.push_lasti {
+                sym.symbolic_stack.push(OpRef::NONE);
+                sym.symbolic_stack_types.push(Type::Ref);
+                sym.concrete_stack
+                    .push(ConcreteValue::Ref(w_int_new(pc as i64)));
+            }
+            sym.symbolic_stack.push(exc_opref);
+            sym.symbolic_stack_types.push(Type::Ref);
+            sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
+            sym.valuestackdepth = sym.nlocals + sym.symbolic_stack.len();
+            sym.pending_next_instr = Some(handler_pc);
+
+            TraceAction::Continue
+        } else {
+            if majit_meta::majit_log_enabled() {
+                eprintln!(
+                    "[jit][handle_possible_exception] no handler pc={} err={}",
+                    pc, err
+                );
+            }
+            TraceAction::Abort
+        }
     }
 
     pub(crate) fn trace_code_step_inline(
@@ -4703,14 +4775,14 @@ impl MIFrame {
         self.prepare_fallthrough();
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
         let action = match step_result {
-            // Inline finishframe() is not a top-level FINISH descriptor
-            // boundary. Preserve the traced value and its current symbolic
-            // type for the parent frame instead of coercing boxed ints to
-            // raw finish-protocol Ints.
             Ok(pyre_runtime::StepResult::Return(value)) => TraceAction::Finish {
                 finish_args: vec![value.opref],
                 finish_arg_types: vec![self.value_type(value.opref)],
             },
+            Err(err) => {
+                let cf = self.concrete_frame_addr;
+                self.handle_possible_exception(code, pc, err, cf)
+            }
             other => self.into_trace_action(other),
         };
         match action {
@@ -5650,15 +5722,6 @@ impl OpcodeStepExecutor for MIFrame {
     }
 
     /// LOAD_ATTR is_method=true — RPython LOOKUP_METHOD parity.
-    ///
-    /// For non-instance objects: traces normally as [attr, NULL].
-    /// For instances: abort trace — instance method calls require
-    /// LOOKUP_METHOD/CALL_METHOD IR semantics that change the effective
-    /// nargs seen by the trace. Changing nargs mid-trace corrupts the
-    /// virtualizable frame state (stack depth mismatch on guard failure).
-    ///
-    /// The loop falls back to the interpreter which handles self-binding
-    /// correctly via PyFrame::load_method/call overrides.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = SharedOpcodeHandler::pop_value(self)?;
         let concrete_obj = obj.concrete.to_pyobj();
@@ -5687,10 +5750,22 @@ impl OpcodeStepExecutor for MIFrame {
         )
     }
 
-    // No call() override — uses exec_call default (discard null_or_self).
-    // Instance method self-binding requires LOOKUP_METHOD/CALL_METHOD IR
-    // ops that change the effective nargs. Without dedicated IR support,
-    // changing nargs corrupts virtualizable frame state on guard failure.
+    /// RPython opimpl_raise (pyjitpl.py:1688).
+    fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
+        if argc == 0 {
+            return Err(PyError::runtime_error("bare raise during tracing"));
+        }
+        let _sym_exc = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        if argc >= 2 {
+            let _cause = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        }
+        Err(PyError::value_error("raised during tracing"))
+    }
+
+    /// RPython opimpl_reraise (pyjitpl.py:1701).
+    fn reraise(&mut self) -> Result<(), Self::Error> {
+        Err(PyError::runtime_error("reraise during tracing"))
+    }
 
     fn unsupported(
         &mut self,
