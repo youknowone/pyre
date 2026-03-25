@@ -2,8 +2,8 @@
 //!
 //! PyPy equivalent: pypy/module/sys/
 
+use crate::{PyNamespace, namespace_store};
 use pyre_object::*;
-use pyre_runtime::{PyNamespace, namespace_store};
 
 pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "maxsize", w_int_new(i64::MAX));

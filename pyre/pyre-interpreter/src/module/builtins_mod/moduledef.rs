@@ -5,10 +5,10 @@
 //! `import builtins` gives access to all builtin names.
 //! This module re-uses the default builtins namespace.
 
-use pyre_runtime::PyNamespace;
+use crate::PyNamespace;
 
 pub fn init(ns: &mut PyNamespace) {
     // Seed with all default builtins — same as the module-level namespace.
     // PyPy: __builtin__ module exposes the same names.
-    pyre_runtime::install_default_builtins(ns);
+    crate::install_default_builtins(ns);
 }

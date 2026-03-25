@@ -10,8 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 pyre-object = { workspace = true }
-pyre-runtime = { workspace = true }
 pyre-bytecode = { workspace = true }
-pyre-interp = { workspace = true }
+pyre-interpreter = { workspace = true }
 pyre-jit = { path = "../pyre-jit" }
 lexopt = "0.3"

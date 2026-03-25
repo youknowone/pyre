@@ -11,9 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::{PyExecutionContext, PyNamespace, namespace_load, namespace_store};
 use pyre_bytecode::{CodeObject, Mode, compile_source_with_filename};
 use pyre_object::*;
-use pyre_runtime::{PyExecutionContext, PyNamespace, namespace_load, namespace_store};
 
 use crate::eval::eval_frame_plain;
 use crate::frame::PyFrame;
@@ -219,7 +219,7 @@ fn exec_code_module(
     code: CodeObject,
     namespace: *mut PyNamespace,
     execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, pyre_runtime::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     let code_ptr = Box::into_raw(Box::new(code));
     let mut frame = PyFrame::new_with_namespace(code_ptr, execution_context, namespace);
     eval_frame_plain(&mut frame)
@@ -234,15 +234,15 @@ fn load_source_module(
     modulename: &str,
     pathname: &Path,
     execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, pyre_runtime::PyError> {
-    let source = std::fs::read_to_string(pathname).map_err(|e| pyre_runtime::PyError {
-        kind: pyre_runtime::PyErrorKind::ImportError,
+) -> Result<PyObjectRef, crate::PyError> {
+    let source = std::fs::read_to_string(pathname).map_err(|e| crate::PyError {
+        kind: crate::PyErrorKind::ImportError,
         message: format!("cannot read '{}': {e}", pathname.display()),
     })?;
 
     let pathname_str = pathname.to_string_lossy();
-    let code = parse_source_module(&pathname_str, &source).map_err(|e| pyre_runtime::PyError {
-        kind: pyre_runtime::PyErrorKind::ImportError,
+    let code = parse_source_module(&pathname_str, &source).map_err(|e| crate::PyError {
+        kind: crate::PyErrorKind::ImportError,
         message: format!("cannot compile '{}': {e}", pathname.display()),
     })?;
 
@@ -255,11 +255,11 @@ fn load_source_module(
 
     // Set __name__ in the module namespace (PyPy: Module.__init__ sets __name__)
     let name_obj = pyre_object::w_str_new(modulename);
-    pyre_runtime::namespace_store(&mut namespace, "__name__", name_obj);
+    crate::namespace_store(&mut namespace, "__name__", name_obj);
 
     // Set __file__ (PyPy: _prepare_module sets __file__)
     let file_obj = pyre_object::w_str_new(&pathname_str);
-    pyre_runtime::namespace_store(&mut namespace, "__file__", file_obj);
+    crate::namespace_store(&mut namespace, "__file__", file_obj);
 
     let ns_ptr = Box::into_raw(namespace);
     exec_code_module(code, ns_ptr, execution_context)?;
@@ -276,7 +276,7 @@ fn load_package(
     modulename: &str,
     dirpath: &Path,
     execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, pyre_runtime::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     let init_path = dirpath.join("__init__.py");
     let module = load_source_module(modulename, &init_path, execution_context)?;
 
@@ -285,7 +285,7 @@ fn load_package(
     let path_str = pyre_object::w_str_new(&dirpath.to_string_lossy());
     let path_list = pyre_object::w_list_new(vec![path_str]);
     unsafe {
-        pyre_runtime::namespace_store(&mut *ns_ptr, "__path__", path_list);
+        crate::namespace_store(&mut *ns_ptr, "__path__", path_list);
     }
 
     // Add package directory to sys.path for sub-imports
@@ -301,7 +301,7 @@ fn load_part(
     modulename: &str,
     partname: &str,
     execution_context: *const PyExecutionContext,
-) -> Result<Option<PyObjectRef>, pyre_runtime::PyError> {
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     // Check sys.modules cache first
     if let Some(cached) = check_sys_modules(modulename) {
         return Ok(Some(cached));
@@ -320,8 +320,8 @@ fn load_part(
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // PyPy: getbuiltinmodule() path
-            load_builtin_module(partname).ok_or_else(|| pyre_runtime::PyError {
-                kind: pyre_runtime::PyErrorKind::ImportError,
+            load_builtin_module(partname).ok_or_else(|| crate::PyError {
+                kind: crate::PyErrorKind::ImportError,
                 message: format!("builtin module '{modulename}' failed to initialize"),
             })?
         }
@@ -339,7 +339,7 @@ fn absolute_import(
     modulename: &str,
     w_fromlist: PyObjectRef,
     execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, pyre_runtime::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     let parts: Vec<&str> = modulename.split('.').collect();
     let mut first: Option<PyObjectRef> = None;
     let mut prefix = Vec::new();
@@ -349,8 +349,8 @@ fn absolute_import(
         let full_name = prefix.join(".");
         let w_mod = load_part(&full_name, part, execution_context)?;
         let Some(module) = w_mod else {
-            return Err(pyre_runtime::PyError {
-                kind: pyre_runtime::PyErrorKind::ImportError,
+            return Err(crate::PyError {
+                kind: crate::PyErrorKind::ImportError,
                 message: format!("No module named '{modulename}'"),
             });
         };
@@ -369,8 +369,8 @@ fn absolute_import(
     }
 
     // `import X.Y` → return the top-level module (X)
-    first.ok_or_else(|| pyre_runtime::PyError {
-        kind: pyre_runtime::PyErrorKind::ImportError,
+    first.ok_or_else(|| crate::PyError {
+        kind: crate::PyErrorKind::ImportError,
         message: format!("No module named '{modulename}'"),
     })
 }
@@ -387,10 +387,10 @@ pub fn importhook(
     w_fromlist: PyObjectRef,
     level: i64,
     execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, pyre_runtime::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     if name.is_empty() && level < 0 {
-        return Err(pyre_runtime::PyError {
-            kind: pyre_runtime::PyErrorKind::ValueError,
+        return Err(crate::PyError {
+            kind: crate::PyErrorKind::ValueError,
             message: "Empty module name".to_string(),
         });
     }
@@ -398,8 +398,8 @@ pub fn importhook(
     // Level 0 = absolute import (the common case)
     // Level > 0 = relative import (not yet supported)
     if level > 0 {
-        return Err(pyre_runtime::PyError {
-            kind: pyre_runtime::PyErrorKind::ImportError,
+        return Err(crate::PyError {
+            kind: crate::PyErrorKind::ImportError,
             message: format!("relative imports not yet supported (level={level})"),
         });
     }
@@ -412,7 +412,7 @@ pub fn importhook(
 //
 // Get an attribute from the module on TOS. Like `space.getattr(w_module, w_name)`.
 
-pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, pyre_runtime::PyError> {
+pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup)
     if unsafe { is_module(module) } {
         let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
@@ -425,10 +425,10 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, pyre_
     }
 
     // Fallback: try py_getattr (for non-module objects or attrs set via setattr)
-    match pyre_runtime::space::py_getattr(module, name) {
+    match crate::space::py_getattr(module, name) {
         Ok(value) => Ok(value),
-        Err(_) => Err(pyre_runtime::PyError {
-            kind: pyre_runtime::PyErrorKind::ImportError,
+        Err(_) => Err(crate::PyError {
+            kind: crate::PyErrorKind::ImportError,
             message: format!("cannot import name '{name}'"),
         }),
     }

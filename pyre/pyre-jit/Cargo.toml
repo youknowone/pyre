@@ -5,10 +5,9 @@ edition.workspace = true
 description = "Auto-generated JIT for pyre — rpython/jit/ equivalent"
 
 [dependencies]
-pyre-interp = { path = "../pyre-interp" }
-pyre-runtime = { path = "../pyre-runtime" }
 pyre-bytecode = { path = "../pyre-bytecode" }
 pyre-object = { path = "../pyre-object" }
+pyre-interpreter = { path = "../pyre-interpreter" }
 majit-ir = { path = "../../majit/majit-ir" }
 majit-meta = { path = "../../majit/majit-meta" }
 majit-codegen = { path = "../../majit/majit-codegen" }

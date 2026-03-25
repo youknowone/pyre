@@ -23,7 +23,7 @@ pub struct MetaInterpFrame {
     pub greenkey: Option<u64>,
     pub concrete_frame: usize,
     /// Box for heap stability across Vec reallocs.
-    pub owned_concrete_frame: Option<Box<pyre_interp::frame::PyFrame>>,
+    pub owned_concrete_frame: Option<Box<pyre_interpreter::frame::PyFrame>>,
     pub parent_fail_args: Vec<OpRef>,
     pub parent_fail_arg_types: Vec<Type>,
     pub drop_frame_opref: Option<OpRef>,
@@ -39,7 +39,7 @@ impl MetaInterpFrame {
 
     fn concrete_frame_addr(&self) -> usize {
         if let Some(ref cf) = self.owned_concrete_frame {
-            &**cf as *const pyre_interp::frame::PyFrame as usize
+            &**cf as *const pyre_interpreter::frame::PyFrame as usize
         } else {
             self.concrete_frame
         }
@@ -51,13 +51,13 @@ pub struct PyreMetaInterp {
     pub framestack: Vec<MetaInterpFrame>,
     pub portal_call_depth: i32,
     pub jitcode: *const CodeObject,
-    pub namespace: *mut pyre_runtime::PyNamespace,
-    inline_call_guard: Option<pyre_interp::call::InlineCallOverrideGuard>,
+    pub namespace: *mut pyre_interpreter::PyNamespace,
+    inline_call_guard: Option<pyre_interpreter::call::InlineCallOverrideGuard>,
     inline_trace_base: usize,
 }
 
 impl PyreMetaInterp {
-    pub fn new(jitcode: *const CodeObject, namespace: *mut pyre_runtime::PyNamespace) -> Self {
+    pub fn new(jitcode: *const CodeObject, namespace: *mut pyre_interpreter::PyNamespace) -> Self {
         Self {
             framestack: Vec::new(),
             portal_call_depth: -1,
@@ -242,7 +242,7 @@ impl PyreMetaInterp {
         caller_result_idx: Option<usize>,
     ) {
         if self.inline_call_guard.is_none() {
-            self.inline_call_guard = Some(pyre_interp::call::inline_call_override_guard());
+            self.inline_call_guard = Some(pyre_interpreter::call::inline_call_override_guard());
         }
 
         let (driver, _) = crate::eval::driver_pair();
@@ -253,7 +253,7 @@ impl PyreMetaInterp {
         let mut owned_sym = Box::new(pending.sym);
         let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
         let mut owned_cf = Box::new(pending.concrete_frame);
-        let cf_addr = &*owned_cf as *const pyre_interp::frame::PyFrame as usize;
+        let cf_addr = &*owned_cf as *const pyre_interpreter::frame::PyFrame as usize;
 
         let frame = MetaInterpFrame {
             sym: sym_ptr,
@@ -372,14 +372,14 @@ impl PyreMetaInterp {
 
         if let Instruction::Call { argc } = instruction {
             let nargs = argc.get(op_arg) as usize;
-            if pyre_interp::call::replay_pending_inline_call(cf, nargs) {
+            if pyre_interpreter::call::replay_pending_inline_call(cf, nargs) {
                 return;
             }
             let _ = super::state::execute_inline_residual_call(cf, nargs);
             return;
         }
 
-        let _ = pyre_runtime::execute_opcode_step(cf, code, instruction, op_arg, next);
+        let _ = pyre_interpreter::execute_opcode_step(cf, code, instruction, op_arg, next);
     }
 
     fn concrete_execute_return(&mut self) -> pyre_object::PyObjectRef {
@@ -399,8 +399,8 @@ impl PyreMetaInterp {
         cf.next_instr = ni + 1;
         let next = cf.next_instr;
 
-        match pyre_runtime::execute_opcode_step(cf, code, instruction, op_arg, next) {
-            Ok(pyre_runtime::StepResult::Return(value)) => materialize_pending_inline_result(
+        match pyre_interpreter::execute_opcode_step(cf, code, instruction, op_arg, next) {
+            Ok(pyre_interpreter::StepResult::Return(value)) => materialize_pending_inline_result(
                 pending_inline_result_from_concrete(Type::Ref, value),
             ),
             _ => pyre_object::PY_NULL,
@@ -435,7 +435,7 @@ enum LoopAction {
 pub(crate) fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
     let mut next_pc = pc.saturating_add(1);
     loop {
-        match pyre_runtime::decode_instruction_at(code, next_pc) {
+        match pyre_interpreter::decode_instruction_at(code, next_pc) {
             Some((
                 Instruction::ExtendedArg
                 | Instruction::Resume { .. }

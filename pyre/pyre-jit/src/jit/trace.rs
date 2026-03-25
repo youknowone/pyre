@@ -22,13 +22,13 @@ pub fn trace_bytecode(
     sym: &mut PyreSym,
     code: &CodeObject,
     start_pc: usize,
-    mut concrete_frame: Box<pyre_interp::frame::PyFrame>,
-) -> (TraceAction, Box<pyre_interp::frame::PyFrame>) {
+    mut concrete_frame: Box<pyre_interpreter::frame::PyFrame>,
+) -> (TraceAction, Box<pyre_interpreter::frame::PyFrame>) {
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
     concrete_frame.next_instr = start_pc;
-    let cf_addr = &*concrete_frame as *const pyre_interp::frame::PyFrame as usize;
+    let cf_addr = &*concrete_frame as *const pyre_interpreter::frame::PyFrame as usize;
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
@@ -102,7 +102,7 @@ mod tests {
     use crate::jit::metainterp::semantic_fallthrough_pc;
     use pyre_bytecode::bytecode::Instruction;
     use pyre_bytecode::compile_exec;
-    use pyre_runtime::decode_instruction_at;
+    use pyre_interpreter::decode_instruction_at;
 
     #[test]
     fn test_semantic_fallthrough_pc_skips_branch_trivia() {

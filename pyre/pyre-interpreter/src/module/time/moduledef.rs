@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/module/time/moduledef.py
 
-use pyre_runtime::{PyNamespace, namespace_store, w_builtin_func_new};
+use crate::{PyNamespace, namespace_store, w_builtin_func_new};
 
 use super::interp_time;
 

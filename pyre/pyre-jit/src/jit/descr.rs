@@ -262,6 +262,7 @@ pub fn make_array_descr(
 
 // ── Range iterator field descriptors ─────────────────────────────────
 
+use pyre_interpreter::{PYNAMESPACE_VALUES_LEN_OFFSET, PYNAMESPACE_VALUES_OFFSET};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::OB_TYPE_OFFSET;
@@ -274,7 +275,6 @@ use pyre_object::{
     INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
     W_ListObject, W_TupleObject,
 };
-use pyre_runtime::{PYNAMESPACE_VALUES_LEN_OFFSET, PYNAMESPACE_VALUES_OFFSET};
 
 /// Field descriptor for `W_RangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {

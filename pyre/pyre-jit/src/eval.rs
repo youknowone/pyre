@@ -9,9 +9,9 @@
 
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
-use pyre_interp::frame::PyFrame;
+use pyre_interpreter::frame::PyFrame;
+use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
 use pyre_object::w_none;
-use pyre_runtime::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashSet;
 
@@ -93,7 +93,7 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
 #[inline(always)]
 fn call_depth() -> u32 {
-    pyre_interp::call::call_depth()
+    pyre_interpreter::call::call_depth()
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -111,13 +111,13 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
 /// registered after compilation so GUARD_NOT_INVALIDATED fails when
 /// the namespace mutates.
 thread_local! {
-    static TRACING_NAMESPACE_DEPS: std::cell::RefCell<Vec<*mut pyre_runtime::PyNamespace>> =
+    static TRACING_NAMESPACE_DEPS: std::cell::RefCell<Vec<*mut pyre_interpreter::PyNamespace>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Record a namespace dependency during tracing.
 /// Called from load_name_value when a function is constant-folded.
-pub fn record_namespace_dependency(ns: *mut pyre_runtime::PyNamespace) {
+pub fn record_namespace_dependency(ns: *mut pyre_interpreter::PyNamespace) {
     TRACING_NAMESPACE_DEPS.with(|c| {
         let mut deps = c.borrow_mut();
         if !deps.contains(&ns) {
@@ -127,7 +127,7 @@ pub fn record_namespace_dependency(ns: *mut pyre_runtime::PyNamespace) {
 }
 
 /// Take all recorded namespace dependencies (clears the list).
-fn take_namespace_deps() -> Vec<*mut pyre_runtime::PyNamespace> {
+fn take_namespace_deps() -> Vec<*mut pyre_interpreter::PyNamespace> {
     TRACING_NAMESPACE_DEPS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
@@ -159,8 +159,8 @@ fn stack_almost_full() -> bool {
 ///
 /// This is the main entry point for pyre-jit.
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
-    pyre_interp::call::register_eval_override(eval_with_jit);
-    pyre_interp::call::register_inline_call_override(
+    pyre_interpreter::call::register_eval_override(eval_with_jit);
+    pyre_interpreter::call::register_inline_call_override(
         crate::call_jit::maybe_handle_inline_concrete_call,
     );
     crate::call_jit::install_jit_call_bridge();
@@ -174,7 +174,7 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            return pyre_interp::eval::eval_frame_plain(frame);
+            return pyre_interpreter::eval::eval_frame_plain(frame);
         }
     }
 
@@ -267,7 +267,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame.next_instr;
-        let Some((instruction, op_arg)) = pyre_runtime::decode_instruction_at(code, pc) else {
+        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
             return LoopResult::Done(Ok(w_none()));
         };
 
@@ -319,7 +319,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
             if !frame.pending_inline_results.is_empty() {
                 frame.next_instr = pc + 1;
-                if pyre_interp::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
+                if pyre_interpreter::call::replay_pending_inline_call(
+                    frame,
+                    argc.get(op_arg) as usize,
+                ) {
                     continue;
                 }
                 frame.next_instr = pc;
@@ -330,7 +333,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
         if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
-            if pyre_interp::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize) {
+            if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
+            {
                 continue;
             }
         }
@@ -372,7 +376,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
             Err(err) => {
-                if pyre_interp::eval::handle_exception(frame, &err) {
+                if pyre_interpreter::eval::handle_exception(frame, &err) {
                     continue;
                 }
                 return LoopResult::Done(Err(err));
@@ -700,7 +704,7 @@ fn handle_jit_outcome(
                 );
             }
             let [value] = typed_values.as_slice() else {
-                return JitAction::Return(Err(pyre_runtime::PyError::type_error(
+                return JitAction::Return(Err(pyre_interpreter::PyError::type_error(
                     "compiled finish did not produce a single object return value",
                 )));
             };
@@ -721,7 +725,7 @@ fn handle_jit_outcome(
                     pyre_object::floatobject::w_float_new(*f)
                 }
                 majit_ir::Value::Void => {
-                    return JitAction::Return(Err(pyre_runtime::PyError::type_error(
+                    return JitAction::Return(Err(pyre_interpreter::PyError::type_error(
                         "compiled finish produced a void return value",
                     )));
                 }
@@ -1024,7 +1028,7 @@ fn sync_jit_state_to_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_runtime::{is_func, w_func_get_code_ptr};
+    use pyre_interpreter::{is_func, w_func_get_code_ptr};
 
     #[test]
     fn test_eval_simple_addition() {

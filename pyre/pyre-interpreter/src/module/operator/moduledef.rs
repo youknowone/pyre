@@ -2,8 +2,8 @@
 //!
 //! PyPy equivalent: pypy/module/operator/
 
+use crate::{PyNamespace, namespace_store, w_builtin_func_new};
 use pyre_object::*;
-use pyre_runtime::{PyNamespace, namespace_store, w_builtin_func_new};
 
 fn op_index(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 1, "index() takes exactly one argument");
@@ -17,40 +17,37 @@ fn op_index(args: &[PyObjectRef]) -> PyObjectRef {
         }
     }
     // Try __index__ dunder
-    pyre_runtime::space_call_function_or_identity(obj, "__index__")
+    crate::space_call_function_or_identity(obj, "__index__")
 }
 
 fn op_add(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_add(args[0], args[1]).unwrap_or(w_none())
+    crate::space::py_add(args[0], args[1]).unwrap_or(w_none())
 }
 
 fn op_sub(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_sub(args[0], args[1]).unwrap_or(w_none())
+    crate::space::py_sub(args[0], args[1]).unwrap_or(w_none())
 }
 
 fn op_mul(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_mul(args[0], args[1]).unwrap_or(w_none())
+    crate::space::py_mul(args[0], args[1]).unwrap_or(w_none())
 }
 
 fn op_eq(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_compare(args[0], args[1], pyre_runtime::space::CompareOp::Eq)
-        .unwrap_or(w_none())
+    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq).unwrap_or(w_none())
 }
 
 fn op_lt(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_compare(args[0], args[1], pyre_runtime::space::CompareOp::Lt)
-        .unwrap_or(w_none())
+    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Lt).unwrap_or(w_none())
 }
 
 fn op_gt(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2);
-    pyre_runtime::space::py_compare(args[0], args[1], pyre_runtime::space::CompareOp::Gt)
-        .unwrap_or(w_none())
+    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Gt).unwrap_or(w_none())
 }
 
 pub fn init(ns: &mut PyNamespace) {
