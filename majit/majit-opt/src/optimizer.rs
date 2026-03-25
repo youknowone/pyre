@@ -896,10 +896,9 @@ impl Optimizer {
             ctx.emit(op);
         }
 
-        // RPython parity: store_final_boxes_in_guard — expand fail_args
+        // RPython optimizer.py: store_final_boxes_in_guard — expand fail_args
         // with virtual field values and record blueprints in rd_virtuals.
-        // TODO: re-enable when cranelift backend handles extended fail_args.
-        // self.store_final_boxes_in_guard(&mut guard_op, ctx);
+        self.store_final_boxes_in_guard(&mut guard_op, ctx);
 
         // Store this guard as the new sharing source
         let emitted = ctx.emit(guard_op.clone());
