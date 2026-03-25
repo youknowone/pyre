@@ -349,14 +349,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     }
                     // RPython warmstate.py bound_reached: no counter reset
                     // after guard failure — blackhole handles immediate re-entry.
-                    // Reset only when compiled loop was invalidated.
-                    if !driver.has_compiled_loop(green_key) {
-                        driver
-                            .meta_interp_mut()
-                            .warm_state_mut()
-                            .counter
-                            .reset(green_key);
-                    }
+                    // Blocked: counter reset needed until blackhole is active.
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .counter
+                        .reset(green_key);
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
@@ -772,7 +770,10 @@ fn handle_jit_outcome(
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
             // RPython compile.py:710 handle_fail → resume_in_blackhole.
-            JitAction::ContinueRunningNormally
+            // Blocked: typed_values[1] contains caller's ni, not callee's.
+            // Fix the resume PC encoding in trace compiler, then activate:
+            // JitAction::ContinueRunningNormally
+            JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
