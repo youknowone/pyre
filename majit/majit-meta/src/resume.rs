@@ -14,15 +14,36 @@ use majit_codegen::{
 };
 use majit_ir::{GcRef, Type};
 
+// RPython resume.py:94-126 parity — tag encoding.
 const TAG_MASK: i64 = 0b11;
-const TAG_CONST: i64 = 0;
-const TAG_INT: i64 = 1;
-const TAG_FAILARG: i64 = 2;
-const TAG_VIRTUAL: i64 = 3;
+/// TAGCONST = 0: constant pool index.
+const TAGCONST: i64 = 0;
+/// TAGINT = 1: inline small integer.
+const TAGINT: i64 = 1;
+/// TAGBOX = 2: live box reference (fail_args index).
+const TAGBOX: i64 = 2;
+/// TAGVIRTUAL = 3: virtual object index.
+const TAGVIRTUAL: i64 = 3;
 
-// RPython uses CONST-tagged sentinels for special states like UNINITIALIZED.
+// RPython resume.py:128-132 — special tagged sentinels.
+/// tag(-1 << 13, TAGBOX) in RPython. We use a wider range.
+const UNASSIGNED: i64 = tag_const(-(1 << 60), TAGBOX);
+/// tag(-1 << 13, TAGVIRTUAL) in RPython.
+const UNASSIGNEDVIRTUAL: i64 = tag_const(-(1 << 60), TAGVIRTUAL);
+/// tag(-1, TAGCONST) — null reference.
+const NULLREF: i64 = tag_const(-1, TAGCONST);
+/// tag(-2, TAGCONST) — uninitialized slot.
+const UNINITIALIZED: i64 = tag_const(-2, TAGCONST);
+const TAG_CONST_OFFSET: i64 = 0;
+
+// Legacy names for existing code.
 const ENCODED_UNINITIALIZED: i64 = -2;
 const ENCODED_UNAVAILABLE: i64 = -3;
+
+/// Const fn version of tag for use in const declarations.
+const fn tag_const(value: i64, tagbits: i64) -> i64 {
+    (value << 2) | tagbits
+}
 
 // Two low bits are reserved for the tag.
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
@@ -688,17 +709,31 @@ fn can_inline_tagged(value: i64) -> bool {
     (INLINE_TAGGED_MIN..=INLINE_TAGGED_MAX).contains(&value)
 }
 
-fn tag_value(value: i64, tag: i64) -> i64 {
-    assert!((TAG_CONST..=TAG_VIRTUAL).contains(&tag));
-    assert!(
+/// RPython resume.py:99 tag(value, tagbits).
+/// Encode value + tag into a single i64 (RPython uses i16).
+fn tag(value: i64, tagbits: i64) -> i64 {
+    debug_assert!((TAGCONST..=TAGVIRTUAL).contains(&tagbits));
+    debug_assert!(
         can_inline_tagged(value),
         "tagged resume value {value} exceeds inline range"
     );
-    (value << 2) | tag
+    (value << 2) | tagbits
 }
 
-fn untag_value(encoded: i64) -> (i64, i64) {
+/// RPython resume.py:106 untag(value).
+/// Decode (value, tagbits) from a tagged i64.
+fn untag(encoded: i64) -> (i64, i64) {
     (encoded >> 2, encoded & TAG_MASK)
+}
+
+// Legacy aliases for existing callers.
+#[inline]
+fn tag_value(value: i64, tagbits: i64) -> i64 {
+    tag(value, tagbits)
+}
+#[inline]
+fn untag_value(encoded: i64) -> (i64, i64) {
+    untag(encoded)
 }
 
 fn encode_len(value: usize) -> i64 {
@@ -1162,10 +1197,10 @@ impl EncodedResumeData {
                     next_index
                 });
                 *num_fail_args = fail_arg_positions.len();
-                tag_value(encode_len(compact_index), TAG_FAILARG)
+                tag_value(encode_len(compact_index), TAGBOX)
             }
             ResumeValueSource::Constant(value) if can_inline_tagged(*value) => {
-                tag_value(*value, TAG_INT)
+                tag_value(*value, TAGINT)
             }
             ResumeValueSource::Constant(value) => {
                 let next_index = consts.len();
@@ -1173,11 +1208,11 @@ impl EncodedResumeData {
                     consts.push(*value);
                     next_index
                 });
-                tag_value(encode_len(index), TAG_CONST)
+                tag_value(encode_len(index), TAGCONST)
             }
-            ResumeValueSource::Virtual(index) => tag_value(encode_len(*index), TAG_VIRTUAL),
-            ResumeValueSource::Uninitialized => tag_value(ENCODED_UNINITIALIZED, TAG_CONST),
-            ResumeValueSource::Unavailable => tag_value(ENCODED_UNAVAILABLE, TAG_CONST),
+            ResumeValueSource::Virtual(index) => tag_value(encode_len(*index), TAGVIRTUAL),
+            ResumeValueSource::Uninitialized => tag_value(ENCODED_UNINITIALIZED, TAGCONST),
+            ResumeValueSource::Unavailable => tag_value(ENCODED_UNAVAILABLE, TAGCONST),
         }
     }
 
@@ -1373,8 +1408,8 @@ impl EncodedResumeData {
     fn decode_source(&self, encoded: i64) -> ResumeValueSource {
         let (value, tag) = untag_value(encoded);
         match tag {
-            TAG_INT => ResumeValueSource::Constant(value),
-            TAG_FAILARG => {
+            TAGINT => ResumeValueSource::Constant(value),
+            TAGBOX => {
                 let compact_index = decode_len(value);
                 let raw_index = *self
                     .fail_arg_positions
@@ -1382,8 +1417,8 @@ impl EncodedResumeData {
                     .expect("resume fail-arg position out of bounds");
                 ResumeValueSource::FailArg(raw_index)
             }
-            TAG_VIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
-            TAG_CONST => match value {
+            TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
+            TAGCONST => match value {
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
                 index if index >= 0 => ResumeValueSource::Constant(
@@ -2646,14 +2681,14 @@ mod tests {
 
         // Header: [size, fail_arg_count, num_frames, pc, slot_count, ...slots]
         let slot_words = &encoded.code[5..10];
-        assert_eq!(untag_value(slot_words[0]), (0, TAG_FAILARG));
-        assert_eq!(untag_value(slot_words[1]), (7, TAG_INT));
-        assert_eq!(untag_value(slot_words[2]), (1, TAG_VIRTUAL));
+        assert_eq!(untag_value(slot_words[0]), (0, TAGBOX));
+        assert_eq!(untag_value(slot_words[1]), (7, TAGINT));
+        assert_eq!(untag_value(slot_words[2]), (1, TAGVIRTUAL));
         assert_eq!(
             untag_value(slot_words[3]),
-            (ENCODED_UNINITIALIZED, TAG_CONST)
+            (ENCODED_UNINITIALIZED, TAGCONST)
         );
-        assert_eq!(untag_value(slot_words[4]), (ENCODED_UNAVAILABLE, TAG_CONST));
+        assert_eq!(untag_value(slot_words[4]), (ENCODED_UNAVAILABLE, TAGCONST));
     }
 
     #[test]
@@ -3222,7 +3257,7 @@ mod tests {
 
     #[test]
     fn test_encode_inline_vs_pool_constants() {
-        // Small constant: should be inlined with TAG_INT
+        // Small constant: should be inlined with TAGINT
         let rd_small = ResumeData {
             frames: vec![FrameInfo {
                 pc: 0,
@@ -3322,7 +3357,7 @@ mod tests {
 
         // 42 is small enough to be inlined, so pool should be empty
         // unless it exceeds the inline range. For small values, both
-        // guards use TAG_INT, so the pool stays at 0.
+        // guards use TAGINT, so the pool stays at 0.
         assert_eq!(pool_size_1, 0);
         assert_eq!(pool_size_2, 0);
 
