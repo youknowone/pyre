@@ -1848,17 +1848,24 @@ impl MIFrame {
     /// For bridge traces with a pre-opcode snapshot, uses orgpc + the saved
     /// stack state so guard failure re-executes the opcode with correct stack.
     /// Root loop traces continue using fallthrough_pc (original behavior).
+    /// RPython capture_resumedata(resumepc) parity.
+    ///
+    /// pyre uses stack machine semantics (not SSA registers like RPython),
+    /// so the resume PC must be the instruction AFTER the current opcode
+    /// (fallthrough_pc), not orgpc. The stack state in fail_args reflects
+    /// the post-opcode state, so resuming at fallthrough_pc is correct.
+    ///
+    /// For bridge traces with pre-opcode snapshot, use orgpc + pre-opcode
+    /// stack state to re-execute the opcode on guard failure.
     fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
         let has_snapshot = self.sym().pre_opcode_vsd.is_some();
         if has_snapshot {
-            // Bridge trace: use orgpc and pre-opcode stack state
             let resume_pc = self.orgpc;
             let pre_vsd = self.sym().pre_opcode_vsd.unwrap();
             let s = self.sym_mut();
             s.vable_next_instr = ctx.const_int(resume_pc as i64);
             s.vable_valuestackdepth = ctx.const_int(pre_vsd as i64);
         } else {
-            // Root loop: use fallthrough_pc (original behavior)
             self.flush_to_frame(ctx);
         }
     }
