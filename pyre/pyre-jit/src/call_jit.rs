@@ -582,6 +582,7 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh_box_int_fn,
         bh_truth_fn,
         bh_load_const_fn,
+        bh_store_subscr_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -696,6 +697,7 @@ pub fn resume_in_blackhole_from_fail_args(
         bh_box_int_fn,
         bh_truth_fn,
         bh_load_const_fn,
+        bh_store_subscr_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -756,20 +758,7 @@ pub fn resume_in_blackhole_from_fail_args(
         bh.setarg_i(3, frame as *mut PyFrame as i64);
     }
 
-    // Only run the blackhole if the guard PC is inside the same loop
-    // body as the merge point. The blackhole must reach the merge point
-    // via a single backedge within the same loop iteration.
-    // Heuristic: if the distance between guard_pc and merge_pc is too
-    // large, the guard is in a different loop level (e.g., outer loop
-    // vs inner loop merge point) and blackhole would run through the
-    // wrong scope.
-    // TODO: RPython uses proper resume data to determine if the blackhole
-    // can safely reach the merge point. Until we have that, disable
-    // blackhole execution when it would have side effects beyond the
-    // merge point (DoneWithThisFrame path). Only enable for loops where
-    // we're confident the backedge reaches the merge point within the
-    // same loop body.
-    let in_same_loop = false; // Disabled until blackhole execution is fully correct
+    let in_same_loop = guard_py_pc > merge_py_pc;
     if !in_same_loop {
         if majit_meta::majit_log_enabled() {
             eprintln!(
@@ -842,6 +831,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
         bh_box_int_fn,
         bh_truth_fn,
         bh_load_const_fn,
+        bh_store_subscr_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -2030,4 +2020,16 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
+}
+
+/// STORE_SUBSCR: obj[key] = value.
+pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
+    let obj = obj as pyre_object::PyObjectRef;
+    let key = key as pyre_object::PyObjectRef;
+    let value = value as pyre_object::PyObjectRef;
+    if obj.is_null() || key.is_null() {
+        return 0;
+    }
+    let _ = pyre_interpreter::space::py_setitem(obj, key, value);
+    0
 }
