@@ -74,3 +74,21 @@ pub fn space_call_function(
     }
     panic!("space_call_function: no implementation registered and callable is not a builtin");
 }
+
+/// Try calling `obj.__dunder__()`, return obj itself if dunder not found.
+///
+/// Used by operator.index() etc.
+pub fn space_call_function_or_identity(
+    obj: pyre_object::PyObjectRef,
+    dunder: &str,
+) -> pyre_object::PyObjectRef {
+    unsafe {
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            if let Some(method) = space::lookup_in_type_mro_pub(w_type, dunder) {
+                return space_call_function(method, &[obj]);
+            }
+        }
+    }
+    obj
+}
