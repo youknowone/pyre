@@ -27,6 +27,7 @@ mod jit_state;
 pub mod jitcode;
 mod jitdriver;
 pub mod jitexc;
+pub mod jitframe;
 pub mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
