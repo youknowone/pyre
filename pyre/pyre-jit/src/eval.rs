@@ -349,11 +349,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     {
                         return loop_result;
                     }
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .counter
-                        .reset(green_key);
+                    // warmstate.py: counter reset only on trace start,
+                    // not on guard failure — immediate re-entry next tick.
                     if false {
                         pending_trace = Some((green_key, loop_header_pc));
                     }
@@ -719,11 +716,9 @@ fn handle_jit_outcome(
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
             // RPython: guard failure → resume_in_blackhole → interprets
             // from guard PC to loop header → ContinueRunningNormally.
-            // pyre skips the blackhole step: frame is already restored,
-            // eval_loop_jit continues from the restored PC with JIT hooks.
-            // This is equivalent because the next back-edge will trigger
-            // can_enter_jit normally.
-            let _ = frame;
+            // For now, fall through to interpreter. The blackhole merge
+            // point infrastructure is ready for when traces capture the
+            // correct loop body path.
             JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure {

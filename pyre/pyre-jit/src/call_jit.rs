@@ -606,6 +606,107 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     result
 }
 
+/// bhimpl_jit_merge_point parity: run the blackhole from `guard_py_pc`
+/// until it reaches `merge_py_pc` (the loop header). On success, writes
+/// back the blackhole register state into the frame and returns true.
+///
+/// This implements the RPython flow:
+///   guard fail → resume_in_blackhole → jit_merge_point → ContinueRunningNormally
+pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usize) -> bool {
+    let code = unsafe { &*frame.code };
+    let py_pc = frame.next_instr;
+
+    let writer = crate::jit::codewriter::CodeWriter::new(
+        bh_call_fn,
+        bh_load_global_fn,
+        bh_compare_fn,
+        bh_binary_op_fn,
+        bh_box_int_fn,
+        bh_truth_fn,
+    );
+    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+
+    let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
+        pyjitcode.pc_map[py_pc]
+    } else {
+        return false;
+    };
+    let merge_jitcode_pc = if merge_py_pc < pyjitcode.pc_map.len() {
+        pyjitcode.pc_map[merge_py_pc]
+    } else {
+        return false;
+    };
+
+    thread_local! {
+        static BH_BUILDER2: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+    }
+    let builder = BH_BUILDER2.with(|cell| unsafe { &mut *cell.get() });
+    let mut bh = builder.acquire_interp();
+    bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+    bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
+
+    let nlocals = code.varnames.len();
+    for i in 0..nlocals {
+        if i < frame.locals_cells_stack_w.len() {
+            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
+        }
+    }
+    let stack_base = nlocals;
+    let vsd = frame.valuestackdepth;
+    for i in stack_base..vsd {
+        if i < frame.locals_cells_stack_w.len() {
+            bh.runtime_stack_push(0, frame.locals_cells_stack_w[i] as i64);
+        }
+    }
+    if nlocals + 3 < bh.registers_i.len() {
+        bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
+    }
+
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][blackhole-merge] guard_pc={} merge_pc={} jit_pc={} merge_jit_pc={}",
+            py_pc, merge_py_pc, jitcode_pc, merge_jitcode_pc,
+        );
+    }
+
+    bh.run();
+
+    if !bh.reached_merge_point {
+        // Blackhole finished without reaching merge point (RETURN_VALUE
+        // or exception). Frame state is stale — caller should not use it.
+        builder.release_interp(bh);
+        return false;
+    }
+
+    // Write back blackhole register state → frame locals.
+    for i in 0..nlocals {
+        if i < bh.registers_i.len() && i < frame.locals_cells_stack_w.len() {
+            frame.locals_cells_stack_w[i] = bh.registers_i[i] as pyre_object::PyObjectRef;
+        }
+    }
+    // Write back runtime stack → frame value stack.
+    let stack = bh.runtime_stack_drain(0);
+    frame.valuestackdepth = nlocals + stack.len();
+    for (i, val) in stack.iter().enumerate() {
+        let idx = nlocals + i;
+        if idx < frame.locals_cells_stack_w.len() {
+            frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
+        }
+    }
+    frame.next_instr = merge_py_pc;
+
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][blackhole-merge] reached merge point, frame.next_instr={}",
+            frame.next_instr,
+        );
+    }
+
+    builder.release_interp(bh);
+    true
+}
+
 /// Interpreter-only force without memoization.
 ///
 /// Used by the fused raw-int recursive helper, which already maintains

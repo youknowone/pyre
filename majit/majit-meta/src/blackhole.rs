@@ -759,6 +759,13 @@ pub struct BlackholeInterpreter {
     runtime_stacks: HashMap<usize, Vec<i64>>,
     /// Current selected storage index.
     current_selected: usize,
+    /// RPython bhimpl_jit_merge_point parity: when set, BC_JUMP targeting
+    /// this JitCode PC exits the blackhole with ContinueRunningNormally
+    /// instead of looping. The outermost blackhole frame uses this to
+    /// hand control back to the JIT dispatch loop at the merge point.
+    pub merge_point_jitcode_pc: Option<usize>,
+    /// Set to true when `run()` exited via merge point (not LeaveFrame).
+    pub reached_merge_point: bool,
 }
 
 impl Default for BlackholeInterpreter {
@@ -782,6 +789,8 @@ impl BlackholeInterpreter {
             return_type: BhReturnType::Void,
             runtime_stacks: HashMap::new(),
             current_selected: 0,
+            merge_point_jitcode_pc: None,
+            reached_merge_point: false,
         }
     }
 
@@ -924,6 +933,12 @@ impl BlackholeInterpreter {
 
     fn runtime_stack_len(&self, selected: usize) -> usize {
         self.runtime_stacks.get(&selected).map_or(0, |s| s.len())
+    }
+
+    /// Drain the runtime stack for the given selected index, returning
+    /// all values in order (bottom → top).
+    pub fn runtime_stack_drain(&mut self, selected: usize) -> Vec<i64> {
+        self.runtime_stacks.remove(&selected).unwrap_or_default()
     }
 
     // -- Call argument reading --
@@ -1183,6 +1198,14 @@ impl BlackholeInterpreter {
             }
             BC_JUMP => {
                 let target = self.next_u16() as usize;
+                // bhimpl_jit_merge_point parity: if this jump targets the
+                // merge point, exit the blackhole so the JIT dispatch loop
+                // can re-enter compiled code (ContinueRunningNormally).
+                if self.merge_point_jitcode_pc == Some(target) {
+                    self.position = target;
+                    self.reached_merge_point = true;
+                    return Err(LeaveFrame);
+                }
                 self.position = target;
             }
             BC_JUMP_TARGET => {
