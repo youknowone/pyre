@@ -51,10 +51,11 @@ pub enum CompileOutcome {
     Compiled {
         cut_header_pc: Option<usize>,
         green_key: u64,
-        /// True when compilation went through the InvalidLoop retry path
-        /// (simple optimizer without unrolling). The resulting code may
-        /// have guards that always fail, so callers should not update
-        /// merge_pc to enable entry.
+        /// RPython: no equivalent — blackhole handles guard failures from
+        /// retry-compiled code. In pyre, the blackhole Finished path is not
+        /// yet correct, so retry-compiled code with always-failing guards
+        /// must not have merge_pc updated (would cause tight guard-fail loops).
+        /// Remove once blackhole DoneWithThisFrame is fully implemented.
         from_retry: bool,
     },
     /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).

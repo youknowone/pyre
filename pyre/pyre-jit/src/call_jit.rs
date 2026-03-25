@@ -654,7 +654,7 @@ pub enum BlackholeResult {
     /// bhimpl_jit_merge_point → ContinueRunningNormally.
     MergePoint,
     /// DoneWithThisFrame: blackhole ran to RETURN_VALUE.
-    Finished(pyre_runtime::PyResult),
+    Finished(PyResult),
     /// Blackhole couldn't run (bad PC mapping etc).
     Failed,
 }
