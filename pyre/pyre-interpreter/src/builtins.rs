@@ -183,24 +183,10 @@ fn builtin_range(args: &[PyObjectRef]) -> PyObjectRef {
 }
 
 /// `len(obj)` — return the length of an object.
+/// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 1, "len() takes exactly one argument");
-    let obj = args[0];
-    unsafe {
-        if is_list(obj) {
-            return w_int_new(w_list_len(obj) as i64);
-        }
-        if is_tuple(obj) {
-            return w_int_new(w_tuple_len(obj) as i64);
-        }
-        if is_dict(obj) {
-            return w_int_new(w_dict_len(obj) as i64);
-        }
-        if is_str(obj) {
-            return w_int_new(w_str_len(obj) as i64);
-        }
-    }
-    panic!("object has no len()")
+    crate::space::py_len(args[0]).expect("object has no len()")
 }
 
 /// `abs(x)` — return the absolute value of a number.
@@ -222,6 +208,15 @@ fn builtin_abs(args: &[PyObjectRef]) -> PyObjectRef {
         }
         if is_float(obj) {
             return w_float_new(w_float_get_value(obj).abs());
+        }
+    }
+    // Instance __abs__ — PyPy: baseobjspace.py abs
+    unsafe {
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__abs__") {
+                return crate::space_call_function(method, &[obj]);
+            }
         }
     }
     panic!("bad operand type for abs()")
@@ -505,23 +500,12 @@ fn builtin_float(args: &[PyObjectRef]) -> PyObjectRef {
 }
 
 /// `bool(obj)` → convert to bool (simplified truthiness)
+/// `bool(obj)` — PyPy: operation.py bool → space.is_true
 fn builtin_bool(args: &[PyObjectRef]) -> PyObjectRef {
     if args.is_empty() {
         return w_bool_from(false);
     }
-    let obj = args[0];
-    unsafe {
-        if is_bool(obj) {
-            return obj;
-        }
-        if is_int(obj) {
-            return w_bool_from(w_int_get_value(obj) != 0);
-        }
-        if is_none(obj) {
-            return w_bool_from(false);
-        }
-    }
-    w_bool_from(true)
+    w_bool_from(crate::space::py_is_true(args[0]))
 }
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
@@ -643,6 +627,15 @@ fn builtin_hash(args: &[PyObjectRef]) -> PyObjectRef {
                 h = h.wrapping_mul(1000003).wrapping_add(b as i64);
             }
             return w_int_new(h);
+        }
+    }
+    // Instance __hash__ — PyPy: baseobjspace.py hash_w
+    unsafe {
+        if pyre_object::is_instance(args[0]) {
+            let w_type = pyre_object::w_instance_get_type(args[0]);
+            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__hash__") {
+                return crate::space_call_function(method, &[args[0]]);
+            }
         }
     }
     w_int_new(args[0] as i64) // identity hash fallback

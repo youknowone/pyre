@@ -888,6 +888,24 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
         if is_none(obj) {
             return false;
         }
+        // Instance __bool__ / __len__ — PyPy: descroperation.py is_true
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            // Try __bool__ first
+            if let Some(method) = lookup_in_type_mro(w_type, "__bool__") {
+                let result = crate::space_call_function(method, &[obj]);
+                if !result.is_null() && is_bool(result) {
+                    return w_bool_get_value(result);
+                }
+            }
+            // Then __len__ (nonzero length = truthy)
+            if let Some(method) = lookup_in_type_mro(w_type, "__len__") {
+                let result = crate::space_call_function(method, &[obj]);
+                if !result.is_null() && is_int(result) {
+                    return w_int_get_value(result) != 0;
+                }
+            }
+        }
         true // default: objects are truthy
     }
 }
@@ -909,6 +927,10 @@ pub fn py_negative(a: PyObjectRef) -> PyResult {
         if is_float(a) {
             return Ok(w_float_new(-w_float_get_value(a)));
         }
+        // Instance __neg__
+        if let Some(result) = try_instance_unaryop(a, "__neg__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
             (*(*a).ob_type).tp_name,
@@ -925,6 +947,9 @@ pub fn py_invert(a: PyObjectRef) -> PyResult {
         }
         if is_long(a) {
             return Ok(bigint_result(!w_long_get_value(a).clone()));
+        }
+        if let Some(result) = try_instance_unaryop(a, "__invert__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary ~: '{}'",
@@ -1051,6 +1076,15 @@ pub fn py_len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(w_dict_len(obj) as i64))
         } else if is_str(obj) {
             Ok(w_int_new(w_str_len(obj) as i64))
+        } else if is_instance(obj) {
+            // Instance __len__ — PyPy: descroperation.py len
+            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__len__") {
+                return Ok(crate::space_call_function(method, &[obj]));
+            }
+            Err(PyError::type_error(format!(
+                "object of type '{}' has no len()",
+                w_type_get_name(w_instance_get_type(obj)),
+            )))
         } else {
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
@@ -1775,6 +1809,16 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
             let h = w_str_get_value(haystack);
             let n = w_str_get_value(needle);
             return Ok(h.contains(n));
+        }
+    }
+    // Instance __contains__ — PyPy: descroperation.py contains_w
+    unsafe {
+        if is_instance(haystack) {
+            let w_type = w_instance_get_type(haystack);
+            if let Some(method) = lookup_in_type_mro(w_type, "__contains__") {
+                let result = crate::space_call_function(method, &[haystack, needle]);
+                return Ok(py_is_true(result));
+            }
         }
     }
     // Fallback: try iterating with py_getitem(obj, i) for i=0,1,...
