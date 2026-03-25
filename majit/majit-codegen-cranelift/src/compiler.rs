@@ -386,13 +386,19 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
 static NEXT_FORCE_TOKEN_HANDLE: AtomicU64 = AtomicU64::new(1);
 static FORCE_FRAMES: OnceLock<Mutex<HashMap<u64, Arc<ActiveForceFrame>>>> = OnceLock::new();
 
+/// Global exception state for JIT-compiled code.
+/// pyre is no-GIL single-threaded, so global statics are safe and allow
+/// GUARD_NO_EXCEPTION to emit a direct memory load instead of a TLS call.
+static JIT_EXC_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static JIT_EXC_TYPE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Return the address of JIT_EXC_VALUE for direct memory load in JIT code.
+pub fn jit_exc_value_addr() -> usize {
+    &JIT_EXC_VALUE as *const _ as usize
+}
+
 thread_local! {
     static CURRENT_FORCE_FRAME_HANDLE: Cell<u64> = const { Cell::new(0) };
-    /// Thread-local exception state for JIT-compiled code.
-    /// exc_value holds the current exception value (as a GcRef encoded in i64).
-    /// exc_type holds the current exception class (as a GcRef encoded in i64).
-    static JIT_EXC_VALUE: Cell<i64> = const { Cell::new(0) };
-    static JIT_EXC_TYPE: Cell<i64> = const { Cell::new(0) };
     /// Thread-local reference storage for JIT-compiled code.
     ///
     /// Mirrors RPython's `rpy_threadlocalref` — an array of integer-sized slots
@@ -407,56 +413,56 @@ thread_local! {
 
 /// Read the current exception value (returns 0 if no exception pending).
 extern "C" fn jit_exc_get_value() -> i64 {
-    JIT_EXC_VALUE.with(|c| c.get())
+    JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Read the current exception class (returns 0 if no exception pending).
 extern "C" fn jit_exc_get_type() -> i64 {
-    JIT_EXC_TYPE.with(|c| c.get())
+    JIT_EXC_TYPE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Clear the current exception state and return the value that was pending.
 extern "C" fn jit_exc_clear_and_get_value() -> i64 {
-    let val = JIT_EXC_VALUE.with(|c| c.replace(0));
-    JIT_EXC_TYPE.with(|c| c.set(0));
+    let val = JIT_EXC_VALUE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    JIT_EXC_TYPE.store(0, std::sync::atomic::Ordering::Relaxed);
     val
 }
 
 /// Clear the current exception state.
 extern "C" fn jit_exc_clear() {
-    JIT_EXC_VALUE.with(|c| c.set(0));
-    JIT_EXC_TYPE.with(|c| c.set(0));
+    JIT_EXC_VALUE.store(0, std::sync::atomic::Ordering::Relaxed);
+    JIT_EXC_TYPE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Return 1 if the current exception class exactly matches `expected_type`.
 extern "C" fn jit_exc_type_matches(expected_type: i64) -> i64 {
-    let exc_value = JIT_EXC_VALUE.with(|c| c.get());
-    let exc_type = JIT_EXC_TYPE.with(|c| c.get());
+    let exc_value = JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+    let exc_type = JIT_EXC_TYPE.load(std::sync::atomic::Ordering::Relaxed);
     i64::from(exc_value != 0 && exc_type == expected_type)
 }
 
 /// Set the current exception state (value, class).
 extern "C" fn jit_exc_restore(value: i64, exc_type: i64) {
-    JIT_EXC_VALUE.with(|c| c.set(value));
-    JIT_EXC_TYPE.with(|c| c.set(exc_type));
+    JIT_EXC_VALUE.store(value, std::sync::atomic::Ordering::Relaxed);
+    JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Set exception state from a call that may raise.
 /// This is called by external code that wants to signal an exception
 /// to the JIT-compiled code.
 pub fn jit_exc_raise(value: i64, exc_type: i64) {
-    JIT_EXC_VALUE.with(|c| c.set(value));
-    JIT_EXC_TYPE.with(|c| c.set(exc_type));
+    JIT_EXC_VALUE.store(value, std::sync::atomic::Ordering::Relaxed);
+    JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Check if an exception is currently pending.
 pub fn jit_exc_is_pending() -> bool {
-    JIT_EXC_VALUE.with(|c| c.get()) != 0
+    JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
 fn take_pending_jit_exception_state() -> (i64, GcRef) {
-    let value = JIT_EXC_VALUE.with(|c| c.replace(0));
-    let exc_type = JIT_EXC_TYPE.with(|c| c.replace(0));
+    let value = JIT_EXC_VALUE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let exc_type = JIT_EXC_TYPE.swap(0, std::sync::atomic::Ordering::Relaxed);
     if value == 0 {
         (0, GcRef::NULL)
     } else {
@@ -4860,16 +4866,16 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    // Call jit_exc_get_value() → if non-zero, exception pending → exit
-                    let exc_val = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jit_exc_get_value as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("jit_exc_get_value must return a value");
+                    // Direct memory load from global JIT_EXC_VALUE (no TLS/host call).
+                    // RPython backend fuses this into the preceding CALL as an
+                    // inline flag check. We use a plain load from a known address.
+                    let exc_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+                    let exc_val = builder.ins().load(
+                        cl_types::I64,
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        exc_addr,
+                        0,
+                    );
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let has_exc = builder.ins().icmp(IntCC::NotEqual, exc_val, zero);
                     let exit_block = builder.create_block();
