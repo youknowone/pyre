@@ -252,6 +252,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // header. This ensures the trace captures the HOT path entry values,
     // not the EXIT path values from the last iteration.
     let mut pending_trace: Option<(u64, usize)> = None; // (green_key, loop_header_pc)
+    // Keys where jmp-entry guard-failed: suppress re-entry until bridge compiled.
     loop {
         if frame.next_instr >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
@@ -263,11 +264,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // RPython: tracing starts at jit_merge_point when the counter
-        // threshold was reached at the preceding backedge. The pending_trace
-        // flag defers trace start from the backedge to the loop header.
-        // TODO: also move compiled entry here from can_enter_jit.
-        // Blocked by guard failure re-entry loop — needs bridge compilation.
+        // RPython: compiled entry + tracing at dispatch loop top.
+        if is_portal {
+            // TODO: compiled code entry at jit_merge_point (RPython parity).
+            // Blocked by guard failure for NONE-slot traces — compiled code
+            // modifies untracked locals, guard failure can't restore them.
+            // Needs RPython resume data (rd_virtuals + lazy materialization)
+            // to correctly handle NONE slots on guard failure.
+        }
+        // 2. Deferred trace start + trace feed.
         if is_portal {
             // Check pending_trace: start tracing at the loop header
             if let Some((key, header_pc)) = pending_trace {
