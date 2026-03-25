@@ -16,9 +16,9 @@ use num_traits::ToPrimitive;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
-pub use pyre_runtime::{PyError, PyErrorKind, PyResult};
 
 // ── BigInt helpers ──────────────────────────────────────────────────
 
@@ -1082,7 +1082,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
         if is_module(obj) {
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut pyre_runtime::PyNamespace;
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
             if !ns_ptr.is_null() {
                 if let Some(&value) = (*ns_ptr).get(name) {
                     if !value.is_null() {
@@ -1214,7 +1214,7 @@ unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObject
     }
     let mro = compute_mro(w_type);
     for cls in &mro {
-        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut pyre_runtime::PyNamespace;
+        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::PyNamespace;
         if !ns_ptr.is_null() {
             let ns = &*ns_ptr;
             if let Some(&value) = ns.get(name) {
@@ -1377,11 +1377,11 @@ unsafe fn call_descriptor_get(
         if let Some(get_fn) = lookup_in_type_mro(descr_type, "__get__") {
             if !get_fn.is_null() {
                 // Call __get__(descr, obj, type)
-                if pyre_runtime::is_builtin_func(get_fn) {
-                    let func = pyre_runtime::w_builtin_func_get(get_fn);
+                if crate::is_builtin_func(get_fn) {
+                    let func = crate::w_builtin_func_get(get_fn);
                     return Some(func(&[descr, obj, w_type]));
                 }
-                if pyre_runtime::is_func(get_fn) {
+                if crate::is_func(get_fn) {
                     return PROPERTY_CALLER_2.with(|c| {
                         let caller = c.get()?;
                         // __get__(descr, obj) — simplified 2-arg call
@@ -1396,11 +1396,11 @@ unsafe fn call_descriptor_get(
 
 /// Helper: call a function with one argument (builtin or user).
 unsafe fn call_func_1(func: PyObjectRef, arg: PyObjectRef) -> Option<PyObjectRef> {
-    if pyre_runtime::is_builtin_func(func) {
-        let f = pyre_runtime::w_builtin_func_get(func);
+    if crate::is_builtin_func(func) {
+        let f = crate::w_builtin_func_get(func);
         return Some(f(&[arg]));
     }
-    if pyre_runtime::is_func(func) {
+    if crate::is_func(func) {
         return PROPERTY_CALLER_1.with(|c| {
             let caller = c.get()?;
             Some(caller(func, arg))
@@ -1445,12 +1445,12 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
 
 /// Helper: call a function with two arguments (builtin or user).
 unsafe fn call_func_2(func: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> bool {
-    if pyre_runtime::is_builtin_func(func) {
-        let f = pyre_runtime::w_builtin_func_get(func);
+    if crate::is_builtin_func(func) {
+        let f = crate::w_builtin_func_get(func);
         f(&[a, b]);
         return true;
     }
-    if pyre_runtime::is_func(func) {
+    if crate::is_func(func) {
         return PROPERTY_CALLER_2.with(|c| {
             if let Some(caller) = c.get() {
                 caller(func, a, b);
@@ -1867,69 +1867,5 @@ pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     Err(PyError::type_error("object does not support item deletion"))
 }
 
-/// Convert object to string representation (str()).
-pub fn py_str(obj: PyObjectRef) -> String {
-    use pyre_object::*;
-    unsafe {
-        if is_str(obj) {
-            return w_str_get_value(obj).to_string();
-        }
-        if is_int(obj) {
-            return w_int_get_value(obj).to_string();
-        }
-        if is_none(obj) {
-            return "None".to_string();
-        }
-        if is_bool(obj) {
-            return if w_bool_get_value(obj) {
-                "True"
-            } else {
-                "False"
-            }
-            .to_string();
-        }
-        if is_float(obj) {
-            let v = w_float_get_value(obj);
-            if v == v.floor() && v.is_finite() {
-                return format!("{v:.1}");
-            }
-            return v.to_string();
-        }
-        if is_exception(obj) {
-            return w_exception_get_message(obj).to_string();
-        }
-    }
-    "<object>".to_string()
-}
-
-/// Convert object to repr string (repr()).
-pub fn py_repr(obj: PyObjectRef) -> String {
-    use pyre_object::*;
-    unsafe {
-        if is_str(obj) {
-            return format!("'{}'", w_str_get_value(obj));
-        }
-        if is_int(obj) {
-            return w_int_get_value(obj).to_string();
-        }
-        if is_none(obj) {
-            return "None".to_string();
-        }
-        if is_bool(obj) {
-            return if w_bool_get_value(obj) {
-                "True"
-            } else {
-                "False"
-            }
-            .to_string();
-        }
-        if is_float(obj) {
-            let v = w_float_get_value(obj);
-            if v == v.floor() && v.is_finite() {
-                return format!("{v:.1}");
-            }
-            return v.to_string();
-        }
-    }
-    "<object>".to_string()
-}
+// py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).
+// Re-exported via crate::display::*.

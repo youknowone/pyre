@@ -6,7 +6,7 @@
 
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 use pyre_object::*;
-use pyre_objspace::*;
+use pyre_runtime::*;
 use pyre_runtime::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
@@ -526,7 +526,7 @@ impl OpcodeStepExecutor for PyFrame {
         // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
         let needle = self.pop();
-        let result = pyre_objspace::space::py_contains(haystack, needle)?;
+        let result = pyre_runtime::space::py_contains(haystack, needle)?;
         let inverted = match invert {
             pyre_bytecode::bytecode::Invert::No => result,
             pyre_bytecode::bytecode::Invert::Yes => !result,
@@ -555,7 +555,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn to_bool(&mut self) -> Result<(), Self::Error> {
         let val = self.pop();
-        let truth = pyre_objspace::space::py_is_true(val);
+        let truth = pyre_runtime::space::py_is_true(val);
         self.push(pyre_object::w_bool_from(truth));
         Ok(())
     }
@@ -583,7 +583,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn delete_subscript(&mut self) -> Result<(), Self::Error> {
         let index = self.pop();
         let obj = self.pop();
-        pyre_objspace::space::py_delitem(obj, index)?;
+        pyre_runtime::space::py_delitem(obj, index)?;
         Ok(())
     }
 
@@ -597,7 +597,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── FormatSimple (str(TOS)) ──
     fn format_simple(&mut self) -> Result<(), Self::Error> {
         let val = self.pop();
-        let s = pyre_objspace::space::py_str(val);
+        let s = unsafe { pyre_runtime::py_str(val) };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -607,7 +607,7 @@ impl OpcodeStepExecutor for PyFrame {
         let _spec = self.pop();
         let val = self.pop();
         // Phase 1: ignore spec, just convert to str
-        let s = pyre_objspace::space::py_str(val);
+        let s = unsafe { pyre_runtime::py_str(val) };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
     }
@@ -619,10 +619,16 @@ impl OpcodeStepExecutor for PyFrame {
     ) -> Result<(), Self::Error> {
         let val = self.pop();
         let s = match conv {
-            pyre_bytecode::bytecode::ConvertValueOparg::Str => pyre_objspace::space::py_str(val),
-            pyre_bytecode::bytecode::ConvertValueOparg::Repr => pyre_objspace::space::py_repr(val),
-            pyre_bytecode::bytecode::ConvertValueOparg::Ascii => pyre_objspace::space::py_repr(val),
-            pyre_bytecode::bytecode::ConvertValueOparg::None => pyre_objspace::space::py_str(val),
+            pyre_bytecode::bytecode::ConvertValueOparg::Str => unsafe { pyre_runtime::py_str(val) },
+            pyre_bytecode::bytecode::ConvertValueOparg::Repr => unsafe {
+                pyre_runtime::py_repr(val)
+            },
+            pyre_bytecode::bytecode::ConvertValueOparg::Ascii => unsafe {
+                pyre_runtime::py_repr(val)
+            },
+            pyre_bytecode::bytecode::ConvertValueOparg::None => unsafe {
+                pyre_runtime::py_str(val)
+            },
         };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
@@ -724,7 +730,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), Self::Error> {
         let dict = self.pop();
         // Try dict first (if it's a dict or has attrs)
-        if let Ok(val) = pyre_objspace::space::py_getattr(dict, name) {
+        if let Ok(val) = pyre_runtime::space::py_getattr(dict, name) {
             self.push(val);
             return Ok(());
         }
@@ -740,7 +746,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── GetLen ──
     fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
-        let len = pyre_objspace::space::py_len(obj)?;
+        let len = pyre_runtime::space::py_len(obj)?;
         Ok(len)
     }
 
@@ -864,7 +870,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: PRINT_EXPR → sys.displayhook(value)
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), Self::Error> {
         if !unsafe { pyre_object::is_none(val) } {
-            let s = pyre_objspace::space::py_repr(val);
+            let s = unsafe { pyre_runtime::py_repr(val) };
             println!("{}", s);
         }
         Ok(())
@@ -912,7 +918,7 @@ impl OpcodeStepExecutor for PyFrame {
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = self.pop();
-        let attr = pyre_objspace::space::py_getattr(obj, name)?;
+        let attr = pyre_runtime::space::py_getattr(obj, name)?;
         self.push(attr);
         // Bind self only for regular instance method calls.
         // staticmethod/classmethod descriptors already unwrap to the raw
@@ -924,7 +930,7 @@ impl OpcodeStepExecutor for PyFrame {
             pyre_object::is_instance(obj) && {
                 // Check raw descriptor in class dict before unwrap
                 let w_type = pyre_object::w_instance_get_type(obj);
-                let raw = pyre_objspace::space::lookup_in_type_mro_pub(w_type, name);
+                let raw = pyre_runtime::space::lookup_in_type_mro_pub(w_type, name);
                 match raw {
                     Some(d) if pyre_object::is_staticmethod(d) => false,
                     Some(d) if pyre_object::is_classmethod(d) => false,
@@ -2682,7 +2688,7 @@ result = fib(10)";
         res.expect("boolean and failed");
         unsafe {
             let r = *(*frame.namespace).get("result").unwrap();
-            assert!(!pyre_objspace::space::py_is_true(r));
+            assert!(!pyre_runtime::space::py_is_true(r));
         }
     }
 

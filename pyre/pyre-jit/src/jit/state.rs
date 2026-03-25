@@ -26,7 +26,7 @@ use pyre_object::{
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage,
     w_str_get_value, w_tuple_len,
 };
-use pyre_objspace::truth_value as objspace_truth_value;
+use pyre_runtime::truth_value as objspace_truth_value;
 
 /// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.
 ///
@@ -2496,7 +2496,7 @@ impl MIFrame {
         }
         // MIFrame Box tracking: compute concrete subscr result
         let subscr_concrete =
-            if let Ok(result) = pyre_objspace::space::py_getitem(concrete_obj, concrete_key) {
+            if let Ok(result) = pyre_runtime::space::py_getitem(concrete_obj, concrete_key) {
                 ConcreteValue::from_pyobj(result)
             } else {
                 ConcreteValue::Null
@@ -5058,7 +5058,7 @@ impl SharedOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         let c_obj = obj.concrete.to_pyobj();
         if !c_obj.is_null() {
-            if let Ok(result) = pyre_objspace::space::py_getattr(c_obj, name) {
+            if let Ok(result) = pyre_runtime::space::py_getattr(c_obj, name) {
                 result_concrete = ConcreteValue::from_pyobj(result);
             }
         }
@@ -5437,13 +5437,13 @@ impl ArithmeticOpcodeHandler for MIFrame {
         if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
             let result = match op {
                 BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-                    pyre_objspace::space::py_add(lhs_obj, rhs_obj)
+                    pyre_runtime::space::py_add(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                    pyre_objspace::space::py_sub(lhs_obj, rhs_obj)
+                    pyre_runtime::space::py_sub(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                    pyre_objspace::space::py_mul(lhs_obj, rhs_obj)
+                    pyre_runtime::space::py_mul(lhs_obj, rhs_obj)
                 }
                 _ => Err(pyre_runtime::PyError::type_error("unsupported")),
             };
@@ -5532,14 +5532,14 @@ impl ArithmeticOpcodeHandler for MIFrame {
         }
         if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
             let cmp_op = match op {
-                ComparisonOperator::Less => pyre_objspace::space::CompareOp::Lt,
-                ComparisonOperator::LessOrEqual => pyre_objspace::space::CompareOp::Le,
-                ComparisonOperator::Greater => pyre_objspace::space::CompareOp::Gt,
-                ComparisonOperator::GreaterOrEqual => pyre_objspace::space::CompareOp::Ge,
-                ComparisonOperator::Equal => pyre_objspace::space::CompareOp::Eq,
-                ComparisonOperator::NotEqual => pyre_objspace::space::CompareOp::Ne,
+                ComparisonOperator::Less => pyre_runtime::space::CompareOp::Lt,
+                ComparisonOperator::LessOrEqual => pyre_runtime::space::CompareOp::Le,
+                ComparisonOperator::Greater => pyre_runtime::space::CompareOp::Gt,
+                ComparisonOperator::GreaterOrEqual => pyre_runtime::space::CompareOp::Ge,
+                ComparisonOperator::Equal => pyre_runtime::space::CompareOp::Eq,
+                ComparisonOperator::NotEqual => pyre_runtime::space::CompareOp::Ne,
             };
-            if let Ok(r) = pyre_objspace::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
+            if let Ok(r) = pyre_runtime::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
                 result_concrete = ConcreteValue::from_pyobj(r);
             }
         }
@@ -5674,7 +5674,7 @@ impl OpcodeStepExecutor for MIFrame {
 
         // Non-instance path: trace as normal [attr, NULL]
         let mut attr_concrete = ConcreteValue::Null;
-        if let Ok(result) = pyre_objspace::space::py_getattr(concrete_obj, name) {
+        if let Ok(result) = pyre_runtime::space::py_getattr(concrete_obj, name) {
             attr_concrete = ConcreteValue::from_pyobj(result);
         }
         let attr_opref = self.trace_load_attr(obj.opref, name)?;

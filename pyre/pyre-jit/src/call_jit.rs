@@ -1651,7 +1651,7 @@ pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
     if obj.is_null() {
         return 0;
     }
-    pyre_objspace::opcode_ops::truth_value(obj) as i64
+    pyre_runtime::opcode_ops::truth_value(obj) as i64
 }
 
 /// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
@@ -1669,7 +1669,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // Transmute back and call compare_value.
     use pyre_bytecode::bytecode::ComparisonOperator;
     let op: ComparisonOperator = unsafe { std::mem::transmute(op_code as u8) };
-    match pyre_objspace::opcode_ops::compare_value(lhs, rhs, op) {
+    match pyre_runtime::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
@@ -1690,7 +1690,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // Transmute back to BinaryOperator enum and call binary_value.
     use pyre_bytecode::bytecode::BinaryOperator;
     let op: BinaryOperator = unsafe { std::mem::transmute(op_code as u8) };
-    match pyre_objspace::opcode_ops::binary_value(lhs, rhs, op) {
+    match pyre_runtime::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }

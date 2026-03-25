@@ -304,20 +304,10 @@ pub fn call_callable_inline_residual(
 /// Called at startup from pyre-jit or pyrex.
 pub fn register_build_class() {
     pyre_runtime::register_build_class_impl(real_build_class);
-    pyre_objspace::space::register_property_callers(property_caller_1, property_caller_2);
-    pyre_objspace::space::register_dunder_binop_caller(dunder_binop_caller);
-    pyre_objspace::space::register_dunder_unary_caller(dunder_unary_caller);
+    pyre_runtime::space::register_property_callers(property_caller_1, property_caller_2);
+    pyre_runtime::space::register_dunder_binop_caller(dunder_binop_caller);
+    pyre_runtime::space::register_dunder_unary_caller(dunder_unary_caller);
     pyre_runtime::register_dunder_caller(dunder_method_caller);
-    pyre_runtime::register_attr_builtins(
-        |obj, name| pyre_objspace::space::py_getattr(obj, name).is_ok(),
-        |obj, name, default| {
-            pyre_objspace::space::py_getattr(obj, name)
-                .unwrap_or_else(|_| default.unwrap_or(PY_NULL))
-        },
-        |obj, name, value| {
-            let _ = pyre_objspace::space::py_setattr(obj, name, value);
-        },
-    );
 }
 
 /// Call a user function with 1 arg (property fget).
@@ -348,7 +338,7 @@ fn dunder_method_caller(obj: PyObjectRef, method_name: &str) -> Option<PyObjectR
             return None;
         }
         let w_type = pyre_object::w_instance_get_type(obj);
-        let method = pyre_objspace::space::py_getattr(w_type, method_name).ok()?;
+        let method = pyre_runtime::space::py_getattr(w_type, method_name).ok()?;
         if method.is_null() {
             return None;
         }
@@ -448,7 +438,7 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
 
     // Step 2: Look up __init__ via MRO and call it
     // PyPy: descr_call → space.lookup(w_newobject, '__init__') → call
-    if let Ok(init_fn) = pyre_objspace::space::py_getattr(w_type, "__init__") {
+    if let Ok(init_fn) = pyre_runtime::space::py_getattr(w_type, "__init__") {
         // Call __init__(instance, *args)
         let mut init_args = Vec::with_capacity(1 + args.len());
         init_args.push(instance);
