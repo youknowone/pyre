@@ -205,8 +205,7 @@ fn call_user_function_with_eval(
 }
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    // Type objects are callable — calling creates an instance.
-    // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
+    let callable = crate::space::unwrap_cell(callable);
     if unsafe { pyre_object::is_type(callable) } {
         return call_type_object(frame, callable, args);
     }
@@ -396,6 +395,24 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     // Create frame with class_locals set AND closure from enclosing scope.
     // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals,
     // and the closure tuple is passed through for LOAD_DEREF access.
+    // Debug: dump code object for __class__ cell investigation
+    let code_ref = unsafe { &*func_code };
+    if std::env::var("PYRE_DEBUG_CLASS").is_ok() {
+        eprintln!("[build_class] name={name}");
+        eprintln!("  varnames: {:?}", code_ref.varnames);
+        eprintln!("  cellvars: {:?}", code_ref.cellvars);
+        eprintln!("  freevars: {:?}", code_ref.freevars);
+        eprintln!(
+            "  nlocals={} ncells={} nfree={}",
+            code_ref.varnames.len(),
+            code_ref.cellvars.len(),
+            code_ref.freevars.len()
+        );
+        for (i, instr) in code_ref.instructions.iter().enumerate().take(20) {
+            eprintln!("  {i}: {:?}", instr);
+        }
+    }
+
     let mut frame = PyFrame::new_for_call_with_closure(func_code, &[], globals, exec_ctx, closure);
     frame.class_locals = class_ns_ptr;
 
@@ -404,6 +421,15 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     let w_type = pyre_object::w_type_new(name, bases, class_ns_ptr as *mut u8);
+
+    // CPython: if __classcell__ is in the namespace, set the cell's content
+    // to the newly created class. This enables `__class__` references in methods.
+    let class_ns = unsafe { &*class_ns_ptr };
+    if let Some(&classcell) = class_ns.get("__classcell__") {
+        if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
+            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+        }
+    }
     // Cache C3 MRO (PyPy: W_TypeObject.mro_w set during ready())
     let mro = unsafe { crate::space::compute_mro_pub(w_type) };
     unsafe { pyre_object::w_type_set_mro(w_type, mro) };

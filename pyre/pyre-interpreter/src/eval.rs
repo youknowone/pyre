@@ -197,10 +197,15 @@ impl LocalOpcodeHandler for PyFrame {
                 message: format!("local variable '{name}' referenced before assignment"),
             });
         }
+        // Cell objects are valid even if their contents are PY_NULL
+        // (needed for __class__ cell during class body execution).
+        // The cell itself is non-null, so the check above passes.
         Ok(value)
     }
 
     fn store_local_value(&mut self, idx: usize, value: Self::Value) -> Result<(), PyError> {
+        // STORE_FAST always writes directly to the slot.
+        // Cell content updates use STORE_DEREF, not STORE_FAST.
         self.locals_cells_stack_w[idx] = value;
         Ok(())
     }
@@ -485,9 +490,12 @@ impl OpcodeStepExecutor for PyFrame {
     /// Reads cell/free variable. If the slot holds a cell object (from
     /// closure tuple via COPY_FREE_VARS), dereferences it. Otherwise
     /// reads the raw value (pyre's direct storage for cellvars).
+    /// LOAD_DEREF — RustPython 3.13 uses unified index (same as LOAD_FAST).
+    ///
+    /// PyPy: pyopcode.py LOAD_DEREF → cell.get()
+    /// If the slot holds a cell object, dereference it to get the value.
     fn load_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let nlocals = self.nlocals();
-        let slot = self.locals_cells_stack_w[nlocals + idx];
+        let slot = self.locals_cells_stack_w[idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
@@ -502,36 +510,48 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    /// PyPy: pyopcode.py STORE_DEREF
+    /// STORE_DEREF — unified index. Stores into cell if present.
+    ///
+    /// PyPy: pyopcode.py STORE_DEREF → cell.set(value)
     fn store_deref(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let nlocals = self.nlocals();
         let value = self.pop();
-        let slot = self.locals_cells_stack_w[nlocals + idx];
+        let slot = self.locals_cells_stack_w[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_set(slot, value) };
         } else {
-            self.locals_cells_stack_w[nlocals + idx] = value;
+            self.locals_cells_stack_w[idx] = value;
         }
         Ok(())
     }
 
-    /// PyPy: pyopcode.py LOAD_CLOSURE → push the cell object itself
-    /// (not its contents — the cell is captured by the inner function's closure)
+    /// LOAD_CLOSURE — unified index. Push cell object itself (not contents).
+    ///
+    /// PyPy: pyopcode.py LOAD_CLOSURE → push cell for closure capture.
     fn load_closure(&mut self, idx: usize) -> Result<(), Self::Error> {
-        let nlocals = self.nlocals();
-        let cell = self.locals_cells_stack_w[nlocals + idx];
-        // Push the cell object itself (or the raw value for legacy non-cell path)
+        let cell = self.locals_cells_stack_w[idx];
         self.push(cell);
         Ok(())
     }
 
     /// MAKE_CELL — no-op in pyre.
     ///
-    /// RustPython bytecode uses LOAD_CLOSURE + LOAD_DEREF for cell
-    /// variable access. Cell slots in locals_cells_stack_w (indices
-    /// nlocals..nlocals+ncells) are populated by STORE_DEREF or
-    /// COPY_FREE_VARS, not by MAKE_CELL.
-    fn make_cell(&mut self, _idx: usize) -> Result<(), Self::Error> {
+    /// CPython 3.13 / RustPython MAKE_CELL — create cell object in slot.
+    ///
+    /// PyPy: pyframe.py cell initialization.
+    /// Wraps the current value (PY_NULL if uninitialized) in a W_CellObject.
+    /// LoadFast on cell slots returns the cell object itself (needed for
+    /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
+    fn make_cell(&mut self, idx: usize) -> Result<(), Self::Error> {
+        let code = unsafe { &*self.code };
+        if std::env::var("PYRE_DEBUG_CELL").is_ok() {
+            eprintln!("  varnames: {:?}", code.varnames);
+            eprintln!("  cellvars: {:?}", code.cellvars);
+            for (i, instr) in code.instructions.iter().enumerate().take(25) {
+                eprintln!("  {i}: {:?}", instr);
+            }
+        }
+        let current = self.locals_cells_stack_w[idx];
+        self.locals_cells_stack_w[idx] = pyre_object::w_cell_new(current);
         Ok(())
     }
 
@@ -737,22 +757,26 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── SetFunctionAttribute ──
+    /// CPython 3.13 SET_FUNCTION_ATTRIBUTE: pop attr, pop func, set, push func.
+    /// Stack effect: (2) → (1)
+    /// CPython 3.13 SET_FUNCTION_ATTRIBUTE: (attr, func -- func)
+    /// attr = TOS1 (below), func = TOS (top).
+    /// Pops both, sets attribute on func, pushes func back.
     fn set_function_attribute_with_flag(
         &mut self,
         flag: pyre_bytecode::bytecode::MakeFunctionFlag,
     ) -> Result<(), Self::Error> {
         use pyre_bytecode::bytecode::MakeFunctionFlag;
-        let attr = self.pop();
+        let func = self.pop(); // TOS = function
+        let attr = self.pop(); // TOS1 = attribute value (closure tuple etc.)
         match flag {
-            MakeFunctionFlag::Closure => {
-                let func = self.peek();
-                unsafe {
-                    let func_obj = &mut *(func as *mut crate::W_FunctionObject);
-                    func_obj.closure = attr;
-                }
-            }
-            _ => {} // Phase 1: ignore defaults, annotations, etc.
+            MakeFunctionFlag::Closure => unsafe {
+                let func_obj = &mut *(func as *mut crate::W_FunctionObject);
+                func_obj.closure = attr;
+            },
+            _ => {} // defaults, annotations, etc.
         }
+        self.push(func);
         Ok(())
     }
 
