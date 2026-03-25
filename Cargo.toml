@@ -29,7 +29,6 @@ members = [
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-runtime",
-    "pyre/pyre-objspace",
     "pyre/pyre-bytecode",
     "pyre/pyre-interp",
     "pyre/pyre-jit",
@@ -40,7 +39,6 @@ members = [
 # pyre internal crates
 pyre-object = { path = "pyre/pyre-object" }
 pyre-runtime = { path = "pyre/pyre-runtime" }
-pyre-objspace = { path = "pyre/pyre-objspace" }
 pyre-bytecode = { path = "pyre/pyre-bytecode" }
 pyre-interp = { path = "pyre/pyre-interp" }
 

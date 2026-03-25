@@ -390,7 +390,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, pyre_
     }
 
     // Fallback: try py_getattr (for non-module objects or attrs set via setattr)
-    match pyre_objspace::space::py_getattr(module, name) {
+    match pyre_runtime::space::py_getattr(module, name) {
         Ok(value) => Ok(value),
         Err(_) => Err(pyre_runtime::PyError {
             kind: pyre_runtime::PyErrorKind::ImportError,

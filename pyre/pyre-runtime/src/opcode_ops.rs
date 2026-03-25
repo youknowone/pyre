@@ -1,6 +1,6 @@
+use crate::PyError;
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{PyObjectRef, w_bool_from};
-use pyre_runtime::PyError;
 
 use crate::{
     CompareOp, py_add, py_bitand, py_bitor, py_bitxor, py_compare, py_floordiv, py_getitem,

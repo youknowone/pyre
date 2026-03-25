@@ -8,13 +8,13 @@ use majit_ir::{OpCode, OpRef, Type};
 use majit_meta::TraceCtx;
 
 use pyre_object::*;
-use pyre_objspace::{
-    jit_binary_value_from_tag, jit_bool_value_from_truth, jit_compare_value_from_tag, jit_getattr,
-    jit_setattr, jit_setitem, jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
-};
 use pyre_runtime::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
     jit_sequence_getitem,
+};
+use pyre_runtime::{
+    jit_binary_value_from_tag, jit_bool_value_from_truth, jit_compare_value_from_tag, jit_getattr,
+    jit_setattr, jit_setitem, jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
 };
 
 pub use pyre_runtime::{

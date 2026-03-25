@@ -282,72 +282,17 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> PyObjectRef {
 /// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
 ///
 /// PyPy: baseobjspace.py `issubtype_w` → checks `cls in w_type.mro_w`.
+/// Uses the single C3 MRO implementation in space.rs (no duplication).
 unsafe fn is_subtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() || !is_type(w_type) {
         return false;
     }
-    // Walk MRO: w_type itself + all ancestors via C3
-    for t in c3_mro(w_type) {
+    for t in crate::space::compute_mro_pub(w_type) {
         if std::ptr::eq(t, cls) {
             return true;
         }
     }
     false
-}
-
-/// Compute C3 MRO for a type (standalone, no pyre-objspace dependency).
-///
-/// PyPy: typeobject.py `compute_default_mro`
-unsafe fn c3_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
-    let mut result = vec![w_type];
-    let bases = w_type_get_bases(w_type);
-    if bases.is_null() || !is_tuple(bases) {
-        return result;
-    }
-    let n = w_tuple_len(bases);
-    if n == 0 {
-        return result;
-    }
-    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
-    for i in 0..n {
-        if let Some(base) = w_tuple_getitem(bases, i as i64) {
-            if is_type(base) {
-                lists.push(c3_mro(base));
-            }
-        }
-    }
-    let mut bases_list = Vec::with_capacity(n);
-    for i in 0..n {
-        if let Some(base) = w_tuple_getitem(bases, i as i64) {
-            bases_list.push(base);
-        }
-    }
-    lists.push(bases_list);
-    loop {
-        lists.retain(|l| !l.is_empty());
-        if lists.is_empty() {
-            break;
-        }
-        let mut found = None;
-        for list in &lists {
-            let candidate = list[0];
-            let in_tail = lists
-                .iter()
-                .any(|o| o.len() > 1 && o[1..].iter().any(|&x| std::ptr::eq(x, candidate)));
-            if !in_tail {
-                found = Some(candidate);
-                break;
-            }
-        }
-        let Some(next) = found else { break };
-        result.push(next);
-        for list in &mut lists {
-            if !list.is_empty() && std::ptr::eq(list[0], next) {
-                list.remove(0);
-            }
-        }
-    }
-    result
 }
 
 /// Exception type constructor — called as e.g. `ValueError("msg")`.
@@ -563,51 +508,33 @@ fn builtin_bool(args: &[PyObjectRef]) -> PyObjectRef {
     w_bool_from(true)
 }
 
-/// `hasattr(obj, name)` → bool — uses registered callback
+/// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
 fn builtin_hasattr(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 2, "hasattr() takes exactly two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    if let Some(caller) = HASATTR_IMPL.get() {
-        return w_bool_from(caller(obj, name));
-    }
-    w_bool_from(false)
+    w_bool_from(crate::space::py_getattr(obj, name).is_ok())
 }
 
-/// `getattr(obj, name[, default])` → value — uses registered callback
+/// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() >= 2, "getattr() takes at least two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    let default = args.get(2).copied();
-    if let Some(caller) = GETATTR_IMPL.get() {
-        return caller(obj, name, default);
+    match crate::space::py_getattr(obj, name) {
+        Ok(val) => val,
+        Err(_) => args
+            .get(2)
+            .copied()
+            .unwrap_or_else(|| panic!("getattr: attribute '{name}' not found")),
     }
-    default.unwrap_or(w_none())
 }
 
-/// `setattr(obj, name, value)` — uses registered callback
+/// `setattr(obj, name, value)` — direct call
 fn builtin_setattr(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(args.len() == 3, "setattr() takes exactly three arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    if let Some(caller) = SETATTR_IMPL.get() {
-        caller(obj, name, args[2]);
-    }
+    let _ = crate::space::py_setattr(obj, name, args[2]);
     w_none()
-}
-
-// Callbacks for hasattr/getattr/setattr (avoid pyre-objspace dependency)
-type HasattrFn = fn(PyObjectRef, &str) -> bool;
-type GetattrFn = fn(PyObjectRef, &str, Option<PyObjectRef>) -> PyObjectRef;
-type SetattrFn = fn(PyObjectRef, &str, PyObjectRef);
-
-static HASATTR_IMPL: std::sync::OnceLock<HasattrFn> = std::sync::OnceLock::new();
-static GETATTR_IMPL: std::sync::OnceLock<GetattrFn> = std::sync::OnceLock::new();
-static SETATTR_IMPL: std::sync::OnceLock<SetattrFn> = std::sync::OnceLock::new();
-
-pub fn register_attr_builtins(h: HasattrFn, g: GetattrFn, s: SetattrFn) {
-    let _ = HASATTR_IMPL.set(h);
-    let _ = GETATTR_IMPL.set(g);
-    let _ = SETATTR_IMPL.set(s);
 }
