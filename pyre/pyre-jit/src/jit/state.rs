@@ -4764,17 +4764,7 @@ impl MIFrame {
                 );
             }
 
-            // Exception path during root trace: emit GUARD_EXCEPTION then
-            // ABORT the trace. The exception path will be compiled as a
-            // bridge later (RPython parity: exception paths are bridges,
-            // not main loops). This prevents exception-path compiled code
-            // from being the main loop, which causes guard failure stack
-            // mismatch when the normal (non-exception) path runs.
-            //
-            // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
-            // The guard asserts this specific exception type was raised.
-            // At runtime, if a different exception (or none) occurs, the
-            // guard fails and a bridge handles the alternative path.
+            // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class).
             let exc_obj = err.to_exc_object();
             let exc_type_ptr = unsafe {
                 (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
@@ -4786,11 +4776,11 @@ impl MIFrame {
                 this.record_guard(ctx, majit_ir::OpCode::GuardException, &[exc_type_const]);
             });
 
-            // Abort: exception path traces are compiled as bridges (RPython
-            // parity), not main loops. GUARD_EXCEPTION is already emitted
-            // above so the non-exception path is protected. The exception
-            // path will be handled by a bridge from GUARD_EXCEPTION when
-            // bridge infrastructure is ready.
+            // Exception path abort: exception paths are traced as bridges
+            // (RPython parity). Root traces and bridge traces that encounter
+            // exceptions during tracing abort — the exception path bridge
+            // will be compiled from GUARD_EXCEPTION when the bridge
+            // infrastructure handles nested exception-path tracing.
             TraceAction::Abort
         } else {
             if majit_meta::majit_log_enabled() {
@@ -5865,8 +5855,32 @@ impl OpcodeStepExecutor for MIFrame {
         )
     }
 
-    /// RPython opimpl_raise (pyjitpl.py:1688).
-    /// RPython opimpl_goto_if_exception_mismatch (pyjitpl.py:1677).
+    fn push_exc_info(&mut self) -> Result<(), Self::Error> {
+        let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let none_obj = pyre_object::w_none();
+        let none_opref = self.with_ctx(|_this, ctx| ctx.const_ref(none_obj as i64));
+        <Self as SharedOpcodeHandler>::push_value(
+            self,
+            FrontendOp::new(none_opref, ConcreteValue::Ref(none_obj)),
+        )?;
+        <Self as SharedOpcodeHandler>::push_value(self, exc)?;
+        // Sync owned concrete frame.
+        let frame =
+            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+        let exc_val = frame.pop();
+        frame.push(pyre_object::w_none());
+        frame.push(exc_val);
+        Ok(())
+    }
+
+    fn pop_except(&mut self) -> Result<(), Self::Error> {
+        let _ = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        let frame =
+            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+        frame.pop();
+        Ok(())
+    }
+
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let _exc_type = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         let true_obj = pyre_object::w_bool_from(true);
