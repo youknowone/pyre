@@ -5651,16 +5651,12 @@ impl OpcodeStepExecutor for MIFrame {
 
     /// LOAD_ATTR is_method=true — RPython LOOKUP_METHOD parity.
     ///
-    /// Traces the method lookup with correct concrete tracking so that
-    /// instance method calls produce valid traces. The concrete object
-    /// determines whether self is bound:
-    ///   - instance → push [attr, self], guard nonnull on self
-    ///   - other    → push [attr, NULL]
-    /// LOAD_ATTR is_method in JIT trace.
+    /// For non-instance objects: traces normally as [attr, NULL].
+    /// For instances: abort trace — instance method calls require
+    /// LOOKUP_METHOD/CALL_METHOD IR semantics that change the effective
+    /// nargs seen by the trace. Changing nargs mid-trace corrupts the
+    /// virtualizable frame state (stack depth mismatch on guard failure).
     ///
-    /// For non-instance objects (modules, etc.), traces normally: [attr, NULL].
-    /// For instance method calls, aborts the trace — full JIT support
-    /// requires LOOKUP_METHOD / CALL_METHOD IR ops (RPython parity).
     /// The loop falls back to the interpreter which handles self-binding
     /// correctly via PyFrame::load_method/call overrides.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
@@ -5672,7 +5668,7 @@ impl OpcodeStepExecutor for MIFrame {
             !concrete_obj.is_null() && unsafe { pyre_object::is_instance(concrete_obj) };
         if is_instance || concrete_obj.is_null() {
             return Err(PyError::type_error(
-                "load_method: instance or unknown concrete — aborting trace",
+                "load_method: instance method — needs LOOKUP_METHOD IR (not yet implemented)",
             ));
         }
 
@@ -5690,6 +5686,11 @@ impl OpcodeStepExecutor for MIFrame {
             FrontendOp::new(null_opref, ConcreteValue::Ref(pyre_object::PY_NULL)),
         )
     }
+
+    // No call() override — uses exec_call default (discard null_or_self).
+    // Instance method self-binding requires LOOKUP_METHOD/CALL_METHOD IR
+    // ops that change the effective nargs. Without dedicated IR support,
+    // changing nargs corrupts virtualizable frame state on guard failure.
 
     fn unsupported(
         &mut self,

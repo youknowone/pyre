@@ -300,10 +300,72 @@ pub fn call_callable_inline_residual(
 //   1. Execute class body function with fresh namespace (class_locals)
 //   2. Create W_TypeObject from the harvested namespace
 
-/// Register the real __build_class__ callback into pyre-runtime.
+/// Register the real __build_class__ callback and property caller.
 /// Called at startup from pyre-jit or pyrex.
 pub fn register_build_class() {
     pyre_runtime::register_build_class_impl(real_build_class);
+    pyre_objspace::space::register_property_callers(property_caller_1, property_caller_2);
+    pyre_objspace::space::register_dunder_binop_caller(dunder_binop_caller);
+    pyre_objspace::space::register_dunder_unary_caller(dunder_unary_caller);
+    pyre_runtime::register_dunder_caller(dunder_method_caller);
+    pyre_runtime::register_attr_builtins(
+        |obj, name| pyre_objspace::space::py_getattr(obj, name).is_ok(),
+        |obj, name, default| {
+            pyre_objspace::space::py_getattr(obj, name)
+                .unwrap_or_else(|_| default.unwrap_or(PY_NULL))
+        },
+        |obj, name, value| {
+            let _ = pyre_objspace::space::py_setattr(obj, name, value);
+        },
+    );
+}
+
+/// Call a user function with 1 arg (property fget).
+fn property_caller_1(func: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
+    call_user_func_with_args(func, &[arg])
+}
+
+/// Call a user function with 2 args (property fset).
+fn property_caller_2(func: PyObjectRef, arg0: PyObjectRef, arg1: PyObjectRef) -> PyObjectRef {
+    call_user_func_with_args(func, &[arg0, arg1])
+}
+
+/// Call a dunder unary method(obj) — for __neg__, __bool__, etc.
+fn dunder_unary_caller(method: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
+    call_user_func_with_args(method, &[obj])
+}
+
+/// Call a dunder binop method(a, b) — for __add__, __eq__, etc.
+fn dunder_binop_caller(method: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    call_user_func_with_args(method, &[a, b])
+}
+
+/// Call a dunder method on obj — for __repr__, __str__, __bool__, etc.
+/// Looks up method_name in obj's type MRO, then calls it.
+fn dunder_method_caller(obj: PyObjectRef, method_name: &str) -> Option<PyObjectRef> {
+    unsafe {
+        if !pyre_object::is_instance(obj) {
+            return None;
+        }
+        let w_type = pyre_object::w_instance_get_type(obj);
+        let method = pyre_objspace::space::py_getattr(w_type, method_name).ok()?;
+        if method.is_null() {
+            return None;
+        }
+        Some(call_user_func_with_args(method, &[obj]))
+    }
+}
+
+/// Helper: call a user function with arbitrary args from descriptor context.
+fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    let code_ptr = unsafe { w_func_get_code_ptr(func) };
+    let globals = unsafe { w_func_get_globals(func) };
+    let closure = unsafe { w_func_get_closure(func) };
+    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let mut frame = PyFrame::new_for_call_with_closure(func_code, args, globals, exec_ctx, closure);
+    frame.fix_array_ptrs();
+    eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
 }
 
 /// The real __build_class__(body_fn, name, *bases) implementation.
