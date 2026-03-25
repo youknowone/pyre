@@ -12,12 +12,14 @@ use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, In
 use pyre_interp::frame::PendingInlineResult;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
+use pyre_object::listobject::w_list_getitem;
 use pyre_object::pyobject::{
     BOOL_TYPE, DICT_TYPE, FLOAT_TYPE, INT_TYPE, LIST_TYPE, NONE_TYPE, PyType, TUPLE_TYPE, is_bool,
     is_dict, is_float, is_int, is_list, is_none, is_tuple,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::strobject::is_str;
+use pyre_object::tupleobject::w_tuple_getitem;
 use pyre_object::{
     PY_NULL, w_bool_from, w_float_get_value, w_int_get_value, w_int_new,
     w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len, w_list_new,
@@ -2414,12 +2416,28 @@ impl MIFrame {
         seq: OpRef,
         count: usize,
         concrete_seq: PyObjectRef,
-    ) -> Result<Vec<OpRef>, PyError> {
+    ) -> Result<Vec<FrontendOp>, PyError> {
         if concrete_seq.is_null() {
-            return TraceHelperAccess::trace_unpack_sequence(self, seq, count);
+            let oprefs = TraceHelperAccess::trace_unpack_sequence(self, seq, count)?;
+            return Ok(oprefs.into_iter().map(FrontendOp::opref_only).collect());
         }
 
-        self.with_ctx(|this, ctx| unsafe {
+        // Extract concrete items from the sequence for RPython Box parity.
+        let concrete_items: Vec<PyObjectRef> = unsafe {
+            if is_tuple(concrete_seq) {
+                (0..count)
+                    .filter_map(|i| w_tuple_getitem(concrete_seq, i as i64))
+                    .collect()
+            } else if is_list(concrete_seq) && w_list_uses_object_storage(concrete_seq) {
+                (0..count)
+                    .filter_map(|i| w_list_getitem(concrete_seq, i as i64))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let oprefs = self.with_ctx(|this, ctx| unsafe {
             if is_tuple(concrete_seq) && w_tuple_len(concrete_seq) == count {
                 return Ok(this.trace_unpack_known_sequence(
                     ctx,
@@ -2444,7 +2462,20 @@ impl MIFrame {
                 ));
             }
             TraceHelperAccess::trace_unpack_sequence(this, seq, count)
-        })
+        })?;
+
+        Ok(oprefs
+            .into_iter()
+            .enumerate()
+            .map(|(i, opref)| {
+                let cv = concrete_items
+                    .get(i)
+                    .copied()
+                    .map(ConcreteValue::from_pyobj)
+                    .unwrap_or(ConcreteValue::Null);
+                FrontendOp::new(opref, cv)
+            })
+            .collect())
     }
 
     pub(crate) fn binary_subscr_value(
@@ -4999,8 +5030,7 @@ impl SharedOpcodeHandler for MIFrame {
         seq: Self::Value,
         count: usize,
     ) -> Result<Vec<Self::Value>, PyError> {
-        let oprefs = self.unpack_sequence_value(seq.opref, count, seq.concrete.to_pyobj())?;
-        Ok(oprefs.into_iter().map(FrontendOp::opref_only).collect())
+        self.unpack_sequence_value(seq.opref, count, seq.concrete.to_pyobj())
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
