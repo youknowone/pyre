@@ -204,11 +204,11 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
                 frame.fix_array_ptrs();
-                // RPython warmspot.py:961-983 handle_jitexception parity:
-                // after ContinueRunningNormally, re-enter portal which calls
-                // maybe_compile_and_run → dispatches to compiled code.
-                // TODO: enable try_function_entry_jit dispatch after full
-                // resume data parity (null Ref in fail_args must be fixed).
+                // RPython warmspot.py:976-978:
+                //   result = portal_ptr(*args)
+                //   return result
+                // Requires all guards to have working blackhole (no Failed).
+                // Until resume data is complete, fall through to eval_loop_jit.
                 continue;
             }
         }
@@ -347,9 +347,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     {
                         return loop_result;
                     }
-                    // RPython warmstate.py bound_reached: no counter reset
-                    // after guard failure — blackhole handles immediate re-entry.
-                    // Blocked: counter reset needed until blackhole is active.
+                    // RPython warmstate.py:429 bound_reached:
+                    // jitcounter.decay_all_counters()
+                    // Requires all guards to have working blackhole.
+                    // Until resume data is complete, use reset as fallback.
                     driver
                         .meta_interp_mut()
                         .warm_state_mut()
