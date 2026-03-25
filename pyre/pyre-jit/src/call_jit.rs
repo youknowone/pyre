@@ -804,10 +804,25 @@ pub fn resume_in_blackhole_from_fail_args(
                 return BlackholeResult::Failed;
             }
         };
-        if py_pc >= code.instructions.len() {
-            builder.release_chain(prev_bh);
-            return BlackholeResult::Failed;
-        }
+        // Root guard: fail_args[0] = virtualizable frame (callee) but
+        // ni/locals = caller's state. If ni is out of range for the
+        // virtualizable frame's code, use _caller_frame's code instead.
+        // RPython: root guard resume data encodes the caller frame.
+        let (code, nlocals, frame_ptr) = if py_pc >= code.instructions.len() {
+            let caller_code = unsafe { &*_caller_frame.code };
+            let caller_nlocals = caller_code.varnames.len();
+            if py_pc >= caller_code.instructions.len() {
+                builder.release_chain(prev_bh);
+                return BlackholeResult::Failed;
+            }
+            (
+                caller_code,
+                caller_nlocals,
+                _caller_frame as *const PyFrame as *mut PyFrame,
+            )
+        } else {
+            (code, nlocals, frame_ptr)
+        };
         let vsd = match section.get(2) {
             Some(Value::Int(v)) => *v as usize,
             _ => {
