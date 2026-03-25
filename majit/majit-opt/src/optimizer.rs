@@ -105,7 +105,11 @@ pub struct Optimizer {
     /// optimizer.py: `can_replace_guards` — flag to enable/disable guard sharing.
     can_replace_guards: bool,
     /// optimizer.py: `quasi_immutable_deps` — quasi-immutable field dependencies.
-    quasi_immutable_deps: std::collections::HashSet<u32>,
+    /// RPython: dict[QuasiImmut → None]. We store raw pointers (u64) to
+    /// namespace/quasi-immutable objects that compiled code depends on.
+    /// After compilation, each dependency gets the loop's invalidation
+    /// flag registered as a watcher.
+    pub quasi_immutable_deps: std::collections::HashSet<u64>,
     /// optimizer.py: `resumedata_memo` — shared constant map for resume data.
     /// Maps constant values to shared indices to reduce resume data size.
     /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
@@ -994,10 +998,13 @@ impl Optimizer {
         self.resumedata_memo_consts.len()
     }
 
-    /// optimizer.py: add_quasi_immutable_dep(descr_idx)
-    /// Track a quasi-immutable field dependency.
-    pub fn add_quasi_immutable_dep(&mut self, descr_idx: u32) {
-        self.quasi_immutable_deps.insert(descr_idx);
+    /// optimizer.py: quasi_immutable_deps[qmut] = None
+    /// Track a quasi-immutable field dependency. `dep` is a raw pointer
+    /// to the quasi-immutable object (e.g., PyNamespace) that the compiled
+    /// loop depends on. After compilation, each dep gets the loop's
+    /// invalidation flag registered as a watcher.
+    pub fn add_quasi_immutable_dep(&mut self, dep: u64) {
+        self.quasi_immutable_deps.insert(dep);
     }
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
@@ -1573,6 +1580,8 @@ impl Optimizer {
         }
 
         // Transfer exported virtual state from context to optimizer
+        // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
+        self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
         let exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
         self.imported_short_sources = std::mem::take(&mut ctx.imported_short_sources);
         self.imported_short_aliases = ctx.used_imported_short_aliases();

@@ -1902,6 +1902,13 @@ impl Optimization for OptHeap {
                     ctx.emit(guard_op);
                 }
                 let obj = op.arg(0);
+                // RPython optimize_QUASIIMMUT_FIELD: collect quasi-immutable
+                // dependencies. If obj is a constant (e.g., namespace pointer),
+                // add it to quasi_immutable_deps for post-compile watcher
+                // registration (compile.py:record_loop_or_bridge parity).
+                if let Some(dep_ptr) = ctx.get_constant_int(obj) {
+                    ctx.add_quasi_immutable_dep(dep_ptr as u64);
+                }
                 if let Some(descr) = &op.descr {
                     let field_idx = descr.index();
                     self.quasi_immut_cache.insert((obj, field_idx), OpRef::NONE);

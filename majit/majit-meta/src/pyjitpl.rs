@@ -328,6 +328,12 @@ pub struct MetaInterp<M: Clone> {
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
     pub(crate) potential_retrace_position: Option<majit_trace::recorder::TracePosition>,
+    /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
+    /// quasi-immutable dependencies from the last compilation.
+    /// Raw pointers to namespace/quasi-immutable objects that the compiled
+    /// loop depends on. After compilation, the caller registers the loop's
+    /// invalidation flag on each dep. Cleared on each compile attempt.
+    pub last_quasi_immutable_deps: Vec<u64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -622,6 +628,7 @@ impl<M: Clone> MetaInterp<M> {
             exported_state: None,
             cancel_count: 0,
             potential_retrace_position: None,
+            last_quasi_immutable_deps: Vec::new(),
         }
     }
 
@@ -2430,6 +2437,9 @@ impl<M: Clone> MetaInterp<M> {
             trace.inputargs.len(),
         );
         let num_ops_after = optimized_ops.len();
+        // RPython compile.py:234 parity: transfer quasi-immutable deps
+        // from optimizer to MetaInterp for post-compile watcher registration.
+        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
 
         if crate::majit_log_enabled() {
             eprintln!(
