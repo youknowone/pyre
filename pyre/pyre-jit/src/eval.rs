@@ -844,7 +844,7 @@ fn restore_guard_failure_for_loop(
         crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take())
     {
         if restored {
-            let frame = unsafe { &mut *(jit_state.frame as *mut pyre_interp::frame::PyFrame) };
+            let frame = unsafe { &mut *(jit_state.frame as *mut PyFrame) };
             crate::call_jit::jit_bridge_compile_for_guard(
                 bridge_gk,
                 bridge_tid,
