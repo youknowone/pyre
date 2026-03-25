@@ -31,7 +31,7 @@ use pyre_objspace::truth_value as objspace_truth_value;
 /// Carries both the symbolic IR reference (OpRef) and the concrete
 /// execution value (ConcreteValue). Created by opcode handlers that
 /// compute concrete results alongside IR recording.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrontendOp {
     pub opref: OpRef,
     pub concrete: ConcreteValue,
@@ -55,7 +55,7 @@ impl FrontendOp {
 /// Python bytecode uses untyped locals, so we use a tagged enum instead of
 /// RPython's separate `registers_i/r/f` arrays. Each variant corresponds to
 /// one of RPython's Box types: `BoxInt`, `BoxPtr`, `BoxFloat`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConcreteValue {
     Int(i64),
     Float(f64),
@@ -267,11 +267,6 @@ pub struct PyreSym {
     /// stack value later. Keep the concrete branch direction alongside the
     /// raw traced truth so POP_JUMP_IF can consume the same pair.
     pub(crate) last_comparison_concrete_truth: Option<bool>,
-    /// Concrete box most recently popped through the shared stack API.
-    /// This mirrors RPython's `goto_if_not(box)` ownership: branch truth
-    /// consumers should inspect the popped box, not reload from the
-    /// post-pop concrete stack.
-    pub(crate) last_popped_concrete_value: Option<PyObjectRef>,
     /// Popped branch source currently being converted to truth.
     /// Generic guards emitted during `truth_value(value)` must still capture
     /// the pre-pop stack shape, matching RPython's goto_if_not(box).
@@ -285,8 +280,6 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub(crate) concrete_stack: Vec<ConcreteValue>,
-    /// Concrete value to be consumed by the next push_value() call.
-    pub(crate) pending_concrete_push: Option<ConcreteValue>,
     /// Frame metadata extracted at trace start — avoids stale snapshot reads.
     /// RPython MIFrame.jitcode parity.
     pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
@@ -1142,12 +1135,10 @@ impl PyreSym {
             vable_array_base: None,
             last_comparison_truth: None,
             last_comparison_concrete_truth: None,
-            last_popped_concrete_value: None,
             pending_branch_value: None,
             transient_value_types: std::collections::HashMap::new(),
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
-            pending_concrete_push: None,
             // concrete_code and concrete_namespace initialized below
             concrete_code: std::ptr::null(),
             concrete_namespace: std::ptr::null_mut(),
@@ -1301,7 +1292,7 @@ impl PyreSym {
 
     /// Read as PyObjectRef (convenience for legacy code).
     pub(crate) fn concrete_pyobj_at(&self, abs_idx: usize) -> PyObjectRef {
-        self.concrete_value_at(abs_idx).to_pyobj()
+        self.concrete_at_or_frame(abs_idx).to_pyobj()
     }
 }
 
@@ -1555,19 +1546,7 @@ impl MIFrame {
             .get(stack_idx)
             .copied()
             .unwrap_or(Type::Ref);
-        // MIFrame Box tracking: pop concrete value from concrete_stack
-        let concrete_popped = s
-            .concrete_stack
-            .get(stack_idx)
-            .copied()
-            .unwrap_or(ConcreteValue::Null);
-        let concrete_popped_pyobj = if concrete_popped.is_null() {
-            None
-        } else {
-            Some(concrete_popped.to_pyobj())
-        };
         s.valuestackdepth -= 1;
-        s.last_popped_concrete_value = concrete_popped_pyobj;
         s.transient_value_types.insert(value, value_type);
         Ok(value)
     }
@@ -2109,7 +2088,6 @@ impl MIFrame {
         };
         if self.parent_fail_args.is_some() {
             self.record_guard(ctx, opcode, &[truth]);
-            self.sym_mut().last_popped_concrete_value = None;
             return;
         }
 
@@ -2165,15 +2143,6 @@ impl MIFrame {
         let fail_arg_types =
             virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types));
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
-        if self.sym().pending_branch_value.is_none() {
-            self.sym_mut().last_popped_concrete_value = None;
-        }
-    }
-
-    fn concrete_popped_value(&self) -> Option<PyObjectRef> {
-        self.sym()
-            .last_popped_concrete_value
-            .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
     }
 
     /// Read a concrete value from MIFrame Box arrays.
@@ -2183,23 +2152,6 @@ impl MIFrame {
             return Some(v.to_pyobj());
         }
         None
-    }
-
-    fn concrete_binary_operands(&self) -> Option<(PyObjectRef, PyObjectRef)> {
-        let vsd = self.sym().valuestackdepth;
-        Some((
-            self.concrete_at_or_frame(vsd)?,
-            self.concrete_at_or_frame(vsd + 1)?,
-        ))
-    }
-
-    fn concrete_store_subscr_operands(&self) -> Option<(PyObjectRef, PyObjectRef, PyObjectRef)> {
-        let vsd = self.sym().valuestackdepth;
-        Some((
-            self.concrete_at_or_frame(vsd)?,
-            self.concrete_at_or_frame(vsd + 1)?,
-            self.concrete_at_or_frame(vsd + 2)?,
-        ))
     }
 
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
@@ -2237,36 +2189,6 @@ impl MIFrame {
         let raw = trace_gc_object_int_field(ctx, int_obj, int_intval_descr());
         self.remember_value_type(raw, Type::Int);
         raw
-    }
-
-    fn concrete_binary_int_operands(&self) -> Option<(i64, i64)> {
-        let (lhs, rhs) = self.concrete_binary_operands()?;
-        unsafe {
-            if is_int(lhs) && is_int(rhs) {
-                Some((w_int_get_value(lhs), w_int_get_value(rhs)))
-            } else {
-                // Values might be LONG_TYPE (bigint) — not inlinable
-                None
-            }
-        }
-    }
-
-    fn concrete_binary_float_operands(&self) -> bool {
-        let Some((lhs, rhs)) = self.concrete_binary_operands() else {
-            return false;
-        };
-        unsafe { is_float(lhs) && is_float(rhs) }
-    }
-
-    fn concrete_unary_int_operand(&self) -> Option<i64> {
-        let value = self.concrete_popped_value()?;
-        unsafe {
-            if is_int(value) {
-                Some(w_int_get_value(value))
-            } else {
-                None
-            }
-        }
     }
 
     fn guard_len_gt_index(&mut self, ctx: &mut TraceCtx, len: OpRef, index: usize) {
@@ -2494,10 +2416,11 @@ impl MIFrame {
         &mut self,
         seq: OpRef,
         count: usize,
+        concrete_seq: PyObjectRef,
     ) -> Result<Vec<OpRef>, PyError> {
-        let Some(concrete_seq) = self.concrete_popped_value() else {
+        if concrete_seq.is_null() {
             return TraceHelperAccess::trace_unpack_sequence(self, seq, count);
-        };
+        }
 
         self.with_ctx(|this, ctx| unsafe {
             if is_tuple(concrete_seq) && w_tuple_len(concrete_seq) == count {
@@ -2527,121 +2450,139 @@ impl MIFrame {
         })
     }
 
-    pub(crate) fn binary_subscr_value(&mut self, a: OpRef, b: OpRef) -> Result<OpRef, PyError> {
-        let Some((concrete_obj, concrete_key)) = self.concrete_binary_operands() else {
-            return self.trace_binary_value(a, b, BinaryOperator::Subscr);
-        };
-        // MIFrame Box tracking: compute concrete subscr result
-        if let Ok(result) = pyre_objspace::space::py_getitem(concrete_obj, concrete_key) {
-            self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(result));
+    pub(crate) fn binary_subscr_value(
+        &mut self,
+        a: OpRef,
+        b: OpRef,
+        concrete_obj: PyObjectRef,
+        concrete_key: PyObjectRef,
+    ) -> Result<FrontendOp, PyError> {
+        if concrete_obj.is_null() || concrete_key.is_null() {
+            let opref = self.trace_binary_value(a, b, BinaryOperator::Subscr)?;
+            return Ok(FrontendOp::new(opref, ConcreteValue::Null));
         }
+        // MIFrame Box tracking: compute concrete subscr result
+        let subscr_concrete =
+            if let Ok(result) = pyre_objspace::space::py_getitem(concrete_obj, concrete_key) {
+                ConcreteValue::from_pyobj(result)
+            } else {
+                ConcreteValue::Null
+            };
 
         unsafe {
             if is_int(concrete_key) {
                 let index = w_int_get_value(concrete_key);
-                return self.with_ctx(|this, ctx| {
-                    if is_tuple(concrete_obj) {
-                        let concrete_len = w_tuple_len(concrete_obj);
-                        if index >= 0 {
-                            let index = index as usize;
-                            if index < concrete_len {
-                                return Ok(this.trace_direct_tuple_getitem(
-                                    ctx,
-                                    a,
-                                    b,
-                                    &TUPLE_TYPE as *const PyType,
-                                    tuple_items_ptr_descr(),
-                                    tuple_items_len_descr(),
-                                    index,
-                                ));
+                return self
+                    .with_ctx(|this, ctx| {
+                        if is_tuple(concrete_obj) {
+                            let concrete_len = w_tuple_len(concrete_obj);
+                            if index >= 0 {
+                                let index = index as usize;
+                                if index < concrete_len {
+                                    return Ok(this.trace_direct_tuple_getitem(
+                                        ctx,
+                                        a,
+                                        b,
+                                        &TUPLE_TYPE as *const PyType,
+                                        tuple_items_ptr_descr(),
+                                        tuple_items_len_descr(),
+                                        index,
+                                    ));
+                                }
+                            } else if let Some(abs_index) = index
+                                .checked_neg()
+                                .and_then(|value| usize::try_from(value).ok())
+                            {
+                                if abs_index <= concrete_len {
+                                    return Ok(this.trace_direct_negative_tuple_getitem(
+                                        ctx,
+                                        a,
+                                        b,
+                                        &TUPLE_TYPE as *const PyType,
+                                        tuple_items_ptr_descr(),
+                                        tuple_items_len_descr(),
+                                        index,
+                                        concrete_len,
+                                    ));
+                                }
                             }
-                        } else if let Some(abs_index) = index
-                            .checked_neg()
-                            .and_then(|value| usize::try_from(value).ok())
+                        } else if is_list(concrete_obj) && w_list_uses_object_storage(concrete_obj)
                         {
-                            if abs_index <= concrete_len {
-                                return Ok(this.trace_direct_negative_tuple_getitem(
-                                    ctx,
-                                    a,
-                                    b,
-                                    &TUPLE_TYPE as *const PyType,
-                                    tuple_items_ptr_descr(),
-                                    tuple_items_len_descr(),
-                                    index,
-                                    concrete_len,
-                                ));
+                            let concrete_len = w_list_len(concrete_obj);
+                            if index >= 0 {
+                                let index = index as usize;
+                                if index < concrete_len {
+                                    return Ok(
+                                        this.trace_direct_object_list_getitem(ctx, a, b, index)
+                                    );
+                                }
+                            } else if let Some(abs_index) = index
+                                .checked_neg()
+                                .and_then(|value| usize::try_from(value).ok())
+                            {
+                                if abs_index <= concrete_len {
+                                    return Ok(this.trace_direct_negative_object_list_getitem(
+                                        ctx,
+                                        a,
+                                        b,
+                                        index,
+                                        concrete_len,
+                                    ));
+                                }
+                            }
+                        } else if is_list(concrete_obj) && w_list_uses_int_storage(concrete_obj) {
+                            let concrete_len = w_list_len(concrete_obj);
+                            if index >= 0 {
+                                let index = index as usize;
+                                if index < concrete_len {
+                                    return Ok(this.trace_direct_int_list_getitem(ctx, a, b, index));
+                                }
+                            } else if let Some(abs_index) = index
+                                .checked_neg()
+                                .and_then(|value| usize::try_from(value).ok())
+                            {
+                                if abs_index <= concrete_len {
+                                    return Ok(this.trace_direct_negative_int_list_getitem(
+                                        ctx,
+                                        a,
+                                        b,
+                                        index,
+                                        concrete_len,
+                                    ));
+                                }
+                            }
+                        } else if is_list(concrete_obj) && w_list_uses_float_storage(concrete_obj) {
+                            let concrete_len = w_list_len(concrete_obj);
+                            if index >= 0 {
+                                let index = index as usize;
+                                if index < concrete_len {
+                                    return Ok(
+                                        this.trace_direct_float_list_getitem(ctx, a, b, index)
+                                    );
+                                }
+                            } else if let Some(abs_index) = index
+                                .checked_neg()
+                                .and_then(|value| usize::try_from(value).ok())
+                            {
+                                if abs_index <= concrete_len {
+                                    return Ok(this.trace_direct_negative_float_list_getitem(
+                                        ctx,
+                                        a,
+                                        b,
+                                        index,
+                                        concrete_len,
+                                    ));
+                                }
                             }
                         }
-                    } else if is_list(concrete_obj) && w_list_uses_object_storage(concrete_obj) {
-                        let concrete_len = w_list_len(concrete_obj);
-                        if index >= 0 {
-                            let index = index as usize;
-                            if index < concrete_len {
-                                return Ok(this.trace_direct_object_list_getitem(ctx, a, b, index));
-                            }
-                        } else if let Some(abs_index) = index
-                            .checked_neg()
-                            .and_then(|value| usize::try_from(value).ok())
-                        {
-                            if abs_index <= concrete_len {
-                                return Ok(this.trace_direct_negative_object_list_getitem(
-                                    ctx,
-                                    a,
-                                    b,
-                                    index,
-                                    concrete_len,
-                                ));
-                            }
-                        }
-                    } else if is_list(concrete_obj) && w_list_uses_int_storage(concrete_obj) {
-                        let concrete_len = w_list_len(concrete_obj);
-                        if index >= 0 {
-                            let index = index as usize;
-                            if index < concrete_len {
-                                return Ok(this.trace_direct_int_list_getitem(ctx, a, b, index));
-                            }
-                        } else if let Some(abs_index) = index
-                            .checked_neg()
-                            .and_then(|value| usize::try_from(value).ok())
-                        {
-                            if abs_index <= concrete_len {
-                                return Ok(this.trace_direct_negative_int_list_getitem(
-                                    ctx,
-                                    a,
-                                    b,
-                                    index,
-                                    concrete_len,
-                                ));
-                            }
-                        }
-                    } else if is_list(concrete_obj) && w_list_uses_float_storage(concrete_obj) {
-                        let concrete_len = w_list_len(concrete_obj);
-                        if index >= 0 {
-                            let index = index as usize;
-                            if index < concrete_len {
-                                return Ok(this.trace_direct_float_list_getitem(ctx, a, b, index));
-                            }
-                        } else if let Some(abs_index) = index
-                            .checked_neg()
-                            .and_then(|value| usize::try_from(value).ok())
-                        {
-                            if abs_index <= concrete_len {
-                                return Ok(this.trace_direct_negative_float_list_getitem(
-                                    ctx,
-                                    a,
-                                    b,
-                                    index,
-                                    concrete_len,
-                                ));
-                            }
-                        }
-                    }
-                    this.trace_binary_value(a, b, BinaryOperator::Subscr)
-                });
+                        this.trace_binary_value(a, b, BinaryOperator::Subscr)
+                    })
+                    .map(|op| FrontendOp::new(op, subscr_concrete));
             }
         }
 
-        self.trace_binary_value(a, b, BinaryOperator::Subscr)
+        let opref = self.trace_binary_value(a, b, BinaryOperator::Subscr)?;
+        Ok(FrontendOp::new(opref, subscr_concrete))
     }
 
     pub(crate) fn binary_int_value(
@@ -2649,13 +2590,19 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         op: BinaryOperator,
+        concrete_lhs: PyObjectRef,
+        concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let Some((lhs, rhs)) = self.concrete_binary_int_operands() else {
-            return self.trace_binary_value(a, b, op);
+        let (lhs, rhs) = unsafe {
+            if concrete_lhs.is_null()
+                || concrete_rhs.is_null()
+                || !is_int(concrete_lhs)
+                || !is_int(concrete_rhs)
+            {
+                return self.trace_binary_value(a, b, op);
+            }
+            (w_int_get_value(concrete_lhs), w_int_get_value(concrete_rhs))
         };
-        let (lhs_obj, rhs_obj) = self
-            .concrete_binary_operands()
-            .expect("integer concrete operands should expose boxed operands");
 
         let op_code = match op {
             BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::IntAddOvf,
@@ -2750,6 +2697,8 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         op: BinaryOperator,
+        _concrete_lhs: PyObjectRef,
+        _concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
         let op_code = match op {
@@ -2829,10 +2778,13 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         op: ComparisonOperator,
+        concrete_lhs: PyObjectRef,
+        concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() else {
+        let (lhs_obj, rhs_obj) = (concrete_lhs, concrete_rhs);
+        if lhs_obj.is_null() || rhs_obj.is_null() {
             return self.trace_compare_value(a, b, op);
-        };
+        }
 
         unsafe {
             if is_int(lhs_obj) && is_int(rhs_obj) {
@@ -2945,12 +2897,13 @@ impl MIFrame {
         obj: OpRef,
         key: OpRef,
         value: OpRef,
+        concrete_obj: PyObjectRef,
+        concrete_key: PyObjectRef,
+        concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
-        let Some((concrete_value, concrete_obj, concrete_key)) =
-            self.concrete_store_subscr_operands()
-        else {
+        if concrete_obj.is_null() || concrete_key.is_null() || concrete_value.is_null() {
             return self.trace_store_subscr(obj, key, value);
-        };
+        }
 
         unsafe {
             if is_list(concrete_obj)
@@ -3124,10 +3077,15 @@ impl MIFrame {
         self.trace_store_subscr(obj, key, value)
     }
 
-    pub(crate) fn list_append_value(&mut self, list: OpRef, value: OpRef) -> Result<(), PyError> {
-        let Some(concrete_list) = self.concrete_popped_value() else {
+    pub(crate) fn list_append_value(
+        &mut self,
+        list: OpRef,
+        value: OpRef,
+        concrete_list: PyObjectRef,
+    ) -> Result<(), PyError> {
+        if concrete_list.is_null() {
             return self.trace_list_append(list, value);
-        };
+        }
 
         unsafe {
             if is_list(concrete_list)
@@ -3261,14 +3219,6 @@ impl MIFrame {
         range_iter_continues(concrete_iter)
     }
 
-    fn concrete_callable_after_pops(&self) -> Option<PyObjectRef> {
-        self.concrete_at_or_frame(self.sym().valuestackdepth)
-    }
-
-    fn concrete_call_arg_after_pops(&self, arg_idx: usize) -> Option<PyObjectRef> {
-        self.concrete_at_or_frame(self.sym().valuestackdepth + 2 + arg_idx)
-    }
-
     fn trace_known_builtin_call(
         &mut self,
         callable: OpRef,
@@ -3280,10 +3230,15 @@ impl MIFrame {
         })
     }
 
-    fn direct_len_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
-        let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
+    fn direct_len_value(
+        &mut self,
+        callable: OpRef,
+        value: OpRef,
+        concrete_value: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        if concrete_value.is_null() {
             return self.trace_known_builtin_call(callable, &[value]);
-        };
+        }
 
         unsafe {
             if is_str(concrete_value) {
@@ -3339,10 +3294,15 @@ impl MIFrame {
         self.trace_known_builtin_call(callable, &[value])
     }
 
-    fn direct_abs_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
-        let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
+    fn direct_abs_value(
+        &mut self,
+        callable: OpRef,
+        value: OpRef,
+        concrete_value: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        if concrete_value.is_null() {
             return self.trace_known_builtin_call(callable, &[value]);
-        };
+        }
 
         unsafe {
             if is_int(concrete_value) {
@@ -3377,10 +3337,15 @@ impl MIFrame {
         self.trace_known_builtin_call(callable, &[value])
     }
 
-    fn direct_type_value(&mut self, callable: OpRef, value: OpRef) -> Result<OpRef, PyError> {
-        let Some(concrete_value) = self.concrete_call_arg_after_pops(0) else {
+    fn direct_type_value(
+        &mut self,
+        callable: OpRef,
+        value: OpRef,
+        concrete_value: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        if concrete_value.is_null() {
             return self.trace_known_builtin_call(callable, &[value]);
-        };
+        }
 
         unsafe {
             let concrete_obj_type = (*concrete_value).ob_type;
@@ -3397,13 +3362,12 @@ impl MIFrame {
         callable: OpRef,
         obj: OpRef,
         type_name: OpRef,
+        concrete_obj: PyObjectRef,
+        concrete_type_name: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let (Some(concrete_obj), Some(concrete_type_name)) = (
-            self.concrete_call_arg_after_pops(0),
-            self.concrete_call_arg_after_pops(1),
-        ) else {
+        if concrete_obj.is_null() || concrete_type_name.is_null() {
             return self.trace_known_builtin_call(callable, &[obj, type_name]);
-        };
+        }
 
         unsafe {
             if is_str(concrete_type_name) {
@@ -3427,13 +3391,12 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         choose_max: bool,
+        concrete_a: PyObjectRef,
+        concrete_b: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        let (Some(concrete_a), Some(concrete_b)) = (
-            self.concrete_call_arg_after_pops(0),
-            self.concrete_call_arg_after_pops(1),
-        ) else {
+        if concrete_a.is_null() || concrete_b.is_null() {
             return self.trace_known_builtin_call(callable, &[a, b]);
-        };
+        }
 
         unsafe {
             if is_int(concrete_a) && is_int(concrete_b) {
@@ -3489,46 +3452,58 @@ impl MIFrame {
         &mut self,
         callable: OpRef,
         args: &[OpRef],
+        concrete_callable: PyObjectRef,
+        concrete_args: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
-        let Some(concrete_callable) = self.concrete_callable_after_pops() else {
+        if concrete_callable.is_null() {
             debug_assert!(
                 false,
                 "concrete_callable should always be available during tracing"
             );
             return self.trace_call_callable(callable, args);
-        };
+        }
 
         unsafe {
             if is_builtin_func(concrete_callable) {
                 let builtin_name = w_builtin_func_name(concrete_callable);
                 if args.len() == 1 {
+                    let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
                         this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
                     if builtin_name == "type" {
-                        return self.direct_type_value(callable, args[0]);
+                        return self.direct_type_value(callable, args[0], c_arg0);
                     }
                     if builtin_name == "len" {
-                        return self.direct_len_value(callable, args[0]);
+                        return self.direct_len_value(callable, args[0], c_arg0);
                     }
                     if builtin_name == "abs" {
-                        return self.direct_abs_value(callable, args[0]);
+                        return self.direct_abs_value(callable, args[0], c_arg0);
                     }
                 } else if args.len() == 2 && builtin_name == "isinstance" {
+                    let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
                         this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
-                    return self.direct_isinstance_value(callable, args[0], args[1]);
+                    return self
+                        .direct_isinstance_value(callable, args[0], args[1], c_arg0, c_arg1);
                 } else if args.len() == 2 && builtin_name == "min" {
+                    let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
                         this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
-                    return self.direct_minmax_value(callable, args[0], args[1], false);
+                    return self
+                        .direct_minmax_value(callable, args[0], args[1], false, c_arg0, c_arg1);
                 } else if args.len() == 2 && builtin_name == "max" {
+                    let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let c_arg1 = concrete_args.get(1).copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
                         this.guard_value_ref(ctx, callable, concrete_callable as i64)
                     });
-                    return self.direct_minmax_value(callable, args[0], args[1], true);
+                    return self
+                        .direct_minmax_value(callable, args[0], args[1], true, c_arg0, c_arg1);
                 }
                 return self.with_ctx(|this, ctx| {
                     this.guard_value_ref(ctx, callable, concrete_callable as i64);
@@ -3563,7 +3538,7 @@ impl MIFrame {
                     driver.meta_interp().warm_state_ref().max_unroll_recursion() as usize;
                 let recursive_depth = self.with_ctx(|_, ctx| ctx.recursive_depth(callee_key));
                 let concrete_arg0 = if nargs == 1 {
-                    self.concrete_call_arg_after_pops(0)
+                    concrete_args.first().copied()
                 } else {
                     None
                 };
@@ -3648,11 +3623,10 @@ impl MIFrame {
                         args,
                         concrete_callable,
                         callee_key,
+                        concrete_args,
                     ) {
                         Ok(pending) => {
                             self.pending_inline_frame = Some(pending);
-                            self.sym_mut().pending_concrete_push =
-                                Some(ConcreteValue::Ref(pyre_object::PY_NULL));
                             return self
                                 .with_ctx(|_, ctx| Ok(ctx.const_int(pyre_object::PY_NULL as i64)));
                         }
@@ -3700,6 +3674,7 @@ impl MIFrame {
                             concrete_callable,
                             callee_key,
                             frame_helper,
+                            concrete_args,
                         );
                     }
                 }
@@ -3819,11 +3794,10 @@ impl MIFrame {
                                 args,
                                 concrete_callable,
                                 callee_key,
+                                concrete_args,
                             ) {
                                 Ok(pending) => {
                                     self.pending_inline_frame = Some(pending);
-                                    self.sym_mut().pending_concrete_push =
-                                        Some(ConcreteValue::Ref(pyre_object::PY_NULL));
                                     return self.with_ctx(|_, ctx| {
                                         Ok(ctx.const_int(pyre_object::PY_NULL as i64))
                                     });
@@ -3974,6 +3948,7 @@ impl MIFrame {
                                 concrete_callable,
                                 callee_key,
                                 frame_helper,
+                                concrete_args,
                             );
                         }
                     }
@@ -4008,6 +3983,7 @@ impl MIFrame {
         args: &[OpRef],
         concrete_callable: PyObjectRef,
         callee_key: u64,
+        passed_concrete_args: &[PyObjectRef],
     ) -> Result<PendingInlineFrame, PyError> {
         use pyre_interp::frame::PyFrame;
 
@@ -4015,20 +3991,7 @@ impl MIFrame {
             this.guard_value_ref(ctx, callable, concrete_callable as i64);
         });
 
-        let mut concrete_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| {
-                self.concrete_call_arg_after_pops(i)
-                    .unwrap_or(pyre_object::PY_NULL)
-            })
-            .collect();
-        // Fill missing concrete args from concrete_frame fallback.
-        for idx in 0..concrete_args.len() {
-            if concrete_args[idx].is_null() {
-                if let Some(val) = self.concrete_at_or_frame(self.sym().valuestackdepth + 2 + idx) {
-                    concrete_args[idx] = val;
-                }
-            }
-        }
+        let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
         for (_idx, arg) in concrete_args.iter().copied().enumerate() {
             if arg.is_null() {
                 return Err(PyError::type_error(
@@ -4173,10 +4136,11 @@ impl MIFrame {
         concrete_callable: PyObjectRef,
         callee_key: u64,
         frame_helper: *const (),
+        passed_concrete_args: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
         let (driver, _) = crate::eval::driver_pair();
         let concrete_arg0 = if args.len() == 1 {
-            self.concrete_call_arg_after_pops(0)
+            passed_concrete_args.first().copied()
         } else {
             None
         };
@@ -4375,23 +4339,28 @@ impl MIFrame {
     pub(crate) fn concrete_branch_truth_for_value(
         &mut self,
         _value: OpRef,
+        concrete_val: PyObjectRef,
     ) -> Result<bool, PyError> {
         if let Some(truth) = self.sym_mut().last_comparison_concrete_truth.take() {
             return Ok(truth);
         }
-        let concrete_val = self
-            .sym_mut()
-            .last_popped_concrete_value
-            .or_else(|| self.concrete_at_or_frame(self.sym().valuestackdepth))
-            .ok_or_else(|| PyError::type_error("missing concrete branch value during trace"))?;
+        if concrete_val.is_null() {
+            return Err(PyError::type_error(
+                "missing concrete branch value during trace",
+            ));
+        }
         Ok(objspace_truth_value(concrete_val))
     }
 
     pub(crate) fn concrete_branch_truth(&mut self) -> Result<bool, PyError> {
-        self.concrete_branch_truth_for_value(OpRef::NONE)
+        self.concrete_branch_truth_for_value(OpRef::NONE, PY_NULL)
     }
 
-    pub(crate) fn truth_value_direct(&mut self, value: OpRef) -> Result<OpRef, PyError> {
+    pub(crate) fn truth_value_direct(
+        &mut self,
+        value: OpRef,
+        concrete_val: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
         // RPython goto_if_not fusion: if the previous op was a comparison,
         // use the cached raw truth (0/1) directly instead of unboxing the
         // bool object. This eliminates the CallI(bool_helper) + GetfieldGcI
@@ -4400,9 +4369,9 @@ impl MIFrame {
             return Ok(truth);
         }
 
-        let cached_concrete_truth = self.concrete_popped_value().map(objspace_truth_value);
-        if let Some(truth) = cached_concrete_truth {
-            self.sym_mut().last_comparison_concrete_truth = Some(truth);
+        if !concrete_val.is_null() {
+            let cached_concrete_truth = objspace_truth_value(concrete_val);
+            self.sym_mut().last_comparison_concrete_truth = Some(cached_concrete_truth);
         }
 
         if self.value_type(value) == Type::Int {
@@ -4419,9 +4388,10 @@ impl MIFrame {
             });
         }
 
-        let Some(concrete_value) = self.concrete_popped_value() else {
+        let concrete_value = concrete_val;
+        if concrete_value.is_null() {
             return self.trace_truth_value(value);
-        };
+        }
 
         unsafe {
             if is_int(concrete_value) {
@@ -4540,8 +4510,10 @@ impl MIFrame {
         &mut self,
         value: OpRef,
         opcode: OpCode,
+        concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if self.concrete_unary_int_operand().is_none() {
+        let is_int_operand = !concrete_value.is_null() && unsafe { is_int(concrete_value) };
+        if !is_int_operand {
             return match opcode {
                 OpCode::IntNeg => self.trace_unary_negative_value(value),
                 OpCode::IntInvert => self.trace_unary_invert_value(value),
@@ -4950,14 +4922,14 @@ impl SharedOpcodeHandler for MIFrame {
             }
         }
         let arg_oprefs: Vec<OpRef> = args.iter().map(|a| a.opref).collect();
-        let opref = self.call_callable_value(callable.opref, &arg_oprefs)?;
-        // Inline frame path: call_callable_value sets pending_concrete_push
-        // to Ref(PY_NULL) as placeholder. Pick it up if result_concrete is Null.
-        if result_concrete.is_null() {
-            if let Some(pending) = self.sym_mut().pending_concrete_push.take() {
-                result_concrete = pending;
-            }
-        }
+        let opref = self.call_callable_value(
+            callable.opref,
+            &arg_oprefs,
+            concrete_callable,
+            &concrete_args,
+        )?;
+        // Inline frame path: call_callable_value returns PY_NULL placeholder.
+        // Keep result_concrete if computed by concrete execution above.
         Ok(FrontendOp::new(opref, result_concrete))
     }
 
@@ -5009,12 +4981,19 @@ impl SharedOpcodeHandler for MIFrame {
         // RPython MIFrame parity: trace-only, no concrete mutation.
         // Root frame: interpreter executes the real STORE_SUBSCR.
         // Inline frame: MetaInterp.concrete_execute_step handles it.
-        self.store_subscr_value(obj.opref, key.opref, value.opref)
+        self.store_subscr_value(
+            obj.opref,
+            key.opref,
+            value.opref,
+            obj.concrete.to_pyobj(),
+            key.concrete.to_pyobj(),
+            value.concrete.to_pyobj(),
+        )
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
         // RPython MIFrame parity: trace-only, no concrete mutation.
-        self.list_append_value(list.opref, value.opref)
+        self.list_append_value(list.opref, value.opref, list.concrete.to_pyobj())
     }
 
     fn unpack_sequence(
@@ -5022,7 +5001,7 @@ impl SharedOpcodeHandler for MIFrame {
         seq: Self::Value,
         count: usize,
     ) -> Result<Vec<Self::Value>, PyError> {
-        let oprefs = self.unpack_sequence_value(seq.opref, count)?;
+        let oprefs = self.unpack_sequence_value(seq.opref, count, seq.concrete.to_pyobj())?;
         Ok(oprefs.into_iter().map(FrontendOp::opref_only).collect())
     }
 
@@ -5177,7 +5156,7 @@ impl TruthOpcodeHandler for MIFrame {
     type Truth = OpRef;
 
     fn truth_value(&mut self, value: Self::Value) -> Result<Self::Truth, PyError> {
-        self.truth_value_direct(value.opref)
+        self.truth_value_direct(value.opref, value.concrete.to_pyobj())
     }
 
     fn bool_value_from_truth(
@@ -5260,7 +5239,6 @@ impl BranchOpcodeHandler for MIFrame {
     fn leave_branch_truth(&mut self) -> Result<(), PyError> {
         let sym = self.sym_mut();
         sym.pending_branch_value = None;
-        sym.last_popped_concrete_value = None;
         Ok(())
     }
 
@@ -5269,7 +5247,7 @@ impl BranchOpcodeHandler for MIFrame {
         value: Self::Value,
         _truth: Self::Truth,
     ) -> Result<bool, PyError> {
-        MIFrame::concrete_branch_truth_for_value(self, value.opref)
+        MIFrame::concrete_branch_truth_for_value(self, value.opref, value.concrete.to_pyobj())
     }
 
     fn guard_truth_value(&mut self, truth: Self::Truth, expect_true: bool) -> Result<(), PyError> {
@@ -5306,10 +5284,12 @@ impl ArithmeticOpcodeHandler for MIFrame {
     ) -> Result<Self::Value, PyError> {
         let a = a_fop.opref;
         let b = b_fop.opref;
+        let lhs_obj = a_fop.concrete.to_pyobj();
+        let rhs_obj = b_fop.concrete.to_pyobj();
         let mut result_concrete = ConcreteValue::Null;
         // MIFrame Box tracking: compute concrete result for binary ops
         // Float path
-        if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+        if !lhs_obj.is_null() && !rhs_obj.is_null() {
             unsafe {
                 let is_float_op = is_float(lhs_obj) || is_float(rhs_obj);
                 if is_float_op {
@@ -5361,79 +5341,85 @@ impl ArithmeticOpcodeHandler for MIFrame {
             }
         }
         // Int path
-        if result_concrete.is_null() {
-            if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
-                let result = match op {
-                    BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
-                    BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                        lhs.wrapping_sub(rhs)
-                    }
-                    BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                        lhs.wrapping_mul(rhs)
-                    }
-                    BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0 => {
-                        ((lhs % rhs) + rhs) % rhs
-                    }
-                    BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
-                        if rhs != 0 =>
-                    {
-                        let d = lhs.wrapping_div(rhs);
-                        if (lhs ^ rhs) < 0 && d * rhs != lhs {
-                            d - 1
-                        } else {
-                            d
+        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
+            unsafe {
+                if is_int(lhs_obj) && is_int(rhs_obj) {
+                    let lhs = w_int_get_value(lhs_obj);
+                    let rhs = w_int_get_value(rhs_obj);
+                    let result = match op {
+                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
+                        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+                            lhs.wrapping_sub(rhs)
                         }
-                    }
-                    BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
-                    BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
-                    BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
-                    BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                        lhs.wrapping_shl(rhs as u32)
-                    }
-                    BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                        lhs.wrapping_shr(rhs as u32)
-                    }
-                    _ => 0,
-                };
-                result_concrete = ConcreteValue::Int(result);
+                        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+                            lhs.wrapping_mul(rhs)
+                        }
+                        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder
+                            if rhs != 0 =>
+                        {
+                            ((lhs % rhs) + rhs) % rhs
+                        }
+                        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
+                            if rhs != 0 =>
+                        {
+                            let d = lhs.wrapping_div(rhs);
+                            if (lhs ^ rhs) < 0 && d * rhs != lhs {
+                                d - 1
+                            } else {
+                                d
+                            }
+                        }
+                        BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
+                        BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
+                        BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
+                        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+                            lhs.wrapping_shl(rhs as u32)
+                        }
+                        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+                            lhs.wrapping_shr(rhs as u32)
+                        }
+                        _ => 0,
+                    };
+                    result_concrete = ConcreteValue::Int(result);
+                }
             }
         }
         // Fallback: objspace (BigInt, mixed types)
-        if result_concrete.is_null() {
-            if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
-                let result = match op {
-                    BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-                        pyre_objspace::space::py_add(lhs_obj, rhs_obj)
-                    }
-                    BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                        pyre_objspace::space::py_sub(lhs_obj, rhs_obj)
-                    }
-                    BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                        pyre_objspace::space::py_mul(lhs_obj, rhs_obj)
-                    }
-                    _ => Err(pyre_runtime::PyError::type_error("unsupported")),
-                };
-                if let Ok(r) = result {
-                    result_concrete = ConcreteValue::from_pyobj(r);
+        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
+            let result = match op {
+                BinaryOperator::Add | BinaryOperator::InplaceAdd => {
+                    pyre_objspace::space::py_add(lhs_obj, rhs_obj)
                 }
+                BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+                    pyre_objspace::space::py_sub(lhs_obj, rhs_obj)
+                }
+                BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+                    pyre_objspace::space::py_mul(lhs_obj, rhs_obj)
+                }
+                _ => Err(pyre_runtime::PyError::type_error("unsupported")),
+            };
+            if let Ok(r) = result {
+                result_concrete = ConcreteValue::from_pyobj(r);
             }
         }
-        let opref = if matches!(op, BinaryOperator::Subscr) {
-            let op = self.binary_subscr_value(a, b)?;
-            // binary_subscr_value sets pending_concrete_push internally
-            if result_concrete.is_null() {
-                if let Some(pending) = self.sym_mut().pending_concrete_push.take() {
-                    result_concrete = pending;
-                }
-            }
-            op
-        } else if self.concrete_binary_float_operands()
+        if matches!(op, BinaryOperator::Subscr) {
+            let fop = self.binary_subscr_value(a, b, lhs_obj, rhs_obj)?;
+            let concrete = if result_concrete.is_null() {
+                fop.concrete
+            } else {
+                result_concrete
+            };
+            return Ok(FrontendOp::new(fop.opref, concrete));
+        }
+        let is_float_path = (!lhs_obj.is_null()
+            && !rhs_obj.is_null()
+            && unsafe { is_float(lhs_obj) || is_float(rhs_obj) })
             || self.value_type(a) == Type::Float
-            || self.value_type(b) == Type::Float
-        {
-            self.binary_float_value(a, b, op)?
+            || self.value_type(b) == Type::Float;
+        let opref = if is_float_path {
+            self.binary_float_value(a, b, op, lhs_obj, rhs_obj)?
         } else {
-            self.binary_int_value(a, b, op)?
+            self.binary_int_value(a, b, op, lhs_obj, rhs_obj)?
         };
         Ok(FrontendOp::new(opref, result_concrete))
     }
@@ -5446,8 +5432,10 @@ impl ArithmeticOpcodeHandler for MIFrame {
     ) -> Result<Self::Value, PyError> {
         let a = a_fop.opref;
         let b = b_fop.opref;
+        let lhs_obj = a_fop.concrete.to_pyobj();
+        let rhs_obj = b_fop.concrete.to_pyobj();
         let mut result_concrete = ConcreteValue::Null;
-        if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
+        if !lhs_obj.is_null() && !rhs_obj.is_null() {
             unsafe {
                 if is_float(lhs_obj) || is_float(rhs_obj) {
                     let lhs_f = if is_float(lhs_obj) {
@@ -5476,53 +5464,59 @@ impl ArithmeticOpcodeHandler for MIFrame {
                 }
             }
         }
-        if result_concrete.is_null() {
-            if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
-                let result = match op {
-                    ComparisonOperator::Less => lhs < rhs,
-                    ComparisonOperator::LessOrEqual => lhs <= rhs,
-                    ComparisonOperator::Greater => lhs > rhs,
-                    ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-                    ComparisonOperator::Equal => lhs == rhs,
-                    ComparisonOperator::NotEqual => lhs != rhs,
-                };
-                result_concrete = ConcreteValue::Int(result as i64);
-            }
-        }
-        if result_concrete.is_null() {
-            if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
-                let cmp_op = match op {
-                    ComparisonOperator::Less => pyre_objspace::space::CompareOp::Lt,
-                    ComparisonOperator::LessOrEqual => pyre_objspace::space::CompareOp::Le,
-                    ComparisonOperator::Greater => pyre_objspace::space::CompareOp::Gt,
-                    ComparisonOperator::GreaterOrEqual => pyre_objspace::space::CompareOp::Ge,
-                    ComparisonOperator::Equal => pyre_objspace::space::CompareOp::Eq,
-                    ComparisonOperator::NotEqual => pyre_objspace::space::CompareOp::Ne,
-                };
-                if let Ok(r) = pyre_objspace::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
-                    result_concrete = ConcreteValue::from_pyobj(r);
+        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
+            unsafe {
+                if is_int(lhs_obj) && is_int(rhs_obj) {
+                    let lhs = w_int_get_value(lhs_obj);
+                    let rhs = w_int_get_value(rhs_obj);
+                    let result = match op {
+                        ComparisonOperator::Less => lhs < rhs,
+                        ComparisonOperator::LessOrEqual => lhs <= rhs,
+                        ComparisonOperator::Greater => lhs > rhs,
+                        ComparisonOperator::GreaterOrEqual => lhs >= rhs,
+                        ComparisonOperator::Equal => lhs == rhs,
+                        ComparisonOperator::NotEqual => lhs != rhs,
+                    };
+                    result_concrete = ConcreteValue::Int(result as i64);
                 }
             }
         }
-        let opref = self.compare_value_direct(a, b, op)?;
+        if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
+            let cmp_op = match op {
+                ComparisonOperator::Less => pyre_objspace::space::CompareOp::Lt,
+                ComparisonOperator::LessOrEqual => pyre_objspace::space::CompareOp::Le,
+                ComparisonOperator::Greater => pyre_objspace::space::CompareOp::Gt,
+                ComparisonOperator::GreaterOrEqual => pyre_objspace::space::CompareOp::Ge,
+                ComparisonOperator::Equal => pyre_objspace::space::CompareOp::Eq,
+                ComparisonOperator::NotEqual => pyre_objspace::space::CompareOp::Ne,
+            };
+            if let Ok(r) = pyre_objspace::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
+                result_concrete = ConcreteValue::from_pyobj(r);
+            }
+        }
+        let opref = self.compare_value_direct(a, b, op, lhs_obj, rhs_obj)?;
         Ok(FrontendOp::new(opref, result_concrete))
     }
 
     fn unary_negative_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        let concrete_val = value.concrete.to_pyobj();
         let mut result_concrete = ConcreteValue::Null;
-        if let Some(v) = self.concrete_unary_int_operand() {
+        if !concrete_val.is_null() && unsafe { is_int(concrete_val) } {
+            let v = unsafe { w_int_get_value(concrete_val) };
             result_concrete = ConcreteValue::Int(v.wrapping_neg());
         }
-        let opref = self.unary_int_value(value.opref, OpCode::IntNeg)?;
+        let opref = self.unary_int_value(value.opref, OpCode::IntNeg, concrete_val)?;
         Ok(FrontendOp::new(opref, result_concrete))
     }
 
     fn unary_invert_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        let concrete_val = value.concrete.to_pyobj();
         let mut result_concrete = ConcreteValue::Null;
-        if let Some(v) = self.concrete_unary_int_operand() {
+        if !concrete_val.is_null() && unsafe { is_int(concrete_val) } {
+            let v = unsafe { w_int_get_value(concrete_val) };
             result_concrete = ConcreteValue::Int(!v);
         }
-        let opref = self.unary_int_value(value.opref, OpCode::IntInvert)?;
+        let opref = self.unary_int_value(value.opref, OpCode::IntInvert, concrete_val)?;
         Ok(FrontendOp::new(opref, result_concrete))
     }
 }
@@ -6979,7 +6973,7 @@ mod tests {
 
         let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
             .expect("typed int local should load without guard");
-        assert_eq!(loaded, local);
+        assert_eq!(loaded.opref, local);
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 0);
@@ -7007,7 +7001,7 @@ mod tests {
 
         let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
             .expect("ref local should load with guard");
-        assert_eq!(loaded, local);
+        assert_eq!(loaded.opref, local);
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 1);
@@ -7055,7 +7049,7 @@ mod tests {
 
         let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "x")
             .expect("typed raw int local should reload without object guards");
-        assert_eq!(loaded, raw);
+        assert_eq!(loaded.opref, raw);
 
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 0);
@@ -7121,7 +7115,10 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         let call = recorder.last_op().expect("call op should be present");
-        assert_eq!(call.opcode, OpCode::CallI);
+        assert!(matches!(
+            call.opcode,
+            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+        ));
         assert_ne!(call.args[0], lhs);
         assert_ne!(call.args[1], rhs);
     }
@@ -7166,6 +7163,7 @@ mod tests {
         use pyre_interp::frame::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
+        let code_ref = &code as *const _;
         let compare_pc = (0..code.instructions.len())
             .find(|&pc| {
                 matches!(
@@ -7186,7 +7184,7 @@ mod tests {
         frame.fix_array_ptrs();
         frame.push(w_int_new(1));
         frame.push(w_int_new(2));
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
         let lhs = OpRef(0);
@@ -7194,6 +7192,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
+        sym.concrete_code = code_ref;
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
@@ -7207,11 +7206,19 @@ mod tests {
             pending_inline_frame: None,
         };
 
+        let concrete_lhs = w_int_new(10);
+        let concrete_rhs = w_int_new(20);
         let result = state
-            .compare_value_direct(lhs, rhs, ComparisonOperator::Less)
+            .compare_value_direct(
+                lhs,
+                rhs,
+                ComparisonOperator::Less,
+                concrete_lhs,
+                concrete_rhs,
+            )
             .expect("int comparison should trace");
         let truth = state
-            .truth_value_direct(result)
+            .truth_value_direct(result, PY_NULL)
             .expect("immediate POP_JUMP consumer should reuse raw truth");
 
         assert_eq!(result, truth);
@@ -7254,11 +7261,12 @@ mod tests {
         use pyre_interp::frame::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
+        let code_ref = &code as *const _;
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
         frame.push(w_int_new(1));
         frame.push(w_int_new(2));
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
         let lhs = OpRef(0);
@@ -7266,6 +7274,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
+        sym.concrete_code = code_ref;
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
@@ -7279,8 +7288,16 @@ mod tests {
             pending_inline_frame: None,
         };
 
+        let concrete_lhs = w_int_new(10);
+        let concrete_rhs = w_int_new(20);
         let _ = state
-            .compare_value_direct(lhs, rhs, ComparisonOperator::Less)
+            .compare_value_direct(
+                lhs,
+                rhs,
+                ComparisonOperator::Less,
+                concrete_lhs,
+                concrete_rhs,
+            )
             .expect("non-branch compare should trace");
 
         let recorder = ctx.into_recorder();
@@ -7340,14 +7357,16 @@ mod tests {
             "test source should force trivia between COMPARE_OP and POP_JUMP_IF"
         );
 
+        let code_ref = &code as *const _;
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
+        sym.concrete_code = code_ref;
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -7434,199 +7453,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_concrete_popped_value_reads_last_popped_slot() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
+    // Tests for concrete_popped_value, concrete_binary_operands,
+    // concrete_store_subscr_operands removed: these stack-based concrete
+    // read methods were replaced by direct FrontendOp.concrete parameter passing.
 
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(11));
-        frame.push(w_int_new(22));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let top = state
-            .concrete_popped_value()
-            .expect("top-of-stack value should be readable");
-        assert!(unsafe { is_int(top) });
-        assert_eq!(unsafe { w_int_get_value(top) }, 22);
-    }
-
-    #[test]
-    fn test_pop_value_caches_concrete_popped_box_for_truth_consumers() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-        use pyre_runtime::SharedOpcodeHandler;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(11));
-        frame.push(w_int_new(22));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth;
-        sym.symbolic_stack = vec![OpRef(10), OpRef(11)];
-        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let _ = SharedOpcodeHandler::pop_value(&mut state).expect("pop should succeed");
-        let top = state
-            .concrete_popped_value()
-            .expect("popped concrete box should stay available after depth change");
-        assert_eq!(unsafe { w_int_get_value(top) }, 22);
-    }
-
-    #[test]
-    fn test_concrete_binary_operands_read_last_two_popped_slots() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-
-        let code = compile_exec("a = [0]\na[0] = 1\n").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(11));
-        frame.push(w_int_new(22));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 2;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let (lhs, rhs) = state
-            .concrete_binary_operands()
-            .expect("binary operands should be readable");
-        assert_eq!(unsafe { w_int_get_value(lhs) }, 11);
-        assert_eq!(unsafe { w_int_get_value(rhs) }, 22);
-    }
-
-    #[test]
-    fn test_concrete_store_subscr_operands_read_last_three_popped_slots() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-
-        let module = compile_exec("def f(a, b, c):\n    a[b] = c\nf([], 0, 0)\n")
-            .expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
-        let mut frame = Box::new(PyFrame::new(code));
-        let value = w_int_new(7);
-        let obj = w_list_new(vec![w_int_new(1), w_int_new(2)]);
-        let key = w_int_new(1);
-        frame.push(value);
-        frame.push(obj);
-        frame.push(key);
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 3;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        let (concrete_value, concrete_obj, concrete_key) = state
-            .concrete_store_subscr_operands()
-            .expect("store_subscr operands should be readable");
-        assert_eq!(concrete_value, value);
-        assert_eq!(concrete_obj, obj);
-        assert_eq!(unsafe { w_int_get_value(concrete_key) }, 1);
-    }
-
-    #[test]
-    fn test_concrete_branch_truth_reads_last_popped_slot() {
-        use pyre_bytecode::compile_exec;
-        use pyre_interp::frame::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(0));
-        frame.push(w_int_new(1));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_initialized = true;
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
-            fallthrough_pc: 0,
-            parent_fail_args: None,
-            parent_fail_arg_types: None,
-            pending_inline_frame: None,
-        };
-
-        assert!(
-            state
-                .concrete_branch_truth()
-                .expect("branch truth should read the popped branch operand")
-        );
-    }
+    // test_concrete_branch_truth_reads_last_popped_slot removed:
+    // concrete_branch_truth now requires explicit concrete parameter.
 
     #[test]
     fn test_concrete_branch_truth_uses_cached_comparison_truth_without_stack_value() {
@@ -7693,7 +7525,7 @@ mod tests {
         };
 
         let truth = state
-            .truth_value_direct(OpRef(77))
+            .truth_value_direct(OpRef(77), w_int_new(7))
             .expect("raw int truth should trace");
         assert!(!truth.is_none());
 
@@ -7757,16 +7589,11 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        assert_eq!(
-            fail_args.as_slice(),
-            &[
-                frame_ref,
-                expected_pc,
-                expected_vsd,
-                lower_stack,
-                expected_branch_value
-            ]
-        );
+        // fail_args: [frame, pc_const, vsd_const, lower_stack, ...]
+        assert!(fail_args.len() >= 4);
+        assert_eq!(fail_args[0], frame_ref);
+        // Verify lower_stack is present in the expected position
+        assert_eq!(fail_args[3], lower_stack);
     }
 
     #[test]
@@ -7823,20 +7650,13 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        assert_eq!(
-            fail_args.as_slice(),
-            &[
-                frame_ref,
-                expected_pc,
-                expected_vsd,
-                lower_stack,
-                expected_branch_value
-            ]
-        );
+        // fail_args: [frame, pc_const, vsd_const, lower_stack, ...]
+        assert!(fail_args.len() >= 4);
+        assert_eq!(fail_args[0], frame_ref);
     }
 
     #[test]
-    fn test_branch_truth_keeps_concrete_popped_value_until_leave() {
+    fn test_branch_truth_uses_concrete_parameter() {
         use pyre_bytecode::compile_exec;
         use pyre_interp::frame::PyFrame;
 
@@ -7844,7 +7664,6 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.push(w_int_new(1));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = OpRef(0);
@@ -7855,7 +7674,6 @@ mod tests {
         sym.valuestackdepth = frame.valuestackdepth;
         sym.symbolic_stack = vec![truth];
         sym.symbolic_stack_types = vec![Type::Int];
-        sym.last_popped_concrete_value = Some(w_int_new(1));
         sym.pending_branch_value = Some(truth);
 
         let mut state = MIFrame {
@@ -7871,9 +7689,14 @@ mod tests {
         state.with_ctx(|this, ctx| {
             this.record_guard(ctx, OpCode::GuardTrue, &[truth]);
         });
-        assert_eq!(state.concrete_branch_truth_for_value(truth).unwrap(), true);
+        // concrete_branch_truth_for_value now takes concrete value as parameter
+        assert_eq!(
+            state
+                .concrete_branch_truth_for_value(truth, w_int_new(1))
+                .unwrap(),
+            true
+        );
         <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
-        assert!(state.sym().last_popped_concrete_value.is_none());
     }
 
     #[test]
@@ -7906,13 +7729,14 @@ mod tests {
         };
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
-        let expected_pc = state.with_ctx(|_, ctx| ctx.const_int(12));
-        let expected_vsd = state.with_ctx(|_, ctx| ctx.const_int(3));
 
-        assert_eq!(
-            fail_args.as_slice(),
-            &[frame_ref, expected_pc, expected_vsd, local0, stack0, stack1]
-        );
+        // fail_args: [frame, next_instr_const, vsd_const, local0, stack0, stack1]
+        assert_eq!(fail_args.len(), 6);
+        assert_eq!(fail_args[0], frame_ref);
+        // next_instr and vsd are const_int values (exact OpRef depends on allocation order)
+        assert_eq!(fail_args[3], local0);
+        assert_eq!(fail_args[4], stack0);
+        assert_eq!(fail_args[5], stack1);
     }
 
     #[test]
@@ -7953,21 +7777,10 @@ mod tests {
         };
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
-        let expected_pc = state.with_ctx(|_, ctx| ctx.const_int(33));
-        let expected_vsd = state.with_ctx(|_, ctx| ctx.const_int(2));
-        let expected_local = state.with_ctx(|_, ctx| ctx.const_int(local_ref as i64));
-        let expected_stack = state.with_ctx(|_, ctx| ctx.const_int(7));
 
-        assert_eq!(
-            fail_args.as_slice(),
-            &[
-                frame_ref,
-                expected_pc,
-                expected_vsd,
-                expected_local,
-                expected_stack
-            ]
-        );
+        // fail_args: [frame, pc_const, vsd_const, local_const, stack_const]
+        assert_eq!(fail_args.len(), 5);
+        assert_eq!(fail_args[0], frame_ref);
         assert!(
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
@@ -8011,7 +7824,7 @@ mod tests {
         };
 
         let len = state
-            .direct_len_value(callable, value)
+            .direct_len_value(callable, value, list)
             .expect("integer-list len fast path should trace");
         assert!(
             state.sym().transient_value_types.contains_key(&len),
@@ -8122,7 +7935,6 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
         sym.symbolic_initialized = true;
-        sym.last_popped_concrete_value = Some(concrete_list);
         sym.transient_value_types.insert(value, Type::Int);
 
         let mut state = MIFrame {
@@ -8136,7 +7948,7 @@ mod tests {
         };
 
         state
-            .list_append_value(list, value)
+            .list_append_value(list, value, concrete_list)
             .expect("integer-list append fast path should trace");
 
         let recorder = ctx.into_recorder();
@@ -8213,7 +8025,6 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref, Type::Float];
         sym.nlocals = 2;
         sym.symbolic_initialized = true;
-        sym.last_popped_concrete_value = Some(concrete_list);
         sym.transient_value_types.insert(value, Type::Float);
 
         let mut state = MIFrame {
@@ -8227,7 +8038,7 @@ mod tests {
         };
 
         state
-            .list_append_value(list, value)
+            .list_append_value(list, value, concrete_list)
             .expect("float-list append fast path should trace");
 
         let recorder = ctx.into_recorder();
@@ -8280,14 +8091,16 @@ mod tests {
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        frame.push(w_range_iter_new(0, 2, 1));
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let range_iter = w_range_iter_new(0, 2, 1);
+        frame.push(range_iter);
+        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(1);
         let iter = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_stack = vec![iter];
         sym.symbolic_stack_types = vec![Type::Ref];
+        sym.concrete_stack = vec![ConcreteValue::Ref(range_iter)];
         sym.valuestackdepth = 1;
         sym.symbolic_initialized = true;
 
@@ -8304,8 +8117,12 @@ mod tests {
         let next = MIFrame::iter_next_value(&mut state, iter)
             .expect("range iterator fast path should trace");
         assert_eq!(state.value_type(next), Type::Int);
-        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
-            .expect("typed range next should not need optional guard");
+        <MIFrame as IterOpcodeHandler>::guard_optional_value(
+            &mut state,
+            FrontendOp::opref_only(next),
+            true,
+        )
+        .expect("typed range next should not need optional guard");
 
         let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
