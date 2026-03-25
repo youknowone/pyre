@@ -54,6 +54,9 @@ pub fn install_builtin_modules() {
     register_builtin_module("math", crate::module::math::moduledef::init);
     register_builtin_module("time", crate::module::time::moduledef::init);
     register_builtin_module("sys", crate::module::sys::moduledef::init);
+    register_builtin_module("operator", crate::module::operator::moduledef::init);
+    register_builtin_module("_operator", crate::module::operator::moduledef::init);
+    register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
 }
 
 /// Try to load a builtin module by name.
@@ -97,7 +100,39 @@ pub fn init_sys_path(script_dir: &Path) {
                 path.push(cwd);
             }
         }
+        // CPython stdlib path — PyPy: initpath.py adds lib-python/X.Y
+        // Auto-detect from python3 sysconfig if available.
+        if let Some(stdlib) = detect_stdlib_path() {
+            path.push(stdlib);
+        }
     });
+}
+
+/// Detect CPython stdlib path via `python3 -c "import sysconfig; ..."`.
+///
+/// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
+fn detect_stdlib_path() -> Option<PathBuf> {
+    // Try PYRE_STDLIB env var first
+    if let Ok(p) = std::env::var("PYRE_STDLIB") {
+        let path = PathBuf::from(p);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    // Auto-detect via python3
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(s.trim());
+    if path.is_dir() { Some(path) } else { None }
 }
 
 /// Add a directory to sys.path.

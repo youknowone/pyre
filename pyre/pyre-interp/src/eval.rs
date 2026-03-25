@@ -927,8 +927,8 @@ impl OpcodeStepExecutor for PyFrame {
         // PyPy: LOOKUP_METHOD checks whether the attr came from a
         // non-data descriptor that is a plain function (not staticmethod).
         let bind_self = unsafe {
-            pyre_object::is_instance(obj) && {
-                // Check raw descriptor in class dict before unwrap
+            if pyre_object::is_instance(obj) {
+                // User-defined instance: bind self unless staticmethod/classmethod
                 let w_type = pyre_object::w_instance_get_type(obj);
                 let raw = pyre_runtime::space::lookup_in_type_mro_pub(w_type, name);
                 match raw {
@@ -936,6 +936,13 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_classmethod(d) => false,
                     _ => true,
                 }
+            } else {
+                // Builtin type method (list.append, str.join, etc.)
+                // If attr is a builtin function found via builtin_type_method,
+                // it expects self as first arg.
+                pyre_runtime::is_builtin_func(attr)
+                    && !pyre_object::is_module(obj)
+                    && !pyre_object::is_type(obj)
             }
         };
         if bind_self {

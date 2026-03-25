@@ -1162,6 +1162,14 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Builtin type methods: list.append, str.join, dict.get, etc.
+    // PyPy: each type has a TypeDef with interpleveldefs.
+    unsafe {
+        if let Some(method) = builtin_type_method(obj, name) {
+            return Ok(method);
+        }
+    }
+
     // All other objects: use side table
     ATTR_TABLE.with(|table| {
         let table = table.borrow();
@@ -1181,6 +1189,423 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             })
         }
     })
+}
+
+/// Return a builtin method for built-in types (list, str, dict, etc.).
+///
+/// PyPy: each type has a TypeDef with interpleveldefs mapping method names
+/// to interp-level functions. In pyre, we match on (type, name) directly.
+///
+/// The returned function expects `self` as the first argument.
+/// LOAD_ATTR is_method + CALL automatically prepends self for instance
+/// method calls. For direct calls, the caller must pass self explicitly.
+unsafe fn builtin_type_method(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    use crate::w_builtin_func_new;
+
+    if is_list(obj) {
+        return match name {
+            "append" => Some(w_builtin_func_new("append", list_method_append)),
+            "extend" => Some(w_builtin_func_new("extend", list_method_extend)),
+            "insert" => Some(w_builtin_func_new("insert", list_method_insert)),
+            "pop" => Some(w_builtin_func_new("pop", list_method_pop)),
+            "clear" => Some(w_builtin_func_new("clear", list_method_clear)),
+            "copy" => Some(w_builtin_func_new("copy", list_method_copy)),
+            "reverse" => Some(w_builtin_func_new("reverse", list_method_reverse)),
+            "sort" => Some(w_builtin_func_new("sort", list_method_sort)),
+            "index" => Some(w_builtin_func_new("index", list_method_index)),
+            "count" => Some(w_builtin_func_new("count", list_method_count)),
+            "remove" => Some(w_builtin_func_new("remove", list_method_remove)),
+            _ => None,
+        };
+    }
+    if is_str(obj) {
+        return match name {
+            "join" => Some(w_builtin_func_new("join", str_method_join)),
+            "split" => Some(w_builtin_func_new("split", str_method_split)),
+            "strip" => Some(w_builtin_func_new("strip", str_method_strip)),
+            "lstrip" => Some(w_builtin_func_new("lstrip", str_method_lstrip)),
+            "rstrip" => Some(w_builtin_func_new("rstrip", str_method_rstrip)),
+            "startswith" => Some(w_builtin_func_new("startswith", str_method_startswith)),
+            "endswith" => Some(w_builtin_func_new("endswith", str_method_endswith)),
+            "replace" => Some(w_builtin_func_new("replace", str_method_replace)),
+            "find" => Some(w_builtin_func_new("find", str_method_find)),
+            "rfind" => Some(w_builtin_func_new("rfind", str_method_rfind)),
+            "upper" => Some(w_builtin_func_new("upper", str_method_upper)),
+            "lower" => Some(w_builtin_func_new("lower", str_method_lower)),
+            "format" => Some(w_builtin_func_new("format", str_method_format)),
+            "encode" => Some(w_builtin_func_new("encode", str_method_encode)),
+            "isdigit" => Some(w_builtin_func_new("isdigit", str_method_isdigit)),
+            "isalpha" => Some(w_builtin_func_new("isalpha", str_method_isalpha)),
+            "zfill" => Some(w_builtin_func_new("zfill", str_method_zfill)),
+            _ => None,
+        };
+    }
+    if is_dict(obj) {
+        return match name {
+            "get" => Some(w_builtin_func_new("get", dict_method_get)),
+            "keys" => Some(w_builtin_func_new("keys", dict_method_keys)),
+            "values" => Some(w_builtin_func_new("values", dict_method_values)),
+            "items" => Some(w_builtin_func_new("items", dict_method_items)),
+            "update" => Some(w_builtin_func_new("update", dict_method_update)),
+            "pop" => Some(w_builtin_func_new("pop", dict_method_pop)),
+            "setdefault" => Some(w_builtin_func_new("setdefault", dict_method_setdefault)),
+            _ => None,
+        };
+    }
+    if is_tuple(obj) {
+        return match name {
+            "index" => Some(w_builtin_func_new("index", tuple_method_index)),
+            "count" => Some(w_builtin_func_new("count", tuple_method_count)),
+            _ => None,
+        };
+    }
+    None
+}
+
+// ── List methods ─────────────────────────────────────────────────────
+// All take self (list) as first arg.
+
+fn list_method_append(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() == 2, "append() takes exactly one argument");
+    unsafe { w_list_append(args[0], args[1]) };
+    w_none()
+}
+
+fn list_method_extend(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() == 2);
+    let list = args[0];
+    let other = args[1];
+    unsafe {
+        if is_list(other) {
+            let n = w_list_len(other);
+            for i in 0..n {
+                if let Some(item) = w_list_getitem(other, i as i64) {
+                    w_list_append(list, item);
+                }
+            }
+        } else if is_tuple(other) {
+            let n = w_tuple_len(other);
+            for i in 0..n {
+                if let Some(item) = w_tuple_getitem(other, i as i64) {
+                    w_list_append(list, item);
+                }
+            }
+        }
+    }
+    w_none()
+}
+
+/// PyPy: listobject.py descr_insert
+fn list_method_insert(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.insert() not yet implemented");
+}
+
+/// PyPy: listobject.py descr_pop
+fn list_method_pop(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.pop() not yet implemented (requires mutable list removal)");
+}
+
+/// PyPy stub — list.clear() not yet implemented
+fn list_method_clear(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.clear() not yet implemented");
+}
+
+fn list_method_copy(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let list = args[0];
+    unsafe {
+        let n = w_list_len(list);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(item) = w_list_getitem(list, i as i64) {
+                items.push(item);
+            }
+        }
+        w_list_new(items)
+    }
+}
+
+/// PyPy stub — list.reverse() not yet implemented
+fn list_method_reverse(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.reverse() not yet implemented");
+}
+
+/// PyPy stub — list.sort() not yet implemented
+fn list_method_sort(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.sort() not yet implemented");
+}
+
+/// PyPy stub — list.index() not yet implemented
+fn list_method_index(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.index() not yet implemented");
+}
+
+/// PyPy stub — list.count() not yet implemented
+fn list_method_count(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.count() not yet implemented");
+}
+
+/// PyPy stub — list.remove() not yet implemented
+fn list_method_remove(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("list.remove() not yet implemented");
+}
+
+// ── String methods ───────────────────────────────────────────────────
+
+fn str_method_join(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() == 2);
+    let sep = unsafe { w_str_get_value(args[0]) };
+    let iterable = args[1];
+    let mut parts = Vec::new();
+    unsafe {
+        if is_list(iterable) {
+            let n = w_list_len(iterable);
+            for i in 0..n {
+                if let Some(item) = w_list_getitem(iterable, i as i64) {
+                    if is_str(item) {
+                        parts.push(w_str_get_value(item).to_string());
+                    }
+                }
+            }
+        } else if is_tuple(iterable) {
+            let n = w_tuple_len(iterable);
+            for i in 0..n {
+                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
+                    if is_str(item) {
+                        parts.push(w_str_get_value(item).to_string());
+                    }
+                }
+            }
+        }
+    }
+    w_str_new(&parts.join(sep))
+}
+
+fn str_method_split(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sep = if args.len() > 1 && !args[1].is_null() && unsafe { !is_none(args[1]) } {
+        Some(unsafe { w_str_get_value(args[1]) })
+    } else {
+        None
+    };
+    let parts: Vec<PyObjectRef> = match sep {
+        Some(sep) => s.split(sep).map(|p| w_str_new(p)).collect(),
+        None => s.split_whitespace().map(|p| w_str_new(p)).collect(),
+    };
+    w_list_new(parts)
+}
+
+fn str_method_strip(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    w_str_new(unsafe { w_str_get_value(args[0]) }.trim())
+}
+
+fn str_method_lstrip(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    w_str_new(unsafe { w_str_get_value(args[0]) }.trim_start())
+}
+
+fn str_method_rstrip(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    w_str_new(unsafe { w_str_get_value(args[0]) }.trim_end())
+}
+
+fn str_method_startswith(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let prefix = unsafe { w_str_get_value(args[1]) };
+    w_bool_from(s.starts_with(prefix))
+}
+
+fn str_method_endswith(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let suffix = unsafe { w_str_get_value(args[1]) };
+    w_bool_from(s.ends_with(suffix))
+}
+
+fn str_method_replace(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 3);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let old = unsafe { w_str_get_value(args[1]) };
+    let new = unsafe { w_str_get_value(args[2]) };
+    w_str_new(&s.replace(old, new))
+}
+
+fn str_method_find(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sub = unsafe { w_str_get_value(args[1]) };
+    w_int_new(s.find(sub).map(|i| i as i64).unwrap_or(-1))
+}
+
+fn str_method_rfind(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let sub = unsafe { w_str_get_value(args[1]) };
+    w_int_new(s.rfind(sub).map(|i| i as i64).unwrap_or(-1))
+}
+
+fn str_method_upper(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    w_str_new(&unsafe { w_str_get_value(args[0]) }.to_uppercase())
+}
+
+fn str_method_lower(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    w_str_new(&unsafe { w_str_get_value(args[0]) }.to_lowercase())
+}
+
+fn str_method_format(args: &[PyObjectRef]) -> PyObjectRef {
+    // Simplified: return self as-is (format not yet implemented)
+    assert!(!args.is_empty());
+    args[0]
+}
+
+fn str_method_encode(args: &[PyObjectRef]) -> PyObjectRef {
+    // Simplified: return str as-is (bytes not yet implemented)
+    assert!(!args.is_empty());
+    args[0]
+}
+
+fn str_method_isdigit(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    w_bool_from(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn str_method_isalpha(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    w_bool_from(!s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+}
+
+fn str_method_zfill(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let s = unsafe { w_str_get_value(args[0]) };
+    let width = unsafe { w_int_get_value(args[1]) } as usize;
+    if s.len() >= width {
+        return args[0];
+    }
+    let padding = "0".repeat(width - s.len());
+    w_str_new(&format!("{padding}{s}"))
+}
+
+// ── Dict methods ─────────────────────────────────────────────────────
+
+fn dict_method_get(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let dict = args[0];
+    let key = args[1];
+    let default = args.get(2).copied().unwrap_or_else(w_none);
+    unsafe {
+        if is_int(key) {
+            w_dict_getitem(dict, w_int_get_value(key)).unwrap_or(default)
+        } else {
+            default
+        }
+    }
+}
+
+/// PyPy: dictobject.py descr_keys — returns dict_keys view.
+/// Simplified: returns list of int keys from our int-keyed dict.
+fn dict_method_keys(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let dict = args[0];
+    unsafe {
+        if is_dict(dict) {
+            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*d.entries;
+            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| w_int_new(k)).collect();
+            return w_list_new(keys);
+        }
+    }
+    w_list_new(vec![])
+}
+
+/// PyPy: dictobject.py descr_values
+fn dict_method_values(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let dict = args[0];
+    unsafe {
+        if is_dict(dict) {
+            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*d.entries;
+            let values: Vec<PyObjectRef> = entries.iter().map(|&(_, v)| v).collect();
+            return w_list_new(values);
+        }
+    }
+    w_list_new(vec![])
+}
+
+/// PyPy: dictobject.py descr_items
+fn dict_method_items(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let dict = args[0];
+    unsafe {
+        if is_dict(dict) {
+            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*d.entries;
+            let items: Vec<PyObjectRef> = entries
+                .iter()
+                .map(|&(k, v)| w_tuple_new(vec![w_int_new(k), v]))
+                .collect();
+            return w_list_new(items);
+        }
+    }
+    w_list_new(vec![])
+}
+
+/// PyPy stub — dict.update() not yet implemented
+fn dict_method_update(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("dict.update() not yet implemented");
+}
+
+/// PyPy: dictobject.py descr_pop
+fn dict_method_pop(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "dict.pop() takes at least 1 argument");
+    let dict = args[0];
+    let key = args[1];
+    let default = args.get(2).copied();
+    unsafe {
+        if is_dict(dict) && is_int(key) {
+            let k = w_int_get_value(key);
+            if let Some(val) = w_dict_getitem(dict, k) {
+                // Note: actual removal from dict not yet implemented
+                return val;
+            }
+        }
+    }
+    default.unwrap_or_else(|| panic!("KeyError"))
+}
+
+fn dict_method_setdefault(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2);
+    let dict = args[0];
+    let key = args[1];
+    let default = args.get(2).copied().unwrap_or_else(w_none);
+    unsafe {
+        if is_int(key) {
+            if let Some(existing) = w_dict_getitem(dict, w_int_get_value(key)) {
+                return existing;
+            }
+            w_dict_setitem(dict, w_int_get_value(key), default);
+        }
+    }
+    default
+}
+
+// ── Tuple methods ────────────────────────────────────────────────────
+
+/// PyPy stub — tuple.index() not yet implemented
+fn tuple_method_index(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("tuple.index() not yet implemented");
+}
+
+/// PyPy stub — tuple.count() not yet implemented
+fn tuple_method_count(_args: &[PyObjectRef]) -> PyObjectRef {
+    panic!("tuple.count() not yet implemented");
 }
 
 /// Look up a name by walking the C3 MRO.
