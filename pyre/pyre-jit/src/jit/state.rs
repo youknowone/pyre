@@ -1906,15 +1906,6 @@ impl MIFrame {
         value: OpRef,
         slot_type: Type,
     ) -> OpRef {
-        // RPython parity: every loop-carried value must be a valid OpRef.
-        // NONE means the symbolic tracker lost this slot. This can happen
-        // when inner loops modify locals that the outer trace hasn't tracked.
-        // Return NONE — the caller (close_and_compile) will use it as-is
-        // in fail_args. Guard failure restore handles NONE by keeping the
-        // frame's existing value for that slot.
-        if value.is_none() {
-            return value;
-        }
         match slot_type {
             Type::Int => match self.value_type(value) {
                 Type::Int => value,
@@ -6205,13 +6196,8 @@ impl PyreJitState {
         // Locals follow directly (indices 0..nlocals in unified array)
         for i in 0..nlocals {
             if idx < values.len() {
-                let val = values[idx];
-                // Skip null (0) — indicates a slot the JIT couldn't track.
-                // Preserve the frame's existing value for that slot.
-                if val != 0 {
-                    let slot_type = concrete_value_type(self.local_at(i).unwrap_or(PY_NULL));
-                    let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, val));
-                }
+                let slot_type = concrete_value_type(self.local_at(i).unwrap_or(PY_NULL));
+                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
                 idx += 1;
             }
         }
@@ -6220,11 +6206,8 @@ impl PyreJitState {
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let val = values[idx];
-                if val != 0 {
-                    let slot_type = concrete_value_type(self.stack_at(i).unwrap_or(PY_NULL));
-                    let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, val));
-                }
+                let slot_type = concrete_value_type(self.stack_at(i).unwrap_or(PY_NULL));
+                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
                 idx += 1;
             }
         }
