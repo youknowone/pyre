@@ -62,7 +62,7 @@ mod tests {
         unsafe {
             assert!(is_instance(obj));
             assert!(!is_int(obj));
-            assert!(!is_type(obj));
+            assert!(!crate::typeobject::is_type(obj));
             assert_eq!(w_instance_get_type(obj), fake_type);
         }
     }
