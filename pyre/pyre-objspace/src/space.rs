@@ -961,6 +961,56 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Instance objects: check instance dict → class dict → base class dicts
+    // PyPy: descroperation.py Object.descr__getattribute__
+    //   1. instance dict (ATTR_TABLE)
+    //   2. type dict (class namespace)
+    //   3. base type dicts (MRO traversal)
+    unsafe {
+        if is_instance(obj) {
+            // Step 1: instance dict (ATTR_TABLE)
+            let found = ATTR_TABLE.with(|table| {
+                let table = table.borrow();
+                table
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get(name).copied())
+            });
+            if let Some(value) = found {
+                return Ok(value);
+            }
+            // Step 2+3: class dict and base class dicts
+            let w_type = w_instance_get_type(obj);
+            if let Some(value) = lookup_in_type_mro(w_type, name) {
+                return Ok(value);
+            }
+            return Err(PyError {
+                kind: PyErrorKind::AttributeError,
+                message: format!(
+                    "'{}' object has no attribute '{name}'",
+                    w_type_get_name(w_type),
+                ),
+            });
+        }
+    }
+
+    // Type objects: look up in type's own dict → base dicts
+    // PyPy: typeobject.py lookup_where → MRO search
+    unsafe {
+        if is_type(obj) {
+            if let Some(value) = lookup_in_type_mro(obj, name) {
+                return Ok(value);
+            }
+            return Err(PyError {
+                kind: PyErrorKind::AttributeError,
+                message: format!(
+                    "type object '{}' has no attribute '{name}'",
+                    w_type_get_name(obj),
+                ),
+            });
+        }
+    }
+
+    // All other objects: use side table
     ATTR_TABLE.with(|table| {
         let table = table.borrow();
         let key = obj as usize;
@@ -979,6 +1029,41 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             })
         }
     })
+}
+
+/// Look up a name in a type's dict and its base class dicts (MRO).
+///
+/// PyPy equivalent: typeobject.py `_lookup_where(self, key)` →
+/// linear search through `self.mro_w`.
+///
+/// Simplified: checks the type's own dict, then each base's dict recursively.
+unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return None;
+    }
+    // Check this type's dict
+    let ns_ptr = w_type_get_dict_ptr(w_type) as *mut pyre_runtime::PyNamespace;
+    if !ns_ptr.is_null() {
+        let ns = &*ns_ptr;
+        if let Some(&value) = ns.get(name) {
+            if !value.is_null() {
+                return Some(value);
+            }
+        }
+    }
+    // Check base classes (PyPy: iterate mro_w)
+    let bases = w_type_get_bases(w_type);
+    if !bases.is_null() && is_tuple(bases) {
+        let n = w_tuple_len(bases);
+        for i in 0..n {
+            if let Some(base) = w_tuple_getitem(bases, i as i64) {
+                if let Some(value) = lookup_in_type_mro(base, name) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Set an attribute on an object: `obj.name = value`.

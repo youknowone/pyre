@@ -83,6 +83,13 @@ pub struct PyFrame {
     /// protocol to the outermost interpreter loop without conflating it with
     /// unrelated next_instr changes.
     pub pending_inline_resume_pc: Option<usize>,
+    /// Optional class-body local namespace.
+    ///
+    /// PyPy equivalent: pyframe.py has separate `w_locals` and `w_globals`.
+    /// When set (non-null), STORE_NAME writes here instead of `namespace`,
+    /// and LOAD_NAME checks here first before falling back to `namespace`.
+    /// Used for class body execution where locals ≠ globals.
+    pub class_locals: *mut PyNamespace,
 }
 
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
@@ -147,6 +154,7 @@ impl PyFrame {
             block_stack: Vec::new(),
             pending_inline_results: std::collections::VecDeque::new(),
             pending_inline_resume_pc: None,
+            class_locals: std::ptr::null_mut(),
         }
     }
 
@@ -162,6 +170,12 @@ impl PyFrame {
     pub fn new_with_context(code: CodeObject, execution_context: Rc<PyExecutionContext>) -> Self {
         let mut namespace = Box::new(execution_context.fresh_namespace());
         namespace.fix_ptr();
+        // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
+        pyre_runtime::namespace_store(
+            &mut namespace,
+            "__name__",
+            pyre_object::w_str_new("__main__"),
+        );
         let namespace = Box::into_raw(namespace);
         let code_ptr = Box::into_raw(Box::new(code));
         let ctx_ptr = Rc::into_raw(execution_context);
@@ -193,6 +207,7 @@ impl PyFrame {
             block_stack: Vec::new(),
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
+            class_locals: std::ptr::null_mut(),
         }
     }
 
@@ -213,6 +228,7 @@ impl PyFrame {
             block_stack: self.block_stack.clone(),
             pending_inline_results: self.pending_inline_results.clone(),
             pending_inline_resume_pc: self.pending_inline_resume_pc,
+            class_locals: self.class_locals,
         };
         frame.fix_array_ptrs();
         frame
@@ -320,6 +336,7 @@ impl PyFrame {
             block_stack: Vec::new(),
             pending_inline_results: VecDeque::new(),
             pending_inline_resume_pc: None,
+            class_locals: std::ptr::null_mut(),
         }
     }
 

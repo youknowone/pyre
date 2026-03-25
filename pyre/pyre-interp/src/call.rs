@@ -6,10 +6,10 @@
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-use pyre_object::PyObjectRef;
+use pyre_object::{PY_NULL, PyObjectRef};
 use pyre_runtime::{
-    PyResult, dispatch_callable, w_builtin_func_get, w_func_get_closure, w_func_get_code_ptr,
-    w_func_get_globals,
+    PyError, PyErrorKind, PyNamespace, PyResult, dispatch_callable, w_builtin_func_get,
+    w_func_get_closure, w_func_get_code_ptr, w_func_get_globals,
 };
 
 use crate::eval::eval_frame_plain;
@@ -205,6 +205,12 @@ fn call_user_function_with_eval(
 }
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+    // Type objects are callable — calling creates an instance.
+    // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
+    if unsafe { pyre_object::is_type(callable) } {
+        return call_type_object(frame, callable, args);
+    }
+
     dispatch_callable(
         callable,
         |callable| {
@@ -287,4 +293,106 @@ pub fn call_callable_inline_residual(
         },
         |callable| call_user_function_plain(frame, callable, args),
     )
+}
+
+// ── __build_class__ implementation ───────────────────────────────────
+// PyPy equivalent: pyopcode.py BUILD_CLASS
+//   1. Execute class body function with fresh namespace (class_locals)
+//   2. Create W_TypeObject from the harvested namespace
+
+/// Register the real __build_class__ callback into pyre-runtime.
+/// Called at startup from pyre-jit or pyrex.
+pub fn register_build_class() {
+    pyre_runtime::register_build_class_impl(real_build_class);
+}
+
+/// The real __build_class__(body_fn, name, *bases) implementation.
+///
+/// PyPy equivalent: pyopcode.py BUILD_CLASS →
+///   w_methodsdict = call(body_fn)
+///   w_newclass = call(metaclass, name, bases, methodsdict)
+fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(
+        args.len() >= 2,
+        "__build_class__ requires at least 2 arguments"
+    );
+    let body_fn = args[0];
+    let name_obj = args[1];
+    let bases = &args[2..];
+
+    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+    let bases_tuple = pyre_object::w_tuple_new(bases.to_vec());
+
+    match build_class_inner(body_fn, name, bases_tuple) {
+        Ok(cls) => cls,
+        Err(e) => panic!("__build_class__ failed: {e}"),
+    }
+}
+
+fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> PyResult {
+    let code_ptr = unsafe { w_func_get_code_ptr(body_fn) };
+    let globals = unsafe { w_func_get_globals(body_fn) };
+    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+
+    // Create a fresh namespace for the class body (PyPy: w_locals for class scope)
+    let mut class_ns = Box::new(PyNamespace::new());
+    class_ns.fix_ptr();
+    let class_ns_ptr = Box::into_raw(class_ns);
+
+    // Get execution context from the globals namespace (approximation)
+    // We need an execution context pointer; use the one from the function's globals.
+    let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = if stored.is_null() {
+        std::ptr::null::<pyre_runtime::PyExecutionContext>()
+    } else {
+        stored
+    };
+
+    // Create frame with class_locals set
+    // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals
+    let mut frame = PyFrame::new_with_namespace(func_code, exec_ctx, globals);
+    frame.class_locals = class_ns_ptr;
+
+    eval_frame_plain(&mut frame)?;
+
+    // Create W_TypeObject from the class namespace
+    // PyPy: type.__new__(type, name, bases, dict_w)
+    Ok(pyre_object::w_type_new(
+        name,
+        bases,
+        class_ns_ptr as *mut u8,
+    ))
+}
+
+thread_local! {
+    /// Execution context for __build_class__ calls.
+    /// Set before eval_loop starts so build_class can access it.
+    static BUILD_CLASS_EXEC_CTX: Cell<*const pyre_runtime::PyExecutionContext> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// Set the execution context for __build_class__ to use.
+pub fn set_build_class_exec_ctx(ctx: *const pyre_runtime::PyExecutionContext) {
+    BUILD_CLASS_EXEC_CTX.with(|c| c.set(ctx));
+}
+
+// ── Type calling (instance creation) ─────────────────────────────────
+// PyPy equivalent: typeobject.py descr_call → __new__ + __init__
+
+fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+    // Step 1: object.__new__ — allocate instance
+    // PyPy: descr__new__ → space.allocate_instance(W_ObjectObject, w_type)
+    let instance = pyre_object::w_instance_new(w_type);
+
+    // Step 2: Look up __init__ via MRO and call it
+    // PyPy: descr_call → space.lookup(w_newobject, '__init__') → call
+    if let Ok(init_fn) = pyre_objspace::space::py_getattr(w_type, "__init__") {
+        // Call __init__(instance, *args)
+        let mut init_args = Vec::with_capacity(1 + args.len());
+        init_args.push(instance);
+        init_args.extend_from_slice(args);
+        let _ = call_callable(frame, init_fn, &init_args)?;
+    }
+
+    Ok(instance)
 }

@@ -5544,6 +5544,52 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
+    /// LOAD_ATTR is_method=true — RPython LOOKUP_METHOD parity.
+    ///
+    /// Traces the method lookup with correct concrete tracking so that
+    /// instance method calls produce valid traces. The concrete object
+    /// determines whether self is bound:
+    ///   - instance → push [attr, self], guard nonnull on self
+    ///   - other    → push [attr, NULL]
+    /// LOAD_ATTR is_method in JIT trace.
+    ///
+    /// For non-instance objects (modules, etc.), traces normally: [attr, NULL].
+    /// For instance method calls, aborts the trace — full JIT support
+    /// requires LOOKUP_METHOD / CALL_METHOD IR ops (RPython parity).
+    /// The loop falls back to the interpreter which handles self-binding
+    /// correctly via PyFrame::load_method/call overrides.
+    fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
+        let obj = SharedOpcodeHandler::pop_value(self)?;
+        let concrete_obj = self.concrete_popped_value();
+
+        // Abort trace for instance method calls — not yet supported in JIT.
+        // Full JIT support requires LOOKUP_METHOD / CALL_METHOD IR ops.
+        // Also abort when concrete is unknown (None) — cannot determine
+        // whether self-binding is needed without the concrete value.
+        let is_instance = concrete_obj
+            .map(|cv| !cv.is_null() && unsafe { pyre_object::is_instance(cv) })
+            .unwrap_or(false);
+        let concrete_unknown = concrete_obj.is_none();
+        if is_instance || concrete_unknown {
+            return Err(PyError::type_error(
+                "load_method: instance or unknown concrete — aborting trace",
+            ));
+        }
+
+        // Non-instance path: trace as normal [attr, NULL]
+        if let Some(cv) = concrete_obj {
+            if let Ok(result) = pyre_objspace::space::py_getattr(cv, name) {
+                self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(result));
+            }
+        }
+        let attr = self.trace_load_attr(obj, name)?;
+        SharedOpcodeHandler::push_value(self, attr)?;
+
+        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::PY_NULL));
+        let null = self.trace_null_value()?;
+        SharedOpcodeHandler::push_value(self, null)
+    }
+
     fn unsupported(
         &mut self,
         instruction: &Instruction,
