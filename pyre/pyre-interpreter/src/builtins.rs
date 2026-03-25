@@ -589,15 +589,34 @@ fn builtin_dict_ctor(args: &[PyObjectRef]) -> PyObjectRef {
             return args[0];
         }
     }
-    panic!("dict() from non-dict not yet implemented");
+    // Try to construct from iterable of (key, value) pairs
+    // PyPy: dictobject.py W_DictMultiObject.descr_init
+    let src = args[0];
+    unsafe {
+        if is_list(src) {
+            let dict = w_dict_new();
+            let n = w_list_len(src);
+            for i in 0..n {
+                if let Some(pair) = w_list_getitem(src, i as i64) {
+                    if is_tuple(pair) && w_tuple_len(pair) == 2 {
+                        let k = w_tuple_getitem(pair, 0).unwrap();
+                        let v = w_tuple_getitem(pair, 1).unwrap();
+                        w_dict_store(dict, k, v);
+                    }
+                }
+            }
+            return dict;
+        }
+    }
+    panic!("dict() from this type not yet implemented");
 }
 
 /// `object()` — PyPy: objectobject.py descr__new__
-/// Creates a bare object instance (no type, no dict).
 fn builtin_object(_args: &[PyObjectRef]) -> PyObjectRef {
-    // In Python, object() creates an instance of the base object type.
-    // We return a minimal instance with no type.
-    w_none() // Simplified: object() → None placeholder
+    // PyPy: objectobject.py descr__new__ → allocate bare object
+    // In Python, object() returns a featureless object instance.
+    // Use PY_NULL as type since there's no builtin 'object' W_TypeObject yet.
+    pyre_object::w_instance_new(pyre_object::PY_NULL)
     // Full implementation requires a base object type in TypeDef.
 }
 
