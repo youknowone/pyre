@@ -117,50 +117,6 @@ pub struct TrackedPreambleUse {
 /// allocated memory. The optimizer writes field values directly.
 pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 
-// --- Phase A: new forwarding types (additive, not yet wired) ---
-
-/// Unified forwarding slot. RPython stores forwarded as one of:
-/// - another op (Op), a PtrInfo (Info), or a Const (Constant).
-/// This replaces the separate `forwarding`, `ptr_info`, `constants` vecs
-/// once migration is complete.
-#[derive(Clone)]
-pub enum Forwarded {
-    None,
-    Op(OpRef),
-    Info(InfoRef),
-    Constant(Value),
-}
-
-/// Handle into `InfoArena`. Lightweight copy type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InfoRef(pub u32);
-
-/// Arena allocator for `PtrInfo` objects. Provides stable `InfoRef` handles
-/// that do not move when the arena grows.
-pub struct InfoArena {
-    infos: Vec<PtrInfo>,
-}
-
-impl InfoArena {
-    pub fn new() -> Self {
-        Self { infos: Vec::new() }
-    }
-
-    pub fn alloc(&mut self, info: PtrInfo) -> InfoRef {
-        let idx = self.infos.len();
-        self.infos.push(info);
-        InfoRef(idx as u32)
-    }
-
-    pub fn get(&self, r: InfoRef) -> &PtrInfo {
-        &self.infos[r.0 as usize]
-    }
-
-    pub fn get_mut(&mut self, r: InfoRef) -> &mut PtrInfo {
-        &mut self.infos[r.0 as usize]
-    }
-}
-
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -287,10 +243,6 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
-    /// Phase A: unified forwarding table (additive, not yet wired).
-    pub forwarded: Vec<Forwarded>,
-    /// Phase A: arena for PtrInfo objects (additive, not yet wired).
-    pub info_arena: InfoArena,
 }
 
 impl OptContext {
@@ -335,8 +287,6 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             // (import_boxes removed)
-            forwarded: Vec::new(),
-            info_arena: InfoArena::new(),
         }
     }
 
@@ -381,8 +331,6 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             // (import_boxes removed)
-            forwarded: Vec::new(),
-            info_arena: InfoArena::new(),
         }
     }
 
@@ -770,11 +718,6 @@ impl OptContext {
             self.ptr_info[idx] = None;
         }
         self.short_preamble_mapping.remove(&old);
-        // Sync to forwarded table.
-        if idx >= self.forwarded.len() {
-            self.forwarded.resize(idx + 1, Forwarded::None);
-        }
-        self.forwarded[idx] = Forwarded::Op(new);
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
