@@ -413,6 +413,82 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 // ── Public dispatch API ───────────────────────────────────────────────
 
+/// Try to call a dunder method on an instance for binary ops.
+///
+/// PyPy: descroperation.py `_binop_impl` →
+///   1. Try `a.__op__(b)` (forward)
+///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
+unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
+    let caller = DUNDER_BINOP_CALLER.get()?;
+
+    // Forward: a.__op__(b)
+    if is_instance(a) {
+        let w_type = w_instance_get_type(a);
+        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
+            return Some(Ok(caller(method, a, b)));
+        }
+    }
+
+    // Reverse: b.__rop__(a) — PyPy: descroperation.py _binop_impl step 2
+    if is_instance(b) {
+        let rdunder = reverse_dunder(dunder);
+        if let Some(rdunder) = rdunder {
+            let w_type = w_instance_get_type(b);
+            if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
+                return Some(Ok(caller(method, b, a)));
+            }
+        }
+    }
+
+    None
+}
+
+/// Map forward dunder to reverse dunder.
+/// PyPy: descroperation.py `_make_binop_impl` generates both directions.
+fn reverse_dunder(dunder: &str) -> Option<&'static str> {
+    Some(match dunder {
+        "__add__" => "__radd__",
+        "__sub__" => "__rsub__",
+        "__mul__" => "__rmul__",
+        "__truediv__" => "__rtruediv__",
+        "__floordiv__" => "__rfloordiv__",
+        "__mod__" => "__rmod__",
+        "__pow__" => "__rpow__",
+        "__lshift__" => "__rlshift__",
+        "__rshift__" => "__rrshift__",
+        "__and__" => "__rand__",
+        "__or__" => "__ror__",
+        "__xor__" => "__rxor__",
+        _ => return None,
+    })
+}
+
+/// Try to call a unary dunder on an instance.
+unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
+    if is_instance(a) {
+        let w_type = w_instance_get_type(a);
+        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
+            let caller = DUNDER_UNARY_CALLER.get()?;
+            return Some(Ok(caller(method, a)));
+        }
+    }
+    None
+}
+
+type BinopCaller = fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef;
+type UnaryCaller = fn(PyObjectRef, PyObjectRef) -> PyObjectRef;
+static DUNDER_BINOP_CALLER: std::sync::OnceLock<BinopCaller> = std::sync::OnceLock::new();
+static DUNDER_UNARY_CALLER: std::sync::OnceLock<UnaryCaller> = std::sync::OnceLock::new();
+
+/// Register dunder caller callbacks (from pyre-interp).
+pub fn register_dunder_binop_caller(f: BinopCaller) {
+    let _ = DUNDER_BINOP_CALLER.set(f);
+}
+
+pub fn register_dunder_unary_caller(f: UnaryCaller) {
+    let _ = DUNDER_UNARY_CALLER.set(f);
+}
+
 /// Binary operation dispatch.
 ///
 /// Checks types and dispatches to the appropriate fast path.
@@ -437,6 +513,10 @@ pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_tuple(a) && is_tuple(b) {
             return tuple_concat(a, b);
         }
+        // Instance dunder dispatch: __add__
+        if let Some(result) = try_instance_binop(a, b, "__add__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for +: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -455,6 +535,9 @@ pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_sub(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__sub__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for -: '{}' and '{}'",
@@ -488,6 +571,9 @@ pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int(a) && is_list(b) {
             return list_repeat(b, a);
         }
+        if let Some(result) = try_instance_binop(a, b, "__mul__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for *: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -506,6 +592,9 @@ pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_float_pair(a, b) {
             return float_floordiv(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__floordiv__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for //: '{}' and '{}'",
@@ -526,6 +615,9 @@ pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_mod(a, b);
         }
+        if let Some(result) = try_instance_binop(a, b, "__mod__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for %: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -541,6 +633,9 @@ pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let b_num = is_int(b) || is_float(b) || is_long(b);
         if a_num && b_num {
             return float_truediv(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__truediv__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for /: '{}' and '{}'",
@@ -562,6 +657,9 @@ pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return Ok(w_float_new(as_float(a).powf(as_float(b))));
         }
+        if let Some(result) = try_instance_binop(a, b, "__pow__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for **: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -578,6 +676,9 @@ pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_lshift(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__lshift__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for <<: '{}' and '{}'",
@@ -596,6 +697,9 @@ pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_rshift(a, b);
         }
+        if let Some(result) = try_instance_binop(a, b, "__rshift__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for >>: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -612,6 +716,9 @@ pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitand(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__and__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for &: '{}' and '{}'",
@@ -630,6 +737,9 @@ pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitor(a, b);
         }
+        if let Some(result) = try_instance_binop(a, b, "__or__") {
+            return result;
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for |: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -646,6 +756,9 @@ pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_bitxor(a, b);
+        }
+        if let Some(result) = try_instance_binop(a, b, "__xor__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for ^: '{}' and '{}'",
@@ -701,6 +814,25 @@ pub fn py_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Eq => sa == sb,
                 CompareOp::Ne => sa != sb,
             }));
+        }
+        // Instance dunder dispatch for comparison
+        let dunder = match op {
+            CompareOp::Lt => "__lt__",
+            CompareOp::Le => "__le__",
+            CompareOp::Gt => "__gt__",
+            CompareOp::Ge => "__ge__",
+            CompareOp::Eq => "__eq__",
+            CompareOp::Ne => "__ne__",
+        };
+        if let Some(result) = try_instance_binop(a, b, dunder) {
+            return result;
+        }
+        // Identity comparison fallback for == and !=
+        if matches!(op, CompareOp::Eq) {
+            return Ok(w_bool_from(std::ptr::eq(a, b)));
+        }
+        if matches!(op, CompareOp::Ne) {
+            return Ok(w_bool_from(!std::ptr::eq(a, b)));
         }
         Err(PyError::type_error(format!(
             "'{op:?}' not supported between instances of '{}' and '{}'",
@@ -961,14 +1093,33 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
-    // Instance objects: check instance dict → class dict → base class dicts
-    // PyPy: descroperation.py Object.descr__getattribute__
-    //   1. instance dict (ATTR_TABLE)
-    //   2. type dict (class namespace)
-    //   3. base type dicts (MRO traversal)
+    // Instance objects — PyPy: descroperation.py descr__getattribute__
+    //
+    // Full descriptor protocol (PEP 252):
+    //   1. Look up name in type MRO → w_descr
+    //   2. If w_descr is a data descriptor (__get__ + __set__/__delete__):
+    //      → call w_descr.__get__(obj, type)
+    //   3. Check instance dict
+    //   4. If w_descr is a non-data descriptor (__get__ only):
+    //      → call w_descr.__get__(obj, type)
+    //   5. Return w_descr as-is
     unsafe {
         if is_instance(obj) {
-            // Step 1: instance dict (ATTR_TABLE)
+            let w_type = w_instance_get_type(obj);
+
+            // Step 1: look up in type MRO
+            let w_descr = lookup_in_type_mro(w_type, name);
+
+            // Step 2: data descriptor takes priority over instance dict
+            if let Some(descr) = w_descr {
+                if is_data_descriptor(descr) {
+                    if let Some(result) = call_descriptor_get(descr, obj, w_type) {
+                        return Ok(result);
+                    }
+                }
+            }
+
+            // Step 3: instance dict (ATTR_TABLE)
             let found = ATTR_TABLE.with(|table| {
                 let table = table.borrow();
                 table
@@ -978,11 +1129,16 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             if let Some(value) = found {
                 return Ok(value);
             }
-            // Step 2+3: class dict and base class dicts
-            let w_type = w_instance_get_type(obj);
-            if let Some(value) = lookup_in_type_mro(w_type, name) {
-                return Ok(value);
+
+            // Step 4: non-data descriptor
+            if let Some(descr) = w_descr {
+                if let Some(result) = call_descriptor_get(descr, obj, w_type) {
+                    return Ok(result);
+                }
+                // Step 5: return descriptor as-is
+                return Ok(descr);
             }
+
             return Err(PyError {
                 kind: PyErrorKind::AttributeError,
                 message: format!(
@@ -994,10 +1150,22 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 
     // Type objects: look up in type's own dict → base dicts
-    // PyPy: typeobject.py lookup_where → MRO search
+    // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
         if is_type(obj) {
             if let Some(value) = lookup_in_type_mro(obj, name) {
+                // Unwrap staticmethod/classmethod/property descriptors
+                // PyPy: type.__getattribute__ calls space.get on descriptors
+                if is_staticmethod(value) {
+                    return Ok(w_staticmethod_get_func(value));
+                }
+                if is_classmethod(value) {
+                    return Ok(w_classmethod_get_func(value));
+                }
+                if is_property(value) {
+                    // property accessed on class → return property itself
+                    return Ok(value);
+                }
                 return Ok(value);
             }
             return Err(PyError {
@@ -1031,33 +1199,26 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     })
 }
 
-/// Look up a name in a type's dict and its base class dicts (MRO).
+/// Look up a name by walking the C3 MRO.
 ///
+/// Public wrapper for external callers (eval.rs load_method).
+pub unsafe fn lookup_in_type_mro_pub(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    lookup_in_type_mro(w_type, name)
+}
+
 /// PyPy equivalent: typeobject.py `_lookup_where(self, key)` →
 /// linear search through `self.mro_w`.
-///
-/// Simplified: checks the type's own dict, then each base's dict recursively.
 unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
-    // Check this type's dict
-    let ns_ptr = w_type_get_dict_ptr(w_type) as *mut pyre_runtime::PyNamespace;
-    if !ns_ptr.is_null() {
-        let ns = &*ns_ptr;
-        if let Some(&value) = ns.get(name) {
-            if !value.is_null() {
-                return Some(value);
-            }
-        }
-    }
-    // Check base classes (PyPy: iterate mro_w)
-    let bases = w_type_get_bases(w_type);
-    if !bases.is_null() && is_tuple(bases) {
-        let n = w_tuple_len(bases);
-        for i in 0..n {
-            if let Some(base) = w_tuple_getitem(bases, i as i64) {
-                if let Some(value) = lookup_in_type_mro(base, name) {
+    let mro = compute_mro(w_type);
+    for cls in &mro {
+        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut pyre_runtime::PyNamespace;
+        if !ns_ptr.is_null() {
+            let ns = &*ns_ptr;
+            if let Some(&value) = ns.get(name) {
+                if !value.is_null() {
                     return Some(value);
                 }
             }
@@ -1066,10 +1227,277 @@ unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObject
     None
 }
 
+/// C3 linearization — PyPy: typeobject.py `compute_default_mro`.
+///
+/// Computes the Method Resolution Order for a type following the C3
+/// algorithm (Python 2.3+). Handles diamond inheritance correctly.
+///
+/// Public wrapper for use by isinstance and other external callers.
+pub unsafe fn compute_mro_pub(w_type: PyObjectRef) -> Vec<PyObjectRef> {
+    compute_mro(w_type)
+}
+
+unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
+    let mut result = vec![w_type];
+    let bases = w_type_get_bases(w_type);
+    if bases.is_null() || !is_tuple(bases) {
+        return result;
+    }
+    let n = w_tuple_len(bases);
+    if n == 0 {
+        return result;
+    }
+
+    // Build candidate lists: [base.mro() for base in bases] + [list(bases)]
+    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        if let Some(base) = w_tuple_getitem(bases, i as i64) {
+            if is_type(base) {
+                lists.push(compute_mro(base));
+            }
+        }
+    }
+    let mut bases_list = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(base) = w_tuple_getitem(bases, i as i64) {
+            bases_list.push(base);
+        }
+    }
+    lists.push(bases_list);
+
+    // C3 merge
+    loop {
+        // Remove empty lists
+        lists.retain(|l| !l.is_empty());
+        if lists.is_empty() {
+            break;
+        }
+        // Find a candidate: head of some list that doesn't appear in
+        // the tail of any other list.
+        let mut found = None;
+        for list in &lists {
+            let candidate = list[0];
+            let in_tail = lists.iter().any(|other| {
+                other.len() > 1 && other[1..].iter().any(|&x| std::ptr::eq(x, candidate))
+            });
+            if !in_tail {
+                found = Some(candidate);
+                break;
+            }
+        }
+        let Some(next) = found else {
+            // C3 inconsistency — fall back to first available
+            break;
+        };
+        result.push(next);
+        // Remove next from the head of all lists
+        for list in &mut lists {
+            if !list.is_empty() && std::ptr::eq(list[0], next) {
+                list.remove(0);
+            }
+        }
+    }
+    result
+}
+
+// ── Descriptor protocol ──────────────────────────────────────────────
+// PyPy equivalent: descroperation.py is_data_descr / space.get
+
+/// Check if a descriptor is a data descriptor (has __set__ or __delete__).
+///
+/// PyPy: descroperation.py `space.is_data_descr(w_descr)`
+///
+/// In Python, a data descriptor is any object whose type defines __set__
+/// or __delete__. For pyre's current object model, we check the ATTR_TABLE
+/// and type dict for these names.
+unsafe fn is_data_descriptor(descr: PyObjectRef) -> bool {
+    if descr.is_null() {
+        return false;
+    }
+    // property objects are always data descriptors
+    // PyPy: W_Property has __get__, __set__, __delete__
+    if is_property(descr) {
+        return true;
+    }
+    // Check if the descriptor's class has __set__ or __delete__
+    if is_instance(descr) {
+        let w_type = w_instance_get_type(descr);
+        if !w_type.is_null() && is_type(w_type) {
+            return lookup_in_type_mro(w_type, "__set__").is_some()
+                || lookup_in_type_mro(w_type, "__delete__").is_some();
+        }
+    }
+    false
+}
+
+/// Call a descriptor's __get__ method.
+///
+/// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
+/// `w_descr.__get__(w_obj, w_type)`
+///
+/// Returns Some(result) if __get__ was found and called, None otherwise.
+/// Call a descriptor's __get__ method.
+///
+/// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
+/// dispatch on descriptor type, then fallback to __get__ MRO lookup.
+unsafe fn call_descriptor_get(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if descr.is_null() {
+        return None;
+    }
+
+    // property: PyPy W_Property.get → call fget(obj)
+    if is_property(descr) {
+        let fget = w_property_get_fget(descr);
+        if fget.is_null() || is_none(fget) {
+            return None;
+        }
+        return call_func_1(fget, obj);
+    }
+
+    // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
+    if is_staticmethod(descr) {
+        return Some(w_staticmethod_get_func(descr));
+    }
+
+    // classmethod: PyPy ClassMethod.descr_classmethod_get → func bound to class
+    // Simplified: return a closure-like call that prepends class.
+    // For now, return the inner function (class arg not yet prepended).
+    if is_classmethod(descr) {
+        return Some(w_classmethod_get_func(descr));
+    }
+
+    // General __get__: look up __get__ on the descriptor's own type MRO
+    // PyPy: descroperation.py → space.get_and_call_function(w_get, descr, obj, type)
+    if is_instance(descr) {
+        let descr_type = w_instance_get_type(descr);
+        if let Some(get_fn) = lookup_in_type_mro(descr_type, "__get__") {
+            if !get_fn.is_null() {
+                // Call __get__(descr, obj, type)
+                if pyre_runtime::is_builtin_func(get_fn) {
+                    let func = pyre_runtime::w_builtin_func_get(get_fn);
+                    return Some(func(&[descr, obj, w_type]));
+                }
+                if pyre_runtime::is_func(get_fn) {
+                    return PROPERTY_CALLER_2.with(|c| {
+                        let caller = c.get()?;
+                        // __get__(descr, obj) — simplified 2-arg call
+                        Some(caller(get_fn, descr, obj))
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Helper: call a function with one argument (builtin or user).
+unsafe fn call_func_1(func: PyObjectRef, arg: PyObjectRef) -> Option<PyObjectRef> {
+    if pyre_runtime::is_builtin_func(func) {
+        let f = pyre_runtime::w_builtin_func_get(func);
+        return Some(f(&[arg]));
+    }
+    if pyre_runtime::is_func(func) {
+        return PROPERTY_CALLER_1.with(|c| {
+            let caller = c.get()?;
+            Some(caller(func, arg))
+        });
+    }
+    None
+}
+
+/// Call a property's __set__(obj, value).
+///
+/// PyPy: W_Property.set → call_function(w_fset, w_obj, w_value)
+/// Call a descriptor's __set__ method.
+///
+/// PyPy: descroperation.py `descr__setattr__` →
+/// `space.get_and_call_function(w_set, w_descr, w_obj, w_value)`
+unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool {
+    if descr.is_null() {
+        return false;
+    }
+
+    // property: PyPy W_Property.set → call fset(obj, value)
+    if is_property(descr) {
+        let fset = w_property_get_fset(descr);
+        if fset.is_null() || is_none(fset) {
+            return false;
+        }
+        return call_func_2(fset, obj, value);
+    }
+
+    // General __set__: look up on descriptor's type MRO
+    if is_instance(descr) {
+        let descr_type = w_instance_get_type(descr);
+        if let Some(set_fn) = lookup_in_type_mro(descr_type, "__set__") {
+            if !set_fn.is_null() {
+                // Call __set__(descr, obj, value)
+                return call_func_2(set_fn, obj, value);
+            }
+        }
+    }
+    false
+}
+
+/// Helper: call a function with two arguments (builtin or user).
+unsafe fn call_func_2(func: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> bool {
+    if pyre_runtime::is_builtin_func(func) {
+        let f = pyre_runtime::w_builtin_func_get(func);
+        f(&[a, b]);
+        return true;
+    }
+    if pyre_runtime::is_func(func) {
+        return PROPERTY_CALLER_2.with(|c| {
+            if let Some(caller) = c.get() {
+                caller(func, a, b);
+                true
+            } else {
+                false
+            }
+        });
+    }
+    false
+}
+
+thread_local! {
+    /// Callback for calling user functions from descriptor protocol.
+    /// Registered by pyre-interp at startup.
+    static PROPERTY_CALLER_1: std::cell::Cell<Option<fn(PyObjectRef, PyObjectRef) -> PyObjectRef>> =
+        const { std::cell::Cell::new(None) };
+    static PROPERTY_CALLER_2: std::cell::Cell<Option<fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Register property caller callbacks (from pyre-interp).
+pub fn register_property_callers(
+    f1: fn(PyObjectRef, PyObjectRef) -> PyObjectRef,
+    f2: fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef,
+) {
+    PROPERTY_CALLER_1.with(|c| c.set(Some(f1)));
+    PROPERTY_CALLER_2.with(|c| c.set(Some(f2)));
+}
+
 /// Set an attribute on an object: `obj.name = value`.
 ///
 /// Stores the attribute in the per-object side table.
+/// PyPy: descroperation.py descr__setattr__
 pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    // Data descriptor __set__ takes priority (PyPy: descr__setattr__ step 1)
+    unsafe {
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(descr) = lookup_in_type_mro(w_type, name) {
+                if call_descriptor_set(descr, obj, value) {
+                    return Ok(w_none());
+                }
+            }
+        }
+    }
+    // Store in instance dict (ATTR_TABLE)
     ATTR_TABLE.with(|table| {
         let mut table = table.borrow_mut();
         let key = obj as usize;

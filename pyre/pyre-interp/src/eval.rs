@@ -914,7 +914,25 @@ impl OpcodeStepExecutor for PyFrame {
         let obj = self.pop();
         let attr = pyre_objspace::space::py_getattr(obj, name)?;
         self.push(attr);
-        if unsafe { pyre_object::is_instance(obj) } {
+        // Bind self only for regular instance method calls.
+        // staticmethod/classmethod descriptors already unwrap to the raw
+        // function via py_getattr → call_descriptor_get; self must NOT
+        // be prepended for those.
+        // PyPy: LOOKUP_METHOD checks whether the attr came from a
+        // non-data descriptor that is a plain function (not staticmethod).
+        let bind_self = unsafe {
+            pyre_object::is_instance(obj) && {
+                // Check raw descriptor in class dict before unwrap
+                let w_type = pyre_object::w_instance_get_type(obj);
+                let raw = pyre_objspace::space::lookup_in_type_mro_pub(w_type, name);
+                match raw {
+                    Some(d) if pyre_object::is_staticmethod(d) => false,
+                    Some(d) if pyre_object::is_classmethod(d) => false,
+                    _ => true,
+                }
+            }
+        };
+        if bind_self {
             self.push(obj);
         } else {
             self.push(PY_NULL);

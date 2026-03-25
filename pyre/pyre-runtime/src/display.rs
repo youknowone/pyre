@@ -1,11 +1,38 @@
 use std::fmt;
+use std::sync::OnceLock;
 
 use pyre_object::excobject::EXCEPTION_TYPE;
 use pyre_object::pyobject::{
-    BOOL_TYPE, FLOAT_TYPE, INT_TYPE, LONG_TYPE, NONE_TYPE, PyObjectRef, PyType, STR_TYPE,
+    BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LONG_TYPE, MODULE_TYPE, NONE_TYPE, PyObjectRef,
+    PyType, STR_TYPE, TYPE_TYPE,
 };
 
 use crate::{BUILTIN_FUNC_TYPE, FUNCTION_TYPE, w_builtin_func_name, w_func_get_name};
+
+/// Callback to call a dunder method (e.g. __repr__) on an instance.
+/// Registered by pyre-interp at startup.
+type DunderCaller = fn(PyObjectRef, &str) -> Option<PyObjectRef>;
+pub static DUNDER_CALLER: OnceLock<DunderCaller> = OnceLock::new();
+
+/// Register the dunder method caller (from pyre-interp).
+pub fn register_dunder_caller(f: DunderCaller) {
+    let _ = DUNDER_CALLER.set(f);
+}
+
+/// Try to call a dunder method (__repr__, __str__, etc.) on an object.
+fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
+    let caller = DUNDER_CALLER.get()?;
+    let result = caller(obj, name)?;
+    if result.is_null() {
+        return None;
+    }
+    unsafe {
+        if pyre_object::is_str(result) {
+            return Some(pyre_object::w_str_get_value(result).to_string());
+        }
+    }
+    None
+}
 
 /// Format a PyObjectRef for debug display.
 ///
@@ -52,10 +79,48 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
             let msg = pyre_object::excobject::w_exception_get_message(obj);
             msg.to_string()
+        } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {
+            let name = pyre_object::w_type_get_name(obj);
+            format!("<class '{name}'>")
+        } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
+            let name = pyre_object::w_module_get_name(obj);
+            format!("<module '{name}'>")
+        } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+            // Try __repr__ first, then __str__
+            if let Some(s) = try_call_dunder(obj, "__repr__") {
+                return s;
+            }
+            if let Some(s) = try_call_dunder(obj, "__str__") {
+                return s;
+            }
+            let w_type = pyre_object::w_instance_get_type(obj);
+            let name = pyre_object::w_type_get_name(w_type);
+            format!("<{name} object at {obj:?}>")
         } else {
             format!("<{} object at {:?}>", (*tp).tp_name, obj)
         }
     }
+}
+
+/// Format for str() — tries __str__ first, then __repr__.
+pub unsafe fn py_str(obj: PyObjectRef) -> String {
+    if obj.is_null() {
+        return "NULL".to_string();
+    }
+    let tp = (*obj).ob_type;
+    // For strings, return the value directly (no quotes).
+    if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+        return pyre_object::w_str_get_value(obj).to_string();
+    }
+    if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+        if let Some(s) = try_call_dunder(obj, "__str__") {
+            return s;
+        }
+        if let Some(s) = try_call_dunder(obj, "__repr__") {
+            return s;
+        }
+    }
+    py_repr(obj)
 }
 
 /// Display wrapper for PyObjectRef.
@@ -66,7 +131,7 @@ impl fmt::Display for PyDisplay {
         if self.0.is_null() {
             write!(f, "NULL")
         } else {
-            write!(f, "{}", unsafe { py_repr(self.0) })
+            write!(f, "{}", unsafe { py_str(self.0) })
         }
     }
 }
