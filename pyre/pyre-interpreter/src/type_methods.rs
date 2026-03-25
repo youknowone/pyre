@@ -44,21 +44,36 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> PyObjectRef {
     w_none()
 }
 
-/// PyPy: listobject.py descr_insert
-pub fn list_method_insert(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.insert() not yet implemented");
+/// PyPy: listobject.py descr_insert — list.insert(index, item)
+pub fn list_method_insert(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() == 3, "insert() takes exactly 2 arguments");
+    let index = unsafe { w_int_get_value(args[1]) };
+    unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
+    w_none()
 }
 
-/// PyPy: listobject.py descr_pop
-pub fn list_method_pop(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.pop() not yet implemented (requires mutable list removal)");
+/// PyPy: listobject.py descr_pop — list.pop([index])
+pub fn list_method_pop(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty(), "pop() requires self");
+    let index = if args.len() > 1 {
+        unsafe { w_int_get_value(args[1]) }
+    } else {
+        -1 // default: pop last
+    };
+    unsafe {
+        pyre_object::listobject::w_list_pop(args[0], index)
+            .unwrap_or_else(|| panic!("pop from empty list"))
+    }
 }
 
-/// PyPy stub — list.clear() not yet implemented
-pub fn list_method_clear(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.clear() not yet implemented");
+/// PyPy: listobject.py descr_clear — list.clear()
+pub fn list_method_clear(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    unsafe { pyre_object::listobject::w_list_clear(args[0]) };
+    w_none()
 }
 
+/// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(!args.is_empty());
     let list = args[0];
@@ -74,29 +89,99 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> PyObjectRef {
     }
 }
 
-/// PyPy stub — list.reverse() not yet implemented
-pub fn list_method_reverse(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.reverse() not yet implemented");
+/// PyPy: listobject.py descr_reverse — list.reverse()
+pub fn list_method_reverse(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
+    w_none()
 }
 
-/// PyPy stub — list.sort() not yet implemented
-pub fn list_method_sort(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.sort() not yet implemented");
+/// PyPy: listobject.py descr_sort — list.sort()
+///
+/// Simplified: only sorts int lists. Full sort requires comparison protocol.
+pub fn list_method_sort(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty());
+    let list = args[0];
+    unsafe {
+        let n = w_list_len(list);
+        let mut items: Vec<PyObjectRef> = (0..n)
+            .filter_map(|i| w_list_getitem(list, i as i64))
+            .collect();
+        // Sort by int value (PyPy uses timsort with key/cmp)
+        items.sort_by(|a, b| {
+            if is_int(*a) && is_int(*b) {
+                w_int_get_value(*a).cmp(&w_int_get_value(*b))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        pyre_object::listobject::w_list_clear(list);
+        for item in items {
+            w_list_append(list, item);
+        }
+    }
+    w_none()
 }
 
-/// PyPy stub — list.index() not yet implemented
-pub fn list_method_index(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.index() not yet implemented");
+/// PyPy: listobject.py descr_index — list.index(value)
+pub fn list_method_index(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    let list = args[0];
+    let value = args[1];
+    unsafe {
+        let n = w_list_len(list);
+        for i in 0..n {
+            if let Some(item) = w_list_getitem(list, i as i64) {
+                if std::ptr::eq(item, value) {
+                    return w_int_new(i as i64);
+                }
+                if is_int(item) && is_int(value) && w_int_get_value(item) == w_int_get_value(value)
+                {
+                    return w_int_new(i as i64);
+                }
+                if is_str(item) && is_str(value) && w_str_get_value(item) == w_str_get_value(value)
+                {
+                    return w_int_new(i as i64);
+                }
+            }
+        }
+    }
+    panic!("ValueError: value not in list")
 }
 
-/// PyPy stub — list.count() not yet implemented
-pub fn list_method_count(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.count() not yet implemented");
+/// PyPy: listobject.py descr_count — list.count(value)
+pub fn list_method_count(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "count() takes exactly 1 argument");
+    let list = args[0];
+    let value = args[1];
+    let mut count: i64 = 0;
+    unsafe {
+        let n = w_list_len(list);
+        for i in 0..n {
+            if let Some(item) = w_list_getitem(list, i as i64) {
+                if std::ptr::eq(item, value) {
+                    count += 1;
+                } else if is_int(item)
+                    && is_int(value)
+                    && w_int_get_value(item) == w_int_get_value(value)
+                {
+                    count += 1;
+                }
+            }
+        }
+    }
+    w_int_new(count)
 }
 
-/// PyPy stub — list.remove() not yet implemented
-pub fn list_method_remove(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("list.remove() not yet implemented");
+/// PyPy: listobject.py descr_remove — list.remove(value)
+pub fn list_method_remove(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "remove() takes exactly 1 argument");
+    unsafe {
+        if !pyre_object::listobject::w_list_remove(args[0], args[1]) {
+            panic!("ValueError: list.remove(x): x not in list");
+        }
+    }
+    w_none()
 }
 
 // ── String methods ───────────────────────────────────────────────────
@@ -306,9 +391,21 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> PyObjectRef {
     w_list_new(vec![])
 }
 
-/// PyPy stub — dict.update() not yet implemented
-pub fn dict_method_update(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("dict.update() not yet implemented");
+/// PyPy: dictobject.py descr_update — dict.update(other)
+pub fn dict_method_update(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "update() takes at least 1 argument");
+    let dict = args[0];
+    let other = args[1];
+    unsafe {
+        if is_dict(other) {
+            let src = &*(other as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*src.entries;
+            for &(k, v) in entries {
+                w_dict_store(dict, k, v);
+            }
+        }
+    }
+    w_none()
 }
 
 /// PyPy: dictobject.py descr_pop
@@ -345,12 +442,47 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> PyObjectRef {
 
 // ── Tuple methods ────────────────────────────────────────────────────
 
-/// PyPy stub — tuple.index() not yet implemented
-pub fn tuple_method_index(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("tuple.index() not yet implemented");
+/// PyPy: tupleobject.py descr_index — tuple.index(value)
+pub fn tuple_method_index(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    let tup = args[0];
+    let value = args[1];
+    unsafe {
+        let n = w_tuple_len(tup);
+        for i in 0..n {
+            if let Some(item) = w_tuple_getitem(tup, i as i64) {
+                if std::ptr::eq(item, value) {
+                    return w_int_new(i as i64);
+                }
+                if is_int(item) && is_int(value) && w_int_get_value(item) == w_int_get_value(value)
+                {
+                    return w_int_new(i as i64);
+                }
+            }
+        }
+    }
+    panic!("ValueError: tuple.index(x): x not in tuple")
 }
 
-/// PyPy stub — tuple.count() not yet implemented
-pub fn tuple_method_count(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("tuple.count() not yet implemented");
+/// PyPy: tupleobject.py descr_count — tuple.count(value)
+pub fn tuple_method_count(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(args.len() >= 2, "count() takes exactly 1 argument");
+    let tup = args[0];
+    let value = args[1];
+    let mut count: i64 = 0;
+    unsafe {
+        let n = w_tuple_len(tup);
+        for i in 0..n {
+            if let Some(item) = w_tuple_getitem(tup, i as i64) {
+                if std::ptr::eq(item, value)
+                    || (is_int(item)
+                        && is_int(value)
+                        && w_int_get_value(item) == w_int_get_value(value))
+                {
+                    count += 1;
+                }
+            }
+        }
+    }
+    w_int_new(count)
 }

@@ -296,6 +296,85 @@ pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
     list.strategy == ListStrategy::Float
 }
 
+/// Rebuild the list's object storage from a Vec.
+/// Used by mutation operations that need insert/remove.
+unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>) {
+    list.items = PyObjectArray::from_vec(items);
+    list.items.fix_ptr();
+}
+
+/// Get a mutable copy of items as Vec (object strategy).
+unsafe fn items_to_vec(list: &mut W_ListObject) -> Vec<PyObjectRef> {
+    switch_to_object_strategy(list);
+    list.items.to_vec()
+}
+
+/// Insert item at index. PyPy: listobject.py descr_insert.
+pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
+    let list = &mut *(obj as *mut W_ListObject);
+    let mut items = items_to_vec(list);
+    let len = items.len() as i64;
+    let idx = if index < 0 {
+        (index + len).max(0) as usize
+    } else {
+        (index as usize).min(items.len())
+    };
+    items.insert(idx, value);
+    rebuild_object_items(list, items);
+}
+
+/// Remove and return item at index. PyPy: listobject.py descr_pop.
+pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    let list = &mut *(obj as *mut W_ListObject);
+    let mut items = items_to_vec(list);
+    let len = items.len() as i64;
+    if len == 0 {
+        return None;
+    }
+    let idx = if index < 0 { index + len } else { index };
+    if idx < 0 || idx >= len {
+        return None;
+    }
+    let removed = items.remove(idx as usize);
+    rebuild_object_items(list, items);
+    Some(removed)
+}
+
+/// Clear all items. PyPy: listobject.py descr_clear.
+pub unsafe fn w_list_clear(obj: PyObjectRef) {
+    let list = &mut *(obj as *mut W_ListObject);
+    rebuild_object_items(list, Vec::new());
+    list.strategy = ListStrategy::Object;
+}
+
+/// Reverse in place. PyPy: listobject.py descr_reverse.
+pub unsafe fn w_list_reverse(obj: PyObjectRef) {
+    let list = &mut *(obj as *mut W_ListObject);
+    let mut items = items_to_vec(list);
+    items.reverse();
+    rebuild_object_items(list, items);
+}
+
+/// Remove first occurrence of value. PyPy: listobject.py descr_remove.
+pub unsafe fn w_list_remove(obj: PyObjectRef, value: PyObjectRef) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
+    let mut items = items_to_vec(list);
+    for i in 0..items.len() {
+        if std::ptr::eq(items[i], value) {
+            items.remove(i);
+            rebuild_object_items(list, items);
+            return true;
+        }
+        if is_int(items[i]) && is_int(value) && w_int_get_value(items[i]) == w_int_get_value(value)
+        {
+            items.remove(i);
+            rebuild_object_items(list, items);
+            return true;
+        }
+    }
+    false
+}
+
 pub extern "C" fn jit_list_append(list: i64, item: i64) -> i64 {
     unsafe { w_list_append(list as PyObjectRef, item as PyObjectRef) };
     0

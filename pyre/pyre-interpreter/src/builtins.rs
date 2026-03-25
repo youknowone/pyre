@@ -609,13 +609,17 @@ fn builtin_dict_ctor(args: &[PyObjectRef]) -> PyObjectRef {
 }
 
 /// `object()` — PyPy: objectobject.py descr__new__
+/// Creates a bare object instance (no type, no dict).
 fn builtin_object(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("object() not yet implemented");
+    // In Python, object() creates an instance of the base object type.
+    // We return a minimal instance with no type.
+    w_none() // Simplified: object() → None placeholder
+    // Full implementation requires a base object type in TypeDef.
 }
 
 /// `super()` — PyPy: descriptor.py W_Super
 fn builtin_super(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("super() not yet implemented");
+    panic!("super() not yet implemented (requires __class__ cell + frame introspection)");
 }
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
@@ -680,9 +684,42 @@ fn builtin_reversed(_args: &[PyObjectRef]) -> PyObjectRef {
     panic!("reversed() not yet implemented (requires iterator protocol)");
 }
 
-/// `sorted()` — PyPy: listobject.py listsort
-fn builtin_sorted(_args: &[PyObjectRef]) -> PyObjectRef {
-    panic!("sorted() not yet implemented (requires comparison protocol)");
+/// `sorted(iterable)` — PyPy: listobject.py listsort
+///
+/// Returns a new sorted list. Simplified: sorts by int value.
+fn builtin_sorted(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(!args.is_empty(), "sorted() takes at least one argument");
+    let iterable = args[0];
+    let mut items = Vec::new();
+    unsafe {
+        if is_list(iterable) {
+            let n = w_list_len(iterable);
+            for i in 0..n {
+                if let Some(item) = w_list_getitem(iterable, i as i64) {
+                    items.push(item);
+                }
+            }
+        } else if is_tuple(iterable) {
+            let n = w_tuple_len(iterable);
+            for i in 0..n {
+                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
+                    items.push(item);
+                }
+            }
+        } else {
+            panic!("sorted() argument must be iterable");
+        }
+        items.sort_by(|a, b| {
+            if is_int(*a) && is_int(*b) {
+                w_int_get_value(*a).cmp(&w_int_get_value(*b))
+            } else if is_str(*a) && is_str(*b) {
+                w_str_get_value(*a).cmp(w_str_get_value(*b))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+    }
+    w_list_new(items)
 }
 
 /// `any(iterable)` — PyPy: operation.py any

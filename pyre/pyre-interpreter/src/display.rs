@@ -64,6 +64,36 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             } else {
                 "False".to_string()
             }
+        } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
+            let n = pyre_object::w_list_len(obj);
+            let mut parts = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
+                    parts.push(py_repr(item));
+                }
+            }
+            format!("[{}]", parts.join(", "))
+        } else if std::ptr::eq(tp, &pyre_object::pyobject::TUPLE_TYPE as *const PyType) {
+            let n = pyre_object::w_tuple_len(obj);
+            let mut parts = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some(item) = pyre_object::w_tuple_getitem(obj, i as i64) {
+                    parts.push(py_repr(item));
+                }
+            }
+            if n == 1 {
+                format!("({},)", parts[0])
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        } else if std::ptr::eq(tp, &pyre_object::pyobject::DICT_TYPE as *const PyType) {
+            let d = &*(obj as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*d.entries;
+            let mut parts = Vec::with_capacity(entries.len());
+            for &(k, v) in entries {
+                parts.push(format!("{}: {}", py_repr(k), py_repr(v)));
+            }
+            format!("{{{}}}", parts.join(", "))
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
             let str_obj = obj as *const pyre_object::strobject::W_StrObject;
             format!("'{}'", &*(*str_obj).value)
