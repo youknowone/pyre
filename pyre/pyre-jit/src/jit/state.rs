@@ -4693,8 +4693,19 @@ impl MIFrame {
                     pc, handler_pc, err
                 );
             }
+            // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
+            // The guard asserts this specific exception type was raised.
+            // At runtime, if a different exception (or none) occurs, the
+            // guard fails and a bridge handles the alternative path.
+            let exc_obj = err.to_exc_object();
+            let exc_type_ptr = unsafe {
+                (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
+                    .ob_header
+                    .ob_type as i64
+            };
             self.with_ctx(|this, ctx| {
-                this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                let exc_type_const = ctx.const_int(exc_type_ptr);
+                this.record_guard(ctx, majit_ir::OpCode::GuardException, &[exc_type_const]);
             });
 
             let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interp::frame::PyFrame) };
@@ -4705,7 +4716,6 @@ impl MIFrame {
             if entry.push_lasti {
                 frame.push(w_int_new(pc as i64));
             }
-            let exc_obj = err.to_exc_object();
             frame.push(exc_obj);
 
             let exc_opref = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
@@ -5755,10 +5765,28 @@ impl OpcodeStepExecutor for MIFrame {
         if argc == 0 {
             return Err(PyError::runtime_error("bare raise during tracing"));
         }
-        let _sym_exc = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
         if argc >= 2 {
             let _cause = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         }
+        // RPython pyjitpl.py:1692: GUARD_CLASS on the exception value.
+        let concrete_exc = exc_val.concrete.to_pyobj();
+        if !concrete_exc.is_null() {
+            let exc_class = unsafe {
+                (*(concrete_exc as *const pyre_object::excobject::W_ExceptionObject))
+                    .ob_header
+                    .ob_type as i64
+            };
+            self.with_ctx(|this, ctx| {
+                let cls_const = ctx.const_int(exc_class);
+                this.record_guard(
+                    ctx,
+                    majit_ir::OpCode::GuardClass,
+                    &[exc_val.opref, cls_const],
+                );
+            });
+        }
+        // Return the concrete exception as Err for handle_possible_exception.
         Err(PyError::value_error("raised during tracing"))
     }
 
