@@ -2125,6 +2125,12 @@ fn call_assembler_fast_path(
     // from the first input arg.
     if target.code_ptr.is_null() {
         let frame_ptr = inputs.get(0).copied().unwrap_or(0);
+        // Set pending_force_local0 for lazy frame creation.
+        // When create_frame is elided, frame_ptr is the caller frame.
+        // force_fn uses pending_force_local0 to create a callee frame.
+        if inputs.len() > 3 {
+            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(inputs[3])));
+        }
         let result = force_fn(frame_ptr);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
