@@ -1479,23 +1479,26 @@ impl MIFrame {
 
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
         let s = self.sym();
-        // Use pre-opcode stack depth if available (bridge traces)
+        // RPython capture_resumedata: use pre-opcode stack depth/types
         let stack_only = if let Some(pre_vsd) = s.pre_opcode_vsd {
             pre_vsd.saturating_sub(s.nlocals)
         } else {
             s.stack_only_depth()
         };
-        let is_bridge = {
+        let is_bridge = s.pre_opcode_vsd.is_some() && {
             let (driver, _) = crate::eval::driver_pair();
             driver.is_bridge_tracing()
         };
-        // RPython virtualizable convention: back-edge traces and bridge
-        // traces use all-Ref fail_arg types (GCREF array slots).
-        // Bridge traces inherit is_function_entry_trace=true from header_pc=0
-        // but must still use all-Ref to match the root loop's convention.
         if s.vable_array_base.is_some() && (!s.is_function_entry_trace || is_bridge) {
             let total_slots = s.symbolic_local_types.len() + stack_only;
             virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
+        } else if let Some(ref pre_types) = s.pre_opcode_stack_types {
+            let slot_types = s
+                .symbolic_local_types
+                .iter()
+                .copied()
+                .chain(pre_types.iter().copied());
+            virtualizable_fail_arg_types(slot_types)
         } else {
             let slot_types = s.symbolic_local_types.iter().copied().chain(
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
@@ -1849,19 +1852,16 @@ impl MIFrame {
         s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
     }
 
-    /// RPython capture_resumedata(resumepc=orgpc) parity: flush for guards.
-    /// For bridge traces with a pre-opcode snapshot, uses orgpc + the saved
-    /// stack state so guard failure re-executes the opcode with correct stack.
-    /// Root loop traces continue using fallthrough_pc (original behavior).
-    /// RPython capture_resumedata(resumepc) parity.
+    /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
     ///
-    /// pyre uses stack machine semantics (not SSA registers like RPython),
-    /// so the resume PC must be the instruction AFTER the current opcode
-    /// (fallthrough_pc), not orgpc. The stack state in fail_args reflects
-    /// the post-opcode state, so resuming at fallthrough_pc is correct.
+    /// When pre_opcode_vsd is set, sets vable_next_instr = orgpc and
+    /// vable_valuestackdepth = pre-opcode depth. The guard's fail_args
+    /// then carry the pre-opcode stack state so the blackhole interpreter
+    /// can re-execute the opcode from orgpc.
     ///
-    /// For bridge traces with pre-opcode snapshot, use orgpc + pre-opcode
-    /// stack state to re-execute the opcode on guard failure.
+    /// Note: `record_branch_guard` does NOT call this — branch guards
+    /// build their own fail_args with post-pop state and other_target PC
+    /// (see the comment there for why).
     fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
         let has_snapshot = self.sym().pre_opcode_vsd.is_some();
         if has_snapshot {
@@ -2156,11 +2156,20 @@ impl MIFrame {
             return;
         }
 
-        // RPython goto_if_not (pyjitpl.py:514): on guard failure, the
-        // interpreter resumes at the branch NOT taken during tracing.
-        // Stack is post-pop (comparison result already consumed).
+        // goto_if_not (pyjitpl.py:514) parity:
+        //   RPython: generate_guard(resumepc=orgpc) → re-executes compound
+        //            goto_if_not on guard failure, which naturally takes the
+        //            other branch.
+        //   pyre:    COMPARE_OP + POP_JUMP_IF are separate opcodes, so we
+        //            cannot re-execute — the comparison result is already
+        //            consumed.  Instead we record other_target (the branch
+        //            NOT taken) as the resume PC directly.
+        //
+        // fail_args use post-pop stack state (comparison result already
+        // consumed by POP_JUMP_IF), NOT the pre_opcode snapshot.
+        // flush_to_frame_for_guard is intentionally NOT called here —
+        // its orgpc + pre_opcode_vsd would be wrong for branch guards.
         let other_target = self.sym().pending_branch_other_target;
-        self.flush_to_frame_for_guard(ctx);
         let (
             frame,
             next_instr,
@@ -2173,7 +2182,6 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
-            // Use the "other" branch target as resume PC if available.
             let resume_pc =
                 other_target.unwrap_or(s.pending_next_instr.unwrap_or(self.fallthrough_pc));
             (
@@ -2188,10 +2196,6 @@ impl MIFrame {
             )
         };
 
-        // RPython pyjitpl.py:514: guard fail_args capture the state AFTER
-        // the branch is resolved (comparison result already consumed).
-        // The resume PC (next_instr) is the branch target, and vsd does not
-        // include the comparison result (already popped by pop_jump_if).
         let mut fail_args = vec![frame, next_instr, ctx.const_int(stack_depth as i64)];
         for (idx, slot) in local_values.into_iter().enumerate() {
             let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
@@ -4702,21 +4706,19 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
-        // RPython capture_resumedata parity (bridge traces): save the
-        // pre-opcode stack state so guard fail_args include operands
-        // that will be popped by the opcode handler.
+        // RPython capture_resumedata(resumepc=orgpc): save pre-opcode
+        // stack state so guard fail_args reflect the state BEFORE the
+        // opcode executes. On guard failure the interpreter re-executes
+        // the opcode from orgpc.
         {
-            let (driver, _) = crate::eval::driver_pair();
-            if driver.is_bridge_tracing() {
-                let s = self.sym_mut();
-                let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-                s.pre_opcode_vsd = Some(s.valuestackdepth);
-                s.pre_opcode_stack =
-                    Some(s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec());
-                s.pre_opcode_stack_types = Some(
-                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
-                );
-            }
+            let s = self.sym_mut();
+            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
+            s.pre_opcode_vsd = Some(s.valuestackdepth);
+            s.pre_opcode_stack =
+                Some(s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec());
+            s.pre_opcode_stack_types = Some(
+                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
+            );
         }
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
         // Clear pre-opcode snapshot after opcode completes
@@ -4776,11 +4778,19 @@ impl MIFrame {
                 this.record_guard(ctx, majit_ir::OpCode::GuardException, &[exc_type_const]);
             });
 
-            // Exception path abort: exception paths are traced as bridges
-            // (RPython parity). Root traces and bridge traces that encounter
-            // exceptions during tracing abort — the exception path bridge
-            // will be compiled from GUARD_EXCEPTION when the bridge
-            // infrastructure handles nested exception-path tracing.
+            // TODO(exception-path-tracing): pyjitpl.py:2506 finishframe_exception
+            // searches the bytecode for a catch_exception handler; if found,
+            // it sets frame.pc = handler_target and raises ChangeFrame so the
+            // meta-interpreter continues tracing through the exception handler
+            // inline within the same trace.
+            //
+            // pyre currently aborts instead. To reach full parity:
+            //   1. Adjust symbolic stack to handler depth (entry.depth)
+            //   2. Push exc_obj onto symbolic stack
+            //   3. Set pending_next_instr = handler_pc
+            //   4. Return TraceAction::Continue
+            // This requires push_exc_info / check_exc_match / pop_except
+            // MIFrame overrides (already stubbed below) to be fully wired.
             TraceAction::Abort
         } else {
             if majit_meta::majit_log_enabled() {
@@ -5855,6 +5865,27 @@ impl OpcodeStepExecutor for MIFrame {
         )
     }
 
+    // TODO(exception-path-tracing): these three overrides are stubs for
+    // future inline exception-path tracing (see handle_possible_exception TODO).
+    // Currently dead — exception paths abort before reaching handler bytecodes.
+    //
+    // RPython equivalents (different bytecode set):
+    //   PUSH_EXC_INFO  → no direct equivalent; exception state lives in
+    //                     MetaInterp.last_exc_value / last_exc_box
+    //   CHECK_EXC_MATCH → opimpl_goto_if_exception_mismatch (pyjitpl.py:1677)
+    //                     — no guard needed because class_of_last_exc_is_const
+    //                     is True after GUARD_EXCEPTION
+    //   POP_EXCEPT     → no direct equivalent; RPython's catch_exception
+    //                     handler block implicitly consumes the exception
+    //
+    // When exception-path tracing lands, these must:
+    //   - push_exc_info: record symbolic exc value + None (prev_exc) on
+    //     the symbolic stack, matching the concrete frame push
+    //   - check_exc_match: emit GUARD_CLASS if the exception type is not
+    //     already const-known, then push True (within the guarded trace
+    //     the match is guaranteed)
+    //   - pop_except: pop the symbolic exception value from the stack
+
     fn push_exc_info(&mut self) -> Result<(), Self::Error> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         let none_obj = pyre_object::w_none();
@@ -5864,7 +5895,6 @@ impl OpcodeStepExecutor for MIFrame {
             FrontendOp::new(none_opref, ConcreteValue::Ref(none_obj)),
         )?;
         <Self as SharedOpcodeHandler>::push_value(self, exc)?;
-        // Sync owned concrete frame.
         let frame =
             unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
         let exc_val = frame.pop();
