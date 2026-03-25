@@ -1,8 +1,8 @@
 use majit_ir::Type;
 use majit_meta::virtualizable::VirtualizableInfo;
 use pyre_bytecode::CodeObject;
+use pyre_interpreter::{PyExecutionContext, PyNamespace, PyObjectArray};
 use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PYOBJECT_ARRAY_PTR_OFFSET};
-use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray};
 
 use crate::jit::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
 

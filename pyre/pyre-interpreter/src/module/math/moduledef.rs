@@ -5,7 +5,7 @@
 //! Maps Python-visible names to interp-level implementations,
 //! matching PyPy's `interpleveldefs` dict.
 
-use pyre_runtime::{PyNamespace, namespace_store, w_builtin_func_new};
+use crate::{PyNamespace, namespace_store, w_builtin_func_new};
 
 use super::interp_math;
 

@@ -7,17 +7,17 @@
 use majit_ir::{OpCode, OpRef, Type};
 use majit_meta::TraceCtx;
 
-use pyre_object::*;
-use pyre_runtime::{
+use pyre_interpreter::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
     jit_sequence_getitem,
 };
-use pyre_runtime::{
+use pyre_interpreter::{
     jit_binary_value_from_tag, jit_bool_value_from_truth, jit_compare_value_from_tag, jit_getattr,
     jit_setattr, jit_setitem, jit_truth_value, jit_unary_invert_value, jit_unary_negative_value,
 };
+use pyre_object::*;
 
-pub use pyre_runtime::{
+pub use pyre_interpreter::{
     FlatBuildKind, callable_call_helper, flat_build_helper, jit_build_list_0, jit_build_list_1,
     jit_build_list_2, jit_build_list_3, jit_build_list_4, jit_build_list_5, jit_build_list_6,
     jit_build_list_7, jit_build_list_8, jit_build_map_0, jit_build_map_1, jit_build_map_2,
@@ -459,7 +459,9 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_code_constant(&mut self, code: &pyre_bytecode::CodeObject) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(ctx.const_int(pyre_runtime::box_code_constant(code) as i64)))
+        self.with_trace_ctx(|ctx| {
+            Ok(ctx.const_int(pyre_interpreter::box_code_constant(code) as i64))
+        })
     }
 
     fn trace_none_constant(&mut self) -> Result<OpRef, PyError> {
@@ -524,7 +526,7 @@ pub fn emit_box_float_inline(
 mod tests {
     use super::*;
     use pyre_bytecode::{ConstantData, compile_exec};
-    use pyre_runtime::PyExecutionContext;
+    use pyre_interpreter::PyExecutionContext;
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {
@@ -615,12 +617,12 @@ mod tests {
             })
             .expect("expected nested function code");
         let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-        let code_obj = pyre_runtime::w_code_new(code_ptr);
+        let code_obj = pyre_interpreter::w_code_new(code_ptr);
         let func = jit_make_function_from_globals(0, code_obj as i64) as PyObjectRef;
 
         unsafe {
-            assert!(pyre_runtime::is_func(func));
-            assert_eq!(pyre_runtime::w_func_get_code_ptr(func), code_ptr);
+            assert!(pyre_interpreter::is_func(func));
+            assert_eq!(pyre_interpreter::w_func_get_code_ptr(func), code_ptr);
         }
     }
 

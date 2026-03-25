@@ -6,11 +6,11 @@
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-use pyre_object::{PY_NULL, PyObjectRef};
-use pyre_runtime::{
+use crate::{
     PyError, PyErrorKind, PyNamespace, PyResult, dispatch_callable, w_builtin_func_get,
     w_func_get_closure, w_func_get_code_ptr, w_func_get_globals,
 };
+use pyre_object::{PY_NULL, PyObjectRef};
 
 use crate::eval::eval_frame_plain;
 use crate::frame::{PendingInlineResult, PyFrame};
@@ -258,7 +258,7 @@ pub fn call_user_function_plain(
 /// Call a user function with an explicit execution context pointer.
 /// Used by MIFrame Box tracking when concrete_frame is unavailable.
 pub fn call_user_function_plain_with_ctx(
-    execution_context: *const pyre_runtime::PyExecutionContext,
+    execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
@@ -300,38 +300,33 @@ pub fn call_callable_inline_residual(
 //   1. Execute class body function with fresh namespace (class_locals)
 //   2. Create W_TypeObject from the harvested namespace
 
-/// Register the real __build_class__ callback and property caller.
-/// Called at startup from pyre-jit or pyrex.
+/// Initialize interpreter callbacks and type registry.
+///
+/// PyPy: setup_builtin_modules / make_builtins — called once at startup.
 pub fn register_build_class() {
-    pyre_runtime::register_build_class_impl(real_build_class);
-    pyre_runtime::register_space_call_function(space_call_function_impl);
-    // Install TypeDef registry for builtin types (PyPy: typedef.py)
-    pyre_runtime::typedef::install_builtin_typedefs();
+    crate::typedef::install_builtin_typedefs();
 }
 
-/// Unified `space.call_function(callable, *args)` implementation.
+/// `space.call_function(callable, *args)` — direct implementation.
 ///
-/// PyPy: baseobjspace.py `call_function` — the single entry point for
-/// calling any Python callable. Dispatches to builtins, user functions,
-/// and type objects.
-///
-/// Registered into pyre-runtime via `register_space_call_function`.
-fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+/// PyPy: baseobjspace.py `call_function`. Now a direct function call
+/// (no callback — interpreter and runtime are in the same crate).
+pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     unsafe {
         // Builtin function: direct Rust call
-        if pyre_runtime::is_builtin_func(callable) {
-            let func = pyre_runtime::w_builtin_func_get(callable);
+        if crate::is_builtin_func(callable) {
+            let func = crate::w_builtin_func_get(callable);
             return func(args);
         }
         // User function: create frame + eval
-        if pyre_runtime::is_func(callable) {
+        if crate::is_func(callable) {
             return call_user_func_with_args(callable, args);
         }
         // Type object: instance creation
         if pyre_object::is_type(callable) {
             // Minimal: create instance + call __init__
             let instance = pyre_object::w_instance_new(callable);
-            if let Ok(init_fn) = pyre_runtime::space::py_getattr(callable, "__init__") {
+            if let Ok(init_fn) = crate::space::py_getattr(callable, "__init__") {
                 let mut init_args = Vec::with_capacity(1 + args.len());
                 init_args.push(instance);
                 init_args.extend_from_slice(args);
@@ -362,7 +357,7 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
 /// PyPy equivalent: pyopcode.py BUILD_CLASS →
 ///   w_methodsdict = call(body_fn)
 ///   w_newclass = call(metaclass, name, bases, methodsdict)
-fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
+pub(crate) fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
     assert!(
         args.len() >= 2,
         "__build_class__ requires at least 2 arguments"
@@ -393,7 +388,7 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
 
     let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
     let exec_ctx = if stored.is_null() {
-        std::ptr::null::<pyre_runtime::PyExecutionContext>()
+        std::ptr::null::<crate::PyExecutionContext>()
     } else {
         stored
     };
@@ -410,7 +405,7 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     let w_type = pyre_object::w_type_new(name, bases, class_ns_ptr as *mut u8);
     // Cache C3 MRO (PyPy: W_TypeObject.mro_w set during ready())
-    let mro = unsafe { pyre_runtime::space::compute_mro_pub(w_type) };
+    let mro = unsafe { crate::space::compute_mro_pub(w_type) };
     unsafe { pyre_object::w_type_set_mro(w_type, mro) };
     Ok(w_type)
 }
@@ -418,12 +413,12 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
 thread_local! {
     /// Execution context for __build_class__ calls.
     /// Set before eval_loop starts so build_class can access it.
-    static BUILD_CLASS_EXEC_CTX: Cell<*const pyre_runtime::PyExecutionContext> =
+    static BUILD_CLASS_EXEC_CTX: Cell<*const crate::PyExecutionContext> =
         const { Cell::new(std::ptr::null()) };
 }
 
 /// Set the execution context for __build_class__ to use.
-pub fn set_build_class_exec_ctx(ctx: *const pyre_runtime::PyExecutionContext) {
+pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
     BUILD_CLASS_EXEC_CTX.with(|c| c.set(ctx));
 }
 
@@ -437,9 +432,7 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
 
     // Step 2: Look up __init__ via type MRO
     // PyPy: descr_call → space.lookup(w_newobject, '__init__') → searches type's MRO
-    if let Some(init_fn) =
-        unsafe { pyre_runtime::space::lookup_in_type_mro_pub(w_type, "__init__") }
-    {
+    if let Some(init_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__init__") } {
         // Call __init__(instance, *args)
         let mut init_args = Vec::with_capacity(1 + args.len());
         init_args.push(instance);

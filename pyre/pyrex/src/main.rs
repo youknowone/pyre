@@ -8,11 +8,11 @@ use lexopt::Arg::*;
 use lexopt::ValueExt;
 
 use pyre_bytecode::*;
-use pyre_interp::call;
-use pyre_interp::frame::PyFrame;
-use pyre_interp::importing;
+use pyre_interpreter::call;
+use pyre_interpreter::frame::PyFrame;
+use pyre_interpreter::importing;
+use pyre_interpreter::{PyDisplay, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
-use pyre_runtime::{PyDisplay, PyExecutionContext};
 
 enum RunMode {
     Script(String),

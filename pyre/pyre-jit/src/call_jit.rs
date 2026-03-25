@@ -8,16 +8,16 @@ use std::mem::MaybeUninit;
 use std::sync::Once;
 
 use pyre_bytecode::bytecode::{Instruction, OpArgState};
+use pyre_interpreter::{
+    PyResult, is_func, register_jit_function_caller, w_func_get_closure, w_func_get_code_ptr,
+    w_func_get_globals, w_func_get_name,
+};
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
 use pyre_object::pyobject::is_int;
 use pyre_object::{PY_NULL, PyObjectRef};
-use pyre_runtime::{
-    PyResult, is_func, register_jit_function_caller, w_func_get_closure, w_func_get_code_ptr,
-    w_func_get_globals, w_func_get_name,
-};
 
-use pyre_interp::frame::PyFrame;
+use pyre_interpreter::frame::PyFrame;
 
 // Force cache removed: CallAssemblerI + bridge handles recursion
 // natively without memoization.
@@ -248,9 +248,9 @@ pub fn maybe_handle_inline_concrete_call(
     // plain concrete execution: if it reuses the outer inline override or the
     // outer trace's merge-point path, it will keep tracing against the wrong
     // symbolic frame and corrupt concrete stack reads.
-    let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
-    // Depth tracked by pyre_interp::call::CALL_DEPTH (call_user_function path).
+    let _suspend_inline_override = pyre_interpreter::call::suspend_inline_call_override();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
+    // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
     // RPython blackhole.py:1095: bhimpl_recursive_call → portal_runner
     // CAN enter JIT. JIT_TRACING_DEPTH prevents re-entrant tracing,
     // so nested calls safely enter compiled code without force_plain_eval.
@@ -436,16 +436,16 @@ extern "C" fn jit_call_user_function_from_frame(
     let frame = unsafe { &*(frame_ptr as *const PyFrame) };
     let args =
         unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, nargs as usize) };
-    let _suspend_inline_override = pyre_interp::call::suspend_inline_call_override();
-    // Depth tracked by pyre_interp::call::CALL_DEPTH (call_user_function path).
-    match pyre_interp::call::call_user_function(frame, callable as PyObjectRef, args) {
+    let _suspend_inline_override = pyre_interpreter::call::suspend_inline_call_override();
+    // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
+    match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
         Err(err) => panic!("jit user-function call failed: {err}"),
     }
 }
 
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let _ = majit_codegen_cranelift::take_pending_frame_restore();
     let pending = majit_codegen_cranelift::take_pending_force_local0();
 
@@ -466,12 +466,12 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, 0);
     let protocol = finish_protocol(green_key);
 
-    pyre_interp::call::register_eval_override(pyre_interp::eval::eval_frame_plain);
-    let result = match pyre_interp::eval::eval_frame_plain(frame) {
+    pyre_interpreter::call::register_eval_override(pyre_interpreter::eval::eval_frame_plain);
+    let result = match pyre_interpreter::eval::eval_frame_plain(frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
     };
-    pyre_interp::call::register_eval_override(crate::eval::eval_with_jit);
+    pyre_interpreter::call::register_eval_override(crate::eval::eval_with_jit);
 
     match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
@@ -483,7 +483,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 }
 
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
@@ -534,7 +534,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
 /// Interpreter-only force: used by execute_call_assembler_direct
 /// to handle guard failures without recursive compiled dispatch.
 extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     // RPython: blackhole interp — no blackhole_entry_bump needed.
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
 
@@ -754,7 +754,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
 /// Used by the fused raw-int recursive helper, which already maintains
 /// its own outer force cache keyed by (callee code, raw arg).
 extern "C" fn jit_force_callee_frame_interp_nocache(frame_ptr: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
@@ -843,7 +843,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
@@ -862,7 +862,7 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 /// blackhole fallback route. This mirrors the specialized raw helper:
 /// the callee frame is created directly from the caller's code/globals.
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
@@ -897,7 +897,7 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
     caller_frame: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt) {
@@ -921,7 +921,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let callable_ref = callable as PyObjectRef;
     let code_ptr = unsafe { w_func_get_code_ptr(callable_ref) };
     let green_key = crate::eval::make_green_key(code_ptr as *const _, 0);
@@ -959,7 +959,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// callee's own frame without JIT on that frame, but let nested portal
 /// calls re-enter compiled code through the normal portal runner path.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }
@@ -1063,7 +1063,7 @@ fn jit_blackhole_resume_from_guard(
     // The green_key from the target may be 0 for function-entry traces.
     // Recover the real green_key from the callee frame's code pointer.
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
-        let frame_ptr = fail_values[0] as *const pyre_interp::frame::PyFrame;
+        let frame_ptr = fail_values[0] as *const pyre_interpreter::frame::PyFrame;
         if !frame_ptr.is_null() {
             let code = unsafe { (*frame_ptr).code };
             crate::eval::make_green_key(code, 0)
@@ -1262,7 +1262,7 @@ extern "C" fn jit_bridge_compile_callee(
     trace_id: u64,
     green_key: u64,
 ) -> i64 {
-    let _suspend_inline_result = pyre_interp::call::suspend_inline_handled_result();
+    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
     use std::collections::HashMap;
 
@@ -1716,7 +1716,7 @@ pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
 
     if !unsafe { is_func(callable) } {
         // Builtin function: call directly
-        let func = unsafe { pyre_runtime::w_builtin_func_get(callable) };
+        let func = unsafe { pyre_interpreter::w_builtin_func_get(callable) };
         let args = [arg0 as PyObjectRef];
         return func(&args) as i64;
     }
@@ -1778,7 +1778,7 @@ pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
     if obj.is_null() {
         return 0;
     }
-    pyre_runtime::opcode_ops::truth_value(obj) as i64
+    pyre_interpreter::opcode_ops::truth_value(obj) as i64
 }
 
 /// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
@@ -1796,7 +1796,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // Transmute back and call compare_value.
     use pyre_bytecode::bytecode::ComparisonOperator;
     let op: ComparisonOperator = unsafe { std::mem::transmute(op_code as u8) };
-    match pyre_runtime::opcode_ops::compare_value(lhs, rhs, op) {
+    match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
@@ -1817,7 +1817,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // Transmute back to BinaryOperator enum and call binary_value.
     use pyre_bytecode::bytecode::BinaryOperator;
     let op: BinaryOperator = unsafe { std::mem::transmute(op_code as u8) };
-    match pyre_runtime::opcode_ops::binary_value(lhs, rhs, op) {
+    match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }

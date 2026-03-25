@@ -7,9 +7,9 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::{PyExecutionContext, PyNamespace, PyObjectArray};
 use pyre_bytecode::CodeObject;
 use pyre_object::*;
-use pyre_runtime::{PyExecutionContext, PyNamespace, PyObjectArray};
 
 // Ensure *const PyExecutionContext and Rc<PyExecutionContext> have the same
 // size so that PyFrame field offsets are preserved after the switch.
@@ -137,7 +137,7 @@ impl PyFrame {
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
     pub fn new_minimal(
         code: *const CodeObject,
-        namespace: *mut pyre_runtime::PyNamespace,
+        namespace: *mut crate::PyNamespace,
         execution_context: *const PyExecutionContext,
     ) -> Self {
         let nlocals = unsafe { (&*code).varnames.len() };
@@ -146,10 +146,7 @@ impl PyFrame {
         PyFrame {
             execution_context,
             code,
-            locals_cells_stack_w: pyre_runtime::PyObjectArray::from_vec(vec![
-                pyre_object::PY_NULL;
-                size
-            ]),
+            locals_cells_stack_w: crate::PyObjectArray::from_vec(vec![pyre_object::PY_NULL; size]),
             valuestackdepth: nlocals + ncells,
             next_instr: 0,
             namespace,
@@ -174,7 +171,7 @@ impl PyFrame {
         let mut namespace = Box::new(execution_context.fresh_namespace());
         namespace.fix_ptr();
         // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
-        pyre_runtime::namespace_store(
+        crate::namespace_store(
             &mut namespace,
             "__name__",
             pyre_object::w_str_new("__main__"),
