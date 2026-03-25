@@ -185,13 +185,14 @@ pub trait GcRewriter: Send {
     /// Rewrite a list of operations, inserting GC-aware code.
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op>;
     /// Rewrite with access to the constant pool.
+    /// Returns (rewritten ops, merged constants).
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
         constants: &std::collections::HashMap<u32, i64>,
-    ) -> Vec<Op> {
+    ) -> (Vec<Op>, std::collections::HashMap<u32, i64>) {
         let _ = constants;
-        self.rewrite_for_gc(ops)
+        (self.rewrite_for_gc(ops), std::collections::HashMap::new())
     }
 }
 
