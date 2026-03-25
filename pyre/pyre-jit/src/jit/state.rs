@@ -1467,8 +1467,15 @@ impl MIFrame {
         } else {
             s.stack_only_depth()
         };
-        if s.vable_array_base.is_some() && !s.is_function_entry_trace {
-            // Back-edge: virtualizable array slots are always GCREF.
+        let is_bridge = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.is_bridge_tracing()
+        };
+        // RPython virtualizable convention: back-edge traces and bridge
+        // traces use all-Ref fail_arg types (GCREF array slots).
+        // Bridge traces inherit is_function_entry_trace=true from header_pc=0
+        // but must still use all-Ref to match the root loop's convention.
+        if s.vable_array_base.is_some() && (!s.is_function_entry_trace || is_bridge) {
             let total_slots = s.symbolic_local_types.len() + stack_only;
             virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
         } else {

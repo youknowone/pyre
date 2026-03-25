@@ -1356,7 +1356,7 @@ fn register_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
-        _green_key: 0, // Populated by the meta-interp layer if needed
+        _green_key: token.green_key,
         source_guard: None,
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
@@ -1881,12 +1881,10 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // MetaInterp layer can pick up after execute_token returns.
         // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
         if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-            // header_pc stores the green_key hash (set by MetaInterp before compile_loop)
-            let gk = target.header_pc;
-            // resume_pc = 0: the caller (restore_guard_failure_for_loop) uses
-            // jit_state.next_instr which is the correct bytecode PC after
-            // guard failure restoration.
-            notify_bridge_threshold(gk, target.trace_id, fail_index, 0);
+            let gk = target._green_key;
+            // RPython rd_numb parity: outputs[1] = vable_next_instr (bytecode PC)
+            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
+            notify_bridge_threshold(gk, target.trace_id, fail_index, resume_pc);
         }
 
         let saved_data = if let Some(ref ff) = force_frame {
@@ -3517,6 +3515,8 @@ struct CompiledLoop {
     trace_id: u64,
     input_types: Vec<Type>,
     header_pc: u64,
+    /// Green key hash from JitCellToken. Used by bridge threshold callback.
+    green_key: u64,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     _func_id: FuncId,
     code_ptr: *const u8,
@@ -4015,9 +4015,9 @@ impl CraneliftBackend {
             // RPython compile.py:696 handle_fail: trigger bridge compilation.
             let fail_count = fail_descr.get_fail_count();
             if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-                let gk = compiled.header_pc;
-                // resume_pc = 0: caller uses jit_state.next_instr after restoration
-                notify_bridge_threshold(gk, compiled.trace_id, fail_index, 0);
+                let gk = compiled.green_key;
+                let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
+                notify_bridge_threshold(gk, compiled.trace_id, fail_index, resume_pc);
             }
 
             let saved_data = if let Some(ref ff) = force_frame {
@@ -7650,6 +7650,7 @@ impl CraneliftBackend {
             trace_id,
             input_types: trace_info.input_types.clone(),
             header_pc,
+            green_key: 0, // Set by compile_loop from token.green_key
             caller_prefix_layout: caller_layout.cloned(),
             _func_id: func_id,
             code_ptr,
@@ -7946,7 +7947,8 @@ impl majit_codegen::Backend for CraneliftBackend {
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
+        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
+        compiled.green_key = token.green_key;
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
