@@ -3999,7 +3999,13 @@ impl CraneliftBackend {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
         if let Some(rewriter) = self.gc_rewriter() {
-            rewriter.rewrite_for_gc_with_constants(&normalized, constants)
+            let (result, new_constants) =
+                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+            // Merge GC rewriter's new constants into self.constants
+            for (k, v) in new_constants {
+                self.constants.entry(k).or_insert(v);
+            }
+            result
         } else {
             normalized
         }

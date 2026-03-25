@@ -350,6 +350,14 @@ pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
             jf_frame_baseitemofs: BASEITEMOFS,
             jf_frame_lengthofs: LENGTHOFS,
             sign_size: SIGN_SIZE,
+            pyframe_alloc_size: std::mem::size_of::<pyre_interpreter::frame::PyFrame>(),
+            pyframe_code_ofs: pyre_interpreter::frame::PYFRAME_CODE_OFFSET,
+            pyframe_namespace_ofs: std::mem::offset_of!(
+                pyre_interpreter::frame::PyFrame,
+                namespace
+            ),
+            pyframe_next_instr_ofs: pyre_interpreter::frame::PYFRAME_NEXT_INSTR_OFFSET,
+            pyframe_vable_token_ofs: pyre_interpreter::frame::PYFRAME_VABLE_TOKEN_OFFSET,
         }),
     }
 }
@@ -473,18 +481,32 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
     }
 
-    // Non-lazy: frame_ptr IS the callee frame (legacy path)
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let nlocals = unsafe { &*frame.code }.varnames.len();
-    frame.next_instr = 0;
-    frame.valuestackdepth = nlocals;
-    frame.fix_array_ptrs();
+    // Nursery-safe force: read code/namespace/exec_ctx via raw offsets
+    // (valid for both arena PyFrame AND nursery-allocated raw blocks).
+    // Then create a proper PyFrame for the interpreter.
+    //
+    // warmspot.py:1021 assembler_call_helper parity: the callee frame
+    // (deadframe) may be a nursery-allocated JitFrame-like block. We
+    // reconstruct a proper interpreter frame from its raw fields.
+    let (code, namespace, exec_ctx) = unsafe {
+        use pyre_interpreter::frame::*;
+        let p = frame_ptr as *const u8;
+        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const pyre_bytecode::CodeObject);
+        let ns = *(p.add(std::mem::offset_of!(PyFrame, namespace))
+            as *const *mut pyre_interpreter::PyNamespace);
+        let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
+            as *const *const pyre_interpreter::PyExecutionContext);
+        (code, ns, ec)
+    };
 
-    let green_key = crate::eval::make_green_key(frame.code, 0);
+    let green_key = crate::eval::make_green_key(code as *const _, 0);
     let protocol = finish_protocol(green_key);
 
+    let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
+    func_frame.fix_array_ptrs();
+
     pyre_interpreter::call::register_eval_override(pyre_interpreter::eval::eval_frame_plain);
-    let result = match pyre_interpreter::eval::eval_frame_plain(frame) {
+    let result = match pyre_interpreter::eval::eval_frame_plain(&mut func_frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
     };

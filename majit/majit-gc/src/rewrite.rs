@@ -71,6 +71,17 @@ pub struct JitFrameDescrs {
     pub jf_frame_lengthofs: usize,
     /// SIGN_SIZE: size of one jf_frame slot.
     pub sign_size: usize,
+    // ── PyFrame layout (for nursery allocation transition) ──
+    /// Total PyFrame size for nursery allocation.
+    pub pyframe_alloc_size: usize,
+    /// Byte offset of `code` in PyFrame.
+    pub pyframe_code_ofs: usize,
+    /// Byte offset of `namespace` in PyFrame.
+    pub pyframe_namespace_ofs: usize,
+    /// Byte offset of `next_instr` in PyFrame.
+    pub pyframe_next_instr_ofs: usize,
+    /// Byte offset of `vable_token` in PyFrame.
+    pub pyframe_vable_token_ofs: usize,
 }
 
 /// A deferred ZERO_ARRAY emission that can be elided or shortened when
@@ -159,6 +170,26 @@ impl RewriteState {
     /// Resolve a constant value from the constant pool.
     fn resolve_constant(&self, key: u32) -> Option<i64> {
         self.constants.get(&key).copied()
+    }
+
+    /// Create or reuse a constant OpRef in the constants pool.
+    /// Returns an OpRef key that resolves to `value` at compile time.
+    fn const_int(&mut self, value: i64) -> OpRef {
+        // Check if this constant already exists
+        for (&key, &val) in &self.constants {
+            if val == value {
+                return OpRef(key);
+            }
+        }
+        // Allocate a new constant key (use high range to avoid collision)
+        let key = 10_000 + self.constants.len() as u32;
+        // Skip keys already in use
+        let mut key = key;
+        while self.constants.contains_key(&key) {
+            key += 1;
+        }
+        self.constants.insert(key, value);
+        OpRef(key)
     }
 
     /// Emit an op. Void ops do not consume a result id.
@@ -583,64 +614,73 @@ impl GcRewriterImpl {
     ///   GcStore(v_frame, jf_guard_exc, 0)
     ///   GcStore(v_frame, jf_forward, 0)
     ///   GcStore(v_frame, jf_frame_info, info_ptr)
+    /// rewrite.py:665-695 parity: replace CallR(create_frame) with
+    /// nursery bump allocation + field initialization.
+    ///
+    /// Allocates a PyFrame-layout block from the nursery (matching
+    /// the field offsets that compiled code reads via raw pointers).
+    /// Copies `code` and `namespace` from the caller frame, zeroes
+    /// `next_instr` and `vable_token`.
     fn handle_create_frame(&self, op: &Op, st: &mut RewriteState) {
         let descrs = self.jitframe_info.as_ref().unwrap();
 
-        // For now, use a fixed allocation size.  A full implementation
-        // would read jfi_frame_size from the JitFrameInfo pointer (the
-        // second CallR arg is the caller frame; the target's frame_info
-        // is looked up via the compiled loop token).  For the current
-        // self-recursive pattern the size is constant.
-        //
-        // TODO: emit GetfieldRawI to read jfi_frame_size at runtime
-        // (rewrite.py:627-633).
-        let alloc_size = descrs.jitframe_fixed_size + descrs.sign_size * (1 + 4); // length + 4 slots (conservative)
-        let alloc_size = (alloc_size + 7) & !7; // align
-
-        // CallMallocNurseryVarsizeFrame(size)
         // rewrite.py:634 — gen_malloc_nursery_varsize_frame
+        let alloc_size = (descrs.pyframe_alloc_size + 7) & !7;
         st.emitting_can_collect();
-        let size_ref = OpRef(alloc_size as u32);
-        let malloc_op = Op::new(OpCode::CallMallocNurseryVarsizeFrame, &[size_ref]);
+        let malloc_op = Op::new(
+            OpCode::CallMallocNurseryVarsizeFrame,
+            &[OpRef(alloc_size as u32)],
+        );
         let frame = st.emit_result(malloc_op, op.pos);
         st.remember_wb(frame);
 
-        // gen_initialize_tid (rewrite.py:635)
-        self.gen_initialize_tid(frame, descrs.jitframe_tid, st);
+        // Copy `code` from caller frame (self-recursive: same code).
+        // CallR args: [fn_addr, caller_frame, raw_arg]
+        // rewrite.py:655-658 emit_getfield → GC_LOAD_I(ptr, ofs, size)
+        let caller_frame = st.resolve(op.arg(1));
+        let word_size = st.const_int(8); // sizeof(pointer)
+        let code_ofs = st.const_int(descrs.pyframe_code_ofs as i64);
+        let ns_ofs = st.const_int(descrs.pyframe_namespace_ofs as i64);
+        let ni_ofs = st.const_int(descrs.pyframe_next_instr_ofs as i64);
+        let vt_ofs = st.const_int(descrs.pyframe_vable_token_ofs as i64);
 
-        // Zero GCREF fields (rewrite.py:641-650)
-        let zero = OpRef(0);
-        for &ofs in &[
-            descrs.jf_descr_ofs,
-            descrs.jf_force_descr_ofs,
-            descrs.jf_savedata_ofs,
-            descrs.jf_guard_exc_ofs,
-            descrs.jf_forward_ofs,
-        ] {
-            st.emit(Op::new(OpCode::GcStore, &[frame, OpRef(ofs as u32), zero]));
-        }
-
-        // Set jf_frame_info (rewrite.py:671)
-        // The caller_frame arg (op.arg(1)) carries the frame_info
-        // via its code pointer.  For self-recursive calls the info
-        // can be resolved statically; for now store 0 (the Cranelift
-        // backend fills it at execution time via the dispatch entry).
+        // GcLoadI(base, offset, size) → read field
+        // GcStore(base, offset, value, size) → write field (4-arg form)
+        let caller_code = st.emit(Op::new(
+            OpCode::GcLoadI,
+            &[caller_frame, code_ofs, word_size],
+        ));
         st.emit(Op::new(
             OpCode::GcStore,
-            &[frame, OpRef(descrs.jf_frame_info_ofs as u32), zero],
+            &[frame, code_ofs, caller_code, word_size],
         ));
 
-        // Map this op's result to the nursery-allocated frame.
+        // Copy `namespace` from caller frame.
+        let caller_ns = st.emit(Op::new(OpCode::GcLoadI, &[caller_frame, ns_ofs, word_size]));
+        st.emit(Op::new(
+            OpCode::GcStore,
+            &[frame, ns_ofs, caller_ns, word_size],
+        ));
+
+        // next_instr = 0, vable_token = 0
+        let zero = st.const_int(0);
+        st.emit(Op::new(OpCode::GcStore, &[frame, ni_ofs, zero, word_size]));
+        st.emit(Op::new(OpCode::GcStore, &[frame, vt_ofs, zero, word_size]));
+
         st.record_result_mapping(op.pos, frame);
     }
 }
 
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op> {
-        self.rewrite_for_gc_with_constants(ops, &HashMap::new())
+        self.rewrite_for_gc_with_constants(ops, &HashMap::new()).0
     }
 
-    fn rewrite_for_gc_with_constants(&self, ops: &[Op], constants: &HashMap<u32, i64>) -> Vec<Op> {
+    fn rewrite_for_gc_with_constants(
+        &self,
+        ops: &[Op],
+        constants: &HashMap<u32, i64>,
+    ) -> (Vec<Op>, HashMap<u32, i64>) {
         let next_pos = ops
             .iter()
             .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
@@ -692,19 +732,16 @@ impl GcRewriter for GcRewriterImpl {
                 }
 
                 // ── rewrite.py:665 handle_call_assembler parity ──
-                // Infrastructure for replacing CallR(create_frame) with
-                // nursery alloc and eliding CallN(drop_frame).
-                // Disabled until nursery allocation is fully wired:
-                // - CallMallocNurseryVarsizeFrame must be lowered by Cranelift
-                // - Guard failure must materialize PyFrame from JitFrame
-                // - Arena put must be kept while arena is still used
-                //
-                // OpCode::CallR if self.is_create_frame_call(op, &st) => {
-                //     self.handle_create_frame(op, &mut st);
-                // }
-                // OpCode::CallN if self.is_drop_frame_call(op, &st) => {
-                //     // elide — GC collects
-                // }
+                // Replace CallR(create_frame) with nursery bump alloc.
+                // Elide CallN(drop_frame) — GC collects nursery objects.
+                // Force path (jit_force_callee_frame) reads code/namespace
+                // via raw offsets, creates a proper PyFrame for interpreter.
+                OpCode::CallR if self.is_create_frame_call(op, &st) => {
+                    self.handle_create_frame(op, &mut st);
+                }
+                OpCode::CallN if self.is_drop_frame_call(op, &st) => {
+                    // rewrite.py:665-695: no explicit free — GC collects.
+                }
 
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
@@ -752,7 +789,7 @@ impl GcRewriter for GcRewriterImpl {
         // Flush any remaining pending zeros at end of trace.
         st.flush_pending_zeros();
 
-        st.out
+        (st.out, st.constants)
     }
 }
 
