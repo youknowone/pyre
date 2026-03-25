@@ -371,11 +371,14 @@ fn instruction_may_raise(instruction: Instruction) -> bool {
         instruction,
         // RPython exc=True: external calls and attribute access that
         // may invoke arbitrary Python code (__getattr__, descriptors).
-        Instruction::Call { .. }
-            | Instruction::CallKw { .. }
-            | Instruction::CallFunctionEx { .. }
-            | Instruction::LoadGlobal { .. }
-            | Instruction::StoreAttr { .. }
+        // TODO: re-enable CALL guards when Cranelift backend fuses
+        // GUARD_NO_EXCEPTION into the preceding CALL (RPython backend
+        // handles this as a single fused check-after-call, not a
+        // separate guard instruction).
+        // Instruction::Call { .. }
+        //     | Instruction::CallKw { .. }
+        //     | Instruction::CallFunctionEx { .. }
+        Instruction::StoreAttr { .. }
             | Instruction::DeleteAttr { .. }
             | Instruction::StoreSubscr
             | Instruction::DeleteSubscr
@@ -4698,16 +4701,13 @@ impl MIFrame {
             }
             other => {
                 // RPython pyjitpl.py:1956-1957: exc=True ops that didn't
-                // raise get GUARD_NO_EXCEPTION. Currently disabled because
-                // the optimizer doesn't yet remove redundant guards for
-                // pure/elidable calls (RPython OptPure handles this).
-                // TODO: re-enable when optimizer GUARD_NO_EXCEPTION
-                // elimination is implemented.
-                // if instruction_may_raise(instruction) {
-                //     self.with_ctx(|this, ctx| {
-                //         this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
-                //     });
-                // }
+                // raise get GUARD_NO_EXCEPTION. OptPure/OptRewrite remove
+                // these when the preceding CALL_PURE was constant-folded.
+                if instruction_may_raise(instruction) {
+                    self.with_ctx(|this, ctx| {
+                        this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                    });
+                }
                 self.into_trace_action(other)
             }
         }
