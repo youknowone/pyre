@@ -2037,12 +2037,25 @@ impl MIFrame {
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         // If parent_fail_args is set (inlined callee), use parent's
         // state for guard recovery instead of callee's vable fields.
+        // RPython resume data encodes multi-frame (caller + callee).
+        // For pyre's single-frame blackhole, override ni (slot 1) with
+        // the callee's current PC so the blackhole resumes in the callee.
         if let Some(ref pfa) = self.parent_fail_args {
+            let mut fail_args = pfa.clone();
+            // Slot 0 = frame ref (callee's virtualizable frame from parent).
+            // Slot 1 = ni: replace caller's CALL PC with callee's current PC.
+            self.with_ctx(|this, inner_ctx| {
+                this.flush_to_frame(inner_ctx);
+                let callee_ni = this.sym().vable_next_instr;
+                if fail_args.len() > 1 {
+                    fail_args[1] = callee_ni;
+                }
+            });
             let types = self
                 .parent_fail_arg_types
                 .clone()
-                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(pfa.len()));
-            ctx.record_guard_typed_with_fail_args(opcode, args, types, pfa);
+                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(fail_args.len()));
+            ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
             return;
         }
 
