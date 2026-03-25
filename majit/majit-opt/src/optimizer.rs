@@ -791,6 +791,19 @@ impl Optimizer {
     /// resume.py: ResumeDataVirtualAdder.finish() equivalent.
     pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op, ctx: &OptContext) {
         let pending = std::mem::take(&mut self.pendingfields);
+        // RPython resume.py: ResumeDataVirtualAdder uses rd_resume_position
+        // to look up the snapshot (fail_args) for this guard. In majit, when
+        // fail_args is None, we resolve it from patchguardop's fail_args
+        // via rd_resume_position (equivalent to snapshot lookup).
+        if guard_op.fail_args.is_none() {
+            if let Some(ref patch) = self.patchguardop {
+                if guard_op.rd_resume_position >= 0
+                    && guard_op.rd_resume_position == patch.rd_resume_position
+                {
+                    guard_op.fail_args = patch.fail_args.clone();
+                }
+            }
+        }
         if guard_op.fail_args.is_none() {
             guard_op.fail_args = Some(Default::default());
         }
