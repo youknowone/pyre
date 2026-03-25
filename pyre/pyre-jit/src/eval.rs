@@ -455,6 +455,12 @@ fn can_enter_jit_hook(
             has_compiled
         );
     }
+    // RPython warmstate.py:473-477: per-cell JC_TRACING — if this
+    // specific green key is being traced, don't enter compiled code
+    // or start a second trace. Other keys are unaffected.
+    if driver.meta_interp().is_tracing_key(green_key) {
+        return None;
+    }
     // RPython can_enter_jit only runs compiled code — tracing starts
     // from jit_merge_point via the eval_loop_jit dispatch path.
     let outcome = if driver.has_compiled_loop(green_key) {
@@ -564,6 +570,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
     }
 
+    // RPython warmstate.py:473-477: per-cell JC_TRACING.
+    if driver.meta_interp().is_tracing_key(green_key) {
+        return None;
+    }
     if driver.has_compiled_loop(green_key) {
         if majit_meta::majit_log_enabled() {
             eprintln!(

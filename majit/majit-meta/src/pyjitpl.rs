@@ -1496,6 +1496,9 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:269-270: extract cross-loop cut data before consuming
         // the recorder. When the trace closes at a different loop header
         // than where it started, cut the trace to begin at that header.
+        // RPython pyjitpl.py:3160 strips green args: original_boxes[num_green_args:].
+        // In pyre, green key is a u64 (not in original_boxes), so original_boxes
+        // is already red-only — no stripping needed.
         let cross_loop_cut = ctx
             .get_merge_point(green_key)
             .filter(|mp| mp.position.ops_len > 0)
