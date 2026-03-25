@@ -1290,9 +1290,8 @@ impl PyreSym {
         }
     }
 
-    /// Read as PyObjectRef (convenience for legacy code).
     pub(crate) fn concrete_pyobj_at(&self, abs_idx: usize) -> PyObjectRef {
-        self.concrete_at_or_frame(abs_idx).to_pyobj()
+        self.concrete_value_at(abs_idx).to_pyobj()
     }
 }
 
@@ -1385,7 +1384,7 @@ impl MIFrame {
         if !slot.is_none() {
             return slot;
         }
-        let concrete_value = self.concrete_at_or_frame(abs_idx).unwrap_or(PY_NULL);
+        let concrete_value = self.concrete_at(abs_idx).unwrap_or(PY_NULL);
         let typed_value = extract_concrete_typed_value(slot_type, concrete_value);
         fail_arg_opref_for_typed_value(ctx, typed_value)
     }
@@ -1675,9 +1674,7 @@ impl MIFrame {
         mut value: OpRef,
     ) -> Result<(), PyError> {
         let vtype = self.value_type(value);
-        let concrete_slot_type = self
-            .concrete_at_or_frame(idx)
-            .map(concrete_virtualizable_slot_type);
+        let concrete_slot_type = self.concrete_at(idx).map(concrete_virtualizable_slot_type);
         match (concrete_slot_type, vtype) {
             (Some(Type::Int), Type::Ref) => {
                 value = self.trace_guarded_int_payload(ctx, value);
@@ -2145,8 +2142,8 @@ impl MIFrame {
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
     }
 
-    /// Read a concrete value from MIFrame Box arrays.
-    fn concrete_at_or_frame(&self, abs_idx: usize) -> Option<PyObjectRef> {
+    /// RPython registers[idx] parity: read concrete value from Box arrays.
+    fn concrete_at(&self, abs_idx: usize) -> Option<PyObjectRef> {
         let v = self.sym().concrete_value_at(abs_idx);
         if !v.is_null() {
             return Some(v.to_pyobj());
@@ -3212,10 +3209,10 @@ impl MIFrame {
         self.trace_list_append(list, value)
     }
 
-    pub(crate) fn concrete_iter_continues(&self) -> Result<bool, PyError> {
-        let concrete_iter = self
-            .concrete_at_or_frame(self.sym().valuestackdepth - 1)
-            .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
+    pub(crate) fn concrete_iter_continues(
+        &self,
+        concrete_iter: PyObjectRef,
+    ) -> Result<bool, PyError> {
         range_iter_continues(concrete_iter)
     }
 
@@ -4285,10 +4282,11 @@ impl MIFrame {
         result
     }
 
-    pub(crate) fn iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
-        let concrete_iter = self
-            .concrete_at_or_frame(self.sym().valuestackdepth - 1)
-            .ok_or_else(|| PyError::type_error("missing concrete iterator during trace"))?;
+    pub(crate) fn iter_next_value(
+        &mut self,
+        iter: OpRef,
+        concrete_iter: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step =
             unsafe { (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).step };
@@ -5128,12 +5126,15 @@ impl IterOpcodeHandler for MIFrame {
         })
     }
 
-    fn concrete_iter_continues(&mut self, _iter: Self::Value) -> Result<bool, PyError> {
-        MIFrame::concrete_iter_continues(self)
+    fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
+        let concrete_iter = iter.concrete.to_pyobj();
+        MIFrame::concrete_iter_continues(self, concrete_iter)
     }
 
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        let opref = MIFrame::iter_next_value(self, iter.opref)?;
+        let concrete_iter = iter.concrete.to_pyobj();
+        let opref = MIFrame::iter_next_value(self, iter.opref, concrete_iter)?;
+        // iter_next returns the next int value from range iterator
         Ok(FrontendOp::opref_only(opref))
     }
 
@@ -5616,34 +5617,30 @@ impl OpcodeStepExecutor for MIFrame {
     /// correctly via PyFrame::load_method/call overrides.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = SharedOpcodeHandler::pop_value(self)?;
-        let concrete_obj = self.concrete_popped_value();
+        let concrete_obj = obj.concrete.to_pyobj();
 
-        // Abort trace for instance method calls — not yet supported in JIT.
-        // Full JIT support requires LOOKUP_METHOD / CALL_METHOD IR ops.
-        // Also abort when concrete is unknown (None) — cannot determine
-        // whether self-binding is needed without the concrete value.
-        let is_instance = concrete_obj
-            .map(|cv| !cv.is_null() && unsafe { pyre_object::is_instance(cv) })
-            .unwrap_or(false);
-        let concrete_unknown = concrete_obj.is_none();
-        if is_instance || concrete_unknown {
+        // Abort for instance method calls or unknown concrete.
+        let is_instance =
+            !concrete_obj.is_null() && unsafe { pyre_object::is_instance(concrete_obj) };
+        if is_instance || concrete_obj.is_null() {
             return Err(PyError::type_error(
                 "load_method: instance or unknown concrete — aborting trace",
             ));
         }
 
         // Non-instance path: trace as normal [attr, NULL]
-        if let Some(cv) = concrete_obj {
-            if let Ok(result) = pyre_objspace::space::py_getattr(cv, name) {
-                self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(result));
-            }
+        let mut attr_concrete = ConcreteValue::Null;
+        if let Ok(result) = pyre_objspace::space::py_getattr(concrete_obj, name) {
+            attr_concrete = ConcreteValue::from_pyobj(result);
         }
-        let attr = self.trace_load_attr(obj, name)?;
-        SharedOpcodeHandler::push_value(self, attr)?;
+        let attr_opref = self.trace_load_attr(obj.opref, name)?;
+        SharedOpcodeHandler::push_value(self, FrontendOp::new(attr_opref, attr_concrete))?;
 
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::PY_NULL));
-        let null = self.trace_null_value()?;
-        SharedOpcodeHandler::push_value(self, null)
+        let null_opref = self.trace_null_value()?;
+        SharedOpcodeHandler::push_value(
+            self,
+            FrontendOp::new(null_opref, ConcreteValue::Ref(pyre_object::PY_NULL)),
+        )
     }
 
     fn unsupported(
