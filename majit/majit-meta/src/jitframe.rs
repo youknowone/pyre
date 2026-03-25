@@ -272,3 +272,27 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
         no += 1;
     }
 }
+
+// ── GC type registration (jitframe.py:49) ───────────────────────────
+
+/// Custom trace bridge for `TypeInfo::with_custom_trace`.
+///
+/// Adapts `jitframe_trace(*mut JitFrame, FnMut(*mut usize))` to the
+/// `CustomTraceFn(usize, &mut dyn FnMut(*mut GcRef))` interface.
+///
+/// jitframe.py:49 — `rgc.register_custom_trace_hook(JITFRAME, lambda_jitframe_trace)`
+unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    jitframe_trace(obj_addr as *mut JitFrame, |slot_ptr| {
+        // GcRef and usize are both word-sized; reinterpret the slot.
+        f(slot_ptr as *mut majit_ir::GcRef);
+    });
+}
+
+/// Build a `TypeInfo` for JitFrame with the custom trace hook registered.
+///
+/// jitframe.py:48-52 — the `jitframe_allocate` function registers
+/// the custom trace hook on first call. In pyre, the TypeInfo is
+/// registered once with `gc.register_type(jitframe_type_info())`.
+pub fn jitframe_type_info() -> majit_gc::trace::TypeInfo {
+    majit_gc::trace::TypeInfo::with_custom_trace(JITFRAME_FIXED_SIZE, jitframe_custom_trace)
+}
