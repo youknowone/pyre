@@ -6319,6 +6319,34 @@ impl JitState for PyreJitState {
         }
     }
 
+    fn build_meta_from_merge_point(
+        provisional: &PyreMeta,
+        header_pc: usize,
+        original_box_types: &[Type],
+    ) -> PyreMeta {
+        // pyjitpl.py:3158-3175 compile_loop parity:
+        // Build meta entirely from MergePoint's original_box_types.
+        // Layout: [Ref(frame), Int(ni), Int(vsd), slot_types...]
+        let slot_types = if original_box_types.len() >= 3 {
+            original_box_types[3..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let vsd = if original_box_types.len() >= 3 {
+            original_box_types.len() - 3
+        } else {
+            provisional.valuestackdepth
+        };
+        PyreMeta {
+            merge_pc: header_pc,
+            num_locals: provisional.num_locals,
+            ns_keys: provisional.ns_keys.clone(),
+            valuestackdepth: vsd,
+            has_virtualizable: provisional.has_virtualizable,
+            slot_types,
+        }
+    }
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
         if values.is_empty() {
             return;
