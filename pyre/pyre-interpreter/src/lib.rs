@@ -21,6 +21,7 @@ pub mod opcode_step;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod space;
+pub mod type_methods;
 pub mod typedef;
 
 // ── Former pyre-interp modules ──

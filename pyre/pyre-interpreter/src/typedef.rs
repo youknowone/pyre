@@ -119,57 +119,57 @@ fn init_list_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "append",
-        w_builtin_func_new("append", super::space::list_method_append),
+        w_builtin_func_new("append", crate::type_methods::list_method_append),
     );
     namespace_store(
         ns,
         "extend",
-        w_builtin_func_new("extend", super::space::list_method_extend),
+        w_builtin_func_new("extend", crate::type_methods::list_method_extend),
     );
     namespace_store(
         ns,
         "copy",
-        w_builtin_func_new("copy", super::space::list_method_copy),
+        w_builtin_func_new("copy", crate::type_methods::list_method_copy),
     );
     namespace_store(
         ns,
         "insert",
-        w_builtin_func_new("insert", super::space::list_method_insert),
+        w_builtin_func_new("insert", crate::type_methods::list_method_insert),
     );
     namespace_store(
         ns,
         "pop",
-        w_builtin_func_new("pop", super::space::list_method_pop),
+        w_builtin_func_new("pop", crate::type_methods::list_method_pop),
     );
     namespace_store(
         ns,
         "clear",
-        w_builtin_func_new("clear", super::space::list_method_clear),
+        w_builtin_func_new("clear", crate::type_methods::list_method_clear),
     );
     namespace_store(
         ns,
         "reverse",
-        w_builtin_func_new("reverse", super::space::list_method_reverse),
+        w_builtin_func_new("reverse", crate::type_methods::list_method_reverse),
     );
     namespace_store(
         ns,
         "sort",
-        w_builtin_func_new("sort", super::space::list_method_sort),
+        w_builtin_func_new("sort", crate::type_methods::list_method_sort),
     );
     namespace_store(
         ns,
         "index",
-        w_builtin_func_new("index", super::space::list_method_index),
+        w_builtin_func_new("index", crate::type_methods::list_method_index),
     );
     namespace_store(
         ns,
         "count",
-        w_builtin_func_new("count", super::space::list_method_count),
+        w_builtin_func_new("count", crate::type_methods::list_method_count),
     );
     namespace_store(
         ns,
         "remove",
-        w_builtin_func_new("remove", super::space::list_method_remove),
+        w_builtin_func_new("remove", crate::type_methods::list_method_remove),
     );
 }
 
@@ -180,87 +180,87 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "join",
-        w_builtin_func_new("join", super::space::str_method_join),
+        w_builtin_func_new("join", crate::type_methods::str_method_join),
     );
     namespace_store(
         ns,
         "split",
-        w_builtin_func_new("split", super::space::str_method_split),
+        w_builtin_func_new("split", crate::type_methods::str_method_split),
     );
     namespace_store(
         ns,
         "strip",
-        w_builtin_func_new("strip", super::space::str_method_strip),
+        w_builtin_func_new("strip", crate::type_methods::str_method_strip),
     );
     namespace_store(
         ns,
         "lstrip",
-        w_builtin_func_new("lstrip", super::space::str_method_lstrip),
+        w_builtin_func_new("lstrip", crate::type_methods::str_method_lstrip),
     );
     namespace_store(
         ns,
         "rstrip",
-        w_builtin_func_new("rstrip", super::space::str_method_rstrip),
+        w_builtin_func_new("rstrip", crate::type_methods::str_method_rstrip),
     );
     namespace_store(
         ns,
         "startswith",
-        w_builtin_func_new("startswith", super::space::str_method_startswith),
+        w_builtin_func_new("startswith", crate::type_methods::str_method_startswith),
     );
     namespace_store(
         ns,
         "endswith",
-        w_builtin_func_new("endswith", super::space::str_method_endswith),
+        w_builtin_func_new("endswith", crate::type_methods::str_method_endswith),
     );
     namespace_store(
         ns,
         "replace",
-        w_builtin_func_new("replace", super::space::str_method_replace),
+        w_builtin_func_new("replace", crate::type_methods::str_method_replace),
     );
     namespace_store(
         ns,
         "find",
-        w_builtin_func_new("find", super::space::str_method_find),
+        w_builtin_func_new("find", crate::type_methods::str_method_find),
     );
     namespace_store(
         ns,
         "rfind",
-        w_builtin_func_new("rfind", super::space::str_method_rfind),
+        w_builtin_func_new("rfind", crate::type_methods::str_method_rfind),
     );
     namespace_store(
         ns,
         "upper",
-        w_builtin_func_new("upper", super::space::str_method_upper),
+        w_builtin_func_new("upper", crate::type_methods::str_method_upper),
     );
     namespace_store(
         ns,
         "lower",
-        w_builtin_func_new("lower", super::space::str_method_lower),
+        w_builtin_func_new("lower", crate::type_methods::str_method_lower),
     );
     namespace_store(
         ns,
         "format",
-        w_builtin_func_new("format", super::space::str_method_format),
+        w_builtin_func_new("format", crate::type_methods::str_method_format),
     );
     namespace_store(
         ns,
         "encode",
-        w_builtin_func_new("encode", super::space::str_method_encode),
+        w_builtin_func_new("encode", crate::type_methods::str_method_encode),
     );
     namespace_store(
         ns,
         "isdigit",
-        w_builtin_func_new("isdigit", super::space::str_method_isdigit),
+        w_builtin_func_new("isdigit", crate::type_methods::str_method_isdigit),
     );
     namespace_store(
         ns,
         "isalpha",
-        w_builtin_func_new("isalpha", super::space::str_method_isalpha),
+        w_builtin_func_new("isalpha", crate::type_methods::str_method_isalpha),
     );
     namespace_store(
         ns,
         "zfill",
-        w_builtin_func_new("zfill", super::space::str_method_zfill),
+        w_builtin_func_new("zfill", crate::type_methods::str_method_zfill),
     );
 }
 
@@ -271,37 +271,37 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "get",
-        w_builtin_func_new("get", super::space::dict_method_get),
+        w_builtin_func_new("get", crate::type_methods::dict_method_get),
     );
     namespace_store(
         ns,
         "keys",
-        w_builtin_func_new("keys", super::space::dict_method_keys),
+        w_builtin_func_new("keys", crate::type_methods::dict_method_keys),
     );
     namespace_store(
         ns,
         "values",
-        w_builtin_func_new("values", super::space::dict_method_values),
+        w_builtin_func_new("values", crate::type_methods::dict_method_values),
     );
     namespace_store(
         ns,
         "items",
-        w_builtin_func_new("items", super::space::dict_method_items),
+        w_builtin_func_new("items", crate::type_methods::dict_method_items),
     );
     namespace_store(
         ns,
         "update",
-        w_builtin_func_new("update", super::space::dict_method_update),
+        w_builtin_func_new("update", crate::type_methods::dict_method_update),
     );
     namespace_store(
         ns,
         "pop",
-        w_builtin_func_new("pop", super::space::dict_method_pop),
+        w_builtin_func_new("pop", crate::type_methods::dict_method_pop),
     );
     namespace_store(
         ns,
         "setdefault",
-        w_builtin_func_new("setdefault", super::space::dict_method_setdefault),
+        w_builtin_func_new("setdefault", crate::type_methods::dict_method_setdefault),
     );
 }
 
@@ -311,12 +311,12 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "index",
-        w_builtin_func_new("index", super::space::tuple_method_index),
+        w_builtin_func_new("index", crate::type_methods::tuple_method_index),
     );
     namespace_store(
         ns,
         "count",
-        w_builtin_func_new("count", super::space::tuple_method_count),
+        w_builtin_func_new("count", crate::type_methods::tuple_method_count),
     );
 }
 

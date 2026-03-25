@@ -100,11 +100,9 @@ pub fn init_sys_path(script_dir: &Path) {
                 path.push(cwd);
             }
         }
-        // CPython stdlib path — PyPy: initpath.py adds lib-python/X.Y
-        // Auto-detect from python3 sysconfig if available.
-        if let Some(stdlib) = detect_stdlib_path() {
-            path.push(stdlib);
-        }
+        // CPython stdlib path is detected lazily on first stdlib import
+        // to avoid spawning python3 subprocess on every startup.
+        // See find_module() → ensure_stdlib_path().
     });
 }
 
@@ -181,6 +179,33 @@ fn find_module(partname: &str) -> Option<FindInfo> {
         return Some(FindInfo::Builtin);
     }
 
+    // Try sys.path first
+    if let Some(info) = find_in_sys_path(partname) {
+        return Some(info);
+    }
+
+    // Lazy stdlib detection — only on first miss (avoid python3 spawn at startup)
+    ensure_stdlib_path();
+    return find_in_sys_path(partname);
+}
+
+/// Detect and add CPython stdlib to sys.path (once).
+fn ensure_stdlib_path() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    DONE.with(|d| {
+        if d.get() {
+            return;
+        }
+        d.set(true);
+        if let Some(stdlib) = detect_stdlib_path() {
+            add_sys_path(&stdlib);
+        }
+    });
+}
+
+fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     SYS_PATH.with(|p| {
         let path = p.borrow();
         for dir in path.iter() {
