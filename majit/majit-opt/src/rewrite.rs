@@ -2043,13 +2043,11 @@ impl Optimization for OptRewrite {
             }
 
             // ── rewrite.py: CALL_PURE demote (if not handled by pure.rs) ──
+            // CallPure must reach OptPure for constant folding via
+            // RecordKnownResult cache. Demoting here would bypass the
+            // CSE / known_result lookup in pure.py.
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                let call_opcode = OpCode::call_for_type(op.result_type());
-                let mut new_op = Op::new(call_opcode, &op.args);
-                new_op.pos = op.pos;
-                new_op.descr = op.descr.clone();
-                self.last_op_removed = false;
-                OptimizationResult::Emit(new_op)
+                OptimizationResult::PassOn
             }
 
             // rewrite.py: optimize_CALL_LOOPINVARIANT_I

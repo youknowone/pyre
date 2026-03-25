@@ -5253,29 +5253,32 @@ impl NamespaceOpcodeHandler for MIFrame {
             .unwrap_or(ConcreteValue::Null);
         if let Some(concrete_value) = concrete_cv {
             if !concrete_value.is_null() {
-                // RPython celldict.py + quasiimmut.py parity:
+                // RPython celldict.py @elidable_promote + quasiimmut.py parity:
                 //
                 // 1. QUASIIMMUT_FIELD(ns, slot) — optimizer collects into
                 //    quasi_immutable_deps + emits GUARD_NOT_INVALIDATED.
-                //    After compilation, watcher registered on namespace slot.
                 //
-                // 2. const_int(concrete_value) — direct constant folding.
-                //    RPython uses @elidable_promote + CALL_PURE for this,
-                //    but that requires the CALL_PURE to be in the MAIN trace
-                //    (not a bridge). Since pyre's tracing captures the base
-                //    case first, the n>=2 path ends up in a bridge where
-                //    CALL_PURE constant folding isn't yet active.
-                //    Direct constant is functionally equivalent and safe:
-                //    GUARD_NOT_INVALIDATED protects against mutation.
+                // 2. RECORD_KNOWN_RESULT(result, ns, slot) — cache the
+                //    trace-time lookup result (RPython call_pure_results).
+                //
+                // 3. CALL_PURE_I(ns, slot) — elidable lookup call.
+                //    RPython record_result_of_call_pure: all args constant
+                //    → history.cut() → trace-time constant. Our OptPure
+                //    folds via lookup_known_result → same effect.
                 let opref = self.with_ctx(|this, ctx| {
                     let ns_const = ctx.const_int(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
                     ctx.record_op(OpCode::QuasiimmutField, &[ns_const, slot_const]);
-                    let const_value = ctx.const_int(concrete_value as i64);
+                    let result_const = ctx.const_int(concrete_value as i64);
+                    ctx.record_op(
+                        OpCode::RecordKnownResult,
+                        &[result_const, ns_const, slot_const],
+                    );
+                    let call_result = ctx.record_op(OpCode::CallPureI, &[ns_const, slot_const]);
                     this.sym_mut()
                         .symbolic_namespace_slots
-                        .insert(slot, const_value);
-                    Ok(const_value)
+                        .insert(slot, call_result);
+                    Ok(call_result)
                 })?;
                 return Ok(FrontendOp::new(opref, result_concrete));
             }

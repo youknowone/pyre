@@ -2304,7 +2304,6 @@ impl Optimizer {
 
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
-            let pass_name = self.passes[pass_idx].name().to_string();
             let result = {
                 let pass = &mut self.passes[pass_idx];
                 pass.propagate_forward(&current_op, ctx)
