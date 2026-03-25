@@ -114,45 +114,25 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
 // JIT_CALL_DEPTH removed — pyre-interp::call::CALL_DEPTH is the single
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
-/// TLS: namespace pointers that the current trace depends on.
-/// RPython compile.py parity: quasi-immutable field dependencies are
-/// registered after compilation so GUARD_NOT_INVALIDATED fails when
-/// the namespace mutates.
-thread_local! {
-    static TRACING_NAMESPACE_DEPS: std::cell::RefCell<Vec<*mut pyre_interpreter::PyNamespace>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Record a namespace dependency during tracing.
-/// Called from load_name_value when a function is constant-folded.
-pub fn record_namespace_dependency(ns: *mut pyre_interpreter::PyNamespace) {
-    TRACING_NAMESPACE_DEPS.with(|c| {
-        let mut deps = c.borrow_mut();
-        if !deps.contains(&ns) {
-            deps.push(ns);
-        }
-    });
-}
-
-/// Take all recorded namespace dependencies (clears the list).
-fn take_namespace_deps() -> Vec<*mut pyre_interpreter::PyNamespace> {
-    TRACING_NAMESPACE_DEPS.with(|c| std::mem::take(&mut *c.borrow_mut()))
-}
-
-/// Register a compiled loop's invalidation flag with all dependent namespaces.
-/// RPython quasiimmut.py:register_loop_token parity.
-fn register_namespace_watchers(green_key: u64) {
-    let deps = take_namespace_deps();
+/// RPython compile.py:204-207 (record_loop_or_bridge) parity:
+/// Register the compiled loop's invalidation flag with all quasi-immutable
+/// dependencies collected during optimization. The optimizer records
+/// namespace pointers in quasi_immutable_deps when processing
+/// QUASIIMMUT_FIELD ops. After compilation, this function reads them
+/// from MetaInterp and registers watchers so GUARD_NOT_INVALIDATED
+/// fails when the namespace mutates.
+fn register_quasi_immutable_deps(green_key: u64) {
+    let (driver, _) = driver_pair();
+    let deps: Vec<u64> = std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
     if deps.is_empty() {
         return;
     }
-    let (driver, _) = driver_pair();
     let Some(token) = driver.get_loop_token(green_key) else {
         return;
     };
     let flag = token.invalidation_flag();
-    for ns_ptr in deps {
-        let ns = unsafe { &mut *ns_ptr };
+    for dep_ptr in deps {
+        let ns = unsafe { &mut *(dep_ptr as *mut pyre_interpreter::PyNamespace) };
         ns.register_watcher(&flag);
     }
 }
@@ -430,10 +410,9 @@ fn jit_merge_point_hook(
     // Trace completed or aborted — clear tracing depth.
     if !driver.is_tracing() {
         driver.meta_interp_mut().tracing_call_depth = None;
-        // RPython compile.py:205 parity: register namespace watchers
-        // after compilation. If compilation succeeded, the loop token
-        // exists and we connect its invalidation flag to namespaces.
-        register_namespace_watchers(green_key);
+        // RPython compile.py:204-207 (record_loop_or_bridge) parity:
+        // register quasi-immutable watchers after compilation.
+        register_quasi_immutable_deps(green_key);
         // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
@@ -501,12 +480,11 @@ fn can_enter_jit_hook(
         );
         if !was_tracing && driver.is_tracing() {
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
-            take_namespace_deps(); // clear deps for new trace
         }
-        // RPython compile.py:205 parity: after compilation succeeds,
-        // register the loop's invalidation flag with dependent namespaces.
+        // RPython compile.py:204-207 (record_loop_or_bridge) parity:
+        // register quasi-immutable watchers after compilation.
         if !had_compiled && driver.has_compiled_loop(green_key) {
-            register_namespace_watchers(green_key);
+            register_quasi_immutable_deps(green_key);
         }
         result
     } else {
@@ -708,7 +686,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     driver.force_start_tracing(green_key, frame.next_instr, &mut jit_state, &env);
     if driver.is_tracing() {
-        take_namespace_deps(); // clear deps for new trace
         // RPython warmstate.py:429 decay_all_counters:
         // called once after tracing starts to prevent burst compilation.
         driver.meta_interp_mut().warm_state_mut().decay_counters();

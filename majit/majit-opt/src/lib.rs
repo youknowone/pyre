@@ -193,6 +193,11 @@ pub struct OptContext {
     /// RPython shortpreamble.py: active phase-2 short preamble builder.
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
+    /// RPython optimizer.py: quasi_immutable_deps — collected during optimization.
+    /// Raw pointers to quasi-immutable objects (e.g., PyNamespace) that the
+    /// trace depends on. After compilation, each dep gets the loop's
+    /// invalidation flag registered as a watcher.
+    pub quasi_immutable_deps: HashSet<u64>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
@@ -246,6 +251,11 @@ pub struct OptContext {
 }
 
 impl OptContext {
+    /// RPython optimizer.py: add to quasi_immutable_deps
+    pub fn add_quasi_immutable_dep(&mut self, dep: u64) {
+        self.quasi_immutable_deps.insert(dep);
+    }
+
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
@@ -286,7 +296,7 @@ impl OptContext {
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
-            // (import_boxes removed)
+            quasi_immutable_deps: HashSet::new(),
         }
     }
 
@@ -330,6 +340,7 @@ impl OptContext {
             in_final_emission: false,
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
+            quasi_immutable_deps: HashSet::new(),
             // (import_boxes removed)
         }
     }

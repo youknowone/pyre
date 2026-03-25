@@ -5252,25 +5252,25 @@ impl NamespaceOpcodeHandler for MIFrame {
             .map(ConcreteValue::from_pyobj)
             .unwrap_or(ConcreteValue::Null);
         if let Some(concrete_value) = concrete_cv {
-            unsafe {
-                if is_func(concrete_value) || is_builtin_func(concrete_value) {
-                    // RPython celldict.py + quasiimmut.py parity:
-                    // constant-fold the function lookup, protected by
-                    // GUARD_NOT_INVALIDATED. Namespace watcher is registered
-                    // after compilation via record_namespace_dependency.
-                    crate::eval::record_namespace_dependency(ns);
-                    let opref = self.with_ctx(|this, ctx| {
-                        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-                            this.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
-                        }
-                        let const_value = ctx.const_int(concrete_value as i64);
-                        this.sym_mut()
-                            .symbolic_namespace_slots
-                            .insert(slot, const_value);
-                        Ok(const_value)
-                    })?;
-                    return Ok(FrontendOp::new(opref, result_concrete));
-                }
+            if !concrete_value.is_null() {
+                // RPython celldict.py + quasiimmut.py parity:
+                // Emit QUASIIMMUT_FIELD with namespace pointer so the
+                // optimizer collects it into quasi_immutable_deps (same
+                // as RPython optimize_QUASIIMMUT_FIELD adding qmut to
+                // optimizer.quasi_immutable_deps). The optimizer removes
+                // the op and emits GUARD_NOT_INVALIDATED.
+                // After compilation, record_loop_or_bridge registers
+                // the loop's invalidation flag on each dep namespace.
+                let opref = self.with_ctx(|this, ctx| {
+                    let ns_const = ctx.const_int(ns as i64);
+                    ctx.record_op(OpCode::QuasiimmutField, &[ns_const]);
+                    let const_value = ctx.const_int(concrete_value as i64);
+                    this.sym_mut()
+                        .symbolic_namespace_slots
+                        .insert(slot, const_value);
+                    Ok(const_value)
+                })?;
+                return Ok(FrontendOp::new(opref, result_concrete));
             }
         }
         let opref = self.with_ctx(|this, ctx| MIFrame::load_namespace_value(this, ctx, slot))?;
