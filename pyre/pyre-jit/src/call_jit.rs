@@ -765,11 +765,18 @@ pub fn resume_in_blackhole_from_fail_args(
     let code = unsafe { &*callee_frame.code };
     let nlocals = code.varnames.len();
 
-    // RPython: resume data encodes per-frame (jitcode, pc). In pyre,
-    // restore_guard_failure_values already synced the callee frame via
-    // virtualizable, so callee_frame.next_instr is the correct resume PC.
-    // typed_values[1] may contain the caller's PC, not the callee's.
-    let guard_py_pc = callee_frame.next_instr;
+    // RPython resume.py:928 read_jitcode_pos_pc parity:
+    // typed_values[1] = callee's guard resume PC (set by record_guard
+    // which builds callee section with callee's vable_next_instr).
+    let guard_py_pc = match typed_values.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return BlackholeResult::Failed,
+    };
+    // Validate: guard_py_pc must be within callee's instruction range.
+    let num_instrs = code.instructions.len();
+    if guard_py_pc >= num_instrs {
+        return BlackholeResult::Failed;
+    }
     let vsd = match typed_values.get(2) {
         Some(Value::Int(v)) => *v as usize,
         _ => return BlackholeResult::Failed,
