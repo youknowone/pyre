@@ -2444,11 +2444,15 @@ impl Default for ResumeDataVirtualAdder {
 /// Shared constant pool + box numbering cache across all guards in a loop.
 pub struct ResumeDataLoopMemo {
     /// resume.py:147 — shared constant pool.
-    consts: Vec<i64>,
+    /// RPython stores Const objects (with type INT/REF/FLOAT).
+    /// We store (value, type) pairs to preserve type information.
+    consts: Vec<(i64, majit_ir::Type)>,
     /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
     large_ints: HashMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: HashMap<i64, i16>,
+    /// Legacy untyped constant pool for encode_shared.
+    legacy_consts: Vec<i64>,
     /// Unified index for encode_shared (legacy path).
     const_indices: HashMap<i64, usize>,
     /// resume.py:150-151 — cached box/virtual numbering.
@@ -2466,6 +2470,7 @@ impl ResumeDataLoopMemo {
             consts: Vec::new(),
             large_ints: HashMap::new(),
             refs: HashMap::new(),
+            legacy_consts: Vec::new(),
             const_indices: HashMap::new(),
             cached_boxes: HashMap::new(),
             cached_virtuals: HashMap::new(),
@@ -2475,25 +2480,35 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// resume.py:157 getconst(const) — tag a constant value.
-    /// INT: try inline TAGINT first, then large_ints cache, then consts pool.
-    /// REF: null → NULLREF, then refs cache, then consts pool.
+    /// resume.py:157-183 getconst(const) — tag a constant value.
+    /// Unified entry point matching RPython's getconst(const) which
+    /// dispatches on const.type (INT, REF, FLOAT).
+    pub fn getconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
+        match tp {
+            majit_ir::Type::Int => self.getconst_int(val),
+            majit_ir::Type::Ref => self.getconst_ref(val),
+            majit_ir::Type::Float => self.getconst_float(val),
+            majit_ir::Type::Void => self.newconst(val, tp),
+        }
+    }
+
+    /// resume.py:158-172 getconst for INT type.
     pub fn getconst_int(&mut self, val: i64) -> i16 {
         // Try inline TAGINT (-8191..8190 in RPython's i16 range).
         let shifted = val >> 13;
         if shifted == 0 || shifted == -1 {
-            return (((val << 2) | TAGINT as i64) as i16);
+            return ((val << 2) | TAGINT as i64) as i16;
         }
         // Large int: check cache.
         if let Some(&tagged) = self.large_ints.get(&val) {
             return tagged;
         }
-        let tagged = self.newconst(val);
+        let tagged = self.newconst(val, majit_ir::Type::Int);
         self.large_ints.insert(val, tagged);
         tagged
     }
 
-    /// resume.py:173 getconst for REF type.
+    /// resume.py:173-182 getconst for REF type.
     pub fn getconst_ref(&mut self, val: i64) -> i16 {
         if val == 0 {
             return NULLREF;
@@ -2501,15 +2516,22 @@ impl ResumeDataLoopMemo {
         if let Some(&tagged) = self.refs.get(&val) {
             return tagged;
         }
-        let tagged = self.newconst(val);
+        let tagged = self.newconst(val, majit_ir::Type::Ref);
         self.refs.insert(val, tagged);
         tagged
     }
 
+    /// resume.py:183 getconst fallback for FLOAT type.
+    pub fn getconst_float(&mut self, val: i64) -> i16 {
+        // FLOAT constants always go to the pool (no inline encoding).
+        // RPython: return self._newconst(const)
+        self.newconst(val, majit_ir::Type::Float)
+    }
+
     /// resume.py:185 _newconst — add to consts pool, return TAGCONST-tagged.
-    fn newconst(&mut self, val: i64) -> i16 {
+    fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
         let index = self.consts.len() as i32 + TAG_CONST_OFFSET;
-        self.consts.push(val);
+        self.consts.push((val, tp));
         ((index << 2) | TAGCONST as i32) as i16
     }
 
@@ -2539,9 +2561,146 @@ impl ResumeDataLoopMemo {
         self.cached_virtuals.clear();
     }
 
-    /// Access the shared constant pool.
-    pub fn consts(&self) -> &[i64] {
+    /// Access the shared constant pool (value, type) pairs.
+    pub fn consts(&self) -> &[(i64, majit_ir::Type)] {
         &self.consts
+    }
+
+    /// Access constant values only (for decode compatibility).
+    pub fn const_values(&self) -> Vec<i64> {
+        self.consts.iter().map(|&(v, _)| v).collect()
+    }
+
+    /// Take ownership of the shared constant pool.
+    pub fn take_consts(&mut self) -> Vec<(i64, majit_ir::Type)> {
+        std::mem::take(&mut self.consts)
+    }
+
+    /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
+    ///
+    /// Each OpRef is classified as:
+    /// - Constant → TAGINT (inline) or TAGCONST (pool)
+    /// - Already seen box → cached tag
+    /// - Virtual (optimizer says is_virtual) → TAGVIRTUAL
+    /// - Otherwise → TAGBOX (live fail_arg)
+    ///
+    /// `constants` maps OpRef → concrete i64 (from trace constants).
+    /// `is_virtual` returns true if the OpRef represents a virtual object.
+    /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
+    ///
+    /// `get_replacement` resolves forwarded OpRefs (RPython box.get_box_replacement()).
+    /// `constants` maps OpRef.0 → (value, type) for constant OpRefs.
+    /// `is_virtual` returns true if the OpRef represents a virtual object.
+    ///
+    /// Returns Err(TagOverflow) if a box index exceeds the 13-bit tag range.
+    /// RPython: raises TagOverflow → caller does compile.giveup().
+    pub fn _number_boxes(
+        &mut self,
+        fail_args: &[majit_ir::OpRef],
+        numb_state: &mut NumberingState,
+        get_replacement: &dyn Fn(majit_ir::OpRef) -> majit_ir::OpRef,
+        constants: &HashMap<u32, (i64, majit_ir::Type)>,
+        is_virtual: &dyn Fn(majit_ir::OpRef) -> bool,
+    ) -> Result<(), TagOverflow> {
+        for &raw_opref in fail_args {
+            if raw_opref.is_none() {
+                numb_state.append_short(UNASSIGNED);
+                continue;
+            }
+            // resume.py:201-202: box = iter.get(item); box = box.get_box_replacement()
+            let opref = get_replacement(raw_opref);
+
+            // resume.py:204-205: isinstance(box, Const) → self.getconst(box)
+            if let Some(&(val, tp)) = constants.get(&opref.0) {
+                let tagged = self.getconst(val, tp);
+                numb_state.append_short(tagged);
+                continue;
+            }
+            // resume.py:207-208: liveboxes[box] (already seen)
+            if let Some(&tagged) = numb_state.liveboxes.get(&opref.0) {
+                numb_state.append_short(tagged);
+                continue;
+            }
+            // resume.py:210-223: new box — virtual or live
+            let tagged = if is_virtual(opref) {
+                let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
+                numb_state.num_virtuals += 1;
+                t
+            } else {
+                let t = tag(numb_state.num_boxes, TAGBOX)?;
+                numb_state.num_boxes += 1;
+                t
+            };
+            numb_state.liveboxes.insert(opref.0, tagged);
+            numb_state.append_short(tagged);
+        }
+        Ok(())
+    }
+
+    /// resume.py:228-256 number() — serialize a guard's full snapshot.
+    ///
+    /// Output format (in NumberingState):
+    /// ```text
+    /// [0]  size (patched later)
+    /// [1]  number of failargs (patched later)
+    /// [2]  vable_array_length  (0 if no virtualizable)
+    ///      [tagged boxes for vable_array]
+    /// [n]  vref_array_length   (0 if no virtualrefs)
+    ///      [tagged boxes for vref_array]
+    /// [m]  frame0_pc frame0_slots...
+    /// [m+] frame1_pc frame1_slots...
+    /// ...
+    /// ```
+    ///
+    /// `frames` is a list of (pc, fail_args_slice) for each frame.
+    /// In pyre (single frame), this is typically one frame.
+    /// resume.py:228-256 number() — serialize a guard's full snapshot.
+    ///
+    /// Returns `Err(TagOverflow)` if any box index exceeds the tag range.
+    /// RPython: raises TagOverflow → caller does compile.giveup().
+    ///
+    /// NOTE: Slot 1 (number of failargs) is left as 0 here.
+    /// RPython patches it later in ResumeDataVirtualAdder.finish()
+    /// (resume.py:433) after virtual processing is complete.
+    /// Callers must call `numb_state.writer.patch(1, num_liveboxes)`
+    /// after finish() to match RPython behavior.
+    pub fn number(
+        &mut self,
+        frames: &[(i32, &[majit_ir::OpRef])],
+        get_replacement: &dyn Fn(majit_ir::OpRef) -> majit_ir::OpRef,
+        constants: &HashMap<u32, (i64, majit_ir::Type)>,
+        is_virtual: &dyn Fn(majit_ir::OpRef) -> bool,
+    ) -> Result<NumberingState, TagOverflow> {
+        let size_hint = frames.iter().map(|(_, args)| args.len() + 2).sum::<usize>() + 4;
+        let mut numb_state = NumberingState::new(size_hint);
+
+        // resume.py:231-232: patch later
+        numb_state.append_int(0); // slot 0: size of resume section
+        numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
+
+        // resume.py:234-241: virtualizable array
+        numb_state.append_int(0); // vable_array_length = 0
+
+        // resume.py:243-247: virtualref array
+        numb_state.append_int(0); // vref_array_length = 0
+
+        // resume.py:249-253: frame chain
+        for &(pc, fail_args) in frames {
+            numb_state.append_int(0); // jitcode_index (pyre: single jitcode)
+            numb_state.append_int(pc);
+            self._number_boxes(
+                fail_args,
+                &mut numb_state,
+                get_replacement,
+                constants,
+                is_virtual,
+            )?;
+        }
+
+        // resume.py:254: patch total size
+        numb_state.patch_current_size(0);
+
+        Ok(numb_state)
     }
 
     /// Encode a `ResumeData` using the shared constant pool.
@@ -2560,7 +2719,7 @@ impl ResumeDataLoopMemo {
             for source in &frame.slot_map {
                 let encoded = EncodedResumeData::encode_source(
                     source,
-                    &mut self.consts,
+                    &mut self.legacy_consts,
                     &mut self.const_indices,
                     &mut num_fail_args,
                     &mut fail_arg_positions,
@@ -2574,7 +2733,7 @@ impl ResumeDataLoopMemo {
             EncodedResumeData::encode_virtual(
                 vinfo,
                 &mut code,
-                &mut self.consts,
+                &mut self.legacy_consts,
                 &mut self.const_indices,
                 &mut num_fail_args,
                 &mut fail_arg_positions,
@@ -2588,7 +2747,7 @@ impl ResumeDataLoopMemo {
                 descr_index: pending.descr_index,
                 target: EncodedResumeData::encode_source(
                     &pending.target,
-                    &mut self.consts,
+                    &mut self.legacy_consts,
                     &mut self.const_indices,
                     &mut num_fail_args,
                     &mut fail_arg_positions,
@@ -2596,7 +2755,7 @@ impl ResumeDataLoopMemo {
                 ),
                 value: EncodedResumeData::encode_source(
                     &pending.value,
-                    &mut self.consts,
+                    &mut self.legacy_consts,
                     &mut self.const_indices,
                     &mut num_fail_args,
                     &mut fail_arg_positions,
@@ -2610,7 +2769,7 @@ impl ResumeDataLoopMemo {
 
         EncodedResumeData {
             code,
-            consts: self.consts.clone(),
+            consts: self.legacy_consts.clone(),
             num_fail_args,
             fail_arg_positions,
             pending_fields,
@@ -2698,6 +2857,116 @@ impl<'a> ResumeDataReader<'a> {
             .map(|f| f.pc)
             .unwrap_or(0)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// resume.py:1042-1080 rebuild_from_resumedata — tagged numbering
+// deserialization.
+// ═══════════════════════════════════════════════════════════════
+
+/// Result of rebuilding interpreter state from resume data.
+#[derive(Debug)]
+pub struct RebuiltFrame {
+    pub jitcode_index: i32,
+    pub pc: i32,
+    pub values: Vec<RebuiltValue>,
+}
+
+/// A single value decoded from tagged resume numbering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RebuiltValue {
+    /// TAGINT: inline integer constant.
+    Int(i32),
+    /// TAGCONST: value from constant pool.
+    Const(i64),
+    /// TAGBOX: live value from fail_args[index].
+    Box(usize),
+    /// TAGVIRTUAL: virtual object (index into rd_virtuals).
+    Virtual(usize),
+    /// Unassigned slot.
+    Unassigned,
+}
+
+/// resume.py:1042-1057 rebuild_from_resumedata parity.
+///
+/// Decode a numbering (produced by `ResumeDataLoopMemo::number()`)
+/// back into frame state. `rd_consts` is the shared constant pool,
+/// `fail_values` are the live values from the guard failure.
+pub fn rebuild_from_numbering(
+    rd_numb: &[u8],
+    rd_consts: &[(i64, majit_ir::Type)],
+) -> (i32, Vec<RebuiltFrame>) {
+    let mut reader = crate::resumecode::Reader::new(rd_numb);
+
+    let total_size = reader.next_item();
+    let num_failargs = reader.next_item();
+
+    // Virtualizable array (skip).
+    let vable_len = reader.next_item();
+    if vable_len > 0 {
+        reader.jump(vable_len as usize);
+    }
+
+    // Virtualref array (skip).
+    let vref_len = reader.next_item();
+    if vref_len > 0 {
+        reader.jump((vref_len * 2) as usize);
+    }
+
+    // Frames.
+    let mut frames = Vec::new();
+    while reader.has_more() {
+        let jitcode_index = reader.next_item();
+        let pc = reader.next_item();
+        let mut values = Vec::new();
+
+        // Read tagged values until end of reader or next frame marker.
+        // We read items until we've consumed all remaining items for
+        // this frame. Since we don't know the frame size in advance,
+        // read until done_reading or start of next frame.
+        // Actually, RPython reads based on jitcode's position_info
+        // (number of slots). For simplicity, we read all remaining
+        // items as this frame's values (pyre has single-frame traces).
+        while reader.has_more() {
+            let tagged_i32 = reader.next_item();
+            let tagged = tagged_i32 as i16;
+            let (val, tagbits) = untag(tagged);
+            let rebuilt = match tagbits {
+                TAGINT => RebuiltValue::Int(val),
+                TAGCONST => {
+                    if tagged == NULLREF {
+                        RebuiltValue::Const(0)
+                    } else if tagged == UNINITIALIZED_TAG {
+                        RebuiltValue::Unassigned
+                    } else {
+                        let idx = (val - TAG_CONST_OFFSET) as usize;
+                        let c = rd_consts.get(idx).map(|&(v, _)| v).unwrap_or(0);
+                        RebuiltValue::Const(c)
+                    }
+                }
+                TAGBOX => {
+                    let index = if val < 0 {
+                        (val + num_failargs) as usize
+                    } else {
+                        val as usize
+                    };
+                    RebuiltValue::Box(index)
+                }
+                TAGVIRTUAL => RebuiltValue::Virtual(val as usize),
+                _ => RebuiltValue::Unassigned,
+            };
+            values.push(rebuilt);
+        }
+
+        frames.push(RebuiltFrame {
+            jitcode_index,
+            pc,
+            values,
+        });
+    }
+
+    let _ = total_size;
+    (num_failargs, frames)
 }
 
 #[cfg(test)]
@@ -3911,5 +4180,125 @@ mod tests {
                 value: ExitValueSourceLayout::ExitValue(1),
             }
         );
+    }
+
+    #[test]
+    fn test_memo_number_simple() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut constants = HashMap::new();
+        constants.insert(10001, (42i64, majit_ir::Type::Int));
+        let fail_args = vec![OpRef(10001), OpRef(1), OpRef(2)];
+        let frames = vec![(8i32, fail_args.as_slice())];
+        let identity = |op: OpRef| op;
+        let numb_state = memo
+            .number(&frames, &identity, &constants, &|_| false)
+            .unwrap();
+        // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        // items[0] = total size
+        assert!(items[0] > 0);
+        // items[1] = num_failargs: 0 (not patched yet — RPython patches in finish())
+        // After finish: patch(1, numb_state.liveboxes.len()) would set to 2.
+        assert_eq!(items[1], 0);
+        // items[2] = vable_array_length = 0
+        assert_eq!(items[2], 0);
+        // items[3] = vref_array_length = 0
+        assert_eq!(items[3], 0);
+        // items[4] = jitcode_index = 0
+        assert_eq!(items[4], 0);
+        // items[5] = pc = 8
+        assert_eq!(items[5], 8);
+        // items[6] = OpRef(10001) tagged as TAGINT(42) since 42 fits in 13 bits
+        let (val, tagbits) = untag(items[6] as i16);
+        assert_eq!(tagbits, TAGINT);
+        assert_eq!(val, 42);
+        // items[7] = OpRef(1) tagged as TAGBOX(0) — first live box
+        let (val, tagbits) = untag(items[7] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 0);
+        // items[8] = OpRef(2) tagged as TAGBOX(1) — second live box
+        let (val, tagbits) = untag(items[8] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_number_rebuild_roundtrip() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut constants = HashMap::new();
+        constants.insert(10001, (42i64, majit_ir::Type::Int));
+        let fail_args = vec![OpRef(10001), OpRef(1), OpRef(2)];
+        let frames = vec![(8i32, fail_args.as_slice())];
+        let identity = |op: OpRef| op;
+        let mut numb_state = memo
+            .number(&frames, &identity, &constants, &|_| false)
+            .unwrap();
+        // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
+        numb_state.writer.patch(1, numb_state.num_boxes);
+        let rd_numb = numb_state.create_numbering();
+
+        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, memo.consts());
+        assert_eq!(num_failargs, 2);
+        assert_eq!(rebuilt_frames.len(), 1);
+        assert_eq!(rebuilt_frames[0].pc, 8);
+        assert_eq!(rebuilt_frames[0].values.len(), 3);
+        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
+        assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Box(0));
+        assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Box(1));
+    }
+
+    #[test]
+    fn test_number_rebuild_with_virtual() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
+        let fail_args = vec![OpRef(1), OpRef(2), OpRef(3)];
+        let frames = vec![(10i32, fail_args.as_slice())];
+        let identity = |op: OpRef| op;
+        let mut numb_state = memo
+            .number(&frames, &identity, &constants, &|opref| opref == OpRef(2))
+            .unwrap();
+        // RPython: finish() patches with len(newboxes) which is num_boxes
+        // (not liveboxes which includes virtuals).
+        numb_state.writer.patch(1, numb_state.num_boxes);
+        let rd_numb = numb_state.create_numbering();
+
+        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, memo.consts());
+        assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
+        assert_eq!(rebuilt_frames[0].values.len(), 3);
+        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
+        assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Virtual(0));
+        assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Box(1));
+    }
+
+    #[test]
+    fn test_memo_number_with_virtual() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
+        let fail_args = vec![OpRef(1), OpRef(2), OpRef(3)];
+        let frames = vec![(10i32, fail_args.as_slice())];
+        // OpRef(2) is virtual
+        let identity = |op: OpRef| op;
+        let numb_state = memo
+            .number(&frames, &identity, &constants, &|opref| opref == OpRef(2))
+            .unwrap();
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
+        assert_eq!(items[1], 0);
+        // items[6] = OpRef(1) → TAGBOX(0)
+        let (val, tagbits) = untag(items[6] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 0);
+        // items[7] = OpRef(2) → TAGVIRTUAL(0)
+        let (val, tagbits) = untag(items[7] as i16);
+        assert_eq!(tagbits, TAGVIRTUAL);
+        assert_eq!(val, 0);
+        // items[8] = OpRef(3) → TAGBOX(1)
+        let (val, tagbits) = untag(items[8] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 1);
     }
 }

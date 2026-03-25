@@ -38,7 +38,7 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
     if item < 0 {
         item = -1 - item;
     }
-    debug_assert!(item >= 0);
+    assert!(item >= 0);
     let item = item as u32;
 
     if item < (1 << 7) {
@@ -47,7 +47,8 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
         buf.push((item | 0x80) as u8);
         buf.push((item >> 7) as u8);
     } else {
-        debug_assert!(item < (1 << 16), "resumecode item too large: {item}");
+        // resumecode.py: assert item < 2**16
+        assert!(item < (1 << 16), "resumecode item too large: {item}");
         buf.push((item | 0x80) as u8);
         buf.push(((item >> 7) | 0x80) as u8);
         buf.push((item >> 14) as u8);
