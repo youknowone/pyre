@@ -221,18 +221,14 @@ impl TreeLoop {
         let mut escaped_set: HashSet<OpRef> = HashSet::new();
         let mut queue: VecDeque<OpRef> = VecDeque::new();
 
-        // Seed with refs used by post-cut ops.
+        // Seed with refs used by post-cut ops (args only, not fail_args).
+        // RPython CutTrace parity: pre-cut refs in fail_args map to
+        // OpRef::NONE (resume data handles materialization). Only regular
+        // op args seed escaped refs for prefix re-emission.
         for op in cut_ops {
             for arg in &op.args {
                 if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                     queue.push_back(*arg);
-                }
-            }
-            if let Some(ref fa) = op.fail_args {
-                for arg in fa {
-                    if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
-                        queue.push_back(*arg);
-                    }
                 }
             }
         }
