@@ -27,6 +27,9 @@ pub struct W_TypeObject {
     pub bases: PyObjectRef,
     /// Raw pointer to the class namespace (PyNamespace from pyre-runtime).
     pub dict: *mut u8,
+    /// Cached C3 MRO — PyPy: W_TypeObject.mro_w.
+    /// Computed once at type creation and cached.
+    pub mro_w: *mut Vec<PyObjectRef>,
 }
 
 /// Allocate a new W_TypeObject.
@@ -37,6 +40,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
         },
+        mro_w: std::ptr::null_mut(), // set after construction via set_mro
         name: Box::into_raw(Box::new(name.to_string())),
         bases,
         dict: dict_ptr,
@@ -57,6 +61,16 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
 /// Get the class namespace pointer (as *mut u8).
 pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
     (*(obj as *const W_TypeObject)).dict
+}
+
+/// Get the cached MRO, or null if not yet set.
+pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
+    (*(obj as *const W_TypeObject)).mro_w
+}
+
+/// Set the cached MRO.
+pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
+    (*(obj as *mut W_TypeObject)).mro_w = Box::into_raw(Box::new(mro));
 }
 
 /// Check if an object is a type (user-defined class).

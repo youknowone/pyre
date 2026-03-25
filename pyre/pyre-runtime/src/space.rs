@@ -973,15 +973,11 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 }),
             }
         } else if is_dict(obj) {
-            if !is_int(index) {
-                return Err(PyError::type_error("dict keys must be integers in Phase 1"));
-            }
-            let key = w_int_get_value(index);
-            match w_dict_getitem(obj, key) {
+            match w_dict_lookup(obj, index) {
                 Some(val) => Ok(val),
                 None => Err(PyError {
                     kind: PyErrorKind::KeyError,
-                    message: format!("{key}"),
+                    message: "key not found".to_string(),
                 }),
             }
         } else {
@@ -1013,8 +1009,7 @@ pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> P
             if !is_int(index) {
                 return Err(PyError::type_error("dict keys must be integers in Phase 1"));
             }
-            let key = w_int_get_value(index);
-            w_dict_setitem(obj, key, value);
+            w_dict_store(obj, index, value);
             Ok(w_none())
         } else {
             Err(PyError::type_error(format!(
@@ -1501,7 +1496,7 @@ fn dict_method_get(args: &[PyObjectRef]) -> PyObjectRef {
     let default = args.get(2).copied().unwrap_or_else(w_none);
     unsafe {
         if is_int(key) {
-            w_dict_getitem(dict, w_int_get_value(key)).unwrap_or(default)
+            w_dict_lookup(dict, key).unwrap_or(default)
         } else {
             default
         }
@@ -1517,7 +1512,7 @@ fn dict_method_keys(args: &[PyObjectRef]) -> PyObjectRef {
         if is_dict(dict) {
             let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
             let entries = &*d.entries;
-            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| w_int_new(k)).collect();
+            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
             return w_list_new(keys);
         }
     }
@@ -1549,7 +1544,7 @@ fn dict_method_items(args: &[PyObjectRef]) -> PyObjectRef {
             let entries = &*d.entries;
             let items: Vec<PyObjectRef> = entries
                 .iter()
-                .map(|&(k, v)| w_tuple_new(vec![w_int_new(k), v]))
+                .map(|&(k, v)| w_tuple_new(vec![k, v]))
                 .collect();
             return w_list_new(items);
         }
@@ -1569,10 +1564,8 @@ fn dict_method_pop(args: &[PyObjectRef]) -> PyObjectRef {
     let key = args[1];
     let default = args.get(2).copied();
     unsafe {
-        if is_dict(dict) && is_int(key) {
-            let k = w_int_get_value(key);
-            if let Some(val) = w_dict_getitem(dict, k) {
-                // Note: actual removal from dict not yet implemented
+        if is_dict(dict) {
+            if let Some(val) = w_dict_lookup(dict, key) {
                 return val;
             }
         }
@@ -1586,11 +1579,11 @@ fn dict_method_setdefault(args: &[PyObjectRef]) -> PyObjectRef {
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
     unsafe {
-        if is_int(key) {
-            if let Some(existing) = w_dict_getitem(dict, w_int_get_value(key)) {
+        if is_dict(dict) {
+            if let Some(existing) = w_dict_lookup(dict, key) {
                 return existing;
             }
-            w_dict_setitem(dict, w_int_get_value(key), default);
+            w_dict_store(dict, key, default);
         }
     }
     default
@@ -1621,8 +1614,16 @@ unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObject
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
-    let mro = compute_mro(w_type);
-    for cls in &mro {
+    // Use cached MRO if available (PyPy: W_TypeObject.mro_w)
+    let cached = w_type_get_mro(w_type);
+    let mro_owned;
+    let mro: &[PyObjectRef] = if !cached.is_null() {
+        &*cached
+    } else {
+        mro_owned = compute_mro(w_type);
+        &mro_owned
+    };
+    for cls in mro {
         let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::PyNamespace;
         if !ns_ptr.is_null() {
             let ns = &*ns_ptr;

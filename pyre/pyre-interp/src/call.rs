@@ -405,12 +405,12 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     eval_frame_plain(&mut frame)?;
 
     // Create W_TypeObject from the class namespace
-    // PyPy: type.__new__(type, name, bases, dict_w)
-    Ok(pyre_object::w_type_new(
-        name,
-        bases,
-        class_ns_ptr as *mut u8,
-    ))
+    // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
+    let w_type = pyre_object::w_type_new(name, bases, class_ns_ptr as *mut u8);
+    // Cache C3 MRO (PyPy: W_TypeObject.mro_w set during ready())
+    let mro = unsafe { pyre_runtime::space::compute_mro_pub(w_type) };
+    unsafe { pyre_object::w_type_set_mro(w_type, mro) };
+    Ok(w_type)
 }
 
 thread_local! {
@@ -433,9 +433,11 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
     // PyPy: descr__new__ → space.allocate_instance(W_ObjectObject, w_type)
     let instance = pyre_object::w_instance_new(w_type);
 
-    // Step 2: Look up __init__ via MRO and call it
-    // PyPy: descr_call → space.lookup(w_newobject, '__init__') → call
-    if let Ok(init_fn) = pyre_runtime::space::py_getattr(w_type, "__init__") {
+    // Step 2: Look up __init__ via type MRO
+    // PyPy: descr_call → space.lookup(w_newobject, '__init__') → searches type's MRO
+    if let Some(init_fn) =
+        unsafe { pyre_runtime::space::lookup_in_type_mro_pub(w_type, "__init__") }
+    {
         // Call __init__(instance, *args)
         let mut init_args = Vec::with_capacity(1 + args.len());
         init_args.push(instance);
