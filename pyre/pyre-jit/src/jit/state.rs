@@ -2085,7 +2085,39 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         let fail_arg_types = self.build_single_frame_fail_arg_types();
         let fail_args = self.build_single_frame_fail_args(ctx);
+
+        // opencoder.py:819 parity: capture snapshot of frame state.
+        // Each fail_arg slot becomes a SnapshotTagged::Box(n) where n
+        // is the slot's position in fail_args. Constants (OpRef >= 10_000)
+        // become SnapshotTagged::Const. This ensures resume data is
+        // independent of optimizer transformations to fail_args.
+        let snapshot_boxes: Vec<majit_trace::recorder::SnapshotTagged> = fail_args
+            .iter()
+            .enumerate()
+            .map(|(i, &opref)| {
+                if opref.is_none() {
+                    majit_trace::recorder::SnapshotTagged::Box(i as u32)
+                } else if opref.0 >= 10_000 {
+                    let val = ctx.constant_value(opref).unwrap_or(0);
+                    majit_trace::recorder::SnapshotTagged::Const(val)
+                } else {
+                    majit_trace::recorder::SnapshotTagged::Box(i as u32)
+                }
+            })
+            .collect();
+        let snapshot = majit_trace::recorder::Snapshot {
+            frames: vec![majit_trace::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: self.sym().valuestackdepth as u32,
+                boxes: snapshot_boxes,
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        };
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
+        ctx.set_last_guard_resume_position(snapshot_id);
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {

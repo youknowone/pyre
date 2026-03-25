@@ -425,6 +425,22 @@ impl TraceCtx {
     /// Record a guard with auto-generated FailDescr.
     ///
     /// `num_live` is the number of live integer values (for the FailDescr).
+    /// opencoder.py:819 parity: capture a snapshot of the interpreter
+    /// frame state. Returns a snapshot_id for use as rd_resume_position.
+    pub fn capture_resumedata(&mut self, snapshot: majit_trace::recorder::Snapshot) -> i32 {
+        self.recorder.capture_resumedata(snapshot)
+    }
+
+    /// Set rd_resume_position on the last recorded guard.
+    pub fn set_last_guard_resume_position(&mut self, snapshot_id: i32) {
+        self.recorder.set_last_op_resume_position(snapshot_id);
+    }
+
+    /// Look up a constant value by its OpRef (>= 10_000).
+    pub fn constant_value(&self, opref: OpRef) -> Option<i64> {
+        self.constants.as_ref().get(&opref.0).copied()
+    }
+
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let descr = make_fail_descr(num_live);
         self.recorder.record_guard(opcode, args, descr)
