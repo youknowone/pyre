@@ -165,6 +165,30 @@ fn trace_getfield_gc_int_pureornot(
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
         return cached;
     }
+    // RPython constant_fold: read immutable field from constant object
+    // at trace time, avoiding the GetfieldGcPureI operation entirely.
+    // Only fold Ref-typed constants (object pointers), not Int constants
+    // which would be misinterpreted as memory addresses.
+    if descr.is_always_pure() && ctx.const_type(obj) == Some(majit_ir::Type::Ref) {
+        if let Some(ptr) = ctx.const_value(obj) {
+            if ptr != 0 {
+                if let Some(field) = descr.as_field_descr() {
+                    let addr = ptr as usize + field.offset();
+                    let value = unsafe {
+                        match field.field_size() {
+                            8 => Some(*(addr as *const i64)),
+                            4 => Some(*(addr as *const u32) as i64),
+                            1 => Some(*(addr as *const u8) as i64),
+                            _ => None,
+                        }
+                    };
+                    if let Some(v) = value {
+                        return ctx.const_int(v);
+                    }
+                }
+            }
+        }
+    }
     let opcode = if descr.is_always_pure() {
         OpCode::GetfieldGcPureI
     } else {
