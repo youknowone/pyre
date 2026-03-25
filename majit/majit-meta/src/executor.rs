@@ -498,11 +498,14 @@ pub(crate) fn execute_one(
             OpResult::Value(a)
         }
 
-        // ── CALL_ASSEMBLER (delegate to regular execution) ──
+        // ── CALL_ASSEMBLER: cannot be executed in the blackhole ──
+        // Must fall back to force_fn which creates a proper callee frame.
         OpCode::CallAssemblerI | OpCode::CallAssemblerR | OpCode::CallAssemblerF => {
-            OpResult::Value(0)
+            OpResult::Unsupported("CallAssembler requires force_fn fallback".to_string())
         }
-        OpCode::CallAssemblerN => OpResult::Void,
+        OpCode::CallAssemblerN => {
+            OpResult::Unsupported("CallAssemblerN requires force_fn fallback".to_string())
+        }
 
         // ── Cond call (conditional function call) ──
         OpCode::CondCallValueI | OpCode::CondCallValueR => OpResult::Value(0),

@@ -2610,7 +2610,18 @@ mod tests {
 
             match result {
                 OpResult::Unsupported(msg) => {
-                    panic!("OpCode {:?} returned Unsupported: {}", opcode, msg);
+                    // CallAssembler ops intentionally return Unsupported —
+                    // they require force_fn fallback, not blackhole execution.
+                    let is_call_assembler = matches!(
+                        opcode,
+                        OpCode::CallAssemblerI
+                            | OpCode::CallAssemblerR
+                            | OpCode::CallAssemblerF
+                            | OpCode::CallAssemblerN
+                    );
+                    if !is_call_assembler {
+                        panic!("OpCode {:?} returned Unsupported: {}", opcode, msg);
+                    }
                 }
                 // Any other result (Value, Void, Finish, Jump, GuardFailed) is acceptable
                 _ => {}
