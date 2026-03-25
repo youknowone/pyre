@@ -273,6 +273,10 @@ pub struct PyreSym {
     /// Generic guards emitted during `truth_value(value)` must still capture
     /// the pre-pop stack shape, matching RPython's goto_if_not(box).
     pub(crate) pending_branch_value: Option<OpRef>,
+    /// RPython goto_if_not parity: the branch target NOT taken during tracing.
+    /// On guard failure, the interpreter jumps to this PC instead of
+    /// re-executing the branch instruction (stack machine safety).
+    pub(crate) pending_branch_other_target: Option<usize>,
     pub(crate) transient_value_types: std::collections::HashMap<OpRef, Type>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
@@ -1164,6 +1168,7 @@ impl PyreSym {
             last_comparison_truth: None,
             last_comparison_concrete_truth: None,
             pending_branch_value: None,
+            pending_branch_other_target: None,
             transient_value_types: std::collections::HashMap::new(),
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
@@ -2151,8 +2156,11 @@ impl MIFrame {
             return;
         }
 
+        // RPython goto_if_not (pyjitpl.py:514): on guard failure, the
+        // interpreter resumes at the branch NOT taken during tracing.
+        // Stack is post-pop (comparison result already consumed).
+        let other_target = self.sym().pending_branch_other_target;
         self.flush_to_frame_for_guard(ctx);
-        let concrete_next_instr = self.sym().pending_next_instr.unwrap_or(self.fallthrough_pc);
         let (
             frame,
             next_instr,
@@ -2165,13 +2173,12 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
+            // Use the "other" branch target as resume PC if available.
+            let resume_pc =
+                other_target.unwrap_or(s.pending_next_instr.unwrap_or(self.fallthrough_pc));
             (
                 s.frame,
-                if s.vable_next_instr.is_none() {
-                    ctx.const_int(concrete_next_instr as i64)
-                } else {
-                    s.vable_next_instr
-                },
+                ctx.const_int(resume_pc as i64),
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_local_types.clone(),
@@ -5475,7 +5482,16 @@ impl BranchOpcodeHandler for MIFrame {
     fn leave_branch_truth(&mut self) -> Result<(), PyError> {
         let sym = self.sym_mut();
         sym.pending_branch_value = None;
+        sym.pending_branch_other_target = None;
         Ok(())
+    }
+
+    fn set_branch_other_target(&mut self, target: usize) {
+        self.sym_mut().pending_branch_other_target = Some(target);
+    }
+
+    fn branch_other_target(&self) -> Option<usize> {
+        self.sym().pending_branch_other_target
     }
 
     fn concrete_truth_as_bool(

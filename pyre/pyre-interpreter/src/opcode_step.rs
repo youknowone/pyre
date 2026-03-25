@@ -127,6 +127,13 @@ pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
         Ok(())
     }
 
+    /// RPython goto_if_not parity: store the branch target NOT taken
+    /// during tracing, so guard failure can resume at the correct path.
+    fn set_branch_other_target(&mut self, _target: usize) {}
+    fn branch_other_target(&self) -> Option<usize> {
+        None
+    }
+
     fn concrete_truth_as_bool(
         &mut self,
         value: Self::Value,
@@ -420,6 +427,10 @@ fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
     if !should_jump {
         handler.set_next_instr(target)?;
     }
+    // The "other target" is the branch NOT taken during tracing.
+    // On guard failure, the interpreter should jump to this target.
+    let other_target = if should_jump { fallthrough } else { target };
+    handler.set_branch_other_target(other_target);
     handler.record_branch_guard(value, truth, concrete_truth)?;
     handler.leave_branch_truth()?;
     let next_target = if should_jump { target } else { fallthrough };
