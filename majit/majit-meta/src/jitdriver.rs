@@ -454,12 +454,17 @@ impl<S: JitState> JitDriver<S> {
                     self.trace_meta = None;
                     if let Some(sym) = sym {
                         let finish_args = S::collect_jump_args(&sym);
-                        self.meta.close_bridge(
+                        let ok = self.meta.close_bridge(
                             bridge_key,
                             bridge_trace_id,
                             bridge_fail_index,
                             &finish_args,
                         );
+                        if !ok {
+                            // Bridge compilation failed (e.g., no target_tokens).
+                            // Abort the trace to clean up driver state.
+                            self.meta.abort_trace(false);
+                        }
                     } else {
                         self.meta.abort_trace(false);
                     }
@@ -499,12 +504,15 @@ impl<S: JitState> JitDriver<S> {
                 {
                     self.sym = None;
                     self.trace_meta = None;
-                    self.meta.close_bridge(
+                    let ok = self.meta.close_bridge(
                         bridge_key,
                         bridge_trace_id,
                         bridge_fail_index,
                         &jump_args,
                     );
+                    if !ok {
+                        self.meta.abort_trace(false);
+                    }
                     return;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
