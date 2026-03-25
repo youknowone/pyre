@@ -75,10 +75,12 @@ pub fn trace_bytecode(
         } => {
             let key = crate::eval::make_green_key(code as *const CodeObject, *target_pc);
             ctx.set_green_key(key);
+            ctx.header_pc = *target_pc;
         }
         TraceAction::CloseLoop => {
             let key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
             ctx.set_green_key(key);
+            ctx.header_pc = start_pc;
         }
         _ => {}
     }

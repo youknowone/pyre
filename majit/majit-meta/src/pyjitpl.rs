@@ -46,7 +46,9 @@ pub enum BackEdgeAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileOutcome {
     /// Compilation succeeded — compiled loop is installed and ready to run.
-    Compiled,
+    /// `cut_header_pc` is Some when the trace was retargeted to a different
+    /// loop header via cross-loop cut. The caller should update meta.merge_pc.
+    Compiled { cut_header_pc: Option<usize> },
     /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).
     /// The caller may retry or continue tracing.
     Cancelled,
@@ -1410,7 +1412,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
-    pub fn close_and_compile(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+    pub fn close_and_compile(&mut self, jump_args: &[OpRef], mut meta: M) -> CompileOutcome {
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -1431,7 +1433,9 @@ impl<M: Clone> MetaInterp<M> {
                     if ok {
                         self.cancel_count = 0;
                         self.warm_state.reset_function_counts();
-                        return CompileOutcome::Compiled;
+                        return CompileOutcome::Compiled {
+                            cut_header_pc: None,
+                        };
                     }
                     // pyjitpl.py:3004: creation of the loop was cancelled!
                     self.cancel_count += 1;
@@ -1527,20 +1531,29 @@ impl<M: Clone> MetaInterp<M> {
         let trace = recorder.get_trace();
 
         // compile.py:269-270: cut trace at cross-loop merge point.
-        let trace =
-            if let Some((ref original_boxes, ref original_box_types, start)) = cross_loop_cut {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] cut_trace_from: start.ops_len={} original_boxes={} trace_ops={}",
-                        start.ops_len,
-                        original_boxes.len(),
-                        trace.ops.len()
-                    );
-                }
-                trace.cut_trace_from(start, original_boxes, original_box_types)
-            } else {
-                trace
-            };
+        // When the trace was retargeted to a different loop header, record
+        // the new header PC so meta.merge_pc can be updated after insert.
+        let cut_header_pc = if cross_loop_cut.is_some() {
+            Some(ctx.header_pc)
+        } else {
+            None
+        };
+        let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
+            cross_loop_cut
+        {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] cut_trace_from: start.ops_len={} original_boxes={} trace_ops={} header_pc={}",
+                    start.ops_len,
+                    original_boxes.len(),
+                    trace.ops.len(),
+                    ctx.header_pc,
+                );
+            }
+            trace.cut_trace_from(start, original_boxes, original_box_types)
+        } else {
+            trace
+        };
 
         let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 
@@ -1860,7 +1873,7 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
                 self.warm_state.reset_function_counts();
-                return CompileOutcome::Compiled;
+                return CompileOutcome::Compiled { cut_header_pc };
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -1988,7 +2001,9 @@ impl<M: Clone> MetaInterp<M> {
                     constants,
                 );
                 if success {
-                    CompileOutcome::Compiled
+                    CompileOutcome::Compiled {
+                        cut_header_pc: None,
+                    }
                 } else {
                     CompileOutcome::Cancelled
                 }
@@ -2008,7 +2023,9 @@ impl<M: Clone> MetaInterp<M> {
                     constants,
                 );
                 if success {
-                    CompileOutcome::Compiled
+                    CompileOutcome::Compiled {
+                        cut_header_pc: None,
+                    }
                 } else {
                     CompileOutcome::Cancelled
                 }

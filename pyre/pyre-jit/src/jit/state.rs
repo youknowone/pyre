@@ -5388,7 +5388,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     let outcome = driver
                         .meta_interp_mut()
                         .compile_trace(root_key, &jump_args, None);
-                    if matches!(outcome, majit_meta::CompileOutcome::Compiled) {
+                    if matches!(outcome, majit_meta::CompileOutcome::Compiled { .. }) {
                         if majit_meta::majit_log_enabled() {
                             eprintln!(
                                 "[jit][reached_loop_header] compile_trace success: root={} pc={}",
