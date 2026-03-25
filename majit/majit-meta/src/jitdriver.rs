@@ -483,7 +483,18 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
-                    let meta = self.trace_meta.take().unwrap();
+                    let mut meta = self.trace_meta.take().unwrap();
+                    // RPython compile_and_run_once parity: function-entry traces
+                    // (header_pc=0) that close at a loop header have their meta
+                    // updated to the close point. Without this, meta.merge_pc=0
+                    // mismatches the loop's can_enter_jit entry point.
+                    if let Some(ctx) = self.meta.trace_ctx() {
+                        if ctx.header_pc == 0 {
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                            }
+                        }
+                    }
                     let _ = self.meta.close_and_compile(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -527,7 +538,14 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
-                    let meta = self.trace_meta.take().unwrap();
+                    let mut meta = self.trace_meta.take().unwrap();
+                    if let Some(ctx) = self.meta.trace_ctx() {
+                        if ctx.header_pc == 0 {
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                            }
+                        }
+                    }
                     let _ = self.meta.close_and_compile(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
