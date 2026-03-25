@@ -1012,7 +1012,7 @@ pub struct UnrollInfo {
     /// Extra same_as ops added during finalization.
     pub extra_same_as: Vec<Op>,
     /// Quasi-immutable dependencies discovered during optimization.
-    pub quasi_immutable_deps: std::collections::HashSet<u64>,
+    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
     /// Extra ops to insert before the label (from bridge inlining).
     pub extra_before_label: Vec<Op>,
 }

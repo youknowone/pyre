@@ -18,11 +18,11 @@ pub const PYNAMESPACE_VALUES_LEN_OFFSET: usize =
 pub struct PyNamespace {
     names: Vec<String>,
     values: PyObjectArray,
-    /// JIT invalidation watchers. When a namespace slot is overwritten,
-    /// all watchers are notified (AtomicBool set to true) so that
-    /// compiled code using constant-folded globals is invalidated.
-    /// RPython parity: quasi-immutable field invalidation for module dicts.
-    watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    /// Per-slot JIT invalidation watchers.
+    /// RPython quasiimmut.py parity: each dict entry has its own
+    /// QuasiImmut watcher list. Only loops that depend on a specific
+    /// slot are invalidated when that slot is overwritten.
+    slot_watchers: Vec<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Clone for PyNamespace {
@@ -30,7 +30,7 @@ impl Clone for PyNamespace {
         let mut namespace = Self {
             names: self.names.clone(),
             values: PyObjectArray::from_vec(self.values.to_vec()),
-            watchers: Vec::new(), // cloned namespace is a new identity
+            slot_watchers: Vec::new(), // cloned namespace is a new identity
         };
         namespace.fix_ptr();
         namespace
@@ -48,7 +48,7 @@ impl PyNamespace {
         let mut namespace = Self {
             names: Vec::new(),
             values: PyObjectArray::from_vec(Vec::new()),
-            watchers: Vec::new(),
+            slot_watchers: Vec::new(),
         };
         namespace.fix_ptr();
         namespace
@@ -90,6 +90,7 @@ impl PyNamespace {
         let value = make();
         self.names.push(name.to_string());
         self.values.push(value);
+        self.slot_watchers.push(Vec::new());
         value
     }
 
@@ -98,12 +99,13 @@ impl PyNamespace {
             let old = self.values[idx];
             self.values[idx] = value;
             if old != value {
-                self.notify_watchers();
+                self.notify_slot_watchers(idx);
             }
             Some(old)
         } else {
             self.names.push(name);
             self.values.push(value);
+            self.slot_watchers.push(Vec::new());
             None
         }
     }
@@ -117,23 +119,36 @@ impl PyNamespace {
         let old = *slot;
         *slot = value;
         if old != value {
-            self.notify_watchers();
+            self.notify_slot_watchers(idx);
         }
         true
     }
 
-    /// Register a JIT invalidation watcher. When any namespace slot
-    /// is overwritten, the flag is set to true, causing
-    /// GUARD_NOT_INVALIDATED to fail in compiled code.
-    pub fn register_watcher(&mut self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.watchers.push(std::sync::Arc::downgrade(flag));
+    /// Register a JIT invalidation watcher for a specific slot.
+    /// RPython quasiimmut.py:register_loop_token parity: each dict
+    /// entry has its own watcher list, so only loops depending on
+    /// this slot are invalidated when it changes.
+    pub fn register_slot_watcher(
+        &mut self,
+        slot: usize,
+        flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        // Grow slot_watchers if needed (slots added before JIT was active).
+        while self.slot_watchers.len() <= slot {
+            self.slot_watchers.push(Vec::new());
+        }
+        self.slot_watchers[slot].push(std::sync::Arc::downgrade(flag));
     }
 
-    fn notify_watchers(&mut self) {
-        if self.watchers.is_empty() {
+    /// RPython quasiimmut.py:invalidate parity.
+    fn notify_slot_watchers(&mut self, slot: usize) {
+        let Some(watchers) = self.slot_watchers.get_mut(slot) else {
+            return;
+        };
+        if watchers.is_empty() {
             return;
         }
-        self.watchers.retain(|w| {
+        watchers.retain(|w| {
             if let Some(flag) = w.upgrade() {
                 flag.store(true, std::sync::atomic::Ordering::Release);
                 true

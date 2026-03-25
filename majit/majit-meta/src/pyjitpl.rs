@@ -333,7 +333,7 @@ pub struct MetaInterp<M: Clone> {
     /// Raw pointers to namespace/quasi-immutable objects that the compiled
     /// loop depends on. After compilation, the caller registers the loop's
     /// invalidation flag on each dep. Cleared on each compile attempt.
-    pub last_quasi_immutable_deps: Vec<u64>,
+    pub last_quasi_immutable_deps: Vec<(u64, u32)>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.

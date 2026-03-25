@@ -5263,7 +5263,8 @@ impl NamespaceOpcodeHandler for MIFrame {
                 // the loop's invalidation flag on each dep namespace.
                 let opref = self.with_ctx(|this, ctx| {
                     let ns_const = ctx.const_int(ns as i64);
-                    ctx.record_op(OpCode::QuasiimmutField, &[ns_const]);
+                    let slot_const = ctx.const_int(slot as i64);
+                    ctx.record_op(OpCode::QuasiimmutField, &[ns_const, slot_const]);
                     let const_value = ctx.const_int(concrete_value as i64);
                     this.sym_mut()
                         .symbolic_namespace_slots
