@@ -215,6 +215,11 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
                 frame.fix_array_ptrs();
+                // RPython warmspot.py:961-983 handle_jitexception parity:
+                // after ContinueRunningNormally, re-enter portal which calls
+                // maybe_compile_and_run → dispatches to compiled code.
+                // TODO: enable try_function_entry_jit dispatch after full
+                // resume data parity (null Ref in fail_args must be fixed).
                 continue;
             }
         }
@@ -391,6 +396,7 @@ fn jit_merge_point_hook(
     let green_key = make_green_key(frame.code, pc);
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
+    let was_tracing = driver.is_tracing();
     if let Some(outcome) = driver.jit_merge_point_keyed(
         green_key,
         pc,
@@ -419,6 +425,12 @@ fn jit_merge_point_hook(
         // after compilation. If compilation succeeded, the loop token
         // exists and we connect its invalidation flag to namespaces.
         register_namespace_watchers(green_key);
+        // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
+        // after trace compilation, restart so maybe_compile_and_run
+        // (try_function_entry_jit) dispatches to compiled code.
+        if was_tracing {
+            return Some(LoopResult::ContinueRunningNormally);
+        }
     }
     None
 }
@@ -773,35 +785,27 @@ fn restore_guard_failure_for_loop(
     }
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
     materialize_recovery_virtuals(&mut typed, exit_layout);
-    // After materialization, remaining null Ref slots represent
-    // virtual objects that couldn't be materialized. Invalidate
-    // compiled code so the loop re-traces. RPython handles this
-    // via proper resume data in the blackhole; until full resume
-    // parity, this conservative fallback prevents stale-state bugs.
+    // Null Ref slots indicate incomplete resume data (OpRef::NONE in
+    // fail_args). RPython's full resume data framework never produces
+    // null slots for live variables. Until pyre has complete resume
+    // data, invalidate compiled code and decay counters to prevent
+    // immediate recompilation. This entire block has no RPython
+    // equivalent and should be removed once resume data is complete.
     let has_null_ref = typed
         .iter()
         .skip(3)
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
         if majit_meta::majit_log_enabled() {
-            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating compiled code");
+            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating trace");
         }
+        // Null Ref slots indicate incomplete fail_args (OpRef::NONE for
+        // slots the trace didn't track). RPython's full resume data
+        // framework never produces null slots for live variables. Until
+        // pyre has complete resume data, invalidate compiled code and
+        // decay counters to prevent immediate recompilation.
         let (driver, _) = driver_pair();
-        let keys: Vec<u64> = driver.meta_interp().all_compiled_keys();
-        for key in keys {
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .abort_tracing(key, true);
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .clear_loop_token(key);
-        }
         driver.invalidate_all_compiled();
-        // warmstate.py:429 decay_all_counters — after invalidation,
-        // decay counters so the loop doesn't immediately re-trace on
-        // every backedge tick.
         driver.meta_interp_mut().warm_state_mut().decay_counters();
         return None;
     }
