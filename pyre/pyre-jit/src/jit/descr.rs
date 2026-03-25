@@ -208,6 +208,8 @@ pub struct PyreSizeDescr {
 
 pub const W_INT_GC_TYPE_ID: u32 = 0;
 pub const W_FLOAT_GC_TYPE_ID: u32 = 1;
+/// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
+pub const JITFRAME_GC_TYPE_ID: u32 = 2;
 
 impl Descr for PyreSizeDescr {
     fn index(&self) -> u32 {

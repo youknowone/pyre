@@ -338,7 +338,7 @@ pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
         jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
             create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as usize,
             drop_fn_addr: jit_drop_callee_frame as usize,
-            jitframe_tid: 0, // TODO: register JitFrame type with GC
+            jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
             jitframe_fixed_size: JITFRAME_FIXED_SIZE,
             jf_frame_info_ofs: JF_FRAME_INFO_OFS,
             jf_descr_ofs: JF_DESCR_OFS,
