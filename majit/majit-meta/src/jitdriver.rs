@@ -1564,10 +1564,14 @@ impl<S: JitState> JitDriver<S> {
         let restored = resume_pc.is_some();
         if restored {
             self.sync_after(state, &exit_meta, descriptor.as_ref());
-            // TODO: start_bridge_tracing causes stack underflow — PyreSym
-            // initialization doesn't reflect guard failure frame state.
-            // Disabled until rebuild_state_after_failure is implemented.
-            if false && should_bridge {
+            // RPython compile.py:696 handle_fail → _trace_and_compile_from_bridge.
+            // Only start bridge tracing from the MetaInterp path if the
+            // Cranelift-level callback did NOT already handle bridge
+            // compilation synchronously (via PENDING_BRIDGE_REQUEST consumed
+            // inside on_guard_failure). For CALL_ASSEMBLER guard failures,
+            // the Cranelift shim fires with the callee loop's green_key
+            // which is more specific than the caller's green_key here.
+            if should_bridge && !self.is_tracing() {
                 self.start_bridge_tracing(
                     green_key,
                     trace_id,
