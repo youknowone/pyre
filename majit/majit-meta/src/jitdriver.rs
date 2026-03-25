@@ -483,17 +483,28 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
-                    let mut meta = self.trace_meta.take().unwrap();
-                    // RPython compile_and_run_once parity: function-entry traces
-                    // (header_pc=0) update meta pre-compile. Backedge traces
-                    // update post-compile on success only.
+                    let provisional_meta = self.trace_meta.take().unwrap();
+                    // pyjitpl.py:3158-3175 compile_loop parity: rebuild meta
+                    // from the MergePoint that matched at close time.
+                    // Gate: function-entry (header_pc=0) only until
+                    // compile_loop+raise_if_successful is fully ported.
                     let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
-                    let cut = self.meta.cross_loop_cut_info();
-                    if hpc == Some(0) {
-                        if let Some((cut_pc, ref cut_types)) = cut {
-                            S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                    let meta = match hpc {
+                        Some(0) => {
+                            if let Some((cut_pc, ref cut_types)) =
+                                self.meta.cross_loop_cut_info()
+                            {
+                                S::build_meta_from_merge_point(
+                                    &provisional_meta,
+                                    cut_pc,
+                                    cut_types,
+                                )
+                            } else {
+                                provisional_meta
+                            }
                         }
-                    }
+                        _ => provisional_meta,
+                    };
                     let outcome = self.meta.close_and_compile(&jump_args, meta);
                     // Backedge traces: update merge_pc post-compile on success.
                     if hpc != Some(0) {
@@ -552,14 +563,25 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
-                    let mut meta = self.trace_meta.take().unwrap();
+                    let provisional_meta = self.trace_meta.take().unwrap();
+                    // pyjitpl.py:3158-3175 compile_loop parity (see CloseLoop above).
                     let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
-                    let cut = self.meta.cross_loop_cut_info();
-                    if hpc == Some(0) {
-                        if let Some((cut_pc, ref cut_types)) = cut {
-                            S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                    let meta = match hpc {
+                        Some(0) => {
+                            if let Some((cut_pc, ref cut_types)) =
+                                self.meta.cross_loop_cut_info()
+                            {
+                                S::build_meta_from_merge_point(
+                                    &provisional_meta,
+                                    cut_pc,
+                                    cut_types,
+                                )
+                            } else {
+                                provisional_meta
+                            }
                         }
-                    }
+                        _ => provisional_meta,
+                    };
                     let outcome = self.meta.close_and_compile(&jump_args, meta);
                     if hpc != Some(0) {
                         if let crate::pyjitpl::CompileOutcome::Compiled {

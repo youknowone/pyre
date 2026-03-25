@@ -146,6 +146,24 @@ pub trait JitState: Sized {
     ) {
     }
 
+    /// pyjitpl.py:3158-3175 compile_loop parity: build final meta from
+    /// the MergePoint that matched at close time, not from the trace start.
+    ///
+    /// RPython's compile_loop extracts greenkey and inputargs from
+    /// `original_boxes` (which comes from `current_merge_points[j]`).
+    /// This method rebuilds the meta entirely from MergePoint data,
+    /// replacing the post-patch `update_meta_for_cut` band-aid.
+    fn build_meta_from_merge_point(
+        provisional: &Self::Meta,
+        header_pc: usize,
+        original_box_types: &[Type],
+    ) -> Self::Meta {
+        // Default: clone + patch (backward compat for non-pyre consumers)
+        let mut meta = provisional.clone();
+        Self::update_meta_for_cut(&mut meta, header_pc, original_box_types);
+        meta
+    }
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]);
 
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
