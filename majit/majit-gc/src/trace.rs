@@ -16,6 +16,17 @@ pub struct TypeRegistry {
     entries: Vec<TypeInfo>,
 }
 
+/// Custom trace function type.
+///
+/// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
+/// When set, the GC calls this instead of the generic offset-based
+/// tracing. Used for types with dynamic GC reference layouts
+/// (e.g. JitFrame with gcmap bitmap).
+///
+/// `obj_addr` is the object payload start. The callback `f` must be
+/// called for each GC reference slot address.
+pub type CustomTraceFn = unsafe fn(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef));
+
 /// Information about a GC-managed type.
 pub struct TypeInfo {
     /// Fixed size of the object (excluding header), or base size for varsize objects.
@@ -31,6 +42,9 @@ pub struct TypeInfo {
     /// For variable-size objects: whether items contain GC pointers.
     /// If true, each item is treated as a GcRef.
     pub items_have_gc_ptrs: bool,
+    /// RPython `rgc.register_custom_trace_hook` parity.
+    /// When set, overrides offset-based tracing entirely.
+    pub custom_trace: Option<CustomTraceFn>,
 }
 
 impl TypeInfo {
@@ -43,6 +57,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            custom_trace: None,
         }
     }
 
@@ -57,6 +72,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            custom_trace: None,
         }
     }
 
@@ -75,6 +91,22 @@ impl TypeInfo {
             item_size,
             length_offset,
             items_have_gc_ptrs,
+            custom_trace: None,
+        }
+    }
+
+    /// Create a type info with a custom trace hook.
+    ///
+    /// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
+    pub fn with_custom_trace(size: usize, trace_fn: CustomTraceFn) -> Self {
+        TypeInfo {
+            size,
+            has_gc_ptrs: true,
+            gc_ptr_offsets: Vec::new(),
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: Some(trace_fn),
         }
     }
 
@@ -93,6 +125,13 @@ impl TypeInfo {
     /// `obj_addr` must point to valid memory of at least `self.size` bytes (plus
     /// variable part if applicable).
     pub unsafe fn for_each_gc_ptr(&self, obj_addr: usize, mut f: impl FnMut(*mut GcRef)) {
+        // RPython custom_trace_hook parity: if a custom trace function
+        // is registered, use it instead of generic offset-based tracing.
+        if let Some(trace_fn) = self.custom_trace {
+            trace_fn(obj_addr, &mut f);
+            return;
+        }
+
         // Fixed-part GC pointer fields.
         for &offset in &self.gc_ptr_offsets {
             f((obj_addr + offset) as *mut GcRef);

@@ -66,6 +66,8 @@ thread_local! {
         let w_float_tid =
             gc.register_type(TypeInfo::simple(std::mem::size_of::<W_FloatObject>()));
         debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
+        // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
+        let _jitframe_tid = gc.register_type(majit_meta::jitframe::jitframe_type_info());
         d.set_gc_allocator(Box::new(gc));
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
         d.register_raw_int_force_helper(crate::call_jit::jit_force_recursive_call_raw_1 as *const ());
