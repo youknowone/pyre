@@ -196,6 +196,10 @@ pub struct JitDriver<S: JitState> {
     descriptor: Option<JitDriverStaticData>,
     /// Bridge tracing state: (green_key, trace_id, fail_index).
     bridge_info: Option<(u64, u64, u32)>,
+    /// RPython pyjitpl.py:3101 parity: true when the current bridge
+    /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
+    /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
+    pub last_bridge_is_exception_guard: bool,
     /// Additional entry points sharing this driver's compiled loops.
     entry_points: Vec<EntryPoint>,
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
@@ -242,6 +246,7 @@ impl<S: JitState> JitDriver<S> {
             trace_meta: None,
             descriptor: None,
             bridge_info: None,
+            last_bridge_is_exception_guard: false,
             entry_points: Vec::new(),
             is_recursive: false,
             epoch_qmut,
@@ -1968,10 +1973,10 @@ impl<S: JitState> JitDriver<S> {
 
         let live_values = state.extract_live(&trace_meta);
 
-        if !self
-            .meta
-            .start_retrace_from_guard(green_key, trace_id, fail_index, &live_values)
-        {
+        let (ok, is_exception_guard) =
+            self.meta
+                .start_retrace_from_guard(green_key, trace_id, fail_index, &live_values);
+        if !ok {
             return false;
         }
 
@@ -1983,6 +1988,13 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref mut ctx) = self.meta.tracing {
             ctx.clear_merge_points();
         }
+
+        // RPython pyjitpl.py:3101 _prepare_exception_resumption parity:
+        // For exception guard bridges, the caller should emit
+        // SAVE_EXC_CLASS + SAVE_EXCEPTION at the trace start.
+        // Store the flag so it's accessible to the pyre-jit caller.
+        self.last_bridge_is_exception_guard = is_exception_guard;
+
         true
     }
 

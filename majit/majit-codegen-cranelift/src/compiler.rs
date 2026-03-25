@@ -460,6 +460,16 @@ pub fn jit_exc_is_pending() -> bool {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// RPython cpu.grab_exc_value parity: read exception class from TLS.
+pub fn jit_exc_class_raw() -> i64 {
+    JIT_EXC_TYPE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RPython cpu.grab_exc_value parity: read exception value from TLS.
+pub fn jit_exc_value_raw() -> i64 {
+    JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn take_pending_jit_exception_state() -> (i64, GcRef) {
     let value = JIT_EXC_VALUE.swap(0, std::sync::atomic::Ordering::Relaxed);
     let exc_type = JIT_EXC_TYPE.swap(0, std::sync::atomic::Ordering::Relaxed);

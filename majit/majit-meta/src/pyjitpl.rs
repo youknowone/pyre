@@ -4189,20 +4189,36 @@ impl<M: Clone> MetaInterp<M> {
     /// guard failure point. The resulting trace replaces the original guard.
     ///
     /// Returns true if retracing was started.
+    /// RPython pyjitpl.py:2890 handle_guard_failure parity:
+    /// Initialize bridge tracing from a guard failure point.
+    /// Returns (success, is_exception_guard) so the caller can emit
+    /// SAVE_EXC_CLASS + SAVE_EXCEPTION ops for exception bridges.
     pub fn start_retrace_from_guard(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         _fail_values: &[i64],
-    ) -> bool {
+    ) -> (bool, bool) {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
-            None => return false,
+            None => return (false, false),
         };
+
+        // RPython compile.py:932 invent_fail_descr_for_op:
+        // GUARD_EXCEPTION / GUARD_NO_EXCEPTION → ResumeGuardExcDescr.
+        // Check the guard's opcode to determine if this is an exception guard.
+        let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+        let is_exception_guard = Self::trace_for_exit(compiled, norm_tid)
+            .and_then(|(_, trace)| {
+                let idx = *trace.guard_op_indices.get(&fail_index)?;
+                Some(trace.ops.get(idx)?.opcode.is_guard_exception())
+            })
+            .unwrap_or(false);
+
         let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
             Some(descr) => descr,
-            None => return false,
+            None => return (false, false),
         };
 
         let recorder = self.warm_state.start_retrace(&fail_descr.fail_arg_types);
@@ -4210,11 +4226,31 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
+        // RPython pyjitpl.py:3101 _prepare_exception_resumption:
+        // For exception guards, the caller should call
+        // emit_exception_bridge_prologue(exc_class, exc_value) to emit
+        // SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at trace start.
+
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
 
-        true
+        (true, is_exception_guard)
+    }
+
+    /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
+    /// pyjitpl.py:3132 prepare_resume_from_failure parity:
+    /// Emit SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at
+    /// the bridge trace start for exception guard bridges.
+    pub fn emit_exception_bridge_prologue(&mut self, exc_class: i64, exc_value: i64) {
+        let Some(ref mut ctx) = self.tracing else {
+            return;
+        };
+        let class_const = ctx.const_int(exc_class);
+        let value_const = ctx.const_int(exc_value);
+        let class_op = ctx.record_op(OpCode::SaveExcClass, &[class_const]);
+        let value_op = ctx.record_op(OpCode::SaveException, &[value_const]);
+        ctx.record_op(OpCode::RestoreException, &[class_op, value_op]);
     }
 
     // ── Guard Failure Recovery ─────────────────────────────────
@@ -4942,6 +4978,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
+            .0
     }
 
     // ── Inlining Support ──────────────────────────────────────
@@ -6900,7 +6937,7 @@ mod tests {
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta.compiled_loops[&green_key].root_trace_id;
 
-        assert!(meta.start_retrace_from_guard(green_key, trace_id, 0, &[]));
+        assert!(meta.start_retrace_from_guard(green_key, trace_id, 0, &[]).0);
 
         let mut ctx = meta.tracing.take().expect("expected active bridge trace");
         ctx.recorder.close_loop(&[OpRef(0), OpRef(1)]);
