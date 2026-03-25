@@ -45,6 +45,48 @@ const fn tag_const(value: i64, tagbits: i64) -> i64 {
     (value << 2) | tagbits
 }
 
+/// RPython resume.py:134 NumberingState(resumecode.Writer).
+/// Extends Writer with per-guard numbering state.
+pub struct NumberingState {
+    /// resumecode.Writer fields (inlined, not inherited).
+    pub writer: crate::resumecode::Writer,
+    /// resume.py:137 liveboxes — box → tagged number mapping.
+    pub liveboxes: HashMap<u32, i16>,
+    /// resume.py:138 num_boxes — count of TAGBOX-numbered boxes.
+    pub num_boxes: i32,
+    /// resume.py:139 num_virtuals — count of TAGVIRTUAL-numbered virtuals.
+    pub num_virtuals: i32,
+}
+
+impl NumberingState {
+    pub fn new(size_hint: usize) -> Self {
+        NumberingState {
+            writer: crate::resumecode::Writer::new(size_hint),
+            liveboxes: HashMap::new(),
+            num_boxes: 0,
+            num_virtuals: 0,
+        }
+    }
+
+    /// Delegate to writer.
+    pub fn append_short(&mut self, item: i16) {
+        self.writer.append_short(item as i32);
+    }
+
+    pub fn append_int(&mut self, item: i32) {
+        self.writer.append_int(item);
+    }
+
+    pub fn patch_current_size(&mut self, index: usize) {
+        self.writer.patch_current_size(index);
+    }
+
+    /// Create the final encoded numbering bytes.
+    pub fn create_numbering(&self) -> Vec<u8> {
+        self.writer.create_numbering()
+    }
+}
+
 // Two low bits are reserved for the tag.
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
