@@ -89,6 +89,10 @@ pub(crate) struct CompiledTrace {
     pub(crate) exit_layouts: HashMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
     pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
+    /// opencoder.py parity: per-guard snapshots from tracing time.
+    /// Indexed by the guard's rd_resume_position. Used for snapshot-based
+    /// resume data reconstruction (independent of optimizer's fail_args).
+    pub(crate) snapshots: Vec<majit_trace::recorder::Snapshot>,
     /// bridgeopt.py: serialized optimizer knowledge per guard, keyed by fail_index.
     /// Each guard gets the optimizer knowledge state at its point in the trace.
     /// Used by deserialize_optimizer_knowledge when compiling a bridge.
@@ -1577,6 +1581,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             trace
         };
+        let trace_snapshots = trace.snapshots.clone();
 
         let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 
@@ -1859,6 +1864,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
+                        snapshots: trace_snapshots,
                         optimizer_knowledge: HashMap::new(), // TODO: serialize from optimizer
                     },
                 );
@@ -2321,6 +2327,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
+                        snapshots: Vec::new(),
                         inputargs: inputargs.clone(),
                         resume_data,
                         ops: combined_ops,
@@ -2638,6 +2645,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
+                        snapshots: Vec::new(),
                         inputargs: trace.inputargs.clone(),
                         resume_data,
                         ops: optimized_ops,
@@ -4181,6 +4189,7 @@ impl<M: Clone> MetaInterp<M> {
                     compiled.traces.insert(
                         bridge_trace_id,
                         CompiledTrace {
+                            snapshots: Vec::new(),
                             inputargs: bridge_inputargs.to_vec(),
                             resume_data,
                             ops: optimized_ops,

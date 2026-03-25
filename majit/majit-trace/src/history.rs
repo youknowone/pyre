@@ -14,12 +14,32 @@ pub struct TreeLoop {
     pub inputargs: Vec<InputArg>,
     /// The recorded operations, in execution order.
     pub ops: Vec<Op>,
+    /// opencoder.py parity: per-guard snapshots captured during tracing.
+    /// Indexed by the guard op's `rd_resume_position`.
+    pub snapshots: Vec<crate::recorder::Snapshot>,
 }
 
 impl TreeLoop {
     /// Create a new trace from input arguments and operations.
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
-        TreeLoop { inputargs, ops }
+        TreeLoop {
+            inputargs,
+            ops,
+            snapshots: Vec::new(),
+        }
+    }
+
+    /// Create a new trace with snapshots.
+    pub fn with_snapshots(
+        inputargs: Vec<InputArg>,
+        ops: Vec<Op>,
+        snapshots: Vec<crate::recorder::Snapshot>,
+    ) -> Self {
+        TreeLoop {
+            inputargs,
+            ops,
+            snapshots,
+        }
     }
 
     /// Number of operations in the trace.
