@@ -837,23 +837,16 @@ fn restore_guard_failure_for_loop(
         );
     }
 
-    // RPython handle_fail → _trace_and_compile_from_bridge parity:
-    // If a bridge compilation was requested (guard failure count >= threshold),
-    // compile the bridge now while the frame is in a restored state.
-    if let Some((bridge_gk, bridge_tid, bridge_fidx, bridge_pc)) =
-        crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take())
-    {
-        if restored {
-            let frame = unsafe { &mut *(jit_state.frame as *mut PyFrame) };
-            crate::call_jit::jit_bridge_compile_for_guard(
-                bridge_gk,
-                bridge_tid,
-                bridge_fidx,
-                frame,
-                bridge_pc,
-            );
-        }
-    }
+    // Discard pending bridge requests from call_assembler_guard_failure.
+    // MetaInterp bridge compilation (RPython handle_fail →
+    // _trace_and_compile_from_bridge) requires the jitdriver-level
+    // guard failure counting path (run_compiled_detailed_with_bridge_keyed
+    // → should_compile_bridge_in_trace → start_bridge_tracing) which
+    // is the orthodox RPython bridge entry point.
+    // The PENDING_BRIDGE_REQUEST path (Cranelift shim → pyre callback)
+    // bypasses RPython's control flow and causes infinite guard-fail
+    // loops when the bridge doesn't match the expected trace structure.
+    crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
 }
