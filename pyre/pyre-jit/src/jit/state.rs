@@ -4763,6 +4763,14 @@ impl MIFrame {
                     pc, handler_pc, err
                 );
             }
+
+            // Exception path during root trace: emit GUARD_EXCEPTION then
+            // ABORT the trace. The exception path will be compiled as a
+            // bridge later (RPython parity: exception paths are bridges,
+            // not main loops). This prevents exception-path compiled code
+            // from being the main loop, which causes guard failure stack
+            // mismatch when the normal (non-exception) path runs.
+            //
             // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
             // The guard asserts this specific exception type was raised.
             // At runtime, if a different exception (or none) occurs, the
@@ -4778,36 +4786,12 @@ impl MIFrame {
                 this.record_guard(ctx, majit_ir::OpCode::GuardException, &[exc_type_const]);
             });
 
-            let frame =
-                unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
-            let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
-            while frame.valuestackdepth > target_depth {
-                frame.pop();
-            }
-            if entry.push_lasti {
-                frame.push(w_int_new(pc as i64));
-            }
-            frame.push(exc_obj);
-
-            let exc_opref = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
-            let sym = self.sym_mut();
-            let target_stack_only = target_depth.saturating_sub(sym.nlocals);
-            sym.symbolic_stack.truncate(target_stack_only);
-            sym.symbolic_stack_types.truncate(target_stack_only);
-            sym.concrete_stack.truncate(target_stack_only);
-            if entry.push_lasti {
-                sym.symbolic_stack.push(OpRef::NONE);
-                sym.symbolic_stack_types.push(Type::Ref);
-                sym.concrete_stack
-                    .push(ConcreteValue::Ref(w_int_new(pc as i64)));
-            }
-            sym.symbolic_stack.push(exc_opref);
-            sym.symbolic_stack_types.push(Type::Ref);
-            sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
-            sym.valuestackdepth = sym.nlocals + sym.symbolic_stack.len();
-            sym.pending_next_instr = Some(handler_pc);
-
-            TraceAction::Continue
+            // Abort: exception path traces are compiled as bridges (RPython
+            // parity), not main loops. GUARD_EXCEPTION is already emitted
+            // above so the non-exception path is protected. The exception
+            // path will be handled by a bridge from GUARD_EXCEPTION when
+            // bridge infrastructure is ready.
+            TraceAction::Abort
         } else {
             if majit_meta::majit_log_enabled() {
                 eprintln!(
@@ -5882,6 +5866,18 @@ impl OpcodeStepExecutor for MIFrame {
     }
 
     /// RPython opimpl_raise (pyjitpl.py:1688).
+    /// RPython opimpl_goto_if_exception_mismatch (pyjitpl.py:1677).
+    fn check_exc_match(&mut self) -> Result<(), Self::Error> {
+        let _exc_type = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        let true_obj = pyre_object::w_bool_from(true);
+        let true_opref = self.with_ctx(|_this, ctx| ctx.const_ref(true_obj as i64));
+        <Self as SharedOpcodeHandler>::push_value(
+            self,
+            FrontendOp::new(true_opref, ConcreteValue::Ref(true_obj)),
+        )?;
+        Ok(())
+    }
+
     fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
         if argc == 0 {
             return Err(PyError::runtime_error("bare raise during tracing"));
