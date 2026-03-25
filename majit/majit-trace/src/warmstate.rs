@@ -298,6 +298,13 @@ pub enum HotResult {
 }
 
 impl WarmEnterState {
+    /// Check if the given green key corresponds to a known loop header
+    /// (a PC where back-edge counters have fired). Used by jit_merge_point
+    /// to avoid entering compiled code at non-loop-header PCs.
+    pub fn is_loop_header(&self, green_key: u64) -> bool {
+        self.cells.contains_key(&green_key)
+    }
+
     fn should_start_dont_trace_here_trace(
         &mut self,
         green_key_hash: u64,

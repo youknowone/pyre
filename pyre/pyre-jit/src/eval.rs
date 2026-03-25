@@ -252,7 +252,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // header. This ensures the trace captures the HOT path entry values,
     // not the EXIT path values from the last iteration.
     let mut pending_trace: Option<(u64, usize)> = None; // (green_key, loop_header_pc)
-
     loop {
         if frame.next_instr >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
@@ -267,6 +266,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // RPython: tracing starts at jit_merge_point when the counter
         // threshold was reached at the preceding backedge. The pending_trace
         // flag defers trace start from the backedge to the loop header.
+        // TODO: also move compiled entry here from can_enter_jit.
+        // Blocked by guard failure re-entry loop — needs bridge compilation.
         if is_portal {
             // Check pending_trace: start tracing at the loop header
             if let Some((key, header_pc)) = pending_trace {
