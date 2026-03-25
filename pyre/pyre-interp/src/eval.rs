@@ -812,7 +812,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let src = &*(source as *const pyre_object::dictobject::W_DictObject);
                 let entries = &*src.entries;
                 for &(k, v) in entries {
-                    pyre_object::w_dict_setitem(dict, k, v);
+                    pyre_object::w_dict_store(dict, k, v);
                 }
             }
         }
@@ -829,7 +829,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let src = &*(source as *const pyre_object::dictobject::W_DictObject);
                 let entries = &*src.entries;
                 for &(k, v) in entries {
-                    pyre_object::w_dict_setitem(dict, k, v);
+                    pyre_object::w_dict_store(dict, k, v);
                 }
             }
         }
@@ -844,11 +844,7 @@ impl OpcodeStepExecutor for PyFrame {
         let key = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);
         unsafe {
-            if pyre_object::is_int(key) {
-                let k = pyre_object::w_int_get_value(key);
-                pyre_object::w_dict_setitem(dict, k, value);
-            }
-            // Phase 1: only int keys supported in dict
+            pyre_object::w_dict_store(dict, key, value);
         }
         Ok(())
     }
@@ -957,30 +953,37 @@ impl OpcodeStepExecutor for PyFrame {
         // be prepended for those.
         // PyPy: LOOKUP_METHOD checks whether the attr came from a
         // non-data descriptor that is a plain function (not staticmethod).
-        let bind_self = unsafe {
+        // Determine what to bind as null_or_self.
+        // PyPy: LOOKUP_METHOD resolves descriptors and decides binding.
+        //  - regular method → bind instance (self)
+        //  - classmethod → bind class (w_type)
+        //  - staticmethod → no binding (NULL)
+        //  - builtin type method (list.append etc.) → bind instance
+        let bound = unsafe {
             if pyre_object::is_instance(obj) {
-                // User-defined instance: bind self unless staticmethod/classmethod
                 let w_type = pyre_object::w_instance_get_type(obj);
                 let raw = pyre_runtime::space::lookup_in_type_mro_pub(w_type, name);
                 match raw {
-                    Some(d) if pyre_object::is_staticmethod(d) => false,
-                    Some(d) if pyre_object::is_classmethod(d) => false,
-                    _ => true,
+                    Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
+                    // PyPy: ClassMethod.__get__ → Method(func, klass)
+                    Some(d) if pyre_object::is_classmethod(d) => w_type,
+                    _ => obj, // regular method: bind self
                 }
+            } else if pyre_object::is_type(obj) {
+                // Type object: check for classmethod in type's MRO
+                let raw = pyre_runtime::space::lookup_in_type_mro_pub(obj, name);
+                match raw {
+                    // PyPy: ClassMethod.__get__(obj, klass) → bind class
+                    Some(d) if pyre_object::is_classmethod(d) => obj,
+                    _ => PY_NULL,
+                }
+            } else if pyre_runtime::is_builtin_func(attr) && !pyre_object::is_module(obj) {
+                obj // builtin type method: bind self
             } else {
-                // Builtin type method (list.append, str.join, etc.)
-                // If attr is a builtin function found via builtin_type_method,
-                // it expects self as first arg.
-                pyre_runtime::is_builtin_func(attr)
-                    && !pyre_object::is_module(obj)
-                    && !pyre_object::is_type(obj)
+                PY_NULL
             }
         };
-        if bind_self {
-            self.push(obj);
-        } else {
-            self.push(PY_NULL);
-        }
+        self.push(bound);
         Ok(())
     }
 

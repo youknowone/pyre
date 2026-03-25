@@ -4,8 +4,9 @@ use std::sync::OnceLock;
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_int, is_list, is_range_iter, is_seq_iter, is_tuple,
-    w_dict_new, w_dict_setitem, w_int_get_value, w_list_getitem, w_list_len, w_list_new,
-    w_range_iter_has_next, w_range_iter_next, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    w_dict_new, w_dict_setitem, w_dict_store, w_int_get_value, w_list_getitem, w_list_len,
+    w_list_new, w_range_iter_has_next, w_range_iter_next, w_tuple_getitem, w_tuple_len,
+    w_tuple_new,
 };
 
 use crate::{
@@ -301,9 +302,7 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
         let key = pair[0];
         let value = pair[1];
         unsafe {
-            if is_int(key) {
-                w_dict_setitem(dict, w_int_get_value(key), value);
-            }
+            w_dict_store(dict, key, value);
         }
     }
     dict
