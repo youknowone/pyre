@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::OnceLock;
 
 use pyre_object::excobject::EXCEPTION_TYPE;
 use pyre_object::pyobject::{
@@ -9,24 +8,24 @@ use pyre_object::pyobject::{
 
 use crate::{BUILTIN_FUNC_TYPE, FUNCTION_TYPE, w_builtin_func_name, w_func_get_name};
 
-/// Callback to call a dunder method (e.g. __repr__) on an instance.
-/// Registered by pyre-interp at startup.
-type DunderCaller = fn(PyObjectRef, &str) -> Option<PyObjectRef>;
-pub static DUNDER_CALLER: OnceLock<DunderCaller> = OnceLock::new();
-
-/// Register the dunder method caller (from pyre-interp).
-pub fn register_dunder_caller(f: DunderCaller) {
-    let _ = DUNDER_CALLER.set(f);
-}
-
-/// Try to call a dunder method (__repr__, __str__, etc.) on an object.
+/// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
+///
+/// PyPy: `space.call_function(space.lookup(w_obj, name), w_obj)`
+/// Uses the unified `space_call_function` instead of a dedicated callback.
 fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
-    let caller = DUNDER_CALLER.get()?;
-    let result = caller(obj, name)?;
-    if result.is_null() {
-        return None;
-    }
     unsafe {
+        if !pyre_object::is_instance(obj) {
+            return None;
+        }
+        let w_type = pyre_object::w_instance_get_type(obj);
+        let method = crate::space::lookup_in_type_mro_pub(w_type, name)?;
+        if method.is_null() {
+            return None;
+        }
+        let result = crate::space_call_function(method, &[obj]);
+        if result.is_null() {
+            return None;
+        }
         if pyre_object::is_str(result) {
             return Some(pyre_object::w_str_get_value(result).to_string());
         }

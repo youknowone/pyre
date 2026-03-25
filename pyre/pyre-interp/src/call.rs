@@ -304,46 +304,43 @@ pub fn call_callable_inline_residual(
 /// Called at startup from pyre-jit or pyrex.
 pub fn register_build_class() {
     pyre_runtime::register_build_class_impl(real_build_class);
-    pyre_runtime::space::register_property_callers(property_caller_1, property_caller_2);
-    pyre_runtime::space::register_dunder_binop_caller(dunder_binop_caller);
-    pyre_runtime::space::register_dunder_unary_caller(dunder_unary_caller);
-    pyre_runtime::register_dunder_caller(dunder_method_caller);
+    pyre_runtime::register_space_call_function(space_call_function_impl);
 }
 
-/// Call a user function with 1 arg (property fget).
-fn property_caller_1(func: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
-    call_user_func_with_args(func, &[arg])
-}
-
-/// Call a user function with 2 args (property fset).
-fn property_caller_2(func: PyObjectRef, arg0: PyObjectRef, arg1: PyObjectRef) -> PyObjectRef {
-    call_user_func_with_args(func, &[arg0, arg1])
-}
-
-/// Call a dunder unary method(obj) — for __neg__, __bool__, etc.
-fn dunder_unary_caller(method: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
-    call_user_func_with_args(method, &[obj])
-}
-
-/// Call a dunder binop method(a, b) — for __add__, __eq__, etc.
-fn dunder_binop_caller(method: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
-    call_user_func_with_args(method, &[a, b])
-}
-
-/// Call a dunder method on obj — for __repr__, __str__, __bool__, etc.
-/// Looks up method_name in obj's type MRO, then calls it.
-fn dunder_method_caller(obj: PyObjectRef, method_name: &str) -> Option<PyObjectRef> {
+/// Unified `space.call_function(callable, *args)` implementation.
+///
+/// PyPy: baseobjspace.py `call_function` — the single entry point for
+/// calling any Python callable. Dispatches to builtins, user functions,
+/// and type objects.
+///
+/// Registered into pyre-runtime via `register_space_call_function`.
+fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     unsafe {
-        if !pyre_object::is_instance(obj) {
-            return None;
+        // Builtin function: direct Rust call
+        if pyre_runtime::is_builtin_func(callable) {
+            let func = pyre_runtime::w_builtin_func_get(callable);
+            return func(args);
         }
-        let w_type = pyre_object::w_instance_get_type(obj);
-        let method = pyre_runtime::space::py_getattr(w_type, method_name).ok()?;
-        if method.is_null() {
-            return None;
+        // User function: create frame + eval
+        if pyre_runtime::is_func(callable) {
+            return call_user_func_with_args(callable, args);
         }
-        Some(call_user_func_with_args(method, &[obj]))
+        // Type object: instance creation
+        if pyre_object::is_type(callable) {
+            // Minimal: create instance + call __init__
+            let instance = pyre_object::w_instance_new(callable);
+            if let Ok(init_fn) = pyre_runtime::space::py_getattr(callable, "__init__") {
+                let mut init_args = Vec::with_capacity(1 + args.len());
+                init_args.push(instance);
+                init_args.extend_from_slice(args);
+                let _ = space_call_function_impl(init_fn, &init_args);
+            }
+            return instance;
+        }
     }
+    panic!("space_call_function: '{}' object is not callable", unsafe {
+        (*(*callable).ob_type).tp_name
+    });
 }
 
 /// Helper: call a user function with arbitrary args from descriptor context.

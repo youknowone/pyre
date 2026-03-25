@@ -419,23 +419,20 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 ///   1. Try `a.__op__(b)` (forward)
 ///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
 unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    let caller = DUNDER_BINOP_CALLER.get()?;
-
-    // Forward: a.__op__(b)
+    // Forward: a.__op__(b) — PyPy: space.call_function(method, a, b)
     if is_instance(a) {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_mro(w_type, dunder) {
-            return Some(Ok(caller(method, a, b)));
+            return Some(Ok(crate::space_call_function(method, &[a, b])));
         }
     }
 
     // Reverse: b.__rop__(a) — PyPy: descroperation.py _binop_impl step 2
     if is_instance(b) {
-        let rdunder = reverse_dunder(dunder);
-        if let Some(rdunder) = rdunder {
+        if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
-                return Some(Ok(caller(method, b, a)));
+                return Some(Ok(crate::space_call_function(method, &[b, a])));
             }
         }
     }
@@ -464,29 +461,16 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 }
 
 /// Try to call a unary dunder on an instance.
+///
+/// PyPy: `space.call_function(space.lookup(w_obj, dunder), w_obj)`
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_mro(w_type, dunder) {
-            let caller = DUNDER_UNARY_CALLER.get()?;
-            return Some(Ok(caller(method, a)));
+            return Some(Ok(crate::space_call_function(method, &[a])));
         }
     }
     None
-}
-
-type BinopCaller = fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef;
-type UnaryCaller = fn(PyObjectRef, PyObjectRef) -> PyObjectRef;
-static DUNDER_BINOP_CALLER: std::sync::OnceLock<BinopCaller> = std::sync::OnceLock::new();
-static DUNDER_UNARY_CALLER: std::sync::OnceLock<UnaryCaller> = std::sync::OnceLock::new();
-
-/// Register dunder caller callbacks (from pyre-interp).
-pub fn register_dunder_binop_caller(f: BinopCaller) {
-    let _ = DUNDER_BINOP_CALLER.set(f);
-}
-
-pub fn register_dunder_unary_caller(f: UnaryCaller) {
-    let _ = DUNDER_UNARY_CALLER.set(f);
 }
 
 /// Binary operation dispatch.
@@ -1376,42 +1360,21 @@ unsafe fn call_descriptor_get(
         let descr_type = w_instance_get_type(descr);
         if let Some(get_fn) = lookup_in_type_mro(descr_type, "__get__") {
             if !get_fn.is_null() {
-                // Call __get__(descr, obj, type)
-                if crate::is_builtin_func(get_fn) {
-                    let func = crate::w_builtin_func_get(get_fn);
-                    return Some(func(&[descr, obj, w_type]));
-                }
-                if crate::is_func(get_fn) {
-                    return PROPERTY_CALLER_2.with(|c| {
-                        let caller = c.get()?;
-                        // __get__(descr, obj) — simplified 2-arg call
-                        Some(caller(get_fn, descr, obj))
-                    });
-                }
+                // Call __get__(descr, obj, type) via space.call_function
+                return Some(crate::space_call_function(get_fn, &[descr, obj, w_type]));
             }
         }
     }
     None
 }
 
-/// Helper: call a function with one argument (builtin or user).
+/// Call a Python callable with one arg via space_call_function.
+///
+/// PyPy: `space.call_function(w_func, w_arg)`
 unsafe fn call_func_1(func: PyObjectRef, arg: PyObjectRef) -> Option<PyObjectRef> {
-    if crate::is_builtin_func(func) {
-        let f = crate::w_builtin_func_get(func);
-        return Some(f(&[arg]));
-    }
-    if crate::is_func(func) {
-        return PROPERTY_CALLER_1.with(|c| {
-            let caller = c.get()?;
-            Some(caller(func, arg))
-        });
-    }
-    None
+    Some(crate::space_call_function(func, &[arg]))
 }
 
-/// Call a property's __set__(obj, value).
-///
-/// PyPy: W_Property.set → call_function(w_fset, w_obj, w_value)
 /// Call a descriptor's __set__ method.
 ///
 /// PyPy: descroperation.py `descr__setattr__` →
@@ -1421,13 +1384,14 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
         return false;
     }
 
-    // property: PyPy W_Property.set → call fset(obj, value)
+    // property: PyPy W_Property.set → call_function(fset, obj, value)
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
             return false;
         }
-        return call_func_2(fset, obj, value);
+        crate::space_call_function(fset, &[obj, value]);
+        return true;
     }
 
     // General __set__: look up on descriptor's type MRO
@@ -1435,50 +1399,12 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
         let descr_type = w_instance_get_type(descr);
         if let Some(set_fn) = lookup_in_type_mro(descr_type, "__set__") {
             if !set_fn.is_null() {
-                // Call __set__(descr, obj, value)
-                return call_func_2(set_fn, obj, value);
+                crate::space_call_function(set_fn, &[obj, value]);
+                return true;
             }
         }
     }
     false
-}
-
-/// Helper: call a function with two arguments (builtin or user).
-unsafe fn call_func_2(func: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> bool {
-    if crate::is_builtin_func(func) {
-        let f = crate::w_builtin_func_get(func);
-        f(&[a, b]);
-        return true;
-    }
-    if crate::is_func(func) {
-        return PROPERTY_CALLER_2.with(|c| {
-            if let Some(caller) = c.get() {
-                caller(func, a, b);
-                true
-            } else {
-                false
-            }
-        });
-    }
-    false
-}
-
-thread_local! {
-    /// Callback for calling user functions from descriptor protocol.
-    /// Registered by pyre-interp at startup.
-    static PROPERTY_CALLER_1: std::cell::Cell<Option<fn(PyObjectRef, PyObjectRef) -> PyObjectRef>> =
-        const { std::cell::Cell::new(None) };
-    static PROPERTY_CALLER_2: std::cell::Cell<Option<fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Register property caller callbacks (from pyre-interp).
-pub fn register_property_callers(
-    f1: fn(PyObjectRef, PyObjectRef) -> PyObjectRef,
-    f2: fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef,
-) {
-    PROPERTY_CALLER_1.with(|c| c.set(Some(f1)));
-    PROPERTY_CALLER_2.with(|c| c.set(Some(f2)));
 }
 
 /// Set an attribute on an object: `obj.name = value`.
