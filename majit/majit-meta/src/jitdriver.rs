@@ -724,7 +724,7 @@ impl<S: JitState> JitDriver<S> {
                     let jump_args = S::collect_jump_args(sym);
                     if matches!(
                         self.meta.compile_trace(green_key, &jump_args, None),
-                        crate::pyjitpl::CompileOutcome::Compiled
+                        crate::pyjitpl::CompileOutcome::Compiled { .. }
                     ) {
                         self.sym = None;
                         self.trace_meta = None;
