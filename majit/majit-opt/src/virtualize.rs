@@ -1915,6 +1915,14 @@ impl Optimization for OptVirtualize {
                 self.optimize_escaping_op(op, ctx)
             }
 
+            // RecordKnownResult + CallPure must pass through to OptPure
+            // for @elidable constant folding. Must appear BEFORE is_call()
+            // since they are in the CALL opcode range.
+            OpCode::RecordKnownResult => OptimizationResult::PassOn,
+            OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
+                self.optimize_escaping_op(op, ctx)
+            }
+
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
@@ -2027,10 +2035,6 @@ impl Optimization for OptVirtualize {
                 ctx.replace_op(ref_opref, ctx.get_replacement(op.arg(1)));
                 OptimizationResult::Remove
             }
-
-            // RECORD_KNOWN_RESULT: record that a call with given args produces known result.
-            // Consumed by pure pass (CSE) — just remove here.
-            OpCode::RecordKnownResult => OptimizationResult::Remove,
 
             // Everything else passes through, but force any virtual args first
             _ => {
