@@ -1662,6 +1662,16 @@ impl<S: JitState> JitDriver<S> {
         self.meta.compiled_trace_has_float_guards(green_key)
     }
 
+    /// Check if the compiled trace is safe for bridge compilation.
+    pub fn compiled_trace_safe_for_bridge(
+        &self,
+        green_key: u64,
+        slot_types: &[majit_ir::Type],
+    ) -> bool {
+        self.meta
+            .compiled_trace_safe_for_bridge(green_key, slot_types)
+    }
+
     /// Remove all compiled code. Used when guard-fail recovery detects
     /// unrecoverable state (e.g., null Ref slots from incomplete
     /// resume data), preventing repeated entry→guard-fail loops.

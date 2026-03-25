@@ -740,7 +740,8 @@ fn restore_guard_failure_for_loop(
     }
 
     // Discard pending bridge requests. Bridge compilation requires
-    // proper guard type propagation to be safe (TODO).
+    // proper guard type propagation through the bridge body loop
+    // before it can be safely enabled (TODO: RPython bridge parity).
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
