@@ -169,10 +169,36 @@ pub struct Optimizer {
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
+    // First check ops for result type (for inline constants),
+    // then fall back to Int.
     let result_type = ops
         .iter()
         .find(|op| op.pos == opref)
         .map(|op| op.result_type())
+        .unwrap_or(Type::Int);
+    match result_type {
+        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
+        Type::Float => majit_ir::Value::Float(f64::from_bits(raw as u64)),
+        Type::Int | Type::Void => majit_ir::Value::Int(raw),
+    }
+}
+
+fn value_from_backend_constant_bits_typed(
+    opref: OpRef,
+    raw: i64,
+    ops: &[Op],
+    constant_types: &std::collections::HashMap<u32, Type>,
+) -> majit_ir::Value {
+    // Use explicit constant_types first (from ConstantPool),
+    // then fall back to ops result_type, then Int.
+    let result_type = constant_types
+        .get(&opref.0)
+        .copied()
+        .or_else(|| {
+            ops.iter()
+                .find(|op| op.pos == opref)
+                .map(|op| op.result_type())
+        })
         .unwrap_or(Type::Int);
     match result_type {
         Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),
@@ -1352,7 +1378,7 @@ impl Optimizer {
         for (&idx, &val) in constants.iter() {
             ctx.make_constant(
                 OpRef(idx),
-                value_from_backend_constant_bits(OpRef(idx), val, ops),
+                value_from_backend_constant_bits_typed(OpRef(idx), val, ops, &self.constant_types),
             );
         }
 
