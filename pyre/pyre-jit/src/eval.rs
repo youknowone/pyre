@@ -399,10 +399,6 @@ fn jit_merge_point_hook(
             let snapshot = Box::new(frame.snapshot_for_tracing());
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
-            // MetaInterp executed concretely on the snapshot frame.
-            // No writeback: the interpreter re-executes the traced iteration
-            // on the original frame, then compiled code takes over at the
-            // next back-edge. This matches the existing eval_loop_jit flow.
             action
         },
     ) {
@@ -774,15 +770,7 @@ fn restore_guard_failure_for_loop(
         );
     }
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
-    // RPython resume.py: materialize virtual objects from recovery_layout.
-    // Virtual slots in fail_args are NONE (null Ref); their field values
-    // are stored as extra fail_args. Reconstruct the concrete PyObject
-    // from the field values and replace the null slot.
     materialize_recovery_virtuals(&mut typed, exit_layout);
-    // After materialization, check for remaining null Ref slots.
-    // These represent either uninitialized locals or virtual objects
-    // that couldn't be materialized. Don't invalidate — just skip
-    // the restore and let the interpreter continue from scratch.
     let has_null_ref = typed
         .iter()
         .skip(3)
