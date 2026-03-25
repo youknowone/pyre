@@ -2047,26 +2047,35 @@ impl MIFrame {
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
-        // If parent_fail_args is set (inlined callee), use parent's
-        // state for guard recovery instead of callee's vable fields.
-        // RPython resume data encodes multi-frame (caller + callee).
-        // For pyre's single-frame blackhole, override ni (slot 1) with
-        // the callee's current PC so the blackhole resumes in the callee.
-        if let Some(ref pfa) = self.parent_fail_args {
-            let mut fail_args = pfa.clone();
-            // Slot 0 = frame ref (callee's virtualizable frame from parent).
-            // Slot 1 = ni: replace caller's CALL PC with callee's current PC.
-            self.with_ctx(|this, inner_ctx| {
-                this.flush_to_frame(inner_ctx);
-                let callee_ni = this.sym().vable_next_instr;
-                if fail_args.len() > 1 {
-                    fail_args[1] = callee_ni;
-                }
-            });
-            let types = self
+        // RPython opencoder.py:819 capture_resumedata parity:
+        // Inlined callee guards encode BOTH frames in fail_args:
+        //   [callee_frame, callee_ni, callee_vsd, callee_locals..., callee_stack...,
+        //    caller_frame, caller_ni, caller_vsd, caller_locals..., caller_stack...]
+        // blackhole_from_resumedata reads each section to build the chain.
+        if self.parent_fail_args.is_some() {
+            let parent_section = self.parent_fail_args.clone().unwrap();
+            // Build callee section from current MIFrame state.
+            self.flush_to_frame_for_guard(ctx);
+            let callee_types = self.build_single_frame_fail_arg_types();
+            let callee_section = self.build_single_frame_fail_args(ctx);
+            let callee_len = callee_section.len();
+
+            // Concatenate: [callee_section..., caller_section...]
+            let mut fail_args = callee_section;
+            fail_args.extend_from_slice(&parent_section);
+            let caller_len = parent_section.len();
+
+            let mut types = callee_types;
+            let caller_types = self
                 .parent_fail_arg_types
                 .clone()
-                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(fail_args.len()));
+                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(caller_len));
+            types.extend(caller_types);
+
+            // Use standard fail_descr. The decoder splits sections by
+            // finding the second [Ref, Int, Int] header pattern at offset
+            // callee_section_len, which equals 3 + callee_nlocals + callee_stack.
+            // This is stored in the exit_layout's resume_layout at compile time.
             ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
             return;
         }
