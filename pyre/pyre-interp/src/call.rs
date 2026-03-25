@@ -381,6 +381,7 @@ fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
 fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> PyResult {
     let code_ptr = unsafe { w_func_get_code_ptr(body_fn) };
     let globals = unsafe { w_func_get_globals(body_fn) };
+    let closure = unsafe { w_func_get_closure(body_fn) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
     // Create a fresh namespace for the class body (PyPy: w_locals for class scope)
@@ -388,8 +389,6 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     class_ns.fix_ptr();
     let class_ns_ptr = Box::into_raw(class_ns);
 
-    // Get execution context from the globals namespace (approximation)
-    // We need an execution context pointer; use the one from the function's globals.
     let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
     let exec_ctx = if stored.is_null() {
         std::ptr::null::<pyre_runtime::PyExecutionContext>()
@@ -397,9 +396,10 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
         stored
     };
 
-    // Create frame with class_locals set
-    // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals
-    let mut frame = PyFrame::new_with_namespace(func_code, exec_ctx, globals);
+    // Create frame with class_locals set AND closure from enclosing scope.
+    // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals,
+    // and the closure tuple is passed through for LOAD_DEREF access.
+    let mut frame = PyFrame::new_for_call_with_closure(func_code, &[], globals, exec_ctx, closure);
     frame.class_locals = class_ns_ptr;
 
     eval_frame_plain(&mut frame)?;
