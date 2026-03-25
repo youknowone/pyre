@@ -411,7 +411,12 @@ impl PtrInfo {
             if direct {
                 ctx.emit(op)
             } else {
-                ctx.emit_through_passes(op)
+                // RPython info.py:148,226: emit_extra(op) routes through
+                // passes AFTER the calling pass (Virtualize). This prevents
+                // OptVirtualize from re-absorbing the materialized New().
+                // The non-virtual PtrInfo (Struct/Instance) set on alloc_ref
+                // tells downstream passes this is materialized.
+                ctx.emit_through_passes_after(ctx.current_pass_idx, op)
             }
         };
 
@@ -493,6 +498,17 @@ impl PtrInfo {
                         .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
+                    // RPython: descriptors always exist — _fields[i] maps
+                    // to descr.get_all_fielddescrs()[i]. In pyre, field_descrs
+                    // is a separate list that should always be in sync with
+                    // fields. A missing descriptor indicates a structural
+                    // bug in field/descriptor propagation.
+                    debug_assert!(
+                        descr.is_some(),
+                        "force_to_ops: field_idx={} has value but no descriptor \
+                         — field_descrs out of sync with fields",
+                        field_idx,
+                    );
                     if let Some(descr) = descr {
                         let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
                         set_op.descr = Some(descr);
@@ -527,6 +543,17 @@ impl PtrInfo {
                         .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
+                    // RPython: descriptors always exist — _fields[i] maps
+                    // to descr.get_all_fielddescrs()[i]. In pyre, field_descrs
+                    // is a separate list that should always be in sync with
+                    // fields. A missing descriptor indicates a structural
+                    // bug in field/descriptor propagation.
+                    debug_assert!(
+                        descr.is_some(),
+                        "force_to_ops: field_idx={} has value but no descriptor \
+                         — field_descrs out of sync with fields",
+                        field_idx,
+                    );
                     if let Some(descr) = descr {
                         let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
                         set_op.descr = Some(descr);
