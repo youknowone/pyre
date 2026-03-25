@@ -2606,7 +2606,6 @@ impl Optimizer {
             }
 
             // Encode virtual metadata
-            let extra_start = original_len + extra_fail_args.len();
             match &info {
                 PtrInfo::Virtual(vinfo) => {
                     let mut fields = Vec::with_capacity(vinfo.fields.len());
@@ -2620,7 +2619,7 @@ impl Optimizer {
                                 final_ref = ctx.get_replacement(forced);
                             }
                         }
-                        let fa_index = extra_start + extra_fail_args.len();
+                        let fa_index = original_len + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
                         let descr_idx = vinfo
                             .field_descrs
@@ -2650,7 +2649,7 @@ impl Optimizer {
                                 final_ref = ctx.get_replacement(forced);
                             }
                         }
-                        let fa_index = extra_start + extra_fail_args.len();
+                        let fa_index = original_len + extra_fail_args.len();
                         extra_fail_args.push(final_ref);
                         let descr_idx = vinfo
                             .field_descrs
