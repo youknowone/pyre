@@ -363,10 +363,14 @@ fn jit_merge_point_hook(
         |ctx, sym| {
             let (driver, _) = driver_pair();
             driver.meta_interp_mut().tracing_call_depth = Some(current_depth);
-            let mut trace_frame = frame.snapshot_for_tracing();
-            let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
+            let snapshot = Box::new(frame.snapshot_for_tracing());
             let _ = concrete_frame;
-            trace_bytecode(ctx, sym, code, pc, trace_frame_ptr)
+            let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
+            // MetaInterp executed concretely on the snapshot frame.
+            // No writeback: the interpreter re-executes the traced iteration
+            // on the original frame, then compiled code takes over at the
+            // next back-edge. This matches the existing eval_loop_jit flow.
+            action
         },
     ) {
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {

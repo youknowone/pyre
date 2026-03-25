@@ -32,8 +32,9 @@ pub struct MetaInterpFrame {
 }
 
 impl MetaInterpFrame {
+    /// Root frame borrows sym from caller; inline frame owns its sym.
     fn is_inline(&self) -> bool {
-        self.owned_concrete_frame.is_some()
+        self.owned_sym.is_some()
     }
 
     fn concrete_frame_addr(&self) -> usize {
@@ -76,19 +77,17 @@ impl PyreMetaInterp {
                 return TraceAction::Abort;
             };
             let code = unsafe { &*top.jitcode };
-            let is_inline = top.is_inline();
-            // Inline frames use concrete_frame.next_instr as PC source
-            // (synchronized with concrete execution). Root frame uses top.pc.
-            let pc = if is_inline {
-                top.owned_concrete_frame.as_ref().unwrap().next_instr
-            } else {
-                top.pc
-            };
+            // RPython _interpret() parity: all frames use cf.next_instr as PC.
+            let pc = top
+                .owned_concrete_frame
+                .as_ref()
+                .map(|cf| cf.next_instr)
+                .unwrap_or(top.pc);
             if pc >= code.instructions.len() {
                 return TraceAction::Abort;
             }
 
-            let action = if is_inline {
+            let action = if top.is_inline() {
                 self.step_inline_frame(ctx, pc)
             } else {
                 self.step_root_frame(ctx, pc)
@@ -107,9 +106,10 @@ impl PyreMetaInterp {
         let top = self.framestack.last_mut().unwrap();
         let code = unsafe { &*top.jitcode };
         let sym = unsafe { &mut *top.sym };
+        let cf_addr = top.concrete_frame_addr();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
-        let mut fs = MIFrame::from_sym(ctx, sym, top.concrete_frame, fallthrough_pc);
+        let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc);
         let action = fs.trace_code_step(code, pc);
         let pending = fs.pending_inline_frame.take();
         drop(fs);
@@ -118,8 +118,14 @@ impl PyreMetaInterp {
             // RPython perform_call: callee deferred via pending_inline_frame.
             let top = self.framestack.last_mut().unwrap();
             let sym = unsafe { &mut *top.sym };
-            top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+            let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+            top.pc = next_pc;
             let result_idx = sym.stack_only_depth().checked_sub(1);
+            // Root frame: don't pop from owned_concrete_frame — interpreter
+            // drives concrete execution separately. Only sync PC.
+            if let Some(ref mut cf) = top.owned_concrete_frame {
+                cf.next_instr = next_pc;
+            }
             self.push_inline_frame(ctx, pending, result_idx);
             return LoopAction::Continue;
         }
@@ -128,7 +134,12 @@ impl PyreMetaInterp {
             TraceAction::Continue => {
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
-                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                top.pc = next_pc;
+                // Sync concrete frame PC with symbolic PC.
+                if let Some(ref mut cf) = top.owned_concrete_frame {
+                    cf.next_instr = next_pc;
+                }
                 LoopAction::Continue
             }
             TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
