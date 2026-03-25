@@ -90,6 +90,9 @@ pub struct CraneliftFailDescr {
     pub fail_index: u32,
     pub source_op_index: Option<usize>,
     pub trace_id: u64,
+    /// RPython resumedescr.original_greenkey parity: the green_key of
+    /// the compiled loop this guard belongs to.
+    pub green_key: u64,
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
     pub is_finish: bool,
@@ -189,6 +192,7 @@ impl CraneliftFailDescr {
             fail_index,
             source_op_index: None,
             trace_id,
+            green_key: 0,
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
