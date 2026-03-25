@@ -714,6 +714,22 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         exec_load_attr(self, name).map_err(Into::into)
     }
 
+    /// LOAD_ATTR with is_method=true. Default: push [attr, NULL].
+    ///
+    /// PyFrame overrides this to push [attr, self] for instance method
+    /// calls. The JIT tracer uses the default (no runtime branch), so
+    /// trace and concrete execution always agree in the shared path.
+    fn load_method(&mut self, name: &str) -> Result<(), Self::Error>
+    where
+        Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
+    {
+        let obj = self.pop_value().map_err(Into::into)?;
+        let attr_val = SharedOpcodeHandler::load_attr(self, obj, name).map_err(Into::into)?;
+        self.push_value(attr_val).map_err(Into::into)?;
+        let null = self.null_value().map_err(Into::into)?;
+        self.push_value(null).map_err(Into::into)
+    }
+
     fn store_attr(&mut self, name: &str) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
@@ -1319,16 +1335,12 @@ where
             let attr = namei.get(op_arg);
             let name_idx = attr.name_idx() as usize;
             let name = code.names[name_idx].as_ref();
-            // When is_method() is true, CALL expects [NULL_or_self, method, args...].
-            // Since pyre does not implement bound-method lookup, push NULL + attr.
             if attr.is_method() {
-                let obj = executor.pop_value()?;
-                let attr_val = SharedOpcodeHandler::load_attr(executor, obj, name)?;
-                let null = executor.null_value()?;
-                // Stack layout for CALL: [callable, null_or_self, args...]
-                // Push callable (attr) first, then NULL on top.
-                executor.push_value(attr_val)?;
-                executor.push_value(null)?;
+                // Delegate to load_method — the default pushes [attr, NULL].
+                // PyFrame overrides this to push [attr, self] for instance
+                // method calls. This avoids runtime branches in the shared
+                // path that would cause trace/concrete divergence.
+                executor.load_method(name)?;
             } else {
                 OpcodeStepExecutor::load_attr(executor, name)?;
             }

@@ -7621,7 +7621,7 @@ impl CraneliftBackend {
         for (_, block) in &label_blocks {
             builder.seal_block(*block);
         }
-        if label_blocks.is_empty() {
+        if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
         builder.finalize();

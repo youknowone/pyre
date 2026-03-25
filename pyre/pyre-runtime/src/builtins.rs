@@ -307,11 +307,28 @@ exc_constructor!(
     pyre_object::excobject::ExcKind::AssertionError
 );
 
-/// `__build_class__(body, name, *bases)` — stub for class creation.
-/// Phase 1: returns None (class bodies not yet executed).
+/// Callback type for the real __build_class__ implementation.
+///
+/// PyPy equivalent: pyopcode.py BUILD_CLASS calls space.call_function(metaclass, ...)
+/// pyre-runtime cannot depend on pyre-interp, so we use a registered callback.
+type BuildClassFn = fn(&[PyObjectRef]) -> PyObjectRef;
+
+static BUILD_CLASS_IMPL: std::sync::OnceLock<BuildClassFn> = std::sync::OnceLock::new();
+
+/// Register the real __build_class__ implementation from pyre-interp.
+pub fn register_build_class_impl(f: BuildClassFn) {
+    let _ = BUILD_CLASS_IMPL.set(f);
+}
+
+/// `__build_class__(body, name, *bases)` — class creation.
+///
+/// PyPy equivalent: pyopcode.py BUILD_CLASS
+/// Delegates to the registered implementation (in pyre-interp).
 fn builtin_build_class(args: &[PyObjectRef]) -> PyObjectRef {
-    let _ = args;
-    w_none()
+    if let Some(impl_fn) = BUILD_CLASS_IMPL.get() {
+        return impl_fn(args);
+    }
+    panic!("__build_class__ called but no implementation registered");
 }
 
 /// Get a reference to the `__build_class__` builtin function.

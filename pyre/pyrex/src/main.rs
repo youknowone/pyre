@@ -8,6 +8,7 @@ use lexopt::Arg::*;
 use lexopt::ValueExt;
 
 use pyre_bytecode::*;
+use pyre_interp::call;
 use pyre_interp::frame::PyFrame;
 use pyre_interp::importing;
 use pyre_jit::eval::eval_with_jit;
@@ -136,7 +137,12 @@ fn run_source(source: &str, mode: Mode) {
         }
     };
 
+    // Register __build_class__ callback (PyPy: setup_builtin_modules)
+    call::register_build_class();
+
     let execution_context = Rc::new(PyExecutionContext::default());
+    // Set execution context for __build_class__ to use
+    call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     let mut frame = PyFrame::new_with_context(code, execution_context);
     match eval_with_jit(&mut frame) {
         Ok(result) => {

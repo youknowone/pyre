@@ -207,13 +207,27 @@ impl LocalOpcodeHandler for PyFrame {
 }
 
 impl NamespaceOpcodeHandler for PyFrame {
+    /// PyPy: LOAD_NAME checks locals first (class body), then globals.
     fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+        // Check class_locals first (PyPy: w_locals in class body scope)
+        if !self.class_locals.is_null() {
+            let locals = unsafe { &*self.class_locals };
+            if let Ok(value) = namespace_load(locals, name) {
+                return Ok(value);
+            }
+        }
+        // Fall back to globals (PyPy: w_globals)
         let ns = unsafe { &*self.namespace };
         namespace_load(ns, name)
     }
 
+    /// PyPy: STORE_NAME writes to locals (class body) or globals.
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
-        let ns = unsafe { &mut *self.namespace };
+        let ns = if !self.class_locals.is_null() {
+            unsafe { &mut *self.class_locals }
+        } else {
+            unsafe { &mut *self.namespace }
+        };
         namespace_store(ns, name, value);
         Ok(())
     }
@@ -887,6 +901,51 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_build_class(&mut self) -> Result<(), Self::Error> {
         let bc = pyre_runtime::get_build_class_func();
         self.push(bc);
+        Ok(())
+    }
+
+    // ── load_method ──
+    // PyPy: LOOKUP_METHOD — interpreter-only override.
+    // For instances, pushes [attr, self] so CALL prepends self.
+    // For non-instances (modules etc.), pushes [attr, NULL].
+    // The default trait impl always pushes [attr, NULL], which is what
+    // the JIT tracer uses — no runtime branch in the shared path.
+    fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
+        let obj = self.pop();
+        let attr = pyre_objspace::space::py_getattr(obj, name)?;
+        self.push(attr);
+        if unsafe { pyre_object::is_instance(obj) } {
+            self.push(obj);
+        } else {
+            self.push(PY_NULL);
+        }
+        Ok(())
+    }
+
+    // ── call ──
+    // PyPy: CALL_FUNCTION — interpreter-only override.
+    // Handles null_or_self prepend for instance method calls.
+    // The default trait impl (exec_call) always discards null_or_self,
+    // which is what the JIT tracer uses — no trace/concrete divergence.
+    fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(self.pop());
+        }
+        args.reverse();
+        let null_or_self = self.pop();
+        let callable = self.pop();
+
+        let result = if null_or_self.is_null() {
+            call_callable(self, callable, &args)?
+        } else {
+            // Method call: prepend self
+            let mut full_args = Vec::with_capacity(1 + args.len());
+            full_args.push(null_or_self);
+            full_args.extend_from_slice(&args);
+            call_callable(self, callable, &full_args)?
+        };
+        self.push(result);
         Ok(())
     }
 

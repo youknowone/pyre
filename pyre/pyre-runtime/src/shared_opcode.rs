@@ -58,6 +58,9 @@ pub fn exec_call<H: SharedOpcodeHandler + ?Sized>(
     nargs: usize,
 ) -> OpcodeResult<()> {
     // Specialize common arities to avoid Vec heap allocation per call.
+    // null_or_self is always discarded here — self-binding for instance
+    // method calls is handled in the interpreter's OpcodeStepExecutor::call
+    // override, NOT in this shared path, to avoid trace/concrete divergence.
     match nargs {
         0 => {
             let _null_or_self = handler.pop_value()?;
