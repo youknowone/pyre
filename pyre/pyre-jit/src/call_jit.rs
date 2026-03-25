@@ -734,54 +734,20 @@ pub enum BlackholeResult {
     Failed,
 }
 
-/// RPython blackhole.py:1782 resume_in_blackhole parity.
+/// RPython resume.py:1312 blackhole_from_resumedata +
+/// blackhole.py:1752 _run_forever parity.
 ///
-/// Extracts the callee frame from typed_values[0], compiles the callee's
-/// CodeObject to JitCode, builds a blackhole, and runs to merge point.
-/// Codewriter register layout:
-///   ref registers:  [0..nlocals) = locals, nlocals+ = temps
-///   int registers:  [0]=tmp0, [1]=tmp1, [2]=opcode, [3]=frame_ptr
-///   runtime stack:  value stack entries (boxed PyObjectRefs)
+/// Multi-frame fail_args: [callee_section..., caller_section...]
+/// Each section: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
 ///
-/// typed_values layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+/// Builds a blackhole chain (innermost first), then runs _run_forever:
+/// callee blackhole → RETURN_VALUE → caller blackhole → merge point.
 pub fn resume_in_blackhole_from_fail_args(
     _caller_frame: &mut PyFrame,
     typed_values: &[majit_ir::Value],
     merge_py_pc: usize,
 ) -> BlackholeResult {
     use majit_ir::Value;
-
-    // RPython blackhole_from_resumedata: extract callee frame from
-    // deadframe. typed_values[0] = Ref(callee_frame_ptr).
-    let callee_frame_ptr = match typed_values.get(0) {
-        Some(Value::Ref(r)) => r.as_usize() as *mut PyFrame,
-        Some(Value::Int(v)) => *v as *mut PyFrame,
-        _ => return BlackholeResult::Failed,
-    };
-    if callee_frame_ptr.is_null() {
-        return BlackholeResult::Failed;
-    }
-    let callee_frame = unsafe { &mut *callee_frame_ptr };
-    let code = unsafe { &*callee_frame.code };
-    let nlocals = code.varnames.len();
-
-    // RPython resume.py:928 read_jitcode_pos_pc parity:
-    // typed_values[1] = callee's guard resume PC (set by record_guard
-    // which builds callee section with callee's vable_next_instr).
-    let guard_py_pc = match typed_values.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => return BlackholeResult::Failed,
-    };
-    // Validate: guard_py_pc must be within callee's instruction range.
-    let num_instrs = code.instructions.len();
-    if guard_py_pc >= num_instrs {
-        return BlackholeResult::Failed;
-    }
-    let vsd = match typed_values.get(2) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => return BlackholeResult::Failed,
-    };
-    let stack_only = vsd.saturating_sub(nlocals);
 
     let writer = crate::jit::codewriter::CodeWriter::new(
         bh_call_fn,
@@ -793,118 +759,223 @@ pub fn resume_in_blackhole_from_fail_args(
         bh_load_const_fn,
         bh_store_subscr_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
-    let jitcode_pc = if guard_py_pc < pyjitcode.pc_map.len() {
-        pyjitcode.pc_map[guard_py_pc]
-    } else {
+    // RPython resume.py:1333-1343 blackhole_from_resumedata:
+    // Parse sections and build blackhole chain.
+    let sections = parse_fail_arg_sections(typed_values);
+    if sections.is_empty() {
         return BlackholeResult::Failed;
-    };
-    let merge_jitcode_pc = if merge_py_pc < pyjitcode.pc_map.len() {
-        pyjitcode.pc_map[merge_py_pc]
-    } else {
-        return BlackholeResult::Failed;
-    };
+    }
 
     thread_local! {
         static BH_BUILDER3: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
     }
     let builder = BH_BUILDER3.with(|cell| unsafe { &mut *cell.get() });
-    let mut bh = builder.acquire_interp();
-    bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
-    bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
 
-    // ResumeDataDirectReader.consume_one_section parity:
-    // Load from typed fail_args directly. All Python locals are boxed
-    // PyObjectRef. An Int-typed fail_arg that holds a heap pointer is
-    // a W_IntObject; a genuine small int must be re-boxed.
-    for i in 0..nlocals {
-        let slot = 3 + i;
-        if let Some(val) = typed_values.get(slot) {
-            let ptr = match val {
-                Value::Ref(r) => r.as_usize() as i64,
-                // RPython: virtualizable array slots are GCREF.
-                // An Int-typed slot in the deadframe is the raw i64
-                // from compiled code. For virtualizable slots this is
-                // always a heap pointer (boxed PyObjectRef).
-                Value::Int(v) => *v,
-                Value::Float(v) => v.to_bits() as i64,
-                Value::Void => 0i64,
-            };
-            bh.setarg_r(i, ptr);
+    // Build chain bottom-up: first section = callee (innermost),
+    // last section = caller (outermost). Chain: callee.next = caller.
+    let mut prev_bh: Option<majit_meta::blackhole::BlackholeInterpreter> = None;
+
+    // Process sections in REVERSE (caller first, then callee on top).
+    // RPython builds the chain so that the LAST acquired interp is the
+    // innermost (callee), with nextblackholeinterp pointing to the caller.
+    for (sec_idx, section) in sections.iter().enumerate().rev() {
+        let frame_ptr = match section.get(0) {
+            Some(Value::Ref(r)) => r.as_usize() as *mut PyFrame,
+            Some(Value::Int(v)) => *v as *mut PyFrame,
+            _ => {
+                builder.release_chain(prev_bh);
+                return BlackholeResult::Failed;
+            }
+        };
+        if frame_ptr.is_null() {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
         }
-    }
-    for i in 0..stack_only {
-        let slot = 3 + nlocals + i;
-        if let Some(val) = typed_values.get(slot) {
-            let ptr = match val {
-                Value::Ref(r) => r.as_usize() as i64,
-                Value::Int(v) => *v,
-                Value::Float(v) => v.to_bits() as i64,
-                Value::Void => 0i64,
-            };
-            bh.runtime_stack_push(0, ptr);
+        let frame = unsafe { &*frame_ptr };
+        let code = unsafe { &*frame.code };
+        let nlocals = code.varnames.len();
+
+        let py_pc = match section.get(1) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => {
+                builder.release_chain(prev_bh);
+                return BlackholeResult::Failed;
+            }
+        };
+        if py_pc >= code.instructions.len() {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
         }
-    }
-    // int register 3 = callee frame pointer
-    if 3 < bh.registers_i.len() {
-        bh.setarg_i(3, callee_frame_ptr as i64);
+        let vsd = match section.get(2) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => {
+                builder.release_chain(prev_bh);
+                return BlackholeResult::Failed;
+            }
+        };
+        let stack_only = vsd.saturating_sub(nlocals);
+
+        let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+        let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
+            pyjitcode.pc_map[py_pc]
+        } else {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
+        };
+
+        // RPython: curbh.setposition(jitcode, pc)
+        let mut bh = builder.acquire_interp();
+        bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+
+        // Set merge_point on the OUTERMOST (last section = caller) blackhole.
+        if sec_idx == sections.len() - 1 {
+            if let Some(merge_jitcode_pc) = pyjitcode.pc_map.get(merge_py_pc).copied() {
+                bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
+            }
+        }
+
+        // RPython: resumereader.consume_one_section(curbh)
+        for i in 0..nlocals {
+            let slot = 3 + i;
+            if let Some(val) = section.get(slot) {
+                let ptr = match val {
+                    Value::Ref(r) => r.as_usize() as i64,
+                    Value::Int(v) => *v,
+                    Value::Float(v) => v.to_bits() as i64,
+                    Value::Void => 0i64,
+                };
+                bh.setarg_r(i, ptr);
+            }
+        }
+        for i in 0..stack_only {
+            let slot = 3 + nlocals + i;
+            if let Some(val) = section.get(slot) {
+                let ptr = match val {
+                    Value::Ref(r) => r.as_usize() as i64,
+                    Value::Int(v) => *v,
+                    Value::Float(v) => v.to_bits() as i64,
+                    Value::Void => 0i64,
+                };
+                bh.runtime_stack_push(0, ptr);
+            }
+        }
+        if 3 < bh.registers_i.len() {
+            bh.setarg_i(3, frame_ptr as i64);
+        }
+
+        // RPython: nextbh.nextblackholeinterp = curbh
+        bh.nextblackholeinterp = prev_bh.map(Box::new);
+        prev_bh = Some(bh);
     }
 
-    let in_same_loop = guard_py_pc > merge_py_pc;
-    if !in_same_loop {
-        if majit_meta::majit_log_enabled() {
-            eprintln!(
-                "[jit][blackhole-resume] SKIP guard_pc={} <= merge_pc={}",
-                guard_py_pc, merge_py_pc,
-            );
-        }
-        builder.release_interp(bh);
+    let Some(mut bh) = prev_bh else {
         return BlackholeResult::Failed;
-    }
+    };
 
     if majit_meta::majit_log_enabled() {
         eprintln!(
-            "[jit][blackhole-resume] guard_pc={} merge_pc={} nlocals={} stack={}",
-            guard_py_pc, merge_py_pc, nlocals, stack_only,
+            "[jit][blackhole-resume] chain_len={} merge_pc={}",
+            sections.len(),
+            merge_py_pc,
         );
     }
 
-    bh.run();
+    // RPython blackhole.py:1752 _run_forever parity:
+    // Run the innermost blackhole. On RETURN_VALUE (LeaveFrame),
+    // pop to caller blackhole and continue.
+    loop {
+        bh.run();
 
-    if !bh.reached_merge_point {
-        // DoneWithThisFrame: blackhole ran to RETURN_VALUE.
-        let result = bh.registers_r.get(0).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+        if bh.reached_merge_point {
+            // RPython bhimpl_jit_merge_point:
+            // if nextblackholeinterp is None → ContinueRunningNormally
+            // Write back to the frame that owns this merge point.
+            let frame_ptr = bh.registers_i.get(3).copied().unwrap_or(0) as *mut PyFrame;
+            if !frame_ptr.is_null() {
+                let frame = unsafe { &mut *frame_ptr };
+                let code = unsafe { &*frame.code };
+                let nlocals = code.varnames.len();
+                for i in 0..nlocals {
+                    if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
+                        frame.locals_cells_stack_w[i] =
+                            bh.registers_r[i] as pyre_object::PyObjectRef;
+                    }
+                }
+                let stack = bh.runtime_stack_drain(0);
+                frame.valuestackdepth = nlocals + stack.len();
+                for (i, val) in stack.iter().enumerate() {
+                    let idx = nlocals + i;
+                    if idx < frame.locals_cells_stack_w.len() {
+                        frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
+                    }
+                }
+                frame.next_instr = merge_py_pc;
+            }
+            builder.release_interp(bh);
+            return BlackholeResult::MergePoint;
+        }
+
+        // DoneWithThisFrame: callee finished (RETURN_VALUE).
+        let return_value = bh.registers_r.get(0).copied().unwrap_or(0);
+        let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
-        return BlackholeResult::Finished(Ok(result));
+
+        let Some(mut caller_bh) = next.map(|b| *b) else {
+            // Outermost frame finished — function return.
+            return BlackholeResult::Finished(Ok(return_value as pyre_object::PyObjectRef));
+        };
+
+        // RPython _run_forever: pass return value to caller blackhole.
+        // The caller's CALL instruction result goes onto the runtime stack.
+        caller_bh.runtime_stack_push(0, return_value);
+
+        bh = caller_bh;
+    }
+}
+
+/// Parse multi-frame fail_args into per-frame sections.
+/// Single frame: [[Ref, Int, Int, locals..., stack...]]
+/// Multi frame: [[callee: Ref, Int, Int, ...], [caller: Ref, Int, Int, ...]]
+fn parse_fail_arg_sections(typed_values: &[majit_ir::Value]) -> Vec<&[majit_ir::Value]> {
+    use majit_ir::Value;
+    if typed_values.len() < 3 {
+        return vec![];
+    }
+    // Extract first section's frame pointer to get nlocals.
+    let frame_ptr = match typed_values.get(0) {
+        Some(Value::Ref(r)) => r.as_usize() as *const PyFrame,
+        Some(Value::Int(v)) => *v as *const PyFrame,
+        _ => return vec![],
+    };
+    if frame_ptr.is_null() {
+        return vec![];
+    }
+    let code = unsafe { &*(*frame_ptr).code };
+    let nlocals = code.varnames.len();
+    let vsd = match typed_values.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return vec![],
+    };
+    let first_section_len = 3 + vsd.max(nlocals);
+
+    if first_section_len >= typed_values.len() {
+        // Single section (entire typed_values).
+        return vec![typed_values];
     }
 
-    // Write back ref registers → callee frame locals.
-    for i in 0..nlocals {
-        if i < bh.registers_r.len() && i < callee_frame.locals_cells_stack_w.len() {
-            callee_frame.locals_cells_stack_w[i] = bh.registers_r[i] as pyre_object::PyObjectRef;
-        }
+    // Check if remainder starts with a valid section header [Ref, Int, Int].
+    let rest = &typed_values[first_section_len..];
+    if rest.len() >= 3
+        && matches!(rest[0], Value::Ref(_) | Value::Int(_))
+        && matches!(rest[1], Value::Int(_))
+        && matches!(rest[2], Value::Int(_))
+    {
+        vec![&typed_values[..first_section_len], rest]
+    } else {
+        vec![typed_values]
     }
-    let stack = bh.runtime_stack_drain(0);
-    callee_frame.valuestackdepth = nlocals + stack.len();
-    for (i, val) in stack.iter().enumerate() {
-        let idx = nlocals + i;
-        if idx < callee_frame.locals_cells_stack_w.len() {
-            callee_frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
-        }
-    }
-    callee_frame.next_instr = merge_py_pc;
-
-    if majit_meta::majit_log_enabled() {
-        eprintln!(
-            "[jit][blackhole-resume] reached merge point ni={}",
-            callee_frame.next_instr
-        );
-    }
-
-    builder.release_interp(bh);
-    BlackholeResult::MergePoint
 }
 
 /// bhimpl_jit_merge_point parity: run the blackhole from `guard_py_pc`

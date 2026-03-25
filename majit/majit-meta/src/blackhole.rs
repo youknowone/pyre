@@ -1463,7 +1463,19 @@ impl BlackholeInterpBuilder {
         interp.registers_f.clear();
         interp.nextblackholeinterp = None;
         interp.runtime_stacks.clear();
+        interp.merge_point_jitcode_pc = None;
+        interp.reached_merge_point = false;
         self.pool.push(interp);
+    }
+
+    /// Release an entire blackhole chain (including all nextblackholeinterps).
+    pub fn release_chain(&mut self, chain: Option<BlackholeInterpreter>) {
+        let mut current = chain;
+        while let Some(mut bh) = current {
+            let next = bh.nextblackholeinterp.take().map(|b| *b);
+            self.release_interp(bh);
+            current = next;
+        }
     }
 }
 
