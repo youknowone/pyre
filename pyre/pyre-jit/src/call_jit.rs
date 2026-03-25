@@ -648,6 +648,170 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     result
 }
 
+/// RPython blackhole.py _run_forever result parity.
+pub enum BlackholeResult {
+    /// bhimpl_jit_merge_point → ContinueRunningNormally.
+    MergePoint,
+    /// DoneWithThisFrame: blackhole ran to RETURN_VALUE.
+    Finished(pyre_runtime::PyResult),
+    /// Blackhole couldn't run (bad PC mapping etc).
+    Failed,
+}
+
+/// RPython blackhole.py:resume_in_blackhole + blackhole_from_resumedata.
+///
+/// Builds a blackhole from typed fail_args (deadframe), NOT from frame.
+/// Codewriter register layout:
+///   ref registers:  [0..nlocals) = locals, nlocals+ = temps
+///   int registers:  [0]=tmp0, [1]=tmp1, [2]=opcode, [3]=frame_ptr
+///   runtime stack:  value stack entries (boxed PyObjectRefs)
+///
+/// typed_values layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+pub fn resume_in_blackhole_from_fail_args(
+    frame: &mut PyFrame,
+    typed_values: &[majit_ir::Value],
+    merge_py_pc: usize,
+) -> BlackholeResult {
+    use majit_ir::Value;
+
+    let code = unsafe { &*frame.code };
+    let nlocals = code.varnames.len();
+
+    let guard_py_pc = match typed_values.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return BlackholeResult::Failed,
+    };
+    let vsd = match typed_values.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => return BlackholeResult::Failed,
+    };
+    let stack_only = vsd.saturating_sub(nlocals);
+
+    let writer = crate::jit::codewriter::CodeWriter::new(
+        bh_call_fn,
+        bh_load_global_fn,
+        bh_compare_fn,
+        bh_binary_op_fn,
+        bh_box_int_fn,
+        bh_truth_fn,
+    );
+    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+
+    let jitcode_pc = if guard_py_pc < pyjitcode.pc_map.len() {
+        pyjitcode.pc_map[guard_py_pc]
+    } else {
+        return BlackholeResult::Failed;
+    };
+    let merge_jitcode_pc = if merge_py_pc < pyjitcode.pc_map.len() {
+        pyjitcode.pc_map[merge_py_pc]
+    } else {
+        return BlackholeResult::Failed;
+    };
+
+    thread_local! {
+        static BH_BUILDER3: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+    }
+    let builder = BH_BUILDER3.with(|cell| unsafe { &mut *cell.get() });
+    let mut bh = builder.acquire_interp();
+    bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
+    bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
+
+    // ResumeDataDirectReader.consume_one_section parity:
+    // Load from typed fail_args directly. All Python locals are boxed
+    // PyObjectRef. An Int-typed fail_arg that holds a heap pointer is
+    // a W_IntObject; a genuine small int must be re-boxed.
+    for i in 0..nlocals {
+        let slot = 3 + i;
+        if let Some(val) = typed_values.get(slot) {
+            let ptr = match val {
+                Value::Ref(r) => r.as_usize() as i64,
+                // RPython: virtualizable array slots are GCREF.
+                // An Int-typed slot in the deadframe is the raw i64
+                // from compiled code. For virtualizable slots this is
+                // always a heap pointer (boxed PyObjectRef).
+                Value::Int(v) => *v,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Void => 0i64,
+            };
+            bh.setarg_r(i, ptr);
+        }
+    }
+    for i in 0..stack_only {
+        let slot = 3 + nlocals + i;
+        if let Some(val) = typed_values.get(slot) {
+            let ptr = match val {
+                Value::Ref(r) => r.as_usize() as i64,
+                Value::Int(v) => *v,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Void => 0i64,
+            };
+            bh.runtime_stack_push(0, ptr);
+        }
+    }
+    // int register 3 = frame pointer
+    if 3 < bh.registers_i.len() {
+        bh.setarg_i(3, frame as *mut PyFrame as i64);
+    }
+
+    // Only run the blackhole if the guard PC is inside the loop body
+    // (guard_pc > merge_pc), meaning the backedge will reach the merge
+    // point. If guard_pc <= merge_pc, the blackhole would run past the
+    // loop into the outer scope, causing unwanted side effects.
+    if guard_py_pc <= merge_py_pc {
+        if majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit][blackhole-resume] SKIP guard_pc={} <= merge_pc={}",
+                guard_py_pc, merge_py_pc,
+            );
+        }
+        builder.release_interp(bh);
+        return BlackholeResult::Failed;
+    }
+
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][blackhole-resume] guard_pc={} merge_pc={} nlocals={} stack={}",
+            guard_py_pc, merge_py_pc, nlocals, stack_only,
+        );
+    }
+
+    bh.run();
+
+    if !bh.reached_merge_point {
+        // DoneWithThisFrame: blackhole ran to RETURN_VALUE.
+        let result = bh.registers_r.get(0).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+        builder.release_interp(bh);
+        return BlackholeResult::Finished(Ok(result));
+    }
+
+    // Write back ref registers → frame locals.
+    for i in 0..nlocals {
+        if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
+            frame.locals_cells_stack_w[i] = bh.registers_r[i] as pyre_object::PyObjectRef;
+        }
+    }
+    let stack = bh.runtime_stack_drain(0);
+    frame.valuestackdepth = nlocals + stack.len();
+    for (i, val) in stack.iter().enumerate() {
+        let idx = nlocals + i;
+        if idx < frame.locals_cells_stack_w.len() {
+            frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
+        }
+    }
+    frame.next_instr = merge_py_pc;
+
+    if majit_meta::majit_log_enabled() {
+        eprintln!(
+            "[jit][blackhole-resume] reached merge point ni={}",
+            frame.next_instr
+        );
+    }
+
+    builder.release_interp(bh);
+    BlackholeResult::MergePoint
+}
+
 /// bhimpl_jit_merge_point parity: run the blackhole from `guard_py_pc`
 /// until it reaches `merge_py_pc` (the loop header). On success, writes
 /// back the blackhole register state into the frame and returns true.
