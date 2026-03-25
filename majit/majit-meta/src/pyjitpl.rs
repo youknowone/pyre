@@ -661,6 +661,16 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// compile.py:269-270: return cross-loop cut info if the current trace
+    /// closes at a different loop header than where it started.
+    pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<Type>)> {
+        let ctx = self.tracing.as_ref()?;
+        let green_key = ctx.green_key;
+        ctx.get_merge_point(green_key)
+            .filter(|mp| mp.position.ops_len > 0)
+            .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
+    }
+
     /// Set the bridge compilation threshold.
     pub fn set_bridge_threshold(&mut self, threshold: u32) {
         self.warm_state.set_bridge_threshold(threshold);
@@ -1461,6 +1471,20 @@ impl<M: Clone> MetaInterp<M> {
         ctx.apply_replacements();
         let green_key = ctx.green_key;
 
+        // compile.py:269-270: extract cross-loop cut data before consuming
+        // the recorder. When the trace closes at a different loop header
+        // than where it started, cut the trace to begin at that header.
+        let cross_loop_cut = ctx
+            .get_merge_point(green_key)
+            .filter(|mp| mp.position.ops_len > 0)
+            .map(|mp| {
+                (
+                    mp.original_boxes.clone(),
+                    mp.original_box_types.clone(),
+                    mp.position,
+                )
+            });
+
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -1501,6 +1525,22 @@ impl<M: Clone> MetaInterp<M> {
         }
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
+
+        // compile.py:269-270: cut trace at cross-loop merge point.
+        let trace =
+            if let Some((ref original_boxes, ref original_box_types, start)) = cross_loop_cut {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] cut_trace_from: start.ops_len={} original_boxes={} trace_ops={}",
+                        start.ops_len,
+                        original_boxes.len(),
+                        trace.ops.len()
+                    );
+                }
+                trace.cut_trace_from(start, original_boxes, original_box_types)
+            } else {
+                trace
+            };
 
         let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 

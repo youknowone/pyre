@@ -56,7 +56,7 @@ pub fn trace_bytecode(
             .map(|i| majit_ir::OpRef(i as u32))
             .collect();
         let input_types = ctx.inputarg_types();
-        ctx.add_merge_point(start_key, input_args, input_types);
+        ctx.add_merge_point(start_key, input_args, input_types, start_pc);
     }
 
     let action = metainterp.interpret(ctx);

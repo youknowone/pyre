@@ -157,6 +157,177 @@ impl TreeLoop {
         }
         (guards, pure, calls, other)
     }
+
+    /// opencoder.py CutTrace parity — create a new trace by cutting at the
+    /// given position. `original_boxes` become the new inputargs; any OpRef
+    /// referenced after the cut but defined before it (and not in
+    /// `original_boxes`) is re-emitted as a prefix operation (transitive
+    /// closure of dependencies).
+    pub fn cut_trace_from(
+        &self,
+        start: crate::recorder::TracePosition,
+        original_boxes: &[OpRef],
+        original_box_types: &[majit_ir::Type],
+    ) -> TreeLoop {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let num_original_inputargs = self.inputargs.len() as u32;
+        let cut_ops = &self.ops[start.ops_len..];
+
+        // Phase 1: Build initial remap from original_boxes → new inputargs.
+        let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
+        let original_set: HashSet<OpRef> = original_boxes.iter().copied().collect();
+        for (i, &old_ref) in original_boxes.iter().enumerate() {
+            remap.insert(old_ref, OpRef(i as u32));
+        }
+
+        // Collect all OpRefs defined by post-cut ops.
+        let defined_after_cut: HashSet<OpRef> = cut_ops
+            .iter()
+            .filter(|op| !op.pos.is_none())
+            .map(|op| op.pos)
+            .collect();
+
+        // Phase 2: Find escaped refs — referenced after cut, defined before
+        // cut, not in original_boxes. Use BFS for transitive closure: an
+        // escaped op's own args may also be escaped.
+        let is_pre_cut_ref = |r: &OpRef| -> bool {
+            !r.is_none()
+                && r.0 < 10_000
+                && !original_set.contains(r)
+                && !defined_after_cut.contains(r)
+        };
+
+        let mut escaped_set: HashSet<OpRef> = HashSet::new();
+        let mut queue: VecDeque<OpRef> = VecDeque::new();
+
+        // Seed with refs used by post-cut ops.
+        for op in cut_ops {
+            for arg in &op.args {
+                if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
+                    queue.push_back(*arg);
+                }
+            }
+            if let Some(ref fa) = op.fail_args {
+                for arg in fa {
+                    if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
+                        queue.push_back(*arg);
+                    }
+                }
+            }
+        }
+
+        // BFS: transitively collect dependencies of escaped ops.
+        while let Some(esc_ref) = queue.pop_front() {
+            if esc_ref.0 < num_original_inputargs {
+                // Original inputarg of the full trace — must become a new
+                // inputarg (handled in phase 3 below).
+                continue;
+            }
+            let op_idx = (esc_ref.0 - num_original_inputargs) as usize;
+            if let Some(op) = self.ops.get(op_idx) {
+                for arg in &op.args {
+                    if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
+                        queue.push_back(*arg);
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Partition escaped refs.
+        //  - "orig_inputarg_escaped": refs to the full trace's original inputargs
+        //    that weren't in original_boxes → must become new inputargs.
+        //  - "op_escaped": refs to pre-cut ops → re-emit as prefix operations.
+        let mut orig_inputarg_escaped: Vec<OpRef> = Vec::new();
+        let mut op_escaped: Vec<OpRef> = Vec::new();
+        for &r in &escaped_set {
+            if r.0 < num_original_inputargs {
+                orig_inputarg_escaped.push(r);
+            } else {
+                op_escaped.push(r);
+            }
+        }
+        orig_inputarg_escaped.sort_by_key(|r| r.0);
+        op_escaped.sort_by_key(|r| r.0); // preserve original order
+
+        // Phase 4: Build new inputargs = original_boxes + escaped inputargs.
+        let mut new_ia_boxes = original_boxes.to_vec();
+        let mut new_ia_types = original_box_types.to_vec();
+        for &r in &orig_inputarg_escaped {
+            remap.insert(r, OpRef(new_ia_boxes.len() as u32));
+            new_ia_boxes.push(r);
+            new_ia_types.push(self.inputargs[r.0 as usize].tp);
+        }
+        let new_inputargs_count = new_ia_boxes.len() as u32;
+
+        let new_inputargs: Vec<InputArg> = new_ia_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| InputArg {
+                index: i as u32,
+                tp,
+            })
+            .collect();
+
+        // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.
+        let mut next_ref = new_inputargs_count;
+        for &r in &op_escaped {
+            remap.insert(r, OpRef(next_ref));
+            next_ref += 1;
+        }
+
+        // Also assign fresh refs for post-cut ops (shifted by prefix count).
+        let prefix_count = op_escaped.len() as u32;
+        for (i, op) in cut_ops.iter().enumerate() {
+            if !op.pos.is_none() {
+                remap.insert(op.pos, OpRef(new_inputargs_count + prefix_count + i as u32));
+            }
+        }
+
+        let remap_ref = |r: &OpRef| -> OpRef {
+            if r.is_none() || r.0 >= 10_000 {
+                *r
+            } else if let Some(&new_ref) = remap.get(r) {
+                new_ref
+            } else {
+                OpRef::NONE
+            }
+        };
+
+        // Build prefix ops (re-emitted escaped definitions).
+        let mut prefix_ops: Vec<Op> = Vec::with_capacity(op_escaped.len());
+        for (pi, &r) in op_escaped.iter().enumerate() {
+            let op_idx = (r.0 - num_original_inputargs) as usize;
+            let orig_op = &self.ops[op_idx];
+            let mut new_op = orig_op.clone();
+            new_op.pos = OpRef(new_inputargs_count + pi as u32);
+            for arg in new_op.args.iter_mut() {
+                *arg = remap_ref(arg);
+            }
+            // Prefix ops don't need fail_args (they're not guards).
+            new_op.fail_args = None;
+            prefix_ops.push(new_op);
+        }
+
+        // Phase 6: Remap post-cut ops.
+        let mut new_ops: Vec<Op> = Vec::with_capacity(prefix_ops.len() + cut_ops.len());
+        new_ops.extend(prefix_ops);
+        for (i, op) in cut_ops.iter().enumerate() {
+            let mut new_op = op.clone();
+            new_op.pos = OpRef(new_inputargs_count + prefix_count + i as u32);
+            for arg in new_op.args.iter_mut() {
+                *arg = remap_ref(arg);
+            }
+            if let Some(ref mut fa) = new_op.fail_args {
+                for arg in fa.iter_mut() {
+                    *arg = remap_ref(arg);
+                }
+            }
+            new_ops.push(new_op);
+        }
+
+        TreeLoop::new(new_inputargs, new_ops)
+    }
 }
 
 #[cfg(test)]
@@ -760,5 +931,152 @@ mod tests {
         let trace = TreeLoop::new(inputargs, vec![Op::new(OpCode::Finish, &[])]);
         let types = trace.inputarg_types();
         assert_eq!(types, vec![Type::Int, Type::Ref, Type::Float]);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // cut_trace_from tests — opencoder.py CutTrace parity
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cut_trace_from_no_escaped_refs() {
+        // Simple cut: all post-cut refs are either in original_boxes
+        // or defined after the cut.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut ops = Vec::new();
+        // Pre-cut ops (2 inputargs → first op is OpRef(2))
+        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        op0.pos = OpRef(2);
+        ops.push(op0);
+        // Post-cut ops
+        let mut op1 = Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]);
+        op1.pos = OpRef(3);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[OpRef(3)]);
+        op2.pos = OpRef(4);
+        ops.push(op2);
+        let trace = TreeLoop::new(inputargs, ops);
+
+        let start = crate::recorder::TracePosition {
+            op_count: 3,
+            ops_len: 1, // cut after op0
+        };
+        let original_boxes = vec![OpRef(0), OpRef(1)];
+        let original_box_types = vec![Type::Int, Type::Int];
+
+        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        assert_eq!(cut.inputargs.len(), 2);
+        assert_eq!(cut.ops.len(), 2); // IntMul + Jump
+        assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
+        assert_eq!(cut.ops[0].args[0], OpRef(0)); // remapped from OpRef(0)
+        assert_eq!(cut.ops[0].args[1], OpRef(1)); // remapped from OpRef(1)
+        assert_eq!(cut.ops[1].opcode, OpCode::Jump);
+        assert_eq!(cut.ops[1].args[0], OpRef(2)); // remapped from OpRef(3) → new idx 2
+    }
+
+    #[test]
+    fn test_cut_trace_from_with_escaped_op() {
+        // An op defined before the cut point is used after the cut.
+        // It should be re-emitted as a prefix operation.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut ops = Vec::new();
+        // op0: v2 = int_add(v0, v1) — before cut
+        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        op0.pos = OpRef(2);
+        ops.push(op0);
+        // op1: v3 = int_mul(v2, v0) — after cut, references v2 (escaped!)
+        let mut op1 = Op::new(OpCode::IntMul, &[OpRef(2), OpRef(0)]);
+        op1.pos = OpRef(3);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[OpRef(3)]);
+        op2.pos = OpRef(4);
+        ops.push(op2);
+        let trace = TreeLoop::new(inputargs, ops);
+
+        let start = crate::recorder::TracePosition {
+            op_count: 3,
+            ops_len: 1, // cut after op0
+        };
+        // original_boxes only has v0 — v2 is escaped
+        let original_boxes = vec![OpRef(0)];
+        let original_box_types = vec![Type::Int];
+
+        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        // v1 = OpRef(1) is an original trace inputarg NOT in original_boxes.
+        // It's referenced by the escaped int_add op → added as extra inputarg.
+        // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
+        assert_eq!(cut.inputargs.len(), 2); // v0 + escaped v1
+        assert_eq!(cut.ops.len(), 3); // prefix(int_add) + int_mul + jump
+    }
+
+    #[test]
+    fn test_cut_trace_from_constants_preserved() {
+        // Constants (OpRef >= 10_000) should not be remapped.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut ops = Vec::new();
+        // pre-cut: noop
+        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]);
+        op0.pos = OpRef(1);
+        ops.push(op0);
+        // post-cut: uses a constant
+        let mut op1 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(10_000)]);
+        op1.pos = OpRef(2);
+        ops.push(op1);
+        let mut op2 = Op::new(OpCode::Jump, &[OpRef(2)]);
+        op2.pos = OpRef(3);
+        ops.push(op2);
+        let trace = TreeLoop::new(inputargs, ops);
+
+        let start = crate::recorder::TracePosition {
+            op_count: 2,
+            ops_len: 1,
+        };
+        let original_boxes = vec![OpRef(0)];
+        let original_box_types = vec![Type::Int];
+
+        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        assert_eq!(cut.ops.len(), 2);
+        // Constant ref should be preserved as-is
+        assert_eq!(cut.ops[0].args[1], OpRef(10_000));
+    }
+
+    #[test]
+    fn test_cut_trace_from_transitive_escaped() {
+        // Escaped op depends on another escaped op (transitive closure).
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut ops = Vec::new();
+        // v1 = int_add(v0, v0) — before cut
+        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]);
+        op0.pos = OpRef(1);
+        ops.push(op0);
+        // v2 = int_mul(v1, v0) — before cut
+        let mut op1 = Op::new(OpCode::IntMul, &[OpRef(1), OpRef(0)]);
+        op1.pos = OpRef(2);
+        ops.push(op1);
+        // v3 = int_sub(v2, v0) — after cut, references v2 (escaped, depends on v1)
+        let mut op2 = Op::new(OpCode::IntSub, &[OpRef(2), OpRef(0)]);
+        op2.pos = OpRef(3);
+        ops.push(op2);
+        let mut op3 = Op::new(OpCode::Jump, &[OpRef(3)]);
+        op3.pos = OpRef(4);
+        ops.push(op3);
+        let trace = TreeLoop::new(inputargs, ops);
+
+        let start = crate::recorder::TracePosition {
+            op_count: 3,
+            ops_len: 2, // cut after op0 and op1
+        };
+        let original_boxes = vec![OpRef(0)];
+        let original_box_types = vec![Type::Int];
+
+        let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
+        // 1 inputarg, 2 prefix ops (v1=int_add, v2=int_mul), 2 post-cut ops
+        assert_eq!(cut.inputargs.len(), 1);
+        assert_eq!(cut.ops.len(), 4);
+        assert_eq!(cut.ops[0].opcode, OpCode::IntAdd); // re-emitted v1
+        assert_eq!(cut.ops[1].opcode, OpCode::IntMul); // re-emitted v2
+        assert_eq!(cut.ops[2].opcode, OpCode::IntSub);
+        assert_eq!(cut.ops[3].opcode, OpCode::Jump);
+        // Verify remapping chain: v2's arg should reference re-emitted v1
+        assert_eq!(cut.ops[1].args[0], OpRef(1)); // v1 → prefix idx 0 → OpRef(1)
     }
 }
