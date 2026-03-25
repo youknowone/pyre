@@ -323,6 +323,7 @@ static mut ARENA_INITIALIZED: usize = 0;
 /// Returns addresses of the global arena state variables and frame
 /// layout constants needed by Cranelift to inline arena take/put.
 pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
+    use majit_meta::jitframe::*;
     majit_codegen_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
@@ -334,6 +335,22 @@ pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
         create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as usize,
         drop_fn_addr: jit_drop_callee_frame as usize,
         arena_cap: ARENA_CAP,
+        jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
+            create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as usize,
+            drop_fn_addr: jit_drop_callee_frame as usize,
+            jitframe_tid: 0, // TODO: register JitFrame type with GC
+            jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+            jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+            jf_descr_ofs: JF_DESCR_OFS,
+            jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+            jf_savedata_ofs: JF_SAVEDATA_OFS,
+            jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+            jf_forward_ofs: JF_FORWARD_OFS,
+            jf_frame_ofs: JF_FRAME_OFS,
+            jf_frame_baseitemofs: BASEITEMOFS,
+            jf_frame_lengthofs: LENGTHOFS,
+            sign_size: SIGN_SIZE,
+        }),
     }
 }
 
