@@ -2388,18 +2388,108 @@ impl Default for ResumeDataVirtualAdder {
 /// RPython's `ResumeDataLoopMemo` shares constant pools and frame sections
 /// across guards. We use a shared `ResumeEncoder` state so that the same
 /// large constant only appears once in the pool.
+/// RPython resume.py:142 ResumeDataLoopMemo.
+/// Shared constant pool + box numbering cache across all guards in a loop.
 pub struct ResumeDataLoopMemo {
-    /// Shared constant pool across all guards in this loop.
+    /// resume.py:147 — shared constant pool.
     consts: Vec<i64>,
+    /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
+    large_ints: HashMap<i64, i16>,
+    /// resume.py:149 — ref pointers → tagged const.
+    refs: HashMap<i64, i16>,
+    /// Unified index for encode_shared (legacy path).
     const_indices: HashMap<i64, usize>,
+    /// resume.py:150-151 — cached box/virtual numbering.
+    pub cached_boxes: HashMap<u32, i32>,
+    pub cached_virtuals: HashMap<u32, i32>,
+    /// resume.py:153-155 — statistics.
+    pub nvirtuals: usize,
+    pub nvholes: usize,
+    pub nvreused: usize,
 }
 
 impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
             consts: Vec::new(),
+            large_ints: HashMap::new(),
+            refs: HashMap::new(),
             const_indices: HashMap::new(),
+            cached_boxes: HashMap::new(),
+            cached_virtuals: HashMap::new(),
+            nvirtuals: 0,
+            nvholes: 0,
+            nvreused: 0,
         }
+    }
+
+    /// resume.py:157 getconst(const) — tag a constant value.
+    /// INT: try inline TAGINT first, then large_ints cache, then consts pool.
+    /// REF: null → NULLREF, then refs cache, then consts pool.
+    pub fn getconst_int(&mut self, val: i64) -> i16 {
+        // Try inline TAGINT (-8191..8190 in RPython's i16 range).
+        let shifted = val >> 13;
+        if shifted == 0 || shifted == -1 {
+            return (((val << 2) | TAGINT) as i16);
+        }
+        // Large int: check cache.
+        if let Some(&tagged) = self.large_ints.get(&val) {
+            return tagged;
+        }
+        let tagged = self.newconst(val);
+        self.large_ints.insert(val, tagged);
+        tagged
+    }
+
+    /// resume.py:173 getconst for REF type.
+    pub fn getconst_ref(&mut self, val: i64) -> i16 {
+        if val == 0 {
+            return NULLREF as i16;
+        }
+        if let Some(&tagged) = self.refs.get(&val) {
+            return tagged;
+        }
+        let tagged = self.newconst(val);
+        self.refs.insert(val, tagged);
+        tagged
+    }
+
+    /// resume.py:185 _newconst — add to consts pool, return TAGCONST-tagged.
+    fn newconst(&mut self, val: i64) -> i16 {
+        let index = self.consts.len() as i64 + TAG_CONST_OFFSET;
+        self.consts.push(val);
+        ((index << 2) | TAGCONST) as i16
+    }
+
+    /// resume.py:264 assign_number_to_box — returns a negative number.
+    pub fn assign_number_to_box(&mut self, box_id: u32) -> i32 {
+        if let Some(&num) = self.cached_boxes.get(&box_id) {
+            return num;
+        }
+        let num = -(self.cached_boxes.len() as i32) - 1;
+        self.cached_boxes.insert(box_id, num);
+        num
+    }
+
+    /// resume.py:278 assign_number_to_virtual — returns a negative number.
+    pub fn assign_number_to_virtual(&mut self, box_id: u32) -> i32 {
+        if let Some(&num) = self.cached_virtuals.get(&box_id) {
+            return num;
+        }
+        let num = -(self.cached_virtuals.len() as i32) - 1;
+        self.cached_virtuals.insert(box_id, num);
+        num
+    }
+
+    /// resume.py:286 clear_box_virtual_numbers.
+    pub fn clear_box_virtual_numbers(&mut self) {
+        self.cached_boxes.clear();
+        self.cached_virtuals.clear();
+    }
+
+    /// Access the shared constant pool.
+    pub fn consts(&self) -> &[i64] {
+        &self.consts
     }
 
     /// Encode a `ResumeData` using the shared constant pool.
