@@ -1657,6 +1657,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.has_compiled_loop(green_key)
     }
 
+    /// Check if any guard in the compiled trace has Float-typed fail_args.
+    pub fn compiled_trace_has_float_guards(&self, green_key: u64) -> bool {
+        self.meta.compiled_trace_has_float_guards(green_key)
+    }
+
     /// Remove all compiled code. Used when guard-fail recovery detects
     /// unrecoverable state (e.g., null Ref slots from incomplete
     /// resume data), preventing repeated entry→guard-fail loops.

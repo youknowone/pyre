@@ -2161,7 +2161,6 @@ impl<M: Clone> MetaInterp<M> {
         token.green_key = green_key;
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
-        self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
@@ -3521,6 +3520,27 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.token.is_invalidated())
+    }
+
+    /// Check if any guard in the compiled trace has Float-typed fail_args.
+    /// Used to gate bridge compilation: traces with Float guards have
+    /// type metadata issues that cause crashes on bridge guard failures.
+    pub fn compiled_trace_has_float_guards(&self, green_key: u64) -> bool {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return false;
+        };
+        for trace in compiled.traces.values() {
+            for layout in trace.exit_layouts.values() {
+                if layout
+                    .exit_types
+                    .iter()
+                    .any(|t| matches!(t, majit_ir::Type::Float))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Remove all compiled loops. Used when guard-fail recovery is

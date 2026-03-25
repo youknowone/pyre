@@ -739,9 +739,8 @@ fn restore_guard_failure_for_loop(
         );
     }
 
-    // Discard any pending Cranelift-level bridge requests.
-    // Bridge compilation is deferred until guard recovery properly
-    // handles mixed-type fail_args (including Float types).
+    // Discard pending bridge requests. Bridge compilation requires
+    // proper guard type propagation to be safe (TODO).
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
