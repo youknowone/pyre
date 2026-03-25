@@ -361,6 +361,31 @@ fn instruction_is_trivia_between_compare_and_branch(instruction: Instruction) ->
     )
 }
 
+/// RPython exc=True parity: instructions that correspond to JitCode ops
+/// with exc=True. Only external calls and operations that invoke arbitrary
+/// Python code need GUARD_NO_EXCEPTION. Arithmetic, comparisons, and
+/// local variable access are lowered to primitive IR ops (exc=False) in
+/// RPython and protected by type-specific guards instead.
+fn instruction_may_raise(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        // RPython exc=True: external calls and attribute access that
+        // may invoke arbitrary Python code (__getattr__, descriptors).
+        Instruction::Call { .. }
+            | Instruction::CallKw { .. }
+            | Instruction::CallFunctionEx { .. }
+            | Instruction::LoadGlobal { .. }
+            | Instruction::StoreAttr { .. }
+            | Instruction::DeleteAttr { .. }
+            | Instruction::StoreSubscr
+            | Instruction::DeleteSubscr
+            | Instruction::ImportName { .. }
+            | Instruction::ImportFrom { .. } // Note: LOAD_ATTR is exc=False for simple field loads (RPython
+                                             // getfield_gc). RaiseVarargs/Reraise always Err, handled by
+                                             // handle_possible_exception directly.
+    )
+}
+
 /// Environment context — currently unused.
 pub struct PyreEnv;
 
@@ -4671,7 +4696,20 @@ impl MIFrame {
                 let cf = self.concrete_frame_addr;
                 self.handle_possible_exception(code, pc, err, cf)
             }
-            other => self.into_trace_action(other),
+            other => {
+                // RPython pyjitpl.py:1956-1957: exc=True ops that didn't
+                // raise get GUARD_NO_EXCEPTION. Currently disabled because
+                // the optimizer doesn't yet remove redundant guards for
+                // pure/elidable calls (RPython OptPure handles this).
+                // TODO: re-enable when optimizer GUARD_NO_EXCEPTION
+                // elimination is implemented.
+                // if instruction_may_raise(instruction) {
+                //     self.with_ctx(|this, ctx| {
+                //         this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+                //     });
+                // }
+                self.into_trace_action(other)
+            }
         }
     }
 
