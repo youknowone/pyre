@@ -221,8 +221,36 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
 
+            // RPython resume.py parity: build ExitFrameLayout that maps
+            // each fail_args slot to ExitValue (direct) or Virtual(idx).
+            // This allows materialize_from_recovery_layout to find which
+            // null slots need virtual reconstruction.
+            let frame_slots = if let Some(ref fa) = op.fail_args {
+                let mut virtual_map = std::collections::HashMap::new();
+                for (vidx, entry) in entries.iter().enumerate() {
+                    virtual_map.insert(entry.fail_arg_index, vidx);
+                }
+                (0..fa.len())
+                    .map(|i| {
+                        if let Some(&vidx) = virtual_map.get(&i) {
+                            ExitValueSourceLayout::Virtual(vidx)
+                        } else {
+                            ExitValueSourceLayout::ExitValue(i)
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
             ExitRecoveryLayout {
-                frames: vec![],
+                frames: vec![majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
+                    pc: 0,
+                    slots: frame_slots,
+                    slot_types: None,
+                }],
                 virtual_layouts,
                 pending_field_layouts,
             }
