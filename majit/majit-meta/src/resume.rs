@@ -26,10 +26,12 @@ const TAGBOX: i64 = 2;
 const TAGVIRTUAL: i64 = 3;
 
 // RPython resume.py:128-132 — special tagged sentinels.
-/// tag(-1 << 13, TAGBOX) in RPython. We use a wider range.
-const UNASSIGNED: i64 = tag_const(-(1 << 60), TAGBOX);
-/// tag(-1 << 13, TAGVIRTUAL) in RPython.
-const UNASSIGNEDVIRTUAL: i64 = tag_const(-(1 << 60), TAGVIRTUAL);
+// RPython uses i16 tags with 13-bit value range. We use i64 but
+// preserve the same sentinel VALUES for structural parity.
+/// tag(-1 << 13, TAGBOX) — unassigned box sentinel.
+const UNASSIGNED: i64 = tag_const(-(1 << 13), TAGBOX);
+/// tag(-1 << 13, TAGVIRTUAL) — unassigned virtual sentinel.
+const UNASSIGNEDVIRTUAL: i64 = tag_const(-(1 << 13), TAGVIRTUAL);
 /// tag(-1, TAGCONST) — null reference.
 const NULLREF: i64 = tag_const(-1, TAGCONST);
 /// tag(-2, TAGCONST) — uninitialized slot.
