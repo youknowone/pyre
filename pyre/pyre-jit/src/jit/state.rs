@@ -1498,7 +1498,14 @@ impl MIFrame {
         self.sym().value_type_of(value)
     }
 
-    fn push_typed_value(&mut self, _ctx: &mut TraceCtx, value: OpRef, value_type: Type) {
+    /// RPython Box push: symbolic OpRef + concrete value together.
+    fn push_typed_value(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        value: OpRef,
+        value_type: Type,
+        concrete: ConcreteValue,
+    ) {
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
         if stack_idx >= s.symbolic_stack.len() {
@@ -1509,16 +1516,9 @@ impl MIFrame {
         }
         s.symbolic_stack[stack_idx] = value;
         s.symbolic_stack_types[stack_idx] = value_type;
-        // Persist type for value_type_of lookups after stack pop
-        // (e.g., inline callee return → pop → value_type_of on result).
         if !value.is_none() {
             s.transient_value_types.insert(value, value_type);
         }
-        // MIFrame Box tracking: store concrete value alongside symbolic
-        let concrete = s
-            .pending_concrete_push
-            .take()
-            .unwrap_or(ConcreteValue::Null);
         if stack_idx >= s.concrete_stack.len() {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
@@ -1526,30 +1526,14 @@ impl MIFrame {
         s.valuestackdepth += 1;
     }
 
-    /// Push a FrontendOp (RPython execute_and_record return value parity).
-    /// Bypasses pending_concrete_push — concrete value is directly provided.
-    fn push_traced_box(&mut self, _ctx: &mut TraceCtx, traced: FrontendOp) {
-        let value_type = self.value_type(traced.opref);
-        let s = self.sym_mut();
-        let stack_idx = s.stack_only_depth();
-        if stack_idx >= s.symbolic_stack.len() {
-            s.symbolic_stack.resize(stack_idx + 1, OpRef::NONE);
-        }
-        if stack_idx >= s.symbolic_stack_types.len() {
-            s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
-        }
-        s.symbolic_stack[stack_idx] = traced.opref;
-        s.symbolic_stack_types[stack_idx] = value_type;
-        if stack_idx >= s.concrete_stack.len() {
-            s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
-        }
-        s.concrete_stack[stack_idx] = traced.concrete;
-        s.valuestackdepth += 1;
-    }
-
-    pub(crate) fn push_value(&mut self, _ctx: &mut TraceCtx, value: OpRef) {
+    pub(crate) fn push_value(
+        &mut self,
+        _ctx: &mut TraceCtx,
+        value: OpRef,
+        concrete: ConcreteValue,
+    ) {
         let value_type = self.value_type(value);
-        self.push_typed_value(_ctx, value, value_type);
+        self.push_typed_value(_ctx, value, value_type, concrete);
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
@@ -1623,10 +1607,10 @@ impl MIFrame {
         call_pc: usize,
     ) {
         let null = ctx.const_int(pyre_object::PY_NULL as i64);
-        self.push_value(ctx, callable);
-        self.push_value(ctx, null);
+        self.push_value(ctx, callable, ConcreteValue::Null);
+        self.push_value(ctx, null, ConcreteValue::Ref(pyre_object::PY_NULL));
         for &arg in args {
-            self.push_value(ctx, arg);
+            self.push_value(ctx, arg, ConcreteValue::Null);
         }
         self.sym_mut().pending_next_instr = Some(call_pc);
     }
@@ -4887,13 +4871,7 @@ impl SharedOpcodeHandler for MIFrame {
 
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython Box direct pass: concrete travels inside FrontendOp.
-            // During migration, also check pending_concrete_push as fallback.
-            if !value.concrete.is_null() {
-                let _ = this.sym_mut().pending_concrete_push.take();
-                this.sym_mut().pending_concrete_push = Some(value.concrete);
-            }
-            MIFrame::push_value(this, ctx, value.opref);
+            MIFrame::push_value(this, ctx, value.opref, value.concrete);
             Ok(())
         })
     }
@@ -4971,11 +4949,15 @@ impl SharedOpcodeHandler for MIFrame {
                 }
             }
         }
-        if !result_concrete.is_null() {
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
-        }
         let arg_oprefs: Vec<OpRef> = args.iter().map(|a| a.opref).collect();
         let opref = self.call_callable_value(callable.opref, &arg_oprefs)?;
+        // Inline frame path: call_callable_value sets pending_concrete_push
+        // to Ref(PY_NULL) as placeholder. Pick it up if result_concrete is Null.
+        if result_concrete.is_null() {
+            if let Some(pending) = self.sym_mut().pending_concrete_push.take() {
+                result_concrete = pending;
+            }
+        }
         Ok(FrontendOp::new(opref, result_concrete))
     }
 
@@ -4986,7 +4968,6 @@ impl SharedOpcodeHandler for MIFrame {
         if concrete_items.iter().all(|v| !v.is_null()) {
             let list = pyre_runtime::build_list_from_refs(&concrete_items);
             result_concrete = ConcreteValue::from_pyobj(list);
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let item_oprefs: Vec<OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_list(&item_oprefs)?;
@@ -5000,7 +4981,6 @@ impl SharedOpcodeHandler for MIFrame {
         if concrete_items.iter().all(|v| !v.is_null()) {
             let tuple = pyre_runtime::build_tuple_from_refs(&concrete_items);
             result_concrete = ConcreteValue::from_pyobj(tuple);
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let item_oprefs: Vec<OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_tuple(&item_oprefs)?;
@@ -5014,7 +4994,6 @@ impl SharedOpcodeHandler for MIFrame {
         if concrete_items.iter().all(|v| !v.is_null()) {
             let dict = pyre_runtime::build_map_from_refs(&concrete_items);
             result_concrete = ConcreteValue::from_pyobj(dict);
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let item_oprefs: Vec<OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_map(&item_oprefs)?;
@@ -5027,25 +5006,14 @@ impl SharedOpcodeHandler for MIFrame {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        // Concrete mutation via stack lookup (original pattern)
-        if let Some((c_obj, c_key, c_val)) = self.concrete_store_subscr_operands() {
-            let _ = pyre_objspace::space::py_setitem(c_obj, c_key, c_val);
-        }
+        // RPython MIFrame parity: trace-only, no concrete mutation.
+        // Root frame: interpreter executes the real STORE_SUBSCR.
+        // Inline frame: MetaInterp.concrete_execute_step handles it.
         self.store_subscr_value(obj.opref, key.opref, value.opref)
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
-        // Concrete mutation via stack lookup (original pattern)
-        let s = self.sym();
-        let c_list = s.concrete_value_at(s.valuestackdepth).to_pyobj();
-        let c_value = s.concrete_value_at(s.valuestackdepth + 1).to_pyobj();
-        if !c_list.is_null() && !c_value.is_null() {
-            unsafe {
-                if pyre_object::is_list(c_list) {
-                    pyre_object::w_list_append(c_list, c_value);
-                }
-            }
-        }
+        // RPython MIFrame parity: trace-only, no concrete mutation.
         self.list_append_value(list.opref, value.opref)
     }
 
@@ -5065,7 +5033,6 @@ impl SharedOpcodeHandler for MIFrame {
         if !c_obj.is_null() {
             if let Ok(result) = pyre_objspace::space::py_getattr(c_obj, name) {
                 result_concrete = ConcreteValue::from_pyobj(result);
-                self.sym_mut().pending_concrete_push = Some(result_concrete);
             }
         }
         let opref = self.trace_load_attr(obj.opref, name)?;
@@ -5090,7 +5057,6 @@ impl LocalOpcodeHandler for MIFrame {
             .get(idx)
             .copied()
             .unwrap_or(ConcreteValue::Null);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx))?;
         Ok(FrontendOp::new(opref, concrete))
     }
@@ -5103,7 +5069,6 @@ impl LocalOpcodeHandler for MIFrame {
             .get(idx)
             .copied()
             .unwrap_or(ConcreteValue::Null);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.with_ctx(|this, ctx| MIFrame::load_local_value(this, ctx, idx))?;
         if self.value_type(opref) == Type::Ref {
             self.with_ctx(|this, ctx| {
@@ -5130,9 +5095,6 @@ impl NamespaceOpcodeHandler for MIFrame {
             return Ok(FrontendOp::opref_only(opref));
         };
         let concrete_cv = namespace_value_direct(ns, slot);
-        if let Some(cv) = concrete_cv {
-            self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(cv));
-        }
         let result_concrete = concrete_cv
             .map(ConcreteValue::from_pyobj)
             .unwrap_or(ConcreteValue::Null);
@@ -5165,7 +5127,6 @@ impl NamespaceOpcodeHandler for MIFrame {
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
-        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Ref(pyre_object::PY_NULL));
         let opref = self.trace_null_value()?;
         Ok(FrontendOp::new(
             opref,
@@ -5232,7 +5193,6 @@ impl TruthOpcodeHandler for MIFrame {
                 concrete_truth
             };
             result_concrete = ConcreteValue::Int(result as i64);
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let opref = self.trace_bool_value_from_truth(truth, negate)?;
         Ok(FrontendOp::new(opref, result_concrete))
@@ -5346,6 +5306,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
     ) -> Result<Self::Value, PyError> {
         let a = a_fop.opref;
         let b = b_fop.opref;
+        let mut result_concrete = ConcreteValue::Null;
         // MIFrame Box tracking: compute concrete result for binary ops
         // Float path
         if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
@@ -5394,44 +5355,51 @@ impl ArithmeticOpcodeHandler for MIFrame {
                             BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
                         )
                     {
-                        self.sym_mut().pending_concrete_push = Some(ConcreteValue::Float(result));
+                        result_concrete = ConcreteValue::Float(result);
                     }
                 }
             }
         }
         // Int path
-        if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
-            let result = match op {
-                BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
-                BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs.wrapping_sub(rhs),
-                BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs.wrapping_mul(rhs),
-                BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0 => {
-                    ((lhs % rhs) + rhs) % rhs // Python modulo semantics
-                }
-                BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0 => {
-                    let d = lhs.wrapping_div(rhs);
-                    if (lhs ^ rhs) < 0 && d * rhs != lhs {
-                        d - 1
-                    } else {
-                        d
+        if result_concrete.is_null() {
+            if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
+                let result = match op {
+                    BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
+                    BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
+                        lhs.wrapping_sub(rhs)
                     }
-                }
-                BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
-                BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
-                BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
-                BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                    lhs.wrapping_shl(rhs as u32)
-                }
-                BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                    lhs.wrapping_shr(rhs as u32)
-                }
-                _ => 0, // fallback
-            };
-            self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result));
+                    BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
+                        lhs.wrapping_mul(rhs)
+                    }
+                    BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0 => {
+                        ((lhs % rhs) + rhs) % rhs
+                    }
+                    BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
+                        if rhs != 0 =>
+                    {
+                        let d = lhs.wrapping_div(rhs);
+                        if (lhs ^ rhs) < 0 && d * rhs != lhs {
+                            d - 1
+                        } else {
+                            d
+                        }
+                    }
+                    BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
+                    BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
+                    BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
+                    BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+                        lhs.wrapping_shl(rhs as u32)
+                    }
+                    BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+                        lhs.wrapping_shr(rhs as u32)
+                    }
+                    _ => 0,
+                };
+                result_concrete = ConcreteValue::Int(result);
+            }
         }
-        // Fallback: if neither int nor float path set pending_concrete_push,
-        // compute via objspace (handles BigInt, mixed types, etc.)
-        if self.sym().pending_concrete_push.is_none() {
+        // Fallback: objspace (BigInt, mixed types)
+        if result_concrete.is_null() {
             if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
                 let result = match op {
                     BinaryOperator::Add | BinaryOperator::InplaceAdd => {
@@ -5446,12 +5414,19 @@ impl ArithmeticOpcodeHandler for MIFrame {
                     _ => Err(pyre_runtime::PyError::type_error("unsupported")),
                 };
                 if let Ok(r) = result {
-                    self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(r));
+                    result_concrete = ConcreteValue::from_pyobj(r);
                 }
             }
         }
         let opref = if matches!(op, BinaryOperator::Subscr) {
-            self.binary_subscr_value(a, b)?
+            let op = self.binary_subscr_value(a, b)?;
+            // binary_subscr_value sets pending_concrete_push internally
+            if result_concrete.is_null() {
+                if let Some(pending) = self.sym_mut().pending_concrete_push.take() {
+                    result_concrete = pending;
+                }
+            }
+            op
         } else if self.concrete_binary_float_operands()
             || self.value_type(a) == Type::Float
             || self.value_type(b) == Type::Float
@@ -5460,12 +5435,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
         } else {
             self.binary_int_value(a, b, op)?
         };
-        // Concrete already set via pending_concrete_push above
-        let concrete = self
-            .sym()
-            .pending_concrete_push
-            .unwrap_or(ConcreteValue::Null);
-        Ok(FrontendOp::new(opref, concrete))
+        Ok(FrontendOp::new(opref, result_concrete))
     }
 
     fn compare_value(
@@ -5476,7 +5446,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
     ) -> Result<Self::Value, PyError> {
         let a = a_fop.opref;
         let b = b_fop.opref;
-        // MIFrame Box tracking: compute concrete comparison result
+        let mut result_concrete = ConcreteValue::Null;
         if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
             unsafe {
                 if is_float(lhs_obj) || is_float(rhs_obj) {
@@ -5502,23 +5472,24 @@ impl ArithmeticOpcodeHandler for MIFrame {
                         ComparisonOperator::Equal => lhs_f == rhs_f,
                         ComparisonOperator::NotEqual => lhs_f != rhs_f,
                     };
-                    self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result as i64));
+                    result_concrete = ConcreteValue::Int(result as i64);
                 }
             }
         }
-        if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
-            let result = match op {
-                ComparisonOperator::Less => lhs < rhs,
-                ComparisonOperator::LessOrEqual => lhs <= rhs,
-                ComparisonOperator::Greater => lhs > rhs,
-                ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-                ComparisonOperator::Equal => lhs == rhs,
-                ComparisonOperator::NotEqual => lhs != rhs,
-            };
-            self.sym_mut().pending_concrete_push = Some(ConcreteValue::Int(result as i64));
+        if result_concrete.is_null() {
+            if let Some((lhs, rhs)) = self.concrete_binary_int_operands() {
+                let result = match op {
+                    ComparisonOperator::Less => lhs < rhs,
+                    ComparisonOperator::LessOrEqual => lhs <= rhs,
+                    ComparisonOperator::Greater => lhs > rhs,
+                    ComparisonOperator::GreaterOrEqual => lhs >= rhs,
+                    ComparisonOperator::Equal => lhs == rhs,
+                    ComparisonOperator::NotEqual => lhs != rhs,
+                };
+                result_concrete = ConcreteValue::Int(result as i64);
+            }
         }
-        // Fallback: compute via objspace for BigInt/mixed types
-        if self.sym().pending_concrete_push.is_none() {
+        if result_concrete.is_null() {
             if let Some((lhs_obj, rhs_obj)) = self.concrete_binary_operands() {
                 let cmp_op = match op {
                     ComparisonOperator::Less => pyre_objspace::space::CompareOp::Lt,
@@ -5529,23 +5500,18 @@ impl ArithmeticOpcodeHandler for MIFrame {
                     ComparisonOperator::NotEqual => pyre_objspace::space::CompareOp::Ne,
                 };
                 if let Ok(r) = pyre_objspace::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
-                    self.sym_mut().pending_concrete_push = Some(ConcreteValue::from_pyobj(r));
+                    result_concrete = ConcreteValue::from_pyobj(r);
                 }
             }
         }
         let opref = self.compare_value_direct(a, b, op)?;
-        let concrete = self
-            .sym()
-            .pending_concrete_push
-            .unwrap_or(ConcreteValue::Null);
-        Ok(FrontendOp::new(opref, concrete))
+        Ok(FrontendOp::new(opref, result_concrete))
     }
 
     fn unary_negative_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
         let mut result_concrete = ConcreteValue::Null;
         if let Some(v) = self.concrete_unary_int_operand() {
             result_concrete = ConcreteValue::Int(v.wrapping_neg());
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let opref = self.unary_int_value(value.opref, OpCode::IntNeg)?;
         Ok(FrontendOp::new(opref, result_concrete))
@@ -5555,7 +5521,6 @@ impl ArithmeticOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         if let Some(v) = self.concrete_unary_int_operand() {
             result_concrete = ConcreteValue::Int(!v);
-            self.sym_mut().pending_concrete_push = Some(result_concrete);
         }
         let opref = self.unary_int_value(value.opref, OpCode::IntInvert)?;
         Ok(FrontendOp::new(opref, result_concrete))
@@ -5565,49 +5530,42 @@ impl ArithmeticOpcodeHandler for MIFrame {
 impl ConstantOpcodeHandler for MIFrame {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Int(value);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_int_constant(value)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn bigint_constant(&mut self, value: &PyBigInt) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Ref(pyre_object::w_long_new(value.clone()));
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_bigint_constant(value)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Float(value);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_float_constant(value)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn bool_constant(&mut self, value: bool) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Int(value as i64);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_bool_constant(value)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Ref(pyre_object::w_str_new(value));
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_str_constant(value)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Ref(code as *const CodeObject as PyObjectRef);
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_code_constant(code)?;
         Ok(FrontendOp::new(opref, concrete))
     }
 
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {
         let concrete = ConcreteValue::Ref(pyre_object::w_none());
-        self.sym_mut().pending_concrete_push = Some(concrete);
         let opref = self.trace_none_constant()?;
         Ok(FrontendOp::new(opref, concrete))
     }

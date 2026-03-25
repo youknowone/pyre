@@ -337,8 +337,7 @@ impl PyreMetaInterp {
             pcf.push(concrete_result);
         }
 
-        // Also set pending_concrete_push for root frame parent
-        parent_sym.pending_concrete_push = Some(ConcreteValue::from_pyobj(concrete_result));
+        // No pending_concrete_push needed — concrete_stack[result_idx] already updated above.
     }
 
     // ── Concrete execution helpers ───────────────────────────────
