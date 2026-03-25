@@ -907,6 +907,10 @@ fn restore_guard_failure_for_loop(
         );
     }
 
+    // RPython compile.py:701 handle_fail → _trace_and_compile_from_bridge.
+    // Consume and discard — bridge compilation from the Cranelift guard
+    // failure shim is attempted once. If the bridge trace aborts (e.g.,
+    // exception during tracing), the request is not retried.
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
