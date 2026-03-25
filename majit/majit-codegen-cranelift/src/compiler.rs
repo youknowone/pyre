@@ -2939,20 +2939,36 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
     Ok(force_tokens)
 }
 
-fn build_value_type_map(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type> {
+/// Returns (value_types, inputarg_types, op_def_positions).
+/// - value_types: merged map (ops override inputargs) — used for most lookups
+/// - inputarg_types: inputarg-only types — used for positional type inference
+/// - op_def_positions: OpRef → op_index of the defining operation
+///   (only for OpRefs that are both inputargs and op results with different types)
+fn build_value_type_map(
+    inputargs: &[InputArg],
+    ops: &[Op],
+) -> (HashMap<u32, Type>, HashMap<u32, Type>, HashMap<u32, usize>) {
     let mut value_types = HashMap::new();
+    let mut inputarg_types = HashMap::new();
+    let mut op_def_positions = HashMap::new();
 
     for input in inputargs {
         value_types.insert(input.index, input.tp);
+        inputarg_types.insert(input.index, input.tp);
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
         let result_type = op.result_type();
         if result_type != Type::Void {
-            value_types.insert(
-                op_var_index(op, op_idx, inputargs.len()) as u32,
-                result_type,
-            );
+            let var_idx = op_var_index(op, op_idx, inputargs.len()) as u32;
+            // Track type conflicts: inputarg type ≠ operation result type.
+            // Guards before this operation should use inputarg_types.
+            if let Some(&ia_type) = inputarg_types.get(&var_idx) {
+                if ia_type != result_type {
+                    op_def_positions.insert(var_idx, op_idx);
+                }
+            }
+            value_types.insert(var_idx, result_type);
         }
         // Propagate optimizer-provided fail_arg_types to value_types.
         // This ensures constant OpRefs typed as Ref by the optimizer
@@ -2971,7 +2987,7 @@ fn build_value_type_map(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type
         }
     }
 
-    value_types
+    (value_types, inputarg_types, op_def_positions)
 }
 
 fn build_ref_root_slots(
@@ -3893,6 +3909,45 @@ fn infer_fail_arg_types(
     Ok(fail_arg_types)
 }
 
+/// Position-aware fail_arg type inference. When an OpRef is both a label
+/// inputarg and a body operation result with a DIFFERENT type, the correct
+/// type depends on whether the guard is BEFORE or AFTER the operation that
+/// redefines it. Guards before the operation see the inputarg value (e.g.
+/// Ref from preamble), while guards after see the operation result (e.g.
+/// Int from IntAddOvf).
+fn infer_fail_arg_types_positional(
+    fail_arg_refs: &[OpRef],
+    value_types: &HashMap<u32, Type>,
+    inputarg_types: &HashMap<u32, Type>,
+    op_def_positions: &HashMap<u32, usize>,
+    guard_op_index: usize,
+) -> Result<Vec<Type>, BackendError> {
+    let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
+    for &opref in fail_arg_refs {
+        if opref.is_none() {
+            fail_arg_types.push(Type::Int);
+            continue;
+        }
+        let tp = if let Some(&def_pos) = op_def_positions.get(&opref.0) {
+            if guard_op_index < def_pos {
+                // Guard is before the operation that defines this OpRef.
+                // Use the inputarg type (value from preamble/label entry).
+                inputarg_types
+                    .get(&opref.0)
+                    .or_else(|| value_types.get(&opref.0))
+                    .copied()
+                    .unwrap_or(Type::Int)
+            } else {
+                value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+            }
+        } else {
+            value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+        };
+        fail_arg_types.push(tp);
+    }
+    Ok(fail_arg_types)
+}
+
 // ---------------------------------------------------------------------------
 // CraneliftBackend
 // ---------------------------------------------------------------------------
@@ -4271,7 +4326,8 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
-        let value_types = build_value_type_map(inputargs, ops);
+        let (value_types, _inputarg_types, _op_def_positions) =
+            build_value_type_map(inputargs, ops);
         let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens);
         let gc_runtime_id = self.gc_runtime_id;
         let mut defined_ref_vars: HashSet<u32> = inputargs
@@ -7906,7 +7962,7 @@ fn collect_guards(
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
-    let value_types = build_value_type_map(inputargs, ops);
+    let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
 
     // Collect Label descr indices to distinguish internal vs external JUMPs.
     let label_descr_indices: HashSet<u32> = ops
@@ -7960,17 +8016,25 @@ fn collect_guards(
                 if dt.len() == refs.len() {
                     dt.to_vec()
                 } else {
-                    infer_fail_arg_types(&refs, &value_types)?
+                    infer_fail_arg_types_positional(
+                        &refs,
+                        &value_types,
+                        &inputarg_types,
+                        &op_def_positions,
+                        op_idx,
+                    )?
                 }
             } else {
-                infer_fail_arg_types(&refs, &value_types)?
+                infer_fail_arg_types_positional(
+                    &refs,
+                    &value_types,
+                    &inputarg_types,
+                    &op_def_positions,
+                    op_idx,
+                )?
             };
             (refs, types)
         } else {
-            // RPython: every guard stores its own fail_args via
-            // guard_op.setfailargs(). The backend uses each guard's
-            // fail_args to determine what to save on guard failure.
-            // No preamble/body distinction needed.
             let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
                 fa.iter().copied().collect()
             } else {
@@ -7982,13 +8046,31 @@ fn collect_guards(
                     if dt.len() == refs.len() {
                         dt.to_vec()
                     } else {
-                        infer_fail_arg_types(&refs, &value_types)?
+                        infer_fail_arg_types_positional(
+                            &refs,
+                            &value_types,
+                            &inputarg_types,
+                            &op_def_positions,
+                            op_idx,
+                        )?
                     }
                 } else {
-                    infer_fail_arg_types(&refs, &value_types)?
+                    infer_fail_arg_types_positional(
+                        &refs,
+                        &value_types,
+                        &inputarg_types,
+                        &op_def_positions,
+                        op_idx,
+                    )?
                 }
             } else {
-                infer_fail_arg_types(&refs, &value_types)?
+                infer_fail_arg_types_positional(
+                    &refs,
+                    &value_types,
+                    &inputarg_types,
+                    &op_def_positions,
+                    op_idx,
+                )?
             };
             (refs, types)
         };
@@ -8085,7 +8167,7 @@ fn collect_terminal_exit_layouts(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let value_types = build_value_type_map(inputargs, ops);
+    let (value_types, _inputarg_types, _op_def_positions) = build_value_type_map(inputargs, ops);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;
 
