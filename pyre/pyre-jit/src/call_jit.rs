@@ -1046,8 +1046,7 @@ pub fn jit_bridge_compile_for_guard(
 
     // pyjitpl.py:2841 interpret(): trace bytecodes from guard failure PC
     // until the bridge path terminates (Finish or CloseLoop).
-    let mut trace_frame = frame.snapshot_for_tracing();
-    let trace_frame_ptr = (&mut trace_frame) as *mut PyFrame as usize;
+    let mut trace_frame = Box::new(frame.snapshot_for_tracing());
     let max_bridge_ops = 200;
 
     for step in 0..max_bridge_ops {
@@ -1063,7 +1062,12 @@ pub fn jit_bridge_compile_for_guard(
             &mut jit_state,
             &env,
             || {},
-            |ctx, sym| trace_bytecode(ctx, sym, code, pc, trace_frame_ptr),
+            |ctx, sym| {
+                // Bridge tracing: create a per-step snapshot.
+                let snapshot = Box::new(trace_frame.snapshot_for_tracing());
+                let (action, _executed) = trace_bytecode(ctx, sym, code, pc, snapshot);
+                action
+            },
         );
 
         // merge_point handles Finish/CloseLoop via bridge_info.

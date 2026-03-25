@@ -22,19 +22,21 @@ pub fn trace_bytecode(
     sym: &mut PyreSym,
     code: &CodeObject,
     start_pc: usize,
-    concrete_frame: usize,
-) -> TraceAction {
-    // Build a MetaInterp with a single root frame.
-    // The root frame borrows PyreSym from the caller via raw pointer.
-    // PyreMetaInterp.interpret() drives the dispatch loop.
+    mut concrete_frame: Box<pyre_interp::frame::PyFrame>,
+) -> (TraceAction, Box<pyre_interp::frame::PyFrame>) {
+    // RPython MetaInterp._interpret() parity: root frame owns a concrete
+    // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
+    // concrete execution — the interpreter does not run during tracing.
+    concrete_frame.next_instr = start_pc;
+    let cf_addr = &*concrete_frame as *const pyre_interp::frame::PyFrame as usize;
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
         jitcode: code as *const CodeObject,
         pc: start_pc,
         greenkey: None,
-        concrete_frame,
-        owned_concrete_frame: None,
+        concrete_frame: cf_addr,
+        owned_concrete_frame: Some(concrete_frame),
         parent_fail_args: Vec::new(),
         parent_fail_arg_types: Vec::new(),
         drop_frame_opref: None,
@@ -59,12 +61,13 @@ pub fn trace_bytecode(
 
     let action = metainterp.interpret(ctx);
 
-    // RPython pyjitpl.py:3000 uses original_boxes[:num_green_args] (= start_pc).
-    // pyre deviates: CloseLoopWithArgs retargets to target_pc because pyre
-    // starts traces from can_enter_jit (inner back-edge), not jit_merge_point
-    // (outer loop header). Without retarget, the compiled code's merge_pc
-    // wouldn't match any can_enter_jit entry point. Removing this requires
-    // per-guard resume data + blackhole interpreter for safe guard recovery.
+    // Recover the root frame's owned_concrete_frame for writeback.
+    let executed_frame = metainterp
+        .framestack
+        .pop()
+        .and_then(|f| f.owned_concrete_frame);
+
+    // RPython pyjitpl.py:3000: retarget green key for can_enter_jit entry.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
@@ -80,7 +83,16 @@ pub fn trace_bytecode(
         _ => {}
     }
 
-    action
+    // On abort, root frame may still be on the stack.
+    let root_frame = if executed_frame.is_some() {
+        executed_frame.unwrap()
+    } else if let Some(root) = metainterp.framestack.pop() {
+        root.owned_concrete_frame
+            .unwrap_or_else(|| Box::new(unsafe { std::mem::zeroed() }))
+    } else {
+        Box::new(unsafe { std::mem::zeroed() })
+    };
+    (action, root_frame)
 }
 
 #[cfg(test)]
