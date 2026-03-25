@@ -246,27 +246,40 @@ impl StackOpcodeHandler for PyFrame {
     }
 }
 
+thread_local! {
+    /// Cache for user-defined iterator __next__ result.
+    /// concrete_iter_continues calls __next__ and caches here;
+    /// iter_next_value returns the cached value.
+    static USER_ITER_NEXT_CACHE: std::cell::Cell<PyObjectRef> =
+        const { std::cell::Cell::new(PY_NULL) };
+}
+
+/// PyPy: pyopcode.py GET_ITER → space.iter(w_iterable)
+///       pyopcode.py FOR_ITER → space.next(w_iterator)
 impl IterOpcodeHandler for PyFrame {
+    /// GET_ITER: convert iterable to iterator.
+    /// PyPy: space.iter(w_iterable) → calls __iter__ or wraps in seq_iter.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
         unsafe {
+            // Already an iterator
             if pyre_object::is_range_iter(iter) || pyre_object::is_seq_iter(iter) {
                 return Ok(());
             }
-            // Convert list/tuple to seq iterator on the stack
+            // list → seq_iter
             if pyre_object::is_list(iter) {
                 let len = pyre_object::w_list_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
-                // Replace TOS with the iterator
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
+            // tuple → seq_iter
             if pyre_object::is_tuple(iter) {
                 let len = pyre_object::w_tuple_len(iter);
                 let seq_iter = pyre_object::w_seq_iter_new(iter, len);
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
-            // String → list of 1-char strings → seq_iter
+            // str → list of 1-char strings → seq_iter
             if pyre_object::is_str(iter) {
                 let s = pyre_object::w_str_get_value(iter);
                 let chars: Vec<pyre_object::PyObjectRef> = s
@@ -282,15 +295,69 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
                 return Ok(());
             }
+            // dict → iterate over keys (PyPy: dictobject.py __iter__ → dict_keys)
+            if pyre_object::is_dict(iter) {
+                let d = &*(iter as *const pyre_object::dictobject::W_DictObject);
+                let entries = &*d.entries;
+                let keys: Vec<pyre_object::PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
+                let key_list = pyre_object::w_list_new(keys);
+                let len = entries.len();
+                let seq_iter = pyre_object::w_seq_iter_new(key_list, len);
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = seq_iter;
+                return Ok(());
+            }
+            // User-defined __iter__ — PyPy: space.iter → __iter__()
+            if pyre_object::is_instance(iter) {
+                let w_type = pyre_object::w_instance_get_type(iter);
+                if let Some(iter_method) = crate::space::lookup_in_type_mro_pub(w_type, "__iter__")
+                {
+                    let result = crate::space_call_function(iter_method, &[iter]);
+                    self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
+                    return Ok(());
+                }
+            }
         }
         ensure_range_iter(iter)
     }
 
+    /// FOR_ITER: check if iterator has more items.
+    /// PyPy: space.next() → StopIteration means exhausted.
+    /// For user-defined iterators, we speculatively call __next__ and
+    /// cache the result — iter_next_value returns the cached value.
     fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
+        unsafe {
+            if pyre_object::is_instance(iter) {
+                let w_type = pyre_object::w_instance_get_type(iter);
+                if let Some(next_method) = crate::space::lookup_in_type_mro_pub(w_type, "__next__")
+                {
+                    match crate::call::call_callable(self, next_method, &[iter]) {
+                        Ok(result) => {
+                            // Cache next value for iter_next_value
+                            USER_ITER_NEXT_CACHE.with(|c| c.set(result));
+                            return Ok(true);
+                        }
+                        Err(e) if e.kind == PyErrorKind::StopIteration => {
+                            USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
+                            return Ok(false);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
         range_iter_continues(iter)
     }
 
+    /// PyPy: space.next(w_iterator) → returns cached value from concrete_iter_continues.
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
+        // User-defined iterator: return cached value from concrete_iter_continues
+        if unsafe { pyre_object::is_instance(iter) } {
+            let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
+            if !cached.is_null() {
+                return Ok(cached);
+            }
+            return Ok(PY_NULL);
+        }
         range_iter_next_or_null(iter)
     }
 
