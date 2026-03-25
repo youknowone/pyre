@@ -216,6 +216,49 @@ impl JitFrame {
         }
         frame
     }
+
+    // ── llmodel.py:412-462 CPU value accessors ──────────────────
+
+    /// llmodel.py:412-420 — get_latest_descr.
+    ///
+    /// Returns the `jf_descr` field, which holds the descr pointer
+    /// of the last GUARD or FINISH operation executed.
+    pub unsafe fn get_latest_descr(ptr: *const JitFrame) -> usize {
+        (*ptr).jf_descr
+    }
+
+    /// llmodel.py:437-444 — get_int_value.
+    ///
+    /// Read the `index`-th Signed slot from `jf_frame`.
+    /// `index` is a slot index (not byte offset).
+    pub unsafe fn get_int_value(ptr: *const JitFrame, index: usize) -> isize {
+        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const isize;
+        *base.add(index)
+    }
+
+    /// llmodel.py:446-453 — get_ref_value.
+    ///
+    /// Read the `index`-th slot as a reference (pointer-sized).
+    pub unsafe fn get_ref_value(ptr: *const JitFrame, index: usize) -> usize {
+        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const usize;
+        *base.add(index)
+    }
+
+    /// llmodel.py:455-462 — get_float_value.
+    pub unsafe fn get_float_value(ptr: *const JitFrame, index: usize) -> u64 {
+        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const u64;
+        *base.add(index)
+    }
+
+    /// llmodel.py:248-251 — get_savedata_ref.
+    pub unsafe fn get_savedata_ref(ptr: *const JitFrame) -> usize {
+        (*ptr).jf_savedata
+    }
+
+    /// llmodel.py:252-257 — set_savedata_ref.
+    pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
+        (*ptr).jf_savedata = value;
+    }
 }
 
 // ── jitframe_trace (jitframe.py:104-136) ────────────────────────────
