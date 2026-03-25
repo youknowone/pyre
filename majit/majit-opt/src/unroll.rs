@@ -1272,21 +1272,14 @@ impl OptUnroll {
             }
 
             // unroll.py:346-347: make_inputargs_and_virtuals
-            // When force_boxes=true, force_to_ops must emit directly to avoid
-            // the Virtualize pass re-absorbing the materialized New().
-            let prev_final = ctx.in_final_emission;
-            if force_boxes {
-                ctx.in_final_emission = true;
-            }
+            // RPython: force_box emits New/SetfieldGc via emit_extra which
+            // routes through passes AFTER Virtualize. The non-virtual PtrInfo
+            // (Struct/Instance) on alloc_ref prevents re-absorption.
             let (target_args, virtuals) = match target_vs
                 .make_inputargs_and_virtuals_with_optimizer(&args, optimizer, ctx, force_boxes)
             {
-                Ok(result) => {
-                    ctx.in_final_emission = prev_final;
-                    result
-                }
+                Ok(result) => result,
                 Err(()) => {
-                    ctx.in_final_emission = prev_final;
                     if force_boxes {
                         args = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
                         virtual_state =
