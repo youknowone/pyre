@@ -837,10 +837,23 @@ fn restore_guard_failure_for_loop(
         );
     }
 
-    // Discard pending bridge requests. Bridge compilation requires
-    // proper guard type propagation through the bridge body loop
-    // before it can be safely enabled (TODO: RPython bridge parity).
-    crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
+    // RPython handle_fail → _trace_and_compile_from_bridge parity:
+    // If a bridge compilation was requested (guard failure count >= threshold),
+    // compile the bridge now while the frame is in a restored state.
+    if let Some((bridge_gk, bridge_tid, bridge_fidx, bridge_pc)) =
+        crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take())
+    {
+        if restored {
+            let frame = unsafe { &mut *(jit_state.frame as *mut pyre_interp::frame::PyFrame) };
+            crate::call_jit::jit_bridge_compile_for_guard(
+                bridge_gk,
+                bridge_tid,
+                bridge_fidx,
+                frame,
+                bridge_pc,
+            );
+        }
+    }
 
     restored.then_some(jit_state.next_instr)
 }
