@@ -5245,11 +5245,8 @@ impl NamespaceOpcodeHandler for MIFrame {
             unsafe {
                 if is_func(concrete_value) || is_builtin_func(concrete_value) {
                     let opref = self.with_ctx(|this, ctx| {
-                        // Emit GUARD_NOT_INVALIDATED to protect against
-                        // globals mutation (quasi-immut pattern).
-                        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-                            this.record_guard(ctx, OpCode::GuardNotInvalidated, &[]);
-                        }
+                        let loaded = MIFrame::load_namespace_value(this, ctx, slot)?;
+                        this.guard_value(ctx, loaded, concrete_value as i64);
                         let const_value = ctx.const_int(concrete_value as i64);
                         this.sym_mut()
                             .symbolic_namespace_slots
