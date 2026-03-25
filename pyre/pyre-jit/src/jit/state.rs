@@ -2002,14 +2002,23 @@ impl MIFrame {
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
             )
         };
+        // RPython close_loop_args parity: use inputarg types as the target
+        // for materialize_loop_carried_value. The label expects inputarg types
+        // (typically all-Ref for virtualizable locals), so JUMP args must be
+        // boxed to match. Using concrete-derived types would skip boxing
+        // for unboxed Int/Float values, causing type mismatch at the JUMP.
+        let inputarg_types = ctx.inputarg_types();
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
-            let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
-            args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
+            let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
+            args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
         for (stack_idx, value) in stack.into_iter().enumerate() {
-            let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
-            args.push(self.materialize_loop_carried_value(ctx, value, slot_type));
+            let target_type = inputarg_types
+                .get(3 + nlocals + stack_idx)
+                .copied()
+                .unwrap_or(Type::Ref);
+            args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
         args
     }
