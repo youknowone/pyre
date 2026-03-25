@@ -5361,11 +5361,36 @@ impl ControlFlowOpcodeHandler for MIFrame {
 
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython reached_loop_header (pyjitpl.py:2988-3030):
+            // RPython reached_loop_header (pyjitpl.py:2973-3036):
             let code_ptr = this.sym().concrete_code;
             let back_edge_key = crate::eval::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
+            // pyjitpl.py:2979-2983: compile_trace — attempt to make a bridge
+            // to the ROOT loop's existing compiled targets. This fires BEFORE
+            // the merge_point search. Uses the ROOT green_key (not back_edge_key).
+            {
+                let root_key = ctx.root_green_key();
+                let (driver, _) = crate::eval::driver_pair();
+                if driver.meta_interp().has_compiled_targets(root_key) {
+                    let jump_args = MIFrame::close_loop_args(this, ctx);
+                    let outcome = driver
+                        .meta_interp_mut()
+                        .compile_trace(root_key, &jump_args, None);
+                    if matches!(outcome, majit_meta::CompileOutcome::Compiled) {
+                        if majit_meta::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][reached_loop_header] compile_trace success: root={} pc={}",
+                                root_key, target
+                            );
+                        }
+                        MIFrame::set_next_instr(this, ctx, target);
+                        return Ok(Some(
+                            jump_args.into_iter().map(FrontendOp::opref_only).collect(),
+                        ));
+                    }
+                }
+            }
             if !ctx.has_merge_point(back_edge_key) {
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
