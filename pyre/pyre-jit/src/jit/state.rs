@@ -300,13 +300,20 @@ pub struct PyreSym {
     pub(crate) concrete_vable_ptr: *mut u8,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
-    /// RPython capture_resumedata parity (bridge traces only):
-    /// pre-opcode snapshot of valuestackdepth + symbolic_stack so that
-    /// guards inside an opcode can capture the state at opcode START.
-    /// Set at the beginning of trace_code_step when bridge tracing.
+    /// RPython capture_resumedata(resumepc=orgpc) parity: pre-opcode
+    /// snapshot of valuestackdepth + symbolic_stack so guards capture
+    /// the state at opcode START. On guard failure the interpreter
+    /// re-executes the opcode from orgpc.
     pub(crate) pre_opcode_vsd: Option<usize>,
     pub(crate) pre_opcode_stack: Option<Vec<OpRef>>,
     pub(crate) pre_opcode_stack_types: Option<Vec<Type>>,
+    /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
+    /// exception object pending during tracing. Set by execute_ll_raised
+    /// (raise_varargs), consumed by handle_possible_exception.
+    pub(crate) last_exc_value: pyre_object::PyObjectRef,
+    /// RPython MetaInterp.class_of_last_exc_is_const (pyjitpl.py:2754):
+    /// True after GUARD_EXCEPTION or GUARD_CLASS on the exception.
+    pub(crate) class_of_last_exc_is_const: bool,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1183,6 +1190,8 @@ impl PyreSym {
             pre_opcode_vsd: None,
             pre_opcode_stack: None,
             pre_opcode_stack_types: None,
+            last_exc_value: std::ptr::null_mut(),
+            class_of_last_exc_is_const: false,
         }
     }
 
@@ -4782,7 +4791,13 @@ impl MIFrame {
         }
     }
 
-    /// RPython pyjitpl.py:3380 handle_possible_exception.
+    /// RPython pyjitpl.py:3380 handle_possible_exception +
+    /// pyjitpl.py:2506 finishframe_exception.
+    ///
+    /// When an opcode raises during tracing and there is a handler in the
+    /// exception table, emit GUARD_EXCEPTION and continue tracing through
+    /// the handler (PUSH_EXC_INFO → CHECK_EXC_MATCH → handler body →
+    /// POP_EXCEPT → back to loop). When there is no handler, abort.
     pub(crate) fn handle_possible_exception(
         &mut self,
         code: &CodeObject,
@@ -4794,39 +4809,99 @@ impl MIFrame {
             pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
         {
             let handler_pc = entry.target as usize;
+            let handler_depth = entry.depth as usize;
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][handle_possible_exception] pc={} handler={} err={}",
-                    pc, handler_pc, err
+                    "[jit][handle_possible_exception] pc={} handler={} depth={} err={}",
+                    pc, handler_pc, handler_depth, err
                 );
             }
 
             // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class).
-            let exc_obj = err.to_exc_object();
+            // Use the concrete exception stored by execute_ll_raised
+            // (raise_varargs); fall back to err.to_exc_object() for
+            // non-raise exceptions (e.g. CALL failures).
+            let exc_obj = {
+                let stored = self.sym().last_exc_value;
+                if !stored.is_null() {
+                    stored
+                } else {
+                    err.to_exc_object()
+                }
+            };
             let exc_type_ptr = unsafe {
                 (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
                     .ob_header
                     .ob_type as i64
             };
-            self.with_ctx(|this, ctx| {
+
+            // Emit GUARD_EXCEPTION — returns the exception value OpRef.
+            let exc_opref = self.with_ctx(|this, ctx| {
+                this.flush_to_frame_for_guard(ctx);
+                let fail_arg_types = this.build_single_frame_fail_arg_types();
+                let fail_args = this.build_single_frame_fail_args(ctx);
                 let exc_type_const = ctx.const_int(exc_type_ptr);
-                this.record_guard(ctx, majit_ir::OpCode::GuardException, &[exc_type_const]);
+                ctx.record_guard_typed_with_fail_args(
+                    majit_ir::OpCode::GuardException,
+                    &[exc_type_const],
+                    fail_arg_types,
+                    &fail_args,
+                )
             });
 
-            // TODO(exception-path-tracing): pyjitpl.py:2506 finishframe_exception
-            // searches the bytecode for a catch_exception handler; if found,
-            // it sets frame.pc = handler_target and raises ChangeFrame so the
-            // meta-interpreter continues tracing through the exception handler
-            // inline within the same trace.
-            //
-            // pyre currently aborts instead. To reach full parity:
-            //   1. Adjust symbolic stack to handler depth (entry.depth)
-            //   2. Push exc_obj onto symbolic stack
-            //   3. Set pending_next_instr = handler_pc
-            //   4. Return TraceAction::Continue
-            // This requires push_exc_info / check_exc_match / pop_except
-            // MIFrame overrides (already stubbed below) to be fully wired.
-            TraceAction::Abort
+            // RPython pyjitpl.py:3390: class_of_last_exc_is_const = True
+            self.sym_mut().class_of_last_exc_is_const = true;
+
+            // RPython pyjitpl.py:2506 finishframe_exception: found a
+            // catch handler — adjust stack and continue at handler_pc.
+            let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+            let nlocals = self.sym().nlocals;
+            let target_stack_only = ncells + handler_depth;
+            {
+                let s = self.sym_mut();
+                s.symbolic_stack.truncate(target_stack_only);
+                s.symbolic_stack_types.truncate(target_stack_only);
+                s.concrete_stack.truncate(target_stack_only);
+                s.valuestackdepth = nlocals + target_stack_only;
+
+                // Push exception value onto symbolic stack (interpreter
+                // pushes exc before PUSH_EXC_INFO).
+                if entry.push_lasti {
+                    let lasti_obj = pyre_object::w_int_new(pc as i64);
+                    let lasti_opref = OpRef::NONE; // placeholder
+                    s.symbolic_stack.push(lasti_opref);
+                    s.symbolic_stack_types.push(Type::Ref);
+                    s.concrete_stack.push(ConcreteValue::Ref(lasti_obj));
+                    s.valuestackdepth += 1;
+                }
+                s.symbolic_stack.push(exc_opref);
+                s.symbolic_stack_types.push(Type::Ref);
+                s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
+                s.valuestackdepth += 1;
+            }
+
+            // Sync concrete frame: unwind stack to handler depth, push exc.
+            let frame =
+                unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+            let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
+            while frame.valuestackdepth > target_depth {
+                frame.pop();
+            }
+            if entry.push_lasti {
+                frame.push(pyre_object::w_int_new(pc as i64));
+            }
+            frame.push(exc_obj);
+
+            // Continue tracing at handler_pc.
+            self.sym_mut().pending_next_instr = Some(handler_pc);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][handle_possible_exception] continue at handler_pc={} vsd={}",
+                    handler_pc,
+                    self.sym().valuestackdepth
+                );
+            }
+            TraceAction::Continue
         } else {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
@@ -5900,26 +5975,13 @@ impl OpcodeStepExecutor for MIFrame {
         )
     }
 
-    // TODO(exception-path-tracing): these three overrides are stubs for
-    // future inline exception-path tracing (see handle_possible_exception TODO).
-    // Currently dead — exception paths abort before reaching handler bytecodes.
+    // RPython exception handler tracing (pyjitpl.py:2506 finishframe_exception):
+    // handle_possible_exception emits GUARD_EXCEPTION and continues at the
+    // handler PC. These three overrides trace the handler-entry bytecodes.
     //
-    // RPython equivalents (different bytecode set):
-    //   PUSH_EXC_INFO  → no direct equivalent; exception state lives in
-    //                     MetaInterp.last_exc_value / last_exc_box
+    //   PUSH_EXC_INFO  → pop exc, push None (prev_exc), push exc (+1 depth)
     //   CHECK_EXC_MATCH → opimpl_goto_if_exception_mismatch (pyjitpl.py:1677)
-    //                     — no guard needed because class_of_last_exc_is_const
-    //                     is True after GUARD_EXCEPTION
-    //   POP_EXCEPT     → no direct equivalent; RPython's catch_exception
-    //                     handler block implicitly consumes the exception
-    //
-    // When exception-path tracing lands, these must:
-    //   - push_exc_info: record symbolic exc value + None (prev_exc) on
-    //     the symbolic stack, matching the concrete frame push
-    //   - check_exc_match: emit GUARD_CLASS if the exception type is not
-    //     already const-known, then push True (within the guarded trace
-    //     the match is guaranteed)
-    //   - pop_except: pop the symbolic exception value from the stack
+    //   POP_EXCEPT     → pop prev_exc, clear_exception (pyjitpl.py:2751)
 
     fn push_exc_info(&mut self) -> Result<(), Self::Error> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
@@ -5943,16 +6005,51 @@ impl OpcodeStepExecutor for MIFrame {
         let frame =
             unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
         frame.pop();
+        // RPython pyjitpl.py:2751 clear_exception: exception fully handled.
+        let s = self.sym_mut();
+        s.last_exc_value = std::ptr::null_mut();
+        s.class_of_last_exc_is_const = false;
         Ok(())
     }
 
+    /// RPython pyjitpl.py:1677 opimpl_goto_if_exception_mismatch.
+    ///
+    /// Pops the expected exception type, checks against last_exc_value,
+    /// and pushes the concrete match result. GUARD_EXCEPTION already
+    /// verified the class so this usually produces True, but multi-except
+    /// blocks may produce False for non-matching clauses.
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
-        let _exc_type = <Self as SharedOpcodeHandler>::pop_value(self).ok();
-        let true_obj = pyre_object::w_bool_from(true);
-        let true_opref = self.with_ctx(|_this, ctx| ctx.const_ref(true_obj as i64));
+        let exc_type_val = <Self as SharedOpcodeHandler>::pop_value(self).ok();
+        let exc_type_obj = exc_type_val
+            .as_ref()
+            .map(|v| v.concrete.to_pyobj())
+            .unwrap_or(std::ptr::null_mut());
+
+        // RPython pyjitpl.py:1682: isinstance check against last_exc_value.
+        let last_exc = self.sym().last_exc_value;
+        let matched = if !last_exc.is_null() && !exc_type_obj.is_null() {
+            unsafe {
+                if !pyre_object::is_exception(last_exc) {
+                    true
+                } else {
+                    let kind = pyre_object::w_exception_get_kind(last_exc);
+                    if pyre_object::is_str(exc_type_obj) {
+                        let type_name = pyre_object::w_str_get_value(exc_type_obj);
+                        pyre_object::exc_kind_matches(kind, type_name)
+                    } else {
+                        true // unrecognized type format → match
+                    }
+                }
+            }
+        } else {
+            true // fallback: assume match if no concrete info
+        };
+
+        let result_obj = pyre_object::w_bool_from(matched);
+        let result_opref = self.with_ctx(|_this, ctx| ctx.const_ref(result_obj as i64));
         <Self as SharedOpcodeHandler>::push_value(
             self,
-            FrontendOp::new(true_opref, ConcreteValue::Ref(true_obj)),
+            FrontendOp::new(result_opref, ConcreteValue::Ref(result_obj)),
         )?;
         Ok(())
     }
@@ -5982,7 +6079,13 @@ impl OpcodeStepExecutor for MIFrame {
                 );
             });
         }
-        // Return the concrete exception as Err for handle_possible_exception.
+        // RPython pyjitpl.py:2745 execute_ll_raised: store concrete
+        // exception for handle_possible_exception / check_exc_match.
+        {
+            let s = self.sym_mut();
+            s.last_exc_value = concrete_exc;
+            s.class_of_last_exc_is_const = true;
+        }
         Err(PyError::value_error("raised during tracing"))
     }
 
