@@ -46,8 +46,8 @@ use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
-    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, JitStats,
-    MetaInterp,
+    BackEdgeAction, BridgeCompilationRequest, CompiledExitLayout, DetailedDriverRunOutcome,
+    InlineDecision, JitStats, MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::TraceCtx;
@@ -491,14 +491,8 @@ impl<S: JitState> JitDriver<S> {
                     let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
                     let meta = match hpc {
                         Some(0) => {
-                            if let Some((cut_pc, ref cut_types)) =
-                                self.meta.cross_loop_cut_info()
-                            {
-                                S::build_meta_from_merge_point(
-                                    &provisional_meta,
-                                    cut_pc,
-                                    cut_types,
-                                )
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
                             } else {
                                 provisional_meta
                             }
@@ -568,14 +562,8 @@ impl<S: JitState> JitDriver<S> {
                     let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
                     let meta = match hpc {
                         Some(0) => {
-                            if let Some((cut_pc, ref cut_types)) =
-                                self.meta.cross_loop_cut_info()
-                            {
-                                S::build_meta_from_merge_point(
-                                    &provisional_meta,
-                                    cut_pc,
-                                    cut_types,
-                                )
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
                             } else {
                                 provisional_meta
                             }
@@ -1639,30 +1627,31 @@ impl<S: JitState> JitDriver<S> {
         let restored = resume_pc.is_some();
         if restored {
             self.sync_after(state, &exit_meta, descriptor.as_ref());
-            // RPython compile.py:696 handle_fail → _trace_and_compile_from_bridge.
-            // Only start bridge tracing from the MetaInterp path if the
-            // Cranelift-level callback did NOT already handle bridge
-            // compilation synchronously (via PENDING_BRIDGE_REQUEST consumed
-            // inside on_guard_failure). For CALL_ASSEMBLER guard failures,
-            // the Cranelift shim fires with the callee loop's green_key
-            // which is more specific than the caller's green_key here.
-            if should_bridge && !self.is_tracing() {
-                self.start_bridge_tracing(
-                    green_key,
-                    trace_id,
-                    fail_index,
-                    state,
-                    env,
-                    resume_pc.unwrap(),
-                    target_pc,
-                );
-            }
         }
+
+        // RPython compile.py handle_fail parity: instead of starting
+        // bridge tracing here (where &mut self is held), return a
+        // BridgeCompilationRequest so the CALLER can compile with
+        // the driver borrow released. This matches RPython where
+        // handle_fail creates a fresh MetaInterp separate from the
+        // main execution loop.
+        let bridge_request = if should_bridge && restored && !self.is_tracing() {
+            Some(BridgeCompilationRequest {
+                green_key,
+                trace_id,
+                fail_index,
+                resume_pc: resume_pc.unwrap(),
+            })
+        } else {
+            None
+        };
+
         DetailedDriverRunOutcome::GuardFailure {
             restored,
             via_blackhole: false,
             fail_index: Some(fail_index),
             trace_id: Some(trace_id),
+            bridge_request,
         }
     }
 

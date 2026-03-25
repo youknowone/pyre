@@ -594,14 +594,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             || {},
             restore_guard_failure_for_loop,
         );
-        // RPython compile.py handle_fail parity: extract fail info
-        // before consuming outcome, for bridge compilation.
-        let guard_fail_info = match &outcome {
+        // RPython compile.py handle_fail parity: extract bridge request
+        // before consuming outcome. The jitdriver returns the request
+        // (instead of compiling inline) so we can compile AFTER the
+        // driver borrow is released — matching RPython where handle_fail
+        // creates a fresh MetaInterp separate from the execution loop.
+        let bridge_request = match &outcome {
             DetailedDriverRunOutcome::GuardFailure {
-                fail_index: Some(fi),
-                trace_id: Some(tid),
+                bridge_request: Some(req),
                 ..
-            } => Some((*fi, *tid)),
+            } => Some(req.clone()),
             _ => None,
         };
 
@@ -626,14 +628,23 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 );
             }
             match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-                JitAction::Return(result) => {
-                    // Bridge requests are drained synchronously inside
-                    // restore_guard_failure_for_loop (RPython handle_fail
-                    // parity). No need to drain here.
-                    return Some(result);
-                }
+                JitAction::Return(result) => return Some(result),
                 JitAction::ContinueRunningNormally | JitAction::Continue => {}
             }
+        }
+
+        // RPython compile.py handle_fail → _trace_and_compile_from_bridge:
+        // Bridge compilation happens HERE — after the jitdriver returns and
+        // its &mut borrow is released. jit_bridge_compile_for_guard accesses
+        // the driver via TLS (safe: no concurrent borrow).
+        if let Some(req) = bridge_request {
+            crate::call_jit::jit_bridge_compile_for_guard(
+                req.green_key,
+                req.trace_id,
+                req.fail_index,
+                frame,
+                req.resume_pc,
+            );
         }
 
         // After compiled code guard-restored fallback, re-establish the

@@ -5263,11 +5263,30 @@ pub enum DetailedDriverRunOutcome {
         /// for bridge compilation after guard failure.
         fail_index: Option<u32>,
         trace_id: Option<u64>,
+        /// RPython handle_fail → _trace_and_compile_from_bridge parity:
+        /// When a guard failure reaches the bridge threshold, the caller
+        /// should compile a bridge from this resume_pc. The jitdriver
+        /// returns this request (instead of compiling inline) so the
+        /// caller can compile with the driver borrow released.
+        bridge_request: Option<BridgeCompilationRequest>,
     },
     Abort {
         restored: bool,
         via_blackhole: bool,
     },
+}
+
+/// RPython compile.py handle_fail parity: bridge compilation request
+/// returned by jitdriver when a guard fails enough times.
+/// The caller compiles the bridge with the driver borrow released,
+/// matching RPython's pattern where handle_fail creates a fresh
+/// MetaInterp separate from the execution loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeCompilationRequest {
+    pub green_key: u64,
+    pub trace_id: u64,
+    pub fail_index: u32,
+    pub resume_pc: usize,
 }
 
 /// Decision about how to handle a function call during tracing.
