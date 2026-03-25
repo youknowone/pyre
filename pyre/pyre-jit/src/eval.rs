@@ -823,26 +823,36 @@ fn restore_guard_failure_for_loop(
         );
     }
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
+    // RPython resume.py ResumeDataVirtualAdder parity: materialize virtual
+    // objects from rd_virtuals (ExitFrameLayout Virtual slots).
     materialize_recovery_virtuals(&mut typed, exit_layout);
-    // Null Ref slots indicate incomplete resume data (OpRef::NONE in
-    // fail_args). RPython's full resume data framework never produces
-    // null slots for live variables. Until pyre has complete resume
-    // data, invalidate compiled code and decay counters to prevent
-    // immediate recompilation. This entire block has no RPython
-    // equivalent and should be removed once resume data is complete.
-    let has_null_ref = typed
+    // Check for remaining null Ref: if materialization replaced all virtual
+    // slots, null_ref count is 0 and we proceed normally. If some slots
+    // couldn't be materialized (incomplete rd_virtuals), fall back to
+    // invalidation. The vsd-bounded check avoids false positives from
+    // virtual field values stored after the frame slots.
+    let vsd = typed
+        .get(2)
+        .map(|v| match v {
+            Value::Int(n) => *n as usize,
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let frame_end = (3 + vsd).min(typed.len());
+    let has_null_ref = typed[3..frame_end]
         .iter()
-        .skip(3)
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
         if majit_meta::majit_log_enabled() {
-            eprintln!("[jit] guard-fail: null Ref in restored values, invalidating trace");
+            eprintln!(
+                "[jit] guard-fail: {} null Ref in frame slots [3..{}], invalidating",
+                typed[3..frame_end]
+                    .iter()
+                    .filter(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))))
+                    .count(),
+                frame_end
+            );
         }
-        // Null Ref slots indicate incomplete fail_args (OpRef::NONE for
-        // slots the trace didn't track). RPython's full resume data
-        // framework never produces null slots for live variables. Until
-        // pyre has complete resume data, invalidate compiled code and
-        // decay counters to prevent immediate recompilation.
         let (driver, _) = driver_pair();
         driver.invalidate_all_compiled();
         driver.meta_interp_mut().warm_state_mut().decay_counters();
