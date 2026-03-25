@@ -1959,7 +1959,9 @@ extern "C" fn call_assembler_guard_failure(
         let inputs = unsafe { std::slice::from_raw_parts(outputs_ptr, num_inputs) };
         let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
-        let mut bridge_outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
+        let mut bridge_outputs = unsafe {
+            std::mem::MaybeUninit::<[i64; FAST_PATH_MAX_OUTPUTS]>::uninit().assume_init()
+        };
         let mut bridge_roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
         let bridge_fail_index = unsafe {
             func(
@@ -2163,8 +2165,13 @@ fn call_assembler_fast_path(
     // guard failures directly, making force_frame redundant.
     let handle = 0u64;
 
-    // Stack-allocated buffers — no heap allocation per call
-    let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
+    // Stack-allocated buffers — no heap allocation per call.
+    // outputs: uninit is safe — compiled code writes slots before they are
+    // read (SSA). Only fail_descr-indexed slots are accessed after return.
+    let mut outputs =
+        unsafe { std::mem::MaybeUninit::<[i64; FAST_PATH_MAX_OUTPUTS]>::uninit().assume_init() };
+    // roots must be zeroed: GC shadow stack walker may see them before
+    // the compiled code has a chance to update them.
     let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
 
     // RPython _call_header_shadowstack / _call_footer_shadowstack parity:
