@@ -305,23 +305,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     .tick(green_key)
                     && !driver.is_tracing()
                 {
-                    if driver.has_compiled_loop(green_key) {
-                        // Run compiled code at backedge.
-                        if let Some(loop_result) =
-                            can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
-                        {
-                            return loop_result;
-                        }
-                        driver
-                            .meta_interp_mut()
-                            .warm_state_mut()
-                            .counter
-                            .reset(green_key);
-                    } else {
-                        // RPython parity: defer tracing to jit_merge_point
-                        // (loop header). The interpreter continues to the
-                        // next iteration, and tracing starts with the HOT
-                        // path entry values instead of the EXIT path values.
+                    // RPython warmstate.py bound_reached parity:
+                    // immediately enter can_enter_jit_hook to either run
+                    // compiled code or start tracing. No pending deferral.
+                    if let Some(loop_result) =
+                        can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
+                    {
+                        return loop_result;
+                    }
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .counter
+                        .reset(green_key);
+                    if false {
                         pending_trace = Some((green_key, loop_header_pc));
                     }
                 }
