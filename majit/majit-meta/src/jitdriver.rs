@@ -484,12 +484,32 @@ impl<S: JitState> JitDriver<S> {
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
                     let mut meta = self.trace_meta.take().unwrap();
-                    // RPython compile.py parity: cross-loop cut updates meta.
+                    // RPython compile_and_run_once parity: function-entry traces
+                    // (header_pc=0) update meta pre-compile. Backedge traces
+                    // update post-compile on success only.
+                    let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
                     let cut = self.meta.cross_loop_cut_info();
-                    if let Some((cut_pc, ref cut_types)) = cut {
-                        S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                    if hpc == Some(0) {
+                        if let Some((cut_pc, ref cut_types)) = cut {
+                            S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                        }
                     }
-                    let _ = self.meta.close_and_compile(&jump_args, meta);
+                    let outcome = self.meta.close_and_compile(&jump_args, meta);
+                    // Backedge traces: update merge_pc post-compile on success.
+                    if hpc != Some(0) {
+                        if let crate::pyjitpl::CompileOutcome::Compiled {
+                            cut_header_pc: Some(cp),
+                            green_key: gk,
+                            from_retry: false,
+                        } = outcome
+                        {
+                            if cp != 0 && gk != 0 {
+                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
+                                    S::update_meta_merge_pc(&mut entry.meta, cp);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -533,11 +553,28 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
                     let mut meta = self.trace_meta.take().unwrap();
+                    let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
                     let cut = self.meta.cross_loop_cut_info();
-                    if let Some((cut_pc, ref cut_types)) = cut {
-                        S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                    if hpc == Some(0) {
+                        if let Some((cut_pc, ref cut_types)) = cut {
+                            S::update_meta_for_cut(&mut meta, cut_pc, cut_types);
+                        }
                     }
-                    let _ = self.meta.close_and_compile(&jump_args, meta);
+                    let outcome = self.meta.close_and_compile(&jump_args, meta);
+                    if hpc != Some(0) {
+                        if let crate::pyjitpl::CompileOutcome::Compiled {
+                            cut_header_pc: Some(cp),
+                            green_key: gk,
+                            from_retry: false,
+                        } = outcome
+                        {
+                            if cp != 0 && gk != 0 {
+                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
+                                    S::update_meta_merge_pc(&mut entry.meta, cp);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(

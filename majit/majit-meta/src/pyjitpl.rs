@@ -48,7 +48,15 @@ pub enum CompileOutcome {
     /// Compilation succeeded — compiled loop is installed and ready to run.
     /// `cut_header_pc` is Some when the trace was retargeted to a different
     /// loop header via cross-loop cut. The caller should update meta.merge_pc.
-    Compiled { cut_header_pc: Option<usize> },
+    Compiled {
+        cut_header_pc: Option<usize>,
+        green_key: u64,
+        /// True when compilation went through the InvalidLoop retry path
+        /// (simple optimizer without unrolling). The resulting code may
+        /// have guards that always fail, so callers should not update
+        /// merge_pc to enable entry.
+        from_retry: bool,
+    },
     /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).
     /// The caller may retry or continue tracing.
     Cancelled,
@@ -1435,6 +1443,8 @@ impl<M: Clone> MetaInterp<M> {
                         self.warm_state.reset_function_counts();
                         return CompileOutcome::Compiled {
                             cut_header_pc: None,
+                            green_key: 0,
+                            from_retry: false,
                         };
                     }
                     // pyjitpl.py:3004: creation of the loop was cancelled!
@@ -1873,7 +1883,12 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
                 self.warm_state.reset_function_counts();
-                return CompileOutcome::Compiled { cut_header_pc };
+                let from_retry = self.cancel_count > 0;
+                return CompileOutcome::Compiled {
+                    cut_header_pc,
+                    green_key,
+                    from_retry,
+                };
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -2003,6 +2018,8 @@ impl<M: Clone> MetaInterp<M> {
                 if success {
                     CompileOutcome::Compiled {
                         cut_header_pc: None,
+                        green_key: 0,
+                        from_retry: false,
                     }
                 } else {
                     CompileOutcome::Cancelled
@@ -2025,6 +2042,8 @@ impl<M: Clone> MetaInterp<M> {
                 if success {
                     CompileOutcome::Compiled {
                         cut_header_pc: None,
+                        green_key: 0,
+                        from_retry: false,
                     }
                 } else {
                     CompileOutcome::Cancelled
