@@ -499,6 +499,41 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     }
 }
 
+/// warmspot.py:1021-1028 — assembler_call_helper.
+///
+/// Called when CALL_ASSEMBLER guard-fails (not a finish exit).
+/// Receives a JitFrame pointer, reconstructs a PyFrame from the
+/// jf_frame slots, and resumes execution in the interpreter.
+///
+/// This is the JitFrame-aware counterpart to `jit_force_callee_frame`
+/// (which operates on PyFrame directly). When the GC rewriter wires
+/// nursery JitFrame allocation, this function replaces the force path.
+#[allow(dead_code)]
+pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i64) -> i64 {
+    use majit_meta::jitframe::JitFrame;
+
+    let jf = jitframe_ptr as *mut JitFrame;
+
+    // warmspot.py:1022 — fail_descr = cpu.get_latest_descr(deadframe)
+    let descr = unsafe { JitFrame::get_latest_descr(jf) };
+    let _ = descr; // TODO: dispatch on descr type (Finish vs Guard)
+
+    // For now, reconstruct a PyFrame and run it in the interpreter.
+    // This is the "blackhole" path — RPython resume.py parity.
+    //
+    // Step 1: read the raw int arg from jf_frame[0]
+    let raw_arg = unsafe { JitFrame::get_int_value(jf, 0) };
+
+    // Step 2: get caller frame from the force context
+    let pending = majit_codegen_cranelift::take_pending_force_local0();
+    let raw_local0 = pending.unwrap_or(raw_arg as i64);
+
+    // Step 3: create a PyFrame and run it
+    // The caller_frame is in inputs[0] which was the JitFrame's first
+    // virtualizable input. For now, fall back to the existing force path.
+    jit_force_self_recursive_call_raw_1(jitframe_ptr, raw_local0)
+}
+
 fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
