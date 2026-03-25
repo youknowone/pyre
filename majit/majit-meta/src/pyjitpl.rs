@@ -3543,6 +3543,34 @@ impl<M: Clone> MetaInterp<M> {
         false
     }
 
+    /// Check if the compiled trace is safe for bridge compilation.
+    /// Returns true if all guard exit_types at slot positions match
+    /// the expected slot_types. Mismatches indicate type propagation
+    /// bugs that cause crashes when bridge guards fail.
+    pub fn compiled_trace_safe_for_bridge(
+        &self,
+        green_key: u64,
+        slot_types: &[majit_ir::Type],
+    ) -> bool {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return false;
+        };
+        let num_slots = slot_types.len();
+        for trace in compiled.traces.values() {
+            for layout in trace.exit_layouts.values() {
+                for i in 0..num_slots {
+                    let exit_pos = i + 3;
+                    if let Some(et) = layout.exit_types.get(exit_pos) {
+                        if *et != slot_types[i] {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Remove all compiled loops. Used when guard-fail recovery is
     /// unrecoverable (null Ref in resume data).
     pub fn clear_compiled_loops(&mut self) {
