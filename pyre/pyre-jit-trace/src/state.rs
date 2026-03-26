@@ -192,9 +192,7 @@ use crate::frame_layout::{
     PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
     PYFRAME_VALUESTACKDEPTH_OFFSET, build_pyframe_virtualizable_info,
 };
-use crate::helpers::{
-    TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth,
-};
+use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 
 /// Interpreter state exposed to the JIT framework.
 ///
@@ -3679,7 +3677,8 @@ impl MIFrame {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let root_trace_green_key = root_trace_green_key(self);
-                let current_function_key = crate::driver::make_green_key(self.sym().concrete_code, 0);
+                let current_function_key =
+                    crate::driver::make_green_key(self.sym().concrete_code, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = self.parent_fail_args.is_some();
@@ -3820,7 +3819,9 @@ impl MIFrame {
                 }
 
                 if inline_decision == majit_metainterp::InlineDecision::Inline {
-                    if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nargs) {
+                    if let Some(frame_helper) =
+                        (crate::callbacks::get().callee_frame_helper)(nargs)
+                    {
                         return self.inline_function_call(
                             callable,
                             args,
@@ -3846,7 +3847,8 @@ impl MIFrame {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
                     };
-                    if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some() {
+                    if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
+                    {
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
                                 this.guard_value_ref(ctx, callable, concrete_callable as i64);
@@ -4094,7 +4096,9 @@ impl MIFrame {
                         }
                     }
                     majit_metainterp::InlineDecision::Inline => {
-                        if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nargs) {
+                        if let Some(frame_helper) =
+                            (crate::callbacks::get().callee_frame_helper)(nargs)
+                        {
                             return self.inline_function_call(
                                 callable,
                                 args,
@@ -4218,7 +4222,8 @@ impl MIFrame {
                             &helper_arg_types,
                         )
                     }
-                } else if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(args.len())
+                } else if let Some(frame_helper) =
+                    (crate::callbacks::get().callee_frame_helper)(args.len())
                 {
                     let mut helper_args = vec![this.frame(), callable];
                     helper_args.extend_from_slice(args);
@@ -4367,8 +4372,7 @@ impl MIFrame {
                         this.remember_value_type(ca_result, Type::Int);
                         ca_result
                     } else if force_fn
-                        == crate::callbacks::get()
-                            .jit_force_self_recursive_call_argraw_boxed_1
+                        == crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     {
                         ctx.call_may_force_ref_typed(
                             force_fn,
