@@ -993,17 +993,16 @@ fn restore_guard_failure_for_loop(
     }
     // resume.py parity: rd_numb decodes the full frame from compact
     // numbering. TAGBOX(n)→raw_values[n], TAGCONST→constant, NULLREF→null.
-    let mut typed = if let (Some(rd_numb), Some(rd_consts)) =
-        (&exit_layout.rd_numb, &exit_layout.rd_consts)
-    {
-        if rd_numb.is_empty() {
-            decode_exit_layout_values(raw_values, exit_layout)
+    let mut typed =
+        if let (Some(rd_numb), Some(rd_consts)) = (&exit_layout.rd_numb, &exit_layout.rd_consts) {
+            if rd_numb.is_empty() {
+                decode_exit_layout_values(raw_values, exit_layout)
+            } else {
+                rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
+            }
         } else {
-            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
-        }
-    } else {
-        decode_exit_layout_values(raw_values, exit_layout)
-    };
+            decode_exit_layout_values(raw_values, exit_layout)
+        };
     materialize_recovery_virtuals(&mut typed, exit_layout);
     // resume.py:993-1007 _prepare_pendingfields: replay deferred
     // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
@@ -1101,50 +1100,17 @@ fn rebuild_typed_from_rd_numb(
 
     let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
 
-    // Flatten all frame values into one typed vector.
-    // pyre single-frame: typically one frame with [frame_ptr, ni, vsd, locals..., stack...].
+    // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
+    // RPython calls _prepare_virtuals then _prepare_next_section per frame.
     let mut typed = Vec::new();
+
+    // resume.py:983-991 _prepare_virtuals: virtual objects are materialized
+    // later by materialize_recovery_virtuals using ExitRecoveryLayout.
+    // TAGVIRTUAL slots become placeholder null Refs.
+
+    // resume.py:1017-1026 _prepare_next_section: decode each frame's slots.
     for frame in &frames {
-        for val in &frame.values {
-            match val {
-                RebuiltValue::Box(idx) => {
-                    // TAGBOX: value from deadframe slot.
-                    let raw = raw_values.get(*idx).copied().unwrap_or(0);
-                    let tp = exit_layout
-                        .exit_types
-                        .get(*idx)
-                        .copied()
-                        .unwrap_or(majit_ir::Type::Int);
-                    typed.push(match tp {
-                        majit_ir::Type::Int => Value::Int(raw),
-                        majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                        majit_ir::Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                        majit_ir::Type::Void => Value::Void,
-                    });
-                }
-                RebuiltValue::Const(c, tp) => {
-                    // TAGCONST: compile-time constant with known type.
-                    typed.push(match tp {
-                        majit_ir::Type::Int => Value::Int(*c),
-                        majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
-                        majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
-                        majit_ir::Type::Void => Value::Void,
-                    });
-                }
-                RebuiltValue::Int(i) => {
-                    // TAGINT: small integer encoded inline.
-                    typed.push(Value::Int(*i as i64));
-                }
-                RebuiltValue::Virtual(_vidx) => {
-                    // TAGVIRTUAL: placeholder null Ref — materialized by
-                    // materialize_recovery_virtuals using ExitRecoveryLayout.
-                    typed.push(Value::Ref(majit_ir::GcRef(0)));
-                }
-                RebuiltValue::Unassigned => {
-                    typed.push(Value::Int(0));
-                }
-            }
-        }
+        _prepare_next_section(frame, raw_values, exit_layout, &mut typed);
     }
 
     if majit_metainterp::majit_log_enabled() {
@@ -1155,6 +1121,45 @@ fn rebuild_typed_from_rd_numb(
         );
     }
     typed
+}
+
+/// resume.py:1017-1026 _prepare_next_section: decode one frame's slots
+/// from rd_numb tagged values into typed Value vector.
+fn _prepare_next_section(
+    frame: &majit_ir::resumedata::RebuiltFrame,
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+    typed: &mut Vec<Value>,
+) {
+    use majit_ir::resumedata::RebuiltValue;
+    for val in &frame.values {
+        typed.push(match val {
+            RebuiltValue::Box(idx) => {
+                let raw = raw_values.get(*idx).copied().unwrap_or(0);
+                let tp = exit_layout
+                    .exit_types
+                    .get(*idx)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int);
+                match tp {
+                    majit_ir::Type::Int => Value::Int(raw),
+                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                    majit_ir::Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                    majit_ir::Type::Void => Value::Void,
+                }
+            }
+            RebuiltValue::Const(c, tp) => match tp {
+                majit_ir::Type::Int => Value::Int(*c),
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
+                majit_ir::Type::Void => Value::Void,
+            },
+            RebuiltValue::Int(i) => Value::Int(*i as i64),
+            // resume.py:983-991: TAGVIRTUAL → placeholder for materialization.
+            RebuiltValue::Virtual(_) => Value::Ref(majit_ir::GcRef(0)),
+            RebuiltValue::Unassigned => Value::Int(0),
+        });
+    }
 }
 
 /// Guard failure recovery: reconstruct virtual objects from their
