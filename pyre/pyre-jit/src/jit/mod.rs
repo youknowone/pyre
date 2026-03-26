@@ -1,5 +1,5 @@
 pub mod codewriter;
-pub mod descr;
+pub use pyre_jit_trace::descr;
 pub mod executor;
 pub use pyre_jit_trace::frame_layout;
 pub use pyre_jit_trace::helpers;
