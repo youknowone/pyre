@@ -192,10 +192,48 @@ fn call_user_function_with_eval(
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };
     let globals = unsafe { w_func_get_globals(callable) };
     let closure = unsafe { w_func_get_closure(callable) };
+    let defaults = unsafe { crate::w_func_get_defaults(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+
+    // PyPy: pyframe.py handle_operation_error / init_cells
+    // Fill missing positional args from defaults tuple.
+    let code_ref = unsafe { &*func_code };
+    let nparams = code_ref.arg_count as usize;
+    let nargs = args.len();
+    let filled_args = if nargs < nparams && !defaults.is_null() {
+        let defaults = crate::space::unwrap_cell(defaults);
+        let mut full = Vec::with_capacity(nparams);
+        full.extend_from_slice(args);
+        // Defaults cover the LAST (nparams - first_default) parameters.
+        // number of defaults = tuple length
+        let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+            unsafe { pyre_object::w_tuple_len(defaults) }
+        } else {
+            0
+        };
+        let first_default = nparams - ndefaults;
+        for i in nargs..nparams {
+            if i >= first_default {
+                let default_idx = i - first_default;
+                if let Some(val) =
+                    unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
+                {
+                    full.push(val);
+                } else {
+                    full.push(pyre_object::PY_NULL);
+                }
+            } else {
+                full.push(pyre_object::PY_NULL);
+            }
+        }
+        full
+    } else {
+        args.to_vec()
+    };
+
     let mut func_frame = PyFrame::new_for_call_with_closure(
         func_code,
-        args,
+        &filled_args,
         globals,
         frame.execution_context,
         closure,
@@ -347,9 +385,41 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let code_ptr = unsafe { w_func_get_code_ptr(func) };
     let globals = unsafe { w_func_get_globals(func) };
     let closure = unsafe { w_func_get_closure(func) };
+    let defaults = unsafe { crate::w_func_get_defaults(func) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
     let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
-    let mut frame = PyFrame::new_for_call_with_closure(func_code, args, globals, exec_ctx, closure);
+
+    // Fill defaults for missing args
+    let code_ref = unsafe { &*func_code };
+    let nparams = code_ref.arg_count as usize;
+    let nargs = args.len();
+    let filled_args = if nargs < nparams && !defaults.is_null() {
+        let defaults = crate::space::unwrap_cell(defaults);
+        let mut full = Vec::with_capacity(nparams);
+        full.extend_from_slice(args);
+        let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+            unsafe { pyre_object::w_tuple_len(defaults) }
+        } else {
+            0
+        };
+        let first_default = nparams - ndefaults;
+        for i in nargs..nparams {
+            if i >= first_default {
+                let di = i - first_default;
+                full.push(
+                    unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }.unwrap_or(PY_NULL),
+                );
+            } else {
+                full.push(PY_NULL);
+            }
+        }
+        full
+    } else {
+        args.to_vec()
+    };
+
+    let mut frame =
+        PyFrame::new_for_call_with_closure(func_code, &filled_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
     eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
 }

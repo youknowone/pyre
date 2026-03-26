@@ -771,10 +771,12 @@ impl OpcodeStepExecutor for PyFrame {
         let attr = self.pop(); // TOS1 = attribute value (closure tuple etc.)
         match flag {
             MakeFunctionFlag::Closure => unsafe {
-                let func_obj = &mut *(func as *mut crate::W_FunctionObject);
-                func_obj.closure = attr;
+                crate::w_func_set_closure(func, attr);
             },
-            _ => {} // defaults, annotations, etc.
+            MakeFunctionFlag::Defaults => unsafe {
+                crate::w_func_set_defaults(func, attr);
+            },
+            _ => {} // annotations, kwdefaults, etc.
         }
         self.push(func);
         Ok(())
