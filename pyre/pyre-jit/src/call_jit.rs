@@ -797,13 +797,27 @@ pub fn resume_in_blackhole_from_fail_args(
         let code = unsafe { &*frame.code };
         let nlocals = code.varnames.len();
 
-        let py_pc = match section.get(1) {
+        let mut py_pc = match section.get(1) {
             Some(Value::Int(v)) => *v as usize,
             _ => {
                 builder.release_chain(prev_bh);
                 return BlackholeResult::Failed;
             }
         };
+        // pyre-specific: the virtualizable's next_instr may land on a
+        // Cache code unit (CPython 3.13 inserts Cache after opcodes).
+        // RPython has no Cache concept. Scan backward to the actual opcode
+        // so the blackhole starts at the correct JitCode position.
+        while py_pc > 0 {
+            match pyre_interpreter::decode_instruction_at(code, py_pc) {
+                Some((pyre_bytecode::bytecode::Instruction::Cache, _))
+                | Some((pyre_bytecode::bytecode::Instruction::ExtendedArg, _))
+                | Some((pyre_bytecode::bytecode::Instruction::NotTaken, _)) => {
+                    py_pc -= 1;
+                }
+                _ => break,
+            }
+        }
         // Root guard: fail_args[0] = virtualizable frame (callee) but
         // ni/locals = caller's state. If ni is out of range for the
         // virtualizable frame's code, use _caller_frame's code instead.
