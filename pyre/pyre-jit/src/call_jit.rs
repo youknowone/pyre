@@ -866,10 +866,10 @@ pub fn resume_in_blackhole_from_fail_args(
         // into TYPED register files based on the Value variant.
         // RPython: decode_int→setarg_i, decode_ref→setarg_r, decode_float→setarg_f.
         // pyre codewriter puts all Python locals in ref registers, so
-        // Ref values go to registers_r. Int/Float values are re-boxed
-        // into PyObjectRef (w_int_new/w_float_new) for the ref file.
-        // When the codewriter gains typed register assignment, this can
-        // be changed to route Int→registers_i, Float→registers_f.
+        // RPython resume.py consume_one_section parity: Python locals
+        // are ref-typed at the jitcode level. Unboxed Int/Float values
+        // from the optimizer are materialized back to PyObjectRef via
+        // box_resume_value (RPython getvirtual_ptr equivalent).
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
@@ -968,14 +968,14 @@ pub fn resume_in_blackhole_from_fail_args(
 /// Multi frame: [[callee: Ref, Int, Int, ...], [caller: Ref, Int, Int, ...]]
 /// Re-box optimized raw values for the blackhole's ref register file.
 ///
-/// RPython difference: RPython's codewriter assigns locals to typed
-/// register files (i/r/f) at compile time via getkind(concretetype).
-/// pyre's codewriter puts all Python locals in ref registers (Python
-/// has no static types). When fail_args contain optimizer-unboxed
-/// Int/Float values, they must be re-boxed to valid PyObjectRef.
+/// RPython resume.py decode_ref(TAGVIRTUAL) → getvirtual_ptr() parity.
 ///
-/// This will become unnecessary once pyre gains typed register
-/// assignment in the codewriter (RPython regalloc.py parity).
+/// Python locals are always ref-typed at the jitcode level (both in
+/// RPython/PyPy and pyre). The optimizer unboxes values in the IR
+/// (guard_class + getfield_gc_pure_i). On guard failure, the resume
+/// reader materializes (re-boxes) unboxed values back to refs.
+/// RPython: getvirtual_ptr() allocates W_IntObject from virtual fields.
+/// pyre: w_int_new / w_float_new from the raw Value payload.
 fn box_resume_value(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
