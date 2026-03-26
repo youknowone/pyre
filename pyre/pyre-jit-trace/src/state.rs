@@ -4802,6 +4802,16 @@ impl MIFrame {
             );
         }
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        // Clear pre-opcode snapshot immediately after opcode execution.
+        // RPython: capture_resumedata is called at each guard; there is
+        // no per-opcode snapshot lifecycle. Clearing here ensures the
+        // snapshot doesn't leak into subsequent opcodes.
+        {
+            let s = self.sym_mut();
+            s.pre_opcode_vsd = None;
+            s.pre_opcode_stack = None;
+            s.pre_opcode_stack_types = None;
+        }
         // RPython execute_ll_raised parity: store exception in
         // last_exc_value before calling handle_possible_exception.
         if let Err(ref err) = step_result {
@@ -4814,30 +4824,18 @@ impl MIFrame {
         // RPython pyjitpl.py:1956-1957 execute_varargs: exc=True ops
         // always call handle_possible_exception, which internally decides
         // GUARD_EXCEPTION vs GUARD_NO_EXCEPTION.
-        // Pre-opcode snapshot is kept alive for GUARD_EXCEPTION fail_args
-        // (RPython capture_resumedata(resumepc=orgpc) parity: guards need
-        // pre-opcode stack state so interpreter re-executes from orgpc).
         if instruction_may_raise(instruction) {
             let action = self.handle_possible_exception(code, pc);
-            // Clear pre-opcode snapshot after exception handling.
-            {
-                let s = self.sym_mut();
-                s.pre_opcode_vsd = None;
-                s.pre_opcode_stack = None;
-                s.pre_opcode_stack_types = None;
-            }
             if !matches!(action, TraceAction::Continue) {
                 return action;
             }
+            // RPython: handle_possible_exception consumes the exception.
+            // If it returned Continue, the exception was handled (e.g.,
+            // GUARD_EXCEPTION emitted) and tracing continues normally.
+            // Treat handled exceptions as successful opcode completion.
             if step_result.is_err() {
                 return TraceAction::Continue;
             }
-        } else {
-            // Non-may-raise: clear pre-opcode snapshot immediately.
-            let s = self.sym_mut();
-            s.pre_opcode_vsd = None;
-            s.pre_opcode_stack = None;
-            s.pre_opcode_stack_types = None;
         }
         match step_result {
             Err(_) => TraceAction::Abort,
