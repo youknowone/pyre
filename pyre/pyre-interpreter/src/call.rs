@@ -231,9 +231,27 @@ fn call_user_function_with_eval(
         args.to_vec()
     };
 
+    let final_args = pack_varargs(code_ref, filled_args);
+
+    // Generator function: create generator object instead of executing.
+    // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
+    // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
+    if code_ref.flags.contains(pyre_bytecode::CodeFlags::GENERATOR) {
+        let mut gen_frame = PyFrame::new_for_call_with_closure(
+            func_code,
+            &final_args,
+            globals,
+            frame.execution_context,
+            closure,
+        );
+        gen_frame.fix_array_ptrs();
+        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
+        return Ok(pyre_object::generatorobject::w_generator_new(frame_ptr));
+    }
+
     let mut func_frame = PyFrame::new_for_call_with_closure(
         func_code,
-        &filled_args,
+        &final_args,
         globals,
         frame.execution_context,
         closure,
@@ -580,10 +598,55 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
         args.to_vec()
     };
 
+    let final_args = pack_varargs(code_ref, filled_args);
+
+    // Generator function: wrap frame in generator object
+    if code_ref.flags.contains(pyre_bytecode::CodeFlags::GENERATOR) {
+        let mut gen_frame =
+            PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
+        gen_frame.fix_array_ptrs();
+        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
+        return pyre_object::generatorobject::w_generator_new(frame_ptr);
+    }
+
     let mut frame =
-        PyFrame::new_for_call_with_closure(func_code, &filled_args, globals, exec_ctx, closure);
+        PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
     eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
+}
+
+/// Pack excess positional args into *args tuple, add empty **kwargs dict.
+/// PyPy: argument.py _match_signature varargs/varkeywords packing
+fn pack_varargs(code: &pyre_bytecode::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
+    let nparams = code.arg_count as usize;
+    let has_varargs = code.flags.contains(pyre_bytecode::CodeFlags::VARARGS);
+    let has_varkw = code.flags.contains(pyre_bytecode::CodeFlags::VARKEYWORDS);
+
+    if !has_varargs && !has_varkw {
+        return args;
+    }
+
+    let mut packed = Vec::with_capacity(nparams + 2);
+    // Regular positional args
+    for i in 0..nparams.min(args.len()) {
+        packed.push(args[i]);
+    }
+    // Fill missing params with PY_NULL
+    while packed.len() < nparams {
+        packed.push(pyre_object::PY_NULL);
+    }
+    if has_varargs {
+        let extra: Vec<_> = if args.len() > nparams {
+            args[nparams..].to_vec()
+        } else {
+            vec![]
+        };
+        packed.push(pyre_object::w_tuple_new(extra));
+    }
+    if has_varkw {
+        packed.push(pyre_object::w_dict_new());
+    }
+    packed
 }
 
 /// The real __build_class__(body_fn, name, *bases) implementation.

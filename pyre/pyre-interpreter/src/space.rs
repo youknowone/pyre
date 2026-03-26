@@ -2077,9 +2077,15 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                 exc_object: std::ptr::null_mut(),
             });
         }
+        let frame = &mut *frame_ptr;
+
+        // On resume (not first call), push the sent value (None for __next__).
+        // CPython: YIELD_VALUE pops value, RESUME+POP_TOP expects sent value on stack.
+        if w_generator_is_started(gen_obj) {
+            frame.push(w_none());
+        }
         w_generator_set_started(gen_obj);
 
-        let frame = &mut *frame_ptr;
         // Resume the frame from where it left off (frame.next_instr is preserved)
         match crate::eval::eval_loop_for_force(frame) {
             Ok(value) => {

@@ -276,7 +276,10 @@ impl IterOpcodeHandler for PyFrame {
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
         unsafe {
             // Already an iterator
-            if pyre_object::is_range_iter(iter) || pyre_object::is_seq_iter(iter) {
+            if pyre_object::is_range_iter(iter)
+                || pyre_object::is_seq_iter(iter)
+                || pyre_object::generatorobject::is_generator(iter)
+            {
                 return Ok(());
             }
             // list → seq_iter
@@ -340,13 +343,27 @@ impl IterOpcodeHandler for PyFrame {
     /// cache the result — iter_next_value returns the cached value.
     fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
         unsafe {
+            // Generator iterator
+            if pyre_object::generatorobject::is_generator(iter) {
+                match crate::space::py_next(iter) {
+                    Ok(result) => {
+                        USER_ITER_NEXT_CACHE.with(|c| c.set(result));
+                        return Ok(true);
+                    }
+                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            // User-defined iterator with __next__
             if pyre_object::is_instance(iter) {
                 let w_type = pyre_object::w_instance_get_type(iter);
                 if let Some(next_method) = crate::space::lookup_in_type_mro_pub(w_type, "__next__")
                 {
                     match crate::call::call_callable(self, next_method, &[iter]) {
                         Ok(result) => {
-                            // Cache next value for iter_next_value
                             USER_ITER_NEXT_CACHE.with(|c| c.set(result));
                             return Ok(true);
                         }
@@ -364,8 +381,10 @@ impl IterOpcodeHandler for PyFrame {
 
     /// PyPy: space.next(w_iterator) → returns cached value from concrete_iter_continues.
     fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        // User-defined iterator: return cached value from concrete_iter_continues
-        if unsafe { pyre_object::is_instance(iter) } {
+        // Generator/user-defined iterator: return cached value
+        if unsafe {
+            pyre_object::generatorobject::is_generator(iter) || pyre_object::is_instance(iter)
+        } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {
                 return Ok(cached);
@@ -1040,6 +1059,14 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.12: RETURN_GENERATOR creates a generator from the current
     // frame and returns it to the caller. PyPy: generator.py GeneratorIterator.
     fn return_generator(&mut self) -> Result<(), Self::Error> {
+        // When the generator function is already wrapped (CodeFlags::GENERATOR
+        // detected in call_user_function_with_eval), RETURN_GENERATOR fires
+        // during the first __next__() resume. It's a no-op in that case —
+        // the generator object was already created at call time.
+        // Just continue execution (the next instruction is POP_TOP + RESUME).
+        return Ok(());
+
+        // Legacy path for CPython-style RETURN_GENERATOR (not used with RustPython compiler):
         // Copy the current frame into a heap-allocated frame for the generator.
         // PyPy: GeneratorIterator stores the PyFrame and resumes it on __next__.
         let code = self.code;
@@ -1235,6 +1262,14 @@ impl OpcodeStepExecutor for PyFrame {
                 let n_pos = args.len() - nkw;
                 let mut resolved = args[..n_pos].to_vec();
                 let kwargs_dict = pyre_object::w_dict_new();
+                // Marker key so print() can distinguish kwargs dict from regular dict arg
+                unsafe {
+                    pyre_object::w_dict_store(
+                        kwargs_dict,
+                        pyre_object::w_str_new("__pyre_kw__"),
+                        pyre_object::w_bool_from(true),
+                    );
+                }
                 for ki in 0..nkw {
                     let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
                     if let Some(name_obj) = name {
