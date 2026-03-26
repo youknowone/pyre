@@ -378,23 +378,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     .tick(green_key)
                     && !driver.is_tracing()
                 {
-                    // RPython warmstate.py bound_reached parity:
-                    // immediately enter can_enter_jit_hook to either run
-                    // compiled code or start tracing. No pending deferral.
-                    if let Some(loop_result) =
-                        can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
-                    {
-                        return loop_result;
+                    if driver.has_compiled_loop(green_key) {
+                        // Run compiled code at backedge.
+                        if let Some(loop_result) =
+                            can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
+                        {
+                            return loop_result;
+                        }
+                        driver
+                            .meta_interp_mut()
+                            .warm_state_mut()
+                            .counter
+                            .reset(green_key);
+                    } else {
+                        // RPython warmstate.py bound_reached → defer tracing
+                        // to jit_merge_point (loop header). The interpreter
+                        // continues to the next iteration, starting the trace
+                        // with HOT path entry values instead of EXIT values.
+                        pending_trace = Some((green_key, loop_header_pc));
                     }
-                    // RPython warmstate.py:429 bound_reached:
-                    // jitcounter.decay_all_counters()
-                    // Requires all guards to have working blackhole.
-                    // Until resume data is complete, use reset as fallback.
-                    driver
-                        .meta_interp_mut()
-                        .warm_state_mut()
-                        .counter
-                        .reset(green_key);
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
