@@ -66,6 +66,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_functools", init_functools);
     register_builtin_module("_thread", init_thread);
     register_builtin_module("itertools", init_itertools);
+    register_builtin_module("_contextvars", init_contextvars);
     for name in &[
         "_signal",
         "_string",
@@ -82,7 +83,6 @@ pub fn install_builtin_modules() {
         "_tokenize",
         "_typing",
         "_bisect",
-        "_contextvars",
         "errno",
         "atexit",
         "_struct",
@@ -217,6 +217,56 @@ fn init_itertools(ns: &mut PyNamespace) {
         ns,
         "groupby",
         crate::w_builtin_func_new("groupby", |_| Ok(pyre_object::w_none())),
+    );
+}
+
+/// _contextvars stub
+fn init_contextvars(ns: &mut PyNamespace) {
+    // ContextVar(name, *, default=_MISSING) — context variable
+    crate::namespace_store(
+        ns,
+        "ContextVar",
+        crate::w_builtin_func_new("ContextVar", |args| {
+            // Return stub object with get/set methods
+            let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+            if !args.is_empty() {
+                let _ = crate::space::py_setattr(obj, "name", args[0]);
+            }
+            // get() returns default or raises LookupError
+            let _ = crate::space::py_setattr(
+                obj,
+                "get",
+                crate::w_builtin_func_new("get", |args| {
+                    // Return default if provided
+                    if args.len() > 1 {
+                        Ok(args[1])
+                    } else {
+                        Ok(pyre_object::w_none())
+                    }
+                }),
+            );
+            let _ = crate::space::py_setattr(
+                obj,
+                "set",
+                crate::w_builtin_func_new("set", |_| Ok(pyre_object::w_none())),
+            );
+            Ok(obj)
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "Context",
+        crate::w_builtin_func_new("Context", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "Token",
+        crate::w_builtin_func_new("Token", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "copy_context",
+        crate::w_builtin_func_new("copy_context", |_| Ok(pyre_object::w_none())),
     );
 }
 
