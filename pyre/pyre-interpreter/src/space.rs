@@ -447,20 +447,50 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 ///   1. Try `a.__op__(b)` (forward)
 ///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
 unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    // Forward: a.__op__(b) — PyPy: descroperation.py _binop_impl step 1
-    if is_instance(a) {
-        let w_type = w_instance_get_type(a);
-        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
-            let result = crate::space_call_function(method, &[a, b]);
-            // If not NotImplemented, return immediately
+    let a_is_inst = is_instance(a);
+    let b_is_inst = is_instance(b);
+
+    // PyPy: descroperation.py _binop_impl
+    // If b's type is a proper subtype of a's type, try reverse first.
+    // This matches Python's "subclass reflected op takes priority" rule.
+    let try_reverse_first = if a_is_inst && b_is_inst {
+        if let Some(rdunder) = reverse_dunder(dunder) {
+            let a_type = w_instance_get_type(a);
+            let b_type = w_instance_get_type(b);
+            !std::ptr::eq(a_type, b_type)
+                && is_subtype_cached(b_type, a_type)
+                && lookup_in_type_mro(b_type, rdunder).is_some()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if try_reverse_first {
+        let rdunder = reverse_dunder(dunder).unwrap();
+        let w_type = w_instance_get_type(b);
+        if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
+            let result = crate::space_call_function(method, &[b, a]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
     }
 
-    // Reverse: b.__rop__(a) — PyPy: descroperation.py _binop_impl step 2
-    if is_instance(b) {
+    // Forward: a.__op__(b)
+    if a_is_inst {
+        let w_type = w_instance_get_type(a);
+        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
+            let result = crate::space_call_function(method, &[a, b]);
+            if !is_not_implemented(result) {
+                return Some(Ok(result));
+            }
+        }
+    }
+
+    // Reverse: b.__rop__(a) — only if not already tried above
+    if !try_reverse_first && b_is_inst {
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
@@ -473,6 +503,15 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     }
 
     None
+}
+
+/// Check if w_type is a subtype of cls using cached MRO.
+unsafe fn is_subtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    let mro_ptr = w_type_get_mro(w_type);
+    if !mro_ptr.is_null() {
+        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
+    }
+    false
 }
 
 /// Map forward dunder to reverse dunder.
