@@ -849,9 +849,9 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
-        // Safety: skip blackhole if jitcode contains BC_ABORT between
-        // guard_pc and the end. BC_ABORT causes side-effect corruption
-        // when the blackhole executes past unsupported bytecodes.
+        // Transitional safety: skip blackhole if jitcode contains BC_ABORT
+        // (unsupported bytecodes). This guard will be removed once all
+        // Python bytecodes are implemented in the codewriter.
         if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
@@ -874,29 +874,19 @@ pub fn resume_in_blackhole_from_fail_args(
             }
         }
 
-        // RPython: resumereader.consume_one_section(curbh)
+        // RPython resume.py consume_one_section parity: box unboxed
+        // values (Int → W_IntObject, Float → W_FloatObject) so the
+        // blackhole's ref registers hold valid PyObjectRef pointers.
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
-                let ptr = match val {
-                    Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => *v,
-                    Value::Float(v) => v.to_bits() as i64,
-                    Value::Void => 0i64,
-                };
-                bh.setarg_r(i, ptr);
+                bh.setarg_r(i, box_resume_value(val));
             }
         }
         for i in 0..stack_only {
             let slot = 3 + nlocals + i;
             if let Some(val) = section.get(slot) {
-                let ptr = match val {
-                    Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => *v,
-                    Value::Float(v) => v.to_bits() as i64,
-                    Value::Void => 0i64,
-                };
-                bh.runtime_stack_push(0, ptr);
+                bh.runtime_stack_push(0, box_resume_value(val));
             }
         }
         if 3 < bh.registers_i.len() {
@@ -983,6 +973,19 @@ pub fn resume_in_blackhole_from_fail_args(
 /// Parse multi-frame fail_args into per-frame sections.
 /// Single frame: [[Ref, Int, Int, locals..., stack...]]
 /// Multi frame: [[callee: Ref, Int, Int, ...], [caller: Ref, Int, Int, ...]]
+/// RPython resume.py parity: re-box optimized raw values for blackhole
+/// ref registers. The optimizer may unbox Int/Float into raw values in
+/// guard fail_args; the blackhole needs boxed PyObjectRef pointers.
+fn box_resume_value(val: &majit_ir::Value) -> i64 {
+    use majit_ir::Value;
+    match val {
+        Value::Ref(r) => r.as_usize() as i64,
+        Value::Int(v) => pyre_object::intobject::w_int_new(*v) as i64,
+        Value::Float(v) => pyre_object::floatobject::w_float_new(*v) as i64,
+        Value::Void => 0i64,
+    }
+}
+
 fn parse_fail_arg_sections(typed_values: &[majit_ir::Value]) -> Vec<&[majit_ir::Value]> {
     use majit_ir::Value;
     if typed_values.len() < 3 {
