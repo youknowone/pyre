@@ -1905,7 +1905,13 @@ impl Optimization for OptHeap {
             OpCode::QuasiimmutField => {
                 if !self.seen_guard_not_invalidated {
                     self.seen_guard_not_invalidated = true;
-                    let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+                    let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
+                    // RPython parity: inherit rd_resume_position from
+                    // patchguardop so the guard gets a snapshot for numbering.
+                    if let Some(ref patch) = ctx.patchguardop {
+                        guard_op.rd_resume_position = patch.rd_resume_position;
+                        guard_op.fail_args = patch.fail_args.clone();
+                    }
                     self.force_all_lazy(ctx);
                     ctx.emit(guard_op);
                 }
