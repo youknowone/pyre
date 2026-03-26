@@ -900,6 +900,7 @@ mod tests {
                 jit_wb_cards_set: 0,
                 jit_wb_card_page_shift: 0,
             },
+            jitframe_info: None,
         }
     }
 

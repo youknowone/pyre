@@ -8544,7 +8544,7 @@ mod tests {
             concrete_frame_addr: 0,
         };
 
-        let next = MIFrame::iter_next_value(&mut state, iter)
+        let next = MIFrame::iter_next_value(&mut state, iter, range_iter)
             .expect("range iterator fast path should trace");
         assert_eq!(state.value_type(next), Type::Int);
         <MIFrame as IterOpcodeHandler>::guard_optional_value(

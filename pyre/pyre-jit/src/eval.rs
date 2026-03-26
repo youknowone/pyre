@@ -1218,7 +1218,7 @@ def fannkuch(n):
 r = fannkuch(6)";
         let code = pyre_bytecode::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_with_jit(&mut frame);
+        let result = eval_with_jit(&mut frame);
         unsafe {
             let r = *(*frame.namespace).get("r").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 999);
