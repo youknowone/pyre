@@ -327,7 +327,7 @@ impl CodeWriter {
 
                 Instruction::JumpBackward { delta } => {
                     let target_py_pc =
-                        jump_target_backward(py_pc + 1, delta.get(op_arg).as_usize());
+                        skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
                     if target_py_pc < num_instrs {
                         assembler.jump(labels[target_py_pc]);
                     }
@@ -434,6 +434,39 @@ fn jump_target_forward(num_instrs: usize, next_instr: usize, delta: usize) -> us
 /// Backward jump target: next_instr - delta.
 fn jump_target_backward(next_instr: usize, delta: usize) -> usize {
     next_instr.saturating_sub(delta)
+}
+
+/// Match pyre-interpreter/opcode_step.rs:skip_caches.
+fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
+    let mut state = OpArgState::default();
+    while pos < code.instructions.len() {
+        let (instruction, _) = state.get(code.instructions[pos]);
+        if matches!(instruction, Instruction::Cache) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// Compute JitCode PC for a Python loop_header_pc.
+/// The interpreter's loop_header_pc includes Cache skip, but the
+/// codewriter's label targets don't. Search pc_map backwards from
+/// loop_header_pc to find the matching JitCode offset.
+pub fn jitcode_pc_for_loop_header(pc_map: &[usize], loop_header_pc: usize) -> Option<usize> {
+    // pc_map[loop_header_pc] is the JitCode PC for that code unit.
+    // But the codewriter may have placed the label at a slightly earlier
+    // code unit (before Cache instructions). Try exact match first,
+    // then search backwards.
+    for offset in 0..4 {
+        let py_pc = loop_header_pc.checked_sub(offset)?;
+        let jitcode_pc = *pc_map.get(py_pc)?;
+        if jitcode_pc > 0 || py_pc == 0 {
+            return Some(jitcode_pc);
+        }
+    }
+    pc_map.get(loop_header_pc).copied()
 }
 
 // ---------------------------------------------------------------------------

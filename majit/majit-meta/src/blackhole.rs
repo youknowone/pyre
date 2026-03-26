@@ -1198,9 +1198,6 @@ impl BlackholeInterpreter {
             }
             BC_JUMP => {
                 let target = self.next_u16() as usize;
-                // bhimpl_jit_merge_point parity: if this jump targets the
-                // merge point, exit the blackhole so the JIT dispatch loop
-                // can re-enter compiled code (ContinueRunningNormally).
                 if self.merge_point_jitcode_pc == Some(target) {
                     self.position = target;
                     self.reached_merge_point = true;

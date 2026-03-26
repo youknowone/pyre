@@ -846,7 +846,7 @@ pub fn resume_in_blackhole_from_fail_args(
 
         // Set merge_point on the OUTERMOST (last section = caller) blackhole.
         if sec_idx == sections.len() - 1 {
-            if let Some(merge_jitcode_pc) = pyjitcode.pc_map.get(merge_py_pc).copied() {
+            if let Some(&merge_jitcode_pc) = pyjitcode.pc_map.get(merge_py_pc) {
                 bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
             }
         }
