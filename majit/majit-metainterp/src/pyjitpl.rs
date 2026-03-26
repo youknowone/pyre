@@ -2078,7 +2078,8 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:1006-1022 — ResumeFromInterpDescr path: entry
                 // bridge. Compile as a fresh entry and attach to interpreter.
                 let fail_descr_types: Vec<Type> = bridge_inputargs.iter().map(|a| a.tp).collect();
-                let fail_descr_ref = crate::fail_descr::make_fail_descr_typed(fail_descr_types);
+                let fail_descr_ref =
+                    crate::fail_descr::make_fail_descr_typed_with_index(0, fail_descr_types);
                 let fail_descr: &dyn majit_ir::FailDescr = fail_descr_ref.as_fail_descr().unwrap();
                 let success = self.compile_bridge(
                     green_key,
