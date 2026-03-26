@@ -33,6 +33,20 @@ use majit_ir::{
 
 use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
 
+// ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
+// Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
+//          savedata:8, guard_exc:8, forward:8]  = 56 bytes
+// Array:  [length:8, item[0]:8, item[1]:8, ...]
+/// Byte offset of `jf_descr` from JitFrame start.
+const JF_DESCR_OFS: i32 = 8;
+/// Byte offset of `jf_gcmap` from JitFrame start.
+const JF_GCMAP_OFS: i32 = 24;
+/// Byte offset of `jf_frame[0]` from JitFrame start (header + length field).
+const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
+/// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
+/// gcmap bit positions are offset by this amount.
+const JITFRAME_FIXED_SIZE: u32 = 7;
+
 #[derive(Debug)]
 struct BuiltinFieldDescr {
     offset: usize,
@@ -1992,20 +2006,21 @@ extern "C" fn call_assembler_guard_failure(
     if !bridge_ptr.is_null() {
         let num_inputs = fail_descr.fail_arg_types.len();
         let inputs = unsafe { std::slice::from_raw_parts(outputs_ptr, num_inputs) };
-        let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
+        let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
-        let mut bridge_outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
+        const HW: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
+        let mut bridge_jf = [0i64; HW + FAST_PATH_MAX_OUTPUTS];
+        for (i, &val) in inputs.iter().enumerate() {
+            bridge_jf[HW + i] = val;
+        }
         let mut bridge_roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
-        let bridge_fail_index = unsafe {
+        let _result_jf = unsafe {
             func(
-                inputs.as_ptr(),
-                bridge_outputs.as_mut_ptr(),
+                bridge_jf.as_mut_ptr(),
                 bridge_roots.as_mut_ptr() as *mut i64,
             )
         };
-        // Simple bridge: Finish at index 0 or 1
-        let _ = bridge_fail_index;
-        return bridge_outputs[0];
+        return bridge_jf[HW];
     } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
         // RPython: bridge compilation goes through MetaInterp, not the
         // backend. Notify the bridge threshold callback so the JIT driver
@@ -2200,29 +2215,20 @@ fn call_assembler_fast_path(
         return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
     }
 
-    let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
+    let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
         unsafe { std::mem::transmute(target.code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
 
-    // Skip force_frame registration — the force callback handles all
-    // guard failures directly, making force_frame redundant.
     let handle = 0u64;
 
-    // Stack-allocated buffers — no heap allocation per call
-    let mut outputs = [0i64; FAST_PATH_MAX_OUTPUTS];
-    // roots must be zeroed: GC shadow stack walker may see them before
-    // the compiled code has a chance to update them.
-    let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
+    const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
+    let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS];
+    for (i, &val) in inputs.iter().enumerate() {
+        jf_buf[HEADER_WORDS + i] = val;
+    }
 
-    // RPython _call_header_shadowstack / _call_footer_shadowstack parity:
-    // Push GC roots onto the TLS shadow stack before compiled call, pop
-    // after. The GC collector walks shadow_stack::walk_roots() to find
-    // live refs (collector.rs:337). This replaces the global mutex
-    // registry (register_gc_roots/unregister_gc_roots) with O(1) TLS.
-    //
-    // Skip force_frame registration — call_assembler_fast_path handles
-    // guard failures directly via target.fail_descrs.
+    let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
     let shadow_depth = if target.num_ref_roots > 0 {
         let mut depth = 0usize;
         for root in roots[..target.num_ref_roots].iter() {
@@ -2233,13 +2239,13 @@ fn call_assembler_fast_path(
         None
     };
 
-    let fail_index = unsafe {
-        func(
-            inputs.as_ptr(),
-            outputs.as_mut_ptr(),
-            roots.as_mut_ptr() as *mut i64,
-        )
-    } as u32;
+    let result_jf = unsafe { func(jf_buf.as_mut_ptr(), roots.as_mut_ptr() as *mut i64) };
+    let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
+    let outputs = {
+        let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
+        out.copy_from_slice(&jf_buf[HEADER_WORDS..]);
+        out
+    };
 
     if let Some(depth) = shadow_depth {
         majit_gc::shadow_stack::pop_to(depth);
@@ -3633,21 +3639,53 @@ fn emit_indirect_call_from_parts(
     }
 }
 
-/// Emit a guard side-exit: store fail args to outputs_ptr and return fail_index.
+/// Emit a guard/finish side-exit.
+///
+/// _build_failure_recovery (assembler.py:2080-2109) parity:
+///   1. _push_all_regs_to_frame  — save live values to jf_frame slots
+///   2. POP [ebp + jf_descr]     — store fail_descr index to jf_descr
+///   3. _call_footer              — mov eax, ebp; ret (return jitframe)
+///
+/// genop_finish (assembler.py:2114-2155) parity:
+///   1. save result to jf_frame[0]
+///   2. MOV [ebp + jf_descr], faildescrindex
+///   3. _call_footer
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     constants: &HashMap<u32, i64>,
-    outputs_ptr: CValue,
+    jf_ptr: CValue,
     info: &GuardInfo,
 ) {
+    // _push_all_regs_to_frame / save_into_mem parity:
+    // store fail_args to jf_frame[slot]
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let val = resolve_opref(builder, constants, arg_ref);
-        let offset = (slot as i32) * 8;
-        let addr = builder.ins().iadd_imm(outputs_ptr, offset as i64);
-        builder.ins().store(MemFlags::trusted(), val, addr, 0);
+        let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+        builder
+            .ins()
+            .store(MemFlags::trusted(), val, jf_ptr, offset);
     }
+    // _build_failure_recovery (assembler.py:2102-2105) parity:
+    //   POP [ebp + jf_gcmap]   — #2104
+    //   POP [ebp + jf_descr]   — #2105
+    // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
+    let gcmap_ptr = if info.gcmap != 0 {
+        // allocate_gcmap (gcmap.py:7-18): Array(Unsigned) [length, data...].
+        let gcmap_arr = Box::leak(Box::new([1isize, info.gcmap as isize]));
+        gcmap_arr.as_ptr() as i64
+    } else {
+        0 // NULLGCMAP
+    };
+    let gcmap_val = builder.ins().iconst(cl_types::I64, gcmap_ptr);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     let idx_val = builder.ins().iconst(cl_types::I64, info.fail_index as i64);
-    builder.ins().return_(&[idx_val]);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), idx_val, jf_ptr, JF_DESCR_OFS); // #2105
+    // _call_footer (assembler.py:1097): mov eax, ebp; ret
+    builder.ins().return_(&[jf_ptr]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3776,9 +3814,17 @@ fn run_compiled_code(
     inputs: &[i64],
     needs_force_frame: bool,
 ) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
-    let mut outputs = vec![0i64; max_output_slots.max(1)];
+    // jf_ptr-based calling: JF header (64B) + items.
+    let depth = max_output_slots.max(inputs.len()).max(1);
+    let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
+    let mut jf_buf = vec![0i64; header_words + depth];
+    // Write inputs to jf_frame[0..n] (after header).
+    for (i, &val) in inputs.iter().enumerate() {
+        jf_buf[header_words + i] = val;
+    }
     let mut roots = vec![GcRef::NULL; num_ref_roots];
-    let func: unsafe extern "C" fn(*const i64, *mut i64, *mut i64) -> i64 =
+    // llmodel.py:323 parity: ll_frame = func(ll_frame, ll_threadlocal_addr)
+    let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
         unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
@@ -3790,22 +3836,23 @@ fn run_compiled_code(
         (0, None)
     };
 
-    // RPython parity: _call_header_shadowstack (assembler.py:1122-1128)
-    // pushes jitframe onto shadowstack at entry. pyre equivalent:
-    // register all root slots with the GC allocator once.
     if let Some(rid) = gc_runtime_id {
         if num_ref_roots > 0 {
             register_gc_roots(rid, &mut roots);
         }
     }
 
-    let mut fail_index = with_active_force_frame(handle, || unsafe {
-        func(
-            inputs.as_ptr(),
-            outputs.as_mut_ptr(),
-            roots.as_mut_ptr() as *mut i64,
-        )
-    }) as u32;
+    let result_jf = with_active_force_frame(handle, || unsafe {
+        func(jf_buf.as_mut_ptr(), roots.as_mut_ptr() as *mut i64)
+    });
+    // llmodel.py:328 parity: return ll_frame — read from returned jitframe.
+    // RPython follows jf_forward if GC moved the frame; we read from
+    // result_jf directly (same as jf_buf when no GC move occurs).
+    let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
+    let mut outputs = vec![0i64; max_output_slots.max(1)];
+    for i in 0..max_output_slots.min(depth) {
+        outputs[i] = unsafe { *result_jf.add(header_words + i) };
+    }
 
     // Bridge dispatch is handled by execute_with_inputs (line 3541),
     // which checks CraneliftFailDescr.bridge after run_compiled_code
@@ -3827,6 +3874,9 @@ fn run_compiled_code(
 struct GuardInfo {
     fail_index: u32,
     fail_arg_refs: Vec<OpRef>,
+    /// gcmap bitmap: bit i set ⇔ fail_arg[i] is Ref type.
+    /// allocate_gcmap (gcmap.py:7-18) parity.
+    gcmap: u64,
 }
 
 fn identity_recovery_layout(
@@ -4368,10 +4418,10 @@ impl CraneliftBackend {
         let call_conv = self.module.target_config().default_call_conv;
 
         let mut sig = Signature::new(call_conv);
-        sig.params.push(AbiParam::new(ptr_type));
-        sig.params.push(AbiParam::new(ptr_type));
-        sig.params.push(AbiParam::new(ptr_type));
-        sig.returns.push(AbiParam::new(cl_types::I64));
+        sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
+        sig.params.push(AbiParam::new(ptr_type)); // roots_ptr
+        // _call_footer (assembler.py:1097): mov eax, ebp; ret
+        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
         let func_name = format!("trace_{}", self.func_counter);
         self.func_counter += 1;
@@ -4443,9 +4493,12 @@ impl CraneliftBackend {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        let inputs_ptr = builder.block_params(entry_block)[0];
-        let outputs_ptr = builder.block_params(entry_block)[1];
-        let roots_ptr = builder.block_params(entry_block)[2];
+        // jf_ptr serves as both inputs_ptr (entry) and outputs_ptr (exits).
+        // Items at offset 0: jf_ptr[i] = jf_ptr + i*8.
+        let jf_ptr = builder.block_params(entry_block)[0];
+        let inputs_ptr = jf_ptr; // alias for entry loading
+        let outputs_ptr = jf_ptr; // alias for guard exit stores
+        let roots_ptr = builder.block_params(entry_block)[1];
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
 
         let label_indices: Vec<usize> = ops
@@ -4552,11 +4605,10 @@ impl CraneliftBackend {
 
         let entry_input_vals: Vec<CValue> = (0..num_inputs)
             .map(|i| {
-                let offset = (i as i32) * 8;
-                let addr = builder.ins().iadd_imm(inputs_ptr, offset as i64);
+                let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                 builder
                     .ins()
-                    .load(cl_types::I64, MemFlags::trusted(), addr, 0)
+                    .load(cl_types::I64, MemFlags::trusted(), inputs_ptr, offset)
             })
             .collect();
 
@@ -5553,24 +5605,34 @@ impl CraneliftBackend {
                         ));
                     }
 
-                    let arg_bytes = (call_descr.arg_types().len().max(1) * 8) as u32;
+                    // args_slot has JF header (64B) + items. Shared for inputs AND outputs.
+                    let out_slots = resolved_target
+                        .as_ref()
+                        .map_or(16, |t| t.max_output_slots.max(1));
+                    let jf_depth = call_descr.arg_types().len().max(out_slots).max(1);
+                    let jf_bytes = (JF_FRAME_ITEM0_OFS as u32) + (jf_depth as u32) * 8;
                     let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
-                        arg_bytes,
+                        jf_bytes,
                         3,
                     ));
                     for (index, &arg_ref) in op.args.iter().enumerate() {
                         let raw = resolve_opref(&mut builder, &constants, arg_ref);
+                        let ofs = JF_FRAME_ITEM0_OFS + (index as i32) * 8;
+                        builder.ins().stack_store(raw, args_slot, ofs);
+                    }
+                    // jf_ptr = start of jitframe (header + items)
+                    let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
+                    // data_ptr = start of items area (for shim which expects flat i64 array)
+                    let args_data_ptr =
                         builder
                             .ins()
-                            .stack_store(raw, args_slot, (index * 8) as i32);
-                    }
-                    let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
+                            .stack_addr(ptr_type, args_slot, JF_FRAME_ITEM0_OFS);
                     let target_token = builder.ins().iconst(
                         cl_types::I64,
                         call_descr.call_target_token().unwrap() as i64,
                     );
-                    let args_ptr_i64 = ptr_arg_as_i64(&mut builder, args_ptr, ptr_type);
+                    let args_ptr_i64 = ptr_arg_as_i64(&mut builder, args_data_ptr, ptr_type);
                     let outcome_slot = builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         16,
@@ -5637,15 +5699,7 @@ impl CraneliftBackend {
                             .as_ref()
                             .map_or(8, |t| t.num_ref_roots.max(1));
 
-                        // Allocate output and roots buffers on stack
-                        let out_bytes = (out_slots * 8) as u32;
-                        let out_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            out_bytes,
-                            3,
-                        ));
-                        let out_ptr = builder.ins().stack_addr(ptr_type, out_slot, 0);
-
+                        // No separate out_slot: callee writes outputs to args_slot (shared).
                         let roots_bytes = (num_ref_roots * 8) as u32;
                         let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
@@ -5693,29 +5747,41 @@ impl CraneliftBackend {
                         builder.switch_to_block(direct_call_block);
                         builder.seal_block(direct_call_block);
 
+                        // Save input[0] (frame_ptr) before call — callee
+                        // overwrites args_slot with fail_args on guard exit.
+                        // Needed by force_fn/shim fallback (cold path only).
+                        let saved_frame_ptr = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            JF_FRAME_ITEM0_OFS,
+                        );
+
+                        // fn(jf_ptr, roots) → jf_ptr (_call_footer parity)
                         let mut sig = Signature::new(call_conv);
-                        sig.params.push(AbiParam::new(ptr_type)); // inputs
-                        sig.params.push(AbiParam::new(ptr_type)); // outputs
+                        sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
                         sig.params.push(AbiParam::new(ptr_type)); // roots
-                        sig.returns.push(AbiParam::new(cl_types::I64)); // fail_index
+                        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
                         let sig_ref = builder.import_signature(sig);
-                        let fail_index_val = builder.ins().call_indirect(
+                        let call_inst = builder.ins().call_indirect(
                             sig_ref,
                             code_addr,
-                            &[args_ptr, out_ptr, ca_roots_ptr],
+                            &[args_ptr, ca_roots_ptr],
                         );
-                        let fail_idx_raw = builder.inst_results(fail_index_val)[0];
+                        let result_jf = builder.inst_results(call_inst)[0];
+                        // Read fail_index from returned jf_descr (assembler.py:2105)
+                        let fail_idx_raw = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            result_jf,
+                            JF_DESCR_OFS,
+                        );
 
-                        // Check: is it the finish exit?
-                        // Compare with runtime_finish_idx loaded from dispatch entry.
                         let is_direct_finish =
                             builder
                                 .ins()
                                 .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_idx);
                         let direct_finish_block = builder.create_block();
-                        // When force_fn is available, route non-finish guard
-                        // failures through a direct force path instead of the
-                        // full shim (avoids double execution of compiled code).
                         let direct_nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
                             let b = builder.create_block();
                             Some(b)
@@ -5732,10 +5798,16 @@ impl CraneliftBackend {
                             &[],
                         );
 
-                        // ── Direct finish: extract result from outputs[0] ──
+                        // ── Direct finish: result in jf_frame[0] ──
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
-                        let direct_result = builder.ins().stack_load(cl_types::I64, out_slot, 0);
+                        // Read result from returned jf_frame[0]
+                        let direct_result = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            result_jf,
+                            JF_FRAME_ITEM0_OFS,
+                        );
                         builder.ins().jump(ca_merge_block, &[direct_result]);
 
                         // ── Direct guard failure: call force_fn on frame ──
@@ -5792,46 +5864,54 @@ impl CraneliftBackend {
                             // ── Inline bridge dispatch (hot path for base case) ──
                             builder.switch_to_block(inline_bridge_block);
                             builder.seal_block(inline_bridge_block);
-                            // Call bridge directly: bridge(outputs, bridge_out, bridge_roots)
-                            // Base case bridge returns result in bridge_out[0].
-                            let bridge_out_slot = builder.create_sized_stack_slot(
-                                StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 3),
-                            );
-                            let bridge_out_ptr =
-                                builder.ins().stack_addr(ptr_type, bridge_out_slot, 0);
+                            // Bridge uses callee's fail_args (in args_slot, overwritten by callee).
+                            // Pass args_ptr as the bridge's jf_ptr (bridge reads inputs, writes outputs).
                             let bridge_roots_slot = builder.create_sized_stack_slot(
                                 StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 3),
                             );
                             let bridge_roots_ptr =
                                 builder.ins().stack_addr(ptr_type, bridge_roots_slot, 0);
                             let mut bridge_sig = Signature::new(call_conv);
-                            bridge_sig.params.push(AbiParam::new(ptr_type));
-                            bridge_sig.params.push(AbiParam::new(ptr_type));
-                            bridge_sig.params.push(AbiParam::new(ptr_type));
-                            bridge_sig.returns.push(AbiParam::new(cl_types::I64));
+                            bridge_sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+                            bridge_sig.params.push(AbiParam::new(ptr_type)); // roots
+                            bridge_sig.returns.push(AbiParam::new(ptr_type)); // jf_ptr
                             let bridge_sig_ref = builder.import_signature(bridge_sig);
-                            let _bridge_fail = builder.ins().call_indirect(
+                            let bridge_call = builder.ins().call_indirect(
                                 bridge_sig_ref,
                                 bridge_ptr_val,
-                                &[out_ptr, bridge_out_ptr, bridge_roots_ptr],
+                                &[args_ptr, bridge_roots_ptr],
                             );
-                            let bridge_result =
-                                builder.ins().stack_load(cl_types::I64, bridge_out_slot, 0);
+                            let bridge_result_jf = builder.inst_results(bridge_call)[0];
+                            let bridge_result = builder.ins().load(
+                                cl_types::I64,
+                                MemFlags::trusted(),
+                                bridge_result_jf,
+                                JF_FRAME_ITEM0_OFS,
+                            );
                             builder.ins().jump(ca_merge_block, &[bridge_result]);
 
                             // ── Extern force fallback (cold: before bridge compiled) ──
                             builder.switch_to_block(extern_force_block);
                             builder.seal_block(extern_force_block);
-                            let frame_ptr =
-                                builder
-                                    .ins()
-                                    .load(cl_types::I64, MemFlags::trusted(), args_ptr, 0);
+                            // saved_frame_ptr: input[0] before callee overwrote args_slot.
+                            let frame_ptr = saved_frame_ptr;
+                            // outputs_ptr = result_jf items area (callee's fail_args)
+                            let result_jf_data =
+                                builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
+                            let result_jf_data_i64 =
+                                ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
                             let force_result = emit_host_call(
                                 &mut builder,
                                 ptr_type,
                                 call_conv,
                                 call_assembler_guard_failure as *const () as usize,
-                                &[target_token, fail_idx_raw, frame_ptr, out_ptr, args_ptr_i64],
+                                &[
+                                    target_token,
+                                    fail_idx_raw,
+                                    frame_ptr,
+                                    result_jf_data_i64,
+                                    args_ptr_i64,
+                                ],
                                 Some(cl_types::I64),
                             );
                             builder.ins().jump(ca_merge_block, &[force_result.unwrap()]);
@@ -5888,13 +5968,19 @@ impl CraneliftBackend {
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let deadframe_handle = builder.ins().stack_load(cl_types::I64, outcome_slot, 8);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), deadframe_handle, outputs_ptr, 0);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        deadframe_handle,
+                        outputs_ptr,
+                        JF_FRAME_ITEM0_OFS,
+                    );
                     let sentinel = builder
                         .ins()
                         .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
-                    builder.ins().return_(&[sentinel]);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), sentinel, outputs_ptr, JF_DESCR_OFS);
+                    builder.ins().return_(&[outputs_ptr]);
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
@@ -8185,6 +8271,20 @@ fn collect_guards(
             }
         }
         let recovery_layout = Some(recovery_layout);
+        // get_gcmap (regalloc.py:1092-1108) parity:
+        // val = loc.position + JITFRAME_FIXED_SIZE  (#1106)
+        let gcmap = {
+            let mut bits: u64 = 0;
+            for (i, tp) in fail_arg_types.iter().enumerate() {
+                if *tp == Type::Ref {
+                    let val = i as u32 + JITFRAME_FIXED_SIZE;
+                    if val < 64 {
+                        bits |= 1u64 << val;
+                    }
+                }
+            }
+            bits
+        };
         let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
             fail_index,
             trace_id,
@@ -8200,6 +8300,7 @@ fn collect_guards(
         guard_infos.push(GuardInfo {
             fail_index,
             fail_arg_refs,
+            gcmap,
         });
     }
 
