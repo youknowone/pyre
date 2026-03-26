@@ -450,11 +450,7 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.as_ref()
                 {
-                    let has_targets = self
-                        .meta
-                        .compiled_loops
-                        .get(&bridge_key)
-                        .map_or(false, |c| !c.front_target_tokens.is_empty());
+                    let has_targets = self.meta.has_compiled_targets(bridge_key);
                     if has_targets {
                         self.bridge_info.take(); // consume
                         if crate::majit_log_enabled() {
@@ -501,7 +497,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                     // No targets: skip bridge, fall through to Path 2
-                    // (compile_loop via close_and_compile).
+                    // (compile_loop via compile_loop).
                     // pyjitpl.py:2982 has_compiled_targets → false.
                     self.bridge_info = None;
                 }
@@ -534,7 +530,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                         _ => provisional_meta,
                     };
-                    let outcome = self.meta.close_and_compile(&jump_args, meta);
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
                     if hpc != Some(0) {
                         if let crate::pyjitpl::CompileOutcome::Compiled {
                             cut_header_pc: Some(cp),
@@ -566,11 +562,7 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.as_ref()
                 {
-                    let has_targets = self
-                        .meta
-                        .compiled_loops
-                        .get(&bridge_key)
-                        .map_or(false, |c| !c.front_target_tokens.is_empty());
+                    let has_targets = self.meta.has_compiled_targets(bridge_key);
                     if has_targets {
                         self.bridge_info.take();
                         let result = self.meta.close_bridge(
@@ -625,7 +617,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                         _ => provisional_meta,
                     };
-                    let outcome = self.meta.close_and_compile(&jump_args, meta);
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
                     if hpc != Some(0) {
                         if let crate::pyjitpl::CompileOutcome::Compiled {
                             cut_header_pc: Some(cp),
@@ -663,7 +655,7 @@ impl<S: JitState> JitDriver<S> {
                 {
                     self.sym = None;
                     self.trace_meta = None;
-                    self.meta.finish_bridge(
+                    self.meta.compile_done_with_this_frame(
                         bridge_key,
                         bridge_trace_id,
                         bridge_fail_index,
@@ -2460,7 +2452,7 @@ mod tests {
             let i0 = OpRef(0); // input arg
             ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[i0]);
         };
-        driver.meta.close_and_compile(&[OpRef(0)], ());
+        driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedRestoreState {
@@ -2504,7 +2496,7 @@ mod tests {
             let i0 = OpRef(0);
             ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
         };
-        driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+        driver.meta.compile_loop(&[OpRef(0), OpRef(1)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedInputState {
@@ -2549,7 +2541,7 @@ mod tests {
             let i0 = OpRef(0);
             ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[OpRef(0), OpRef(1)]);
         };
-        driver.meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+        driver.meta.compile_loop(&[OpRef(0), OpRef(1)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedInputState {
@@ -2692,7 +2684,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let _val = ctx.const_int(42);
         }
-        driver.meta.close_and_compile(&[], ());
+        driver.meta.compile_loop(&[], ());
         assert!(driver.has_compiled_loop(key));
 
         let stats = driver.get_stats();
@@ -2802,7 +2794,7 @@ mod tests {
         };
 
         // Close: JUMP args must match body inputargs after preamble peeling.
-        driver.meta.close_and_compile(&[sum], ());
+        driver.meta.compile_loop(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         let events = compile_events.lock().unwrap();
@@ -2837,7 +2829,7 @@ mod tests {
                 let c1 = ctx.const_int(1);
                 let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             }
-            driver.meta.close_and_compile(&[OpRef(0)], ());
+            driver.meta.compile_loop(&[OpRef(0)], ());
             assert!(driver.has_compiled_loop(key));
         }
 
@@ -2877,7 +2869,7 @@ mod tests {
             ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
             sum
         };
-        driver.meta.close_and_compile(&[sum], ());
+        driver.meta.compile_loop(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         // Identify the fail_index assigned to the first guard in the optimized trace.
@@ -2939,7 +2931,7 @@ mod tests {
             let i0 = OpRef(0);
             ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[]);
         }
-        driver.meta.close_and_compile(&[OpRef(0)], ());
+        driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(green_key));
         let failure = driver
             .meta
@@ -3028,7 +3020,7 @@ mod tests {
             ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
             sum
         };
-        driver.meta.close_and_compile(&[sum], ());
+        driver.meta.compile_loop(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
         // "func_b" can see the compiled loop via the same green_key.
