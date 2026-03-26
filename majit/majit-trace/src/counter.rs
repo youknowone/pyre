@@ -49,28 +49,35 @@ impl JitCounter {
         1 >= self.threshold
     }
 
-    /// Increment the counter for the given hash. Returns true if threshold is reached.
-    /// RPython counter.py tick: always_inline for the fast path (slot 0 hit).
+    /// Increment the counter for the given hash. Returns true if the
+    /// default threshold is reached.
+    /// counter.py tick(hash, increment) with increment = 1/threshold.
     #[inline(always)]
     pub fn tick(&mut self, hash: u64) -> bool {
+        self.tick_with_threshold(hash, self.threshold)
+    }
+
+    /// counter.py tick(hash, increment) parity: increment the counter for
+    /// a hash and compare against a caller-specified threshold. RPython uses
+    /// a single JitCounter with variable float increments; this integer
+    /// equivalent accepts different thresholds per call site (loop entry
+    /// vs guard failure vs function entry).
+    #[inline(always)]
+    pub fn tick_with_threshold(&mut self, hash: u64, threshold: u32) -> bool {
         let base = (hash as usize) & TABLE_MASK;
 
-        // RPython counter.py tick / _tick_slowpath parity:
+        // counter.py tick / _tick_slowpath parity:
         // 5-way associative lookup with MRU swap to slot 0.
-        // Found at slot 0 (fast path):
         if self.table[base].0 == hash {
             self.table[base].1 += 1;
-            return self.table[base].1 >= self.threshold;
+            return self.table[base].1 >= threshold;
         }
-        // Slowpath: check slots 1..ASSOCIATIVITY
-        // RPython counter.py _tick_slowpath + _swap parity.
         for i in 1..ASSOCIATIVITY {
             let idx = (base + i) & TABLE_MASK;
             if self.table[idx].0 == hash {
                 self.table[idx].1 += 1;
-                let fired = self.table[idx].1 >= self.threshold;
-                // RPython _swap(p_entry, n): swap with slot n only if
-                // slot n has a lower count (conditional promotion).
+                let fired = self.table[idx].1 >= threshold;
+                // _swap(p_entry, n): conditional MRU promotion.
                 let prev_idx = (base + i - 1) & TABLE_MASK;
                 if self.table[prev_idx].1 <= self.table[idx].1 {
                     self.table.swap(idx, prev_idx);
@@ -79,8 +86,7 @@ impl JitCounter {
             }
         }
 
-        // Not found — RPython: find first empty slot (count == 0),
-        // or use the last slot (n=4). Existing entries are preserved.
+        // Not found — find first empty slot or evict last.
         let mut insert_idx = (base + ASSOCIATIVITY - 1) & TABLE_MASK;
         for i in (0..ASSOCIATIVITY).rev() {
             let idx = (base + i) & TABLE_MASK;

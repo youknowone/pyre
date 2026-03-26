@@ -207,13 +207,10 @@ pub struct JitStats {
 }
 
 pub struct WarmEnterState {
-    /// Global hot counter (RPython jitcounter timetable).
+    /// counter.py JitCounter parity: single timetable shared by loop
+    /// entry, guard failure, and function entry — each caller passes
+    /// a different threshold to tick_with_threshold().
     pub counter: JitCounter,
-    /// Guard failure counter for bridge compilation decisions.
-    /// counter.py tick(hash, increment_trace_eagerness) parity.
-    /// Separate from `counter` to allow independent threshold
-    /// (trace_eagerness=200 vs threshold=1039).
-    pub guard_counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
     cells: HashMap<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).
@@ -339,7 +336,6 @@ impl WarmEnterState {
     pub fn new(threshold: u32) -> Self {
         WarmEnterState {
             counter: JitCounter::new(threshold),
-            guard_counter: JitCounter::new(DEFAULT_BRIDGE_THRESHOLD),
             cells: HashMap::new(),
             threshold,
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
@@ -370,7 +366,6 @@ impl WarmEnterState {
     pub fn with_jitlog(threshold: u32, jitlog: Option<Logger>) -> Self {
         WarmEnterState {
             counter: JitCounter::new(threshold),
-            guard_counter: JitCounter::new(DEFAULT_BRIDGE_THRESHOLD),
             cells: HashMap::new(),
             threshold,
             bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
@@ -583,7 +578,6 @@ impl WarmEnterState {
     /// Decay all counters (e.g., periodically to avoid stale counts).
     pub fn decay_counters(&mut self) {
         self.counter.decay_all_counters();
-        self.guard_counter.decay_all_counters();
     }
 
     /// Reset the hot counter for a specific green key to zero.
@@ -664,13 +658,13 @@ impl WarmEnterState {
         guard_fail_count >= self.bridge_threshold
     }
 
-    /// compile.py must_compile / counter.py tick parity:
-    /// Increment the guard failure counter for a specific guard hash.
-    /// Returns true when trace_eagerness threshold is reached.
-    /// O(1) via JitCounter timetable, not HashMap.
+    /// compile.py must_compile / counter.py tick(hash, increment_trace_eagerness):
+    /// Increment the guard failure counter using the shared timetable.
+    /// Returns true when bridge_threshold (trace_eagerness=200) is reached.
     #[inline]
     pub fn tick_guard_failure(&mut self, guard_hash: u64) -> bool {
-        self.guard_counter.tick(guard_hash)
+        self.counter
+            .tick_with_threshold(guard_hash, self.bridge_threshold)
     }
 
     /// Get the function inlining threshold.
