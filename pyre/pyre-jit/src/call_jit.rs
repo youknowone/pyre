@@ -849,9 +849,9 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
-        // Transitional safety: skip if jitcode has BC_ABORT (unsupported
-        // bytecodes). Functions with full codewriter coverage won't have
-        // BC_ABORT after the implicit-abort-to-ref_return change.
+        // RPython note: RPython's codewriter handles all bytecodes, so
+        // BC_ABORT never appears. pyre's codewriter has gaps (e.g., some
+        // exception/Copy paths emit BC_ABORT). Skip blackhole for these.
         if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
@@ -874,9 +874,14 @@ pub fn resume_in_blackhole_from_fail_args(
             }
         }
 
-        // RPython resume.py consume_one_section parity: box unboxed
-        // values (Int → W_IntObject, Float → W_FloatObject) so the
-        // blackhole's ref registers hold valid PyObjectRef pointers.
+        // RPython resume.py consume_one_section parity: load values
+        // into TYPED register files based on the Value variant.
+        // RPython: decode_int→setarg_i, decode_ref→setarg_r, decode_float→setarg_f.
+        // pyre codewriter puts all Python locals in ref registers, so
+        // Ref values go to registers_r. Int/Float values are re-boxed
+        // into PyObjectRef (w_int_new/w_float_new) for the ref file.
+        // When the codewriter gains typed register assignment, this can
+        // be changed to route Int→registers_i, Float→registers_f.
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
@@ -973,9 +978,16 @@ pub fn resume_in_blackhole_from_fail_args(
 /// Parse multi-frame fail_args into per-frame sections.
 /// Single frame: [[Ref, Int, Int, locals..., stack...]]
 /// Multi frame: [[callee: Ref, Int, Int, ...], [caller: Ref, Int, Int, ...]]
-/// RPython resume.py parity: re-box optimized raw values for blackhole
-/// ref registers. The optimizer may unbox Int/Float into raw values in
-/// guard fail_args; the blackhole needs boxed PyObjectRef pointers.
+/// Re-box optimized raw values for the blackhole's ref register file.
+///
+/// RPython difference: RPython's codewriter assigns locals to typed
+/// register files (i/r/f) at compile time via getkind(concretetype).
+/// pyre's codewriter puts all Python locals in ref registers (Python
+/// has no static types). When fail_args contain optimizer-unboxed
+/// Int/Float values, they must be re-boxed to valid PyObjectRef.
+///
+/// This will become unnecessary once pyre gains typed register
+/// assignment in the codewriter (RPython regalloc.py parity).
 fn box_resume_value(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
