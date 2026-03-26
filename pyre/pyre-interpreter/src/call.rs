@@ -88,6 +88,14 @@ pub fn register_eval_override(f: EvalFn) {
 
 thread_local! {
     static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Last known valid execution context — for call_user_func_with_args.
+    static LAST_EXEC_CTX: std::cell::Cell<*const crate::PyExecutionContext> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Set the last known execution context (called at eval loop entry).
+pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
+    LAST_EXEC_CTX.with(|c| c.set(ctx));
 }
 
 /// Guard that temporarily forces all nested calls to use the plain
@@ -613,6 +621,11 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let defaults = unsafe { crate::w_func_get_defaults(func) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
     let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
+    let exec_ctx = if exec_ctx.is_null() {
+        LAST_EXEC_CTX.with(|c| c.get())
+    } else {
+        exec_ctx
+    };
 
     // Fill defaults for missing args
     let code_ref = unsafe { &*func_code };
