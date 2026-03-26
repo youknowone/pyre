@@ -231,6 +231,29 @@ fn call_user_function_with_eval(
         args.to_vec()
     };
 
+    // Fill keyword-only defaults from kwdefaults dict
+    let nkwonly = code_ref.kwonlyarg_count as usize;
+    let mut filled_args = filled_args;
+    if nkwonly > 0 {
+        let kwdefaults = unsafe { crate::w_func_get_kwdefaults(callable) };
+        // Ensure filled_args covers all positional + kwonly slots
+        while filled_args.len() < nparams + nkwonly {
+            filled_args.push(pyre_object::PY_NULL);
+        }
+        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            for ki in 0..nkwonly {
+                let slot = nparams + ki;
+                if filled_args[slot].is_null() {
+                    let param_name = &code_ref.varnames[slot];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                        filled_args[slot] = val;
+                    }
+                }
+            }
+        }
+    }
+
     let final_args = pack_varargs(code_ref, filled_args);
 
     // Generator function: create generator object instead of executing.
@@ -426,7 +449,8 @@ pub(crate) fn resolve_kwargs(
 
     let code_ptr = unsafe { w_func_get_code_ptr(target_func) };
     let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
-    let total_params = code.arg_count as usize;
+    // Total named params = positional + keyword-only
+    let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
     // Effective params = params visible to the caller (excludes implicit cls for types)
     let nparams = total_params - skip_cls;
     let n_pos = args.len() - nkw; // number of positional args
@@ -460,20 +484,38 @@ pub(crate) fn resolve_kwargs(
         }
     }
 
-    // Fill defaults for PY_NULL slots (PyPy: _match_signature fills defs_w)
+    // Fill positional defaults (PyPy: _match_signature defs_w)
+    // Defaults cover the LAST N of the positional params (arg_count).
+    let n_pos_params = code.arg_count as usize - skip_cls;
     let defaults = unsafe { crate::w_func_get_defaults(target_func) };
     if !defaults.is_null() {
         let defaults = crate::space::unwrap_cell(defaults);
         if unsafe { pyre_object::is_tuple(defaults) } {
             let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
-            // defaults cover the LAST ndefaults of the effective params
-            let first_default = nparams.saturating_sub(ndefaults);
-            for pi in first_default..nparams {
+            let first_default = n_pos_params.saturating_sub(ndefaults);
+            for pi in first_default..n_pos_params {
                 if result[pi].is_null() {
                     let di = pi - first_default;
                     if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
                         result[pi] = v;
                     }
+                }
+            }
+        }
+    }
+
+    // Fill keyword-only defaults from kwdefaults dict
+    // PyPy: _match_signature fills from w_kw_defs
+    let kwdefaults = unsafe { crate::w_func_get_kwdefaults(target_func) };
+    if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+        let nkwonly = code.kwonlyarg_count as usize;
+        for ki in 0..nkwonly {
+            let pi = n_pos_params + ki; // position in result
+            if result[pi].is_null() {
+                let param_name = &code.varnames[skip_cls + pi];
+                let key = pyre_object::w_str_new(param_name);
+                if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                    result[pi] = val;
                 }
             }
         }
@@ -624,7 +666,7 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
 /// PyPy: argument.py _match_signature varargs/varkeywords packing
 fn pack_varargs(code: &pyre_bytecode::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
-    let nparams = code.arg_count as usize;
+    let nparams = (code.arg_count + code.kwonlyarg_count) as usize;
     let has_varargs = code.flags.contains(pyre_bytecode::CodeFlags::VARARGS);
     let has_varkw = code.flags.contains(pyre_bytecode::CodeFlags::VARKEYWORDS);
 

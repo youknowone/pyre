@@ -804,7 +804,10 @@ impl OpcodeStepExecutor for PyFrame {
             MakeFunctionFlag::Defaults => unsafe {
                 crate::w_func_set_defaults(func, attr);
             },
-            _ => {} // annotations, kwdefaults, etc.
+            MakeFunctionFlag::KwOnlyDefaults => unsafe {
+                crate::w_func_set_kwdefaults(func, attr);
+            },
+            _ => {} // annotations, etc.
         }
         self.push(func);
         Ok(())

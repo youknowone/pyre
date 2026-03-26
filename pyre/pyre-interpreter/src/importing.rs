@@ -164,6 +164,14 @@ fn init_collections_abc(ns: &mut PyNamespace) {
     crate::namespace_store(ns, "MutableSet", crate::typedef::get_object_type());
     crate::namespace_store(ns, "ByteString", crate::typedef::get_object_type());
     crate::namespace_store(ns, "Buffer", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Reversible", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "MappingView", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "KeysView", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "ItemsView", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "ValuesView", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "AsyncIterator", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "AsyncIterable", crate::typedef::get_object_type());
 }
 
 /// itertools stub

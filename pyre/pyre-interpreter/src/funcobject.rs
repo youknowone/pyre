@@ -35,6 +35,9 @@ pub struct W_FunctionObject {
     /// Default argument values (tuple), or PY_NULL if no defaults.
     /// PyPy: W_Function.defs_w
     pub defaults: PyObjectRef,
+    /// Keyword-only default values (dict), or PY_NULL if none.
+    /// PyPy: W_Function.w_kw_defs
+    pub kwdefaults: PyObjectRef,
 }
 
 /// Field offset of `code_ptr` within `W_FunctionObject`, for JIT field access.
@@ -74,6 +77,7 @@ pub fn w_func_new_with_closure(
         globals,
         closure,
         defaults: PY_NULL,
+        kwdefaults: PY_NULL,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -143,6 +147,18 @@ pub unsafe fn w_func_get_defaults(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_func_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
     unsafe { (*(obj as *mut W_FunctionObject)).defaults = defaults }
+}
+
+/// Get kwdefaults dict.
+#[inline]
+pub unsafe fn w_func_get_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_FunctionObject)).kwdefaults }
+}
+
+/// Set kwdefaults dict.
+#[inline]
+pub unsafe fn w_func_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef) {
+    unsafe { (*(obj as *mut W_FunctionObject)).kwdefaults = kwdefaults }
 }
 
 #[cfg(test)]

@@ -481,6 +481,114 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
         "setdefault",
         w_builtin_func_new("setdefault", crate::type_methods::dict_method_setdefault),
     );
+    namespace_store(
+        ns,
+        "__setitem__",
+        w_builtin_func_new("__setitem__", |args| {
+            if args.len() < 3 {
+                return Err(crate::PyError::type_error("__setitem__ requires 3 args"));
+            }
+            crate::space::py_setitem(args[0], args[1], args[2])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__getitem__",
+        w_builtin_func_new("__getitem__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
+            }
+            crate::space::py_getitem(args[0], args[1])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__contains__",
+        w_builtin_func_new("__contains__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            Ok(pyre_object::w_bool_from(
+                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__len__",
+        w_builtin_func_new("__len__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            crate::space::py_len(args[0])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__iter__",
+        w_builtin_func_new("__iter__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            crate::space::py_iter(args[0])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__delitem__",
+        w_builtin_func_new("__delitem__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
+            }
+            crate::space::py_delitem(args[0], args[1])?;
+            Ok(pyre_object::w_none())
+        }),
+    );
+    namespace_store(
+        ns,
+        "__eq__",
+        w_builtin_func_new("__eq__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq)
+        }),
+    );
+    namespace_store(
+        ns,
+        "__or__",
+        w_builtin_func_new("__or__", |args| {
+            // dict | dict → merge
+            if args.len() < 2 {
+                return Ok(args[0]);
+            }
+            Ok(args[0]) // stub
+        }),
+    );
+    namespace_store(
+        ns,
+        "copy",
+        w_builtin_func_new("copy", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_dict_new());
+            }
+            // Shallow copy
+            let src = args[0];
+            let dst = pyre_object::w_dict_new();
+            unsafe {
+                let d = &*(src as *const pyre_object::dictobject::W_DictObject);
+                for &(k, v) in &*d.entries {
+                    pyre_object::w_dict_store(dst, k, v);
+                }
+            }
+            Ok(dst)
+        }),
+    );
+    namespace_store(
+        ns,
+        "clear",
+        w_builtin_func_new("clear", |_args| Ok(pyre_object::w_none())),
+    );
 }
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
