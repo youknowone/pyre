@@ -1,6 +1,6 @@
-#[path = "../../../pyre/pyre-jit/src/jit/call_spec.rs"]
+#[path = "../../../pyre/pyre-jit-trace/src/call_spec.rs"]
 mod call_spec;
-#[path = "../../../pyre/pyre-jit/src/jit/virtualizable_spec.rs"]
+#[path = "../../../pyre/pyre-jit-trace/src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
 pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
