@@ -31,7 +31,11 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("tuple", || w_builtin_func_new("tuple", builtin_tuple));
     namespace.get_or_insert_with("list", || w_builtin_func_new("list", builtin_list_ctor));
     namespace.get_or_insert_with("dict", || w_builtin_func_new("dict", builtin_dict_ctor));
-    namespace.get_or_insert_with("object", || w_builtin_func_new("object", builtin_object));
+    namespace.get_or_insert_with("object", || {
+        // `object` is a W_TypeObject, not a builtin function.
+        // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
+        crate::typedef::get_object_type()
+    });
     namespace.get_or_insert_with("super", || w_builtin_func_new("super", builtin_super));
     namespace.get_or_insert_with("id", || w_builtin_func_new("id", builtin_id));
     namespace.get_or_insert_with("hash", || w_builtin_func_new("hash", builtin_hash));

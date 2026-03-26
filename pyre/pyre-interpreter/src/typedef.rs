@@ -98,7 +98,29 @@ pub fn install_builtin_typedefs() {
         make_type("NoneType", &NONE_TYPE, |_| {}) as usize,
     );
 
+    // 'object' type — PyPy: objectobject.py W_ObjectObject.typedef
+    // Registered under INSTANCE_TYPE so that py_getattr on instances
+    // can also find __new__ via the type registry.
+    let object_type = make_type("object", &INSTANCE_TYPE, init_object_typedef);
+    reg.insert(
+        &INSTANCE_TYPE as *const PyType as usize,
+        object_type as usize,
+    );
+    // Store the object type for builtins to reference
+    let _ = OBJECT_TYPE_OBJ.set(object_type as usize);
+
     let _ = TYPE_REGISTRY.set(reg);
+}
+
+/// The global `object` type object, accessible from builtins.
+static OBJECT_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Get the `object` W_TypeObject for use as a builtin.
+pub fn get_object_type() -> PyObjectRef {
+    OBJECT_TYPE_OBJ
+        .get()
+        .map(|v| *v as PyObjectRef)
+        .unwrap_or(PY_NULL)
 }
 
 fn make_type(name: &str, _tp: &PyType, init: fn(&mut PyNamespace)) -> PyObjectRef {
@@ -420,3 +442,33 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
 fn init_int_typedef(_ns: &mut PyNamespace) {}
 fn init_float_typedef(_ns: &mut PyNamespace) {}
 fn init_bool_typedef(_ns: &mut PyNamespace) {}
+
+// ── Object TypeDef ───────────────────────────────────────────────────
+// PyPy: pypy/objspace/std/objectobject.py TypeDef("object", ...)
+
+/// `object.__new__(cls)` — allocate a bare instance of cls.
+///
+/// PyPy: objectobject.py descr__new__
+fn object_new(args: &[PyObjectRef]) -> PyObjectRef {
+    assert!(
+        !args.is_empty(),
+        "object.__new__() requires a type argument"
+    );
+    let cls = crate::space::unwrap_cell(args[0]);
+    // cls should be a W_TypeObject — create instance of it
+    if unsafe { is_type(cls) } {
+        return w_instance_new(cls);
+    }
+    // Fallback: create bare instance with no type
+    w_instance_new(PY_NULL)
+}
+
+/// `object.__init__(self)` — no-op base __init__.
+fn object_init(_args: &[PyObjectRef]) -> PyObjectRef {
+    w_none()
+}
+
+fn init_object_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", object_new));
+    namespace_store(ns, "__init__", w_builtin_func_new("__init__", object_init));
+}
