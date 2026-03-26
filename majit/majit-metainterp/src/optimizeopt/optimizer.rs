@@ -1738,21 +1738,19 @@ impl Optimizer {
                 .pre_force_jump_args
                 .clone()
                 .unwrap_or_else(|| jump.args.to_vec());
-            ctx.preamble_end_args = Some(
-                original_jump_args
-                    .iter()
-                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
-                    .collect(),
-            );
-            // RPython Box identity: each frame slot carries a distinct Box
-            // even when two slots hold the same Python object (e.g. `b = t`
-            // in fib_loop). In pyre, duplicate OpRefs in preamble_end_args
-            // cause Phase 2 import to merge their virtual PtrInfo. Dedup by
-            // emitting SameAs ops for duplicates — these survive into the
-            // assembled trace and give Phase 2 distinct import targets.
-            if let Some(mut end_args) = ctx.preamble_end_args.take() {
+            // RPython Box identity parity: resolve args BEFORE forcing,
+            // then dedup duplicates with SameAsR while PtrInfo is still
+            // Virtual. Only after dedup do we force the virtuals.
+            let mut resolved_args: Vec<OpRef> = original_jump_args
+                .iter()
+                .map(|&arg| ctx.get_replacement(arg))
+                .collect();
+            // Dedup: when two slots reference the same OpRef (e.g. b and t
+            // in fib_loop), create SameAsR with fresh OpRef and copy the
+            // VIRTUAL PtrInfo (before force turns it into Instance).
+            {
                 let mut seen = std::collections::HashSet::new();
-                for arg in end_args.iter_mut() {
+                for arg in resolved_args.iter_mut() {
                     if arg.0 >= 10_000 || *arg == OpRef::NONE {
                         continue;
                     }
@@ -1763,9 +1761,6 @@ impl Optimizer {
                         let mut op = Op::new(same_as, &[orig]);
                         op.pos = fresh;
                         ctx.emit(op);
-                        // Copy PtrInfo with fresh field OpRefs for virtuals
-                        // so each slot has independent field identities in
-                        // the Phase 2 label. Fields forward to originals.
                         if let Some(info) = ctx.get_ptr_info(orig).cloned() {
                             let fresh_info = match info {
                                 crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
@@ -1789,8 +1784,14 @@ impl Optimizer {
                         *arg = fresh;
                     }
                 }
-                ctx.preamble_end_args = Some(end_args);
             }
+            // Now force all resolved (and dedup'd) args.
+            ctx.preamble_end_args = Some(
+                resolved_args
+                    .iter()
+                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                    .collect(),
+            );
             // RPython parity: nested virtuals in output ops should be
             // forced by force_box_for_end_of_preamble's recursive walk.
             // Additional force is handled by the undefined-ref cleanup below
