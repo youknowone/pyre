@@ -2095,12 +2095,26 @@ impl Optimization for OptHeap {
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
         ctx: &OptContext,
     ) {
-        for cf in self.field_cache.values() {
+        // heap.py:370-372: for descr in cached_fields: d.produce_...(optimizer, sb, descr)
+        // heap.py:54: for i, info in enumerate(self.cached_infos):
+        // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
+        for (&field_idx, cf) in &self.field_cache {
             debug_assert!(cf.lazy_set.is_none()); // heap.py:53
             for i in 0..cf.cached_structs.len() {
-                let obj = ctx.get_replacement(cf.cached_structs[i]); // get_box_replacement
-                let cached_val = ctx.get_replacement(cf.cached_values[i]); // get_box_replacement
-                if cached_val.is_none() || obj.is_none() {
+                // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
+                let obj = ctx.get_replacement(cf.cached_structs[i]);
+                if obj.is_none() {
+                    continue;
+                }
+                // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
+                // Read from PtrInfo._fields — RPython reads info._fields[descr] at export time,
+                // not a stored snapshot. This picks up any updates between registration and export.
+                let cached_val = ctx
+                    .get_ptr_info(obj)
+                    .and_then(|info| info.get_field(field_idx))
+                    .map(|v| ctx.get_replacement(v))
+                    .unwrap_or_else(|| ctx.get_replacement(cf.cached_values[i]));
+                if cached_val.is_none() {
                     continue;
                 }
                 let Some(descr) = cf
