@@ -949,12 +949,6 @@ fn restore_guard_failure_for_loop(
     // RPython compile.py:710 handle_fail → resume_in_blackhole.
     LAST_GUARD_TYPED.with(|c| *c.borrow_mut() = Some(typed.clone()));
 
-    // Blackhole not yet activated — requires complete _run_forever chain.
-    // Multi-frame capture_resumedata encodes callee + caller sections,
-    // but _run_forever needs caller blackhole to continue past the CALL
-    // return point to the merge point. Currently blocked on:
-    // _run_forever caller continuation after DoneWithThisFrame.
-
     // Fallback: restore frame state for interpreter continuation.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
