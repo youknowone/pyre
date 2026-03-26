@@ -849,9 +849,9 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
-        // Transitional safety: skip blackhole if jitcode contains BC_ABORT
-        // (unsupported bytecodes). This guard will be removed once all
-        // Python bytecodes are implemented in the codewriter.
+        // Transitional safety: skip if jitcode has BC_ABORT (unsupported
+        // bytecodes). Functions with full codewriter coverage won't have
+        // BC_ABORT after the implicit-abort-to-ref_return change.
         if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
