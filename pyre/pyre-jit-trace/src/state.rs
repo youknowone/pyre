@@ -2085,24 +2085,28 @@ impl MIFrame {
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
-        // RPython opencoder.py:819 capture_resumedata parity:
-        // Inlined callee guards use parent_fail_args (caller's state) for
-        // frame restore. Override ni (slot 1) with callee's current PC
-        // so blackhole resumes in the callee function.
+        // RPython opencoder.py:819 capture_resumedata(framestack) parity:
+        // Inlined callee guards encode BOTH callee and caller frames as
+        // separate sections. The blackhole builds a chain: callee → caller.
         if self.parent_fail_args.is_some() {
-            let mut fail_args = self.parent_fail_args.clone().unwrap();
-            // Slot 1 = ni: replace caller's CALL PC with callee's current PC.
-            self.with_ctx(|this, inner_ctx| {
-                this.flush_to_frame(inner_ctx);
-                let callee_ni = this.sym().vable_next_instr;
-                if fail_args.len() > 1 {
-                    fail_args[1] = callee_ni;
-                }
-            });
-            let types = self
+            // Callee section: orgpc + pre-opcode locals/stack.
+            self.flush_to_frame_for_guard(ctx);
+            let callee_fail_args = self.build_single_frame_fail_args(ctx);
+            let callee_types = self.build_single_frame_fail_arg_types();
+
+            // Caller section: unchanged from parent_fail_args (captured at CALL).
+            let caller_fail_args = self.parent_fail_args.clone().unwrap();
+            let caller_types = self
                 .parent_fail_arg_types
                 .clone()
-                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(fail_args.len()));
+                .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(caller_fail_args.len()));
+
+            // Multi-frame: [callee_section..., caller_section...]
+            let mut fail_args = callee_fail_args;
+            fail_args.extend_from_slice(&caller_fail_args);
+            let mut types = callee_types;
+            types.extend_from_slice(&caller_types);
+
             ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
             return;
         }
@@ -4289,14 +4293,19 @@ impl MIFrame {
             (sym, Some(callee_frame_opref))
         };
 
-        // GuardNotForced in callee → interpreter must re-execute the CALL.
-        // Temporarily restore callable+args to parent stack and set PC to CALL.
-        let call_pc = self.fallthrough_pc.saturating_sub(1);
-        self.with_ctx(|this, ctx| this.push_call_replay_stack(ctx, callable, args, call_pc));
-        self.with_ctx(|this, ctx| this.flush_to_frame(ctx));
+        // RPython capture_resumedata parity: parent frame's PC is the
+        // CALL return point (fallthrough_pc), not the CALL opcode start.
+        // The callee blackhole handles the call; the caller continues AFTER.
+        // Stack is post-dispatch (args consumed, no result yet).
+        let return_point_pc = self.fallthrough_pc;
+        self.with_ctx(|this, ctx| {
+            let ni = ctx.const_int(return_point_pc as i64);
+            let s = this.sym_mut();
+            s.vable_next_instr = ni;
+            s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
+        });
         let parent_fail_args = self.with_ctx(|this, ctx| this.build_single_frame_fail_args(ctx));
         let parent_fail_arg_types = self.build_single_frame_fail_arg_types();
-        self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
         Ok(PendingInlineFrame {
             sym: callee_sym,
             concrete_frame: callee_frame,

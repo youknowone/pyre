@@ -987,7 +987,9 @@ fn parse_fail_arg_sections(typed_values: &[majit_ir::Value]) -> Vec<&[majit_ir::
         Some(Value::Int(v)) => *v as usize,
         _ => return vec![],
     };
-    let first_section_len = 3 + vsd.max(nlocals);
+    // RPython: vsd = nlocals + stack_depth (already includes nlocals).
+    // Section length = 3 header fields + vsd slots.
+    let first_section_len = 3 + vsd;
 
     if first_section_len >= typed_values.len() {
         // Single section (entire typed_values).
