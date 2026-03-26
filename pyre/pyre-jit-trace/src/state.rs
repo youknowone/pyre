@@ -1376,11 +1376,11 @@ impl MIFrame {
         sym: &mut PyreSym,
         concrete_frame: usize,
         fallthrough_pc: usize,
+        opcode_start_pc: usize,
     ) -> Self {
         sym.init_symbolic(ctx, concrete_frame);
-        // orgpc defaults to fallthrough_pc - 1 (opcode start).
-        // Overridden by set_orgpc() in trace_code_step.
-        let orgpc = fallthrough_pc.saturating_sub(1);
+        // RPython pyjitpl.py: orgpc = opcode start PC passed to each handler.
+        let orgpc = opcode_start_pc;
         Self {
             ctx,
             sym,
@@ -1872,15 +1872,16 @@ impl MIFrame {
     /// build their own fail_args with post-pop state and other_target PC
     /// (see the comment there for why).
     fn flush_to_frame_for_guard(&mut self, ctx: &mut TraceCtx) {
-        let has_snapshot = self.sym().pre_opcode_vsd.is_some();
-        if has_snapshot {
-            let resume_pc = self.orgpc;
-            let pre_vsd = self.sym().pre_opcode_vsd.unwrap();
-            let s = self.sym_mut();
-            s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        // RPython capture_resumedata(resumepc=orgpc) parity:
+        // Always use orgpc (opcode start PC) as the resume PC.
+        // orgpc is set to the current opcode's code unit in from_sym().
+        let resume_pc = self.orgpc;
+        let s = self.sym_mut();
+        s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        if let Some(pre_vsd) = s.pre_opcode_vsd {
             s.vable_valuestackdepth = ctx.const_int(pre_vsd as i64);
         } else {
-            self.flush_to_frame(ctx);
+            s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
         }
     }
 
