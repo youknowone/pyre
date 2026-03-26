@@ -1433,14 +1433,17 @@ fn jit_blackhole_resume_from_guard(
     }
     // RPython _run_forever parity: blackhole may return Jump (loop back)
     // or GuardFailed (nested guard failure). Keep running until Finish.
+    // Zero-copy: pass fail_values slice directly (from caller's jf_frame)
+    // on first iteration, avoiding heap Vec allocation.
     let mut current_fail_index = fail_index;
-    let mut current_values = fail_values.to_vec();
+    let mut _owned_values: Option<Vec<i64>> = None;
+    let mut current_slice: &[i64] = fail_values;
     loop {
         let bh_opt = driver.blackhole_guard_failure(
             actual_green_key,
             trace_id,
             current_fail_index,
-            &current_values,
+            current_slice,
             exception.clone(),
         );
         let (bh_result, _bh_exc) = bh_opt?;
@@ -1451,7 +1454,8 @@ fn jit_blackhole_resume_from_guard(
             majit_metainterp::blackhole::BlackholeResult::Jump { values, .. } => {
                 // Loop back: re-enter from the loop header (fail_index=0)
                 current_fail_index = 0;
-                current_values = values;
+                _owned_values = Some(values);
+                current_slice = _owned_values.as_ref().unwrap();
                 // Jump means re-enter the compiled code from the loop header.
                 // For now, fall back to force_fn since we don't have loop
                 // re-entry support in the blackhole yet.
