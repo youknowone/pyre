@@ -193,8 +193,14 @@ pub fn new_builtin_namespace() -> PyNamespace {
 
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch)
-    let (positional, end, sep) = if !args.is_empty() && unsafe { is_dict(*args.last().unwrap()) } {
+    // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
+    // Distinguished from regular dict args by __pyre_kw__ marker key.
+    let is_kwargs = !args.is_empty()
+        && unsafe {
+            let last = *args.last().unwrap();
+            is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
+        };
+    let (positional, end, sep) = if is_kwargs {
         let kwargs = *args.last().unwrap();
         let end_key = w_str_new("end");
         let sep_key = w_str_new("sep");

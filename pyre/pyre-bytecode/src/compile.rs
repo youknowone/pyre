@@ -3,7 +3,7 @@
 pub use rustpython_compiler::Mode;
 pub use rustpython_compiler::compile as rp_compile;
 pub use rustpython_compiler_core::bytecode::{
-    self, BinaryOperator, CodeObject, ComparisonOperator, ConstantData, Instruction,
+    self, BinaryOperator, CodeFlags, CodeObject, ComparisonOperator, ConstantData, Instruction,
     MakeFunctionFlags, OpArg, OpArgState,
 };
 
