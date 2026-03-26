@@ -97,6 +97,40 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
+fn init_callbacks() {
+    use pyre_jit_trace::callbacks::{self, CallJitCallbacks};
+    thread_local! {
+        static INIT: Cell<bool> = const { Cell::new(false) };
+    }
+    INIT.with(|c| {
+        if !c.get() {
+            c.set(true);
+            let cb = Box::leak(Box::new(CallJitCallbacks {
+                callee_frame_helper: crate::call_jit::callee_frame_helper,
+                callable_prefers_function_entry: crate::call_jit::callable_prefers_function_entry,
+                recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
+                jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
+                jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
+                jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1
+                    as *const (),
+                jit_force_recursive_call_argraw_boxed_1:
+                    crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const (),
+                jit_force_self_recursive_call_argraw_boxed_1:
+                    crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const (),
+                jit_create_callee_frame_1: crate::call_jit::jit_create_callee_frame_1 as *const (),
+                jit_create_callee_frame_1_raw_int:
+                    crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
+                jit_create_self_recursive_callee_frame_1:
+                    crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+                jit_create_self_recursive_callee_frame_1_raw_int:
+                    crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+                driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
+            }));
+            callbacks::init(cb);
+        }
+    });
+}
+
 // JIT_TRACING_DEPTH removed — now MetaInterp.tracing_call_depth field.
 // RPython portal_call_depth parity: state colocated with tracing context.
 
@@ -156,6 +190,7 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
         crate::call_jit::maybe_handle_inline_concrete_call,
     );
     crate::call_jit::install_jit_call_bridge();
+    init_callbacks();
     frame.fix_array_ptrs();
 
     // RPython blackhole.py parity: during bridge tracing, concrete
