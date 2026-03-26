@@ -2555,11 +2555,30 @@ impl Optimizer {
             }
 
             // optimizer.py:732-748 — ResumeDataVirtualAdder.finish() parity.
-            // 1. number() tags each box (TAGBOX/TAGVIRTUAL/TAGCONST/TAGINT)
-            // 2. Walk TAGVIRTUAL entries to discover virtual fields (via PtrInfo)
-            // 3. finish() numbers new field boxes + creates rd_numb/rd_consts
+            // Phase 2 label args must be reverse-mapped to original inputargs
+            // BEFORE number() so that rd_numb TAGBOX indices match dead_frame slots.
+            let label_reverse: std::collections::HashMap<u32, OpRef> = self
+                .imported_label_args
+                .as_ref()
+                .zip(self.imported_label_source_slots.as_ref())
+                .map(|(labels, sources)| {
+                    labels
+                        .iter()
+                        .zip(sources.iter())
+                        .filter_map(|(label, source)| {
+                            (!source.is_none()).then_some((label.0, *source))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             if let Some(ref fail_args) = op.fail_args {
-                let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
+                let env = crate::optimizeopt::OptBoxEnv {
+                    ctx: &*ctx,
+                    label_reverse: label_reverse.clone(),
+                };
+                // env.get_box_replacement() applies reverse mapping automatically,
+                // so number() sees Cranelift-resolvable OpRefs.
                 let snapshot = crate::resume::Snapshot::single_frame(0, fail_args.to_vec());
                 match self.resumedata_memo.number(&snapshot, &env) {
                     Ok(numb_state) => {
@@ -2653,37 +2672,9 @@ impl Optimizer {
                                     .collect(),
                             );
                         }
-                        // RPython optimizer.py:748: descr.store_final_boxes(op, newboxes).
-                        // Phase 2 label args (e.g. OpRef(65)) are optimizer-internal
-                        // OpRefs created by import_state. The Cranelift backend only
-                        // knows about the original inputargs (OpRef(0..N)). Map each
-                        // livebox OpRef back to its source inputarg using the
-                        // imported_label reverse mapping.
-                        let fail_args: Vec<OpRef> =
-                            if let Some(ref labels) = self.imported_label_args {
-                                let reverse: std::collections::HashMap<u32, OpRef> = labels
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(i, label)| {
-                                        // Source slot = original inputarg index.
-                                        // Virtual imports have no source slot (None
-                                        // in imported_label_source_slots); these
-                                        // should not appear as TAGBOX liveboxes.
-                                        self.imported_label_source_slots
-                                            .as_ref()
-                                            .and_then(|s| s.get(i).copied())
-                                            .filter(|s| !s.is_none())
-                                            .map(|source| (label.0, source))
-                                    })
-                                    .collect();
-                                liveboxes
-                                    .iter()
-                                    .map(|lb| reverse.get(&lb.0).copied().unwrap_or(*lb))
-                                    .collect()
-                            } else {
-                                liveboxes
-                            };
-                        op.fail_args = Some(fail_args.into());
+                        // Liveboxes already contain mapped OpRefs (reverse mapping
+                        // was applied to fail_args before snapshot creation).
+                        op.fail_args = Some(liveboxes.into());
                     }
                     Err(_) => {
                         // resume.py: TagOverflow → compile.giveup().
@@ -2699,7 +2690,10 @@ impl Optimizer {
             // Otherwise fall back to constant_types + PtrInfo heuristic.
             if op.rd_numb.is_some() {
                 if let Some(ref fa) = op.fail_args {
-                    let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
+                    let env = crate::optimizeopt::OptBoxEnv {
+                        ctx: &*ctx,
+                        label_reverse: label_reverse.clone(),
+                    };
                     let types: Vec<majit_ir::Type> = fa
                         .iter()
                         .map(|opref| {

@@ -2932,16 +2932,22 @@ impl ResumeDataLoopMemo {
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
         let mut new_liveboxes: HashMap<u32, i16> = HashMap::new();
 
-        for (&opref_id, &tagged) in &numb_state.liveboxes {
+        // Iterate in deterministic order (sorted by opref_id) to ensure
+        // consistent virtual field numbering across runs.
+        // RPython uses dict iteration which is insertion-ordered in the
+        // implementation; Rust HashMap is not ordered.
+        let mut sorted_liveboxes: Vec<(u32, i16)> =
+            numb_state.liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
+        sorted_liveboxes.sort_by_key(|&(k, _)| k);
+
+        for &(opref_id, tagged) in &sorted_liveboxes {
             let (i, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
-                // resume.py:417: liveboxes[i] = box
                 if (i as usize) < liveboxes.len() {
                     liveboxes[i as usize] = Some(majit_ir::OpRef(opref_id));
                 }
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
-                // resume.py:420-426: walk virtual fields
                 if let Some(vf) = virtual_fields.get(&opref_id) {
                     // resume.py:362-368: register_virtual_fields
                     for &field_opref in &vf.field_oprefs {
@@ -2971,8 +2977,9 @@ impl ResumeDataLoopMemo {
         // resume.py:454-509: _number_virtuals
         let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.cached_boxes.len()];
         let mut count = 0;
-        // Collect keys first to avoid borrowing new_liveboxes during mutation.
-        let keys: Vec<(u32, i16)> = new_liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
+        // Collect and sort keys for deterministic ordering.
+        let mut keys: Vec<(u32, i16)> = new_liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
+        keys.sort_by_key(|&(k, _)| k);
         for (opref_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
