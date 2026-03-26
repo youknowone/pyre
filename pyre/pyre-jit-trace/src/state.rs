@@ -178,7 +178,7 @@ use pyre_interpreter::{
     range_iter_continues, w_builtin_func_name, w_func_get_code_ptr, w_func_get_globals,
 };
 
-use crate::jit::descr::{
+use crate::descr::{
     bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
     list_float_items_heap_cap_descr, list_float_items_len_descr, list_float_items_ptr_descr,
     list_int_items_heap_cap_descr, list_int_items_len_descr, list_int_items_ptr_descr,
@@ -188,11 +188,11 @@ use crate::jit::descr::{
     str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
     w_int_size_descr,
 };
-use crate::jit::frame_layout::{
+use crate::frame_layout::{
     PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
     PYFRAME_VALUESTACKDEPTH_OFFSET, build_pyframe_virtualizable_info,
 };
-use crate::jit::helpers::{
+use crate::helpers::{
     TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth,
 };
 
@@ -243,10 +243,10 @@ pub struct PyreSym {
     // ── Persistent symbolic frame field tracking ──
     // These fields survive across per-instruction MIFrame lifetimes.
     pub(crate) symbolic_locals: Vec<OpRef>,
-    pub(crate) symbolic_stack: Vec<OpRef>,
+    pub symbolic_stack: Vec<OpRef>,
     pub(crate) symbolic_local_types: Vec<Type>,
-    pub(crate) symbolic_stack_types: Vec<Type>,
-    pub(crate) pending_next_instr: Option<usize>,
+    pub symbolic_stack_types: Vec<Type>,
+    pub pending_next_instr: Option<usize>,
     pub(crate) locals_cells_stack_array_ref: OpRef,
     /// Absolute index into the unified array (starts at nlocals).
     pub(crate) valuestackdepth: usize,
@@ -279,7 +279,7 @@ pub struct PyreSym {
     /// On guard failure, the interpreter jumps to this PC instead of
     /// re-executing the branch instruction (stack machine safety).
     pub(crate) pending_branch_other_target: Option<usize>,
-    pub(crate) transient_value_types: std::collections::HashMap<OpRef, Type>,
+    pub transient_value_types: std::collections::HashMap<OpRef, Type>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
     // parallel with symbolic_locals/symbolic_stack. Each opcode handler
@@ -287,7 +287,7 @@ pub struct PyreSym {
     // branch directions, and call results use internally tracked values
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
-    pub(crate) concrete_stack: Vec<ConcreteValue>,
+    pub concrete_stack: Vec<ConcreteValue>,
     /// Frame metadata extracted at trace start — avoids stale snapshot reads.
     /// RPython MIFrame.jitcode parity.
     pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
@@ -323,7 +323,7 @@ pub struct PyreSym {
 /// valuestackdepth, next_instr) lives in PyreSym and survives across
 /// instructions; this struct provides the per-instruction context
 /// (ctx, fallthrough_pc).
-pub(crate) struct MIFrame {
+pub struct MIFrame {
     ctx: *mut TraceCtx,
     sym: *mut PyreSym,
     ob_type_fd: DescrRef,
@@ -335,9 +335,9 @@ pub(crate) struct MIFrame {
     /// so that guard failure re-executes the opcode from the beginning.
     orgpc: usize,
     /// PyPy capture_resumedata: parent frame fail_args for multi-frame guards.
-    pub(crate) parent_fail_args: Option<Vec<OpRef>>,
-    pub(crate) parent_fail_arg_types: Option<Vec<Type>>,
-    pub(crate) pending_inline_frame: Option<PendingInlineFrame>,
+    pub parent_fail_args: Option<Vec<OpRef>>,
+    pub parent_fail_arg_types: Option<Vec<Type>>,
+    pub pending_inline_frame: Option<PendingInlineFrame>,
 }
 
 fn code_has_backward_jump(code: &CodeObject) -> bool {
@@ -434,7 +434,7 @@ pub(crate) fn trace_ob_type_descr() -> DescrRef {
 }
 
 fn box_traced_raw_int(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
-    crate::jit::helpers::emit_box_int_inline(
+    crate::helpers::emit_box_int_inline(
         ctx,
         value,
         w_int_size_descr(),
@@ -453,7 +453,7 @@ fn note_inline_trace_too_long(
     if err.message != "inline trace aborted" {
         return;
     }
-    let (driver, _) = crate::eval::driver_pair();
+    let (driver, _) = crate::driver::driver_pair();
     let warm_state = driver.meta_interp_mut().warm_state_mut();
     warm_state.disable_noninlinable_function(callee_key);
     if callee_key == caller_function_key {
@@ -489,7 +489,7 @@ fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
 }
 
 fn note_root_trace_too_long(green_key: u64) {
-    let (driver, _) = crate::eval::driver_pair();
+    let (driver, _) = crate::driver::driver_pair();
     let warm_state = driver.meta_interp_mut().warm_state_mut();
     warm_state.trace_next_iteration(green_key);
     warm_state.mark_force_finish_tracing(green_key);
@@ -809,7 +809,7 @@ pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
 pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let vsd = unsafe {
-        *(frame_ptr.add(crate::jit::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
     };
     if vsd == 0 {
         return None;
@@ -829,7 +829,7 @@ pub(crate) fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObj
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let code_ptr = unsafe {
-        *(frame_ptr.add(crate::jit::frame_layout::PYFRAME_CODE_OFFSET)
+        *(frame_ptr.add(crate::frame_layout::PYFRAME_CODE_OFFSET)
             as *const *const pyre_bytecode::CodeObject)
     };
     if code_ptr.is_null() {
@@ -1042,7 +1042,7 @@ fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -> OpRef {
     }
 }
 
-pub(crate) fn pending_inline_result_from_concrete(
+pub fn pending_inline_result_from_concrete(
     result_type: Type,
     concrete_result: PyObjectRef,
 ) -> PendingInlineResult {
@@ -1055,7 +1055,7 @@ pub(crate) fn pending_inline_result_from_concrete(
     }
 }
 
-pub(crate) fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
+pub fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
     match result {
         PendingInlineResult::Ref(result) => result,
         PendingInlineResult::Int(value) => w_int_new(value),
@@ -1076,19 +1076,19 @@ fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
 fn one_arg_callee_frame_helper(arg_type: Type, is_self_recursive: bool) -> (*const (), Vec<Type>) {
     match (is_self_recursive, arg_type) {
         (true, Type::Int) => (
-            crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+            crate::callbacks::get().jit_create_self_recursive_callee_frame_1_raw_int,
             vec![Type::Ref, Type::Int],
         ),
         (true, _) => (
-            crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+            crate::callbacks::get().jit_create_self_recursive_callee_frame_1,
             vec![Type::Ref, Type::Ref],
         ),
         (false, Type::Int) => (
-            crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
+            crate::callbacks::get().jit_create_callee_frame_1_raw_int,
             vec![Type::Ref, Type::Ref, Type::Int],
         ),
         (false, _) => (
-            crate::call_jit::jit_create_callee_frame_1 as *const (),
+            crate::callbacks::get().jit_create_callee_frame_1,
             vec![Type::Ref, Type::Ref, Type::Ref],
         ),
     }
@@ -1285,7 +1285,7 @@ impl PyreSym {
 
     /// Stack-only depth (number of values on the operand stack).
     #[inline]
-    pub(crate) fn stack_only_depth(&self) -> usize {
+    pub fn stack_only_depth(&self) -> usize {
         self.valuestackdepth.saturating_sub(self.nlocals)
     }
 
@@ -1373,7 +1373,7 @@ impl MIFrame {
         }
     }
 
-    pub(crate) fn from_sym(
+    pub fn from_sym(
         ctx: &mut TraceCtx,
         sym: &mut PyreSym,
         concrete_frame: usize,
@@ -1497,7 +1497,7 @@ impl MIFrame {
             s.stack_only_depth()
         };
         let is_bridge = s.pre_opcode_vsd.is_some() && {
-            let (driver, _) = crate::eval::driver_pair();
+            let (driver, _) = crate::driver::driver_pair();
             driver.is_bridge_tracing()
         };
         if s.vable_array_base.is_some() && (!s.is_function_entry_trace || is_bridge) {
@@ -1737,13 +1737,13 @@ impl MIFrame {
                 let float_type_addr = &FLOAT_TYPE as *const _ as i64;
                 if value.0 < 10_000 && !ctx.heap_cache().is_class_known(value) {
                     let ob_type =
-                        trace_gc_object_int_field(ctx, value, crate::jit::descr::ob_type_descr());
+                        trace_gc_object_int_field(ctx, value, crate::descr::ob_type_descr());
                     let type_const = ctx.const_int(float_type_addr);
                     self.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
                     ctx.heap_cache_mut()
                         .class_now_known(value, majit_ir::GcRef(float_type_addr as usize));
                 }
-                let ff_descr = crate::jit::descr::float_floatval_descr();
+                let ff_descr = crate::descr::float_floatval_descr();
                 let ff_idx = ff_descr.index();
                 value = if let Some(cached) = ctx.heap_cache().getfield_cached(value, ff_idx) {
                     cached
@@ -1932,7 +1932,7 @@ impl MIFrame {
                     // Virtualizable slots are Ref — re-box raw Int for the
                     // loop header which expects boxed W_IntObject.
                     let int_type_addr = &INT_TYPE as *const _ as i64;
-                    crate::jit::generated::trace_box_int(
+                    crate::generated::trace_box_int(
                         ctx,
                         value,
                         w_int_size_descr(),
@@ -2334,7 +2334,7 @@ impl MIFrame {
             key
         } else {
             let fail_args = self.current_fail_args(ctx);
-            crate::jit::generated::trace_unbox_int(
+            crate::generated::trace_unbox_int(
                 ctx,
                 key,
                 &INT_TYPE as *const _ as i64,
@@ -2811,24 +2811,24 @@ impl MIFrame {
             let lhs_raw = if this.value_type(a) == Type::Int {
                 a
             } else {
-                crate::jit::generated::trace_unbox_int(
+                crate::generated::trace_unbox_int(
                     ctx,
                     a,
                     int_type_addr,
-                    crate::jit::descr::ob_type_descr(),
-                    crate::jit::descr::int_intval_descr(),
+                    crate::descr::ob_type_descr(),
+                    crate::descr::int_intval_descr(),
                     &fail_args,
                 )
             };
             let rhs_raw = if this.value_type(b) == Type::Int {
                 b
             } else {
-                crate::jit::generated::trace_unbox_int(
+                crate::generated::trace_unbox_int(
                     ctx,
                     b,
                     int_type_addr,
-                    crate::jit::descr::ob_type_descr(),
-                    crate::jit::descr::int_intval_descr(),
+                    crate::descr::ob_type_descr(),
+                    crate::descr::int_intval_descr(),
                     &fail_args,
                 )
             };
@@ -2875,14 +2875,14 @@ impl MIFrame {
             let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
                 if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
                     let ob_type =
-                        trace_gc_object_int_field(ctx, obj, crate::jit::descr::ob_type_descr());
+                        trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
                     let type_const = ctx.const_int(float_type_addr);
                     this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
                     ctx.heap_cache_mut()
                         .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
                 }
                 {
-                    let ff_descr = crate::jit::descr::float_floatval_descr();
+                    let ff_descr = crate::descr::float_floatval_descr();
                     let ff_idx = ff_descr.index();
                     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, ff_idx) {
                         cached
@@ -2957,7 +2957,7 @@ impl MIFrame {
                     } else if let Some(raw) = try_trace_const_boxed_int(ctx, a, lhs_obj) {
                         raw
                     } else {
-                        crate::jit::generated::trace_unbox_int(
+                        crate::generated::trace_unbox_int(
                             ctx,
                             a,
                             int_type_addr,
@@ -2971,7 +2971,7 @@ impl MIFrame {
                     } else if let Some(raw) = try_trace_const_boxed_int(ctx, b, rhs_obj) {
                         raw
                     } else {
-                        crate::jit::generated::trace_unbox_int(
+                        crate::generated::trace_unbox_int(
                             ctx,
                             b,
                             int_type_addr,
@@ -3008,7 +3008,7 @@ impl MIFrame {
                     let lhs_raw = if this.value_type(a) == Type::Float {
                         a
                     } else {
-                        crate::jit::generated::trace_unbox_float(
+                        crate::generated::trace_unbox_float(
                             ctx,
                             a,
                             float_type_addr,
@@ -3020,7 +3020,7 @@ impl MIFrame {
                     let rhs_raw = if this.value_type(b) == Type::Float {
                         b
                     } else {
-                        crate::jit::generated::trace_unbox_float(
+                        crate::generated::trace_unbox_float(
                             ctx,
                             b,
                             float_type_addr,
@@ -3117,7 +3117,7 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::jit::generated::trace_unbox_int(
+                                crate::generated::trace_unbox_int(
                                     ctx,
                                     value,
                                     &INT_TYPE as *const _ as i64,
@@ -3146,7 +3146,7 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::jit::generated::trace_unbox_int(
+                                crate::generated::trace_unbox_int(
                                     ctx,
                                     value,
                                     &INT_TYPE as *const _ as i64,
@@ -3181,7 +3181,7 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::jit::generated::trace_unbox_float(
+                                crate::generated::trace_unbox_float(
                                     ctx,
                                     value,
                                     &FLOAT_TYPE as *const _ as i64,
@@ -3210,7 +3210,7 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::jit::generated::trace_unbox_float(
+                                crate::generated::trace_unbox_float(
                                     ctx,
                                     value,
                                     &FLOAT_TYPE as *const _ as i64,
@@ -3297,7 +3297,7 @@ impl MIFrame {
                     let raw = if this.value_type(value) == Type::Int {
                         value
                     } else {
-                        crate::jit::generated::trace_unbox_int(
+                        crate::generated::trace_unbox_int(
                             ctx,
                             value,
                             &INT_TYPE as *const _ as i64,
@@ -3341,7 +3341,7 @@ impl MIFrame {
                     let raw = if this.value_type(value) == Type::Float {
                         value
                     } else {
-                        crate::jit::generated::trace_unbox_float(
+                        crate::generated::trace_unbox_float(
                             ctx,
                             value,
                             &FLOAT_TYPE as *const _ as i64,
@@ -3379,7 +3379,7 @@ impl MIFrame {
     ) -> Result<OpRef, PyError> {
         self.with_ctx(|this, ctx| {
             let boxed_args = box_args_for_python_helper(this, ctx, args);
-            crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
+            crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
         })
     }
 
@@ -3424,7 +3424,7 @@ impl MIFrame {
                         trace_arraylen_gc(ctx, value, list_float_items_len_descr())
                     } else {
                         let boxed_value = box_value_for_python_helper(this, ctx, value);
-                        return crate::jit::helpers::emit_trace_call_known_builtin(
+                        return crate::helpers::emit_trace_call_known_builtin(
                             ctx,
                             callable,
                             &[boxed_value],
@@ -3474,7 +3474,7 @@ impl MIFrame {
                     let abs_value = ctx.record_op(OpCode::IntSub, &[xor, sign]);
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
+                        crate::generated::trace_box_int(
                             ctx,
                             abs_value,
                             w_int_size_descr(),
@@ -3585,7 +3585,7 @@ impl MIFrame {
                     };
                     Ok({
                         let int_type_addr = &INT_TYPE as *const _ as i64;
-                        crate::jit::generated::trace_box_int(
+                        crate::generated::trace_box_int(
                             ctx,
                             selected,
                             w_int_size_descr(),
@@ -3661,15 +3661,15 @@ impl MIFrame {
                 return self.with_ctx(|this, ctx| {
                     this.guard_value_ref(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
-                    crate::jit::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
+                    crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
             }
             if is_func(concrete_callable) {
                 let callee_code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
-                let callee_key = crate::eval::make_green_key(callee_code_ptr, 0);
+                let callee_key = crate::driver::make_green_key(callee_code_ptr, 0);
                 let callee_code = unsafe { &*callee_code_ptr };
                 let callee_has_loop = code_has_backward_jump(callee_code);
-                let (driver, _) = crate::eval::driver_pair();
+                let (driver, _) = crate::driver::driver_pair();
                 let nargs = args.len();
 
                 // RPython pyjitpl.py: do_residual_or_indirect_call() follows
@@ -3679,7 +3679,7 @@ impl MIFrame {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let root_trace_green_key = root_trace_green_key(self);
-                let current_function_key = crate::eval::make_green_key(self.sym().concrete_code, 0);
+                let current_function_key = crate::driver::make_green_key(self.sym().concrete_code, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = self.parent_fail_args.is_some();
@@ -3696,7 +3696,7 @@ impl MIFrame {
                     None
                 };
                 let callee_prefers_function_entry =
-                    crate::call_jit::callable_prefers_function_entry(concrete_callable);
+                    (crate::callbacks::get().callable_prefers_function_entry)(concrete_callable);
                 if is_self_recursive
                     && inline_decision == majit_metainterp::InlineDecision::Inline
                     && recursive_depth >= max_unroll_recursion
@@ -3754,7 +3754,7 @@ impl MIFrame {
                     return self.with_ctx(|this, ctx| {
                         this.guard_value_ref(ctx, callable, concrete_callable as i64);
                         let boxed_args = box_args_for_python_helper(this, ctx, args);
-                        let result = crate::jit::helpers::emit_trace_call_known_function(
+                        let result = crate::helpers::emit_trace_call_known_function(
                             ctx,
                             this.frame(),
                             callable,
@@ -3813,14 +3813,14 @@ impl MIFrame {
                     eprintln!(
                         "[jit][call-check] is_self={} cache_safe={} inline_active={} callee_key={}",
                         is_self_recursive,
-                        crate::call_jit::recursive_force_cache_safe(concrete_callable),
+                        (crate::callbacks::get().recursive_force_cache_safe)(concrete_callable),
                         inline_framestack_active,
                         callee_key
                     );
                 }
 
                 if inline_decision == majit_metainterp::InlineDecision::Inline {
-                    if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                    if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nargs) {
                         return self.inline_function_call(
                             callable,
                             args,
@@ -3846,7 +3846,7 @@ impl MIFrame {
                         let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
                     };
-                    if nargs == 1 || crate::call_jit::callee_frame_helper(nargs).is_some() {
+                    if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some() {
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
                                 this.guard_value_ref(ctx, callable, concrete_callable as i64);
@@ -3880,7 +3880,7 @@ impl MIFrame {
                                 ctx.call_ref_typed(helper, &helper_args, &helper_arg_types)
                             } else {
                                 let frame_helper =
-                                    crate::call_jit::callee_frame_helper(nargs).unwrap();
+                                    (crate::callbacks::get().callee_frame_helper)(nargs).unwrap();
                                 let mut helper_args = if is_self_recursive {
                                     vec![this.frame()]
                                 } else {
@@ -3920,7 +3920,7 @@ impl MIFrame {
                                 &ca_arg_types,
                             );
                             ctx.call_void(
-                                crate::call_jit::jit_drop_callee_frame as *const (),
+                                crate::callbacks::get().jit_drop_callee_frame,
                                 &[callee_frame],
                             );
                             let result = if inline_framestack_active {
@@ -3971,7 +3971,7 @@ impl MIFrame {
                             let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
                                 this.guard_value_ref(ctx, callable, concrete_callable as i64);
-                                let result = crate::jit::helpers::emit_trace_call_known_function(
+                                let result = crate::helpers::emit_trace_call_known_function(
                                     ctx,
                                     this.frame(),
                                     callable,
@@ -4015,7 +4015,7 @@ impl MIFrame {
                                     };
                                     ctx.call_ref_typed(helper, &helper_args, &helper_arg_types)
                                 } else if let Some(frame_helper) =
-                                    crate::call_jit::callee_frame_helper(nargs)
+                                    (crate::callbacks::get().callee_frame_helper)(nargs)
                                 {
                                     let mut helper_args = if is_self_recursive {
                                         vec![this.frame()]
@@ -4079,7 +4079,7 @@ impl MIFrame {
                                     &ca_arg_types,
                                 );
                                 ctx.call_void(
-                                    crate::call_jit::jit_drop_callee_frame as *const (),
+                                    crate::callbacks::get().jit_drop_callee_frame,
                                     &[callee_frame],
                                 );
                                 let result = if inline_framestack_active
@@ -4094,7 +4094,7 @@ impl MIFrame {
                         }
                     }
                     majit_metainterp::InlineDecision::Inline => {
-                        if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
+                        if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nargs) {
                             return self.inline_function_call(
                                 callable,
                                 args,
@@ -4112,7 +4112,7 @@ impl MIFrame {
                 return self.with_ctx(|this, ctx| {
                     this.guard_value_ref(ctx, callable, concrete_callable as i64);
                     let boxed_args = box_args_for_python_helper(this, ctx, args);
-                    let result = crate::jit::helpers::emit_trace_call_known_function(
+                    let result = crate::helpers::emit_trace_call_known_function(
                         ctx,
                         this.frame(),
                         callable,
@@ -4159,7 +4159,7 @@ impl MIFrame {
         let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) } as *const CodeObject;
         let globals = unsafe { w_func_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::w_func_get_closure(concrete_callable) };
-        let is_self_recursive = crate::eval::make_green_key(caller_code, 0) == callee_key;
+        let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             code_ptr,
             &concrete_args,
@@ -4218,7 +4218,7 @@ impl MIFrame {
                             &helper_arg_types,
                         )
                     }
-                } else if let Some(frame_helper) = crate::call_jit::callee_frame_helper(args.len())
+                } else if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(args.len())
                 {
                     let mut helper_args = vec![this.frame(), callable];
                     helper_args.extend_from_slice(args);
@@ -4291,7 +4291,7 @@ impl MIFrame {
         frame_helper: *const (),
         passed_concrete_args: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
-        let (driver, _) = crate::eval::driver_pair();
+        let (driver, _) = crate::driver::driver_pair();
         let concrete_arg0 = if args.len() == 1 {
             passed_concrete_args.first().copied()
         } else {
@@ -4307,17 +4307,17 @@ impl MIFrame {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
                     let is_self_recursive =
-                        callee_key == crate::eval::make_green_key(this.sym().concrete_code, 0);
+                        callee_key == crate::driver::make_green_key(this.sym().concrete_code, 0);
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper
                     // boxes at the boundary and the trace records a Ref.
                     let force_fn = if is_self_recursive
-                        && crate::call_jit::recursive_force_cache_safe(concrete_callable)
+                        && (crate::callbacks::get().recursive_force_cache_safe)(concrete_callable)
                     {
-                        crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const ()
+                        crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     } else {
-                        crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const ()
+                        crate::callbacks::get().jit_force_recursive_call_argraw_boxed_1
                     };
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     // RPython parity: use CALL_ASSEMBLER_I when a token
@@ -4361,14 +4361,14 @@ impl MIFrame {
                             &ca_arg_types,
                         );
                         ctx.call_void(
-                            crate::call_jit::jit_drop_callee_frame as *const (),
+                            crate::callbacks::get().jit_drop_callee_frame,
                             &[callee_frame],
                         );
                         this.remember_value_type(ca_result, Type::Int);
                         ca_result
                     } else if force_fn
-                        == crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1
-                            as *const ()
+                        == crate::callbacks::get()
+                            .jit_force_self_recursive_call_argraw_boxed_1
                     {
                         ctx.call_may_force_ref_typed(
                             force_fn,
@@ -4395,7 +4395,7 @@ impl MIFrame {
                     }
                     result
                 } else {
-                    let force_fn = crate::call_jit::jit_force_recursive_call_1 as *const ();
+                    let force_fn = crate::callbacks::get().jit_force_recursive_call_1;
                     this.sync_standard_virtualizable_before_residual_call(ctx);
                     let result = ctx.call_may_force_ref_typed(
                         force_fn,
@@ -4417,7 +4417,7 @@ impl MIFrame {
                 let helper_arg_types = frame_callable_arg_types(args.len());
                 let callee_frame =
                     ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
-                let force_fn = crate::call_jit::jit_force_callee_frame as *const ();
+                let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 this.sync_standard_virtualizable_before_residual_call(ctx);
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
                 if !this.sync_standard_virtualizable_after_residual_call() {
@@ -4428,7 +4428,7 @@ impl MIFrame {
                     this.pop_call_replay_stack(ctx, args.len())?;
                 }
                 ctx.call_void(
-                    crate::call_jit::jit_drop_callee_frame as *const (),
+                    crate::callbacks::get().jit_drop_callee_frame,
                     &[callee_frame],
                 );
                 Ok(result)
@@ -4560,7 +4560,7 @@ impl MIFrame {
                         if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
                             raw
                         } else {
-                            crate::jit::generated::trace_unbox_int(
+                            crate::generated::trace_unbox_int(
                                 ctx,
                                 value,
                                 int_type_addr,
@@ -4581,7 +4581,7 @@ impl MIFrame {
                         if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
                             raw
                         } else {
-                            crate::jit::generated::trace_unbox_int(
+                            crate::generated::trace_unbox_int(
                                 ctx,
                                 value,
                                 bool_type_addr,
@@ -4604,7 +4604,7 @@ impl MIFrame {
                 return self.with_ctx(|this, ctx| {
                     let fail_args = this.current_fail_args(ctx);
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let float_value = crate::jit::generated::trace_unbox_float(
+                    let float_value = crate::generated::trace_unbox_float(
                         ctx,
                         value,
                         float_type_addr,
@@ -4685,7 +4685,7 @@ impl MIFrame {
             } else {
                 let fail_args = this.current_fail_args(ctx);
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                crate::jit::generated::trace_unbox_int(
+                crate::generated::trace_unbox_int(
                     ctx,
                     value,
                     int_type_addr,
@@ -4712,7 +4712,7 @@ impl MIFrame {
         trace_step_result_to_action(self, result)
     }
 
-    pub(crate) fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
+    pub fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
@@ -4875,7 +4875,7 @@ impl MIFrame {
         }
     }
 
-    pub(crate) fn trace_code_step_inline(
+    pub fn trace_code_step_inline(
         &mut self,
         code: &CodeObject,
         pc: usize,
@@ -4951,7 +4951,7 @@ pub(crate) fn trace_step_result_to_action(
                 let green_key = state.ctx().green_key();
                 let root_green_key = state.with_ctx(|_, ctx| ctx.root_green_key());
                 if let Some(biggest_key) = biggest_inline_trace_key(state) {
-                    let (driver, _) = crate::eval::driver_pair();
+                    let (driver, _) = crate::driver::driver_pair();
                     let warm_state = driver.meta_interp_mut().warm_state_mut();
                     warm_state.disable_noninlinable_function(biggest_key);
                     warm_state.trace_next_iteration(root_green_key);
@@ -4964,7 +4964,7 @@ pub(crate) fn trace_step_result_to_action(
                     return majit_metainterp::TraceAction::Abort;
                 }
                 let force_finish_trace = {
-                    let (driver, _) = crate::eval::driver_pair();
+                    let (driver, _) = crate::driver::driver_pair();
                     driver.meta_interp().force_finish_trace_enabled()
                 };
                 if force_finish_trace {
@@ -5076,7 +5076,7 @@ impl TraceHelperAccess for MIFrame {
         let frame = self.trace_frame();
         let result = self.with_ctx(|this, ctx| {
             let boxed_args = box_args_for_python_helper(this, ctx, args);
-            crate::jit::helpers::emit_trace_call_callable(ctx, frame, callable, &boxed_args)
+            crate::helpers::emit_trace_call_callable(ctx, frame, callable, &boxed_args)
         })?;
         self.trace_record_not_forced_guard();
         Ok(result)
@@ -5091,7 +5091,7 @@ impl TraceHelperAccess for MIFrame {
         self.with_ctx(|this, ctx| {
             let lhs = box_value_for_python_helper(this, ctx, a);
             let rhs = box_value_for_python_helper(this, ctx, b);
-            crate::jit::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
+            crate::helpers::emit_trace_binary_value(ctx, lhs, rhs, op)
         })
     }
 }
@@ -5468,14 +5468,14 @@ impl ControlFlowOpcodeHandler for MIFrame {
         self.with_ctx(|this, ctx| {
             // RPython reached_loop_header (pyjitpl.py:2973-3036):
             let code_ptr = this.sym().concrete_code;
-            let back_edge_key = crate::eval::make_green_key(code_ptr, target);
+            let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
             // pyjitpl.py:2979-2983: compile_trace — attempt to connect to
             // the ROOT loop's existing compiled targets.
             {
                 let root_key = ctx.root_green_key();
-                let (driver, _) = crate::eval::driver_pair();
+                let (driver, _) = crate::driver::driver_pair();
                 if driver.meta_interp().has_compiled_targets(root_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
@@ -7263,14 +7263,14 @@ mod tests {
         let value = 3.25f64;
         let materialized = MaterializedVirtual::Obj {
             type_id: 0,
-            descr_index: crate::jit::descr::w_float_size_descr().index(),
+            descr_index: crate::descr::w_float_size_descr().index(),
             fields: vec![
                 (
-                    crate::jit::descr::ob_type_descr().index(),
+                    crate::descr::ob_type_descr().index(),
                     MaterializedValue::Value(&FLOAT_TYPE as *const PyType as usize as i64),
                 ),
                 (
-                    crate::jit::descr::float_floatval_descr().index(),
+                    crate::descr::float_floatval_descr().index(),
                     MaterializedValue::Value(value.to_bits() as i64),
                 ),
             ],
@@ -7319,19 +7319,19 @@ mod tests {
             descr_index: 0,
             fields: vec![
                 (
-                    crate::jit::descr::ob_type_descr().index(),
+                    crate::descr::ob_type_descr().index(),
                     MaterializedValue::Value(&LIST_TYPE as *const PyType as usize as i64),
                 ),
                 (
-                    crate::jit::descr::list_items_ptr_descr().index(),
+                    crate::descr::list_items_ptr_descr().index(),
                     MaterializedValue::VirtualRef(0),
                 ),
                 (
-                    crate::jit::descr::list_items_len_descr().index(),
+                    crate::descr::list_items_len_descr().index(),
                     MaterializedValue::Value(2),
                 ),
                 (
-                    crate::jit::descr::list_items_heap_cap_descr().index(),
+                    crate::descr::list_items_heap_cap_descr().index(),
                     MaterializedValue::Value(2),
                 ),
             ],
@@ -8720,23 +8720,23 @@ mod tests {
 // so the tracer can compute the same offsets without depending on
 // `pyre-interp`. Driver registration still happens in `pyre-interp/src/eval.rs`.
 
-pub(crate) struct PendingInlineFrame {
-    pub(crate) sym: PyreSym,
-    pub(crate) concrete_frame: pyre_interpreter::frame::PyFrame,
-    pub(crate) drop_frame_opref: Option<OpRef>,
-    pub(crate) green_key: u64,
-    pub(crate) parent_fail_args: Vec<OpRef>,
-    pub(crate) parent_fail_arg_types: Vec<Type>,
-    pub(crate) nargs: usize,
-    pub(crate) caller_result_stack_idx: Option<usize>,
+pub struct PendingInlineFrame {
+    pub sym: PyreSym,
+    pub concrete_frame: pyre_interpreter::frame::PyFrame,
+    pub drop_frame_opref: Option<OpRef>,
+    pub green_key: u64,
+    pub parent_fail_args: Vec<OpRef>,
+    pub parent_fail_arg_types: Vec<Type>,
+    pub nargs: usize,
+    pub caller_result_stack_idx: Option<usize>,
 }
 
-pub(crate) enum InlineTraceStepAction {
+pub enum InlineTraceStepAction {
     Trace(TraceAction),
     PushFrame(PendingInlineFrame),
 }
 
-pub(crate) fn execute_inline_residual_call(
+pub fn execute_inline_residual_call(
     frame: &mut pyre_interpreter::frame::PyFrame,
     nargs: usize,
 ) -> Result<(), pyre_interpreter::PyError> {
