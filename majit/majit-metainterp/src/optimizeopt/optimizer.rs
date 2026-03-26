@@ -1725,11 +1725,8 @@ impl Optimizer {
         // in guard fail_args. Phase 2 guards may inherit NONE from Phase 1
         // virtualization — rescan resolves these using imported_virtuals.
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
-        // in Phase 2 guards. Phase 2 fail_args may inherit NONE from Phase 1
-        // virtualization — rescan resolves these via exported_jump_virtuals.
-        if self.skip_flush {
-            Self::rescan_guard_virtuals(&mut ctx);
-        }
+        // RPython parity: number_guard_inline in ctx.emit() handles
+        // virtual tagging inline at each guard emit. No post-pass rescan.
 
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
@@ -1898,11 +1895,8 @@ impl Optimizer {
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
-        // in guard fail_args before forcing remaining virtuals.
-        Self::rescan_guard_virtuals(&mut ctx);
-
-        // rd_numb is produced post-assembly in pyjitpl.rs (number_guards_final)
-        // rather than here, because assembly remaps guard fail_args.
+        // RPython parity: number_guard_inline handles virtual tagging
+        // and rd_numb production inline. No post-pass rescan needed.
 
         // Force any remaining virtual refs in output ops before forwarding resolve.
         // RPython: virtuals are forced during preamble export or JUMP handling.
