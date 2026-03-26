@@ -394,9 +394,11 @@ fn instruction_may_raise(instruction: Instruction) -> bool {
             | Instruction::StoreSubscr
             | Instruction::DeleteSubscr
             | Instruction::ImportName { .. }
-            | Instruction::ImportFrom { .. } // Note: LOAD_ATTR is exc=False for simple field loads (RPython
-                                             // getfield_gc). RaiseVarargs/Reraise always Err, handled by
-                                             // handle_possible_exception directly.
+            | Instruction::ImportFrom { .. }
+            // RPython opimpl_raise/opimpl_reraise: always Err, needs
+            // GUARD_EXCEPTION + finishframe_exception for exception-path tracing.
+            | Instruction::RaiseVarargs { .. }
+            | Instruction::Reraise { .. }
     )
 }
 
@@ -4824,6 +4826,13 @@ impl MIFrame {
             if !matches!(action, TraceAction::Continue) {
                 return action;
             }
+            // RPython parity: if handle_possible_exception returned Continue,
+            // the exception was handled (GUARD_EXCEPTION + finishframe_exception
+            // set pending_next_instr to handler PC). The Err from step_result
+            // is consumed — don't fall through to Abort.
+            if step_result.is_err() {
+                return TraceAction::Continue;
+            }
         }
         match step_result {
             Err(_) => TraceAction::Abort,
@@ -5015,6 +5024,9 @@ impl MIFrame {
             let exc_action = self.handle_possible_exception(code, pc);
             if !matches!(exc_action, TraceAction::Continue) {
                 return InlineTraceStepAction::Trace(exc_action);
+            }
+            if step_result.is_err() {
+                return InlineTraceStepAction::Trace(TraceAction::Continue);
             }
         }
         let action = match step_result {
