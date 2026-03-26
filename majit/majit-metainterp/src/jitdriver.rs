@@ -445,43 +445,65 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
-                // Bridge tracing: close as bridge instead of loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
-                    self.bridge_info.take()
+                // pyjitpl.py:2979-3036 reached_loop_header parity.
+                // Path 1: bridge — only if has_compiled_targets (line 2982).
+                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.as_ref()
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
-                            bridge_key, bridge_trace_id, bridge_fail_index
-                        );
-                    }
-                    if let Some(sym) = self.sym.as_ref() {
-                        let finish_args = S::collect_jump_args(sym);
-                        let result = self.meta.close_bridge(
-                            bridge_key,
-                            bridge_trace_id,
-                            bridge_fail_index,
-                            &finish_args,
-                        );
-                        match result {
-                            crate::pyjitpl::BridgeCompileResult::Compiled => {}
-                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                // compile.py retrace_needed parity: optimizer
-                                // found no matching target token. Continue
-                                // tracing for one more iteration — the next
-                                // CloseLoop goes through close_and_compile.
-                                return;
-                            }
-                            crate::pyjitpl::BridgeCompileResult::Failed => {
-                                self.meta.abort_trace(false);
-                            }
+                    let has_targets = self
+                        .meta
+                        .compiled_loops
+                        .get(&bridge_key)
+                        .map_or(false, |c| !c.front_target_tokens.is_empty());
+                    if has_targets {
+                        self.bridge_info.take(); // consume
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
+                                bridge_key, bridge_trace_id, bridge_fail_index
+                            );
                         }
-                    } else {
-                        self.meta.abort_trace(false);
+                        if let Some(sym) = self.sym.as_ref() {
+                            let finish_args = S::collect_jump_args(sym);
+                            let result = self.meta.close_bridge(
+                                bridge_key,
+                                bridge_trace_id,
+                                bridge_fail_index,
+                                &finish_args,
+                            );
+                            match result {
+                                crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                    self.sym = None;
+                                    self.trace_meta = None;
+                                    return;
+                                }
+                                crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                    // Optimizer created a new TargetToken but
+                                    // couldn't match. Restore bridge_info for
+                                    // the next attempt (which will find the
+                                    // new token).
+                                    self.bridge_info =
+                                        Some((bridge_key, bridge_trace_id, bridge_fail_index));
+                                    return;
+                                }
+                                crate::pyjitpl::BridgeCompileResult::Failed => {
+                                    self.meta.abort_trace(false);
+                                    self.sym = None;
+                                    self.trace_meta = None;
+                                    return;
+                                }
+                            }
+                        } else {
+                            self.meta.abort_trace(false);
+                            self.sym = None;
+                            self.trace_meta = None;
+                            return;
+                        }
                     }
-                    self.sym = None;
-                    self.trace_meta = None;
-                    return;
+                    // No targets: skip bridge, fall through to Path 2
+                    // (compile_loop via close_and_compile).
+                    // pyjitpl.py:2982 has_compiled_targets → false.
+                    self.bridge_info = None;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
                     self.meta.abort_trace(false);
@@ -540,29 +562,43 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc: _,
             } => {
-                // Bridge tracing: close as bridge instead of loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
-                    self.bridge_info.take()
+                // Same has_compiled_targets + bridge logic as CloseLoop.
+                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.as_ref()
                 {
-                    let result = self.meta.close_bridge(
-                        bridge_key,
-                        bridge_trace_id,
-                        bridge_fail_index,
-                        &jump_args,
-                    );
-                    match result {
-                        crate::pyjitpl::BridgeCompileResult::Compiled => {}
-                        crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                            // Continue tracing (see CloseLoop above).
-                            return;
-                        }
-                        crate::pyjitpl::BridgeCompileResult::Failed => {
-                            self.meta.abort_trace(false);
+                    let has_targets = self
+                        .meta
+                        .compiled_loops
+                        .get(&bridge_key)
+                        .map_or(false, |c| !c.front_target_tokens.is_empty());
+                    if has_targets {
+                        self.bridge_info.take();
+                        let result = self.meta.close_bridge(
+                            bridge_key,
+                            bridge_trace_id,
+                            bridge_fail_index,
+                            &jump_args,
+                        );
+                        match result {
+                            crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                self.sym = None;
+                                self.trace_meta = None;
+                                return;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                self.bridge_info =
+                                    Some((bridge_key, bridge_trace_id, bridge_fail_index));
+                                return;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::Failed => {
+                                self.meta.abort_trace(false);
+                                self.sym = None;
+                                self.trace_meta = None;
+                                return;
+                            }
                         }
                     }
-                    self.sym = None;
-                    self.trace_meta = None;
-                    return;
+                    self.bridge_info = None;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
                     self.meta.abort_trace(false);
