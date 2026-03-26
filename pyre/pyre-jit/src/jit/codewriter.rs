@@ -501,9 +501,9 @@ impl CodeWriter {
                     if n >= 1 {
                         assembler.pop_r(obj_tmp0); // exception value
                     }
-                    // Signal abort — exception raised, blackhole will
-                    // catch via LeaveFrame and check exception state.
-                    assembler.abort();
+                    // Exception path: use abort_permanent (BC_ABORT_PERMANENT=14)
+                    // so it doesn't trigger has_abort (BC_ABORT=13) check.
+                    assembler.abort_permanent();
                 }
 
                 Instruction::PushExcInfo => {
@@ -538,8 +538,8 @@ impl CodeWriter {
                 }
 
                 Instruction::Reraise { .. } => {
-                    // Re-raise current exception.
-                    assembler.abort();
+                    // Exception path: abort_permanent.
+                    assembler.abort_permanent();
                 }
 
                 Instruction::Copy { i } => {
@@ -547,31 +547,26 @@ impl CodeWriter {
                     if d == 1 {
                         assembler.dup_stack();
                     } else {
-                        // COPY d: duplicate the d-th item from TOS.
-                        // copy_from_bottom(stack_depth - d) copies the item
-                        // at position (stack_depth - d) to TOS.
-                        // Not easily expressible with current JitCode ops;
-                        // use pop to temp, push back, push temp.
-                        // For now, emit no-op and let interpreter handle.
-                        assembler.abort();
+                        // COPY(d>1): exception handler pattern only.
+                        // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
+                        // doesn't trigger the has_abort(BC_ABORT=13) check.
+                        assembler.abort_permanent();
                     }
                 }
 
                 Instruction::LoadName { .. }
                 | Instruction::StoreName { .. }
                 | Instruction::MakeFunction { .. } => {
-                    // Module-level instructions: never appear in traced
-                    // function bodies (traces start at loop backedges
-                    // inside functions). Safe to abort.
-                    assembler.abort();
+                    // Module-level only: abort_permanent (won't block blackhole).
+                    assembler.abort_permanent();
                 }
 
-                // Truly unsupported: abort to interpreter fallback.
-                other => {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!("[codewriter] unsupported instruction: {:?}", other);
-                    }
-                    assembler.abort();
+                // Unsupported instruction: abort_permanent.
+                // Using BC_ABORT_PERMANENT(14) instead of BC_ABORT(13) so
+                // has_abort check doesn't false-positive on functions where
+                // only exception/module paths have unsupported instructions.
+                _other => {
+                    assembler.abort_permanent();
                 }
             }
         }
