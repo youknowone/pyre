@@ -2006,13 +2006,13 @@ extern "C" fn call_assembler_guard_failure(
     // (callee wrote them on guard exit). No array allocation or copy needed.
     let bridge_ptr = fail_descr.bridge_code_ptr();
     if !bridge_ptr.is_null() {
-        let func: unsafe extern "C" fn(*mut i64) -> (*mut i64, i64) =
+        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
         // outputs_ptr points to jf_frame items (offset 64 from jf_ptr start).
         // Recover jf_ptr by subtracting the header size.
         let jf_ptr =
             unsafe { (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64 };
-        let (_result_jf, _descr) = unsafe { func(jf_ptr) };
+        let _result_jf = unsafe { func(jf_ptr) };
         // Result is at jf_frame[0] = outputs_ptr[0]
         return unsafe { *outputs_ptr };
     } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
@@ -2206,7 +2206,7 @@ fn call_assembler_fast_path(
         return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
     }
 
-    let func: unsafe extern "C" fn(*mut i64) -> (*mut i64, i64) =
+    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
         unsafe { std::mem::transmute(target.code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
@@ -2220,7 +2220,8 @@ fn call_assembler_fast_path(
         jf_buf[HEADER_WORDS + i] = val;
     }
 
-    let (result_jf, jf_descr_raw) = unsafe { func(jf_buf.as_mut_ptr()) };
+    let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
+    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
     let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         CALL_ASSEMBLER_DEADFRAME_SENTINEL
     } else if jf_descr_raw == 0 {
@@ -3684,7 +3685,8 @@ fn emit_guard_exit(
         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
     // _call_footer (assembler.py:1097): mov eax, ebp; ret
     // Also return descr_val in rdx for caller hot-path (avoids memory load).
-    builder.ins().return_(&[jf_ptr, descr_val]);
+    // _call_footer: mov eax, ebp; ret — return jf_ptr only.
+    builder.ins().return_(&[jf_ptr]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3833,8 +3835,7 @@ fn run_compiled_code(
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
     // Returns (jf_ptr, jf_descr) — second value is FailDescr pointer in rdx.
-    let func: unsafe extern "C" fn(*mut i64) -> (*mut i64, i64) =
-        unsafe { std::mem::transmute(code_ptr) };
+    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
 
@@ -3851,8 +3852,10 @@ fn run_compiled_code(
     // (written by push_gcmap in compiled code before GC calls).
     let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_buf.as_mut_ptr() as *mut u8);
 
-    let (result_jf, jf_descr_raw) =
-        with_active_force_frame(handle, || unsafe { func(jf_buf.as_mut_ptr()) });
+    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_buf.as_mut_ptr()) });
+
+    // llmodel.py:412-420 get_latest_descr: read jf_descr from returned frame.
+    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
     // _call_footer_shadowstack (assembler.py:1130-1136) parity:
     // Pop jf_ptr from shadow stack.
@@ -4425,13 +4428,8 @@ impl CraneliftBackend {
 
         let mut sig = Signature::new(call_conv);
         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
-        // RPython: fn(jf_ptr, threadlocal) → jf_ptr; _call_footer: mov eax, ebp; ret
-        // pyre: fn(jf_ptr) → (jf_ptr, jf_descr)
-        // Second return value is jf_descr (FailDescr pointer) — avoids memory
-        // load on caller hot path. The value is also written to jf_frame.jf_descr
-        // for RPython data-layout parity.
-        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr (rax)
-        sig.returns.push(AbiParam::new(cl_types::I64)); // jf_descr value (rdx)
+        // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
+        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
         let func_name = format!("trace_{}", self.func_counter);
         self.func_counter += 1;
@@ -5753,17 +5751,22 @@ impl CraneliftBackend {
                             JF_FRAME_ITEM0_OFS,
                         );
 
-                        // fn(jf_ptr) → (jf_ptr, jf_descr)
+                        // fn(jf_ptr) → jf_ptr  (_call_footer parity)
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr (rax)
-                        sig.returns.push(AbiParam::new(cl_types::I64)); // jf_descr (rdx)
+                        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
                         let sig_ref = builder.import_signature(sig);
                         let call_inst =
                             builder.ins().call_indirect(sig_ref, code_addr, &[args_ptr]);
                         let result_jf = builder.inst_results(call_inst)[0];
-                        // Use second return value (register) — avoids memory load.
-                        let fail_idx_raw = builder.inst_results(call_inst)[1];
+                        // _call_assembler_check_descr (assembler.py:2274-2278):
+                        //   CMP [eax + jf_descr_ofs], done_with_this_frame_descr
+                        let fail_idx_raw = builder.ins().load(
+                            cl_types::I64,
+                            MemFlags::trusted(),
+                            result_jf,
+                            JF_DESCR_OFS,
+                        );
 
                         // RPython: check jf_descr == done_with_this_frame_descr
                         let is_direct_finish =
@@ -5835,7 +5838,6 @@ impl CraneliftBackend {
                             let mut bridge_sig = Signature::new(call_conv);
                             bridge_sig.params.push(AbiParam::new(ptr_type));
                             bridge_sig.returns.push(AbiParam::new(ptr_type));
-                            bridge_sig.returns.push(AbiParam::new(cl_types::I64));
                             let bridge_sig_ref = builder.import_signature(bridge_sig);
                             let bridge_call = builder.ins().call_indirect(
                                 bridge_sig_ref,
@@ -5953,7 +5955,7 @@ impl CraneliftBackend {
                     builder
                         .ins()
                         .store(MemFlags::trusted(), sentinel, outputs_ptr, JF_DESCR_OFS);
-                    builder.ins().return_(&[outputs_ptr, sentinel]);
+                    builder.ins().return_(&[outputs_ptr]);
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
