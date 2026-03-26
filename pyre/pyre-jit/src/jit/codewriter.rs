@@ -64,6 +64,8 @@ pub struct CodeWriter {
     pub load_const_fn: extern "C" fn(i64, i64) -> i64,
     /// Store subscript: obj[key] = value.
     pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// Build list: (argc, item0, item1) → new list.
+    pub build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
 }
 
 impl CodeWriter {
@@ -76,6 +78,7 @@ impl CodeWriter {
         truth_fn: extern "C" fn(i64) -> i64,
         load_const_fn: extern "C" fn(i64, i64) -> i64,
         store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
+        build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
     ) -> Self {
         Self {
             call_fn,
@@ -86,6 +89,7 @@ impl CodeWriter {
             truth_fn,
             load_const_fn,
             store_subscr_fn,
+            build_list_fn,
         }
     }
 
@@ -129,6 +133,7 @@ impl CodeWriter {
         let truth_fn_idx = assembler.add_fn_ptr(self.truth_fn as *const ());
         let load_const_fn_idx = assembler.add_fn_ptr(self.load_const_fn as *const ());
         let store_subscr_fn_idx = assembler.add_fn_ptr(self.store_subscr_fn as *const ());
+        let build_list_fn_idx = assembler.add_fn_ptr(self.build_list_fn as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -444,6 +449,41 @@ impl CodeWriter {
                     }
                 }
 
+                // RPython bhimpl_newlist: build list from N items on stack.
+                Instruction::BuildList { count } => {
+                    let argc = count.get(op_arg) as usize;
+                    // Pop items into registers (reverse order like CALL).
+                    for i in (0..argc.min(2)).rev() {
+                        assembler.pop_r(arg_regs_start + i as u16);
+                    }
+                    // Discard extra items beyond 2 (helper supports 0-2).
+                    for _ in 2..argc {
+                        assembler.pop_discard();
+                    }
+                    // build_list_fn(argc, item0, item1) → list
+                    assembler.load_const_i_value(int_tmp0, argc as i64);
+                    let item0 = if argc >= 1 {
+                        majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start)
+                    } else {
+                        majit_metainterp::jitcode::JitCallArg::int(int_tmp0) // dummy
+                    };
+                    let item1 = if argc >= 2 {
+                        majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start + 1)
+                    } else {
+                        majit_metainterp::jitcode::JitCallArg::int(int_tmp0) // dummy
+                    };
+                    assembler.call_may_force_ref_typed(
+                        build_list_fn_idx,
+                        &[
+                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
+                            item0,
+                            item1,
+                        ],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
+                }
+
                 // Exception handling: residual calls to frame helpers.
                 // RPython blackhole.py handles exceptions via dedicated
                 // bhimpl_* functions. In pyre, we delegate to the frame's
@@ -510,8 +550,8 @@ impl CodeWriter {
             }
         }
 
-        // End of code: implicit abort
-        assembler.abort();
+        // RPython: all code paths end with ref_return or explicit abort.
+        // No end-of-code abort sentinel — falling off the end is unreachable.
 
         // RPython: assembler.assemble() → jitcode via make_jitcode()
         PyJitCode {

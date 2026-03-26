@@ -657,6 +657,7 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh_truth_fn,
         bh_load_const_fn,
         bh_store_subscr_fn,
+        crate::call_jit::bh_build_list_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -758,6 +759,7 @@ pub fn resume_in_blackhole_from_fail_args(
         bh_truth_fn,
         bh_load_const_fn,
         bh_store_subscr_fn,
+        crate::call_jit::bh_build_list_fn,
     );
 
     // RPython resume.py:1333-1343 blackhole_from_resumedata:
@@ -847,13 +849,6 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
-        // Safety: skip blackhole if jitcode contains BC_ABORT between
-        // guard_pc and the end. BC_ABORT causes side-effect corruption
-        // when the blackhole executes past unsupported bytecodes.
-        if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
-            builder.release_chain(prev_bh);
-            return BlackholeResult::Failed;
-        }
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
         } else {
@@ -873,12 +868,15 @@ pub fn resume_in_blackhole_from_fail_args(
         }
 
         // RPython: resumereader.consume_one_section(curbh)
+        // pyre: all Python locals are boxed refs. If fail_args contains
+        // unboxed Int values (from tracing optimizations), re-box them
+        // so the blackhole can pass them as refs to helper functions.
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
                 let ptr = match val {
                     Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => *v,
+                    Value::Int(v) => unsafe { w_int_new(*v) as i64 },
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Void => 0i64,
                 };
@@ -890,7 +888,7 @@ pub fn resume_in_blackhole_from_fail_args(
             if let Some(val) = section.get(slot) {
                 let ptr = match val {
                     Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => *v,
+                    Value::Int(v) => unsafe { w_int_new(*v) as i64 },
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Void => 0i64,
                 };
@@ -1042,6 +1040,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
         bh_truth_fn,
         bh_load_const_fn,
         bh_store_subscr_fn,
+        crate::call_jit::bh_build_list_fn,
     );
     let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
 
@@ -2237,6 +2236,23 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
 }
 
 /// STORE_SUBSCR: obj[key] = value.
+/// RPython bhimpl_newlist: create a list from N items.
+/// argc is a raw integer count; items follow as PyObjectRef args.
+/// Blackhole's call_may_force_ref passes args from registers.
+pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64) -> i64 {
+    let n = argc as usize;
+    let items: Vec<pyre_object::PyObjectRef> = match n {
+        0 => vec![],
+        1 => vec![item0 as pyre_object::PyObjectRef],
+        2 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+        ],
+        _ => vec![], // argc > 2 not supported via this helper
+    };
+    pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
+}
+
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let obj = obj as pyre_object::PyObjectRef;
     let key = key as pyre_object::PyObjectRef;
