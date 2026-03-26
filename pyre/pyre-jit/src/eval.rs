@@ -921,10 +921,15 @@ fn materialize_virtual_from_rd(
     let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
     if ob_type == int_type_addr {
         // W_IntObject: payload is field after ob_type (typically field[1]).
+        // If the dead frame stored a Ref (W_IntObject pointer) due to
+        // Phase 2 reverse mapping, dereference to get intval.
         let payload = field_values
             .get(1)
             .map(|v| match v {
                 Value::Int(n) => *n,
+                Value::Ref(gc) if !gc.is_null() => unsafe {
+                    pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
+                },
                 _ => 0,
             })
             .unwrap_or(0);
@@ -936,6 +941,12 @@ fn materialize_virtual_from_rd(
             .map(|v| match v {
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Int(n) => *n,
+                Value::Ref(gc) if !gc.is_null() => unsafe {
+                    let f = pyre_object::floatobject::w_float_get_value(
+                        gc.0 as pyre_object::PyObjectRef,
+                    );
+                    f.to_bits() as i64
+                },
                 _ => 0,
             })
             .unwrap_or(0);
