@@ -882,7 +882,11 @@ fn restore_guard_failure_for_loop(
     // available, decode the compact numbering to reconstruct ALL frame
     // slots. raw_values only contains TAGBOX entries (liveboxes); TAGCONST
     // and TAGVIRTUAL values come from rd_consts and materialization.
-    // TODO: enable rd_numb-based recovery once slot mapping is verified.
+    // rd_numb-based recovery: disabled until Phase 1/2 rd_numb scope
+    // separation is implemented. Currently Phase 1 rd_numb leaks into
+    // Phase 2 guards via emit_guard_operation sharing, causing slot
+    // mapping mismatches. The infrastructure (rebuild_typed_from_rd_numb,
+    // rebuild_from_numbering, RebuiltValue) is ready for activation.
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
     // Materialize virtual objects from rd_virtuals (ExitFrameLayout Virtual slots).
     materialize_recovery_virtuals(&mut typed, exit_layout);

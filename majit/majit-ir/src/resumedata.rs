@@ -205,6 +205,12 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for &raw_opref in boxes {
+            // OpRef::NONE → NULLREF (no box at this slot).
+            if raw_opref.is_none() {
+                numb_state.append_short(NULLREF);
+                continue;
+            }
+
             // resume.py:201-202
             let opref = env.get_box_replacement(raw_opref);
 
