@@ -2652,9 +2652,10 @@ impl Optimizer {
                                     .collect(),
                             );
                         }
-                        // Liveboxes already contain mapped OpRefs (reverse mapping
-                        // was applied to fail_args before snapshot creation).
-                        op.fail_args = Some(liveboxes.into());
+                        // Dual-write: rd_numb + rd_consts generated alongside
+                        // existing fail_args mechanism. Consumer switchover
+                        // (fail_args = liveboxes) is Phase 5b.
+                        let _ = liveboxes;
                     }
                     Err(_) => {
                         // resume.py: TagOverflow → compile.giveup().
@@ -2664,28 +2665,11 @@ impl Optimizer {
                 }
             }
 
-            // RPython parity: store fail_arg types.
-            // When rd_numb is present, use BoxEnv.get_type() for accurate typing
-            // (follows forwarding chain, distinguishes field values from virtual objects).
-            // Otherwise fall back to constant_types + PtrInfo heuristic.
-            if op.rd_numb.is_some() {
-                if let Some(ref fa) = op.fail_args {
-                    let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
-                    let types: Vec<majit_ir::Type> = fa
-                        .iter()
-                        .map(|opref| {
-                            if opref.is_none() {
-                                majit_ir::Type::Int
-                            } else {
-                                <crate::optimizeopt::OptBoxEnv as majit_ir::BoxEnv>::get_type(
-                                    &env, *opref,
-                                )
-                            }
-                        })
-                        .collect();
-                    op.fail_arg_types = Some(types);
-                }
-            } else if !self.constant_types.is_empty() {
+            // Expand fail_args with virtual field values (legacy consumer path).
+            op = Self::encode_guard_virtuals(op, ctx);
+
+            // RPython parity: store fail_arg types using constant_types.
+            if !self.constant_types.is_empty() {
                 if let Some(ref fa) = op.fail_args {
                     let types: Vec<majit_ir::Type> = fa
                         .iter()
@@ -4171,24 +4155,31 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("guard should survive optimization");
 
-        // New format: rd_numb encodes virtual info (TAGVIRTUAL), not rd_virtuals
+        // Dual-write mode: BOTH rd_numb and rd_virtuals are set.
+        // rd_numb encodes TAGVIRTUAL entries; rd_virtuals has GuardVirtualEntry
+        // for the legacy consumer path (encode_guard_virtuals).
         assert!(
             guard.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
-            guard.rd_virtuals.is_none(),
-            "rd_virtuals should be None — virtual info is in rd_numb now"
+            guard.rd_virtuals.is_some(),
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
         );
         let fail_args = guard
             .fail_args
             .as_ref()
             .expect("guard should keep fail args");
-        // fail_args contains only liveboxes (no virtual field values expanded)
-        // The virtual (OpRef(0)) is not in fail_args — it's encoded as TAGVIRTUAL in rd_numb
+        // fail_args has EXPANDED length: virtual slot replaced with OpRef::NONE,
+        // field values appended as extra fail_args.
         assert!(
-            !fail_args.iter().any(|a| *a == OpRef(0)),
-            "virtual should not appear in fail_args (encoded in rd_numb instead)"
+            fail_args.iter().any(|a| a.is_none()),
+            "virtual slot should be OpRef::NONE placeholder in fail_args"
+        );
+        // Field value (OpRef(11)) should appear as extra fail_arg
+        assert!(
+            fail_args.len() > 1,
+            "fail_args should be expanded with virtual field values"
         );
     }
 

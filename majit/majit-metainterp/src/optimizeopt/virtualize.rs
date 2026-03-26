@@ -3862,14 +3862,15 @@ mod tests {
     #[test]
     fn test_guard_fail_args_virtual_not_forced() {
         // resume.py parity: virtual objects in guard fail_args should NOT be
-        // forced. Instead, rd_numb encodes them as TAGVIRTUAL.
+        // forced (no allocation emitted). Dual-write mode: BOTH rd_numb
+        // (TAGVIRTUAL) and rd_virtuals (GuardVirtualEntry) are set.
         //
         // p0 = new_with_vtable(descr=size1)
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [p0]
         //
-        // Expected: no NEW_WITH_VTABLE emitted, the guard has rd_numb
-        // (compact resume numbering) and fail_args contains only liveboxes.
+        // Expected: no NEW_WITH_VTABLE emitted. Guard has rd_numb AND
+        // rd_virtuals. fail_args expanded: OpRef::NONE + field values.
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3897,7 +3898,7 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
 
-        // The guard should be emitted with rd_numb (compact resume numbering)
+        // Dual-write mode: BOTH rd_numb and rd_virtuals are set.
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
@@ -3908,15 +3909,20 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "rd_virtuals should be None — virtual info is in rd_numb now"
+            guard_op.rd_virtuals.is_some(),
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
         );
 
-        // fail_args contains only liveboxes (no virtual, no expanded field values)
+        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            !fa.iter().any(|a| *a == OpRef(0)),
-            "virtual OpRef(0) should not appear in fail_args"
+            fa.iter().any(|a| a.is_none()),
+            "virtual slot should be OpRef::NONE placeholder in fail_args"
+        );
+        // Field value (OpRef(10)) should be appended as extra fail_arg
+        assert!(
+            fa.len() > 1,
+            "fail_args should be expanded with virtual field values"
         );
     }
 
@@ -3928,8 +3934,8 @@ mod tests {
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [i30, p0, i40]
         //
-        // New format: rd_numb encodes p0 as TAGVIRTUAL, fail_args contains
-        // only liveboxes (i30, i40 and the field value i10).
+        // Dual-write: rd_numb AND rd_virtuals both set. fail_args expanded:
+        // [i30, NONE, i40, i10] — virtual slot replaced with NONE, field appended.
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3962,17 +3968,17 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "rd_virtuals should be None — virtual info is in rd_numb now"
+            guard_op.rd_virtuals.is_some(),
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
         );
 
-        // fail_args contains only liveboxes (virtual p0 is not present)
+        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            !fa.iter().any(|a| *a == OpRef(0)),
-            "virtual OpRef(0) should not appear in fail_args"
+            fa.iter().any(|a| a.is_none()),
+            "virtual slot should be OpRef::NONE placeholder in fail_args"
         );
-        // Non-virtual boxes should still be present as liveboxes
+        // Non-virtual boxes should still be present
         assert!(
             fa.iter().any(|a| *a == OpRef(30)),
             "non-virtual OpRef(30) should be in fail_args"
@@ -3980,6 +3986,11 @@ mod tests {
         assert!(
             fa.iter().any(|a| *a == OpRef(40)),
             "non-virtual OpRef(40) should be in fail_args"
+        );
+        // fail_args expanded: original 3 + field value(s) for the virtual
+        assert!(
+            fa.len() > 3,
+            "fail_args should be expanded with virtual field values"
         );
     }
 
@@ -4038,14 +4049,18 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "rd_virtuals should be None — virtual info is in rd_numb now"
+            guard_op.rd_virtuals.is_some(),
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
         );
-        // fail_args contains only liveboxes (no virtual)
+        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            !fa.iter().any(|a| *a == OpRef(0)),
-            "virtual OpRef(0) should not appear in fail_args"
+            fa.iter().any(|a| a.is_none()),
+            "virtual slot should be OpRef::NONE placeholder in fail_args"
+        );
+        assert!(
+            fa.len() > 1,
+            "fail_args should be expanded with virtual field values"
         );
     }
 
@@ -4079,15 +4094,21 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "rd_virtuals should be None — virtual info is in rd_numb now"
+            guard_op.rd_virtuals.is_some(),
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
         );
 
-        // fail_args contains only liveboxes (virtual and its fields are in rd_numb)
+        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            !fa.iter().any(|a| *a == OpRef(0)),
-            "virtual OpRef(0) should not appear in fail_args"
+            fa.iter().any(|a| a.is_none()),
+            "virtual slot should be OpRef::NONE placeholder in fail_args"
+        );
+        // Two fields means at least 2 extra fail_args beyond the original 1
+        assert!(
+            fa.len() >= 3,
+            "fail_args should be expanded with 2 virtual field values (got {})",
+            fa.len()
         );
     }
 
