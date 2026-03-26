@@ -190,6 +190,12 @@ pub struct OptContext {
     /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
+    /// Phase 2 imported virtuals (from Phase 1 export). Used by
+    /// encode_guard_virtuals_impl to create GuardVirtualEntry for
+    /// NONE positions inherited from Phase 1 virtualization.
+    pub imported_virtuals: Vec<crate::optimizer::ImportedVirtual>,
+    /// Phase 2 imported label args (OpRefs in Phase 2 namespace).
+    pub imported_label_args: Option<Vec<OpRef>>,
     /// RPython shortpreamble.py: active phase-2 short preamble builder.
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder: Option<crate::shortpreamble::ShortPreambleBuilder>,
@@ -345,6 +351,8 @@ impl OptContext {
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
+            imported_virtuals: Vec::new(),
+            imported_label_args: None,
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
@@ -389,6 +397,8 @@ impl OptContext {
             exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
+            imported_virtuals: Vec::new(),
+            imported_label_args: None,
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,

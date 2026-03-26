@@ -1404,6 +1404,16 @@ impl Optimizer {
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
+        // RPython resume.py parity: Phase 2 optimizer needs exported_jump_virtuals
+        // and imported_virtuals to create GuardVirtualEntry for NONE positions
+        // in fail_args inherited from Phase 1 virtualization.
+        ctx.imported_virtuals = self.imported_virtuals.clone();
+        ctx.imported_label_args = self.imported_label_args.clone();
+        // Phase 1's exported_jump_virtuals tell encode_guard_virtuals_impl
+        // which fail_args positions are virtual (using jump_arg_index).
+        if ctx.exported_jump_virtuals.is_empty() {
+            ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
+        }
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
@@ -1601,6 +1611,16 @@ impl Optimizer {
         // Phase 2 leaves lazy sets pending so virtuals aren't forced.
         if !self.skip_flush {
             self.flush(&mut ctx);
+        }
+
+        // RPython store_final_boxes_in_guard parity: re-encode late virtuals
+        // in guard fail_args. Phase 2 guards may inherit NONE from Phase 1
+        // virtualization — rescan resolves these using imported_virtuals.
+        // RPython store_final_boxes_in_guard parity: re-encode late virtuals
+        // in Phase 2 guards. Phase 2 fail_args may inherit NONE from Phase 1
+        // virtualization — rescan resolves these via exported_jump_virtuals.
+        if self.skip_flush {
+            Self::rescan_guard_virtuals(&mut ctx);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -2599,7 +2619,8 @@ impl Optimizer {
             if !op.opcode.is_guard() || op.fail_args.is_none() {
                 continue;
             }
-            let has_late_virtual = op.fail_args.as_ref().unwrap().iter().any(|&fa| {
+            let fa_ref = op.fail_args.as_ref().unwrap();
+            let has_late_virtual = fa_ref.iter().any(|&fa| {
                 if fa.is_none() {
                     return false;
                 }
@@ -2607,7 +2628,11 @@ impl Optimizer {
                 ctx.get_ptr_info(resolved)
                     .is_some_and(|info| info.is_virtual())
             });
-            if !has_late_virtual {
+            // Also check for NONE entries without rd_virtuals — Phase 2
+            // guards inherit NONE from Phase 1 but lack GuardVirtualEntry.
+            let has_unresolved_none =
+                op.rd_virtuals.is_none() && fa_ref.iter().any(|fa| fa.is_none());
+            if !has_late_virtual && !has_unresolved_none {
                 continue;
             }
             // Take the op out, re-encode virtuals, put it back.
@@ -2632,8 +2657,59 @@ impl Optimizer {
         let mut extra_fail_args: Vec<OpRef> = Vec::new();
 
         for fa_idx in 0..original_len {
-            // Already encoded as virtual in a previous pass — skip.
             if fail_args[fa_idx].is_none() {
+                // RPython parity: Phase 2 fail_args inherit NONE from Phase 1.
+                // Look up exported_jump_virtuals to find the virtual for this
+                // frame slot, then imported_virtuals for its Phase 2 head OpRef.
+                let ejv = ctx
+                    .exported_jump_virtuals
+                    .iter()
+                    .find(|v| v.jump_arg_index == fa_idx);
+                if let Some(virt) = ejv {
+                    let head = ctx.imported_virtuals.iter().find_map(|iv| {
+                        if iv.size_descr.index() == virt.size_descr.index() {
+                            ctx.imported_label_args
+                                .as_ref()
+                                .and_then(|la| la.get(iv.inputarg_index).copied())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(head_ref) = head {
+                        let resolved = ctx.get_replacement(head_ref);
+                        if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                            if info.is_virtual() {
+                                let base_idx = original_len + extra_fail_args.len();
+                                let fields_vec = match &info {
+                                    PtrInfo::VirtualStruct(v) => &v.fields,
+                                    PtrInfo::Virtual(v) => &v.fields,
+                                    _ => continue,
+                                };
+                                let mut fields = Vec::new();
+                                for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
+                                    let rv = ctx.get_replacement(*vref);
+                                    extra_fail_args.push(rv);
+                                    fields.push((*fidx, base_idx + i));
+                                }
+                                let descr = match &info {
+                                    PtrInfo::VirtualStruct(v) => v.descr.clone(),
+                                    PtrInfo::Virtual(v) => v.descr.clone(),
+                                    _ => continue,
+                                };
+                                let known_class = match &info {
+                                    PtrInfo::Virtual(v) => v.known_class,
+                                    _ => None,
+                                };
+                                virtual_entries.push(GuardVirtualEntry {
+                                    fail_arg_index: fa_idx,
+                                    descr,
+                                    known_class,
+                                    fields,
+                                });
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             let resolved = ctx.get_replacement(fail_args[fa_idx]);
