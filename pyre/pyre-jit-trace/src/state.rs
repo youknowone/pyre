@@ -312,6 +312,10 @@ pub struct PyreSym {
     /// RPython MetaInterp.class_of_last_exc_is_const (pyjitpl.py:2754):
     /// True after GUARD_EXCEPTION or GUARD_CLASS on the exception.
     pub(crate) class_of_last_exc_is_const: bool,
+    /// RPython MetaInterp.last_exc_box (pyjitpl.py:3386): symbolic OpRef
+    /// for the exception value. Set by handle_possible_exception after
+    /// GUARD_EXCEPTION, consumed by finishframe_exception for stack push.
+    pub(crate) last_exc_box: OpRef,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1190,6 +1194,7 @@ impl PyreSym {
             pre_opcode_stack_types: None,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
+            last_exc_box: OpRef::NONE,
         }
     }
 
@@ -4832,16 +4837,19 @@ impl MIFrame {
 
             // pyjitpl.py:3386-3389: last_exc_box = ConstPtr if class known,
             // else guard op result.
-            let _exc_opref = if self.sym().class_of_last_exc_is_const {
-                self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64))
-            } else {
-                guard_op
-            };
+            {
+                let exc_box = if self.sym().class_of_last_exc_is_const {
+                    self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64))
+                } else {
+                    guard_op
+                };
+                self.sym_mut().last_exc_box = exc_box;
+            }
 
             // pyjitpl.py:3390
             self.sym_mut().class_of_last_exc_is_const = true;
 
-            self.finishframe_exception(code, pc, _exc_opref)
+            self.finishframe_exception(code, pc)
         } else {
             // pyjitpl.py:3397: GUARD_NO_EXCEPTION
             self.with_ctx(|this, ctx| {
@@ -4851,17 +4859,13 @@ impl MIFrame {
         }
     }
 
-    /// RPython pyjitpl.py:2506 finishframe_exception.
+    /// RPython pyjitpl.py:2506 finishframe_exception (single-frame).
     ///
-    /// Walks the frame stack looking for an exception handler.
+    /// Checks current frame for an exception handler.
     /// If found: unwind stack to handler depth, push exception, continue.
-    /// If not found: abort (TODO: compile_exit_frame_with_exception).
-    fn finishframe_exception(
-        &mut self,
-        code: &CodeObject,
-        pc: usize,
-        exc_opref: OpRef,
-    ) -> TraceAction {
+    /// If not found: return Abort (metainterp handles multi-frame unwind).
+    fn finishframe_exception(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
+        let exc_opref = self.sym().last_exc_box;
         let exc_obj = self.sym().last_exc_value;
         let concrete_frame_addr = self.concrete_frame_addr;
 
