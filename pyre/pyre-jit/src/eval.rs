@@ -573,14 +573,14 @@ fn can_enter_jit_hook(
                         vals,
                         loop_header_pc,
                     ) {
-                        crate::call_jit::BlackholeResult::MergePoint => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                             // RPython bhimpl_jit_merge_point → ContinueRunningNormally.
                             // Frame is at loop_header_pc with correct state.
                             // handle_jitexception re-enters eval_loop_jit where
                             // counter >= threshold → immediate compiled code entry.
                             return Some(LoopResult::ContinueRunningNormally);
                         }
-                        crate::call_jit::BlackholeResult::Finished(result) => {
+                        crate::call_jit::BlackholeResult::DoneWithThisFrame(result) => {
                             // RPython DoneWithThisFrame: blackhole completed
                             // the function. The result is final.
                             return Some(LoopResult::Done(result));

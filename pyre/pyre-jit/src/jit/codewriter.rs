@@ -662,7 +662,8 @@ thread_local! {
 ///
 /// RPython: CallControl.get_jitcode() deduplicates per graph.
 /// pyre: deduplicate per CodeObject pointer (thread-local cache).
-pub fn get_or_compile_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
+/// RPython: CallControl.get_jitcode(graph, called_from)
+pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {
         let cache = unsafe { &mut *cell.get() };

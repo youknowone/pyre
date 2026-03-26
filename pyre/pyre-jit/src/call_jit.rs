@@ -659,7 +659,7 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
 
     // Map Python PC → JitCode PC
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
@@ -725,13 +725,15 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     result
 }
 
-/// RPython blackhole.py _run_forever result parity.
+/// RPython blackhole.py _run_forever + jitexc.py parity.
 pub enum BlackholeResult {
-    /// bhimpl_jit_merge_point → ContinueRunningNormally.
-    MergePoint,
-    /// DoneWithThisFrame: blackhole ran to RETURN_VALUE.
-    Finished(PyResult),
-    /// Blackhole couldn't run (bad PC mapping etc).
+    /// RPython jitexc.py:53 ContinueRunningNormally: blackhole reached
+    /// the merge point → restart portal to re-enter compiled code.
+    ContinueRunningNormally,
+    /// RPython jitexc.py:68 DoneWithThisFrame: blackhole ran the
+    /// function to completion (RETURN_VALUE).
+    DoneWithThisFrame(PyResult),
+    /// Blackhole couldn't run (bad resume data, BC_ABORT, etc).
     Failed,
 }
 
@@ -836,7 +838,7 @@ pub fn resume_in_blackhole_from_fail_args(
         };
         let stack_only = vsd.saturating_sub(nlocals);
 
-        let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
         // Skip blackhole if jitcode has actual BC_ABORT opcodes (not just
         // data bytes that happen to equal 13). Walk bytecodes properly
         // to distinguish opcodes from operands.
@@ -869,17 +871,17 @@ pub fn resume_in_blackhole_from_fail_args(
         // RPython resume.py consume_one_section parity: Python locals
         // are ref-typed at the jitcode level. Unboxed Int/Float values
         // from the optimizer are materialized back to PyObjectRef via
-        // box_resume_value (RPython getvirtual_ptr equivalent).
+        // materialize_virtual (RPython getvirtual_ptr equivalent).
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
-                bh.setarg_r(i, box_resume_value(val));
+                bh.setarg_r(i, materialize_virtual(val));
             }
         }
         for i in 0..stack_only {
             let slot = 3 + nlocals + i;
             if let Some(val) = section.get(slot) {
-                bh.runtime_stack_push(0, box_resume_value(val));
+                bh.runtime_stack_push(0, materialize_virtual(val));
             }
         }
         if 3 < bh.registers_i.len() {
@@ -935,7 +937,7 @@ pub fn resume_in_blackhole_from_fail_args(
                 frame.next_instr = merge_py_pc;
             }
             builder.release_interp(bh);
-            return BlackholeResult::MergePoint;
+            return BlackholeResult::ContinueRunningNormally;
         }
 
         // BC_ABORT: unsupported bytecode hit during execution.
@@ -952,7 +954,9 @@ pub fn resume_in_blackhole_from_fail_args(
 
         let Some(mut caller_bh) = next.map(|b| *b) else {
             // Outermost frame finished — function return.
-            return BlackholeResult::Finished(Ok(return_value as pyre_object::PyObjectRef));
+            return BlackholeResult::DoneWithThisFrame(
+                Ok(return_value as pyre_object::PyObjectRef),
+            );
         };
 
         // RPython _run_forever: pass return value to caller blackhole.
@@ -976,7 +980,7 @@ pub fn resume_in_blackhole_from_fail_args(
 /// reader materializes (re-boxes) unboxed values back to refs.
 /// RPython: getvirtual_ptr() allocates W_IntObject from virtual fields.
 /// pyre: w_int_new / w_float_new from the raw Value payload.
-fn box_resume_value(val: &majit_ir::Value) -> i64 {
+fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
         Value::Ref(r) => r.as_usize() as i64,
@@ -1049,7 +1053,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
         bh_store_subscr_fn,
         crate::call_jit::bh_build_list_fn,
     );
-    let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+    let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
 
     let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
         pyjitcode.pc_map[py_pc]
