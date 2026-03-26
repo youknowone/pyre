@@ -1425,6 +1425,25 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Special attributes on any object
+    if name == "__dict__" {
+        let d = pyre_object::w_dict_new();
+        ATTR_TABLE.with(|table| {
+            let table = table.borrow();
+            if let Some(attrs) = table.get(&(obj as usize)) {
+                for (k, &v) in attrs {
+                    unsafe { pyre_object::w_dict_store(d, pyre_object::w_str_new(k), v) };
+                }
+            }
+        });
+        return Ok(d);
+    }
+    if name == "__class__" {
+        if let Some(tp) = crate::typedef::type_of(obj) {
+            return Ok(tp);
+        }
+    }
+
     // All other objects: use side table
     ATTR_TABLE.with(|table| {
         let table = table.borrow();

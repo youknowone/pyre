@@ -46,7 +46,87 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "modules", w_dict_new());
     // sys.path — empty list placeholder
     namespace_store(ns, "path", w_list_new(vec![]));
-    // sys.stdout/stderr — stubs
+    // sys.stdout/stderr/stdin — stubs
     namespace_store(ns, "stdout", w_none());
     namespace_store(ns, "stderr", w_none());
+    namespace_store(ns, "stdin", w_none());
+    // sys._getframe — returns a stub frame object with f_locals/f_globals
+    namespace_store(
+        ns,
+        "_getframe",
+        crate::w_builtin_func_new("_getframe", |_| {
+            let frame_type = crate::typedef::get_object_type();
+            let frame = pyre_object::w_instance_new(frame_type);
+            let _ = crate::space::py_setattr(frame, "f_locals", w_dict_new());
+            let _ = crate::space::py_setattr(frame, "f_globals", w_dict_new());
+            let _ = crate::space::py_setattr(frame, "f_code", w_none());
+            let _ = crate::space::py_setattr(frame, "f_back", w_none());
+            let _ = crate::space::py_setattr(frame, "f_lineno", w_int_new(0));
+            Ok(frame)
+        }),
+    );
+    // sys.exc_info — stub
+    namespace_store(
+        ns,
+        "exc_info",
+        crate::w_builtin_func_new("exc_info", |_| {
+            Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
+        }),
+    );
+    // sys.flags — stub
+    namespace_store(ns, "flags", w_tuple_new(vec![]));
+    // sys.getdefaultencoding
+    namespace_store(
+        ns,
+        "getdefaultencoding",
+        crate::w_builtin_func_new("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
+    );
+    // sys.getrecursionlimit / setrecursionlimit
+    namespace_store(
+        ns,
+        "getrecursionlimit",
+        crate::w_builtin_func_new("getrecursionlimit", |_| Ok(w_int_new(1000))),
+    );
+    namespace_store(
+        ns,
+        "setrecursionlimit",
+        crate::w_builtin_func_new("setrecursionlimit", |_| Ok(w_none())),
+    );
+    // sys.intern
+    namespace_store(
+        ns,
+        "intern",
+        crate::w_builtin_func_new("intern", |args| {
+            Ok(if args.is_empty() {
+                w_str_new("")
+            } else {
+                args[0]
+            })
+        }),
+    );
+    // sys.implementation
+    namespace_store(ns, "implementation", w_none());
+    // sys.hash_info
+    namespace_store(ns, "hash_info", w_none());
+    // sys.float_info
+    namespace_store(ns, "float_info", w_none());
+    // sys.int_info
+    namespace_store(ns, "int_info", w_none());
+    // sys.executable
+    namespace_store(ns, "executable", w_str_new("pyre"));
+    // sys.prefix / exec_prefix
+    namespace_store(ns, "prefix", w_str_new(""));
+    namespace_store(ns, "exec_prefix", w_str_new(""));
+    namespace_store(ns, "base_prefix", w_str_new(""));
+    namespace_store(ns, "base_exec_prefix", w_str_new(""));
+    // sys.argv
+    namespace_store(ns, "argv", w_list_new(vec![]));
+    // sys.warnoptions
+    namespace_store(ns, "warnoptions", w_list_new(vec![]));
+    // sys.addaudithook
+    namespace_store(
+        ns,
+        "addaudithook",
+        crate::w_builtin_func_new("addaudithook", |_| Ok(w_none())),
+    );
 }
