@@ -679,6 +679,9 @@ impl PendingFieldLayoutSummary {
             value: self
                 .value
                 .to_exit_source(fail_arg_positions, virtual_offset),
+            field_offset: 0,
+            field_size: 0,
+            field_type: majit_ir::Type::Int,
         }
     }
 }
