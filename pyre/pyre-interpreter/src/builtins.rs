@@ -51,6 +51,61 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         w_builtin_func_new("reversed", builtin_reversed)
     });
     namespace.get_or_insert_with("sorted", || w_builtin_func_new("sorted", builtin_sorted));
+    namespace.get_or_insert_with("iter", || w_builtin_func_new("iter", builtin_iter));
+    namespace.get_or_insert_with("next", || w_builtin_func_new("next", builtin_next));
+    namespace.get_or_insert_with("callable", || {
+        w_builtin_func_new("callable", builtin_callable)
+    });
+    namespace.get_or_insert_with("vars", || w_builtin_func_new("vars", builtin_vars));
+    namespace.get_or_insert_with("__build_class__", || {
+        w_builtin_func_new("__build_class__", |args| {
+            crate::call::real_build_class(args)
+        })
+    });
+    // Type stubs for missing builtin types
+    namespace.get_or_insert_with("bytearray", || {
+        w_builtin_func_new("bytearray", |_| Ok(w_str_new("")))
+    });
+    namespace.get_or_insert_with("bytes", || {
+        w_builtin_func_new("bytes", |_| Ok(w_str_new("")))
+    });
+    namespace.get_or_insert_with("frozenset", || {
+        w_builtin_func_new("frozenset", |_| Ok(w_tuple_new(vec![])))
+    });
+    namespace.get_or_insert_with("set", || {
+        w_builtin_func_new("set", |_| Ok(w_list_new(vec![])))
+    });
+    namespace.get_or_insert_with("property", || {
+        w_builtin_func_new("property", |args| {
+            if args.is_empty() {
+                return Ok(w_none());
+            }
+            let fget = args[0];
+            let fset = if args.len() > 1 {
+                args[1]
+            } else {
+                pyre_object::PY_NULL
+            };
+            let fdel = if args.len() > 2 {
+                args[2]
+            } else {
+                pyre_object::PY_NULL
+            };
+            Ok(pyre_object::w_property_new(fget, fset, fdel))
+        })
+    });
+    namespace.get_or_insert_with("staticmethod", || {
+        w_builtin_func_new("staticmethod", |args| {
+            Ok(pyre_object::w_staticmethod_new(args[0]))
+        })
+    });
+    namespace.get_or_insert_with("classmethod", || {
+        w_builtin_func_new("classmethod", |args| {
+            Ok(pyre_object::w_classmethod_new(args[0]))
+        })
+    });
+    namespace.get_or_insert_with("Ellipsis", || w_none());
+    namespace.get_or_insert_with("__debug__", || w_bool_from(true));
     namespace.get_or_insert_with("any", || w_builtin_func_new("any", builtin_any));
     namespace.get_or_insert_with("all", || w_builtin_func_new("all", builtin_all));
     namespace.get_or_insert_with("sum", || w_builtin_func_new("sum", builtin_sum));
@@ -718,6 +773,60 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args[0];
     let obj = args[1];
     Ok(pyre_object::superobject::w_super_new(cls, obj))
+}
+
+/// `iter(obj)` — PyPy: baseobjspace.py iter
+fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "iter() requires at least one argument",
+        ));
+    }
+    crate::space::py_iter(args[0])
+}
+
+/// `next(iterator[, default])` — PyPy: baseobjspace.py next
+fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "next() requires at least one argument",
+        ));
+    }
+    match crate::space::py_next(args[0]) {
+        Ok(v) => Ok(v),
+        Err(e) if e.kind == crate::PyErrorKind::StopIteration && args.len() > 1 => {
+            Ok(args[1]) // default value
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `callable(obj)` — PyPy: baseobjspace.py callable
+fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    let is_callable = unsafe {
+        crate::is_func(obj)
+            || crate::is_builtin_func(obj)
+            || pyre_object::is_type(obj)
+            || (pyre_object::is_instance(obj)
+                && crate::space::lookup_in_type_mro_pub(
+                    pyre_object::w_instance_get_type(obj),
+                    "__call__",
+                )
+                .is_some())
+    };
+    Ok(w_bool_from(is_callable))
+}
+
+/// `vars([obj])` — stub
+fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "vars() without argument not supported",
+        ));
+    }
+    // Stub: return empty dict
+    Ok(pyre_object::w_dict_new())
 }
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int

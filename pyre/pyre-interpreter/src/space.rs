@@ -1133,6 +1133,14 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 Some(val) => Ok(val),
                 None => Err(PyError::new(PyErrorKind::KeyError, "key not found")),
             }
+        } else if is_type(obj) {
+            // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
+            // PyPy: typeobject.py type.__class_getitem__
+            if let Some(method) = lookup_in_type_mro(obj, "__class_getitem__") {
+                return Ok(crate::space_call_function(method, &[obj, index]));
+            }
+            // Default: return the type itself (stub for GenericAlias)
+            Ok(obj)
         } else if is_instance(obj) {
             // PyPy: descroperation.py __getitem__
             if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__getitem__") {
@@ -1748,6 +1756,76 @@ pub fn py_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             format!("'{tp_name}' object has no attribute '{name}'"),
         ))
     }
+}
+
+/// `iter(obj)` — PyPy: space.iter(w_obj)
+/// Calls __iter__ on the object if available.
+pub fn py_iter(obj: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    unsafe {
+        // Builtin iterables
+        if is_list(obj) {
+            return Ok(pyre_object::w_seq_iter_new(obj, w_list_len(obj)));
+        }
+        if is_tuple(obj) {
+            return Ok(pyre_object::w_seq_iter_new(obj, w_tuple_len(obj)));
+        }
+        if is_str(obj) {
+            let len = w_str_get_value(obj).len();
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
+        }
+        // Range iterator
+        if is_range_iter(obj) || is_seq_iter(obj) {
+            return Ok(obj);
+        }
+        // Instance __iter__
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(method) = lookup_in_type_mro(w_type, "__iter__") {
+                return Ok(crate::space_call_function(method, &[obj]));
+            }
+        }
+    }
+    Err(PyError::type_error(format!(
+        "'{}' object is not iterable",
+        unsafe { (*(*obj).ob_type).tp_name }
+    )))
+}
+
+/// `next(iterator)` — PyPy: space.next(w_iter)
+pub fn py_next(obj: PyObjectRef) -> PyResult {
+    let obj = unwrap_cell(obj);
+    unsafe {
+        // Seq iterator
+        if is_seq_iter(obj) {
+            let iter = &mut *(obj as *mut pyre_object::W_SeqIterator);
+            let seq = iter.seq;
+            let idx = iter.index;
+            let item = if is_list(seq) {
+                pyre_object::w_list_getitem(seq, idx)
+            } else if is_tuple(seq) {
+                pyre_object::w_tuple_getitem(seq, idx)
+            } else {
+                None
+            };
+            if let Some(v) = item {
+                iter.index += 1;
+                return Ok(v);
+            }
+            return Err(PyError {
+                kind: PyErrorKind::StopIteration,
+                message: "".to_string(),
+            });
+        }
+        // Instance __next__
+        if is_instance(obj) {
+            let w_type = w_instance_get_type(obj);
+            if let Some(method) = lookup_in_type_mro(w_type, "__next__") {
+                return Ok(crate::space_call_function(method, &[obj]));
+            }
+        }
+    }
+    Err(PyError::type_error("not an iterator"))
 }
 
 #[cfg(test)]

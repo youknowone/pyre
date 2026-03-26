@@ -4,6 +4,7 @@
 //! (e.g. `math/` ↔ `pypy/module/math/`).
 
 pub mod builtins_mod;
+pub mod io_mod;
 pub mod math;
 pub mod operator;
 pub mod sys;
