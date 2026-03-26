@@ -236,7 +236,10 @@ fn call_user_function_with_eval(
     // Generator function: create generator object instead of executing.
     // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
     // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
-    if code_ref.flags.contains(pyre_bytecode::CodeFlags::GENERATOR) {
+    if code_ref
+        .flags
+        .intersects(pyre_bytecode::CodeFlags::GENERATOR | pyre_bytecode::CodeFlags::COROUTINE)
+    {
         let mut gen_frame = PyFrame::new_for_call_with_closure(
             func_code,
             &final_args,
@@ -601,7 +604,10 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let final_args = pack_varargs(code_ref, filled_args);
 
     // Generator function: wrap frame in generator object
-    if code_ref.flags.contains(pyre_bytecode::CodeFlags::GENERATOR) {
+    if code_ref
+        .flags
+        .intersects(pyre_bytecode::CodeFlags::GENERATOR | pyre_bytecode::CodeFlags::COROUTINE)
+    {
         let mut gen_frame =
             PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
         gen_frame.fix_array_ptrs();

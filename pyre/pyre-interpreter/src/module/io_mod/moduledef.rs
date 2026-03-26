@@ -48,6 +48,23 @@ pub fn init(ns: &mut PyNamespace) {
     );
     namespace_store(ns, "open", w_builtin_func_new("open", stub_noop_ctor));
 
+    namespace_store(
+        ns,
+        "open_code",
+        w_builtin_func_new("open_code", stub_noop_ctor),
+    );
+    namespace_store(
+        ns,
+        "text_encoding",
+        w_builtin_func_new("text_encoding", |args| {
+            Ok(if args.is_empty() {
+                w_str_new("utf-8")
+            } else {
+                args[0]
+            })
+        }),
+    );
+
     // Exception types as strings (for isinstance checks in io.py)
     namespace_store(
         ns,
