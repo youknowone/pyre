@@ -379,6 +379,11 @@ impl Trace {
         &self.ops
     }
 
+    /// Access the recorded input arguments.
+    pub fn inputargs(&self) -> &[InputArg] {
+        &self.inputargs
+    }
+
     /// Get the last recorded operation, if any.
     pub fn last_op(&self) -> Option<&Op> {
         self.ops.last()

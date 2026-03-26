@@ -445,30 +445,6 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
-                // compile.py retrace_needed parity: if bridge tracing
-                // reaches CloseLoop but no target tokens exist, clear
-                // bridge_info and continue tracing for one more iteration.
-                // The next CloseLoop goes through normal close_and_compile,
-                // whose preamble peeling splits the two-iteration trace into
-                // preamble (guard→merge_point) + body (one loop iteration).
-                if self.bridge_info.is_some() {
-                    let bridge_key = self.bridge_info.as_ref().unwrap().0;
-                    let has_targets = self
-                        .meta
-                        .compiled_loops
-                        .get(&bridge_key)
-                        .map_or(false, |c| !c.front_target_tokens.is_empty());
-                    if !has_targets {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[bridge] CloseLoop -> continue tracing (no targets) key={}",
-                                bridge_key
-                            );
-                        }
-                        self.bridge_info = None;
-                        return;
-                    }
-                }
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
@@ -479,22 +455,32 @@ impl<S: JitState> JitDriver<S> {
                             bridge_key, bridge_trace_id, bridge_fail_index
                         );
                     }
-                    let sym = self.sym.take();
-                    self.trace_meta = None;
-                    if let Some(sym) = sym {
-                        let finish_args = S::collect_jump_args(&sym);
-                        let ok = self.meta.close_bridge(
+                    if let Some(sym) = self.sym.as_ref() {
+                        let finish_args = S::collect_jump_args(sym);
+                        let result = self.meta.close_bridge(
                             bridge_key,
                             bridge_trace_id,
                             bridge_fail_index,
                             &finish_args,
                         );
-                        if !ok {
-                            self.meta.abort_trace(false);
+                        match result {
+                            crate::pyjitpl::BridgeCompileResult::Compiled => {}
+                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                // compile.py retrace_needed parity: optimizer
+                                // found no matching target token. Continue
+                                // tracing for one more iteration — the next
+                                // CloseLoop goes through close_and_compile.
+                                return;
+                            }
+                            crate::pyjitpl::BridgeCompileResult::Failed => {
+                                self.meta.abort_trace(false);
+                            }
                         }
                     } else {
                         self.meta.abort_trace(false);
                     }
+                    self.sym = None;
+                    self.trace_meta = None;
                     return;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
@@ -554,40 +540,28 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc: _,
             } => {
-                // Same retrace logic as CloseLoop (see above).
-                if self.bridge_info.is_some() {
-                    let bridge_key = self.bridge_info.as_ref().unwrap().0;
-                    let has_targets = self
-                        .meta
-                        .compiled_loops
-                        .get(&bridge_key)
-                        .map_or(false, |c| !c.front_target_tokens.is_empty());
-                    if !has_targets {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[bridge] CloseLoopWithArgs -> continue tracing (no targets) key={}",
-                                bridge_key
-                            );
-                        }
-                        self.bridge_info = None;
-                        return;
-                    }
-                }
                 // Bridge tracing: close as bridge instead of loop.
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
                     self.bridge_info.take()
                 {
-                    self.sym = None;
-                    self.trace_meta = None;
-                    let ok = self.meta.close_bridge(
+                    let result = self.meta.close_bridge(
                         bridge_key,
                         bridge_trace_id,
                         bridge_fail_index,
                         &jump_args,
                     );
-                    if !ok {
-                        self.meta.abort_trace(false);
+                    match result {
+                        crate::pyjitpl::BridgeCompileResult::Compiled => {}
+                        crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                            // Continue tracing (see CloseLoop above).
+                            return;
+                        }
+                        crate::pyjitpl::BridgeCompileResult::Failed => {
+                            self.meta.abort_trace(false);
+                        }
                     }
+                    self.sym = None;
+                    self.trace_meta = None;
                     return;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
@@ -2885,10 +2859,14 @@ mod tests {
             let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
         let trace_id = 0u64; // will be normalized to root_trace_id
-        let compiled = driver
+        let result = driver
             .meta
             .close_bridge(key, trace_id, fail_index, &[OpRef(0)]);
-        assert!(compiled, "bridge should compile successfully");
+        assert_eq!(
+            result,
+            crate::pyjitpl::BridgeCompileResult::Compiled,
+            "bridge should compile successfully"
+        );
 
         let events = bridge_events.lock().unwrap();
         assert_eq!(
