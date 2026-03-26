@@ -1706,6 +1706,10 @@ impl<M: Clone> MetaInterp<M> {
                                         green_key
                                     );
                                 }
+                                // Clear stale target_tokens from the failed
+                                // unroll attempt — simple loops have no
+                                // preamble/body split and no target tokens.
+                                unroll_opt.target_tokens.clear();
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
                                 (retry_ops, ni)

@@ -2245,7 +2245,10 @@ impl Optimizer {
         let jump_args: Vec<_> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
 
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
-        // Bridge path: no runtime_boxes available (RPython passes None)
+        // RPython compile.py:1057 parity: bridge always has runtime_boxes
+        // (live_arg_boxes from compile_trace or deadframe values from
+        // guard failure). Used as educated-guess gate for guard emission
+        // in generate_guards_for_entry.
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
@@ -2254,7 +2257,7 @@ impl Optimizer {
             self,
             &mut ctx,
             false,
-            None, // runtime_boxes
+            Some(&jump_args), // runtime_boxes: RPython parity
         );
 
         if vs.is_none() {
@@ -2283,8 +2286,8 @@ impl Optimizer {
             front_target_tokens,
             self,
             &mut ctx,
-            true, // force_boxes
-            None, // runtime_boxes
+            true,             // force_boxes
+            Some(&jump_args), // runtime_boxes: RPython parity
         );
 
         if vs2.is_none() {
