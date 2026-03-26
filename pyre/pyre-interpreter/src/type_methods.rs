@@ -297,12 +297,109 @@ pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: unicodeobject.py descr_format
 /// Requires format spec parser — correct for no-arg case only.
+/// `str.format(*args)` — PyPy: unicodeobject.py descr_format → newformat.py
 pub fn str_method_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    if args.len() == 1 {
-        return Ok(args[0]); // no format args
+    let fmt = unsafe { pyre_object::w_str_get_value(args[0]) };
+    let fargs = &args[1..];
+
+    let mut result = String::new();
+    let mut auto_idx = 0usize;
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                result.push('{');
+                i += 2;
+                continue;
+            }
+            i += 1;
+            // Parse field: {}, {0}, {name}, {0:spec}
+            let mut field = String::new();
+            let mut spec = String::new();
+            let mut in_spec = false;
+            while i < bytes.len() && bytes[i] != b'}' {
+                if bytes[i] == b':' && !in_spec {
+                    in_spec = true;
+                    i += 1;
+                    continue;
+                }
+                if in_spec {
+                    spec.push(bytes[i] as char);
+                } else {
+                    field.push(bytes[i] as char);
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            } // skip '}'
+
+            let idx = if field.is_empty() {
+                let idx = auto_idx;
+                auto_idx += 1;
+                idx
+            } else {
+                field.parse::<usize>().unwrap_or(auto_idx)
+            };
+            let val = fargs.get(idx).copied().unwrap_or(pyre_object::w_none());
+            let formatted = if spec.is_empty() {
+                unsafe { crate::py_str(val) }
+            } else {
+                format_with_spec(val, &spec)
+            };
+            result.push_str(&formatted);
+        } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+            result.push('}');
+            i += 2;
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
     }
-    panic!("str.format() with arguments not yet implemented");
+    Ok(pyre_object::w_str_new(&result))
+}
+
+fn format_with_spec(val: PyObjectRef, spec: &str) -> String {
+    unsafe {
+        if pyre_object::is_int(val) {
+            let v = pyre_object::w_int_get_value(val);
+            if spec.ends_with('d') || spec.is_empty() {
+                return format!("{v}");
+            }
+            if spec.ends_with('x') {
+                return format!("{v:x}");
+            }
+            if spec.ends_with('o') {
+                return format!("{v:o}");
+            }
+            if spec.ends_with('b') {
+                return format!("{v:b}");
+            }
+            // Width/fill: e.g. "02" → zero-padded width 2
+            if let Some(width) = spec
+                .strip_suffix('d')
+                .or(Some(spec))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if spec.starts_with('0') {
+                    return format!("{v:0>width$}");
+                }
+                return format!("{v:>width$}");
+            }
+            return format!("{v}");
+        }
+        if pyre_object::is_float(val) {
+            let v = pyre_object::floatobject::w_float_get_value(val);
+            if let Some(rest) = spec.strip_suffix('f') {
+                let prec: usize = rest.trim_start_matches('.').parse().unwrap_or(6);
+                return format!("{v:.prec$}");
+            }
+            return format!("{v}");
+        }
+        crate::py_str(val)
+    }
 }
 
 /// PyPy: unicodeobject.py descr_encode

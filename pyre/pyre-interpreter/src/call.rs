@@ -669,6 +669,24 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     // Cache C3 MRO (PyPy: W_TypeObject.mro_w set during ready())
     let mro = unsafe { crate::space::compute_mro_pub(w_type) };
     unsafe { pyre_object::w_type_set_mro(w_type, mro) };
+
+    // Call __init_subclass__ on each base class
+    // PyPy: typeobject.py type.__init__ → call __init_subclass__
+    if !effective_bases.is_null() && unsafe { pyre_object::is_tuple(effective_bases) } {
+        let n = unsafe { pyre_object::w_tuple_len(effective_bases) };
+        for i in 0..n {
+            if let Some(base) = unsafe { pyre_object::w_tuple_getitem(effective_bases, i as i64) } {
+                if unsafe { pyre_object::is_type(base) } {
+                    if let Some(init_sub) =
+                        unsafe { crate::space::lookup_in_type_mro_pub(base, "__init_subclass__") }
+                    {
+                        let _ = crate::space_call_function(init_sub, &[w_type]);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(w_type)
 }
 

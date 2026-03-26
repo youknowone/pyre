@@ -692,6 +692,10 @@ pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_float_pair(a, b) {
             return float_mod(a, b);
         }
+        // str % args — PyPy: unicodeobject.py mod__String_ANY
+        if is_str(a) {
+            return str_format_percent(a, b);
+        }
         if let Some(result) = try_instance_binop(a, b, "__mod__") {
             return result;
         }
@@ -701,6 +705,123 @@ pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             (*(*b).ob_type).tp_name,
         )))
     }
+}
+
+/// `str % args` — printf-style string formatting.
+/// PyPy: unicodeobject.py mod__String_ANY → formatting.py
+unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    let fmt_str = w_str_get_value(fmt);
+    // Collect args into a Vec
+    let arg_list: Vec<PyObjectRef> = if is_tuple(args) {
+        let n = w_tuple_len(args);
+        (0..n)
+            .filter_map(|i| w_tuple_getitem(args, i as i64))
+            .collect()
+    } else {
+        vec![args]
+    };
+
+    let mut result = String::new();
+    let mut arg_idx = 0;
+    let bytes = fmt_str.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            i += 1;
+            // Parse optional width/flags
+            let mut width = String::new();
+            while i < bytes.len()
+                && (bytes[i] == b'-'
+                    || bytes[i] == b'+'
+                    || bytes[i] == b'0'
+                    || bytes[i] == b' '
+                    || bytes[i].is_ascii_digit()
+                    || bytes[i] == b'.')
+            {
+                width.push(bytes[i] as char);
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let spec = bytes[i] as char;
+            i += 1;
+            if spec == '%' {
+                result.push('%');
+                continue;
+            }
+            let arg = if arg_idx < arg_list.len() {
+                arg_list[arg_idx]
+            } else {
+                pyre_object::w_none()
+            };
+            arg_idx += 1;
+            match spec {
+                's' => {
+                    result.push_str(&crate::py_str(arg));
+                }
+                'r' => {
+                    result.push_str(&crate::py_repr(arg));
+                }
+                'd' | 'i' => {
+                    if is_int(arg) {
+                        let val = w_int_get_value(arg);
+                        if width.is_empty() {
+                            result.push_str(&format!("{val}"));
+                        } else {
+                            let zero_pad = width.starts_with('0');
+                            let w: usize = width.trim_start_matches('0').parse().unwrap_or(0);
+                            let w = if w == 0 && zero_pad { width.len() } else { w };
+                            if zero_pad {
+                                result.push_str(&format!("{val:0>w$}"));
+                            } else {
+                                result.push_str(&format!("{val:>w$}"));
+                            }
+                        }
+                    } else {
+                        result.push_str(&crate::py_str(arg));
+                    }
+                }
+                'f' => {
+                    let val = if is_float(arg) {
+                        pyre_object::floatobject::w_float_get_value(arg)
+                    } else if is_int(arg) {
+                        w_int_get_value(arg) as f64
+                    } else {
+                        0.0
+                    };
+                    if width.contains('.') {
+                        let prec: usize = width
+                            .split('.')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(6);
+                        result.push_str(&format!("{val:.prec$}"));
+                    } else {
+                        result.push_str(&format!("{val:.6}"));
+                    }
+                }
+                'x' => {
+                    if is_int(arg) {
+                        result.push_str(&format!("{:x}", w_int_get_value(arg)));
+                    }
+                }
+                'o' => {
+                    if is_int(arg) {
+                        result.push_str(&format!("{:o}", w_int_get_value(arg)));
+                    }
+                }
+                _ => {
+                    result.push('%');
+                    result.push(spec);
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Ok(w_str_new(&result))
 }
 
 /// True division (`/` operator) — always produces a float result.
@@ -1793,8 +1914,9 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
             let len = w_str_get_value(obj).len();
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
-        // Range iterator
-        if is_range_iter(obj) || is_seq_iter(obj) {
+        // Already an iterator
+        if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
+        {
             return Ok(obj);
         }
         // Instance __iter__
@@ -1836,6 +1958,10 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
                 message: "".to_string(),
             });
         }
+        // Generator __next__ — PyPy: generator.py GeneratorIterator.next
+        if pyre_object::generatorobject::is_generator(obj) {
+            return generator_next(obj);
+        }
         // Instance __next__
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -1845,6 +1971,56 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
         }
     }
     Err(PyError::type_error("not an iterator"))
+}
+
+/// Resume a generator frame until YIELD_VALUE or RETURN_VALUE.
+///
+/// PyPy: generator.py GeneratorIterator.next() → execute_frame()
+fn generator_next(gen_obj: PyObjectRef) -> PyResult {
+    use pyre_object::generatorobject::*;
+    unsafe {
+        if w_generator_is_exhausted(gen_obj) {
+            return Err(PyError {
+                kind: PyErrorKind::StopIteration,
+                message: "".to_string(),
+            });
+        }
+        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::frame::PyFrame;
+        if frame_ptr.is_null() {
+            w_generator_set_exhausted(gen_obj);
+            return Err(PyError {
+                kind: PyErrorKind::StopIteration,
+                message: "".to_string(),
+            });
+        }
+        w_generator_set_started(gen_obj);
+
+        let frame = &mut *frame_ptr;
+        // Resume the frame from where it left off (frame.next_instr is preserved)
+        match crate::eval::eval_loop_for_force(frame) {
+            Ok(value) => {
+                // Check if this is a yield or a return.
+                // StepResult::Yield returns the yielded value via Ok.
+                // StepResult::Return also returns via Ok but means generator is done.
+                // We distinguish by checking if frame reached the end.
+                let code = &*frame.code;
+                if frame.next_instr >= code.instructions.len() {
+                    // Generator returned (finished) — raise StopIteration
+                    w_generator_set_exhausted(gen_obj);
+                    return Err(PyError {
+                        kind: PyErrorKind::StopIteration,
+                        message: "".to_string(),
+                    });
+                }
+                // Frame is suspended at YIELD_VALUE — return the yielded value
+                Ok(value)
+            }
+            Err(e) => {
+                w_generator_set_exhausted(gen_obj);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
