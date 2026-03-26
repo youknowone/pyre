@@ -2987,6 +2987,49 @@ fn build_value_type_map(
         }
     }
 
+    // Box identity parity: when a JUMP sends a value to a LABEL arg,
+    // the LABEL arg's type changes to the JUMP arg's type. RPython's
+    // Box objects carry their own types; in our flat OpRef namespace we
+    // must propagate types through the JUMP→LABEL edge explicitly.
+    // Collect LABEL→descr and JUMP→descr, then match by descr index.
+    let mut label_by_descr: HashMap<u32, usize> = HashMap::new();
+    let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
+    for (op_idx, op) in ops.iter().enumerate() {
+        if op.opcode == OpCode::Label {
+            if let Some(ref d) = op.descr {
+                label_by_descr.insert(d.index(), op_idx);
+            }
+        } else if op.opcode == OpCode::Jump {
+            if let Some(ref d) = op.descr {
+                jumps_by_descr.push((d.index(), op_idx));
+            }
+        }
+    }
+    for (descr_idx, jump_idx) in &jumps_by_descr {
+        let Some(&label_idx) = label_by_descr.get(descr_idx) else {
+            continue;
+        };
+        let label_op = &ops[label_idx];
+        let jump_op = &ops[*jump_idx];
+        for (i, &label_arg) in label_op.args.iter().enumerate() {
+            if label_arg.is_none() {
+                continue;
+            }
+            let Some(&jump_arg) = jump_op.args.get(i) else {
+                continue;
+            };
+            if jump_arg.is_none() {
+                continue;
+            }
+            let jump_type = value_types.get(&jump_arg.0).copied().unwrap_or(Type::Int);
+            let label_type = value_types.get(&label_arg.0).copied().unwrap_or(Type::Ref);
+            if jump_type != label_type {
+                value_types.insert(label_arg.0, jump_type);
+                op_def_positions.insert(label_arg.0, label_idx);
+            }
+        }
+    }
+
     (value_types, inputarg_types, op_def_positions)
 }
 
@@ -3951,6 +3994,47 @@ fn infer_fail_arg_types_positional(
         fail_arg_types.push(tp);
     }
     Ok(fail_arg_types)
+}
+
+/// box.type parity: merge descriptor types with positional inference.
+/// Use descriptor types as the base, then override slots where
+/// op_def_positions detects a type conflict (JUMP→LABEL propagation
+/// or inputarg-vs-operation redefinition).
+fn merge_descriptor_with_positional(
+    fail_arg_refs: &[OpRef],
+    fd: Option<&dyn majit_ir::descr::FailDescr>,
+    value_types: &HashMap<u32, Type>,
+    inputarg_types: &HashMap<u32, Type>,
+    op_def_positions: &HashMap<u32, usize>,
+    guard_op_index: usize,
+) -> Result<Vec<Type>, BackendError> {
+    let positional = infer_fail_arg_types_positional(
+        fail_arg_refs,
+        value_types,
+        inputarg_types,
+        op_def_positions,
+        guard_op_index,
+    )?;
+    let Some(fd) = fd else {
+        return Ok(positional);
+    };
+    let dt = fd.fail_arg_types();
+    if dt.len() != fail_arg_refs.len() {
+        return Ok(positional);
+    }
+    // Start from descriptor, override conflicting slots.
+    Ok(dt
+        .iter()
+        .enumerate()
+        .map(|(i, &descr_tp)| {
+            let opref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
+            if !opref.is_none() && op_def_positions.contains_key(&opref.0) {
+                positional[i]
+            } else {
+                descr_tp
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -8010,33 +8094,17 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            // RPython parity: use the guard descriptor's fail_arg_types when
-            // available. The tracer sets these to match the virtualizable
-            // layout (all slots as Ref/GCREF). infer_fail_arg_types re-infers
-            // from op result types, which may produce Int for values that the
-            // optimizer unboxed — but the Python frame always needs Ref.
-            let types = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                let dt = fd.fail_arg_types();
-                if dt.len() == refs.len() {
-                    dt.to_vec()
-                } else {
-                    infer_fail_arg_types_positional(
-                        &refs,
-                        &value_types,
-                        &inputarg_types,
-                        &op_def_positions,
-                        op_idx,
-                    )?
-                }
-            } else {
-                infer_fail_arg_types_positional(
-                    &refs,
-                    &value_types,
-                    &inputarg_types,
-                    &op_def_positions,
-                    op_idx,
-                )?
-            };
+            // box.type parity: merge descriptor types with positional
+            // inference. For OpRefs with JUMP→LABEL or inputarg-vs-op
+            // type conflicts, the positional type is authoritative.
+            let types = merge_descriptor_with_positional(
+                &refs,
+                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                &value_types,
+                &inputarg_types,
+                &op_def_positions,
+                op_idx,
+            )?;
             (refs, types)
         } else {
             let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
@@ -8044,38 +8112,14 @@ fn collect_guards(
             } else {
                 (0..num_inputs as u32).map(OpRef).collect()
             };
-            let types: Vec<Type> = if let Some(ref descr) = op.descr {
-                if let Some(fd) = descr.as_fail_descr() {
-                    let dt = fd.fail_arg_types();
-                    if dt.len() == refs.len() {
-                        dt.to_vec()
-                    } else {
-                        infer_fail_arg_types_positional(
-                            &refs,
-                            &value_types,
-                            &inputarg_types,
-                            &op_def_positions,
-                            op_idx,
-                        )?
-                    }
-                } else {
-                    infer_fail_arg_types_positional(
-                        &refs,
-                        &value_types,
-                        &inputarg_types,
-                        &op_def_positions,
-                        op_idx,
-                    )?
-                }
-            } else {
-                infer_fail_arg_types_positional(
-                    &refs,
-                    &value_types,
-                    &inputarg_types,
-                    &op_def_positions,
-                    op_idx,
-                )?
-            };
+            let types = merge_descriptor_with_positional(
+                &refs,
+                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                &value_types,
+                &inputarg_types,
+                &op_def_positions,
+                op_idx,
+            )?;
             (refs, types)
         };
 
