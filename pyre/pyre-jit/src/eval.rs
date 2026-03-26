@@ -564,15 +564,33 @@ fn can_enter_jit_hook(
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
             JitAction::ContinueRunningNormally => {
                 // RPython compile.py:710 handle_fail → resume_in_blackhole.
-                // Frame state was already restored by restore_guard_failure_values
-                // in the guard failure callback. The interpreter continues from
-                // the guard failure PC with the correct frame state.
-                //
-                // TODO(blackhole): Run blackhole from guard PC to merge point
-                // for RPython parity. Currently, let the interpreter resume
-                // directly — restore_guard_failure_values already wrote the
-                // correct locals/stack/next_instr to the frame.
-                let _typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+                // Run blackhole from guard PC to merge point using typed
+                // fail_args directly (not from frame).
+                let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+                if let Some(ref vals) = typed {
+                    match crate::call_jit::resume_in_blackhole_from_fail_args(
+                        frame,
+                        vals,
+                        loop_header_pc,
+                    ) {
+                        crate::call_jit::BlackholeResult::MergePoint => {
+                            // bhimpl_jit_merge_point → ContinueRunningNormally.
+                            // Frame is at loop_header_pc with correct state.
+                            // Return None so eval_loop_jit continues from the
+                            // loop header where the next backedge can re-enter
+                            // compiled code immediately.
+                        }
+                        crate::call_jit::BlackholeResult::Finished(result) => {
+                            // RPython DoneWithThisFrame: blackhole completed
+                            // the function. The result is final.
+                            return Some(LoopResult::Done(result));
+                        }
+                        crate::call_jit::BlackholeResult::Failed => {
+                            // Blackhole couldn't run. Interpreter continues
+                            // from the restored frame state.
+                        }
+                    }
+                }
             }
             JitAction::Continue => {}
         }

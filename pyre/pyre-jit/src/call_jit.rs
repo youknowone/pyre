@@ -849,6 +849,13 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+        // Safety: skip blackhole if jitcode contains BC_ABORT between
+        // guard_pc and the end. BC_ABORT causes side-effect corruption
+        // when the blackhole executes past unsupported bytecodes.
+        if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
+        }
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
         } else {
@@ -868,15 +875,12 @@ pub fn resume_in_blackhole_from_fail_args(
         }
 
         // RPython: resumereader.consume_one_section(curbh)
-        // pyre: all Python locals are boxed refs. If fail_args contains
-        // unboxed Int values (from tracing optimizations), re-box them
-        // so the blackhole can pass them as refs to helper functions.
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
                 let ptr = match val {
                     Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => unsafe { w_int_new(*v) as i64 },
+                    Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Void => 0i64,
                 };
@@ -888,7 +892,7 @@ pub fn resume_in_blackhole_from_fail_args(
             if let Some(val) = section.get(slot) {
                 let ptr = match val {
                     Value::Ref(r) => r.as_usize() as i64,
-                    Value::Int(v) => unsafe { w_int_new(*v) as i64 },
+                    Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Void => 0i64,
                 };
