@@ -74,6 +74,14 @@ impl PyNamespace {
         self.slot_of(name).map(|idx| &self.values[idx])
     }
 
+    /// Iterate over (name, value) pairs.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &PyObjectRef)> {
+        self.names
+            .iter()
+            .enumerate()
+            .map(move |(i, name)| (name.as_str(), &self.values[i]))
+    }
+
     #[inline]
     pub fn get_slot(&self, idx: usize) -> Option<PyObjectRef> {
         self.values.as_slice().get(idx).copied()

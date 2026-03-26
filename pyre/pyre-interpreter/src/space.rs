@@ -1425,7 +1425,7 @@ thread_local! {
     ///
     /// Every object can have attributes stored here. This avoids modifying
     /// the repr(C) layout of existing object types.
-    static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
+    pub static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -1588,6 +1588,22 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(w_tuple_new((*mro_ptr).clone()));
                 }
             }
+            if name == "__dict__" {
+                // Return the type's namespace as a dict
+                let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::PyNamespace;
+                let d = pyre_object::w_dict_new();
+                if !dict_ptr.is_null() {
+                    for (k, &v) in (*dict_ptr).entries() {
+                        if !v.is_null() {
+                            pyre_object::w_dict_store(d, w_str_new(k), v);
+                        }
+                    }
+                }
+                return Ok(d);
+            }
+            if name == "__bases__" {
+                return Ok(w_type_get_bases(obj));
+            }
 
             if let Some(value) = lookup_in_type_mro(obj, name) {
                 // Unwrap staticmethod/classmethod/property descriptors
@@ -1603,6 +1619,28 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(value);
                 }
                 return Ok(value);
+            }
+            // Metaclass attribute lookup — PyPy: type.__getattribute__
+            // Check if this type was created by a custom metaclass.
+            // The metaclass is stored as __metaclass__ in ATTR_TABLE.
+            let metaclass_obj = ATTR_TABLE.with(|table| {
+                let table = table.borrow();
+                table
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get("__metaclass__").copied())
+            });
+            if let Some(mc) = metaclass_obj {
+                if is_type(mc) {
+                    if let Some(value) = lookup_in_type_mro(mc, name) {
+                        return Ok(value);
+                    }
+                }
+            }
+            // Fallback: check type's type registry entry
+            if let Some(metatype) = crate::typedef::get_type_object((*obj).ob_type) {
+                if let Some(value) = lookup_in_type_mro(metatype, name) {
+                    return Ok(value);
+                }
             }
             return Err(PyError::new(
                 PyErrorKind::AttributeError,

@@ -74,6 +74,12 @@ pub fn install_builtin_typedefs() {
     );
     let _ = OBJECT_TYPE_OBJ.set(object_type as usize);
 
+    // type — PyPy: typeobject.py, bases=(object,)
+    // type.__new__(metatype, name, bases, dict) creates new types
+    let type_type = make_type_with_base("type", init_type_typedef, object_type);
+    reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
+    let _ = TYPE_TYPE_OBJ.set(type_type as usize);
+
     // int — PyPy: intobject.py W_IntObject.typedef, bases=(object,)
     let int_type = make_type_with_base("int", init_int_typedef, object_type);
     reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
@@ -125,9 +131,19 @@ pub fn install_builtin_typedefs() {
 
 /// The global `object` type object, accessible from builtins.
 static OBJECT_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// The global `type` type object.
+static TYPE_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Retrieve a W_TypeObject for a builtin type by its PyType pointer.
 /// Used to register `int`, `str`, etc. as types in builtins (not functions).
+/// Get the `type` W_TypeObject for use as a builtin.
+pub fn get_type_type() -> PyObjectRef {
+    TYPE_TYPE_OBJ
+        .get()
+        .map(|v| *v as PyObjectRef)
+        .unwrap_or(PY_NULL)
+}
+
 pub fn get_builtin_type(tp: &PyType) -> PyObjectRef {
     get_type_object(tp as *const PyType).unwrap_or(PY_NULL)
 }
@@ -642,6 +658,24 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
+
+// ── Type TypeDef ─────────────────────────────────────────────────────
+// PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
+
+fn init_type_typedef(ns: &mut PyNamespace) {
+    // type.__new__(metatype, name, bases, dict) — creates new type
+    namespace_store(
+        ns,
+        "__new__",
+        w_builtin_func_new("__new__", crate::builtins::builtin_type_new_pub),
+    );
+    // type.__init__ — no-op for now
+    namespace_store(
+        ns,
+        "__init__",
+        w_builtin_func_new("__init__", |_| Ok(pyre_object::w_none())),
+    );
+}
 
 fn init_int_typedef(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", w_builtin_func_new("__new__", int_new));

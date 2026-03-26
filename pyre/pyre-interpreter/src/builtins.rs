@@ -13,7 +13,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("abs", || w_builtin_func_new("abs", builtin_abs));
     namespace.get_or_insert_with("min", || w_builtin_func_new("min", builtin_min));
     namespace.get_or_insert_with("max", || w_builtin_func_new("max", builtin_max));
-    namespace.get_or_insert_with("type", || w_builtin_func_new("type", builtin_type));
+    namespace.get_or_insert_with("type", || crate::typedef::get_type_type());
     namespace.get_or_insert_with("isinstance", || {
         w_builtin_func_new("isinstance", builtin_isinstance)
     });
@@ -359,20 +359,71 @@ fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `type(obj)` — return the type of an object as a W_TypeObject.
 ///
 /// PyPy: `space.type(w_obj)` → W_TypeObject
+pub(crate) fn builtin_type_new_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // type.__new__(metatype, name, bases, dict)
+    // args[0] = metatype (cls), args[1] = name, args[2] = bases, args[3] = dict
+    if args.len() >= 4 {
+        return builtin_type(&args[1..]);
+    }
+    // type.__new__(metatype, obj) → type(obj)
+    if args.len() >= 2 {
+        return builtin_type(&args[1..]);
+    }
+    builtin_type(args)
+}
 fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "type() takes exactly one argument");
+    // type(name, bases, dict) — 3-arg form creates a new type
+    // PyPy: typeobject.py type.__new__(metatype, name, bases, dict)
+    if args.len() >= 3 {
+        let name_obj = args[0];
+        let bases = args[1];
+        let ns_dict = args[2];
+        let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+
+        // Convert dict to PyNamespace
+        let mut class_ns = Box::new(crate::PyNamespace::new());
+        class_ns.fix_ptr();
+        if unsafe { is_dict(ns_dict) } {
+            let d = unsafe { &*(ns_dict as *const pyre_object::dictobject::W_DictObject) };
+            for &(k, v) in unsafe { &*d.entries } {
+                if unsafe { is_str(k) } {
+                    let key = unsafe { pyre_object::w_str_get_value(k) };
+                    crate::namespace_store(&mut class_ns, key, v);
+                }
+            }
+        }
+        let ns_ptr = Box::into_raw(class_ns);
+
+        // Default bases to (object,) if empty
+        let effective_bases =
+            if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
+            {
+                let obj_type = crate::typedef::get_object_type();
+                if !obj_type.is_null() {
+                    pyre_object::w_tuple_new(vec![obj_type])
+                } else {
+                    bases
+                }
+            } else {
+                bases
+            };
+
+        let w_type = pyre_object::w_type_new(name, effective_bases, ns_ptr as *mut u8);
+        let mro = unsafe { crate::space::compute_mro_pub(w_type) };
+        unsafe { pyre_object::w_type_set_mro(w_type, mro) };
+        return Ok(w_type);
+    }
+
+    // type(obj) — 1-arg form returns the type
     let obj = args[0];
     unsafe {
-        // Instance → return its class (W_TypeObject)
         if is_instance(obj) {
             return Ok(w_instance_get_type(obj));
         }
     }
-    // Builtin → type registry lookup
     if let Some(tp) = crate::typedef::type_of(obj) {
         return Ok(tp);
     }
-    // Fallback: return type name as string (legacy)
     let name = unsafe { (*(*obj).ob_type).tp_name };
     Ok(box_str_constant(name))
 }
