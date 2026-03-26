@@ -929,12 +929,10 @@ impl Optimizer {
                     guard_op.rd_virtuals = Some(virtual_entries);
                 }
 
-                // resume.py:447,450-451: patch num_failargs and store rd_numb.
-                let mut numb_state = numb_state;
-                let fa_len = guard_op.fail_args.as_ref().map_or(0, |f| f.len());
-                numb_state.patch(1, fa_len as i32);
-                guard_op.rd_numb = Some(numb_state.create_numbering());
-                guard_op.rd_consts = Some(memo.consts().to_vec());
+                // rd_numb is produced post-assembly by number_guards_final
+                // using 1:1 TAGBOX mapping. Do NOT store here — the numbering
+                // from _number_boxes has "already seen" dedup that shifts
+                // TAGBOX indices away from raw_values positions.
             }
             return;
         }
@@ -1711,7 +1709,6 @@ impl Optimizer {
         // virtualization — rescan resolves these via exported_jump_virtuals.
         if self.skip_flush {
             Self::rescan_guard_virtuals(&mut ctx);
-            Self::number_all_guards(&mut ctx, &self.snapshot_boxes, &self.constant_types);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -1884,11 +1881,8 @@ impl Optimizer {
         // in guard fail_args before forcing remaining virtuals.
         Self::rescan_guard_virtuals(&mut ctx);
 
-        // resume.py parity: produce rd_numb for every guard with a snapshot.
-        // RPython calls store_final_boxes_in_guard at each guard emit. In majit
-        // guards are emitted directly via ctx.emit, so we run numbering as a
-        // post-pass over all emitted guards.
-        Self::number_all_guards(&mut ctx, &self.snapshot_boxes, &self.constant_types);
+        // rd_numb is produced post-assembly in pyjitpl.rs (number_guards_final)
+        // rather than here, because assembly remaps guard fail_args.
 
         // Force any remaining virtual refs in output ops before forwarding resolve.
         // RPython: virtuals are forced during preamble export or JUMP handling.
