@@ -2201,6 +2201,15 @@ impl Optimizer {
         if let Some(knowledge) = bridge_knowledge {
             self.pending_bridge_knowledge = Some(knowledge.clone());
         }
+        // unroll.py:183 parity: save pre-optimization JUMP args as
+        // runtime_boxes. RPython passes the original live_arg_boxes from
+        // compile_trace / guard failure, not the optimized jump args.
+        let pre_opt_jump_args: Vec<OpRef> = ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
+
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
 
@@ -2245,10 +2254,8 @@ impl Optimizer {
         let jump_args: Vec<_> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
 
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
-        // RPython compile.py:1057 parity: bridge always has runtime_boxes
-        // (live_arg_boxes from compile_trace or deadframe values from
-        // guard failure). Used as educated-guess gate for guard emission
-        // in generate_guards_for_entry.
+        // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
+        // JUMP args (live_arg_boxes from compile_trace / deadframe values).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
@@ -2257,7 +2264,7 @@ impl Optimizer {
             self,
             &mut ctx,
             false,
-            Some(&jump_args), // runtime_boxes: RPython parity
+            Some(&pre_opt_jump_args), // runtime_boxes: pre-opt JUMP args (RPython parity)
         );
 
         if vs.is_none() {
@@ -2286,8 +2293,8 @@ impl Optimizer {
             front_target_tokens,
             self,
             &mut ctx,
-            true,             // force_boxes
-            Some(&jump_args), // runtime_boxes: RPython parity
+            true,                     // force_boxes
+            Some(&pre_opt_jump_args), // runtime_boxes: pre-opt JUMP args (RPython parity)
         );
 
         if vs2.is_none() {
