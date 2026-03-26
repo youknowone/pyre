@@ -3908,8 +3908,12 @@ impl<M: Clone> MetaInterp<M> {
                         green_key
                     );
                 }
+                // Caller (jitdriver.rs) should route to close_and_compile
+                // for retrace when no targets exist. This is a safety fallback.
                 return false;
             }
+        }
+        if ends_with_jump {
             // Validate arg count matches loop inputargs.
             let input_len = self
                 .compiled_loops
