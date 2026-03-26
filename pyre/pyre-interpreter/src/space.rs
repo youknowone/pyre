@@ -1254,6 +1254,73 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 Some(val) => Ok(val),
                 None => Err(PyError::new(PyErrorKind::KeyError, "key not found")),
             }
+        } else if is_str(obj) {
+            let s = w_str_get_value(obj);
+            if is_slice(index) {
+                let len = s.len() as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let step = w_slice_get_step(index);
+                let s_val = if is_none(start) {
+                    0
+                } else {
+                    w_int_get_value(start)
+                };
+                let e_val = if is_none(stop) {
+                    len
+                } else {
+                    w_int_get_value(stop)
+                };
+                let step_val = if is_none(step) {
+                    1
+                } else {
+                    w_int_get_value(step)
+                };
+                let s_idx = if s_val < 0 {
+                    (len + s_val).max(0)
+                } else {
+                    s_val.min(len)
+                } as usize;
+                let e_idx = if e_val < 0 {
+                    (len + e_val).max(0)
+                } else {
+                    e_val.min(len)
+                } as usize;
+                if step_val == 1 {
+                    let chars: Vec<char> = s.chars().collect();
+                    let sliced: String = chars[s_idx..e_idx].iter().collect();
+                    Ok(w_str_new(&sliced))
+                } else {
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut result = String::new();
+                    let mut i = s_idx as i64;
+                    while (step_val > 0 && i < e_idx as i64) || (step_val < 0 && i > e_idx as i64) {
+                        if (i as usize) < chars.len() {
+                            result.push(chars[i as usize]);
+                        }
+                        i += step_val;
+                    }
+                    Ok(w_str_new(&result))
+                }
+            } else if is_int(index) {
+                let idx = w_int_get_value(index);
+                let chars: Vec<char> = s.chars().collect();
+                let actual_idx = if idx < 0 {
+                    chars.len() as i64 + idx
+                } else {
+                    idx
+                } as usize;
+                if actual_idx < chars.len() {
+                    Ok(w_str_new(&chars[actual_idx].to_string()))
+                } else {
+                    Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        "string index out of range",
+                    ))
+                }
+            } else {
+                Err(PyError::type_error("string indices must be integers"))
+            }
         } else if is_type(obj) {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
