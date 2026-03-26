@@ -1094,9 +1094,11 @@ pub trait Optimization {
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
     /// Called after preamble optimization to collect ops that bridges need to replay.
+    /// RPython passes `optimizer` for PtrInfo access. We pass `ctx`.
     fn produce_potential_short_preamble_ops(
         &self,
         _sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        _ctx: &OptContext,
     ) {
         // Default: no contribution
     }
