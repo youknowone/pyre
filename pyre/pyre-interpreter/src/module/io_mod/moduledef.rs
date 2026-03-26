@@ -92,6 +92,34 @@ pub fn init(ns: &mut PyNamespace) {
     );
 }
 
+/// `io` module — re-exports _io names + IOBase/RawIOBase etc. as stubs.
+/// Real io.py uses ABCMeta metaclass which requires metaclass support.
+pub fn init_io(ns: &mut PyNamespace) {
+    init(ns);
+    // Additional names io.py would define
+    namespace_store(ns, "IOBase", w_builtin_func_new("IOBase", stub_noop_ctor));
+    namespace_store(
+        ns,
+        "RawIOBase",
+        w_builtin_func_new("RawIOBase", stub_noop_ctor),
+    );
+    namespace_store(
+        ns,
+        "BufferedIOBase",
+        w_builtin_func_new("BufferedIOBase", stub_noop_ctor),
+    );
+    namespace_store(
+        ns,
+        "TextIOBase",
+        w_builtin_func_new("TextIOBase", stub_noop_ctor),
+    );
+    namespace_store(ns, "SEEK_SET", w_int_new(0));
+    namespace_store(ns, "SEEK_CUR", w_int_new(1));
+    namespace_store(ns, "SEEK_END", w_int_new(2));
+    namespace_store(ns, "Reader", w_builtin_func_new("Reader", stub_noop_ctor));
+    namespace_store(ns, "Writer", w_builtin_func_new("Writer", stub_noop_ctor));
+}
+
 fn stub_stringio(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(""))
 }

@@ -497,6 +497,40 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
         "count",
         w_builtin_func_new("count", crate::type_methods::tuple_method_count),
     );
+    namespace_store(
+        ns,
+        "__contains__",
+        w_builtin_func_new("__contains__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            Ok(pyre_object::w_bool_from(
+                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__len__",
+        w_builtin_func_new("__len__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            Ok(pyre_object::w_int_new(
+                unsafe { pyre_object::w_tuple_len(args[0]) } as i64,
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__iter__",
+        w_builtin_func_new("__iter__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            crate::space::py_iter(args[0])
+        }),
+    );
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
