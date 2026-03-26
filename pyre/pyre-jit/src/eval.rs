@@ -842,6 +842,110 @@ fn handle_jit_outcome(
     }
 }
 
+/// Materialize a virtual object from rd_virtuals_info.
+/// Each virtual has (descr_index, known_class, fieldnums) where fieldnums
+/// are tagged references (TAGBOX → dead_frame, TAGINT → inline, TAGCONST → pool).
+fn materialize_virtual_from_rd(
+    vidx: usize,
+    dead_frame: &[Value],
+    num_failargs: i32,
+    rd_consts: &[(i64, majit_ir::Type)],
+    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>)]>,
+) -> Value {
+    let Some(virtuals) = rd_virtuals_info else {
+        return Value::Ref(majit_ir::GcRef::NULL);
+    };
+    let Some((_descr_idx, known_class, fieldnums)) = virtuals.get(vidx) else {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit] materialize_virtual: vidx={vidx} out of range (len={})",
+                virtuals.len()
+            );
+        }
+        return Value::Ref(majit_ir::GcRef::NULL);
+    };
+    if majit_metainterp::majit_log_enabled() {
+        let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
+        eprintln!(
+            "[jit] materialize_virtual: vidx={vidx} known_class={known_class:?} fieldnums={fieldnums:?} rd_consts={rd_consts:?} INT_TYPE={int_type_addr:#x}",
+        );
+        for (i, &fnum) in fieldnums.iter().enumerate() {
+            let (val, tag) = majit_metainterp::resume::untag(fnum);
+            eprintln!("  field[{i}] tagged={fnum} → val={val} tag={tag}");
+        }
+    }
+    // Resolve field values from tagged numbering
+    let mut field_values = Vec::with_capacity(fieldnums.len());
+    for &tagged in fieldnums {
+        let (val, tagbits) = majit_metainterp::resume::untag(tagged);
+        let field_val = match tagbits {
+            majit_metainterp::resume::TAGBOX => {
+                let idx = if val < 0 {
+                    (val + num_failargs) as usize
+                } else {
+                    val as usize
+                };
+                dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
+            }
+            majit_metainterp::resume::TAGINT => Value::Int(val as i64),
+            majit_metainterp::resume::TAGCONST => {
+                let (c, tp) = rd_consts
+                    .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int));
+                match tp {
+                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
+                    majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
+                    _ => Value::Int(c),
+                }
+            }
+            _ => Value::Int(0), // TAGVIRTUAL — nested virtual, treat as 0 for now
+        };
+        field_values.push(field_val);
+    }
+    // Materialize the virtual object based on known_class (ob_type pointer).
+    // field_values[0] = ob_type (class pointer), field_values[1..] = payload.
+    // RPython resume.py: AbstractVirtualInfo.allocate_then_set_content.
+    let ob_type = known_class.unwrap_or_else(|| {
+        // No known_class: try field[0] (ob_type field at offset 0).
+        field_values
+            .first()
+            .map(|v| match v {
+                Value::Int(n) => *n,
+                Value::Ref(gc) => gc.0 as i64,
+                _ => 0,
+            })
+            .unwrap_or(0)
+    });
+    let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
+    let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
+    if ob_type == int_type_addr {
+        // W_IntObject: payload is field after ob_type (typically field[1]).
+        let payload = field_values
+            .get(1)
+            .map(|v| match v {
+                Value::Int(n) => *n,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        let ptr = pyre_object::intobject::w_int_new(payload);
+        Value::Ref(majit_ir::GcRef(ptr as usize))
+    } else if ob_type == float_type_addr {
+        let payload = field_values
+            .get(1)
+            .map(|v| match v {
+                Value::Float(f) => f.to_bits() as i64,
+                Value::Int(n) => *n,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        let ptr = pyre_object::floatobject::w_float_new(f64::from_bits(payload as u64));
+        Value::Ref(majit_ir::GcRef(ptr as usize))
+    } else {
+        Value::Ref(majit_ir::GcRef::NULL)
+    }
+}
+
 fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
     layout
         .exit_types
@@ -878,17 +982,63 @@ fn restore_guard_failure_for_loop(
             slots.join(", ")
         );
     }
-    // resume.py:1042-1057 rebuild_from_numbering parity: when rd_numb is
-    // available, decode the compact numbering to reconstruct ALL frame
-    // slots. raw_values only contains TAGBOX entries (liveboxes); TAGCONST
-    // and TAGVIRTUAL values come from rd_consts and materialization.
-    // rd_numb-based recovery ready but not yet activated end-to-end:
-    // number_all_guards produces rd_numb in optimizer output, but
-    // assemble_peeled_trace_with_jump_args rebuilds guard ops, losing
-    // the numbered fail_args. Needs post-assembly re-numbering pass.
-    let mut typed = decode_exit_layout_values(raw_values, exit_layout);
-    // Materialize virtual objects from rd_virtuals (ExitFrameLayout Virtual slots).
-    materialize_recovery_virtuals(&mut typed, exit_layout);
+    // RPython resume.py:rebuild_from_numbering parity: when rd_numb is present,
+    // reconstruct full interpreter state from compact resume data + dead frame.
+    // Dead frame has only liveboxes; constants and virtuals come from rd_numb.
+    let mut typed = if let (Some(rd_numb), Some(rd_consts)) =
+        (&exit_layout.rd_numb, &exit_layout.rd_consts)
+    {
+        let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+        let (_num_failargs, frames) =
+            majit_metainterp::resume::rebuild_from_numbering(rd_numb, rd_consts);
+        if let Some(frame) = frames.first() {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit] rebuild_from_numbering: {} values, dead_frame={} types",
+                    frame.values.len(),
+                    dead_frame_typed.len(),
+                );
+            }
+            frame
+                .values
+                .iter()
+                .map(|v| match v {
+                    majit_metainterp::resume::RebuiltValue::Box(i) => dead_frame_typed
+                        .get(*i)
+                        .cloned()
+                        .unwrap_or(majit_ir::Value::Int(0)),
+                    majit_metainterp::resume::RebuiltValue::Int(val) => {
+                        majit_ir::Value::Int(*val as i64)
+                    }
+                    majit_metainterp::resume::RebuiltValue::Const(val, tp) => match tp {
+                        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(*val as usize)),
+                        majit_ir::Type::Float => {
+                            majit_ir::Value::Float(f64::from_bits(*val as u64))
+                        }
+                        _ => majit_ir::Value::Int(*val),
+                    },
+                    majit_metainterp::resume::RebuiltValue::Virtual(vidx) => {
+                        // resume.py: materialize virtual from rd_virtuals.
+                        materialize_virtual_from_rd(
+                            *vidx,
+                            &dead_frame_typed,
+                            _num_failargs,
+                            rd_consts,
+                            exit_layout.rd_virtuals_info.as_deref(),
+                        )
+                    }
+                    majit_metainterp::resume::RebuiltValue::Unassigned => majit_ir::Value::Int(0),
+                })
+                .collect()
+        } else {
+            decode_exit_layout_values(raw_values, exit_layout)
+        }
+    } else {
+        let mut t = decode_exit_layout_values(raw_values, exit_layout);
+        // Legacy path: materialize virtuals from ExitRecoveryLayout.
+        materialize_recovery_virtuals(&mut t, exit_layout);
+        t
+    };
     // Check for remaining null Ref: if materialization replaced all virtual
     // slots, null_ref count is 0 and we proceed normally. If some slots
     // couldn't be materialized (incomplete rd_virtuals), fall back to

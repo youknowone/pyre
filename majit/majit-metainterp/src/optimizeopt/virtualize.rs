@@ -3862,14 +3862,14 @@ mod tests {
     #[test]
     fn test_guard_fail_args_virtual_not_forced() {
         // resume.py parity: virtual objects in guard fail_args should NOT be
-        // forced. Instead, rd_virtuals metadata should be recorded.
+        // forced. Instead, rd_numb encodes them as TAGVIRTUAL.
         //
         // p0 = new_with_vtable(descr=size1)
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [p0]
         //
-        // Expected: no NEW_WITH_VTABLE emitted, the guard has rd_virtuals
-        // with field value i10 as an extra fail_arg.
+        // Expected: no NEW_WITH_VTABLE emitted, the guard has rd_numb
+        // (compact resume numbering) and fail_args contains only liveboxes.
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3897,42 +3897,26 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
 
-        // The guard should be emitted with rd_virtuals metadata
+        // The guard should be emitted with rd_numb (compact resume numbering)
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        let rd_virtuals = guard_op
-            .rd_virtuals
-            .as_ref()
-            .expect("guard should have rd_virtuals");
-        assert_eq!(rd_virtuals.len(), 1, "one virtual entry expected");
+        assert!(
+            guard_op.rd_numb.is_some(),
+            "guard should have rd_numb (compact resume numbering)"
+        );
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "rd_virtuals should be None — virtual info is in rd_numb now"
+        );
 
-        let entry = &rd_virtuals[0];
-        assert_eq!(entry.fail_arg_index, 0, "virtual was at fail_arg index 0");
-        assert_eq!(entry.fields.len(), 1, "virtual has one field");
-
-        // The original fail_arg[0] should be OpRef::NONE (placeholder)
+        // fail_args contains only liveboxes (no virtual, no expanded field values)
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            fa[0].is_none(),
-            "original fail_arg slot should be OpRef::NONE"
-        );
-
-        // Field value should be in the extra fail_args
-        assert!(
-            fa.len() > 1,
-            "fail_args should have extra entries for field values; got len={}",
-            fa.len()
-        );
-
-        // The field's fail_arg_index should point to the extra entry
-        let (field_idx, field_fa_idx) = entry.fields[0];
-        assert_eq!(field_idx, 10, "field descr index should be 10");
-        assert_eq!(
-            field_fa_idx, 1,
-            "field value should be at fail_args index 1"
+            !fa.iter().any(|a| *a == OpRef(0)),
+            "virtual OpRef(0) should not appear in fail_args"
         );
     }
 
@@ -3944,8 +3928,8 @@ mod tests {
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [i30, p0, i40]
         //
-        // Expected: i30 and i40 are kept as-is, p0 becomes NONE with
-        // rd_virtuals entry, field value i10 appended to fail_args.
+        // New format: rd_numb encodes p0 as TAGVIRTUAL, fail_args contains
+        // only liveboxes (i30, i40 and the field value i10).
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3973,19 +3957,30 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        let rd_virtuals = guard_op
-            .rd_virtuals
-            .as_ref()
-            .expect("guard should have rd_virtuals");
-        assert_eq!(rd_virtuals.len(), 1);
-        assert_eq!(rd_virtuals[0].fail_arg_index, 1, "virtual at index 1");
+        assert!(
+            guard_op.rd_numb.is_some(),
+            "guard should have rd_numb (compact resume numbering)"
+        );
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "rd_virtuals should be None — virtual info is in rd_numb now"
+        );
 
+        // fail_args contains only liveboxes (virtual p0 is not present)
         let fa = guard_op.fail_args.as_ref().unwrap();
-        // fa[0] = i30, fa[1] = NONE (virtual placeholder), fa[2] = i40, fa[3] = field value
-        assert_eq!(fa[0], OpRef(30));
-        assert!(fa[1].is_none());
-        assert_eq!(fa[2], OpRef(40));
-        assert_eq!(fa.len(), 4, "3 original + 1 field value");
+        assert!(
+            !fa.iter().any(|a| *a == OpRef(0)),
+            "virtual OpRef(0) should not appear in fail_args"
+        );
+        // Non-virtual boxes should still be present as liveboxes
+        assert!(
+            fa.iter().any(|a| *a == OpRef(30)),
+            "non-virtual OpRef(30) should be in fail_args"
+        );
+        assert!(
+            fa.iter().any(|a| *a == OpRef(40)),
+            "non-virtual OpRef(40) should be in fail_args"
+        );
     }
 
     #[test]
@@ -4038,10 +4033,20 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        let rd_virtuals = guard_op.rd_virtuals.as_ref().unwrap();
-        assert_eq!(rd_virtuals.len(), 1);
-        assert!(rd_virtuals[0].known_class.is_none(), "struct has no class");
-        assert_eq!(rd_virtuals[0].fields.len(), 1);
+        assert!(
+            guard_op.rd_numb.is_some(),
+            "guard should have rd_numb (compact resume numbering)"
+        );
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "rd_virtuals should be None — virtual info is in rd_numb now"
+        );
+        // fail_args contains only liveboxes (no virtual)
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert!(
+            !fa.iter().any(|a| *a == OpRef(0)),
+            "virtual OpRef(0) should not appear in fail_args"
+        );
     }
 
     #[test]
@@ -4069,14 +4074,21 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        let rd_virtuals = guard_op.rd_virtuals.as_ref().unwrap();
-        assert_eq!(rd_virtuals.len(), 1);
-        assert_eq!(rd_virtuals[0].fields.len(), 2, "virtual has two fields");
+        assert!(
+            guard_op.rd_numb.is_some(),
+            "guard should have rd_numb (compact resume numbering)"
+        );
+        assert!(
+            guard_op.rd_virtuals.is_none(),
+            "rd_virtuals should be None — virtual info is in rd_numb now"
+        );
 
+        // fail_args contains only liveboxes (virtual and its fields are in rd_numb)
         let fa = guard_op.fail_args.as_ref().unwrap();
-        // fa[0] = NONE, fa[1] = field_a value, fa[2] = field_b value
-        assert!(fa[0].is_none());
-        assert_eq!(fa.len(), 3, "1 original + 2 field values");
+        assert!(
+            !fa.iter().any(|a| *a == OpRef(0)),
+            "virtual OpRef(0) should not appear in fail_args"
+        );
     }
 
     #[test]

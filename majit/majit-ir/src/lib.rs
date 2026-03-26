@@ -12,7 +12,7 @@ pub use descr::{
 };
 pub use resoperation::{
     BoxEnv, GuardPendingFieldEntry, GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef,
-    ResumeDataEncoder, format_trace,
+    format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,

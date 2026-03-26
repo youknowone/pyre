@@ -290,16 +290,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if let Some(val) = self.ctx.get_constant(opref) {
             return val.get_type();
         }
-        // PtrInfo presence → Ref type
-        if self.ctx.get_ptr_info(opref).is_some() {
-            return majit_ir::Type::Ref;
-        }
-        // Fall back to operation result type
+        // Check emitted op result type first (most accurate for concrete values)
         let resolved = self.ctx.get_replacement(opref);
         for op in &self.ctx.new_operations {
             if op.pos == resolved {
                 return op.result_type();
             }
+        }
+        // PtrInfo presence → Ref type (for non-emitted ops like input args)
+        if self.ctx.get_ptr_info(opref).is_some() {
+            return majit_ir::Type::Ref;
         }
         majit_ir::Type::Int
     }

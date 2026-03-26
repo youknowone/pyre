@@ -138,6 +138,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
+    pub(crate) rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
 }
 
 impl StoredExitLayout {
@@ -154,6 +155,7 @@ impl StoredExitLayout {
             resume_layout: self.resume_layout.clone(),
             rd_numb: self.rd_numb.clone(),
             rd_consts: self.rd_consts.clone(),
+            rd_virtuals_info: self.rd_virtuals_info.clone(),
         }
     }
 }
@@ -489,6 +491,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             })
     }
 
@@ -515,6 +518,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             })
     }
 
@@ -561,6 +565,7 @@ impl<M: Clone> MetaInterp<M> {
                             .and_then(|existing| existing.resume_layout.clone()),
                         rd_numb: None,
                         rd_consts: None,
+                        rd_virtuals_info: None,
                     },
                 );
             }
@@ -614,6 +619,7 @@ impl<M: Clone> MetaInterp<M> {
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
                             rd_numb: None,
                             rd_consts: None,
+                            rd_virtuals_info: None,
                         },
                     },
                 );
@@ -806,8 +812,6 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::GcRef(ptr as usize)
             }
         }));
-        // optimizer.py:732 — inject ResumeDataLoopMemo as resume encoder.
-        opt.resume_encoder = Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
         opt
     }
 
@@ -1649,9 +1653,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
-        unroll_opt.resume_encoder_factory = Some(Box::new(|| {
-            Box::new(crate::resume::ResumeDataLoopMemoEncoder::new())
-        }));
         // history.py: carry retraced_count across recompilations
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -1717,8 +1718,6 @@ impl<M: Clone> MetaInterp<M> {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types;
-                        simple_opt.resume_encoder =
-                            Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2232,9 +2231,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
-        unroll_opt.resume_encoder_factory = Some(Box::new(|| {
-            Box::new(crate::resume::ResumeDataLoopMemoEncoder::new())
-        }));
         unroll_opt.retraced_count = self
             .compiled_loops
             .get(&green_key)
@@ -2508,7 +2504,6 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.constant_types = constant_types;
-        optimizer.resume_encoder = Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches close_and_compile.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2993,6 +2988,7 @@ impl<M: Clone> MetaInterp<M> {
                     resume_layout,
                     rd_numb: None,
                     rd_consts: None,
+                    rd_virtuals_info: None,
                 }
             })
             .or(trace_layout)
@@ -3013,6 +3009,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -3122,6 +3119,7 @@ impl<M: Clone> MetaInterp<M> {
                     resume_layout,
                     rd_numb: None,
                     rd_consts: None,
+                    rd_virtuals_info: None,
                 }
             })
             .or(trace_layout)
@@ -3142,6 +3140,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -3268,6 +3267,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -3447,6 +3447,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -4483,6 +4484,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         let reconstructed_state = exit_layout
             .resume_layout
@@ -6213,6 +6215,7 @@ mod tests {
                 resume_layout: Some(expected_layout.clone()),
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
         let mut traces = HashMap::new();
@@ -6408,6 +6411,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
 
@@ -6461,6 +6465,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
 
@@ -7589,6 +7594,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
         let mut terminal_exit_layouts = HashMap::new();
@@ -7604,6 +7610,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
         let mut traces = HashMap::new();
@@ -8266,6 +8273,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
 
@@ -8367,6 +8375,7 @@ mod tests {
                 resume_layout: Some(existing_resume),
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             },
         );
 

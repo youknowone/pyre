@@ -41,10 +41,12 @@ pub struct CompiledExitLayout {
     pub force_token_slots: Vec<usize>,
     pub recovery_layout: Option<ExitRecoveryLayout>,
     pub resume_layout: Option<ResumeLayoutSummary>,
-    /// resume.py:450 — compact resume numbering for rd_numb-based recovery.
+    /// resume.py:450 — compact resume numbering for this guard.
     pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — constant pool referenced by rd_numb.
+    /// resume.py:451 — shared constant pool.
     pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object blueprints (descr_index, known_class, fieldnums).
+    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
 }
 
 /// Typed result from running compiled code.
@@ -142,6 +144,10 @@ pub(crate) fn build_guard_metadata(
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
+        } else if let Some(ref types) = op.fail_arg_types {
+            // RPython parity: use optimizer-provided types when available.
+            // These are more accurate (BoxEnv.get_type follows forwarding).
+            types.clone()
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
@@ -167,10 +173,57 @@ pub(crate) fn build_guard_metadata(
             }
         }
 
-        // RPython parity: build recovery_layout from rd_virtuals.
-        // resume.py: store_final_boxes stores VirtualInfo blueprints in the
-        // guard descriptor so guard failure can materialize virtual objects.
-        let recovery_layout = op.rd_virtuals.as_ref().map(|entries| {
+        // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
+        let rd_numb = op.rd_numb.clone();
+        let rd_consts = op.rd_consts.clone();
+        let rd_virtuals_info = op.rd_virtuals_info.clone();
+
+        // RPython parity: build recovery_layout.
+        // When rd_numb is available, use rebuild_from_numbering to determine
+        // which slots map to dead-frame values, constants, or virtuals.
+        // Otherwise fall back to the legacy rd_virtuals (GuardVirtualEntry) path.
+        let recovery_layout = if let Some(ref numb) = rd_numb {
+            use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout};
+            let consts = rd_consts.as_deref().unwrap_or(&[]);
+            let (_num_failargs, frames) = crate::resume::rebuild_from_numbering(numb, consts);
+            if !frames.is_empty() {
+                let frame = &frames[0];
+                let slots: Vec<ExitValueSourceLayout> = frame
+                    .values
+                    .iter()
+                    .map(|v| match v {
+                        crate::resume::RebuiltValue::Box(i) => ExitValueSourceLayout::ExitValue(*i),
+                        crate::resume::RebuiltValue::Int(val) => {
+                            ExitValueSourceLayout::Constant(*val as i64)
+                        }
+                        crate::resume::RebuiltValue::Const(val, _tp) => {
+                            ExitValueSourceLayout::Constant(*val)
+                        }
+                        crate::resume::RebuiltValue::Virtual(i) => {
+                            ExitValueSourceLayout::Virtual(*i)
+                        }
+                        crate::resume::RebuiltValue::Unassigned => {
+                            ExitValueSourceLayout::Constant(0)
+                        }
+                    })
+                    .collect();
+                Some(ExitRecoveryLayout {
+                    frames: vec![majit_codegen::ExitFrameLayout {
+                        trace_id: None,
+                        header_pc: None,
+                        source_guard: None,
+                        pc: 0,
+                        slots,
+                        slot_types: None,
+                    }],
+                    virtual_layouts: vec![],
+                    pending_field_layouts: vec![],
+                })
+            } else {
+                None
+            }
+        } else if let Some(ref entries) = op.rd_virtuals {
+            // Legacy path: use GuardVirtualEntry from encode_guard_virtuals.
             use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout, ExitVirtualLayout};
             let virtual_layouts: Vec<ExitVirtualLayout> = entries
                 .iter()
@@ -189,46 +242,6 @@ pub(crate) fn build_guard_metadata(
                         .collect(),
                 })
                 .collect();
-            // Convert op.rd_pendingfields to ExitPendingFieldLayout
-            let pending_field_layouts = op
-                .rd_pendingfields
-                .as_ref()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| {
-                            let fail_args = op.fail_args.as_ref()?;
-                            // Find target and value in fail_args
-                            let target_idx = fail_args.iter().position(|&a| a == entry.target)?;
-                            let value_idx = fail_args.iter().position(|&a| a == entry.value);
-                            let target = ExitValueSourceLayout::ExitValue(target_idx);
-                            let value = match value_idx {
-                                Some(idx) => ExitValueSourceLayout::ExitValue(idx),
-                                None => {
-                                    // Value might be a constant
-                                    ExitValueSourceLayout::Constant(entry.value.0 as i64)
-                                }
-                            };
-                            Some(majit_codegen::ExitPendingFieldLayout {
-                                descr_index: entry.descr_index,
-                                item_index: if entry.item_index >= 0 {
-                                    Some(entry.item_index as usize)
-                                } else {
-                                    None
-                                },
-                                is_array_item: entry.item_index >= 0,
-                                target,
-                                value,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // RPython resume.py parity: build ExitFrameLayout that maps
-            // each fail_args slot to ExitValue (direct) or Virtual(idx).
-            // This allows materialize_from_recovery_layout to find which
-            // null slots need virtual reconstruction.
             let frame_slots = if let Some(ref fa) = op.fail_args {
                 let mut virtual_map = std::collections::HashMap::new();
                 for (vidx, entry) in entries.iter().enumerate() {
@@ -246,7 +259,7 @@ pub(crate) fn build_guard_metadata(
             } else {
                 vec![]
             };
-            ExitRecoveryLayout {
+            Some(ExitRecoveryLayout {
                 frames: vec![majit_codegen::ExitFrameLayout {
                     trace_id: None,
                     header_pc: None,
@@ -256,9 +269,11 @@ pub(crate) fn build_guard_metadata(
                     slot_types: None,
                 }],
                 virtual_layouts,
-                pending_field_layouts,
-            }
-        });
+                pending_field_layouts: vec![],
+            })
+        } else {
+            None
+        };
 
         exit_layouts.insert(
             fail_index,
@@ -274,8 +289,9 @@ pub(crate) fn build_guard_metadata(
                 is_finish,
                 recovery_layout,
                 resume_layout,
-                rd_numb: op.rd_numb.clone(),
-                rd_consts: op.rd_consts.clone(),
+                rd_numb,
+                rd_consts,
+                rd_virtuals_info,
             },
         );
         fail_index += 1;
@@ -330,6 +346,7 @@ pub(crate) fn merge_backend_exit_layouts(
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         entry.source_op_index = layout.source_op_index;
         entry.exit_types = layout.fail_arg_types.clone();
@@ -527,6 +544,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
+                rd_virtuals_info: None,
             });
         entry.source_op_index = Some(layout.op_index);
         entry.exit_types = layout.exit_types.clone();
@@ -677,6 +695,7 @@ pub(crate) fn infer_terminal_exit_layout(
         resume_layout: None,
         rd_numb: None,
         rd_consts: None,
+        rd_virtuals_info: None,
     })
 }
 
@@ -702,6 +721,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     resume_layout: None,
                     rd_numb: None,
                     rd_consts: None,
+                    rd_virtuals_info: None,
                 },
             );
         }
