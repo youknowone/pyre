@@ -2683,16 +2683,21 @@ impl ResumeDataLoopMemo {
     /// resume.py:264 assign_number_to_box — returns a negative number.
     /// resume.py:264-273 assign_number_to_box(box, boxes).
     ///
-    /// TODO(ResumeDataVirtualAdder): RPython's version takes a `boxes`
-    /// list and mutates it: `boxes[-num - 1] = box` (for cached) or
-    /// `boxes.append(box)` (for new). This is used by
-    /// ResumeDataVirtualAdder.finish() to build the final fail_args.
-    /// Once ResumeDataVirtualAdder is ported, add the `boxes` parameter.
-    pub fn assign_number_to_box(&mut self, box_id: u32) -> i32 {
+    /// RPython version mutates `boxes` list:
+    /// - cached: `boxes[-num - 1] = box`
+    /// - new: `boxes.append(box); num = -len(boxes)`
+    pub fn assign_number_to_box(&mut self, box_id: u32, boxes: &mut Vec<u32>) -> i32 {
         if let Some(&num) = self.cached_boxes.get(&box_id) {
+            // resume.py:268: boxes[-num - 1] = box
+            let idx = (-num - 1) as usize;
+            if idx < boxes.len() {
+                boxes[idx] = box_id;
+            }
             return num;
         }
-        let num = -(self.cached_boxes.len() as i32) - 1;
+        // resume.py:270-271: boxes.append(box); num = -len(boxes)
+        boxes.push(box_id);
+        let num = -(boxes.len() as i32);
         self.cached_boxes.insert(box_id, num);
         num
     }
@@ -2859,6 +2864,55 @@ impl ResumeDataLoopMemo {
         numb_state.patch_current_size(0);
 
         Ok(numb_state)
+    }
+
+    /// resume.py:389-452 ResumeDataVirtualAdder.finish() parity.
+    ///
+    /// Called after `number()` to:
+    /// 1. Split liveboxes into TAGBOX (real fail_args) and TAGVIRTUAL (virtuals)
+    /// 2. Collect virtual field values into `rd_virtuals`
+    /// 3. Patch slot 1 with num_liveboxes
+    /// 4. Create rd_numb and rd_consts
+    ///
+    /// `numb_state`: output of `number()`
+    /// `virtual_entries`: virtual objects from optimizer's encode_guard_virtuals
+    ///   (maps fail_arg_index → GuardVirtualEntry)
+    ///
+    /// Returns `(rd_numb, rd_consts, liveboxes)`:
+    /// - `rd_numb`: encoded numbering bytes
+    /// - `rd_consts`: shared constant pool
+    /// - `liveboxes`: ordered list of (OpRef, tag_index) for real fail_args
+    pub fn finish(
+        &mut self,
+        mut numb_state: NumberingState,
+        virtual_entries: &[majit_ir::GuardVirtualEntry],
+    ) -> (Vec<u8>, Vec<(i64, majit_ir::Type)>, Vec<(u32, i32)>) {
+        // resume.py:406-411: split liveboxes into boxes and virtuals
+        let num_virtuals = numb_state.num_virtuals;
+        let num_boxes = numb_state.num_boxes;
+        let mut liveboxes: Vec<(u32, i32)> = Vec::with_capacity(num_boxes as usize);
+
+        for (&opref_id, &tagged) in &numb_state.liveboxes {
+            let (i, tagbits) = untag(tagged);
+            if tagbits == TAGBOX {
+                // resume.py:417: liveboxes[i] = box
+                liveboxes.push((opref_id, i));
+            }
+            // TAGVIRTUAL entries are already numbered — their field values
+            // are in virtual_entries (from encode_guard_virtuals).
+        }
+
+        // Sort liveboxes by tag index to match RPython's ordered array
+        liveboxes.sort_by_key(|&(_, i)| i);
+
+        // resume.py:447: numb_state.patch(1, len(liveboxes))
+        numb_state.writer.patch(1, liveboxes.len() as i32);
+
+        // resume.py:450-451: storage.rd_numb, storage.rd_consts
+        let rd_numb = numb_state.create_numbering();
+        let rd_consts = self.consts.clone();
+
+        (rd_numb, rd_consts, liveboxes)
     }
 
     /// Encode a `ResumeData` using the shared constant pool.
@@ -3028,6 +3082,20 @@ pub struct RebuiltFrame {
     pub jitcode_index: i32,
     pub pc: i32,
     pub values: Vec<RebuiltValue>,
+}
+
+/// resume.py:576-728 VirtualInfo parity.
+/// Describes a virtual object's fields for materialization.
+/// RPython uses a class hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
+/// We use a single struct with tagged field values.
+#[derive(Debug, Clone)]
+pub struct VirtualFieldValues {
+    /// Descriptor (type/class) for the virtual object.
+    pub descr: Option<majit_ir::DescrRef>,
+    /// Known class pointer (ob_type for NewWithVtable).
+    pub known_class: Option<i64>,
+    /// Tagged field values (i16 tags referencing consts/boxes/other virtuals).
+    pub fieldnums: Vec<i16>,
 }
 
 /// A single value decoded from tagged resume numbering.
@@ -4503,5 +4571,34 @@ mod tests {
         // Frame 1
         assert_eq!(rebuilt_frames[1].jitcode_index, 1);
         assert_eq!(rebuilt_frames[1].pc, 20);
+    }
+
+    #[test]
+    fn test_finish_produces_rd_numb_and_liveboxes() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.constants.insert(10001, (42i64, majit_ir::Type::Int));
+        env.virtuals.insert(2);
+        env.types.insert(2, majit_ir::Type::Ref);
+
+        let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
+        let numb_state = memo.number(&snapshot, &env).unwrap();
+        let (rd_numb, rd_consts, liveboxes) = memo.finish(numb_state, &[]);
+
+        // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)
+        assert_eq!(liveboxes.len(), 2);
+        // liveboxes are sorted by tag index
+        assert_eq!(liveboxes[0].0, 1); // OpRef(1) = box #0
+        assert_eq!(liveboxes[1].0, 3); // OpRef(3) = box #1
+
+        // rd_numb should be valid
+        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, &rd_consts);
+        assert_eq!(num_failargs, 2);
+        assert_eq!(rebuilt_frames.len(), 1);
+        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
+        assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Box(0));
+        assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Virtual(0));
+        assert_eq!(rebuilt_frames[0].values[3], RebuiltValue::Box(1));
     }
 }
