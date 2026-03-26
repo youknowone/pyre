@@ -492,7 +492,7 @@ impl<S: JitState> JitDriver<S> {
                     // pyjitpl.py:3158-3175 compile_loop parity: rebuild meta
                     // from the MergePoint that matched at close time.
                     // Gate: function-entry (header_pc=0) only until
-                    // compile_loop+raise_if_successful is fully ported.
+                    // optimize_bridge InvalidLoop is resolved.
                     let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
                     let meta = match hpc {
                         Some(0) => {
@@ -505,7 +505,6 @@ impl<S: JitState> JitDriver<S> {
                         _ => provisional_meta,
                     };
                     let outcome = self.meta.close_and_compile(&jump_args, meta);
-                    // Backedge traces: update merge_pc post-compile on success.
                     if hpc != Some(0) {
                         if let crate::pyjitpl::CompileOutcome::Compiled {
                             cut_header_pc: Some(cp),
@@ -768,6 +767,10 @@ impl<S: JitState> JitDriver<S> {
                         self.meta.compile_trace(green_key, &jump_args, None),
                         crate::pyjitpl::CompileOutcome::Compiled { .. }
                     ) {
+                        // pyjitpl.py:3196: raise_if_successful aborts the
+                        // meta-interp after a successful bridge compilation.
+                        self.meta.abort_trace(false);
+                        self.meta.warm_state.reset_function_counts();
                         self.sym = None;
                         self.trace_meta = None;
                         return Some(DetailedDriverRunOutcome::Jump {
