@@ -283,8 +283,12 @@ impl CodeWriter {
                 // Stack top is a Python object (True/False). We need to
                 // convert to raw 0/1 for branch_reg_zero.
                 Instruction::PopJumpIfFalse { delta } => {
-                    let target_py_pc =
-                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
+                    let target_py_pc = jump_target_forward(
+                        code,
+                        num_instrs,
+                        py_pc + 1,
+                        delta.get(op_arg).as_usize(),
+                    );
                     assembler.pop_r(obj_tmp0);
                     // truth_fn: PyObjectRef → 0/1 (truthiness check)
                     assembler.call_int_typed(
@@ -298,8 +302,12 @@ impl CodeWriter {
                 }
 
                 Instruction::PopJumpIfTrue { delta } => {
-                    let target_py_pc =
-                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
+                    let target_py_pc = jump_target_forward(
+                        code,
+                        num_instrs,
+                        py_pc + 1,
+                        delta.get(op_arg).as_usize(),
+                    );
                     // Invert: branch_reg_zero branches if zero, but we want
                     // branch if nonzero. Emit: tmp0 = (tmp0 == 0), then
                     // branch_reg_zero.
@@ -318,8 +326,12 @@ impl CodeWriter {
 
                 // RPython flatten.py: goto Label
                 Instruction::JumpForward { delta } => {
-                    let target_py_pc =
-                        jump_target_forward(num_instrs, py_pc + 1, delta.get(op_arg).as_usize());
+                    let target_py_pc = jump_target_forward(
+                        code,
+                        num_instrs,
+                        py_pc + 1,
+                        delta.get(op_arg).as_usize(),
+                    );
                     if target_py_pc < num_instrs {
                         assembler.jump(labels[target_py_pc]);
                     }
@@ -425,9 +437,15 @@ impl CodeWriter {
 // Jump target calculation (RPython: flatten.py link following)
 // ---------------------------------------------------------------------------
 
-/// Forward jump target: next_instr + delta.
-fn jump_target_forward(num_instrs: usize, next_instr: usize, delta: usize) -> usize {
-    let target = next_instr + delta;
+/// Forward jump target: skip_caches(next_instr) + delta.
+/// Must match pyre-interpreter/opcode_step.rs:jump_target_forward.
+fn jump_target_forward(
+    code: &CodeObject,
+    num_instrs: usize,
+    next_instr: usize,
+    delta: usize,
+) -> usize {
+    let target = skip_caches(code, next_instr) + delta;
     target.min(num_instrs)
 }
 
