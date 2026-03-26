@@ -1204,18 +1204,23 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
             continue; // null target — skip
         }
         // resume.py:1003-1007: setfield or setarrayitem on the target object.
-        // In pyre, objects are GC-managed with field offsets from FieldDescr.
-        // The field write is a raw pointer store at target + offset.
-        // For now, log the replay. Actual field write requires descr → offset
-        // mapping which is available in the compilation metadata.
+        // Raw pointer store at target + field_offset.
+        let addr = target_ptr as usize + pf.field_offset;
+        unsafe {
+            match pf.field_size {
+                8 => std::ptr::write(addr as *mut i64, value_raw),
+                4 => std::ptr::write(addr as *mut i32, value_raw as i32),
+                2 => std::ptr::write(addr as *mut i16, value_raw as i16),
+                1 => std::ptr::write(addr as *mut u8, value_raw as u8),
+                _ => {}
+            }
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] replay_pending_field: descr={} target={:#x} value={:#x} array_idx={:?}",
-                pf.descr_index, target_ptr as usize, value_raw as usize, pf.item_index
+                "[jit] replay_pending_field: offset={} size={} target={:#x} value={:#x}",
+                pf.field_offset, pf.field_size, target_ptr as usize, value_raw as usize
             );
         }
-        // TODO: implement actual field write using descr_index → offset lookup
-        // from the compiled trace's field descriptor table.
     }
 }
 

@@ -279,6 +279,40 @@ pub(crate) fn build_guard_metadata(
                         .collect(),
                 })
                 .collect();
+            // Convert op.rd_pendingfields to ExitPendingFieldLayout
+            let pending_field_layouts: Vec<majit_codegen::ExitPendingFieldLayout> = op
+                .rd_pendingfields
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let fail_args = op.fail_args.as_ref()?;
+                            let target_idx = fail_args.iter().position(|&a| a == entry.target)?;
+                            let value_idx = fail_args.iter().position(|&a| a == entry.value);
+                            let target = ExitValueSourceLayout::ExitValue(target_idx);
+                            let value = match value_idx {
+                                Some(idx) => ExitValueSourceLayout::ExitValue(idx),
+                                None => ExitValueSourceLayout::Constant(entry.value.0 as i64),
+                            };
+                            Some(majit_codegen::ExitPendingFieldLayout {
+                                descr_index: entry.descr_index,
+                                item_index: if entry.item_index >= 0 {
+                                    Some(entry.item_index as usize)
+                                } else {
+                                    None
+                                },
+                                is_array_item: entry.item_index >= 0,
+                                target,
+                                value,
+                                field_offset: entry.field_offset,
+                                field_size: entry.field_size,
+                                field_type: entry.field_type,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let frame_slots = if let Some(ref fa) = op.fail_args {
                 let mut virtual_map = std::collections::HashMap::new();
                 for (vidx, entry) in entries.iter().enumerate() {
