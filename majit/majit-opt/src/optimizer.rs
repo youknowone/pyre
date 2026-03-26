@@ -2628,10 +2628,17 @@ impl Optimizer {
                 ctx.get_ptr_info(resolved)
                     .is_some_and(|info| info.is_virtual())
             });
-            // Also check for NONE entries without rd_virtuals — Phase 2
-            // guards inherit NONE from Phase 1 but lack GuardVirtualEntry.
-            let has_unresolved_none =
-                op.rd_virtuals.is_none() && fa_ref.iter().any(|fa| fa.is_none());
+            // Check for NONE entries not covered by existing rd_virtuals.
+            // Phase 2 guards may have NONE at positions where Phase 1's
+            // store_final_boxes_in_guard forwarded a value to virtual, but
+            // the forwarding isn't recorded in exported_jump_virtuals.
+            let has_unresolved_none = fa_ref.iter().enumerate().any(|(idx, fa)| {
+                fa.is_none()
+                    && op
+                        .rd_virtuals
+                        .as_ref()
+                        .map_or(true, |rvs| !rvs.iter().any(|e| e.fail_arg_index == idx))
+            });
             if !has_late_virtual && !has_unresolved_none {
                 continue;
             }
