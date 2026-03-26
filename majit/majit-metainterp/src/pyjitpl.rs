@@ -239,6 +239,20 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) previous_tokens: Vec<JitCellToken>,
 }
 
+/// compile.py compile_trace return parity.
+/// Indicates the result of bridge compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeCompileResult {
+    /// Bridge was compiled and attached to the guard.
+    Compiled,
+    /// Bridge compilation failed.
+    Failed,
+    /// Optimizer requested retrace (no matching target token).
+    /// The tracing context is intact — caller should continue tracing.
+    /// pyjitpl.py:3196: compile_trace returns None → MetaInterp continues.
+    RetraceNeeded,
+}
+
 /// pyjitpl.py: partial trace saved from a failed bridge compilation.
 ///
 /// When `compile_trace` (bridge path) fails to close the loop and sets
@@ -342,6 +356,9 @@ pub struct MetaInterp<M: Clone> {
     /// loop depends on. After compilation, the caller registers the loop's
     /// invalidation flag on each dep. Cleared on each compile attempt.
     pub last_quasi_immutable_deps: Vec<(u64, u32)>,
+    /// Set by compile_bridge when optimizer returns retrace_requested=true.
+    /// Checked by compile_bridge_trace to return RetraceNeeded.
+    pub(crate) retrace_after_bridge: bool,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -645,6 +662,7 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
+            retrace_after_bridge: false,
         }
     }
 
@@ -3894,25 +3912,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
         ends_with_jump: bool,
-    ) -> bool {
-        if ends_with_jump {
-            // Validate JUMP target exists.
-            let has_targets = self
-                .compiled_loops
-                .get(&green_key)
-                .map_or(false, |c| !c.front_target_tokens.is_empty());
-            if !has_targets {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] compile_bridge_trace: no target tokens for key={}, aborting",
-                        green_key
-                    );
-                }
-                // Caller (jitdriver.rs) should route to close_and_compile
-                // for retrace when no targets exist. This is a safety fallback.
-                return false;
-            }
-        }
+    ) -> BridgeCompileResult {
         if ends_with_jump {
             // Validate arg count matches loop inputargs.
             let input_len = self
@@ -3924,25 +3924,30 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .map(|(_, t)| t.inputargs.len())
                 .unwrap_or(0);
-            if input_len != finish_args.len() {
-                return false;
+            if input_len > 0 && input_len != finish_args.len() {
+                return BridgeCompileResult::Failed;
             }
         }
 
-        self.forced_virtualizable = None;
-        let ctx = match self.tracing.take() {
+        // pyjitpl.py:3185-3196 compile_trace parity:
+        // Save position, record tentative JUMP, compile, then cut (finally).
+        let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
-            None => return false,
+            None => return BridgeCompileResult::Failed,
         };
-
-        let mut recorder = ctx.recorder;
+        ctx.apply_replacements();
+        let cut_at = ctx.recorder.get_position();
+        // pyjitpl.py:3188: self.potential_retrace_position = cut_at
+        self.potential_retrace_position = Some(cut_at);
         if ends_with_jump {
-            recorder.close_loop(finish_args);
+            ctx.recorder.close_loop(finish_args);
         } else {
-            recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+            ctx.recorder
+                .finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         }
-        let trace = recorder.get_trace();
-        let constants = ctx.constants.into_inner();
+        let ops = ctx.recorder.ops().to_vec();
+        let inputargs = ctx.recorder.inputargs().to_vec();
+        let constants = ctx.constants.snapshot();
 
         let label = if ends_with_jump { "jump" } else { "finish" };
         if crate::majit_log_enabled() {
@@ -3952,32 +3957,57 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
                 trace_id,
                 fail_index,
-                trace.ops.len()
+                ops.len()
             );
             eprintln!("--- bridge trace ({}, before opt) ---", label);
-            eprint!("{}", majit_ir::format_trace(&trace.ops, &constants));
+            eprint!("{}", majit_ir::format_trace(&ops, &constants));
         }
 
         let fail_descr = {
             let compiled = match self.compiled_loops.get(&green_key) {
                 Some(c) => c,
-                None => return false,
+                None => {
+                    self.cut_tentative_op(cut_at);
+                    return BridgeCompileResult::Failed;
+                }
             };
             let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
                 Some(descr) => descr,
-                None => return false,
+                None => {
+                    self.cut_tentative_op(cut_at);
+                    return BridgeCompileResult::Failed;
+                }
             };
             Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
         };
 
-        self.compile_bridge(
+        self.forced_virtualizable = None;
+        let result = self.compile_bridge(
             green_key,
             fail_index,
             &*fail_descr,
-            &trace.ops,
-            &trace.inputargs,
+            &ops,
+            &inputargs,
             constants,
-        )
+        );
+        // pyjitpl.py:3195 — finally: self.history.cut(cut_at)
+        self.cut_tentative_op(cut_at);
+        match result {
+            true => BridgeCompileResult::Compiled,
+            false if self.retrace_after_bridge => {
+                self.retrace_after_bridge = false;
+                BridgeCompileResult::RetraceNeeded
+            }
+            false => BridgeCompileResult::Failed,
+        }
+    }
+
+    /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
+    fn cut_tentative_op(&mut self, cut_at: majit_trace::recorder::TracePosition) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.recorder.unfinalize();
+            ctx.recorder.cut(cut_at);
+        }
     }
 
     /// Legacy wrapper: close_bridge = compile_bridge_trace(ends_with_jump=true)
@@ -3987,7 +4017,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         finish_args: &[OpRef],
-    ) -> bool {
+    ) -> BridgeCompileResult {
         self.compile_bridge_trace(green_key, trace_id, fail_index, finish_args, vec![], true)
     }
 
@@ -3999,7 +4029,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
-    ) -> bool {
+    ) -> BridgeCompileResult {
         self.compile_bridge_trace(
             green_key,
             trace_id,
@@ -4114,9 +4144,9 @@ impl<M: Clone> MetaInterp<M> {
             bridge_knowledge.as_ref(),
         );
         if retrace_requested {
-            // RPython compile.py:1068-1073 parity: InvalidLoop during bridge
-            // optimization → abort bridge compilation. Add target token for
-            // future retrace attempts, but do NOT compile this bridge.
+            // compile.py:1079-1086 parity: optimizer found no matching
+            // target token. Add a new target token from the exported state,
+            // signal retrace needed so the caller continues tracing.
             compiled.retraced_count += 1;
             if let Some(exported) = optimizer.exported_loop_state.take() {
                 let mut new_token = crate::optimizeopt::unroll::TargetToken::new_preamble(
@@ -4127,10 +4157,11 @@ impl<M: Clone> MetaInterp<M> {
             }
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] bridge retrace needed (InvalidLoop): key={} — aborting bridge",
+                    "[jit] bridge retrace needed: key={} — continue tracing",
                     green_key
                 );
             }
+            self.retrace_after_bridge = true;
             return false;
         }
 
