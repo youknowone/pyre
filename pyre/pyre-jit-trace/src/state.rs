@@ -4854,12 +4854,62 @@ impl MIFrame {
             // RPython pyjitpl.py:3390: class_of_last_exc_is_const = True
             self.sym_mut().class_of_last_exc_is_const = true;
 
-            // TODO(exception-path-tracing): pyjitpl.py:2506 finishframe_exception
-            // finds catch_exception handler → frame.pc = target → ChangeFrame
-            // (continues tracing through the handler inline).
-            // Blocked: code size in this compilation unit causes Rust codegen
-            // regression in eval_loop_jit. Requires pyre-jit-trace crate
-            // split to isolate MIFrame monomorphization.
+            // pyjitpl.py:2506 finishframe_exception: unwind symbolic + concrete
+            // stack to handler depth, push exception, continue at handler_pc.
+            //
+            // This is the RPython-parity implementation. It requires bridge
+            // compilation (Phase 3) to work efficiently: without bridges,
+            // the non-exception path hits GUARD_EXCEPTION every iteration
+            // and falls back to the interpreter. Gated behind MAJIT_EXC_TRACE
+            // until bridge compilation is ready.
+            if std::env::var("MAJIT_EXC_TRACE").is_ok() {
+                let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+                let nlocals = self.sym().nlocals;
+
+                // Symbolic stack is stack-only (nlocals offset removed).
+                // handler_depth counts from (nlocals + ncells) base, so
+                // ncells + handler_depth is the target symbolic_stack length.
+                let target_stack_len = ncells + handler_depth;
+                {
+                    let s = self.sym_mut();
+                    s.symbolic_stack.truncate(target_stack_len);
+                    s.symbolic_stack_types.truncate(target_stack_len);
+                    s.concrete_stack.truncate(target_stack_len);
+                    s.valuestackdepth = nlocals + target_stack_len;
+                    if entry.push_lasti {
+                        s.symbolic_stack.push(OpRef::NONE);
+                        s.symbolic_stack_types.push(Type::Ref);
+                        s.concrete_stack
+                            .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
+                        s.valuestackdepth += 1;
+                    }
+                    s.symbolic_stack.push(exc_opref);
+                    s.symbolic_stack_types.push(Type::Ref);
+                    s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
+                    s.valuestackdepth += 1;
+                }
+
+                // Sync concrete frame to match symbolic state.
+                let frame =
+                    unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+                let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
+                while frame.valuestackdepth > target_depth {
+                    frame.pop();
+                }
+                if entry.push_lasti {
+                    frame.push(pyre_object::w_int_new(pc as i64));
+                }
+                frame.push(exc_obj);
+
+                self.sym_mut().pending_next_instr = Some(handler_pc);
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][handle_possible_exception] continue at handler_pc={}",
+                        handler_pc
+                    );
+                }
+                return TraceAction::Continue;
+            }
             TraceAction::Abort
         } else {
             // TODO(exception-exit): RPython finishframe_exception (pyjitpl.py:
