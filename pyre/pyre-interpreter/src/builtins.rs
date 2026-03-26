@@ -335,13 +335,9 @@ fn isinstance_check(obj: PyObjectRef, cls: PyObjectRef) -> bool {
         if !is_type(cls) {
             return false;
         }
-        // Get the W_TypeObject for obj's type.
-        // For instances: w_instance_get_type.
-        // For builtins: type registry lookup via ob_type.
         let obj_type = if is_instance(obj) {
             w_instance_get_type(obj)
         } else {
-            // Builtin object → resolve via type registry (PyPy: space.type(w_obj))
             match crate::typedef::type_of(obj) {
                 Some(t) => t,
                 None => return false,
