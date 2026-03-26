@@ -2122,10 +2122,9 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // Instance __iter__
+        // Instance __iter__ — check type MRO and ATTR_TABLE
         if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            if let Some(method) = lookup_in_type_mro(w_type, "__iter__") {
+            if let Ok(method) = py_getattr(obj, "__iter__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
         }

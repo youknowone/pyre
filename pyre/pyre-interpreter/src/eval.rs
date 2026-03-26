@@ -328,10 +328,9 @@ impl IterOpcodeHandler for PyFrame {
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
+            // Check both type MRO and instance dict (ATTR_TABLE)
             if pyre_object::is_instance(iter) {
-                let w_type = pyre_object::w_instance_get_type(iter);
-                if let Some(iter_method) = crate::space::lookup_in_type_mro_pub(w_type, "__iter__")
-                {
+                if let Ok(iter_method) = crate::space::py_getattr(iter, "__iter__") {
                     let result = crate::space_call_function(iter_method, &[iter]);
                     self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
                     return Ok(());
