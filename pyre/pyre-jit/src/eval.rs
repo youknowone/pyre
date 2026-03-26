@@ -501,6 +501,16 @@ fn can_enter_jit_hook(
         None
     };
     if let Some(outcome) = outcome {
+        // RPython compile.py handle_fail parity: extract bridge request
+        // before consuming outcome. Bridge compilation happens after the
+        // driver borrow is released.
+        let bridge_request = match &outcome {
+            DetailedDriverRunOutcome::GuardFailure {
+                bridge_request: Some(req),
+                ..
+            } => Some(req.clone()),
+            _ => None,
+        };
         if majit_meta::majit_log_enabled() {
             let kind = match &outcome {
                 DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -547,6 +557,17 @@ fn can_enter_jit_hook(
                 }
             }
             JitAction::Continue => {}
+        }
+        // RPython compile.py handle_fail → _trace_and_compile_from_bridge:
+        // Compile bridge for guards that fail >= bridge_threshold times.
+        if let Some(req) = bridge_request {
+            crate::call_jit::jit_bridge_compile_for_guard(
+                req.green_key,
+                req.trace_id,
+                req.fail_index,
+                frame,
+                req.resume_pc,
+            );
         }
     }
     driver.meta_interp_mut().tracing_call_depth = None;
