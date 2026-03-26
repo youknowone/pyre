@@ -2555,28 +2555,8 @@ impl Optimizer {
             }
 
             // optimizer.py:732-748 — ResumeDataVirtualAdder.finish() parity.
-            // Phase 2 label args must be reverse-mapped to original inputargs
-            // BEFORE number() so that rd_numb TAGBOX indices match dead_frame slots.
-            let label_reverse: std::collections::HashMap<u32, OpRef> = self
-                .imported_label_args
-                .as_ref()
-                .zip(self.imported_label_source_slots.as_ref())
-                .map(|(labels, sources)| {
-                    labels
-                        .iter()
-                        .zip(sources.iter())
-                        .filter_map(|(label, source)| {
-                            (!source.is_none()).then_some((label.0, *source))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
             if let Some(ref fail_args) = op.fail_args {
-                let env = crate::optimizeopt::OptBoxEnv {
-                    ctx: &*ctx,
-                    label_reverse: label_reverse.clone(),
-                };
+                let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
                 // env.get_box_replacement() applies reverse mapping automatically,
                 // so number() sees Cranelift-resolvable OpRefs.
                 let snapshot = crate::resume::Snapshot::single_frame(0, fail_args.to_vec());
@@ -2690,10 +2670,7 @@ impl Optimizer {
             // Otherwise fall back to constant_types + PtrInfo heuristic.
             if op.rd_numb.is_some() {
                 if let Some(ref fa) = op.fail_args {
-                    let env = crate::optimizeopt::OptBoxEnv {
-                        ctx: &*ctx,
-                        label_reverse: label_reverse.clone(),
-                    };
+                    let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
                     let types: Vec<majit_ir::Type> = fa
                         .iter()
                         .map(|opref| {
