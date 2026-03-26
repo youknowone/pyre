@@ -78,11 +78,39 @@ impl PyreMetaInterp {
             };
             let code = unsafe { &*top.jitcode };
             // RPython _interpret() parity: all frames use cf.next_instr as PC.
-            let pc = top
+            // Skip trivia (Cache, ExtendedArg, etc.) — RPython's trace loop
+            // only processes real opcodes. Inline frame returns or branch
+            // targets can land on Cache instructions; skip forward to the
+            // next semantic opcode so orgpc is always a real opcode PC.
+            let mut pc = top
                 .owned_concrete_frame
                 .as_ref()
                 .map(|cf| cf.next_instr)
                 .unwrap_or(top.pc);
+            if pc >= code.instructions.len() {
+                return TraceAction::Abort;
+            }
+            // Advance past Cache/ExtendedArg/Nop/NotTaken/Resume trivia.
+            while pc < code.instructions.len() {
+                match pyre_interpreter::decode_instruction_at(code, pc) {
+                    Some((
+                        pyre_bytecode::bytecode::Instruction::Cache
+                        | pyre_bytecode::bytecode::Instruction::ExtendedArg
+                        | pyre_bytecode::bytecode::Instruction::Nop
+                        | pyre_bytecode::bytecode::Instruction::NotTaken,
+                        _,
+                    )) => {
+                        pc += 1;
+                        // Sync the concrete frame so subsequent steps see the
+                        // corrected PC.
+                        if let Some(ref mut cf) = top.owned_concrete_frame {
+                            cf.next_instr = pc;
+                        }
+                        top.pc = pc;
+                    }
+                    _ => break,
+                }
+            }
             if pc >= code.instructions.len() {
                 return TraceAction::Abort;
             }
@@ -118,7 +146,10 @@ impl PyreMetaInterp {
             // RPython perform_call: callee deferred via pending_inline_frame.
             let top = self.framestack.last_mut().unwrap();
             let sym = unsafe { &mut *top.sym };
-            let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+            let next_pc = sym
+                .pending_next_instr
+                .take()
+                .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
             top.pc = next_pc;
             let result_idx = sym.stack_only_depth().checked_sub(1);
             // Root frame: don't pop from owned_concrete_frame — interpreter
@@ -134,7 +165,10 @@ impl PyreMetaInterp {
             TraceAction::Continue => {
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
-                let next_pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let next_pc = sym
+                    .pending_next_instr
+                    .take()
+                    .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
                 top.pc = next_pc;
                 // Sync concrete frame PC with symbolic PC.
                 if let Some(ref mut cf) = top.owned_concrete_frame {
@@ -172,7 +206,8 @@ impl PyreMetaInterp {
             if let Some(pending) = pending {
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
-                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let sfall = semantic_fallthrough_pc(code, pc);
+                top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
                 let result_idx = sym.stack_only_depth().checked_sub(1);
                 // Pop concrete call args from parent owned_concrete_frame
                 if let Some(ref mut cf) = top.owned_concrete_frame {
@@ -181,7 +216,7 @@ impl PyreMetaInterp {
                     }
                     let _ = cf.pop(); // null_or_self
                     let _ = cf.pop(); // callable
-                    cf.next_instr = pc + 1;
+                    cf.next_instr = sfall;
                 }
                 self.push_inline_frame(ctx, pending, result_idx);
                 return LoopAction::Continue;
@@ -193,7 +228,10 @@ impl PyreMetaInterp {
             super::state::InlineTraceStepAction::Trace(TraceAction::Continue) => {
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
-                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                top.pc = sym
+                    .pending_next_instr
+                    .take()
+                    .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
                 // Concrete execution step
                 self.concrete_execute_step();
                 LoopAction::Continue
@@ -215,8 +253,10 @@ impl PyreMetaInterp {
             super::state::InlineTraceStepAction::PushFrame(pending) => {
                 // trace_code_step_inline already took the pending frame
                 let top = self.framestack.last_mut().unwrap();
+                let code = unsafe { &*top.jitcode };
                 let sym = unsafe { &mut *top.sym };
-                top.pc = sym.pending_next_instr.take().unwrap_or(pc + 1);
+                let sfall = semantic_fallthrough_pc(code, pc);
+                top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
                 let result_idx = sym.stack_only_depth().checked_sub(1);
                 if let Some(ref mut cf) = top.owned_concrete_frame {
                     for _ in 0..pending.nargs {
@@ -224,7 +264,7 @@ impl PyreMetaInterp {
                     }
                     let _ = cf.pop(); // null_or_self
                     let _ = cf.pop(); // callable
-                    cf.next_instr = pc + 1;
+                    cf.next_instr = sfall;
                 }
                 self.push_inline_frame(ctx, pending, result_idx);
                 LoopAction::Continue
