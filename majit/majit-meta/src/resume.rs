@@ -147,30 +147,8 @@ impl Snapshot {
     }
 }
 
-/// RPython resume.py:192-226 parity: box environment for _number_boxes.
-///
-/// Abstracts the operations RPython performs on boxes during snapshot
-/// numbering. Maps directly to RPython's box/Const/info API:
-/// - `get_box_replacement` → `box.get_box_replacement()` (forwarding)
-/// - `is_const` → `isinstance(box, Const)`
-/// - `get_const` → `const.getint()` / `const.getref_base()` etc.
-/// - `get_type` → `box.type` ('i'=Int, 'r'=Ref, 'f'=Float)
-/// - `is_virtual_ref` → `getptrinfo(box).is_virtual()` (Ref virtuals)
-/// - `is_virtual_raw` → `getrawptrinfo(box).is_virtual()` (Int virtuals)
-pub trait BoxEnv {
-    /// resume.py:202 — box.get_box_replacement()
-    fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef;
-    /// resume.py:204 — isinstance(box, Const)
-    fn is_const(&self, opref: majit_ir::OpRef) -> bool;
-    /// Constant value + type. Only valid when is_const returns true.
-    fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type);
-    /// resume.py:211,214 — box.type
-    fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type;
-    /// resume.py:212-213 — getptrinfo(box) is not None and info.is_virtual()
-    fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool;
-    /// resume.py:215-216 — getrawptrinfo(box) is not None and info.is_virtual()
-    fn is_virtual_raw(&self, opref: majit_ir::OpRef) -> bool;
-}
+/// Re-export BoxEnv from majit-ir.
+pub use majit_ir::BoxEnv;
 
 /// Simple BoxEnv implementation backed by constant/type HashMaps.
 /// Used in tests and for simple snapshot numbering.
@@ -4600,5 +4578,53 @@ mod tests {
         assert_eq!(rebuilt_frames[0].values[1], RebuiltValue::Box(0));
         assert_eq!(rebuilt_frames[0].values[2], RebuiltValue::Virtual(0));
         assert_eq!(rebuilt_frames[0].values[3], RebuiltValue::Box(1));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ResumeDataEncoder — majit-ir trait implementation
+// ═══════════════════════════════════════════════════════════════
+
+/// optimizer.py:732 parity — wraps ResumeDataLoopMemo for the optimizer.
+///
+/// The optimizer holds this via `Box<dyn ResumeDataEncoder>` to avoid
+/// circular crate dependencies (majit-opt cannot depend on majit-meta).
+pub struct ResumeDataLoopMemoEncoder {
+    memo: ResumeDataLoopMemo,
+}
+
+impl ResumeDataLoopMemoEncoder {
+    pub fn new() -> Self {
+        ResumeDataLoopMemoEncoder {
+            memo: ResumeDataLoopMemo::new(),
+        }
+    }
+}
+
+impl majit_ir::ResumeDataEncoder for ResumeDataLoopMemoEncoder {
+    fn encode_guard(
+        &mut self,
+        fail_args: &[majit_ir::OpRef],
+        env: &dyn majit_ir::BoxEnv,
+        virtual_entries: &[majit_ir::GuardVirtualEntry],
+    ) -> Result<(Vec<u8>, Vec<(i64, majit_ir::Type)>, Vec<majit_ir::OpRef>), ()> {
+        // Create a single-frame Snapshot from the guard's fail_args.
+        // RPython reads snapshot data from the trace via resume_position;
+        // in majit, fail_args on the guard op serve the same purpose.
+        let snapshot = Snapshot::single_frame(0, fail_args.to_vec());
+
+        // resume.py:403-405: memo.number(position, trace)
+        let numb_state = self.memo.number(&snapshot, env).map_err(|_| ())?;
+
+        // resume.py:406-451: ResumeDataVirtualAdder.finish(pendingfields)
+        let (rd_numb, rd_consts, liveboxes) = self.memo.finish(numb_state, virtual_entries);
+
+        // Convert liveboxes from (opref_id, tag_index) to ordered OpRef list.
+        let ordered_liveboxes: Vec<majit_ir::OpRef> = liveboxes
+            .iter()
+            .map(|&(opref_id, _)| majit_ir::OpRef(opref_id))
+            .collect();
+
+        Ok((rd_numb, rd_consts, ordered_liveboxes))
     }
 }

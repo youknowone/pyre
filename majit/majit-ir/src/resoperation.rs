@@ -62,6 +62,47 @@ pub struct GuardPendingFieldEntry {
     pub field_type: Type,
 }
 
+/// resume.py:192-226 parity: box environment for _number_boxes.
+///
+/// Abstracts the operations RPython performs on boxes during snapshot
+/// numbering. Used by ResumeDataLoopMemo.number() to tag each box.
+pub trait BoxEnv {
+    /// resume.py:202 — box.get_box_replacement()
+    fn get_box_replacement(&self, opref: OpRef) -> OpRef;
+    /// resume.py:204 — isinstance(box, Const)
+    fn is_const(&self, opref: OpRef) -> bool;
+    /// Constant value + type. Only valid when is_const returns true.
+    fn get_const(&self, opref: OpRef) -> (i64, Type);
+    /// resume.py:211,214 — box.type
+    fn get_type(&self, opref: OpRef) -> Type;
+    /// resume.py:212-213 — getptrinfo(box) is not None and info.is_virtual()
+    fn is_virtual_ref(&self, opref: OpRef) -> bool;
+    /// resume.py:215-216 — getrawptrinfo(box) is not None and info.is_virtual()
+    fn is_virtual_raw(&self, opref: OpRef) -> bool;
+}
+
+/// optimizer.py:732 — ResumeDataVirtualAdder interface for the optimizer.
+///
+/// Trait-based dependency inversion: majit-opt defines the consumer,
+/// majit-meta provides the implementation (wrapping ResumeDataLoopMemo).
+/// This avoids a circular dependency between the two crates.
+pub trait ResumeDataEncoder: Send {
+    /// resume.py:389-452 — ResumeDataVirtualAdder.finish() equivalent.
+    ///
+    /// Encodes a guard's fail_args into compact resume data:
+    /// 1. Creates Snapshot from fail_args
+    /// 2. Calls memo.number(snapshot, env) → NumberingState
+    /// 3. Calls memo.finish(numb_state, virtual_entries) → rd_numb + rd_consts
+    ///
+    /// Returns (rd_numb, rd_consts, ordered_liveboxes) or Err(()) on TagOverflow.
+    fn encode_guard(
+        &mut self,
+        fail_args: &[OpRef],
+        env: &dyn BoxEnv,
+        virtual_entries: &[GuardVirtualEntry],
+    ) -> Result<(Vec<u8>, Vec<(i64, Type)>, Vec<OpRef>), ()>;
+}
+
 /// A single IR operation.
 #[derive(Clone, Debug)]
 pub struct Op {
@@ -92,6 +133,12 @@ pub struct Op {
     /// creating extra guards from short preamble / virtual state.
     /// -1 means unset.
     pub rd_resume_position: i32,
+    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
+    /// Set by ResumeDataEncoder during store_final_boxes_in_guard.
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — shared constant pool referenced by rd_numb.
+    /// Each entry is (value, type) matching RPython's Const objects.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
 }
 
 impl Op {
@@ -106,6 +153,8 @@ impl Op {
             rd_virtuals: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
+            rd_numb: None,
+            rd_consts: None,
         }
     }
 
@@ -120,6 +169,8 @@ impl Op {
             rd_virtuals: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
+            rd_numb: None,
+            rd_consts: None,
         }
     }
 
