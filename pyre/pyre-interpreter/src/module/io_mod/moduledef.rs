@@ -73,23 +73,17 @@ pub fn init(ns: &mut PyNamespace) {
     );
     namespace_store(ns, "BlockingIOError", w_str_new("BlockingIOError"));
 
-    // Abstract base classes (stubs)
-    namespace_store(ns, "_IOBase", w_builtin_func_new("_IOBase", stub_noop_ctor));
-    namespace_store(
-        ns,
-        "_RawIOBase",
-        w_builtin_func_new("_RawIOBase", stub_noop_ctor),
-    );
-    namespace_store(
-        ns,
-        "_BufferedIOBase",
-        w_builtin_func_new("_BufferedIOBase", stub_noop_ctor),
-    );
-    namespace_store(
-        ns,
-        "_TextIOBase",
-        w_builtin_func_new("_TextIOBase", stub_noop_ctor),
-    );
+    // Abstract base classes as W_TypeObject (required for io.py class inheritance)
+    let obj_type = crate::typedef::get_object_type();
+    for name in &["_IOBase", "_RawIOBase", "_BufferedIOBase", "_TextIOBase"] {
+        let t = pyre_object::w_type_new(
+            name,
+            pyre_object::w_tuple_new(vec![obj_type]),
+            std::ptr::null_mut(),
+        );
+        unsafe { pyre_object::w_type_set_mro(t, vec![t, obj_type]) };
+        namespace_store(ns, name, t);
+    }
 }
 
 /// `io` module — re-exports _io names + IOBase/RawIOBase etc. as stubs.

@@ -1154,9 +1154,14 @@ impl OpcodeStepExecutor for PyFrame {
                 // Type object: check for classmethod in type's MRO
                 let raw = crate::space::lookup_in_type_mro_pub(obj, name);
                 match raw {
-                    // PyPy: ClassMethod.__get__(obj, klass) → bind class
                     Some(d) if pyre_object::is_classmethod(d) => obj,
-                    _ => PY_NULL,
+                    Some(_) => PY_NULL, // found in own MRO → no binding
+                    None => {
+                        // Not found in type's own MRO → check metaclass MRO.
+                        // If found there, bind obj (the type) as self.
+                        // PyPy: type.__getattribute__ metatype descriptor binding.
+                        obj
+                    }
                 }
             } else if crate::typedef::type_of(obj).is_some() && !pyre_object::is_module(obj) {
                 // Builtin type method (list.append, etc.) found via TypeDef.

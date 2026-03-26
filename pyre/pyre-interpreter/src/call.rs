@@ -736,7 +736,34 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let bases_tuple = pyre_object::w_tuple_new(base_args.to_vec());
 
-    build_class_inner(body_fn, name, bases_tuple, metaclass)
+    // If no explicit metaclass, infer from bases (PyPy: calculate_metaclass)
+    let effective_metaclass = metaclass.or_else(|| {
+        unsafe {
+            if !pyre_object::is_tuple(bases_tuple) {
+                return None;
+            }
+            let n = pyre_object::w_tuple_len(bases_tuple);
+            for i in 0..n {
+                if let Some(base) = pyre_object::w_tuple_getitem(bases_tuple, i as i64) {
+                    if pyre_object::is_type(base) {
+                        // Check if base has a custom metaclass
+                        let mc = crate::space::ATTR_TABLE.with(|table| {
+                            table
+                                .borrow()
+                                .get(&(base as usize))
+                                .and_then(|d| d.get("__metaclass__").copied())
+                        });
+                        if mc.is_some() {
+                            return mc;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    });
+
+    build_class_inner(body_fn, name, bases_tuple, effective_metaclass)
 }
 
 fn build_class_inner(
