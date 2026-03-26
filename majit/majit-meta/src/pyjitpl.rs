@@ -2445,11 +2445,31 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types;
         optimizer.resume_encoder = Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
-        let optimized_ops = optimizer.optimize_with_constants_and_inputs(
-            &trace_ops,
-            &mut constants,
-            trace.inputargs.len(),
-        );
+        // Wrap in catch_unwind — InvalidLoop during optimization should
+        // abort the trace, not crash the process. Matches close_and_compile.
+        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            optimizer.optimize_with_constants_and_inputs(
+                &trace_ops,
+                &mut constants,
+                trace.inputargs.len(),
+            )
+        }));
+        let optimized_ops = match optimize_result {
+            Ok(ops) => ops,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<majit_opt::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!("[jit] abort finish: InvalidLoop at key={}", green_key);
+                    }
+                    self.warm_state.abort_tracing(green_key, true);
+                    return;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
         let num_ops_after = optimized_ops.len();
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.

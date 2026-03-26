@@ -625,7 +625,10 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
 pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
     match sequence_getitem(seq as PyObjectRef, index as usize) {
         Ok(value) => value as i64,
-        Err(err) => panic!("sequence getitem failed in JIT: {err}"),
+        // Return PY_NULL on out-of-bounds — the guard after this call
+        // will detect the null and side-exit to the interpreter.
+        // RPython: residual calls that fail trigger guard failure, not crash.
+        Err(_) => pyre_object::PY_NULL as i64,
     }
 }
 
