@@ -1,12 +1,12 @@
 pub mod codewriter;
 pub mod descr;
 pub mod executor;
-pub mod frame_layout;
-pub mod helpers;
+pub use pyre_jit_trace::frame_layout;
+pub use pyre_jit_trace::helpers;
 pub mod metainterp;
 pub mod state;
 pub mod trace;
-pub mod virtualizable_spec;
+pub use pyre_jit_trace::virtualizable_spec;
 
 /// Auto-generated trace functions from majit-analyze.
 #[allow(dead_code, unused_imports)]

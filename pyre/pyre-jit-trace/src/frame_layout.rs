@@ -4,7 +4,7 @@ use pyre_bytecode::CodeObject;
 use pyre_interpreter::{PyExecutionContext, PyNamespace, PyObjectArray};
 use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PYOBJECT_ARRAY_PTR_OFFSET};
 
-use crate::jit::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
+use crate::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
 
 /// Shared PyFrame layout contract used by the interpreter and tracer.
 ///
