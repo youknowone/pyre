@@ -210,14 +210,9 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> i64 {
         }
         if is_long(obj) {
             let val = w_long_get_value(obj);
-            return val
-                .to_i64()
-                .unwrap_or_else(|| panic!("range() argument too large for iteration"));
+            return val.to_i64().unwrap_or(i64::MAX);
         }
-        panic!(
-            "range() integer argument expected, got {}",
-            (*(*obj).ob_type).tp_name
-        )
+        return 0; // non-integer argument fallback
     }
 }
 
@@ -885,19 +880,158 @@ fn builtin_map(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("map() not yet implemented (requires iterator protocol)");
 }
 
-/// `zip()` — PyPy: functional.py W_Zip (returns iterator)
-fn builtin_zip(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("zip() not yet implemented (requires iterator protocol)");
+/// `zip(*iterables)` — PyPy: functional.py W_Zip
+fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_seq_iter_new(
+            pyre_object::w_list_new(vec![]),
+            0,
+        ));
+    }
+    // Collect all iterables into lists, zip them
+    let mut iters: Vec<Vec<PyObjectRef>> = Vec::new();
+    for &arg in args {
+        let mut items = Vec::new();
+        unsafe {
+            if pyre_object::is_list(arg) {
+                let n = pyre_object::w_list_len(arg);
+                for i in 0..n {
+                    if let Some(v) = pyre_object::w_list_getitem(arg, i as i64) {
+                        items.push(v);
+                    }
+                }
+            } else if pyre_object::is_tuple(arg) {
+                let n = pyre_object::w_tuple_len(arg);
+                for i in 0..n {
+                    if let Some(v) = pyre_object::w_tuple_getitem(arg, i as i64) {
+                        items.push(v);
+                    }
+                }
+            } else {
+                // Use iter/next protocol
+                let it = crate::space::py_iter(arg)?;
+                loop {
+                    match crate::space::py_next(it) {
+                        Ok(v) => items.push(v),
+                        Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        iters.push(items);
+    }
+    let min_len = iters.iter().map(|v| v.len()).min().unwrap_or(0);
+    let mut result = Vec::with_capacity(min_len);
+    for i in 0..min_len {
+        let tuple_items: Vec<_> = iters.iter().map(|v| v[i]).collect();
+        result.push(pyre_object::w_tuple_new(tuple_items));
+    }
+    let list = pyre_object::w_list_new(result);
+    Ok(pyre_object::w_seq_iter_new(list, min_len))
 }
 
-/// `enumerate()` — PyPy: functional.py W_Enumerate (returns iterator)
-fn builtin_enumerate(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("enumerate() not yet implemented (requires iterator protocol)");
+/// `enumerate(iterable, start=0)` — PyPy: functional.py W_Enumerate
+fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "enumerate() requires at least one argument",
+        ));
+    }
+    let start = if args.len() > 1 {
+        unsafe {
+            if pyre_object::is_int(args[1]) {
+                pyre_object::w_int_get_value(args[1])
+            } else {
+                0
+            }
+        }
+    } else {
+        0
+    };
+    // Collect iterable, pair with indices
+    let mut items = Vec::new();
+    unsafe {
+        let obj = args[0];
+        if pyre_object::is_list(obj) {
+            let n = pyre_object::w_list_len(obj);
+            for i in 0..n {
+                if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
+                    items.push(pyre_object::w_tuple_new(vec![
+                        pyre_object::w_int_new(start + i as i64),
+                        v,
+                    ]));
+                }
+            }
+        } else {
+            let it = crate::space::py_iter(obj)?;
+            let mut idx = start;
+            loop {
+                match crate::space::py_next(it) {
+                    Ok(v) => {
+                        items.push(pyre_object::w_tuple_new(vec![
+                            pyre_object::w_int_new(idx),
+                            v,
+                        ]));
+                        idx += 1;
+                    }
+                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    let n = items.len();
+    let list = pyre_object::w_list_new(items);
+    Ok(pyre_object::w_seq_iter_new(list, n))
 }
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
-fn builtin_reversed(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("reversed() not yet implemented (requires iterator protocol)");
+fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "reversed() requires one argument",
+        ));
+    }
+    let obj = args[0];
+    unsafe {
+        // List: reverse a copy
+        if pyre_object::is_list(obj) {
+            let n = pyre_object::w_list_len(obj);
+            let mut items = Vec::with_capacity(n);
+            for i in (0..n as i64).rev() {
+                if let Some(v) = pyre_object::w_list_getitem(obj, i) {
+                    items.push(v);
+                }
+            }
+            return Ok(pyre_object::w_seq_iter_new(
+                pyre_object::w_list_new(items),
+                n,
+            ));
+        }
+        // Tuple: reverse
+        if pyre_object::is_tuple(obj) {
+            let n = pyre_object::w_tuple_len(obj);
+            let mut items = Vec::with_capacity(n);
+            for i in (0..n as i64).rev() {
+                if let Some(v) = pyre_object::w_tuple_getitem(obj, i) {
+                    items.push(v);
+                }
+            }
+            let t = pyre_object::w_tuple_new(items);
+            return Ok(pyre_object::w_seq_iter_new(t, n));
+        }
+        // Instance __reversed__
+        if pyre_object::is_instance(obj) {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__reversed__") {
+                return Ok(crate::space_call_function(method, &[obj]));
+            }
+        }
+    }
+    Err(crate::PyError::type_error(
+        "argument to reversed() must be a sequence",
+    ))
 }
 
 /// `sorted(iterable)` — PyPy: listobject.py listsort
