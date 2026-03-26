@@ -260,15 +260,19 @@ fn load_source_module(
     pathname: &Path,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let source = std::fs::read_to_string(pathname).map_err(|e| crate::PyError {
-        kind: crate::PyErrorKind::ImportError,
-        message: format!("cannot read '{}': {e}", pathname.display()),
+    let source = std::fs::read_to_string(pathname).map_err(|e| {
+        crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("cannot read '{}': {e}", pathname.display()),
+        )
     })?;
 
     let pathname_str = pathname.to_string_lossy();
-    let code = parse_source_module(&pathname_str, &source).map_err(|e| crate::PyError {
-        kind: crate::PyErrorKind::ImportError,
-        message: format!("cannot compile '{}': {e}", pathname.display()),
+    let code = parse_source_module(&pathname_str, &source).map_err(|e| {
+        crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("cannot compile '{}': {e}", pathname.display()),
+        )
     })?;
 
     // Create a fresh namespace for the module, seeded with builtins.
@@ -345,9 +349,11 @@ fn load_part(
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // PyPy: getbuiltinmodule() path
-            load_builtin_module(partname).ok_or_else(|| crate::PyError {
-                kind: crate::PyErrorKind::ImportError,
-                message: format!("builtin module '{modulename}' failed to initialize"),
+            load_builtin_module(partname).ok_or_else(|| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("builtin module '{modulename}' failed to initialize"),
+                )
             })?
         }
     };
@@ -374,10 +380,10 @@ fn absolute_import(
         let full_name = prefix.join(".");
         let w_mod = load_part(&full_name, part, execution_context)?;
         let Some(module) = w_mod else {
-            return Err(crate::PyError {
-                kind: crate::PyErrorKind::ImportError,
-                message: format!("No module named '{modulename}'"),
-            });
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ImportError,
+                format!("No module named '{modulename}'"),
+            ));
         };
         if level == 0 {
             first = Some(module);
@@ -394,9 +400,11 @@ fn absolute_import(
     }
 
     // `import X.Y` → return the top-level module (X)
-    first.ok_or_else(|| crate::PyError {
-        kind: crate::PyErrorKind::ImportError,
-        message: format!("No module named '{modulename}'"),
+    first.ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("No module named '{modulename}'"),
+        )
     })
 }
 
@@ -414,19 +422,19 @@ pub fn importhook(
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     if name.is_empty() && level < 0 {
-        return Err(crate::PyError {
-            kind: crate::PyErrorKind::ValueError,
-            message: "Empty module name".to_string(),
-        });
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "Empty module name",
+        ));
     }
 
     // Level 0 = absolute import (the common case)
     // Level > 0 = relative import (not yet supported)
     if level > 0 {
-        return Err(crate::PyError {
-            kind: crate::PyErrorKind::ImportError,
-            message: format!("relative imports not yet supported (level={level})"),
-        });
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("relative imports not yet supported (level={level})"),
+        ));
     }
 
     absolute_import(name, w_fromlist, execution_context)
@@ -452,10 +460,10 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // Fallback: try py_getattr (for non-module objects or attrs set via setattr)
     match crate::space::py_getattr(module, name) {
         Ok(value) => Ok(value),
-        Err(_) => Err(crate::PyError {
-            kind: crate::PyErrorKind::ImportError,
-            message: format!("cannot import name '{name}'"),
-        }),
+        Err(_) => Err(crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("cannot import name '{name}'"),
+        )),
     }
 }
 

@@ -574,9 +574,11 @@ pub fn namespace_get(namespace: &PyNamespace, name: &str) -> Option<PyObjectRef>
 }
 
 pub fn namespace_load(namespace: &PyNamespace, name: &str) -> Result<PyObjectRef, PyError> {
-    namespace_get(namespace, name).ok_or_else(|| PyError {
-        kind: PyErrorKind::NameError,
-        message: format!("name '{name}' is not defined"),
+    namespace_get(namespace, name).ok_or_else(|| {
+        PyError::new(
+            PyErrorKind::NameError,
+            format!("name '{name}' is not defined"),
+        )
     })
 }
 

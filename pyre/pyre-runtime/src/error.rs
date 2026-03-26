@@ -9,6 +9,9 @@ pub type PyResult = Result<PyObjectRef, PyError>;
 pub struct PyError {
     pub kind: PyErrorKind,
     pub message: String,
+    /// Cached W_ExceptionObject pointer — reused by to_exc_object()
+    /// to avoid re-allocating an exception object that already exists.
+    pub exc_object: PyObjectRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,10 +33,19 @@ pub enum PyErrorKind {
 }
 
 impl PyError {
+    pub fn new(kind: PyErrorKind, message: impl Into<String>) -> Self {
+        PyError {
+            kind,
+            message: message.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn type_error(msg: impl Into<String>) -> Self {
         PyError {
             kind: PyErrorKind::TypeError,
             message: msg.into(),
+            exc_object: std::ptr::null_mut(),
         }
     }
 
@@ -41,6 +53,7 @@ impl PyError {
         PyError {
             kind: PyErrorKind::ValueError,
             message: msg.into(),
+            exc_object: std::ptr::null_mut(),
         }
     }
 
@@ -48,6 +61,7 @@ impl PyError {
         PyError {
             kind: PyErrorKind::ZeroDivisionError,
             message: msg.into(),
+            exc_object: std::ptr::null_mut(),
         }
     }
 
@@ -55,6 +69,7 @@ impl PyError {
         PyError {
             kind: PyErrorKind::RuntimeError,
             message: msg.into(),
+            exc_object: std::ptr::null_mut(),
         }
     }
 
@@ -62,11 +77,16 @@ impl PyError {
         PyError {
             kind: PyErrorKind::StopIteration,
             message: String::new(),
+            exc_object: std::ptr::null_mut(),
         }
     }
 
     /// Convert to a W_ExceptionObject for pushing onto the value stack.
+    /// Reuses the cached object from from_exc_object() if available.
     pub fn to_exc_object(&self) -> PyObjectRef {
+        if !self.exc_object.is_null() {
+            return self.exc_object;
+        }
         w_exception_new(self.to_exc_kind(), &self.message)
     }
 
@@ -99,6 +119,7 @@ impl PyError {
         PyError {
             kind: Self::kind_from_exc(kind),
             message,
+            exc_object: obj,
         }
     }
 
