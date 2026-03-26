@@ -1502,6 +1502,12 @@ impl Optimizer {
             ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
         }
 
+        // RPython resume.py parity: pass snapshot_boxes and constant_types
+        // to OptContext so emit() can call store_final_boxes_in_guard inline
+        // at each guard emission (not post-assembly).
+        ctx.snapshot_boxes = self.snapshot_boxes.clone();
+        ctx.constant_types_for_numbering = self.constant_types.clone();
+
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
             ctx.make_constant(

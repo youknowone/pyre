@@ -256,6 +256,12 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
+    /// resume.py parity: per-guard snapshot boxes from tracing time.
+    /// Used by emit() to call store_final_boxes_in_guard inline (RPython
+    /// calls this during optimization, not post-assembly).
+    pub snapshot_boxes: HashMap<i32, Vec<OpRef>>,
+    /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
+    pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
 }
 
 /// resume.py:192-226 parity — BoxEnv for optimizer context.
@@ -366,6 +372,8 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
+            snapshot_boxes: HashMap::new(),
+            constant_types_for_numbering: HashMap::new(),
         }
     }
 
@@ -412,7 +420,8 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
-            // (import_boxes removed)
+            snapshot_boxes: HashMap::new(),
+            constant_types_for_numbering: HashMap::new(),
         }
     }
 
@@ -467,6 +476,13 @@ impl OptContext {
         // short_preamble_mapping entry, so get_replacement returns the body's
         // value rather than the preamble import.
         self.short_preamble_mapping.remove(&pos_ref);
+
+        // RPython optimizer.py:_emit_operation → store_final_boxes_in_guard:
+        // produce rd_numb inline at guard emission time, not post-assembly.
+        if op.opcode.is_guard() && !self.snapshot_boxes.is_empty() {
+            self.number_guard_inline(&mut op);
+        }
+
         self.new_operations.push(op);
         pos_ref
     }
@@ -880,6 +896,141 @@ impl OptContext {
             Value::Int(i) => Some(*i),
             _ => None,
         })
+    }
+
+    /// RPython optimizer.py:722-752 store_final_boxes_in_guard inline.
+    /// Called from emit() for every guard during optimization. Produces
+    /// rd_numb via memo.number() using the CURRENT optimizer state
+    /// (replacement chain, constants, virtual info).
+    fn number_guard_inline(&self, op: &mut Op) {
+        use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
+
+        let pos = op.rd_resume_position;
+        if pos < 0 {
+            return;
+        }
+        let Some(snapshot_boxes) = self.snapshot_boxes.get(&pos) else {
+            return;
+        };
+
+        // Build snapshot from tracing-time OpRefs.
+        let boxes: Vec<OpRef> = snapshot_boxes
+            .iter()
+            .map(|&opref| {
+                if opref.is_none() {
+                    OpRef::NONE
+                } else {
+                    self.get_replacement(opref)
+                }
+            })
+            .collect();
+        let snapshot = Snapshot::single_frame(0, boxes);
+
+        // BoxEnv bridging current optimizer state.
+        struct InlineBoxEnv<'a> {
+            ctx: &'a OptContext,
+        }
+        impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
+            fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+                opref // already resolved above
+            }
+            fn is_const(&self, opref: OpRef) -> bool {
+                self.ctx.is_constant(opref)
+            }
+            fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+                if let Some(val) = self.ctx.get_constant(opref) {
+                    match val {
+                        Value::Int(i) => (*i, majit_ir::Type::Int),
+                        Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                        Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                        Value::Void => (0, majit_ir::Type::Void),
+                    }
+                } else {
+                    (0, majit_ir::Type::Int)
+                }
+            }
+            fn get_type(&self, opref: OpRef) -> majit_ir::Type {
+                if let Some(val) = self.ctx.get_constant(opref) {
+                    return match val {
+                        Value::Int(_) => majit_ir::Type::Int,
+                        Value::Float(_) => majit_ir::Type::Float,
+                        Value::Ref(_) => majit_ir::Type::Ref,
+                        Value::Void => majit_ir::Type::Void,
+                    };
+                }
+                for o in &self.ctx.new_operations {
+                    if o.pos == opref {
+                        return o.result_type();
+                    }
+                }
+                majit_ir::Type::Ref
+            }
+            fn is_virtual_ref(&self, opref: OpRef) -> bool {
+                self.ctx
+                    .get_ptr_info(opref)
+                    .is_some_and(|info| info.is_virtual())
+            }
+            fn is_virtual_raw(&self, _opref: OpRef) -> bool {
+                false
+            }
+        }
+
+        let env = InlineBoxEnv { ctx: self };
+        let mut memo = ResumeDataLoopMemo::new();
+        let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
+            return;
+        };
+
+        // resume.py:406-417: extract TAGBOX entries → liveboxes.
+        let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
+        let mut liveboxes: Vec<OpRef> = vec![OpRef::NONE; n];
+        let mut virtual_boxes: Vec<(OpRef, i32)> = Vec::new();
+        for (&opref_id, &tagged) in &numb_state.liveboxes {
+            let (idx, tagbits) = resumedata::untag(tagged);
+            if tagbits == resumedata::TAGBOX && (idx as usize) < liveboxes.len() {
+                liveboxes[idx as usize] = OpRef(opref_id);
+            } else if tagbits == resumedata::TAGVIRTUAL {
+                virtual_boxes.push((OpRef(opref_id), idx));
+            }
+        }
+
+        // resume.py:419-426 + 444 _number_virtuals: append virtual field boxes.
+        let mut virtual_entries: Vec<majit_ir::GuardVirtualEntry> = Vec::new();
+        for (vbox, vidx) in &virtual_boxes {
+            let vinfo_opt = self.get_ptr_info(*vbox).cloned();
+            let (descr, known_class, fields_data) = match vinfo_opt {
+                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
+                    (vi.descr.clone(), vi.known_class, vi.fields.clone())
+                }
+                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
+                    (vi.descr.clone(), None, vi.fields.clone())
+                }
+                _ => continue,
+            };
+            let base_idx = liveboxes.len();
+            let mut fields = Vec::new();
+            for (fi, (field_idx, value_ref)) in fields_data.iter().enumerate() {
+                let resolved_val = self.get_replacement(*value_ref);
+                liveboxes.push(resolved_val);
+                fields.push((*field_idx, base_idx + fi));
+            }
+            virtual_entries.push(majit_ir::GuardVirtualEntry {
+                original_opref: Some(*vbox),
+                fail_arg_index: *vidx as usize,
+                descr,
+                known_class,
+                fields,
+            });
+        }
+
+        // resume.py:447,450-451: patch and store.
+        numb_state.patch(1, liveboxes.len() as i32);
+        op.fail_args = Some(liveboxes.into());
+        if !virtual_entries.is_empty() {
+            op.rd_virtuals = Some(virtual_entries);
+        }
+        op.rd_numb = Some(numb_state.create_numbering());
+        op.rd_consts = Some(memo.consts().to_vec());
     }
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.
