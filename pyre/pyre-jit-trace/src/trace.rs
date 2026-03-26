@@ -67,17 +67,21 @@ pub fn trace_bytecode(
         .pop()
         .and_then(|f| f.owned_concrete_frame);
 
-    // RPython pyjitpl.py:3000: retarget green key for can_enter_jit entry.
+    // RPython pyjitpl.py:3000: greenkey = original_boxes[:num_green_args].
+    // When the trace closes at the SAME PC it started (target == start),
+    // use start_pc (no retarget). When it closes at a DIFFERENT PC
+    // (multi-loop trace wrapping to an outer loop), retarget to the
+    // closing PC so can_enter_jit at that PC can find the compiled code.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
             ..
-        } => {
+        } if *target_pc != start_pc => {
             let key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
             ctx.set_green_key(key);
             ctx.header_pc = *target_pc;
         }
-        TraceAction::CloseLoop => {
+        TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
             ctx.set_green_key(key);
             ctx.header_pc = start_pc;
