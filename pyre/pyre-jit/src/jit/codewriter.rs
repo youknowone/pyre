@@ -550,8 +550,9 @@ impl CodeWriter {
             }
         }
 
-        // RPython: all code paths end with ref_return or explicit abort.
-        // No end-of-code abort sentinel — falling off the end is unreachable.
+        // RPython flatten.py parity: every code path ends with an explicit
+        // return/raise/goto/unreachable. No end-of-code sentinel needed —
+        // falling off the end is unreachable if all bytecodes are covered.
 
         // RPython: assembler.assemble() → jitcode via make_jitcode()
         PyJitCode {
