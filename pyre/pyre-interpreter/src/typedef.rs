@@ -455,6 +455,125 @@ fn init_str_typedef(ns: &mut PyNamespace) {
         "expandtabs",
         w_builtin_func_new("expandtabs", crate::type_methods::str_method_expandtabs),
     );
+    // str dunder methods
+    namespace_store(
+        ns,
+        "__contains__",
+        w_builtin_func_new("__contains__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            Ok(pyre_object::w_bool_from(
+                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__len__",
+        w_builtin_func_new("__len__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            crate::space::py_len(args[0])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__getitem__",
+        w_builtin_func_new("__getitem__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__getitem__"));
+            }
+            crate::space::py_getitem(args[0], args[1])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__iter__",
+        w_builtin_func_new("__iter__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            crate::space::py_iter(args[0])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__add__",
+        w_builtin_func_new("__add__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__add__"));
+            }
+            crate::space::py_add(args[0], args[1])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__mul__",
+        w_builtin_func_new("__mul__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__mul__"));
+            }
+            crate::space::py_mul(args[0], args[1])
+        }),
+    );
+    namespace_store(
+        ns,
+        "__mod__",
+        w_builtin_func_new("__mod__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__mod__"));
+            }
+            crate::space::py_mod(args[0], args[1])
+        }),
+    );
+    // maketrans — PyPy: unicodeobject.py descr_maketrans
+    namespace_store(
+        ns,
+        "maketrans",
+        w_builtin_func_new("maketrans", |args| {
+            // maketrans(x[, y[, z]]) → translation dict
+            let d = pyre_object::w_dict_new();
+            if args.len() >= 3 {
+                // maketrans(x, y, z) — z is chars to delete (map to None)
+                let x = unsafe { pyre_object::w_str_get_value(args[0]) };
+                let y = unsafe { pyre_object::w_str_get_value(args[1]) };
+                let z = unsafe { pyre_object::w_str_get_value(args[2]) };
+                for (xc, yc) in x.chars().zip(y.chars()) {
+                    unsafe {
+                        pyre_object::w_dict_store(
+                            d,
+                            pyre_object::w_int_new(xc as i64),
+                            pyre_object::w_int_new(yc as i64),
+                        );
+                    }
+                }
+                for zc in z.chars() {
+                    unsafe {
+                        pyre_object::w_dict_store(
+                            d,
+                            pyre_object::w_int_new(zc as i64),
+                            pyre_object::w_none(),
+                        );
+                    }
+                }
+            } else if args.len() >= 2 {
+                let x = unsafe { pyre_object::w_str_get_value(args[0]) };
+                let y = unsafe { pyre_object::w_str_get_value(args[1]) };
+                for (xc, yc) in x.chars().zip(y.chars()) {
+                    unsafe {
+                        pyre_object::w_dict_store(
+                            d,
+                            pyre_object::w_int_new(xc as i64),
+                            pyre_object::w_int_new(yc as i64),
+                        );
+                    }
+                }
+            }
+            Ok(d)
+        }),
+    );
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
@@ -604,6 +723,27 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
         ns,
         "clear",
         w_builtin_func_new("clear", |_args| Ok(pyre_object::w_none())),
+    );
+    // dict.fromkeys(iterable, value=None) — classmethod
+    namespace_store(
+        ns,
+        "fromkeys",
+        w_builtin_func_new("fromkeys", |args| {
+            // Called as dict.fromkeys(iter, val): args = [iter, val] (no cls binding)
+            let (iterable, value) = if args.len() >= 2 {
+                (args[0], args[1])
+            } else if args.len() == 1 {
+                (args[0], pyre_object::w_none())
+            } else {
+                return Ok(pyre_object::w_dict_new());
+            };
+            let d = pyre_object::w_dict_new();
+            let items = crate::builtins::collect_iterable_pub(iterable)?;
+            for key in items {
+                unsafe { pyre_object::w_dict_store(d, key, value) };
+            }
+            Ok(d)
+        }),
     );
 }
 

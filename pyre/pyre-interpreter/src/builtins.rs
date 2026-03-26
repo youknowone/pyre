@@ -1076,8 +1076,23 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `map()` — PyPy: functional.py W_Map (returns iterator)
-fn builtin_map(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("map() not yet implemented (requires iterator protocol)");
+fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "map() requires at least 2 arguments",
+        ));
+    }
+    let func = args[0];
+    let iterable = args[1];
+    let items = collect_iterable(iterable)?;
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let result = crate::space_call_function(func, &[item]);
+        results.push(result);
+    }
+    let n = results.len();
+    let list = pyre_object::w_list_new(results);
+    Ok(pyre_object::w_seq_iter_new(list, n))
 }
 
 /// `zip(*iterables)` — PyPy: functional.py W_Zip
