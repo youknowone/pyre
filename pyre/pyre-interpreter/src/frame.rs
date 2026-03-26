@@ -128,8 +128,22 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
 /// Number of cell + free variable slots for a code object.
 #[inline]
+/// Count cell+free variable slots, excluding cellvars already in varnames.
+/// CPython 3.13+ unified indexing: cellvars that overlap with varnames
+/// share the same slot. Only cellvar-only variables get extra slots.
 fn ncells(code: &CodeObject) -> usize {
-    code.cellvars.len() + code.freevars.len()
+    let cellvars_only = code
+        .cellvars
+        .iter()
+        .filter(|cv| {
+            let cv_name: &str = cv;
+            !code.varnames.iter().any(|v| {
+                let v_name: &str = v;
+                v_name == cv_name
+            })
+        })
+        .count();
+    cellvars_only + code.freevars.len()
 }
 
 impl PyFrame {
@@ -315,13 +329,13 @@ impl PyFrame {
         }
 
         // Copy free variables from closure tuple into the frame's cell slots.
-        // Free vars go after cell vars: indices nlocals+ncellvars..nlocals+ncells
+        // Freevars go after cellvar-only slots: indices nlocals+ncellvars_only..
         if !closure.is_null() {
-            let n_cellvars = code_ref.cellvars.len();
+            let n_cellvars_only = num_cells - code_ref.freevars.len();
             let n_freevars = code_ref.freevars.len();
             for i in 0..n_freevars {
                 let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                locals_cells_stack_w[num_locals + n_cellvars + i] = cell;
+                locals_cells_stack_w[num_locals + n_cellvars_only + i] = cell;
             }
         }
 

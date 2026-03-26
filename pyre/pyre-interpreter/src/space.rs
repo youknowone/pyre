@@ -1676,6 +1676,18 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 
     // Function object attributes — PyPy: funcobject.py W_Function
+    // Check ATTR_TABLE first (for dynamically set attrs like __name__, __doc__)
+    if unsafe { crate::is_func(obj) || crate::is_builtin_func(obj) } {
+        let found = ATTR_TABLE.with(|table| {
+            table
+                .borrow()
+                .get(&(obj as usize))
+                .and_then(|d| d.get(name).copied())
+        });
+        if let Some(v) = found {
+            return Ok(v);
+        }
+    }
     unsafe {
         if crate::is_func(obj) {
             match name {
