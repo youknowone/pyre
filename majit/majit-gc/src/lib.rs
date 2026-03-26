@@ -91,6 +91,17 @@ pub trait GcAllocator: Send {
         self.alloc_varsize(base_size, item_size, length)
     }
 
+    /// Allocate a fixed-size object with type id without triggering collection.
+    ///
+    /// Falls back to old-gen when nursery is full. Used for jitframe
+    /// allocation where input refs on the Rust stack are not yet protected
+    /// by the shadow stack (Rust stack is not traced by GC, unlike RPython
+    /// stack where `lltype.malloc` can safely trigger GC).
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        let _ = type_id;
+        self.alloc_nursery_no_collect(size)
+    }
+
     /// Allocate a variable-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery

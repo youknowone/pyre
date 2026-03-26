@@ -3589,6 +3589,12 @@ fn emit_reload_frame_if_necessary(
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
+    // _reload_frame_if_necessary (assembler.py:405-412):
+    //   MOV ecx, [rootstacktop]
+    //   MOV ebp, [ecx - WORD]
+    //
+    // After a collecting call, the GC may have moved the jitframe.
+    // Read the updated jf_ptr from the shadow stack top.
     emit_host_call(
         builder,
         ptr_type,
@@ -3709,15 +3715,10 @@ fn emit_collecting_gc_call(
 
     let result = emit_host_call(builder, ptr_type, call_conv, func_ptr, &args, return_type);
 
-    // _reload_frame_if_necessary (assembler.py:405-412):
-    // After a collecting call, the GC may have copied the jitframe from
-    // nursery to old gen. Reload jf_ptr from the shadow stack.
-    let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
-
-    emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
+    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
     reload_ref_roots(
         builder,
-        new_jf_ptr,
+        jf_ptr,
         ref_root_slots,
         defined_ref_vars,
         ref_root_base_ofs,
@@ -3796,13 +3797,10 @@ fn emit_indirect_call_from_parts(
     }
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
     if can_collect {
-        // _reload_frame_if_necessary (assembler.py:405-412)
-        let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
-
-        emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
+        emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
         reload_ref_roots(
             builder,
-            new_jf_ptr,
+            jf_ptr,
             ref_root_slots,
             defined_ref_vars,
             ref_root_base_ofs,
@@ -4025,7 +4023,7 @@ fn run_compiled_code(
     let (jf_gcref, _jf_buf_keepalive): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
         let gcref = with_gc_runtime(runtime_id, |gc| {
-            gc.alloc_nursery_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
+            gc.alloc_nursery_no_collect_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
         });
         // jitframe_allocate: frame.jf_frame_info = frame_info (skipped —
         // we don't have frame_info). Write the jf_frame_length field so
@@ -4732,7 +4730,7 @@ impl CraneliftBackend {
         // jf_ptr from the shadow stack (GC may have moved the jitframe).
         let mut jf_ptr = builder.block_params(entry_block)[0];
         let inputs_ptr = jf_ptr; // alias for entry loading
-        let outputs_ptr = jf_ptr; // alias for guard exit stores
+        let mut outputs_ptr = jf_ptr; // alias for guard exit stores (updated after reload)
         // Ref root slots live in jf_frame after output/fail_args area.
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
@@ -5823,7 +5821,9 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                 }
 
                 OpCode::CallAssemblerI
@@ -6273,7 +6273,9 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                 }
 
                 OpCode::CallReleaseGilI
@@ -6511,7 +6513,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsize => {
@@ -6543,7 +6547,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
@@ -6606,7 +6612,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.ins().jump(merge_block, &[slow_result]);
 
                     builder.switch_to_block(merge_block);
@@ -8057,7 +8065,9 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("GC allocation helper must return a value");
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                        // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        // outputs_ptr = jf_ptr;
                         builder.def_var(var(vi), result);
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
@@ -8109,7 +8119,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
 
@@ -8250,7 +8262,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::Newunicode => {
@@ -8274,7 +8288,9 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
+                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 // All OpCode variants are explicitly handled above.

@@ -356,8 +356,6 @@ impl MiniMarkGC {
         });
 
         // Phase 2: Process remembered set and transitive closure.
-        // Objects copied to old gen may reference other nursery objects,
-        // so we process until all references are resolved.
         let mut idx = 0;
         loop {
             if idx >= self.remembered_set.len() {
@@ -1277,6 +1275,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
+    }
+
+    fn alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_with_type_no_collect(type_id, size)
     }
 
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
