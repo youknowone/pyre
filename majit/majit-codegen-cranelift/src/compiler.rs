@@ -8643,11 +8643,7 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
             needs_force_frame,
-            body_num_inputs: if label_indices.len() >= 2 {
-                ops[*label_indices.last().unwrap()].args.len()
-            } else {
-                0
-            },
+            body_num_inputs: 0, // body-direct entry disabled
         })
     }
 }
