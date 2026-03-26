@@ -73,8 +73,31 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
         }),
     );
-    // sys.flags — stub
-    namespace_store(ns, "flags", w_tuple_new(vec![]));
+    // sys.flags — stub object with named attributes
+    {
+        let flags_type = crate::typedef::get_object_type();
+        let flags = pyre_object::w_instance_new(flags_type);
+        let _ = crate::space::py_setattr(flags, "debug", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "inspect", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "interactive", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "optimize", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "dont_write_bytecode", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "no_user_site", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "no_site", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "ignore_environment", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "verbose", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "bytes_warning", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "quiet", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "hash_randomization", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "isolated", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "dev_mode", w_bool_from(false));
+        let _ = crate::space::py_setattr(flags, "utf8_mode", w_int_new(1));
+        let _ = crate::space::py_setattr(flags, "warn_default_encoding", w_int_new(0));
+        let _ = crate::space::py_setattr(flags, "safe_path", w_bool_from(false));
+        let _ = crate::space::py_setattr(flags, "int_max_str_digits", w_int_new(4300));
+        let _ = crate::space::py_setattr(flags, "context_aware_warnings", w_bool_from(false));
+        namespace_store(ns, "flags", flags);
+    }
     // sys.getdefaultencoding
     namespace_store(
         ns,

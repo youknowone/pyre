@@ -1675,6 +1675,54 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Function object attributes — PyPy: funcobject.py W_Function
+    unsafe {
+        if crate::is_func(obj) {
+            match name {
+                "__code__" => {
+                    // Return the code pointer as an opaque object (stub)
+                    let code_ptr = crate::w_func_get_code_ptr(obj);
+                    let code = &*(code_ptr as *const pyre_bytecode::CodeObject);
+                    let co = pyre_object::w_instance_new(crate::typedef::get_object_type());
+                    let _ = py_setattr(
+                        co,
+                        "co_varnames",
+                        w_tuple_new(
+                            code.varnames
+                                .iter()
+                                .map(|s| w_str_new(s) as PyObjectRef)
+                                .collect(),
+                        ),
+                    );
+                    let _ = py_setattr(co, "co_argcount", w_int_new(code.arg_count as i64));
+                    let _ = py_setattr(
+                        co,
+                        "co_kwonlyargcount",
+                        w_int_new(code.kwonlyarg_count as i64),
+                    );
+                    let _ = py_setattr(co, "co_name", w_str_new(&*code.obj_name));
+                    let _ = py_setattr(co, "co_filename", w_str_new(&*code.source_path));
+                    let _ = py_setattr(co, "co_flags", w_int_new(code.flags.bits() as i64));
+                    return Ok(co);
+                }
+                "__name__" => {
+                    return Ok(w_str_new(crate::w_func_get_name(obj)));
+                }
+                "__qualname__" | "__defaults__" | "__kwdefaults__" | "__globals__"
+                | "__closure__" => {
+                    let found = ATTR_TABLE.with(|table| {
+                        table
+                            .borrow()
+                            .get(&(obj as usize))
+                            .and_then(|d| d.get(name).copied())
+                    });
+                    return Ok(found.unwrap_or(w_none()));
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Common special attributes — return defaults for any object type
     if name == "__doc__"
         || name == "__module__"

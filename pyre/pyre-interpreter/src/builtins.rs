@@ -73,7 +73,37 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         w_builtin_func_new("frozenset", |_| Ok(w_tuple_new(vec![])))
     });
     namespace.get_or_insert_with("set", || {
-        w_builtin_func_new("set", |_| Ok(w_list_new(vec![])))
+        w_builtin_func_new("set", |_args| {
+            // set() → instance with add/discard/remove methods backed by a dict
+            let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+            let data = pyre_object::w_dict_new();
+            let _ = crate::space::py_setattr(obj, "__data__", data);
+            let _ = crate::space::py_setattr(
+                obj,
+                "add",
+                crate::w_builtin_func_new("add", |args| {
+                    if args.len() >= 2 {
+                        let self_obj = args[0];
+                        let val = args[1];
+                        if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
+                            unsafe { pyre_object::w_dict_store(data, val, pyre_object::w_none()) };
+                        }
+                    }
+                    Ok(pyre_object::w_none())
+                }),
+            );
+            let _ = crate::space::py_setattr(
+                obj,
+                "discard",
+                crate::w_builtin_func_new("discard", |_args| Ok(pyre_object::w_none())),
+            );
+            let _ = crate::space::py_setattr(
+                obj,
+                "remove",
+                crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
+            );
+            Ok(obj)
+        })
     });
     namespace.get_or_insert_with("property", || {
         w_builtin_func_new("property", |args| {
@@ -114,6 +144,27 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("StopIteration", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("GeneratorExit", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("StopAsyncIteration", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("Warning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("UserWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("DeprecationWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("PendingDeprecationWarning", || {
+        crate::typedef::get_object_type()
+    });
+    namespace.get_or_insert_with("RuntimeWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("FutureWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("ImportWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("UnicodeWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("BytesWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("ResourceWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("SyntaxWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("EncodingWarning", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("LookupError", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("OSError", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("IOError", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("FileNotFoundError", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("SystemExit", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("KeyboardInterrupt", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("RecursionError", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("any", || w_builtin_func_new("any", builtin_any));
     namespace.get_or_insert_with("all", || w_builtin_func_new("all", builtin_all));
     namespace.get_or_insert_with("sum", || w_builtin_func_new("sum", builtin_sum));
