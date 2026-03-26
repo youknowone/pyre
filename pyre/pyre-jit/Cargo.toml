@@ -15,8 +15,3 @@ majit-codegen-cranelift = { path = "../../majit/majit-codegen-cranelift" }
 majit-trace = { path = "../../majit/majit-trace" }
 majit-gc = { path = "../../majit/majit-gc" }
 pyre-jit-trace = { path = "../pyre-jit-trace" }
-
-[build-dependencies]
-majit-analyze = { path = "../../majit/majit-analyze" }
-serde_json = "1"
-syn = { version = "2", features = ["full", "visit"] }

@@ -1,6 +1,6 @@
-#[path = "src/jit/call_spec.rs"]
+#[path = "src/call_spec.rs"]
 mod call_spec;
-#[path = "../pyre-jit-trace/src/virtualizable_spec.rs"]
+#[path = "src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
 /// Build script for pyre-jit: runs majit-analyze on the ENTIRE pyre
@@ -30,7 +30,7 @@ fn main() {
     }
 
     eprintln!(
-        "[pyre-jit build.rs] reading {} source files from {} dirs: {:?}",
+        "[pyre-jit-trace build.rs] reading {} source files from {} dirs: {:?}",
         sources.len(),
         source_dirs.len(),
         source_paths,
@@ -88,7 +88,7 @@ fn main() {
 
     // Report
     eprintln!(
-        "[pyre-jit build.rs] canonical analysis: {} opcode arms ({} graph-classified), {} functions, {} blocks, {} flat ops, generated {} bytes",
+        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} graph-classified), {} functions, {} blocks, {} flat ops, generated {} bytes",
         pipeline.opcode_dispatch.len(),
         pipeline
             .opcode_dispatch
@@ -105,8 +105,8 @@ fn main() {
     for path in &source_paths {
         println!("cargo::rerun-if-changed={path}");
     }
-    println!("cargo::rerun-if-changed=src/jit/virtualizable_spec.rs");
-    println!("cargo::rerun-if-changed=src/jit/call_spec.rs");
+    println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
+    println!("cargo::rerun-if-changed=src/call_spec.rs");
 }
 
 fn build_call_effect_overrides() -> Vec<majit_analyze::CallEffectOverride> {
@@ -233,7 +233,7 @@ fn build_classification_config() -> majit_analyze::ClassificationConfig {
 /// Recursively collect all .rs files from a directory.
 fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("[pyre-jit build.rs] warning: cannot read {dir}");
+        eprintln!("[pyre-jit-trace build.rs] warning: cannot read {dir}");
         return;
     };
     for entry in entries {
@@ -249,7 +249,7 @@ fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String
                     sources.push(content);
                 }
                 Err(e) => {
-                    eprintln!("[pyre-jit build.rs] warning: cannot read {path_str}: {e}");
+                    eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path_str}: {e}");
                 }
             }
         }

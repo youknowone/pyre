@@ -9,3 +9,12 @@ pub mod descr;
 pub mod frame_layout;
 pub mod helpers;
 pub mod virtualizable_spec;
+
+/// Auto-generated trace functions from majit-analyze.
+#[allow(dead_code, unused_imports)]
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
+}
+
+// Re-export top-level auto-generated functions for crate-level access
+include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
