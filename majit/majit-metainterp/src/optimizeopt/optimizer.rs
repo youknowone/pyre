@@ -1561,14 +1561,28 @@ impl Optimizer {
             let n = nia.len();
             let source_set: std::collections::HashSet<OpRef> =
                 (0..n).map(|i| OpRef(i as u32)).collect();
+            // Track which targets have been seen to detect duplicates.
+            // RPython: each JUMP arg is a distinct Box, so duplicates
+            // (same Box in two slots) share identity naturally.
+            // pyre: same OpRef in two slots causes forwarding collision.
+            // Allocate fresh OpRef for duplicates after the first.
+            let mut seen_targets: std::collections::HashMap<OpRef, usize> =
+                std::collections::HashMap::new();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let source = OpRef(i as u32);
                     let target = nia[i];
-                    if target != source && source_set.contains(&target) {
-                        // Collision: target is also another slot's source.
-                        // Use a fresh OpRef so this slot's info doesn't
-                        // collide with the other slot's forwarding chain.
+                    // Skip constants (>= 10000)
+                    if target.0 >= 10000 {
+                        return source;
+                    }
+                    let needs_fresh =
+                        // Case 1: target is another slot's source
+                        (target != source && source_set.contains(&target))
+                        // Case 2: same target used by a previous slot
+                        || seen_targets.contains_key(&target);
+                    seen_targets.insert(target, i);
+                    if needs_fresh {
                         let fresh = ctx.alloc_op_position();
                         ctx.replace_op(source, fresh);
                         fresh
