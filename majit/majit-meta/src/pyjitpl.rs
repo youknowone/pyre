@@ -772,6 +772,8 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::GcRef(ptr as usize)
             }
         }));
+        // optimizer.py:732 — inject ResumeDataLoopMemo as resume encoder.
+        opt.resume_encoder = Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
         opt
     }
 
@@ -1612,6 +1614,9 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.resume_encoder_factory = Some(Box::new(|| {
+            Box::new(crate::resume::ResumeDataLoopMemoEncoder::new())
+        }));
         // history.py: carry retraced_count across recompilations
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -1653,6 +1658,8 @@ impl<M: Clone> MetaInterp<M> {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types;
+                        simple_opt.resume_encoder =
+                            Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
@@ -2162,6 +2169,9 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         let mut unroll_opt = majit_opt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.resume_encoder_factory = Some(Box::new(|| {
+            Box::new(crate::resume::ResumeDataLoopMemoEncoder::new())
+        }));
         unroll_opt.retraced_count = self
             .compiled_loops
             .get(&green_key)
@@ -2434,6 +2444,7 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.constant_types = constant_types;
+        optimizer.resume_encoder = Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
         let optimized_ops = optimizer.optimize_with_constants_and_inputs(
             &trace_ops,
             &mut constants,

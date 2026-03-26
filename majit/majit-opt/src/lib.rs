@@ -250,6 +250,65 @@ pub struct OptContext {
     pub in_final_emission: bool,
 }
 
+/// resume.py:192-226 parity — BoxEnv for optimizer context.
+///
+/// Wraps an immutable reference to OptContext, implementing the BoxEnv
+/// trait so that ResumeDataLoopMemo.number() can tag boxes during
+/// store_final_boxes_in_guard.
+pub struct OptBoxEnv<'a> {
+    pub ctx: &'a OptContext,
+}
+
+impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
+    fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+        self.ctx.get_replacement(opref)
+    }
+
+    fn is_const(&self, opref: OpRef) -> bool {
+        self.ctx.is_constant(opref)
+    }
+
+    fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+        match self.ctx.get_constant(opref) {
+            Some(Value::Int(v)) => (*v, majit_ir::Type::Int),
+            Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
+            Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
+            _ => (0, majit_ir::Type::Int),
+        }
+    }
+
+    fn get_type(&self, opref: OpRef) -> majit_ir::Type {
+        // Check constant type first
+        if let Some(val) = self.ctx.get_constant(opref) {
+            return val.get_type();
+        }
+        // PtrInfo presence → Ref type
+        if self.ctx.get_ptr_info(opref).is_some() {
+            return majit_ir::Type::Ref;
+        }
+        // Fall back to operation result type
+        let resolved = self.ctx.get_replacement(opref);
+        for op in &self.ctx.new_operations {
+            if op.pos == resolved {
+                return op.result_type();
+            }
+        }
+        majit_ir::Type::Int
+    }
+
+    fn is_virtual_ref(&self, opref: OpRef) -> bool {
+        matches!(
+            self.ctx.get_ptr_info(opref),
+            Some(PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_))
+        )
+    }
+
+    fn is_virtual_raw(&self, _opref: OpRef) -> bool {
+        // pyre doesn't have Int-typed virtual objects
+        false
+    }
+}
+
 impl OptContext {
     /// RPython optimizer.py: add to quasi_immutable_deps
     pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {

@@ -9,7 +9,8 @@ pub use descr::{
     SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
 };
 pub use resoperation::{
-    GuardPendingFieldEntry, GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef, format_trace,
+    BoxEnv, GuardPendingFieldEntry, GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef,
+    ResumeDataEncoder, format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,

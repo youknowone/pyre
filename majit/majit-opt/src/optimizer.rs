@@ -170,6 +170,9 @@ pub struct Optimizer {
     pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::ConstantFoldAllocFn>,
+    /// optimizer.py:732 — resumedata_memo injected by majit-meta.
+    /// ResumeDataEncoder encodes guard state into compact rd_numb/rd_consts.
+    pub resume_encoder: Option<Box<dyn majit_ir::ResumeDataEncoder>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -709,6 +712,7 @@ impl Optimizer {
             pending_bridge_knowledge: None,
             per_guard_knowledge: Vec::new(),
             constant_fold_alloc: None,
+            resume_encoder: None,
         }
     }
 
@@ -2401,6 +2405,23 @@ impl Optimizer {
             // RPython parity: do NOT force virtuals in guard fail_args.
             op = Self::encode_guard_virtuals(op, ctx);
 
+            // optimizer.py:732-748 — encode resume data via ResumeDataEncoder.
+            if let Some(ref mut encoder) = self.resume_encoder {
+                if let Some(ref fail_args) = op.fail_args {
+                    let env = crate::OptBoxEnv { ctx: &*ctx };
+                    let virtual_entries = op.rd_virtuals.as_deref().unwrap_or(&[]);
+                    match encoder.encode_guard(fail_args, &env, virtual_entries) {
+                        Ok((rd_numb, rd_consts, _ordered_liveboxes)) => {
+                            op.rd_numb = Some(rd_numb);
+                            op.rd_consts = Some(rd_consts);
+                        }
+                        Err(()) => {
+                            // resume.py: TagOverflow — skip encoding, fall back to fail_args.
+                        }
+                    }
+                }
+            }
+
             // RPython parity: store fail_arg types using constant_types
             // so the backend distinguishes Ref constants from Int.
             if !self.constant_types.is_empty() {
@@ -3840,5 +3861,67 @@ mod tests {
             .expect("forcing imported short guard arg should build short preamble");
         assert_eq!(sp.used_boxes, vec![OpRef(14)]);
         assert_eq!(sp.jump_args, vec![OpRef(14)]);
+    }
+
+    /// Mock ResumeDataEncoder that records calls for testing.
+    struct MockResumeEncoder {
+        calls: std::cell::RefCell<Vec<Vec<OpRef>>>,
+    }
+
+    impl MockResumeEncoder {
+        fn new() -> Self {
+            MockResumeEncoder {
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl majit_ir::ResumeDataEncoder for MockResumeEncoder {
+        fn encode_guard(
+            &mut self,
+            fail_args: &[OpRef],
+            _env: &dyn majit_ir::BoxEnv,
+            _virtual_entries: &[majit_ir::GuardVirtualEntry],
+        ) -> Result<(Vec<u8>, Vec<(i64, majit_ir::Type)>, Vec<OpRef>), ()> {
+            self.calls.borrow_mut().push(fail_args.to_vec());
+            // Return minimal valid encoding
+            Ok((vec![0], vec![], fail_args.to_vec()))
+        }
+    }
+
+    #[test]
+    fn test_resume_encoder_called_in_store_final_boxes() {
+        let mut opt = Optimizer::default_pipeline();
+        opt.resume_encoder = Some(Box::new(MockResumeEncoder::new()));
+
+        let mut ops = vec![
+            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef(100)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        ops[1].fail_args = Some(vec![OpRef(100), OpRef(101)].into());
+        for (i, op) in ops.iter_mut().enumerate() {
+            op.pos = OpRef(i as u32);
+        }
+
+        let result = opt.optimize_with_constants_and_inputs(
+            &ops,
+            &mut std::collections::HashMap::new(),
+            1024,
+        );
+
+        // Guard should have rd_numb set by the encoder
+        let guard = result
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardTrue)
+            .expect("guard should survive optimization");
+        assert!(
+            guard.rd_numb.is_some(),
+            "resume encoder should set rd_numb on guard"
+        );
+        assert!(
+            guard.rd_consts.is_some(),
+            "resume encoder should set rd_consts on guard"
+        );
     }
 }

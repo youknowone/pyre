@@ -52,6 +52,10 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
+    /// Factory to create ResumeDataEncoder instances for internal Optimizers.
+    /// Injected by majit-meta when the optimizer is set up.
+    pub resume_encoder_factory:
+        Option<Box<dyn Fn() -> Box<dyn majit_ir::ResumeDataEncoder> + Send>>,
 }
 
 impl UnrollOptimizer {
@@ -64,6 +68,7 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
+            resume_encoder_factory: None,
         }
     }
 
@@ -190,6 +195,9 @@ impl UnrollOptimizer {
                 None => crate::optimizer::Optimizer::default_pipeline(),
             };
             opt_p1.constant_types = self.constant_types.clone();
+            if let Some(ref factory) = self.resume_encoder_factory {
+                opt_p1.resume_encoder = Some(factory());
+            }
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -260,6 +268,9 @@ impl UnrollOptimizer {
             None => crate::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.constant_types = self.constant_types.clone();
+        if let Some(ref factory) = self.resume_encoder_factory {
+            opt_p2.resume_encoder = Some(factory());
+        }
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
