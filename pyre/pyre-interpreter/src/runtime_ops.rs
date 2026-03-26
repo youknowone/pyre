@@ -83,7 +83,10 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     unsafe {
         let func = w_builtin_func_get(callable);
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
-        func(arg_slice) as i64
+        match func(arg_slice) {
+            Ok(result) => result as i64,
+            Err(e) => panic!("jit builtin call failed: {e}"),
+        }
     }
 }
 

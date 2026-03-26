@@ -449,7 +449,7 @@ fn init_bool_typedef(_ns: &mut PyNamespace) {}
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
-fn object_new(args: &[PyObjectRef]) -> PyObjectRef {
+fn object_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(
         !args.is_empty(),
         "object.__new__() requires a type argument"
@@ -457,15 +457,15 @@ fn object_new(args: &[PyObjectRef]) -> PyObjectRef {
     let cls = crate::space::unwrap_cell(args[0]);
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
-        return w_instance_new(cls);
+        return Ok(w_instance_new(cls));
     }
     // Fallback: create bare instance with no type
-    w_instance_new(PY_NULL)
+    Ok(w_instance_new(PY_NULL))
 }
 
 /// `object.__init__(self)` — no-op base __init__.
-fn object_init(_args: &[PyObjectRef]) -> PyObjectRef {
-    w_none()
+fn object_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_none())
 }
 
 fn init_object_typedef(ns: &mut PyNamespace) {

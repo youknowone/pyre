@@ -6,35 +6,35 @@ use pyre_object::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// time.time() → float (seconds since epoch)
-pub fn time(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    floatobject::w_float_new(now.as_secs_f64())
+    Ok(floatobject::w_float_new(now.as_secs_f64()))
 }
 
 /// time.time_ns() → int (nanoseconds since epoch)
-pub fn time_ns(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    w_int_new(now.as_nanos() as i64)
+    Ok(w_int_new(now.as_nanos() as i64))
 }
 
 /// time.monotonic() → float
-pub fn monotonic(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     // Simplified: use system time as monotonic approximation
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    floatobject::w_float_new(now.as_secs_f64())
+    Ok(floatobject::w_float_new(now.as_secs_f64()))
 }
 
 /// time.sleep(seconds)
-pub fn sleep(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "sleep() takes exactly one argument");
     let secs = unsafe {
         if is_int(args[0]) {
@@ -46,14 +46,14 @@ pub fn sleep(args: &[PyObjectRef]) -> PyObjectRef {
         }
     };
     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-    w_none()
+    Ok(w_none())
 }
 
 /// time.perf_counter() → float
-pub fn perf_counter(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    floatobject::w_float_new(now.as_secs_f64())
+    Ok(floatobject::w_float_new(now.as_secs_f64()))
 }

@@ -5087,7 +5087,7 @@ impl SharedOpcodeHandler for MIFrame {
             unsafe {
                 if pyre_interpreter::is_builtin_func(concrete_callable) {
                     let func = pyre_interpreter::w_builtin_func_get(concrete_callable);
-                    let result = func(&concrete_args);
+                    let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = ConcreteValue::from_pyobj(result);
                 } else if pyre_interpreter::is_func(concrete_callable) {
                     use std::cell::Cell;
