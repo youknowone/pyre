@@ -106,6 +106,14 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     });
     namespace.get_or_insert_with("Ellipsis", || w_none());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
+    namespace.get_or_insert_with("memoryview", || {
+        w_builtin_func_new("memoryview", |_| Ok(w_none()))
+    });
+    namespace.get_or_insert_with("BaseException", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("Exception", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("StopIteration", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("GeneratorExit", || crate::typedef::get_object_type());
+    namespace.get_or_insert_with("StopAsyncIteration", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("any", || w_builtin_func_new("any", builtin_any));
     namespace.get_or_insert_with("all", || w_builtin_func_new("all", builtin_all));
     namespace.get_or_insert_with("sum", || w_builtin_func_new("sum", builtin_sum));

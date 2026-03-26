@@ -1604,6 +1604,17 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             if name == "__bases__" {
                 return Ok(w_type_get_bases(obj));
             }
+            if name == "__doc__"
+                || name == "__module__"
+                || name == "__abstractmethods__"
+                || name == "__flags__"
+            {
+                // Check class dict first, then return None
+                if let Some(v) = lookup_in_type_mro(obj, name) {
+                    return Ok(v);
+                }
+                return Ok(w_none());
+            }
 
             if let Some(value) = lookup_in_type_mro(obj, name) {
                 // Unwrap staticmethod/classmethod/property descriptors
@@ -1629,17 +1640,18 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     .get(&(obj as usize))
                     .and_then(|d| d.get("__metaclass__").copied())
             });
-            if let Some(mc) = metaclass_obj {
+            // PyPy: type.__getattribute__ → metatype descriptor protocol.
+            // Search metaclass MRO. Binding is handled by load_method.
+            let metatypes: [Option<PyObjectRef>; 2] = [
+                metaclass_obj,
+                crate::typedef::get_type_object((*obj).ob_type),
+            ];
+            for mt in metatypes.iter().flatten() {
+                let mc = *mt;
                 if is_type(mc) {
                     if let Some(value) = lookup_in_type_mro(mc, name) {
                         return Ok(value);
                     }
-                }
-            }
-            // Fallback: check type's type registry entry
-            if let Some(metatype) = crate::typedef::get_type_object((*obj).ob_type) {
-                if let Some(value) = lookup_in_type_mro(metatype, name) {
-                    return Ok(value);
                 }
             }
             return Err(PyError::new(

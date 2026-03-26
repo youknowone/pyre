@@ -715,4 +715,64 @@ fn object_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", w_builtin_func_new("__new__", object_new));
     namespace_store(ns, "__init__", w_builtin_func_new("__init__", object_init));
+    // PyPy: objectobject.py — default comparison/hash/repr for all objects
+    namespace_store(
+        ns,
+        "__eq__",
+        w_builtin_func_new("__eq__", |args| {
+            Ok(pyre_object::w_bool_from(
+                args.len() >= 2 && std::ptr::eq(args[0], args[1]),
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__ne__",
+        w_builtin_func_new("__ne__", |args| {
+            Ok(pyre_object::w_bool_from(
+                args.len() >= 2 && !std::ptr::eq(args[0], args[1]),
+            ))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__hash__",
+        w_builtin_func_new("__hash__", |args| {
+            Ok(pyre_object::w_int_new(if args.is_empty() {
+                0
+            } else {
+                args[0] as i64
+            }))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__repr__",
+        w_builtin_func_new("__repr__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_str_new("<object>"));
+            }
+            Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0]) }))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__str__",
+        w_builtin_func_new("__str__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_str_new("<object>"));
+            }
+            Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }))
+        }),
+    );
+    namespace_store(
+        ns,
+        "__init_subclass__",
+        w_builtin_func_new("__init_subclass__", |_| Ok(pyre_object::w_none())),
+    );
+    namespace_store(
+        ns,
+        "__subclasshook__",
+        w_builtin_func_new("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
+    );
 }
