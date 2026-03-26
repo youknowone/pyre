@@ -368,6 +368,12 @@ impl<S: JitState> JitDriver<S> {
         self.bridge_info.is_some()
     }
 
+    /// Bridge origin: (trace_id, fail_index) for compile_trace.
+    #[inline]
+    pub fn bridge_origin(&self) -> Option<(u64, u32)> {
+        self.bridge_info.map(|(_, tid, fi)| (tid, fi))
+    }
+
     /// The green key of the active trace, if any.
     pub fn current_trace_green_key(&mut self) -> Option<u64> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
