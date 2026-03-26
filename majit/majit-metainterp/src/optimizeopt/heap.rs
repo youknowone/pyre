@@ -1552,21 +1552,11 @@ impl OptHeap {
         // cycle is specifically CallMayForce→GuardNotForced. Don't emit here.
 
         // Guards: force lazy sets but keep caches (guards don't mutate the heap).
-        // Track nullity implications from guards.
+        // RPython heap.py does NOT handle GuardNonnull — that is handled
+        // exclusively by rewrite.py. Only track nullity for cache purposes.
         if opcode.is_guard() {
-            // GuardNonnull on a value already known non-null is redundant.
             if opcode == OpCode::GuardNonnull {
-                let arg = op.arg(0);
-                let resolved = ctx.get_replacement(arg);
-                if self.known_nonnull.contains(&arg)
-                    || self.known_nonnull.contains(&resolved)
-                    || self.seen_allocation.contains(&arg)
-                    || self.seen_allocation.contains(&resolved)
-                {
-                    return OptimizationResult::Remove;
-                }
-                self.known_nonnull.insert(arg);
-                self.known_nonnull.insert(resolved);
+                self.known_nonnull.insert(op.arg(0));
             }
 
             // GuardClass / GuardNonnullClass / GuardValue imply non-null.
@@ -2126,19 +2116,24 @@ impl Optimization for OptHeap {
     /// can re-populate the optimizer's cache.
     /// heap.py:360-377: export ALL cached fields to short preamble.
     /// heap.py:360-377: No is_reachable filter — export ALL cached fields.
+    /// heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &OptContext,
+        ctx: &OptContext,
     ) {
         for cf in self.field_cache.values() {
             for i in 0..cf.cached_structs.len() {
-                let obj = cf.cached_structs[i];
-                let cached_val = cf.cached_values[i];
+                // heap.py:55: get_box_replacement
+                let obj = ctx.get_replacement(cf.cached_structs[i]);
+                let cached_val = ctx.get_replacement(cf.cached_values[i]);
                 if cached_val.is_none() || obj.is_none() {
                     continue;
                 }
-                let Some(descr) = cf.get_descr(obj) else {
+                let Some(descr) = cf
+                    .get_descr(cf.cached_structs[i])
+                    .or_else(|| cf.get_descr(obj))
+                else {
                     continue;
                 };
                 let opcode = descr
