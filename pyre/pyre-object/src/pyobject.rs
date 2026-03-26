@@ -52,6 +52,9 @@ pub static LONG_TYPE: PyType = PyType { tp_name: "int" };
 pub static NONE_TYPE: PyType = PyType {
     tp_name: "NoneType",
 };
+pub static NOTIMPLEMENTED_TYPE: PyType = PyType {
+    tp_name: "NotImplementedType",
+};
 pub static MODULE_TYPE: PyType = PyType { tp_name: "module" };
 pub static TYPE_TYPE: PyType = PyType { tp_name: "type" };
 pub static INSTANCE_TYPE: PyType = PyType { tp_name: "object" };
@@ -113,4 +116,9 @@ pub unsafe fn is_dict(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn is_none(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &NONE_TYPE) }
+}
+
+#[inline]
+pub unsafe fn is_not_implemented(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &NOTIMPLEMENTED_TYPE) }
 }

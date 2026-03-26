@@ -65,49 +65,60 @@ pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
 pub fn install_builtin_typedefs() {
     let mut reg: HashMap<usize, usize> = HashMap::new();
 
-    reg.insert(
-        &LIST_TYPE as *const PyType as usize,
-        make_type("list", &LIST_TYPE, init_list_typedef) as usize,
-    );
-    reg.insert(
-        &STR_TYPE as *const PyType as usize,
-        make_type("str", &STR_TYPE, init_str_typedef) as usize,
-    );
-    reg.insert(
-        &DICT_TYPE as *const PyType as usize,
-        make_type("dict", &DICT_TYPE, init_dict_typedef) as usize,
-    );
-    reg.insert(
-        &TUPLE_TYPE as *const PyType as usize,
-        make_type("tuple", &TUPLE_TYPE, init_tuple_typedef) as usize,
-    );
-    reg.insert(
-        &INT_TYPE as *const PyType as usize,
-        make_type("int", &INT_TYPE, init_int_typedef) as usize,
-    );
-    reg.insert(
-        &FLOAT_TYPE as *const PyType as usize,
-        make_type("float", &FLOAT_TYPE, init_float_typedef) as usize,
-    );
-    reg.insert(
-        &BOOL_TYPE as *const PyType as usize,
-        make_type("bool", &BOOL_TYPE, init_bool_typedef) as usize,
-    );
-    reg.insert(
-        &NONE_TYPE as *const PyType as usize,
-        make_type("NoneType", &NONE_TYPE, |_| {}) as usize,
-    );
-
-    // 'object' type — PyPy: objectobject.py W_ObjectObject.typedef
-    // Registered under INSTANCE_TYPE so that py_getattr on instances
-    // can also find __new__ via the type registry.
-    let object_type = make_type("object", &INSTANCE_TYPE, init_object_typedef);
+    // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
+    // MRO = [object]. All other types inherit from object.
+    let object_type = make_type_root("object", init_object_typedef);
     reg.insert(
         &INSTANCE_TYPE as *const PyType as usize,
         object_type as usize,
     );
-    // Store the object type for builtins to reference
     let _ = OBJECT_TYPE_OBJ.set(object_type as usize);
+
+    // int — PyPy: intobject.py W_IntObject.typedef, bases=(object,)
+    let int_type = make_type_with_base("int", init_int_typedef, object_type);
+    reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
+
+    // float — PyPy: floatobject.py, bases=(object,)
+    reg.insert(
+        &FLOAT_TYPE as *const PyType as usize,
+        make_type_with_base("float", init_float_typedef, object_type) as usize,
+    );
+
+    // bool — PyPy: boolobject.py, bases=(int,)
+    reg.insert(
+        &BOOL_TYPE as *const PyType as usize,
+        make_type_with_base("bool", init_bool_typedef, int_type) as usize,
+    );
+
+    // str — PyPy: unicodeobject.py, bases=(object,)
+    reg.insert(
+        &STR_TYPE as *const PyType as usize,
+        make_type_with_base("str", init_str_typedef, object_type) as usize,
+    );
+
+    // list — PyPy: listobject.py, bases=(object,)
+    reg.insert(
+        &LIST_TYPE as *const PyType as usize,
+        make_type_with_base("list", init_list_typedef, object_type) as usize,
+    );
+
+    // tuple — PyPy: tupleobject.py, bases=(object,)
+    reg.insert(
+        &TUPLE_TYPE as *const PyType as usize,
+        make_type_with_base("tuple", init_tuple_typedef, object_type) as usize,
+    );
+
+    // dict — PyPy: dictobject.py, bases=(object,)
+    reg.insert(
+        &DICT_TYPE as *const PyType as usize,
+        make_type_with_base("dict", init_dict_typedef, object_type) as usize,
+    );
+
+    // NoneType — bases=(object,)
+    reg.insert(
+        &NONE_TYPE as *const PyType as usize,
+        make_type_with_base("NoneType", |_| {}, object_type) as usize,
+    );
 
     let _ = TYPE_REGISTRY.set(reg);
 }
@@ -129,14 +140,35 @@ pub fn get_object_type() -> PyObjectRef {
         .unwrap_or(PY_NULL)
 }
 
-fn make_type(name: &str, _tp: &PyType, init: fn(&mut PyNamespace)) -> PyObjectRef {
+/// Create the root `object` type. MRO = [object].
+fn make_type_root(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
     init(&mut ns);
     let ns_ptr = Box::into_raw(ns);
     let type_obj = w_type_new(name, PY_NULL, ns_ptr as *mut u8);
-    // Cache MRO (just self, no bases for builtin types)
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    type_obj
+}
+
+/// Create a builtin type with a single base. MRO = [self] + base.mro().
+/// PyPy: typeobject.py — compute_default_mro for single-inheritance
+fn make_type_with_base(name: &str, init: fn(&mut PyNamespace), base: PyObjectRef) -> PyObjectRef {
+    let mut ns = Box::new(PyNamespace::new());
+    ns.fix_ptr();
+    init(&mut ns);
+    let ns_ptr = Box::into_raw(ns);
+    let bases = w_tuple_new(vec![base]);
+    let type_obj = w_type_new(name, bases, ns_ptr as *mut u8);
+    // MRO = [self] + base_mro
+    let base_mro = unsafe { w_type_get_mro(base) };
+    let mut mro = vec![type_obj];
+    if !base_mro.is_null() {
+        mro.extend_from_slice(unsafe { &*base_mro });
+    } else {
+        mro.push(base);
+    }
+    unsafe { w_type_set_mro(type_obj, mro) };
     type_obj
 }
 

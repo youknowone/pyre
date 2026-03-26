@@ -447,11 +447,15 @@ unsafe fn float_ne(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 ///   1. Try `a.__op__(b)` (forward)
 ///   2. If not found or returns NotImplemented, try `b.__rop__(a)` (reverse)
 unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Option<PyResult> {
-    // Forward: a.__op__(b) — PyPy: space.call_function(method, a, b)
+    // Forward: a.__op__(b) — PyPy: descroperation.py _binop_impl step 1
     if is_instance(a) {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_mro(w_type, dunder) {
-            return Some(Ok(crate::space_call_function(method, &[a, b])));
+            let result = crate::space_call_function(method, &[a, b]);
+            // If not NotImplemented, return immediately
+            if !is_not_implemented(result) {
+                return Some(Ok(result));
+            }
         }
     }
 
@@ -460,7 +464,10 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
-                return Some(Ok(crate::space_call_function(method, &[b, a])));
+                let result = crate::space_call_function(method, &[b, a]);
+                if !is_not_implemented(result) {
+                    return Some(Ok(result));
+                }
             }
         }
     }
