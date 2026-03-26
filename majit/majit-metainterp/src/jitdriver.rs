@@ -491,22 +491,31 @@ impl<S: JitState> JitDriver<S> {
                     let provisional_meta = self.trace_meta.take().unwrap();
                     // pyjitpl.py:3158-3175 compile_loop parity: rebuild meta
                     // from the MergePoint that matched at close time.
-                    let meta =
-                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
-                        } else {
-                            provisional_meta
-                        };
+                    // Gate: function-entry (header_pc=0) only until
+                    // optimize_bridge InvalidLoop is resolved.
+                    let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
+                    let meta = match hpc {
+                        Some(0) => {
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                            } else {
+                                provisional_meta
+                            }
+                        }
+                        _ => provisional_meta,
+                    };
                     let outcome = self.meta.close_and_compile(&jump_args, meta);
-                    if let crate::pyjitpl::CompileOutcome::Compiled {
-                        cut_header_pc: Some(cp),
-                        green_key: gk,
-                        from_retry: false,
-                    } = outcome
-                    {
-                        if cp != 0 && gk != 0 {
-                            if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                                S::update_meta_merge_pc(&mut entry.meta, cp);
+                    if hpc != Some(0) {
+                        if let crate::pyjitpl::CompileOutcome::Compiled {
+                            cut_header_pc: Some(cp),
+                            green_key: gk,
+                            from_retry: false,
+                        } = outcome
+                        {
+                            if cp != 0 && gk != 0 {
+                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
+                                    S::update_meta_merge_pc(&mut entry.meta, cp);
+                                }
                             }
                         }
                     }
@@ -554,22 +563,29 @@ impl<S: JitState> JitDriver<S> {
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
                     let provisional_meta = self.trace_meta.take().unwrap();
                     // pyjitpl.py:3158-3175 compile_loop parity (see CloseLoop above).
-                    let meta =
-                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
-                        } else {
-                            provisional_meta
-                        };
+                    let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
+                    let meta = match hpc {
+                        Some(0) => {
+                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                            } else {
+                                provisional_meta
+                            }
+                        }
+                        _ => provisional_meta,
+                    };
                     let outcome = self.meta.close_and_compile(&jump_args, meta);
-                    if let crate::pyjitpl::CompileOutcome::Compiled {
-                        cut_header_pc: Some(cp),
-                        green_key: gk,
-                        from_retry: false,
-                    } = outcome
-                    {
-                        if cp != 0 && gk != 0 {
-                            if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                                S::update_meta_merge_pc(&mut entry.meta, cp);
+                    if hpc != Some(0) {
+                        if let crate::pyjitpl::CompileOutcome::Compiled {
+                            cut_header_pc: Some(cp),
+                            green_key: gk,
+                            from_retry: false,
+                        } = outcome
+                        {
+                            if cp != 0 && gk != 0 {
+                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
+                                    S::update_meta_merge_pc(&mut entry.meta, cp);
+                                }
                             }
                         }
                     }

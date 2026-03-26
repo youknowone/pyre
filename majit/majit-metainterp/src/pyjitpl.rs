@@ -1498,25 +1498,6 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
-        let root_green_key = ctx.root_green_key();
-
-        // pyjitpl.py:3162-3165: cross-loop trace closing at a key that
-        // already has compiled code → abort to prevent overwriting.
-        if root_green_key != green_key
-            && self.compiled_loops.contains_key(&green_key)
-            && self.partial_trace.is_none()
-        {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] abort: cross-loop overwrite blocked key={} root={}",
-                    green_key, root_green_key
-                );
-            }
-            ctx.recorder.abort();
-            self.warm_state.abort_tracing(green_key, false);
-            self.warm_state.abort_tracing(root_green_key, false);
-            return CompileOutcome::Aborted;
-        }
 
         // compile.py:269-270: extract cross-loop cut data before consuming
         // the recorder. When the trace closes at a different loop header
