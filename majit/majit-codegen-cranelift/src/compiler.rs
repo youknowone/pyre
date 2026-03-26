@@ -39,9 +39,12 @@ use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
 /// Byte offset of `jf_descr` from JitFrame start.
 const JF_DESCR_OFS: i32 = 8; // offset_of!(JitFrame, jf_descr)
-const JF_FORWARD_OFS: i32 = 48; // offset_of!(JitFrame, jf_forward)
+const JF_FORCE_DESCR_OFS: i32 = 16;
 /// Byte offset of `jf_gcmap` from JitFrame start.
 const JF_GCMAP_OFS: i32 = 24;
+const JF_SAVEDATA_OFS: i32 = 32;
+const JF_GUARD_EXC_OFS: i32 = 40;
+const JF_FORWARD_OFS: i32 = 48;
 /// Byte offset of `jf_frame[0]` from JitFrame start (header + length field).
 const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
 /// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
@@ -68,6 +71,28 @@ const JITFRAME_GC_TYPE_ID: u32 = 2;
 /// `obj_addr` must point to a valid JitFrame payload (after GC header).
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
     let jf_ptr = obj_addr as *const u8;
+
+    // jitframe.py:105-109: trace header ref fields.
+    // gc._trace_callback(callback, arg1, arg2, obj_addr + getofs('jf_descr'))
+    // gc._trace_callback(callback, arg1, arg2, obj_addr + getofs('jf_force_descr'))
+    // gc._trace_callback(callback, arg1, arg2, obj_addr + getofs('jf_savedata'))
+    // gc._trace_callback(callback, arg1, arg2, obj_addr + getofs('jf_guard_exc'))
+    // gc._trace_callback(callback, arg1, arg2, obj_addr + getofs('jf_forward'))
+    for &ofs in &[
+        JF_DESCR_OFS,
+        JF_FORCE_DESCR_OFS,
+        JF_SAVEDATA_OFS,
+        JF_GUARD_EXC_OFS,
+        JF_FORWARD_OFS,
+    ] {
+        let slot_ptr = unsafe { jf_ptr.add(ofs as usize) as *mut GcRef };
+        let gcref = unsafe { *slot_ptr };
+        if !gcref.is_null() {
+            f(slot_ptr);
+        }
+    }
+
+    // jitframe.py:115-136: trace jf_frame ref slots via jf_gcmap.
     // Read jf_gcmap pointer (byte offset 24 from jf_ptr).
     let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
     if gcmap_ptr.is_null() {
