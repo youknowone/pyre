@@ -144,10 +144,6 @@ pub(crate) fn build_guard_metadata(
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
-        } else if let Some(ref types) = op.fail_arg_types {
-            // RPython parity: use optimizer-provided types when available.
-            // These are more accurate (BoxEnv.get_type follows forwarding).
-            types.clone()
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
@@ -178,52 +174,8 @@ pub(crate) fn build_guard_metadata(
         let rd_consts = op.rd_consts.clone();
         let rd_virtuals_info = op.rd_virtuals_info.clone();
 
-        // RPython parity: build recovery_layout.
-        // When rd_numb is available, use rebuild_from_numbering to determine
-        // which slots map to dead-frame values, constants, or virtuals.
-        // Otherwise fall back to the legacy rd_virtuals (GuardVirtualEntry) path.
-        let recovery_layout = if let Some(ref numb) = rd_numb {
-            use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout};
-            let consts = rd_consts.as_deref().unwrap_or(&[]);
-            let (_num_failargs, frames) = crate::resume::rebuild_from_numbering(numb, consts);
-            if !frames.is_empty() {
-                let frame = &frames[0];
-                let slots: Vec<ExitValueSourceLayout> = frame
-                    .values
-                    .iter()
-                    .map(|v| match v {
-                        crate::resume::RebuiltValue::Box(i) => ExitValueSourceLayout::ExitValue(*i),
-                        crate::resume::RebuiltValue::Int(val) => {
-                            ExitValueSourceLayout::Constant(*val as i64)
-                        }
-                        crate::resume::RebuiltValue::Const(val, _tp) => {
-                            ExitValueSourceLayout::Constant(*val)
-                        }
-                        crate::resume::RebuiltValue::Virtual(i) => {
-                            ExitValueSourceLayout::Virtual(*i)
-                        }
-                        crate::resume::RebuiltValue::Unassigned => {
-                            ExitValueSourceLayout::Constant(0)
-                        }
-                    })
-                    .collect();
-                Some(ExitRecoveryLayout {
-                    frames: vec![majit_codegen::ExitFrameLayout {
-                        trace_id: None,
-                        header_pc: None,
-                        source_guard: None,
-                        pc: 0,
-                        slots,
-                        slot_types: None,
-                    }],
-                    virtual_layouts: vec![],
-                    pending_field_layouts: vec![],
-                })
-            } else {
-                None
-            }
-        } else if let Some(ref entries) = op.rd_virtuals {
-            // Legacy path: use GuardVirtualEntry from encode_guard_virtuals.
+        // Build recovery_layout from rd_virtuals (GuardVirtualEntry).
+        let recovery_layout = if let Some(ref entries) = op.rd_virtuals {
             use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout, ExitVirtualLayout};
             let virtual_layouts: Vec<ExitVirtualLayout> = entries
                 .iter()

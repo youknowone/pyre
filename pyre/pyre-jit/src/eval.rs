@@ -993,63 +993,9 @@ fn restore_guard_failure_for_loop(
             slots.join(", ")
         );
     }
-    // RPython resume.py:rebuild_from_numbering parity: when rd_numb is present,
-    // reconstruct full interpreter state from compact resume data + dead frame.
-    // Dead frame has only liveboxes; constants and virtuals come from rd_numb.
-    let mut typed = if let (Some(rd_numb), Some(rd_consts)) =
-        (&exit_layout.rd_numb, &exit_layout.rd_consts)
-    {
-        let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
-        let (_num_failargs, frames) =
-            majit_metainterp::resume::rebuild_from_numbering(rd_numb, rd_consts);
-        if let Some(frame) = frames.first() {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit] rebuild_from_numbering: {} values, dead_frame={} types",
-                    frame.values.len(),
-                    dead_frame_typed.len(),
-                );
-            }
-            frame
-                .values
-                .iter()
-                .map(|v| match v {
-                    majit_metainterp::resume::RebuiltValue::Box(i) => dead_frame_typed
-                        .get(*i)
-                        .cloned()
-                        .unwrap_or(majit_ir::Value::Int(0)),
-                    majit_metainterp::resume::RebuiltValue::Int(val) => {
-                        majit_ir::Value::Int(*val as i64)
-                    }
-                    majit_metainterp::resume::RebuiltValue::Const(val, tp) => match tp {
-                        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(*val as usize)),
-                        majit_ir::Type::Float => {
-                            majit_ir::Value::Float(f64::from_bits(*val as u64))
-                        }
-                        _ => majit_ir::Value::Int(*val),
-                    },
-                    majit_metainterp::resume::RebuiltValue::Virtual(vidx) => {
-                        // resume.py: materialize virtual from rd_virtuals.
-                        materialize_virtual_from_rd(
-                            *vidx,
-                            &dead_frame_typed,
-                            _num_failargs,
-                            rd_consts,
-                            exit_layout.rd_virtuals_info.as_deref(),
-                        )
-                    }
-                    majit_metainterp::resume::RebuiltValue::Unassigned => majit_ir::Value::Int(0),
-                })
-                .collect()
-        } else {
-            decode_exit_layout_values(raw_values, exit_layout)
-        }
-    } else {
-        let mut t = decode_exit_layout_values(raw_values, exit_layout);
-        // Legacy path: materialize virtuals from ExitRecoveryLayout.
-        materialize_recovery_virtuals(&mut t, exit_layout);
-        t
-    };
+    let mut typed = decode_exit_layout_values(raw_values, exit_layout);
+    // RPython resume.py parity: materialize virtual objects from rd_virtuals.
+    materialize_recovery_virtuals(&mut typed, exit_layout);
     // Check for remaining null Ref: if materialization replaced all virtual
     // slots, null_ref count is 0 and we proceed normally. If some slots
     // couldn't be materialized (incomplete rd_virtuals), fall back to
