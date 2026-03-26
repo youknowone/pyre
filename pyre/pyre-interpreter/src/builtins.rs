@@ -25,6 +25,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("True", || w_bool_from(true));
     namespace.get_or_insert_with("False", || w_bool_from(false));
     namespace.get_or_insert_with("None", || w_none());
+    namespace.get_or_insert_with("NotImplemented", || w_not_implemented());
     namespace.get_or_insert_with("hasattr", || w_builtin_func_new("hasattr", builtin_hasattr));
     namespace.get_or_insert_with("getattr", || w_builtin_func_new("getattr", builtin_getattr));
     namespace.get_or_insert_with("setattr", || w_builtin_func_new("setattr", builtin_setattr));
@@ -60,6 +61,9 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("oct", || w_builtin_func_new("oct", builtin_oct));
     namespace.get_or_insert_with("bin", || w_builtin_func_new("bin", builtin_bin));
     namespace.get_or_insert_with("format", || w_builtin_func_new("format", builtin_format));
+    namespace.get_or_insert_with("issubclass", || {
+        w_builtin_func_new("issubclass", builtin_issubclass)
+    });
     namespace.get_or_insert_with("__import__", || {
         w_builtin_func_new("__import__", builtin_import_stub)
     });
@@ -278,9 +282,23 @@ fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `type(obj)` — return the type name as a string (simplified).
+/// `type(obj)` — return the type of an object as a W_TypeObject.
+///
+/// PyPy: `space.type(w_obj)` → W_TypeObject
 fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "type() takes exactly one argument");
     let obj = args[0];
+    unsafe {
+        // Instance → return its class (W_TypeObject)
+        if is_instance(obj) {
+            return Ok(w_instance_get_type(obj));
+        }
+    }
+    // Builtin → type registry lookup
+    if let Some(tp) = crate::typedef::type_of(obj) {
+        return Ok(tp);
+    }
+    // Fallback: return type name as string (legacy)
     let name = unsafe { (*(*obj).ob_type).tp_name };
     Ok(box_str_constant(name))
 }
@@ -333,20 +351,42 @@ fn isinstance_check(obj: PyObjectRef, cls: PyObjectRef) -> bool {
     }
 }
 
+/// `issubclass(cls, classinfo)` — PyPy: baseobjspace.py `issubtype_w`
+fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() == 2, "issubclass() takes exactly two arguments");
+    let cls = args[0];
+    let classinfo = args[1];
+    if unsafe { is_tuple(classinfo) } {
+        let len = unsafe { w_tuple_len(classinfo) };
+        for i in 0..len {
+            if let Some(c) = unsafe { w_tuple_getitem(classinfo, i as i64) } {
+                if unsafe { is_subtype(cls, c) } {
+                    return Ok(w_bool_from(true));
+                }
+            }
+        }
+        return Ok(w_bool_from(false));
+    }
+    Ok(w_bool_from(unsafe { is_subtype(cls, classinfo) }))
+}
+
 /// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
 ///
 /// PyPy: baseobjspace.py `issubtype_w` → checks `cls in w_type.mro_w`.
-/// Uses the single C3 MRO implementation in space.rs (no duplication).
+/// Uses the cached MRO (PyPy: w_type.mro_w) for O(n) lookup.
 unsafe fn is_subtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() || !is_type(w_type) {
         return false;
     }
-    for t in crate::space::compute_mro_pub(w_type) {
-        if std::ptr::eq(t, cls) {
-            return true;
-        }
+    // Use cached MRO first (PyPy: w_type.mro_w)
+    let mro_ptr = w_type_get_mro(w_type);
+    if !mro_ptr.is_null() {
+        return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
     }
-    false
+    // Fallback: compute MRO
+    crate::space::compute_mro_pub(w_type)
+        .iter()
+        .any(|&t| std::ptr::eq(t, cls))
 }
 
 /// Exception type constructor — called as e.g. `ValueError("msg")`.

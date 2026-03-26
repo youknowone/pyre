@@ -100,6 +100,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             format!("'{}'", &*(*str_obj).value)
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
             "None".to_string()
+        } else if std::ptr::eq(
+            tp,
+            &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
+        ) {
+            "NotImplemented".to_string()
         } else if std::ptr::eq(tp, &BUILTIN_FUNC_TYPE as *const PyType) {
             let name = w_builtin_func_name(obj);
             format!("<built-in function {name}>")
