@@ -1751,6 +1751,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.clear_compiled_loops();
     }
 
+    /// Invalidate compiled code for a specific trace_id, removing the
+    /// compiled_loops entry whose root_trace_id matches.
+    pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
+        self.meta
+            .compiled_loops
+            .retain(|_, entry| entry.root_trace_id != trace_id);
+    }
+
     /// warmspot.py:449 — set the per-driver result_type.
     pub fn set_result_type(&mut self, tp: Type) {
         self.meta.set_result_type(tp);

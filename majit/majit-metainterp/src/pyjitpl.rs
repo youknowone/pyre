@@ -1682,20 +1682,41 @@ impl<M: Clone> MetaInterp<M> {
                     }
                     self.cancel_count += 1;
                     // pyjitpl.py:3021-3030: if cancelled too many times,
-                    // abort permanently. RPython retries without unroll but
-                    // majit's simple optimizer has guard encoding gaps that
-                    // produce null Ref on guard failure. Until fixed, abort.
+                    // try one last time without unrolling.
                     if self.cancelled_too_many_times() {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[jit] cancelled too many times at key={}, aborting",
-                                green_key
-                            );
+                        let mut retry_constants = constants_snapshot;
+                        let mut simple_opt = Optimizer::default_pipeline();
+                        simple_opt.constant_types = constant_types;
+                        simple_opt.resume_encoder =
+                            Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
+                        simple_opt.snapshot_boxes = snapshot_map.clone();
+                        let retry_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                simple_opt.optimize_with_constants_and_inputs(
+                                    &trace_ops_snapshot,
+                                    &mut retry_constants,
+                                    num_trace_inputargs,
+                                )
+                            }));
+                        match retry_result {
+                            Ok(retry_ops) => {
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] retry without unroll succeeded at key={}",
+                                        green_key
+                                    );
+                                }
+                                unroll_opt.target_tokens.clear();
+                                constants = retry_constants;
+                                let ni = simple_opt.final_num_inputs();
+                                (retry_ops, ni)
+                            }
+                            Err(_) => {
+                                self.warm_state.abort_tracing(green_key, false);
+                                self.warm_state.reset_function_counts();
+                                return CompileOutcome::Aborted;
+                            }
                         }
-                        unroll_opt.target_tokens.clear();
-                        self.warm_state.abort_tracing(green_key, false);
-                        self.warm_state.reset_function_counts();
-                        return CompileOutcome::Aborted;
                     } else {
                         self.warm_state.abort_tracing(green_key, false);
                         self.warm_state.reset_function_counts();

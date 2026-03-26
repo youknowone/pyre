@@ -901,17 +901,20 @@ fn restore_guard_failure_for_loop(
     if has_null_ref {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] guard-fail: {} null Ref in frame slots [3..{}], invalidating",
+                "[jit] guard-fail: {} null Ref in frame slots [3..{}], invalidate trace {}",
                 typed[3..frame_end]
                     .iter()
                     .filter(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))))
                     .count(),
-                frame_end
+                frame_end,
+                exit_layout.trace_id
             );
         }
+        // Incomplete resume data → can't restore frame safely.
+        // Invalidate only the specific trace that produced this guard,
+        // not all compiled loops. Other loops continue working.
         let (driver, _) = driver_pair();
-        driver.invalidate_all_compiled();
-        driver.meta_interp_mut().warm_state_mut().decay_counters();
+        driver.invalidate_compiled_trace(exit_layout.trace_id);
         return None;
     }
     // compile.py:738 must_compile / counter.py tick parity:
