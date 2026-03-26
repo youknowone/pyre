@@ -9,8 +9,10 @@ use std::cell::Cell;
 
 /// Callback table populated by pyre-jit at initialization.
 ///
-/// All function pointers are `extern "C"` JIT helpers from `call_jit.rs`.
+/// All function pointers are `extern "C"` JIT helpers from `call_jit.rs`
+/// and eval.rs driver access.
 pub struct CallJitCallbacks {
+    // call_jit.rs helpers
     pub callee_frame_helper: fn(usize) -> Option<*const ()>,
     pub callable_prefers_function_entry: fn(PyObjectRef) -> bool,
     pub recursive_force_cache_safe: fn(PyObjectRef) -> bool,
@@ -23,6 +25,8 @@ pub struct CallJitCallbacks {
     pub jit_create_callee_frame_1_raw_int: *const (),
     pub jit_create_self_recursive_callee_frame_1: *const (),
     pub jit_create_self_recursive_callee_frame_1_raw_int: *const (),
+    // eval.rs driver access (opaque pointer to JitDriverPair)
+    pub driver_pair: fn() -> *mut u8,
 }
 
 // Safety: function pointers are 'static and never mutated after init
