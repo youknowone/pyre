@@ -208,6 +208,16 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         }
         ConstantData::Code { code } => handler.code_constant(code),
         ConstantData::None => handler.none_constant(),
+        ConstantData::Ellipsis => handler.none_constant(), // stub: Ellipsis → None
+        ConstantData::Bytes { value } => {
+            // Bytes as string stub (proper bytes object needed later)
+            let s = String::from_utf8_lossy(value);
+            handler.str_constant(&s)
+        }
+        ConstantData::Complex { value } => {
+            // Complex number stub → just the real part
+            handler.float_constant(value.re)
+        }
         _ => Err(PyError::type_error("unsupported constant")),
     }
 }

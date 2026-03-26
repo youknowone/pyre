@@ -57,6 +57,194 @@ pub fn install_builtin_modules() {
     register_builtin_module("operator", crate::module::operator::moduledef::init);
     register_builtin_module("_operator", crate::module::operator::moduledef::init);
     register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
+    register_builtin_module("_io", crate::module::io_mod::moduledef::init);
+
+    // Minimal C-extension stubs required for stdlib import chains.
+    // PyPy: these are all implemented as mixed modules under pypy/module/.
+    register_builtin_module("_weakref", init_weakref);
+    register_builtin_module("_abc", init_abc);
+    register_builtin_module("_functools", init_functools);
+    register_builtin_module("_thread", init_thread);
+    for name in &[
+        "_signal",
+        "_string",
+        "_stat",
+        "_sre",
+        "_codecs",
+        "_locale",
+        "_warnings",
+        "_imp",
+        "_collections",
+        "copyreg",
+        "_heapq",
+        "itertools",
+        "_opcode",
+        "_tokenize",
+        "_typing",
+        "_bisect",
+        "_contextvars",
+        "errno",
+        "atexit",
+        "_struct",
+        "binascii",
+        "_hashlib",
+        "_sha2",
+        "_md5",
+        "_sha1",
+        "_sha3",
+        "_blake2",
+        "_random",
+        "_decimal",
+        "_pickle",
+        "_datetime",
+        "_json",
+        "_csv",
+        "marshal",
+        "posix",
+        "fcntl",
+        "grp",
+        "pwd",
+        "select",
+        "_socket",
+        "_tracemalloc",
+    ] {
+        register_builtin_module(name, empty_module_init);
+    }
+}
+
+/// Empty module initializer for C-extension stubs.
+fn empty_module_init(_ns: &mut PyNamespace) {}
+
+/// _weakref stub — PyPy: pypy/module/_weakref/
+fn init_weakref(ns: &mut PyNamespace) {
+    // ref(obj[, callback]) → weakref. Stub: returns obj itself (no GC).
+    crate::namespace_store(
+        ns,
+        "ref",
+        crate::w_builtin_func_new("ref", |args| {
+            Ok(if args.is_empty() {
+                pyre_object::w_none()
+            } else {
+                args[0]
+            })
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "proxy",
+        crate::w_builtin_func_new("proxy", |args| {
+            Ok(if args.is_empty() {
+                pyre_object::w_none()
+            } else {
+                args[0]
+            })
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "getweakrefcount",
+        crate::w_builtin_func_new("getweakrefcount", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::namespace_store(
+        ns,
+        "getweakrefs",
+        crate::w_builtin_func_new("getweakrefs", |_| Ok(pyre_object::w_list_new(vec![]))),
+    );
+}
+
+/// _abc stub — PyPy: pypy/module/_abc/
+fn init_abc(ns: &mut PyNamespace) {
+    crate::namespace_store(
+        ns,
+        "get_cache_token",
+        crate::w_builtin_func_new("get_cache_token", |_| Ok(pyre_object::w_int_new(0))),
+    );
+    crate::namespace_store(
+        ns,
+        "_abc_init",
+        crate::w_builtin_func_new("_abc_init", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_abc_register",
+        crate::w_builtin_func_new("_abc_register", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_abc_instancecheck",
+        crate::w_builtin_func_new("_abc_instancecheck", |_args| {
+            Ok(pyre_object::w_bool_from(false))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "_abc_subclasscheck",
+        crate::w_builtin_func_new("_abc_subclasscheck", |_args| {
+            Ok(pyre_object::w_bool_from(false))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "_get_dump",
+        crate::w_builtin_func_new("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![]))),
+    );
+    crate::namespace_store(
+        ns,
+        "_reset_registry",
+        crate::w_builtin_func_new("_reset_registry", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "_reset_caches",
+        crate::w_builtin_func_new("_reset_caches", |_| Ok(pyre_object::w_none())),
+    );
+}
+
+/// _functools stub
+fn init_functools(ns: &mut PyNamespace) {
+    crate::namespace_store(
+        ns,
+        "reduce",
+        crate::w_builtin_func_new("reduce", |_| {
+            Err(crate::PyError::type_error("reduce not implemented"))
+        }),
+    );
+    crate::namespace_store(
+        ns,
+        "cmp_to_key",
+        crate::w_builtin_func_new("cmp_to_key", |_| {
+            Err(crate::PyError::type_error("cmp_to_key not implemented"))
+        }),
+    );
+}
+
+/// _thread stub
+fn init_thread(ns: &mut PyNamespace) {
+    crate::namespace_store(
+        ns,
+        "allocate_lock",
+        crate::w_builtin_func_new("allocate_lock", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "LockType",
+        crate::w_builtin_func_new("LockType", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "RLock",
+        crate::w_builtin_func_new("RLock", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(
+        ns,
+        "get_ident",
+        crate::w_builtin_func_new("get_ident", |_| Ok(pyre_object::w_int_new(1))),
+    );
+    crate::namespace_store(
+        ns,
+        "_count",
+        crate::w_builtin_func_new("_count", |_| Ok(pyre_object::w_int_new(1))),
+    );
 }
 
 /// Try to load a builtin module by name.
