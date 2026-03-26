@@ -2148,6 +2148,12 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
                 pyre_object::w_list_getitem(seq, idx)
             } else if is_tuple(seq) {
                 pyre_object::w_tuple_getitem(seq, idx)
+            } else if is_str(seq) {
+                let s = w_str_get_value(seq);
+                s.chars().nth(idx as usize).map(|c| {
+                    let mut buf = [0u8; 4];
+                    w_str_new(c.encode_utf8(&mut buf))
+                })
             } else {
                 None
             };
