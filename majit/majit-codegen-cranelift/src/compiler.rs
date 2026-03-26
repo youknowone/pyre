@@ -38,15 +38,128 @@ use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
 /// Byte offset of `jf_descr` from JitFrame start.
-const JF_DESCR_OFS: i32 = 8; // offset_of!(JitFrame, jf_descr)
-const JF_FORWARD_OFS: i32 = 48; // offset_of!(JitFrame, jf_forward)
+const JF_DESCR_OFS: i32 = 8;
+const JF_FORCE_DESCR_OFS: i32 = 16;
 /// Byte offset of `jf_gcmap` from JitFrame start.
 const JF_GCMAP_OFS: i32 = 24;
+const JF_SAVEDATA_OFS: i32 = 32;
+const JF_GUARD_EXC_OFS: i32 = 40;
+const JF_FORWARD_OFS: i32 = 48;
+/// Byte offset of `jf_frame_length` from JitFrame start.
+const JF_FRAME_LENGTH_OFS: i32 = 56;
 /// Byte offset of `jf_frame[0]` from JitFrame start (header + length field).
 const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
 /// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
-/// gcmap bit positions are offset by this amount.
 const JITFRAME_FIXED_SIZE: u32 = 7;
+/// GC type id for JitFrame objects.
+/// RPython parity: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace).
+const JITFRAME_GC_TYPE_ID: u32 = 2;
+
+/// Custom trace function for GC-managed jitframes.
+///
+/// RPython parity: jitframe.py:104-136 `jitframe_trace`.
+///
+/// 1. Trace header ref fields (jf_descr..jf_forward) — jitframe.py:105-109
+/// 2. Read jf_gcmap pointer, trace ref slots in jf_frame — jitframe.py:115-136
+///
+/// # Safety
+/// `obj_addr` must point to a valid JitFrame payload (after GC header).
+unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
+    let jf_ptr = obj_addr as *const u8;
+
+    // jitframe.py:105-109: trace header ref fields.
+    for &ofs in &[
+        JF_DESCR_OFS,
+        JF_FORCE_DESCR_OFS,
+        JF_SAVEDATA_OFS,
+        JF_GUARD_EXC_OFS,
+        JF_FORWARD_OFS,
+    ] {
+        let slot_ptr = unsafe { jf_ptr.add(ofs as usize) as *mut GcRef };
+        let gcref = unsafe { *slot_ptr };
+        if !gcref.is_null() {
+            f(slot_ptr);
+        }
+    }
+
+    // jitframe.py:115: gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
+    let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
+    if gcmap_ptr.is_null() {
+        return;
+    }
+    // jitframe.py:117: gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
+    let gcmap_lgt = unsafe { *(gcmap_ptr as *const isize) };
+    let frame_items = unsafe { jf_ptr.add(JF_FRAME_ITEM0_OFS as usize) };
+    // jitframe.py:118-136: iterate bitmap words
+    let mut no: isize = 0;
+    while no < gcmap_lgt {
+        let word = unsafe { *(gcmap_ptr.add(8 + 8 * no as usize) as *const usize) };
+        let mut bitindex: usize = 0;
+        while bitindex < 64 {
+            if word & (1usize << bitindex) != 0 {
+                let index = no as usize * 64 + bitindex;
+                let slot_ptr = unsafe { frame_items.add(8 * index) as *mut GcRef };
+                let gcref = unsafe { *slot_ptr };
+                if !gcref.is_null() {
+                    f(slot_ptr);
+                }
+            }
+            bitindex += 1;
+        }
+        no += 1;
+    }
+}
+
+/// Ensure the JITFRAME GC type (type_id=2) is registered.
+///
+/// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
+/// called from jitframe_allocate (jitframe.py:49).
+fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
+    use majit_gc::TypeInfo;
+    let current_count = gc.type_count();
+    if current_count == 0 {
+        return; // Stub GC (TrackingGc), no type registry
+    }
+    if current_count > JITFRAME_GC_TYPE_ID as usize {
+        return; // Already registered
+    }
+    while gc.type_count() < JITFRAME_GC_TYPE_ID as usize {
+        gc.register_type(TypeInfo::simple(8)); // placeholder type ids 0, 1
+    }
+    // JITFRAME is a varsize GC struct:
+    //   base_size = 64 (7 header fields × 8 + length field 8)
+    //   item_size = 8 (each jf_frame slot is Signed)
+    //   length_offset = 56 (jf_frame_length at byte 56 from payload start)
+    let mut info = TypeInfo::varsize(
+        64,     // base_size
+        8,      // item_size
+        56,     // length_offset
+        false,  // items_have_gc_ptrs (custom_trace handles this)
+        vec![], // no fixed gc_ptr_offsets (custom_trace handles this)
+    );
+    info.has_gc_ptrs = true;
+    info.custom_trace = Some(jitframe_custom_trace);
+    let id = gc.register_type(info);
+    debug_assert_eq!(id, JITFRAME_GC_TYPE_ID);
+}
+
+/// Follow jf_forward chain to get the final jitframe address.
+///
+/// RPython jitframe.py:54-57 jitframe_resolve:
+///   while frame.jf_forward:
+///       frame = frame.jf_forward
+///   return frame
+fn jitframe_resolve(jf_ptr: *mut i64) -> *mut i64 {
+    let mut ptr = jf_ptr;
+    loop {
+        let forward_addr =
+            unsafe { *((ptr as *const u8).add(JF_FORWARD_OFS as usize) as *const usize) };
+        if forward_addr == 0 {
+            return ptr;
+        }
+        ptr = forward_addr as *mut i64;
+    }
+}
 
 #[derive(Debug)]
 struct BuiltinFieldDescr {
@@ -575,6 +688,16 @@ const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::si
 
 fn var(idx: u32) -> Variable {
     Variable::from_u32(idx)
+}
+
+/// Reserved Cranelift Variable for jf_ptr (jitframe pointer).
+///
+/// RPython: EBP holds the jitframe pointer. After any collecting call,
+/// _reload_frame_if_necessary reloads EBP from the shadow stack because
+/// the GC may have moved the jitframe. Using a Cranelift Variable
+/// (rather than a raw CValue) enables redefining jf_ptr after collecting calls.
+fn jf_ptr_var() -> Variable {
+    Variable::from_u32(u32::MAX - 1)
 }
 
 /// Whether to use native SIMD (I64X2/F64X2) for Vec* codegen.
@@ -3454,6 +3577,29 @@ fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 
     gcmap_arr.as_ptr() as i64
 }
 
+/// RPython _reload_frame_if_necessary (assembler.py:405-412):
+///   MOV ecx, [rootstacktop]
+///   MOV ebp, [ecx - WORD]    // reload jf_ptr from shadow stack
+///
+/// After a collecting call, the GC may have copied the jitframe from
+/// nursery to old gen. The shadow stack entry was updated by the GC.
+/// Reload jf_ptr from the shadow stack top.
+fn emit_reload_frame_if_necessary(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> CValue {
+    emit_host_call(
+        builder,
+        ptr_type,
+        call_conv,
+        majit_gc::shadow_stack::majit_jf_shadow_stack_get_top_jf_ptr as *const () as usize,
+        &[],
+        Some(ptr_type),
+    )
+    .expect("reload returns jf_ptr")
+}
+
 /// RPython push_gcmap (assembler.py:2017-2022, callbuilder.py:93-107):
 ///   MOV [ebp + jf_gcmap_ofs], gcmap_ptr
 ///
@@ -3562,10 +3708,16 @@ fn emit_collecting_gc_call(
     args.extend_from_slice(extra_args);
 
     let result = emit_host_call(builder, ptr_type, call_conv, func_ptr, &args, return_type);
-    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+
+    // _reload_frame_if_necessary (assembler.py:405-412):
+    // After a collecting call, the GC may have copied the jitframe from
+    // nursery to old gen. Reload jf_ptr from the shadow stack.
+    let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+
+    emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
     reload_ref_roots(
         builder,
-        jf_ptr,
+        new_jf_ptr,
         ref_root_slots,
         defined_ref_vars,
         ref_root_base_ofs,
@@ -3644,10 +3796,13 @@ fn emit_indirect_call_from_parts(
     }
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
     if can_collect {
-        emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+        // _reload_frame_if_necessary (assembler.py:405-412)
+        let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+
+        emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
         reload_ref_roots(
             builder,
-            jf_ptr,
+            new_jf_ptr,
             ref_root_slots,
             defined_ref_vars,
             ref_root_base_ofs,
@@ -3850,24 +4005,55 @@ fn run_compiled_code(
 ) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
-    //
-    // RPython allocates jitframes from nursery. pyre uses Rust-managed Vec
-    // because compiled code uses no_collect alloc (gc_alloc_nursery_no_collect)
-    // which prevents GC movement during execution. The shadow stack + jf_gcmap
-    // mechanism traces ref slots identically to RPython's root_walker +
-    // jitframe_trace (jitframe.py:104-136).
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
-    let jf_total = header_words + depth + num_ref_roots;
-    let mut jf_buf = vec![0i64; jf_total];
+    let frame_depth = depth + num_ref_roots;
+    let jf_total = header_words + frame_depth;
+    let payload_bytes = jf_total * 8;
+
+    // RPython gc.py:132 malloc_jitframe → jitframe_allocate:
+    //   rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
+    //   frame = lltype.malloc(JITFRAME, frame_depth)
+    //
+    // When GC has a type registry (MiniMarkGC), allocate from nursery with
+    // JITFRAME type_id so the GC can copy+trace it correctly. The shadow
+    // stack holds a GcRef that the GC updates in place when copying.
+    // When GC is a stub (TrackingGc) or absent, fall back to Vec<i64>.
+    let use_gc_alloc = gc_runtime_id
+        .map(|id| with_gc_runtime(id, |gc| gc.type_count() > 0))
+        .unwrap_or(false);
+    let (jf_gcref, _jf_buf_keepalive): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
+        let runtime_id = gc_runtime_id.unwrap();
+        let gcref = with_gc_runtime(runtime_id, |gc| {
+            gc.alloc_nursery_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
+        });
+        // jitframe_allocate: frame.jf_frame_info = frame_info (skipped —
+        // we don't have frame_info). Write the jf_frame_length field so
+        // copy_nursery_object can compute the varsize total.
+        unsafe {
+            *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
+        }
+        (gcref, None)
+    } else {
+        let mut buf = vec![0i64; jf_total];
+        let gcref = GcRef(buf.as_mut_ptr() as usize);
+        (gcref, Some(buf))
+    };
+
+    let jf_ptr = jf_gcref.0 as *mut i64;
 
     // llmodel.py:306-315: set arguments in frame
     for (i, &val) in inputs.iter().enumerate() {
-        jf_buf[header_words + i] = val;
+        unsafe { *jf_ptr.add(header_words + i) = val };
+    }
+
+    // llmodel.py:322: llop.gc_writebarrier(ll_frame)
+    if use_gc_alloc {
+        let runtime_id = gc_runtime_id.unwrap();
+        with_gc_runtime(runtime_id, |gc| gc.write_barrier(jf_gcref));
     }
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
-    // Returns (jf_ptr, jf_descr) — second value is FailDescr pointer in rdx.
     let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
@@ -3880,19 +4066,24 @@ fn run_compiled_code(
     };
 
     // _call_header_shadowstack (assembler.py:1122-1128) parity:
-    // Push jf_ptr onto the jitframe shadow stack. The GC walks this
-    // stack during collection and traces ref slots via jf_gcmap
-    // (written by push_gcmap in compiled code before GC calls).
-    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_buf.as_mut_ptr() as *mut u8);
+    // Push jf_ptr as GcRef onto the jitframe shadow stack. The GC
+    // treats this as a root: if in nursery, copies jitframe to old gen
+    // and updates the GcRef in place.
+    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_gcref);
 
-    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_buf.as_mut_ptr()) });
+    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_ptr) });
+
+    // _call_footer_shadowstack (assembler.py:1130-1136) parity:
+    majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
+
+    // jitframe_resolve (jitframe.py:54-57):
+    // Follow jf_forward chain — the compiled code may return the old
+    // (nursery) jf_ptr, but the jitframe has been forwarded to old gen.
+    let result_jf = jitframe_resolve(result_jf);
 
     // llmodel.py:412-420 get_latest_descr: read jf_descr from returned frame.
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    // _call_footer_shadowstack (assembler.py:1130-1136) parity:
-    // Pop jf_ptr from shadow stack.
-    majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
     let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         CALL_ASSEMBLER_DEADFRAME_SENTINEL
     } else if jf_descr_raw == 0 {
@@ -4180,7 +4371,8 @@ impl CraneliftBackend {
         backend
     }
 
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
+        ensure_jitframe_type_registered(gc.as_mut());
         if let Some(runtime_id) = self.gc_runtime_id {
             replace_gc_runtime(runtime_id, gc);
         } else {
@@ -4536,7 +4728,9 @@ impl CraneliftBackend {
 
         // jf_ptr serves as both inputs_ptr (entry) and outputs_ptr (exits).
         // RPython: EBP = jitframe pointer throughout compiled code.
-        let jf_ptr = builder.block_params(entry_block)[0];
+        // After a collecting call, _reload_frame_if_necessary reloads
+        // jf_ptr from the shadow stack (GC may have moved the jitframe).
+        let mut jf_ptr = builder.block_params(entry_block)[0];
         let inputs_ptr = jf_ptr; // alias for entry loading
         let outputs_ptr = jf_ptr; // alias for guard exit stores
         // Ref root slots live in jf_frame after output/fail_args area.
@@ -5629,6 +5823,7 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                 }
 
                 OpCode::CallAssemblerI
@@ -6078,6 +6273,7 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                 }
 
                 OpCode::CallReleaseGilI
@@ -6229,6 +6425,8 @@ impl CraneliftBackend {
                                 ref_root_base_ofs,
                                 per_call_gcmap,
                             );
+                            jf_ptr =
+                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         }
                     }
 
@@ -6276,6 +6474,8 @@ impl CraneliftBackend {
                             ) {
                                 call_result = result;
                             }
+                            jf_ptr =
+                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         }
                     }
 
@@ -6311,6 +6511,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsize => {
@@ -6342,6 +6543,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
@@ -6404,6 +6606,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().jump(merge_block, &[slow_result]);
 
                     builder.switch_to_block(merge_block);
@@ -7854,6 +8057,7 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("GC allocation helper must return a value");
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         builder.def_var(var(vi), result);
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
@@ -7905,6 +8109,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.def_var(var(vi), result);
                 }
 
@@ -8045,6 +8250,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.def_var(var(vi), result);
                 }
                 OpCode::Newunicode => {
@@ -8068,6 +8274,7 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.def_var(var(vi), result);
                 }
                 // All OpCode variants are explicitly handled above.

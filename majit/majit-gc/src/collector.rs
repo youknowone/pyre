@@ -487,6 +487,27 @@ impl MiniMarkGC {
     fn trace_and_update_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { header_of(obj_addr).type_id() };
         let type_info = self.types.get(type_id);
+
+        // custom_trace_hook parity: use custom trace function if registered.
+        if let Some(trace_fn) = type_info.custom_trace {
+            let mut slots: Vec<*mut GcRef> = Vec::new();
+            unsafe {
+                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                    slots.push(slot_ptr);
+                });
+            }
+            for slot_ptr in slots {
+                let field_ref = unsafe { *slot_ptr };
+                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                    let new_ref = self.copy_nursery_object(field_ref.0);
+                    unsafe {
+                        *slot_ptr = new_ref;
+                    }
+                }
+            }
+            return;
+        }
+
         let gc_ptr_offsets: Vec<usize> = type_info.gc_ptr_offsets.clone();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
@@ -631,6 +652,30 @@ impl MiniMarkGC {
     fn mark_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { header_of(obj_addr).type_id() };
         let type_info = self.types.get(type_id);
+
+        // custom_trace_hook parity for major GC marking.
+        if let Some(trace_fn) = type_info.custom_trace {
+            let mut refs: Vec<GcRef> = Vec::new();
+            unsafe {
+                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                    let field_ref = *slot_ptr;
+                    if !field_ref.is_null() {
+                        refs.push(field_ref);
+                    }
+                });
+            }
+            for field_ref in refs {
+                if self.is_managed_heap_object(field_ref.0) {
+                    let hdr = unsafe { header_of(field_ref.0) };
+                    if !hdr.has_flag(flags::VISITED) {
+                        hdr.set_flag(flags::VISITED);
+                        self.incr_state.gray_stack.push(field_ref.0);
+                    }
+                }
+            }
+            return;
+        }
+
         let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
@@ -1318,6 +1363,14 @@ impl GcAllocator for MiniMarkGC {
 
     fn is_pinned(&self, obj: GcRef) -> bool {
         self.is_pinned(obj)
+    }
+
+    fn register_type(&mut self, info: TypeInfo) -> u32 {
+        self.types.register(info)
+    }
+
+    fn type_count(&self) -> usize {
+        self.types.len()
     }
 }
 

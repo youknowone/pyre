@@ -96,28 +96,22 @@ pub fn clear() {
 
 // ── JitFrame shadow stack (assembler.py:1122-1136) ───────────────
 
-/// JitFrame layout constants for gcmap walking.
-/// These match the #[repr(C)] JitFrame struct in jitframe.rs.
-///
-/// JitFrame header: [jf_frame_info, jf_descr, jf_force_descr, jf_gcmap,
-///                    jf_savedata, jf_guard_exc, jf_forward]
-/// Then: [jf_frame_length, jf_frame_items...]
-const JF_GCMAP_BYTE_OFS: usize = 24; // offset_of!(JitFrame, jf_gcmap)
-const JF_FRAME_ITEM0_BYTE_OFS: usize = 64; // JITFRAME_FIXED_SIZE(56) + length(8)
-const WORD: usize = 8;
-
 /// RPython shadow stack entry: [category, jf_ptr].
 /// assembler.py:1125: MOV [ebx], 1  — the `1` is_minor marker.
 /// assembler.py:1126: MOV [ebx+WORD], ebp — the jf_ptr.
+///
+/// `jf_ptr` is a GcRef: the GC may copy the jitframe during minor
+/// collection and update jf_ptr in-place (RPython root_walker semantics).
 #[derive(Clone, Copy)]
 struct JfShadowEntry {
     /// is_minor marker. RPython uses 1 to indicate jitframe entry.
-    /// incminimark.py uses this to skip old-gen jitframes during minor GC.
     _category: usize,
-    jf_ptr: *mut u8,
+    /// GcRef to the jitframe. Updated by the GC when the jitframe is
+    /// copied from nursery to old gen (root_walker semantics).
+    jf_ptr: GcRef,
 }
 
-/// Push a jitframe pointer onto the jitframe shadow stack.
+/// Push a jitframe GcRef onto the jitframe shadow stack.
 ///
 /// RPython _call_header_shadowstack (assembler.py:1122-1128):
 ///   MOV [shadowstack_top], 1       // is_minor marker
@@ -125,7 +119,7 @@ struct JfShadowEntry {
 ///   ADD shadowstack_top, 2*WORD
 ///
 /// Returns the depth for later pop.
-pub fn push_jf(jf_ptr: *mut u8) -> usize {
+pub fn push_jf(jf_ptr: GcRef) -> usize {
     JF_SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
@@ -153,50 +147,42 @@ pub fn jf_depth() -> usize {
     JF_SHADOW_STACK.with(|ss| ss.borrow().len())
 }
 
-/// Walk jitframe shadow stack entries, tracing ref slots via jf_gcmap.
+/// Walk jitframe shadow stack entries as GC roots.
 ///
-/// For each jf_ptr on the stack:
-///   1. Read jf_gcmap pointer from jf_ptr + JF_GCMAP_BYTE_OFS
-///   2. If gcmap is non-null, read bitmap [length, data...]
-///   3. For each set bit, call visitor on the corresponding jf_frame slot
+/// Each jf_ptr is exposed as `&mut GcRef`. The GC treats it like any
+/// other root: if it points into the nursery, the jitframe is copied
+/// to old gen and the GcRef is updated in place.
 ///
-/// This is the pyre equivalent of RPython's root_walker.walk_roots()
-/// combined with jitframe_trace (jitframe.py:104-136).
+/// The jitframe's internal ref slots are NOT traced here — that is
+/// handled by `jitframe_custom_trace` via Phase 2 (remembered set +
+/// custom_trace), exactly as in RPython where `root_walker.walk_roots()`
+/// copies the jitframe, and then `jitframe_trace` (custom_trace hook)
+/// traces the gcmap-indicated ref slots during Phase 2.
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     JF_SHADOW_STACK.with(|ss| {
-        let ss = ss.borrow();
-        for entry in ss.iter() {
-            let jf_ptr = entry.jf_ptr;
-            if jf_ptr.is_null() {
-                continue;
-            }
-            // Read jf_gcmap field
-            let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_BYTE_OFS) as *const *const u8) };
-            if gcmap_ptr.is_null() {
-                continue;
-            }
-            // gcmap format: [length: isize, data: usize[length]]
-            let gcmap_lgt = unsafe { *(gcmap_ptr as *const isize) };
-            let frame_items = unsafe { jf_ptr.add(JF_FRAME_ITEM0_BYTE_OFS) };
-            let mut no: isize = 0;
-            while no < gcmap_lgt {
-                let cur = unsafe { *(gcmap_ptr.add(WORD + WORD * no as usize) as *const usize) };
-                let mut bitindex: usize = 0;
-                while bitindex < 64 {
-                    if cur & (1usize << bitindex) != 0 {
-                        let index = no as usize * WORD * 8 + bitindex;
-                        let slot_ptr = unsafe { frame_items.add(WORD * index) as *mut GcRef };
-                        let gcref = unsafe { *slot_ptr };
-                        if !gcref.is_null() {
-                            unsafe { visitor(&mut *slot_ptr) };
-                        }
-                    }
-                    bitindex += 1;
-                }
-                no += 1;
+        let mut ss = ss.borrow_mut();
+        for entry in ss.iter_mut() {
+            if !entry.jf_ptr.is_null() {
+                visitor(&mut entry.jf_ptr);
             }
         }
     });
+}
+
+/// Read the jf_ptr of the top shadow stack entry.
+///
+/// RPython _reload_frame_if_necessary (assembler.py:405-412):
+///   MOV ecx, [rootstacktop]
+///   MOV ebp, [ecx - WORD]        // ebp = *(top - WORD) = jf_ptr
+///
+/// After a collecting call, the GC may have copied the jitframe. The
+/// shadow stack entry has been updated. Compiled code reloads jf_ptr
+/// from here to get the (possibly new) address.
+pub fn jf_top_ptr() -> GcRef {
+    JF_SHADOW_STACK.with(|ss| {
+        let ss = ss.borrow();
+        ss.last().map(|e| e.jf_ptr).unwrap_or(GcRef::NULL)
+    })
 }
 
 // ── Extern "C" interface for compiled code ──────────────────────
@@ -229,6 +215,16 @@ pub extern "C" fn majit_shadow_stack_set_depth(new_depth: i64) {
         let mut ss = ss.borrow_mut();
         ss.entries.truncate(new_depth as usize);
     });
+}
+
+/// Read the top jf_ptr from the jitframe shadow stack.
+///
+/// Called from compiled code as `_reload_frame_if_necessary`
+/// (assembler.py:405-412): after a collecting call, the GC may have
+/// moved the jitframe. Reload jf_ptr from the shadow stack.
+#[unsafe(no_mangle)]
+pub extern "C" fn majit_jf_shadow_stack_get_top_jf_ptr() -> i64 {
+    jf_top_ptr().0 as i64
 }
 
 #[cfg(test)]
@@ -288,42 +284,44 @@ mod tests {
     fn test_jf_shadow_stack_push_pop() {
         clear();
         assert_eq!(jf_depth(), 0);
-        let depth = push_jf(0x1000 as *mut u8);
+        let depth = push_jf(GcRef(0x1000));
         assert_eq!(depth, 0);
         assert_eq!(jf_depth(), 1);
-        push_jf(0x2000 as *mut u8);
+        push_jf(GcRef(0x2000));
         assert_eq!(jf_depth(), 2);
         pop_jf_to(depth);
         assert_eq!(jf_depth(), 0);
     }
 
     #[test]
-    fn test_walk_jf_roots_with_gcmap() {
+    fn test_walk_jf_roots_updates_gcref() {
         clear();
-        // Create a fake jitframe with gcmap
-        // Layout: 64 bytes header + frame items
-        let mut jf_buf = vec![0u8; 128];
-        let jf_ptr = jf_buf.as_mut_ptr();
+        push_jf(GcRef(0x1000));
+        push_jf(GcRef(0x2000));
 
-        // Set up a gcmap: [1, 0b0010] — bit 1 set
-        let gcmap: [isize; 2] = [1, 0b0010];
-        // Write gcmap pointer to jf_gcmap field (offset 24)
-        unsafe {
-            *(jf_ptr.add(JF_GCMAP_BYTE_OFS) as *mut *const u8) = gcmap.as_ptr() as *const u8;
-        }
-        // Write a GcRef at frame item[1] (offset 64 + 8 = 72)
-        unsafe {
-            *(jf_ptr.add(JF_FRAME_ITEM0_BYTE_OFS + 8) as *mut usize) = 0xABCD;
-        }
-
-        push_jf(jf_ptr);
-
-        let mut found = Vec::new();
+        // Simulate GC moving jitframes (root_walker semantics)
         walk_jf_roots(|gcref| {
-            found.push(gcref.0);
+            gcref.0 += 0x100;
         });
-        assert_eq!(found, vec![0xABCD]);
 
+        // After walk, top entry should be updated
+        assert_eq!(jf_top_ptr(), GcRef(0x2100));
+        pop_jf_to(0);
+    }
+
+    #[test]
+    fn test_jf_top_ptr_reload() {
+        clear();
+        push_jf(GcRef(0xABCD));
+        assert_eq!(jf_top_ptr(), GcRef(0xABCD));
+        assert_eq!(majit_jf_shadow_stack_get_top_jf_ptr(), 0xABCD);
+
+        // Simulate GC updating the entry
+        walk_jf_roots(|gcref| {
+            gcref.0 = 0xDEAD;
+        });
+        assert_eq!(jf_top_ptr(), GcRef(0xDEAD));
+        assert_eq!(majit_jf_shadow_stack_get_top_jf_ptr(), 0xDEAD as i64);
         pop_jf_to(0);
     }
 }
