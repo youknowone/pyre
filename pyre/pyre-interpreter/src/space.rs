@@ -1956,6 +1956,21 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
             return Err(PyError {
                 kind: PyErrorKind::StopIteration,
                 message: "".to_string(),
+                exc_object: std::ptr::null_mut(),
+            });
+        }
+        // Range iterator
+        if is_range_iter(obj) {
+            let iter = &mut *(obj as *mut pyre_object::rangeobject::W_RangeIterator);
+            if iter.current < iter.stop {
+                let val = w_int_new(iter.current);
+                iter.current += iter.step;
+                return Ok(val);
+            }
+            return Err(PyError {
+                kind: PyErrorKind::StopIteration,
+                message: "".to_string(),
+                exc_object: std::ptr::null_mut(),
             });
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
@@ -1983,6 +1998,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
             return Err(PyError {
                 kind: PyErrorKind::StopIteration,
                 message: "".to_string(),
+                exc_object: std::ptr::null_mut(),
             });
         }
         let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::frame::PyFrame;
@@ -1991,6 +2007,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
             return Err(PyError {
                 kind: PyErrorKind::StopIteration,
                 message: "".to_string(),
+                exc_object: std::ptr::null_mut(),
             });
         }
         w_generator_set_started(gen_obj);
@@ -2010,6 +2027,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                     return Err(PyError {
                         kind: PyErrorKind::StopIteration,
                         message: "".to_string(),
+                        exc_object: std::ptr::null_mut(),
                     });
                 }
                 // Frame is suspended at YIELD_VALUE — return the yielded value

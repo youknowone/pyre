@@ -1064,6 +1064,7 @@ impl OpcodeStepExecutor for PyFrame {
         return Err(crate::PyError {
             kind: crate::PyErrorKind::GeneratorReturn,
             message: format!("{}", generator as usize),
+            exc_object: std::ptr::null_mut(),
         }
         .into());
     }
@@ -1222,8 +1223,35 @@ impl OpcodeStepExecutor for PyFrame {
 
         // Resolve keyword args into positional order.
         // PyPy: argument.py _match_signature step: match keywords to argnames
-        let resolved = crate::call::resolve_kwargs(callable, &args, kwarg_names);
-        let result = call_callable(self, callable, &resolved)?;
+        let callable_unwrapped = crate::space::unwrap_cell(callable);
+        let resolved = if unsafe { crate::is_builtin_func(callable_unwrapped) } {
+            // Builtin functions: pack kwargs into a dict as last arg
+            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+                unsafe { pyre_object::w_tuple_len(kwarg_names) }
+            } else {
+                0
+            };
+            if nkw > 0 {
+                let n_pos = args.len() - nkw;
+                let mut resolved = args[..n_pos].to_vec();
+                let kwargs_dict = pyre_object::w_dict_new();
+                for ki in 0..nkw {
+                    let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+                    if let Some(name_obj) = name {
+                        unsafe {
+                            pyre_object::w_dict_store(kwargs_dict, name_obj, args[n_pos + ki]);
+                        }
+                    }
+                }
+                resolved.push(kwargs_dict);
+                resolved
+            } else {
+                args.clone()
+            }
+        } else {
+            crate::call::resolve_kwargs(callable, &args, kwarg_names)
+        };
+        let result = call_callable(self, callable_unwrapped, &resolved)?;
         self.push(result);
         Ok(())
     }
