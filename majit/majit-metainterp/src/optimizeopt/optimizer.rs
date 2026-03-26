@@ -922,6 +922,7 @@ impl Optimizer {
                         fields.push((*field_idx, base_idx + i));
                     }
                     virtual_entries.push(GuardVirtualEntry {
+                        original_opref: Some(opref),
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: None,
@@ -937,6 +938,7 @@ impl Optimizer {
                         fields.push((*field_idx, base_idx + i));
                     }
                     virtual_entries.push(GuardVirtualEntry {
+                        original_opref: Some(opref),
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: vinfo.known_class,
@@ -2748,12 +2750,62 @@ impl Optimizer {
                                     _ => None,
                                 };
                                 virtual_entries.push(GuardVirtualEntry {
+                                    original_opref: None,
                                     fail_arg_index: fa_idx,
                                     descr,
                                     known_class,
                                     fields,
                                 });
                             }
+                        }
+                    }
+                }
+                // Fallback: use original_opref from Phase 1's GuardVirtualEntry
+                // to resolve through Phase 2's forwarding chain. RPython
+                // doesn't need this because Phase 2 fail_args contain the
+                // original Box objects (shared forwarding graph).
+                if !virtual_entries.iter().any(|e| e.fail_arg_index == fa_idx) {
+                    // Find original_opref from existing rd_virtuals (Phase 1).
+                    let orig = virtual_entries
+                        .iter()
+                        .find(|e| e.fail_arg_index == fa_idx)
+                        .and_then(|e| e.original_opref);
+                    let try_ref = orig.unwrap_or(OpRef(fa_idx as u32));
+                    let resolved = ctx.get_replacement(try_ref);
+                    if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                        if info.is_virtual() {
+                            let base_idx = original_len + extra_fail_args.len();
+                            let fields_vec = match &info {
+                                PtrInfo::VirtualStruct(v) => &v.fields,
+                                PtrInfo::Virtual(v) => &v.fields,
+                                _ => {
+                                    continue;
+                                }
+                            };
+                            let mut fields = Vec::new();
+                            for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
+                                let rv = ctx.get_replacement(*vref);
+                                extra_fail_args.push(rv);
+                                fields.push((*fidx, base_idx + i));
+                            }
+                            let descr = match &info {
+                                PtrInfo::VirtualStruct(v) => v.descr.clone(),
+                                PtrInfo::Virtual(v) => v.descr.clone(),
+                                _ => {
+                                    continue;
+                                }
+                            };
+                            let known_class = match &info {
+                                PtrInfo::Virtual(v) => v.known_class,
+                                _ => None,
+                            };
+                            virtual_entries.push(GuardVirtualEntry {
+                                original_opref: None,
+                                fail_arg_index: fa_idx,
+                                descr,
+                                known_class,
+                                fields,
+                            });
                         }
                     }
                 }
@@ -2795,6 +2847,7 @@ impl Optimizer {
                         fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
+                        original_opref: None,
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: vinfo.known_class,
@@ -2825,6 +2878,7 @@ impl Optimizer {
                         fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
+                        original_opref: None,
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: None,
