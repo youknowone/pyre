@@ -8,8 +8,8 @@
 use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
 
-use crate::jit::metainterp::{MetaInterpFrame, PyreMetaInterp};
-use crate::jit::state::PyreSym;
+use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
+use crate::state::PyreSym;
 
 /// Trace an entire loop body starting at `start_pc`.
 ///
@@ -50,7 +50,7 @@ pub fn trace_bytecode(
     // RPython pyjitpl.py:2971-2973: register the initial merge point so
     // reached_loop_header recognizes the trace start backedge and closes
     // the loop instead of unrolling it as a first-visit inner loop.
-    let start_key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
+    let start_key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
     {
         let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
             .map(|i| majit_ir::OpRef(i as u32))
@@ -73,12 +73,12 @@ pub fn trace_bytecode(
             loop_header_pc: Some(target_pc),
             ..
         } => {
-            let key = crate::eval::make_green_key(code as *const CodeObject, *target_pc);
+            let key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
             ctx.set_green_key(key);
             ctx.header_pc = *target_pc;
         }
         TraceAction::CloseLoop => {
-            let key = crate::eval::make_green_key(code as *const CodeObject, start_pc);
+            let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
             ctx.set_green_key(key);
             ctx.header_pc = start_pc;
         }
@@ -99,7 +99,7 @@ pub fn trace_bytecode(
 
 #[cfg(test)]
 mod tests {
-    use crate::jit::metainterp::semantic_fallthrough_pc;
+    use crate::metainterp::semantic_fallthrough_pc;
     use pyre_bytecode::bytecode::Instruction;
     use pyre_bytecode::compile_exec;
     use pyre_interpreter::decode_instruction_at;

@@ -245,7 +245,7 @@ impl PyreMetaInterp {
             self.inline_call_guard = Some(pyre_interpreter::call::inline_call_override_guard());
         }
 
-        let (driver, _) = crate::eval::driver_pair();
+        let (driver, _) = crate::driver::driver_pair();
         driver.enter_inline_frame(pending.green_key);
         ctx.push_inline_trace_position(pending.green_key);
 
@@ -295,12 +295,12 @@ impl PyreMetaInterp {
         // Drop callee frame in trace
         if let Some(frame_opref) = popped.drop_frame_opref {
             ctx.call_void(
-                crate::call_jit::jit_drop_callee_frame as *const (),
+                crate::callbacks::get().jit_drop_callee_frame,
                 &[frame_opref],
             );
         }
 
-        let (driver, _) = crate::eval::driver_pair();
+        let (driver, _) = crate::driver::driver_pair();
         driver.leave_inline_frame();
 
         // Release inline call guard when all inline frames are gone
@@ -416,12 +416,12 @@ impl PyreMetaInterp {
             ..
         } = action
         {
-            ctx.set_green_key(crate::eval::make_green_key(
+            ctx.set_green_key(crate::driver::make_green_key(
                 code as *const CodeObject,
                 *target_pc,
             ));
         } else if matches!(action, TraceAction::CloseLoop) {
-            ctx.set_green_key(crate::eval::make_green_key(code as *const CodeObject, pc));
+            ctx.set_green_key(crate::driver::make_green_key(code as *const CodeObject, pc));
         }
     }
 }
