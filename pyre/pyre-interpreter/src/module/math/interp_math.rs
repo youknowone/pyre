@@ -32,27 +32,27 @@ pub fn get_double(obj: PyObjectRef) -> f64 {
 
 macro_rules! math1 {
     ($name:ident, $f:expr) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyObjectRef {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             assert!(
                 args.len() == 1,
                 concat!(stringify!($name), "() takes exactly one argument")
             );
             let x = get_double(args[0]);
-            floatobject::w_float_new($f(x))
+            Ok(floatobject::w_float_new($f(x)))
         }
     };
 }
 
 macro_rules! math2 {
     ($name:ident, $f:expr) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyObjectRef {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             assert!(
                 args.len() == 2,
                 concat!(stringify!($name), "() takes exactly two arguments")
             );
             let x = get_double(args[0]);
             let y = get_double(args[1]);
-            floatobject::w_float_new($f(x, y))
+            Ok(floatobject::w_float_new($f(x, y)))
         }
     };
 }
@@ -91,27 +91,27 @@ math2!(fmod, |x: f64, y: f64| x % y);
 
 // ── functions with non-standard signatures ───────────────────────────
 
-pub fn floor(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn floor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "floor() takes exactly one argument");
     let x = get_double(args[0]);
-    w_int_new(x.floor() as i64)
+    Ok(w_int_new(x.floor() as i64))
 }
 
-pub fn ceil(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn ceil(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "ceil() takes exactly one argument");
     let x = get_double(args[0]);
-    w_int_new(x.ceil() as i64)
+    Ok(w_int_new(x.ceil() as i64))
 }
 
 /// PyPy equivalent: interp_math.trunc
-pub fn trunc(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn trunc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "trunc() takes exactly one argument");
     let x = get_double(args[0]);
-    w_int_new(x.trunc() as i64)
+    Ok(w_int_new(x.trunc() as i64))
 }
 
 /// PyPy equivalent: interp_math.log (supports optional base argument)
-pub fn log(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn log(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let x = get_double(args[0]);
     let result = if args.len() == 2 {
         let base = get_double(args[1]);
@@ -119,50 +119,50 @@ pub fn log(args: &[PyObjectRef]) -> PyObjectRef {
     } else {
         x.ln()
     };
-    floatobject::w_float_new(result)
+    Ok(floatobject::w_float_new(result))
 }
 
-pub fn log2(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn log2(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "log2() takes exactly one argument");
-    floatobject::w_float_new(get_double(args[0]).log2())
+    Ok(floatobject::w_float_new(get_double(args[0]).log2()))
 }
 
-pub fn log10(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn log10(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "log10() takes exactly one argument");
-    floatobject::w_float_new(get_double(args[0]).log10())
+    Ok(floatobject::w_float_new(get_double(args[0]).log10()))
 }
 
 /// PyPy equivalent: interp_math.degrees
-pub fn degrees(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn degrees(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "degrees() takes exactly one argument");
-    floatobject::w_float_new(get_double(args[0]).to_degrees())
+    Ok(floatobject::w_float_new(get_double(args[0]).to_degrees()))
 }
 
 /// PyPy equivalent: interp_math.radians
-pub fn radians(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn radians(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "radians() takes exactly one argument");
-    floatobject::w_float_new(get_double(args[0]).to_radians())
+    Ok(floatobject::w_float_new(get_double(args[0]).to_radians()))
 }
 
 /// PyPy equivalent: interp_math.isinf
-pub fn isinf(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn isinf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "isinf() takes exactly one argument");
-    w_bool_from(get_double(args[0]).is_infinite())
+    Ok(w_bool_from(get_double(args[0]).is_infinite()))
 }
 
 /// PyPy equivalent: interp_math.isnan
-pub fn isnan(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn isnan(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "isnan() takes exactly one argument");
-    w_bool_from(get_double(args[0]).is_nan())
+    Ok(w_bool_from(get_double(args[0]).is_nan()))
 }
 
-pub fn isfinite(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn isfinite(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "isfinite() takes exactly one argument");
-    w_bool_from(get_double(args[0]).is_finite())
+    Ok(w_bool_from(get_double(args[0]).is_finite()))
 }
 
 /// PyPy equivalent: app_math.factorial (app-level in PyPy, interp-level here)
-pub fn factorial(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn factorial(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "factorial() takes exactly one argument");
     let n = unsafe { w_int_get_value(args[0]) };
     assert!(n >= 0, "factorial() not defined for negative values");
@@ -170,10 +170,10 @@ pub fn factorial(args: &[PyObjectRef]) -> PyObjectRef {
     for i in 2..=n {
         result = result.checked_mul(i).expect("factorial overflow");
     }
-    w_int_new(result)
+    Ok(w_int_new(result))
 }
 
-pub fn gcd(args: &[PyObjectRef]) -> PyObjectRef {
+pub fn gcd(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "gcd() takes exactly two arguments");
     let mut a = unsafe { w_int_get_value(args[0]) }.unsigned_abs();
     let mut b = unsafe { w_int_get_value(args[1]) }.unsigned_abs();
@@ -182,5 +182,5 @@ pub fn gcd(args: &[PyObjectRef]) -> PyObjectRef {
         b = a % b;
         a = t;
     }
-    w_int_new(a as i64)
+    Ok(w_int_new(a as i64))
 }

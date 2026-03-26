@@ -5,49 +5,49 @@
 use crate::{PyNamespace, namespace_store, w_builtin_func_new};
 use pyre_object::*;
 
-fn op_index(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "index() takes exactly one argument");
     let obj = args[0];
     unsafe {
         if is_int(obj) {
-            return obj;
+            return Ok(obj);
         }
         if is_bool(obj) {
-            return w_int_new(if w_bool_get_value(obj) { 1 } else { 0 });
+            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
         }
     }
     // Try __index__ dunder
-    crate::space_call_function_or_identity(obj, "__index__")
+    Ok(crate::space_call_function_or_identity(obj, "__index__"))
 }
 
-fn op_add(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_add(args[0], args[1]).unwrap_or(w_none())
+    Ok(crate::space::py_add(args[0], args[1]).unwrap_or(w_none()))
 }
 
-fn op_sub(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_sub(args[0], args[1]).unwrap_or(w_none())
+    Ok(crate::space::py_sub(args[0], args[1]).unwrap_or(w_none()))
 }
 
-fn op_mul(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_mul(args[0], args[1]).unwrap_or(w_none())
+    Ok(crate::space::py_mul(args[0], args[1]).unwrap_or(w_none()))
 }
 
-fn op_eq(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq).unwrap_or(w_none())
+    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq).unwrap_or(w_none()))
 }
 
-fn op_lt(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Lt).unwrap_or(w_none())
+    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Lt).unwrap_or(w_none()))
 }
 
-fn op_gt(args: &[PyObjectRef]) -> PyObjectRef {
+fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Gt).unwrap_or(w_none())
+    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Gt).unwrap_or(w_none()))
 }
 
 pub fn init(ns: &mut PyNamespace) {

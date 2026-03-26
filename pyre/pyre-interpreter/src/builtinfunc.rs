@@ -10,9 +10,11 @@ pub static BUILTIN_FUNC_TYPE: PyType = PyType {
     tp_name: "builtin_function_or_method",
 };
 
-/// Signature of a built-in function: takes a slice of positional arguments
-/// and returns a PyObjectRef (or could panic for now on errors).
-pub type BuiltinFn = fn(&[PyObjectRef]) -> PyObjectRef;
+/// Signature of a built-in function.
+///
+/// PyPy: all interp-level functions can raise OperationError.
+/// pyre equivalent: returns Result so errors propagate through the call stack.
+pub type BuiltinFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
 /// A built-in function object.
 #[repr(C)]

@@ -133,13 +133,13 @@ pub fn new_builtin_namespace() -> PyNamespace {
 }
 
 /// `print(*args)` — write space-separated str representations to stdout.
-fn builtin_print(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let parts: Vec<String> = args
         .iter()
         .map(|&obj| format!("{}", PyDisplay(obj)))
         .collect();
     println!("{}", parts.join(" "));
-    w_none()
+    Ok(w_none())
 }
 
 /// Extract an i64 from an int or long object. Panics if the long value
@@ -165,22 +165,22 @@ unsafe fn range_arg_to_i64(obj: PyObjectRef) -> i64 {
 /// `range(stop)` or `range(start, stop)` or `range(start, stop, step)`.
 ///
 /// Returns a range iterator directly (simplified: no separate range object).
-fn builtin_range(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     match args.len() {
         1 => {
             let stop = unsafe { range_arg_to_i64(args[0]) };
-            w_range_iter_new(0, stop, 1)
+            Ok(w_range_iter_new(0, stop, 1))
         }
         2 => {
             let start = unsafe { range_arg_to_i64(args[0]) };
             let stop = unsafe { range_arg_to_i64(args[1]) };
-            w_range_iter_new(start, stop, 1)
+            Ok(w_range_iter_new(start, stop, 1))
         }
         3 => {
             let start = unsafe { range_arg_to_i64(args[0]) };
             let stop = unsafe { range_arg_to_i64(args[1]) };
             let step = unsafe { range_arg_to_i64(args[2]) };
-            w_range_iter_new(start, stop, step)
+            Ok(w_range_iter_new(start, stop, step))
         }
         _ => panic!("range() takes 1 to 3 arguments"),
     }
@@ -188,30 +188,30 @@ fn builtin_range(args: &[PyObjectRef]) -> PyObjectRef {
 
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
-fn builtin_len(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "len() takes exactly one argument");
-    crate::space::py_len(args[0]).expect("object has no len()")
+    crate::space::py_len(args[0])
 }
 
 /// `abs(x)` — return the absolute value of a number.
-fn builtin_abs(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "abs() takes exactly one argument");
     let obj = args[0];
     unsafe {
         if is_int(obj) {
             let v = w_int_get_value(obj);
             // i64::MIN.abs() overflows; promote to long
-            return match v.checked_abs() {
+            return Ok(match v.checked_abs() {
                 Some(r) => w_int_new(r),
                 None => w_long_new(-BigInt::from(v)),
-            };
+            });
         }
         if is_long(obj) {
             let val = w_long_get_value(obj).clone();
-            return w_long_new(if val < BigInt::from(0) { -val } else { val });
+            return Ok(w_long_new(if val < BigInt::from(0) { -val } else { val }));
         }
         if is_float(obj) {
-            return w_float_new(w_float_get_value(obj).abs());
+            return Ok(w_float_new(w_float_get_value(obj).abs()));
         }
     }
     // Instance __abs__ — PyPy: baseobjspace.py abs
@@ -219,7 +219,7 @@ fn builtin_abs(args: &[PyObjectRef]) -> PyObjectRef {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__abs__") {
-                return crate::space_call_function(method, &[obj]);
+                return Ok(crate::space_call_function(method, &[obj]));
             }
         }
     }
@@ -238,7 +238,7 @@ unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
 }
 
 /// `min(a, b)` — return the smaller of two values.
-fn builtin_min(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "min() takes exactly two arguments");
     let a = args[0];
     let b = args[1];
@@ -246,19 +246,19 @@ fn builtin_min(args: &[PyObjectRef]) -> PyObjectRef {
         if is_int(a) && is_int(b) {
             let va = w_int_get_value(a);
             let vb = w_int_get_value(b);
-            return if va <= vb { a } else { b };
+            return Ok(if va <= vb { a } else { b });
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             let va = obj_to_bigint(a);
             let vb = obj_to_bigint(b);
-            return if va <= vb { a } else { b };
+            return Ok(if va <= vb { a } else { b });
         }
     }
     panic!("min() not supported for these types")
 }
 
 /// `max(a, b)` — return the larger of two values.
-fn builtin_max(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "max() takes exactly two arguments");
     let a = args[0];
     let b = args[1];
@@ -266,29 +266,29 @@ fn builtin_max(args: &[PyObjectRef]) -> PyObjectRef {
         if is_int(a) && is_int(b) {
             let va = w_int_get_value(a);
             let vb = w_int_get_value(b);
-            return if va >= vb { a } else { b };
+            return Ok(if va >= vb { a } else { b });
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             let va = obj_to_bigint(a);
             let vb = obj_to_bigint(b);
-            return if va >= vb { a } else { b };
+            return Ok(if va >= vb { a } else { b });
         }
     }
     panic!("max() not supported for these types")
 }
 
 /// `type(obj)` — return the type name as a string (simplified).
-fn builtin_type(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "type() takes exactly one argument");
     let obj = args[0];
     let name = unsafe { (*(*obj).ob_type).tp_name };
-    box_str_constant(name)
+    Ok(box_str_constant(name))
 }
 
 /// `isinstance(obj, cls)` — type check supporting user-defined classes.
 ///
 /// PyPy: baseobjspace.py `isinstance_w` → check MRO chain.
-fn builtin_isinstance(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "isinstance() takes exactly two arguments");
     let obj = args[0];
     let cls = args[1];
@@ -297,16 +297,16 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> PyObjectRef {
         // by walking the instance's type chain (bases).
         if is_type(cls) && is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            return w_bool_from(is_subtype(w_type, cls));
+            return Ok(w_bool_from(is_subtype(w_type, cls)));
         }
         // Fallback: type name comparison for builtin types
         if is_str(cls) {
             let obj_type = (*(*obj).ob_type).tp_name;
             let check_type = w_str_get_value(cls);
-            return w_bool_from(obj_type == check_type);
+            return Ok(w_bool_from(obj_type == check_type));
         }
     }
-    w_bool_from(false)
+    Ok(w_bool_from(false))
 }
 
 /// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
@@ -329,7 +329,7 @@ unsafe fn is_subtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// Extracts the message from the first argument and creates a W_ExceptionObject.
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
-        fn $fn_name(args: &[PyObjectRef]) -> PyObjectRef {
+        fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let msg = if args.is_empty() {
                 ""
             } else if unsafe { is_str(args[0]) } {
@@ -337,7 +337,7 @@ macro_rules! exc_constructor {
             } else {
                 ""
             };
-            pyre_object::excobject::w_exception_new($kind, msg)
+            Ok(pyre_object::excobject::w_exception_new($kind, msg))
         }
     };
 }
@@ -394,7 +394,7 @@ exc_constructor!(
 /// PyPy equivalent: pyopcode.py BUILD_CLASS
 /// Direct call to call::real_build_class (no callback needed —
 /// interpreter and runtime are in the same crate).
-fn builtin_build_class(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::call::real_build_class(args)
 }
 
@@ -406,191 +406,191 @@ pub fn get_build_class_func() -> PyObjectRef {
 /// `property(fget=None, fset=None, fdel=None, doc=None)` → W_PropertyObject
 ///
 /// PyPy: descriptor.py W_Property
-fn builtin_property(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_property(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let fget = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let fset = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let fdel = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-    pyre_object::w_property_new(fget, fset, fdel)
+    Ok(pyre_object::w_property_new(fget, fset, fdel))
 }
 
 /// `staticmethod(func)` → W_StaticMethodObject
 ///
 /// PyPy: function.py StaticMethod — __get__ returns wrapped func as-is.
-fn builtin_staticmethod(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_staticmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(
         !args.is_empty(),
         "staticmethod requires a callable argument"
     );
-    pyre_object::w_staticmethod_new(args[0])
+    Ok(pyre_object::w_staticmethod_new(args[0]))
 }
 
 /// `classmethod(func)` → W_ClassMethodObject
 ///
 /// PyPy: function.py ClassMethod — __get__ binds the class as first arg.
-fn builtin_classmethod(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_classmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "classmethod requires a callable argument");
-    pyre_object::w_classmethod_new(args[0])
+    Ok(pyre_object::w_classmethod_new(args[0]))
 }
 
 /// `str(obj)` → convert to string
-fn builtin_str(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_str_new("");
+        return Ok(w_str_new(""));
     }
     let obj = args[0];
     unsafe {
         if is_str(obj) {
-            return obj;
+            return Ok(obj);
         }
     }
     let s = unsafe { crate::py_str(obj) };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `repr(obj)` → string representation
-fn builtin_repr(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "repr() takes exactly one argument");
     let s = unsafe { crate::py_repr(args[0]) };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `int(obj)` → convert to int
-fn builtin_int(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_int_new(0);
+        return Ok(w_int_new(0));
     }
     let obj = args[0];
     unsafe {
         if is_int(obj) {
-            return obj;
+            return Ok(obj);
         }
         if is_float(obj) {
-            return w_int_new(floatobject::w_float_get_value(obj) as i64);
+            return Ok(w_int_new(floatobject::w_float_get_value(obj) as i64));
         }
         if is_bool(obj) {
-            return w_int_new(if w_bool_get_value(obj) { 1 } else { 0 });
+            return Ok(w_int_new(if w_bool_get_value(obj) { 1 } else { 0 }));
         }
         if is_str(obj) {
             let s = w_str_get_value(obj);
             if let Ok(v) = s.trim().parse::<i64>() {
-                return w_int_new(v);
+                return Ok(w_int_new(v));
             }
         }
     }
-    w_int_new(0)
+    Ok(w_int_new(0))
 }
 
 /// `float(obj)` → convert to float
-fn builtin_float(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return floatobject::w_float_new(0.0);
+        return Ok(floatobject::w_float_new(0.0));
     }
     let obj = args[0];
     unsafe {
         if is_float(obj) {
-            return obj;
+            return Ok(obj);
         }
         if is_int(obj) {
-            return floatobject::w_float_new(w_int_get_value(obj) as f64);
+            return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
         if is_str(obj) {
             let s = w_str_get_value(obj);
             if let Ok(v) = s.trim().parse::<f64>() {
-                return floatobject::w_float_new(v);
+                return Ok(floatobject::w_float_new(v));
             }
         }
     }
-    floatobject::w_float_new(0.0)
+    Ok(floatobject::w_float_new(0.0))
 }
 
 /// `bool(obj)` → convert to bool (simplified truthiness)
 /// `bool(obj)` — PyPy: operation.py bool → space.is_true
-fn builtin_bool(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_bool_from(false);
+        return Ok(w_bool_from(false));
     }
-    w_bool_from(crate::space::py_is_true(args[0]))
+    Ok(w_bool_from(crate::space::py_is_true(args[0])))
 }
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
-fn builtin_hasattr(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "hasattr() takes exactly two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    w_bool_from(crate::space::py_getattr(obj, name).is_ok())
+    Ok(w_bool_from(crate::space::py_getattr(obj, name).is_ok()))
 }
 
 /// `getattr(obj, name[, default])` → value — direct call
-fn builtin_getattr(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "getattr() takes at least two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
     match crate::space::py_getattr(obj, name) {
-        Ok(val) => val,
-        Err(_) => args
+        Ok(val) => Ok(val),
+        Err(_) => Ok(args
             .get(2)
             .copied()
-            .unwrap_or_else(|| panic!("getattr: attribute '{name}' not found")),
+            .unwrap_or_else(|| panic!("getattr: attribute '{name}' not found"))),
     }
 }
 
 /// `setattr(obj, name, value)` — direct call
-fn builtin_setattr(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 3, "setattr() takes exactly three arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
     let _ = crate::space::py_setattr(obj, name, args[2]);
-    w_none()
+    Ok(w_none())
 }
 
-fn builtin_tuple(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_tuple_new(vec![]);
+        return Ok(w_tuple_new(vec![]));
     }
     let obj = args[0];
     unsafe {
         if is_tuple(obj) {
-            return obj;
+            return Ok(obj);
         }
         if is_list(obj) {
             let n = w_list_len(obj);
             let items: Vec<_> = (0..n)
                 .filter_map(|i| w_list_getitem(obj, i as i64))
                 .collect();
-            return w_tuple_new(items);
+            return Ok(w_tuple_new(items));
         }
     }
-    w_tuple_new(vec![])
+    Ok(w_tuple_new(vec![]))
 }
 
-fn builtin_list_ctor(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_list_new(vec![]);
+        return Ok(w_list_new(vec![]));
     }
     let obj = args[0];
     unsafe {
         if is_list(obj) {
-            return obj;
+            return Ok(obj);
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
             let items: Vec<_> = (0..n)
                 .filter_map(|i| w_tuple_getitem(obj, i as i64))
                 .collect();
-            return w_list_new(items);
+            return Ok(w_list_new(items));
         }
     }
-    w_list_new(vec![])
+    Ok(w_list_new(vec![]))
 }
 
 /// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init
-fn builtin_dict_ctor(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
-        return w_dict_new();
+        return Ok(w_dict_new());
     }
     unsafe {
         if is_dict(args[0]) {
-            return args[0];
+            return Ok(args[0]);
         }
     }
     // Try to construct from iterable of (key, value) pairs
@@ -609,38 +609,38 @@ fn builtin_dict_ctor(args: &[PyObjectRef]) -> PyObjectRef {
                     }
                 }
             }
-            return dict;
+            return Ok(dict);
         }
     }
     panic!("dict() from this type not yet implemented");
 }
 
 /// `object()` — PyPy: objectobject.py descr__new__
-fn builtin_object(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_object(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // PyPy: objectobject.py descr__new__ → allocate bare object
     // In Python, object() returns a featureless object instance.
     // Use PY_NULL as type since there's no builtin 'object' W_TypeObject yet.
-    pyre_object::w_instance_new(pyre_object::PY_NULL)
+    Ok(pyre_object::w_instance_new(pyre_object::PY_NULL))
     // Full implementation requires a base object type in TypeDef.
 }
 
 /// `super()` — PyPy: descriptor.py W_Super
-fn builtin_super(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_super(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("super() not yet implemented (requires __class__ cell + frame introspection)");
 }
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
-fn builtin_id(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "id() takes exactly one argument");
-    w_int_new(args[0] as i64)
+    Ok(w_int_new(args[0] as i64))
 }
 
 /// `hash(obj)` — PyPy: baseobjspace.py hash → identity for now
-fn builtin_hash(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "hash() takes exactly one argument");
     unsafe {
         if is_int(args[0]) {
-            return args[0]; // int hashes to itself
+            return Ok(args[0]); // int hashes to itself
         }
         if is_str(args[0]) {
             // Simplified string hash — deterministic within one run
@@ -649,7 +649,7 @@ fn builtin_hash(args: &[PyObjectRef]) -> PyObjectRef {
             for b in s.bytes() {
                 h = h.wrapping_mul(1000003).wrapping_add(b as i64);
             }
-            return w_int_new(h);
+            return Ok(w_int_new(h));
         }
     }
     // Instance __hash__ — PyPy: baseobjspace.py hash_w
@@ -657,53 +657,53 @@ fn builtin_hash(args: &[PyObjectRef]) -> PyObjectRef {
         if pyre_object::is_instance(args[0]) {
             let w_type = pyre_object::w_instance_get_type(args[0]);
             if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__hash__") {
-                return crate::space_call_function(method, &[args[0]]);
+                return Ok(crate::space_call_function(method, &[args[0]]));
             }
         }
     }
-    w_int_new(args[0] as i64) // identity hash fallback
+    Ok(w_int_new(args[0] as i64)) // identity hash fallback
 }
 
 /// `ord(c)` — PyPy: operation.py ord
-fn builtin_ord(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "ord() takes exactly one argument");
     let s = unsafe { w_str_get_value(args[0]) };
     assert!(s.len() == 1, "ord() expected a character");
-    w_int_new(s.chars().next().unwrap() as i64)
+    Ok(w_int_new(s.chars().next().unwrap() as i64))
 }
 
 /// `chr(i)` — PyPy: operation.py chr
-fn builtin_chr(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "chr() takes exactly one argument");
     let code = unsafe { w_int_get_value(args[0]) } as u32;
     let c = char::from_u32(code).expect("chr() arg not in range");
-    w_str_new(&c.to_string())
+    Ok(w_str_new(&c.to_string()))
 }
 
 /// `map()` — PyPy: functional.py W_Map (returns iterator)
-fn builtin_map(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_map(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("map() not yet implemented (requires iterator protocol)");
 }
 
 /// `zip()` — PyPy: functional.py W_Zip (returns iterator)
-fn builtin_zip(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_zip(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("zip() not yet implemented (requires iterator protocol)");
 }
 
 /// `enumerate()` — PyPy: functional.py W_Enumerate (returns iterator)
-fn builtin_enumerate(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_enumerate(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("enumerate() not yet implemented (requires iterator protocol)");
 }
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
-fn builtin_reversed(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_reversed(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("reversed() not yet implemented (requires iterator protocol)");
 }
 
 /// `sorted(iterable)` — PyPy: listobject.py listsort
 ///
 /// Returns a new sorted list. Simplified: sorts by int value.
-fn builtin_sorted(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "sorted() takes at least one argument");
     let iterable = args[0];
     let mut items = Vec::new();
@@ -735,11 +735,11 @@ fn builtin_sorted(args: &[PyObjectRef]) -> PyObjectRef {
             }
         });
     }
-    w_list_new(items)
+    Ok(w_list_new(items))
 }
 
 /// `any(iterable)` — PyPy: operation.py any
-fn builtin_any(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
     let iterable = args[0];
     unsafe {
@@ -748,29 +748,29 @@ fn builtin_any(args: &[PyObjectRef]) -> PyObjectRef {
             for i in 0..n {
                 if let Some(item) = w_list_getitem(iterable, i as i64) {
                     if crate::space::py_is_true(item) {
-                        return w_bool_from(true);
+                        return Ok(w_bool_from(true));
                     }
                 }
             }
-            return w_bool_from(false);
+            return Ok(w_bool_from(false));
         }
         if is_tuple(iterable) {
             let n = w_tuple_len(iterable);
             for i in 0..n {
                 if let Some(item) = w_tuple_getitem(iterable, i as i64) {
                     if crate::space::py_is_true(item) {
-                        return w_bool_from(true);
+                        return Ok(w_bool_from(true));
                     }
                 }
             }
-            return w_bool_from(false);
+            return Ok(w_bool_from(false));
         }
     }
     panic!("any() argument must be list or tuple");
 }
 
 /// `all(iterable)` — PyPy: operation.py all
-fn builtin_all(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
     let iterable = args[0];
     unsafe {
@@ -779,29 +779,29 @@ fn builtin_all(args: &[PyObjectRef]) -> PyObjectRef {
             for i in 0..n {
                 if let Some(item) = w_list_getitem(iterable, i as i64) {
                     if !crate::space::py_is_true(item) {
-                        return w_bool_from(false);
+                        return Ok(w_bool_from(false));
                     }
                 }
             }
-            return w_bool_from(true);
+            return Ok(w_bool_from(true));
         }
         if is_tuple(iterable) {
             let n = w_tuple_len(iterable);
             for i in 0..n {
                 if let Some(item) = w_tuple_getitem(iterable, i as i64) {
                     if !crate::space::py_is_true(item) {
-                        return w_bool_from(false);
+                        return Ok(w_bool_from(false));
                     }
                 }
             }
-            return w_bool_from(true);
+            return Ok(w_bool_from(true));
         }
     }
     panic!("all() argument must be list or tuple");
 }
 
 /// `sum(iterable, start=0)` — PyPy: operation.py sum
-fn builtin_sum(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "sum() takes at least one argument");
     let iterable = args[0];
     let start = args.get(1).copied().unwrap_or_else(|| w_int_new(0));
@@ -814,7 +814,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> PyObjectRef {
                     acc = crate::space::py_add(acc, item).expect("sum: unsupported type");
                 }
             }
-            return acc;
+            return Ok(acc);
         }
         if is_tuple(iterable) {
             let n = w_tuple_len(iterable);
@@ -823,58 +823,61 @@ fn builtin_sum(args: &[PyObjectRef]) -> PyObjectRef {
                     acc = crate::space::py_add(acc, item).expect("sum: unsupported type");
                 }
             }
-            return acc;
+            return Ok(acc);
         }
     }
     panic!("sum() argument must be list or tuple");
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
-fn builtin_round(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "round() takes at least one argument");
     let obj = args[0];
     let ndigits = args.get(1);
     unsafe {
         if is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
-            return match ndigits {
+            return Ok(match ndigits {
                 Some(nd) if is_int(*nd) => {
                     let n = w_int_get_value(*nd);
                     let factor = 10f64.powi(n as i32);
                     floatobject::w_float_new((v * factor).round() / factor)
                 }
                 _ => w_int_new(v.round() as i64),
-            };
+            });
         }
         if is_int(obj) {
-            return obj;
+            return Ok(obj);
         }
     }
     panic!("round() not supported for this type");
 }
 
 /// `divmod(a, b)` — PyPy: baseobjspace.py divmod
-fn builtin_divmod(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "divmod() takes exactly two arguments");
     unsafe {
         if is_int(args[0]) && is_int(args[1]) {
             let a = w_int_get_value(args[0]);
             let b = w_int_get_value(args[1]);
             assert!(b != 0, "integer division or modulo by zero");
-            return w_tuple_new(vec![w_int_new(a.div_euclid(b)), w_int_new(a.rem_euclid(b))]);
+            return Ok(w_tuple_new(vec![
+                w_int_new(a.div_euclid(b)),
+                w_int_new(a.rem_euclid(b)),
+            ]));
         }
     }
     panic!("divmod() not supported for these types");
 }
 
 /// `pow(base, exp)` — PyPy: baseobjspace.py pow
-fn builtin_pow(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "pow() takes at least two arguments");
-    crate::space::py_pow(args[0], args[1]).expect("pow() failed")
+    crate::space::py_pow(args[0], args[1])
 }
 
 /// `hex(x)` — PyPy: operation.py hex
-fn builtin_hex(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "hex() takes exactly one argument");
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
@@ -882,11 +885,11 @@ fn builtin_hex(args: &[PyObjectRef]) -> PyObjectRef {
     } else {
         format!("0x{v:x}")
     };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `oct(x)` — PyPy: operation.py oct
-fn builtin_oct(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "oct() takes exactly one argument");
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
@@ -894,11 +897,11 @@ fn builtin_oct(args: &[PyObjectRef]) -> PyObjectRef {
     } else {
         format!("0o{v:o}")
     };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `bin(x)` — PyPy: operation.py bin
-fn builtin_bin(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "bin() takes exactly one argument");
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
@@ -906,18 +909,18 @@ fn builtin_bin(args: &[PyObjectRef]) -> PyObjectRef {
     } else {
         format!("0b{v:b}")
     };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `format(value, format_spec='')` — PyPy: operation.py format
-fn builtin_format(args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "format() takes at least one argument");
     // Simplified: format without format_spec returns str(value)
     let s = unsafe { crate::py_str(args[0]) };
-    w_str_new(&s)
+    Ok(w_str_new(&s))
 }
 
 /// `__import__()` — PyPy: pyopcode.py IMPORT_NAME invokes this
-fn builtin_import_stub(_args: &[PyObjectRef]) -> PyObjectRef {
+fn builtin_import_stub(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     panic!("__import__() not callable directly — use import statement");
 }

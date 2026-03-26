@@ -2090,7 +2090,7 @@ pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
         // Builtin function: call directly
         let func = unsafe { pyre_interpreter::w_builtin_func_get(callable) };
         let args = [arg0 as PyObjectRef];
-        return func(&args) as i64;
+        return func(&args).unwrap_or(pyre_object::PY_NULL) as i64;
     }
 
     let code_ptr = unsafe { w_func_get_code_ptr(callable) };

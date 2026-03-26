@@ -214,7 +214,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
         callable,
         |callable| {
             let func = unsafe { w_builtin_func_get(callable) };
-            Ok(func(args))
+            func(args)
         },
         |callable| call_user_function(frame, callable, args),
     )
@@ -288,7 +288,7 @@ pub fn call_callable_inline_residual(
         callable,
         |callable| {
             let func = unsafe { w_builtin_func_get(callable) };
-            Ok(func(args))
+            func(args)
         },
         |callable| call_user_function_plain(frame, callable, args),
     )
@@ -315,7 +315,10 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
         // Builtin function: direct Rust call
         if crate::is_builtin_func(callable) {
             let func = crate::w_builtin_func_get(callable);
-            return func(args);
+            return match func(args) {
+                Ok(result) => result,
+                Err(e) => panic!("builtin call failed: {e}"),
+            };
         }
         // User function: create frame + eval
         if crate::is_func(callable) {
@@ -356,11 +359,12 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
 /// PyPy equivalent: pyopcode.py BUILD_CLASS →
 ///   w_methodsdict = call(body_fn)
 ///   w_newclass = call(metaclass, name, bases, methodsdict)
-pub(crate) fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
-    assert!(
-        args.len() >= 2,
-        "__build_class__ requires at least 2 arguments"
-    );
+pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "__build_class__ requires at least 2 arguments",
+        ));
+    }
     let body_fn = args[0];
     let name_obj = args[1];
     let bases = &args[2..];
@@ -368,14 +372,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     let bases_tuple = pyre_object::w_tuple_new(bases.to_vec());
 
-    match build_class_inner(body_fn, name, bases_tuple) {
-        Ok(cls) => cls,
-        Err(e) => {
-            // Propagate as exception object — the caller's exception handler
-            // will catch it (e.g., try/except ImportError in datetime.py).
-            e.to_exc_object()
-        }
-    }
+    build_class_inner(body_fn, name, bases_tuple)
 }
 
 fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> PyResult {
