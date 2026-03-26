@@ -408,14 +408,13 @@ impl CodeWriter {
                     assembler.push_r(obj_tmp0);
                 }
 
-                // Unsupported: abort to interpreter fallback
-                other => {
-                    if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!(
-                            "[codewriter] unsupported bytecode at py_pc={}: {:?}",
-                            py_pc, other
-                        );
-                    }
+                // Python 3.13: ToBool converts TOS to bool before branch.
+                // No-op in JitCode: the value is already truthy/falsy and
+                // the following PopJumpIfFalse guards on it.
+                Instruction::ToBool => {}
+
+                // Unsupported: abort to interpreter fallback.
+                _ => {
                     assembler.abort();
                 }
             }
