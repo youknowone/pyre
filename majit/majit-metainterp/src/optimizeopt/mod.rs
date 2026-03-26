@@ -905,15 +905,44 @@ impl OptContext {
     fn number_guard_inline(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
-        let pos = op.rd_resume_position;
-        if pos < 0 {
+        // RPython: every guard has a snapshot (from capture_resumedata).
+        // Use tracing-time snapshot if available, otherwise build from
+        // current fail_args (for guards created by the optimizer itself,
+        // e.g. GUARD_NOT_INVALIDATED from quasi-immutable field access).
+        // For guards without tracing-time snapshot (optimizer-created guards
+        // like GUARD_NOT_INVALIDATED from quasi-immut), produce a simple
+        // 1:1 TAGBOX rd_numb without modifying fail_args.
+        if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
+            if let Some(ref fa) = op.fail_args {
+                let fa_len = fa.len();
+                let mut ns = resumedata::NumberingState::new(fa_len + 8);
+                ns.append_int(0);
+                ns.append_int(fa_len as i32);
+                ns.append_int(0);
+                ns.append_int(0);
+                ns.append_int(0);
+                ns.append_int(0);
+                ns.append_int(fa_len as i32);
+                for (i, &opref) in fa.iter().enumerate() {
+                    if opref.is_none() {
+                        ns.append_short(resumedata::NULLREF);
+                    } else {
+                        let t = resumedata::tag(i as i32, resumedata::TAGBOX)
+                            .unwrap_or(resumedata::NULLREF);
+                        ns.append_short(t);
+                    }
+                }
+                ns.patch_current_size(0);
+                op.rd_numb = Some(ns.create_numbering());
+                op.rd_consts = Some(Vec::new());
+            }
             return;
         }
-        let Some(snapshot_boxes) = self.snapshot_boxes.get(&pos) else {
-            return;
-        };
 
-        // Build snapshot from tracing-time OpRefs.
+        let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
+
+        // Build snapshot from tracing-time OpRefs → resolve through
+        // optimizer's replacement chain to current scope.
         let boxes: Vec<OpRef> = snapshot_boxes
             .iter()
             .map(|&opref| {
