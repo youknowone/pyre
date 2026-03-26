@@ -1823,10 +1823,8 @@ impl<M: Clone> MetaInterp<M> {
             return CompileOutcome::Cancelled;
         }
 
-        // resume.py parity: rd_numb produced per-guard at compile time.
-        // number_guards_final builds 1:1 TAGBOX rd_numb encoding so the
-        // guard failure recovery path can decode via rebuild_from_numbering.
-        compile::number_guards_final(&mut optimized_ops, &constants, &constant_types);
+        // resume.py parity: rd_numb is now produced inline during optimization
+        // (ctx.emit → number_guard_inline) rather than post-assembly.
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
@@ -2648,7 +2646,7 @@ impl<M: Clone> MetaInterp<M> {
         // directly (frame + ni + sd + locals). A guard before GETFIELD ops
         // ensures tagged pointers (force_cache hits) don't get dereferenced.
 
-        compile::number_guards_final(&mut optimized_ops, &constants, &constant_types);
+        // rd_numb produced inline during optimization (number_guard_inline).
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
