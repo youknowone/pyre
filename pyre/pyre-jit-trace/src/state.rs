@@ -4838,7 +4838,7 @@ impl MIFrame {
             };
 
             // Emit GUARD_EXCEPTION — returns the exception value OpRef.
-            let exc_opref = self.with_ctx(|this, ctx| {
+            let guard_op = self.with_ctx(|this, ctx| {
                 this.flush_to_frame_for_guard(ctx);
                 let fail_arg_types = this.build_single_frame_fail_arg_types();
                 let fail_args = this.build_single_frame_fail_args(ctx);
@@ -4850,6 +4850,15 @@ impl MIFrame {
                     &fail_args,
                 )
             });
+
+            // pyjitpl.py:3386-3389: if the exception class is already known
+            // constant (from a prior GUARD_CLASS/GUARD_EXCEPTION), represent
+            // the exception value as a constant; otherwise use the guard op.
+            let exc_opref = if self.sym().class_of_last_exc_is_const {
+                self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64))
+            } else {
+                guard_op
+            };
 
             // RPython pyjitpl.py:3390: class_of_last_exc_is_const = True
             self.sym_mut().class_of_last_exc_is_const = true;
