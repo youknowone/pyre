@@ -265,6 +265,10 @@ pub struct OptContext {
 /// store_final_boxes_in_guard.
 pub struct OptBoxEnv<'a> {
     pub ctx: &'a OptContext,
+    /// Phase 2 label arg → original inputarg reverse mapping.
+    /// Applied after get_replacement so that rd_numb references
+    /// Cranelift-known OpRefs instead of optimizer-internal label args.
+    pub label_reverse: std::collections::HashMap<u32, OpRef>,
 }
 
 impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
