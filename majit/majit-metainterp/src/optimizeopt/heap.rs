@@ -348,6 +348,8 @@ pub struct OptHeap {
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
     quasi_immut_cache: HashMap<FieldKey, OpRef>,
+    /// field_idx → DescrRef for PtrInfo-based export.
+    field_descr_map: HashMap<u32, DescrRef>,
     /// heap.py: cached array lengths.
     cached_arraylens: HashMap<(OpRef, u32), OpRef>,
     /// heap.py: variable-index array cache.
@@ -374,6 +376,7 @@ impl OptHeap {
             loopinvariant_cache: HashMap::new(),
             last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
+            field_descr_map: HashMap::new(),
             cached_arraylens: HashMap::new(),
             cached_arrayitems_var: HashMap::new(),
             array_min_lengths: HashMap::new(),
@@ -421,6 +424,11 @@ impl OptHeap {
             .entry(field_idx)
             .or_insert_with(CachedField::new);
         cf.register(obj, value, descr);
+        if let Some(d) = descr {
+            self.field_descr_map
+                .entry(field_idx)
+                .or_insert_with(|| d.clone());
+        }
     }
 
     /// Get the CachedField for a field_idx, if it exists.
@@ -2078,26 +2086,32 @@ impl Optimization for OptHeap {
     /// Add cached field/array reads to the short preamble so bridges
     /// can re-populate the optimizer's cache.
     /// heap.py:360-377: export ALL cached fields to short preamble.
+    /// heap.py:360-377: produce_potential_short_preamble_ops(sb).
+    /// RPython iterates cached_fields keyed by descr, then per-CachedField
+    /// cached_infos. No is_reachable filter. get_box_replacement on struct
+    /// and field value (heap.py:55, info.py:262).
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        ctx: &OptContext,
     ) {
         for cf in self.field_cache.values() {
+            debug_assert!(cf.lazy_set.is_none()); // heap.py:53
             for i in 0..cf.cached_structs.len() {
-                let obj = cf.cached_structs[i];
-                let cached_val = cf.cached_values[i];
+                let obj = ctx.get_replacement(cf.cached_structs[i]); // get_box_replacement
+                let cached_val = ctx.get_replacement(cf.cached_values[i]); // get_box_replacement
                 if cached_val.is_none() || obj.is_none() {
                     continue;
                 }
-                if !sb.is_reachable(obj) {
-                    continue;
-                }
-                let Some(descr) = cf.get_descr(obj) else {
+                let Some(descr) = cf
+                    .get_descr(cf.cached_structs[i])
+                    .or_else(|| cf.get_descr(obj))
+                else {
                     continue;
                 };
                 let opcode = descr
                     .as_field_descr()
-                    .map(|field_descr| OpCode::getfield_for_type(field_descr.field_type()))
+                    .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                     .unwrap_or(OpCode::GetfieldGcI);
                 let mut op = Op::with_descr(opcode, &[obj], descr.clone());
                 op.pos = cached_val;
@@ -2110,9 +2124,6 @@ impl Optimization for OptHeap {
                 let obj = cai.cached_arrays[i];
                 let cached_val = cai.cached_values[i];
                 if cached_val.is_none() || obj.is_none() {
-                    continue;
-                }
-                if !sb.is_reachable(obj) {
                     continue;
                 }
                 let Some(descr) = cai.get_descr(obj) else {
@@ -2971,7 +2982,8 @@ mod tests {
         // Register input args so produce_arg can resolve them.
         sb.add_short_input_arg(OpRef(100));
         sb.add_short_input_arg(OpRef(101));
-        pass.produce_potential_short_preamble_ops(&mut sb);
+        let ctx = crate::optimizeopt::OptContext::new(256);
+        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
         let produced = sb.produced_ops();
 
         // Filter to heap-produced ops (exclude SameAsI from add_short_input_arg).

@@ -1119,9 +1119,10 @@ impl Optimizer {
     pub fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        ctx: &OptContext,
     ) {
         for pass in &self.passes {
-            pass.produce_potential_short_preamble_ops(sb);
+            pass.produce_potential_short_preamble_ops(sb, ctx);
         }
     }
 
@@ -1815,7 +1816,7 @@ impl Optimizer {
             for &arg in &preview_short_args {
                 short_boxes.add_short_input_arg(arg);
             }
-            self.produce_potential_short_preamble_ops(&mut short_boxes);
+            self.produce_potential_short_preamble_ops(&mut short_boxes, &ctx);
             let produced = short_boxes.produced_ops();
             ctx.exported_short_boxes = produced
                 .into_iter()

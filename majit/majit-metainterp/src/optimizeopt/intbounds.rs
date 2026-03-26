@@ -1409,6 +1409,7 @@ impl Optimization for OptIntBounds {
     fn produce_potential_short_preamble_ops(
         &self,
         _sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        _ctx: &OptContext,
     ) {
         // In RPython, this adds INT_GE/INT_LE guards for known bounds
         // that the loop body depends on. The bounds are discovered during
