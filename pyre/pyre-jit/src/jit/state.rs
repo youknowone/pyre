@@ -2025,12 +2025,22 @@ impl MIFrame {
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
             )
         };
-        // RPython close_loop_args parity: use inputarg types as the target
-        // for materialize_loop_carried_value. The label expects inputarg types
-        // (typically all-Ref for virtualizable locals), so JUMP args must be
-        // boxed to match. Using concrete-derived types would skip boxing
-        // for unboxed Int/Float values, causing type mismatch at the JUMP.
-        let inputarg_types = ctx.inputarg_types();
+        // RPython close_loop_args parity: JUMP args must match the target
+        // label's types. For root traces, use inputarg types (= label types).
+        // For bridge traces, the inputarg types are the guard's fail_arg
+        // types (may be Int for unboxed locals), but the target Label
+        // (Phase 1) expects all-Ref for virtualizable locals. Force all-Ref
+        // so materialize_loop_carried_value boxes Int back to Ref.
+        let is_bridge = {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.is_bridge_tracing()
+        };
+        let inputarg_types = if is_bridge {
+            // Bridge → target is Phase 1 (all-Ref for vable slots).
+            vec![Type::Ref; 3 + nlocals + stack.len()]
+        } else {
+            ctx.inputarg_types()
+        };
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
@@ -4903,6 +4913,13 @@ impl MIFrame {
             }
             TraceAction::Continue
         } else {
+            // TODO(exception-exit): RPython finishframe_exception (pyjitpl.py:
+            // 2532-2538) pops all frames, then calls
+            // compile_exit_frame_with_exception(last_exc_box) to record a
+            // FINISH op with the exception value. This compiles the trace
+            // as a normal exit-with-exception path. pyre aborts instead,
+            // losing the optimization opportunity for traces that always
+            // exit via an uncaught exception.
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle_possible_exception] no handler pc={} err={}",
@@ -5509,13 +5526,15 @@ impl ControlFlowOpcodeHandler for MIFrame {
             let back_edge_key = crate::eval::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
-            // pyjitpl.py:2979-2983: compile_trace — attempt to make a bridge
-            // to the ROOT loop's existing compiled targets. This fires BEFORE
-            // the merge_point search. Uses the ROOT green_key (not back_edge_key).
+            // pyjitpl.py:2979-2983: compile_trace — attempt to connect to
+            // the ROOT loop's existing compiled targets. For root traces only;
+            // bridge traces close via merge_point's close_bridge path which
+            // handles bridge_info properly (avoids double compilation).
             {
                 let root_key = ctx.root_green_key();
                 let (driver, _) = crate::eval::driver_pair();
-                if driver.meta_interp().has_compiled_targets(root_key) {
+                let is_bridge = driver.is_bridge_tracing();
+                if !is_bridge && driver.meta_interp().has_compiled_targets(root_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
@@ -5535,6 +5554,33 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
             }
             if !ctx.has_merge_point(back_edge_key) {
+                // Bridge traces close at the first back-edge.
+                //
+                // TODO(bridge-retrace): RPython (pyjitpl.py:3034-3036) does
+                // NOT close bridges here — it appends a merge_point and
+                // continues tracing. On the second iteration, the merge_point
+                // matches and compile_retrace closes the bridge with an
+                // unrolled preamble. pyre closes immediately because retrace
+                // infrastructure (partial_trace, compile_retrace) is not yet
+                // ported. When retrace lands, remove this early-close and
+                // let bridges fall through to the merge_point append path.
+                let is_bridge = {
+                    let (driver, _) = crate::eval::driver_pair();
+                    driver.is_bridge_tracing()
+                };
+                if is_bridge {
+                    MIFrame::set_next_instr(this, ctx, target);
+                    let oprefs = MIFrame::close_loop_args(this, ctx);
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][reached_loop_header] bridge close: key={} pc={}",
+                            back_edge_key, target
+                        );
+                    }
+                    return Ok(Some(
+                        oprefs.into_iter().map(FrontendOp::opref_only).collect(),
+                    ));
+                }
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
                     let s = this.sym();
@@ -6025,7 +6071,9 @@ impl OpcodeStepExecutor for MIFrame {
             .map(|v| v.concrete.to_pyobj())
             .unwrap_or(std::ptr::null_mut());
 
-        // RPython pyjitpl.py:1682: isinstance check against last_exc_value.
+        // pyjitpl.py:1682 rclass.ll_isinstance: isinstance check against
+        // last_exc_value. Must match eval.rs check_exc_match exactly so
+        // the concrete trace path is correct (multi-except blocks).
         let last_exc = self.sym().last_exc_value;
         let matched = if !last_exc.is_null() && !exc_type_obj.is_null() {
             unsafe {
@@ -6035,6 +6083,9 @@ impl OpcodeStepExecutor for MIFrame {
                     let kind = pyre_object::w_exception_get_kind(last_exc);
                     if pyre_object::is_str(exc_type_obj) {
                         let type_name = pyre_object::w_str_get_value(exc_type_obj);
+                        pyre_object::exc_kind_matches(kind, type_name)
+                    } else if pyre_interpreter::is_builtin_func(exc_type_obj) {
+                        let type_name = pyre_interpreter::w_builtin_func_name(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
                     } else {
                         true // unrecognized type format → match
@@ -6054,6 +6105,7 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
+    /// opimpl_raise (pyjitpl.py:1688).
     fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
         if argc == 0 {
             return Err(PyError::runtime_error("bare raise during tracing"));
@@ -6062,21 +6114,18 @@ impl OpcodeStepExecutor for MIFrame {
         if argc >= 2 {
             let _cause = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         }
-        // RPython pyjitpl.py:1692: GUARD_CLASS on the exception value.
+        // pyjitpl.py:1690-1693: GUARD_CLASS on the exception value.
+        // guard_object_class skips the guard if heapcache already knows
+        // the class (pyjitpl.py:1690 is_class_known check).
         let concrete_exc = exc_val.concrete.to_pyobj();
         if !concrete_exc.is_null() {
-            let exc_class = unsafe {
+            let exc_class_ptr = unsafe {
                 (*(concrete_exc as *const pyre_object::excobject::W_ExceptionObject))
                     .ob_header
-                    .ob_type as i64
+                    .ob_type
             };
             self.with_ctx(|this, ctx| {
-                let cls_const = ctx.const_int(exc_class);
-                this.record_guard(
-                    ctx,
-                    majit_ir::OpCode::GuardClass,
-                    &[exc_val.opref, cls_const],
-                );
+                this.guard_object_class(ctx, exc_val.opref, exc_class_ptr);
             });
         }
         // RPython pyjitpl.py:2745 execute_ll_raised: store concrete
