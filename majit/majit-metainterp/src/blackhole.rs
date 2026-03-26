@@ -702,7 +702,7 @@ use crate::jitcode::{
     BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
     BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
     BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REQUIRE_STACK,
+    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK,
     BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
     BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
@@ -1210,6 +1210,13 @@ impl BlackholeInterpreter {
             }
             BC_SET_SELECTED => {
                 self.current_selected = self.next_u16() as usize;
+            }
+            BC_REF_RETURN => {
+                // RPython bhimpl_ref_return: return ref value to caller.
+                let src = self.next_u16() as usize;
+                self.tmpreg_r = self.registers_r[src];
+                self.return_type = BhReturnType::Ref;
+                return Err(LeaveFrame);
             }
             BC_ABORT | BC_ABORT_PERMANENT => {
                 return Err(LeaveFrame);

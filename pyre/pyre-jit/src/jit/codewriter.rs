@@ -347,11 +347,11 @@ impl CodeWriter {
 
                 // RPython flatten.py: int_return / ref_return
                 Instruction::ReturnValue => {
-                    // Pop return value into ref register 0.
-                    // The blackhole caller reads registers_r[0] after run().
+                    // RPython bhimpl_ref_return: pop return value and
+                    // emit BC_REF_RETURN so the blackhole returns cleanly
+                    // (not BC_ABORT which marks a failed/unsupported path).
                     assembler.pop_r(obj_tmp0);
-                    assembler.move_r(0, obj_tmp0);
-                    assembler.abort();
+                    assembler.ref_return(obj_tmp0);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
@@ -409,7 +409,13 @@ impl CodeWriter {
                 }
 
                 // Unsupported: abort to interpreter fallback
-                _ => {
+                other => {
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[codewriter] unsupported bytecode at py_pc={}: {:?}",
+                            py_pc, other
+                        );
+                    }
                     assembler.abort();
                 }
             }
