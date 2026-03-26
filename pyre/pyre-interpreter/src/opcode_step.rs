@@ -943,6 +943,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_super_attr(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("load_super_attr not implemented").into())
     }
+    fn load_super_attr_with(&mut self, _name: &str, _is_method: bool) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_super_attr not implemented").into())
+    }
     fn load_locals(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("load_locals not implemented").into())
     }
@@ -1569,8 +1572,13 @@ where
         }
 
         // ── Load super attr ──
+        // CPython 3.12: stack = [global_super, class, self] → super(class, self).attr
         Instruction::LoadSuperAttr { .. } => {
-            executor.load_super_attr()?;
+            let raw = u32::from(op_arg) as usize;
+            let idx = raw >> 2;
+            let name = &code.names[idx];
+            let is_method = (raw & 1) != 0;
+            executor.load_super_attr_with(name, is_method)?;
             Ok(StepResult::Continue)
         }
 

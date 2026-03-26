@@ -1027,6 +1027,28 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_method ──
     // PyPy: LOOKUP_METHOD — interpreter-only override.
     // For instances, pushes [attr, self] so CALL prepends self.
+    // ── load_super_attr ──
+    // CPython 3.12 LOAD_SUPER_ATTR: stack = [global_super, class, self]
+    // → super(class, self).attr
+    fn load_super_attr_with(&mut self, name: &str, is_method: bool) -> Result<(), Self::Error> {
+        let self_obj = self.pop();
+        let cls = self.pop();
+        let _global_super = self.pop();
+
+        let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
+        let result = crate::space::py_getattr(proxy, name)?;
+
+        // CALL convention: stack = [callable, null_or_self, args...]
+        // load_method pushes [attr, bound] where TOS=bound, TOS1=attr
+        self.push(result);
+        self.push(if is_method {
+            self_obj
+        } else {
+            pyre_object::PY_NULL
+        });
+        Ok(())
+    }
+
     // For non-instances (modules etc.), pushes [attr, NULL].
     // The default trait impl always pushes [attr, NULL], which is what
     // the JIT tracer uses — no runtime branch in the shared path.
@@ -1224,8 +1246,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_attr ──
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
-    fn delete_attr(&mut self, _name: &str) -> Result<(), Self::Error> {
-        let _obj = self.pop();
+    fn delete_attr(&mut self, name: &str) -> Result<(), Self::Error> {
+        let obj = self.pop();
+        crate::space::py_delattr(obj, name)?;
         Ok(())
     }
 
