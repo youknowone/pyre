@@ -924,6 +924,13 @@ impl Optimizer {
                     });
                 }
 
+                // RPython options.failargs_limit parity: don't store
+                // excessively large fail_args. Default limit = 1000.
+                if liveboxes.len() > 30 {
+                    // Too many live boxes — skip snapshot-based fail_args.
+                    // The guard will use the original fail_args from tracing.
+                    return;
+                }
                 guard_op.fail_args = Some(liveboxes.into());
                 if !virtual_entries.is_empty() {
                     guard_op.rd_virtuals = Some(virtual_entries);
