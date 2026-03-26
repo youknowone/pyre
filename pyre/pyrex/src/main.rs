@@ -81,6 +81,21 @@ fn main() {
 }
 
 fn real_main() {
+    // Suppress panic messages for InvalidLoop — these are caught by
+    // catch_unwind in the JIT optimizer but the default panic hook still
+    // prints to stderr, making it look like a crash.
+    // RPython: InvalidLoop is a silent exception, not an error.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Only print if it's NOT an InvalidLoop (which is caught by catch_unwind)
+        let payload = info.payload();
+        if payload
+            .downcast_ref::<majit_opt::optimize::InvalidLoop>()
+            .is_none()
+        {
+            default_hook(info);
+        }
+    }));
     let (mode, inspect, quiet) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
