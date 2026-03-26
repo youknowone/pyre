@@ -222,8 +222,10 @@ pub extern "C" fn majit_shadow_stack_set_depth(new_depth: i64) {
 /// Called from compiled code as `_reload_frame_if_necessary`
 /// (assembler.py:405-412): after a collecting call, the GC may have
 /// moved the jitframe. Reload jf_ptr from the shadow stack.
+/// Takes a dummy argument because Cranelift's call_indirect on aarch64
+/// has issues with 0-arg + return-value signatures.
 #[unsafe(no_mangle)]
-pub extern "C" fn majit_jf_shadow_stack_get_top_jf_ptr() -> i64 {
+pub extern "C" fn majit_jf_shadow_stack_get_top_jf_ptr(_dummy: i64) -> i64 {
     jf_top_ptr().0 as i64
 }
 

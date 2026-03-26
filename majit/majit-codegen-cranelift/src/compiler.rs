@@ -3514,9 +3514,10 @@ fn spill_ref_roots(
         } else {
             builder.ins().iconst(cl_types::I64, 0)
         };
-        builder
-            .ins()
-            .store(MemFlags::trusted(), val, jf_ptr, offset);
+        // Do NOT use MemFlags::trusted() — the GC reads these slots
+        // via jitframe_custom_trace during collection, so the stores
+        // must be visible before the collecting call.
+        builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
     }
 }
 
@@ -3595,12 +3596,13 @@ fn emit_reload_frame_if_necessary(
     //
     // After a collecting call, the GC may have moved the jitframe.
     // Read the updated jf_ptr from the shadow stack top.
+    let dummy = builder.ins().iconst(cl_types::I64, 0);
     emit_host_call(
         builder,
         ptr_type,
         call_conv,
         majit_gc::shadow_stack::majit_jf_shadow_stack_get_top_jf_ptr as *const () as usize,
-        &[],
+        &[dummy],
         Some(ptr_type),
     )
     .expect("reload returns jf_ptr")
@@ -3618,7 +3620,7 @@ fn emit_push_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, per_call_gcmap
     let gcmap_val = builder.ins().iconst(cl_types::I64, per_call_gcmap);
     builder
         .ins()
-        .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+        .store(MemFlags::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
 }
 
 /// RPython pop_gcmap (assembler.py:2024-2027):
@@ -3715,10 +3717,12 @@ fn emit_collecting_gc_call(
 
     let result = emit_host_call(builder, ptr_type, call_conv, func_ptr, &args, return_type);
 
-    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+    // _reload_frame_if_necessary (assembler.py:405-412)
+    let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+    emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
     reload_ref_roots(
         builder,
-        jf_ptr,
+        new_jf_ptr,
         ref_root_slots,
         defined_ref_vars,
         ref_root_base_ofs,
@@ -3797,10 +3801,12 @@ fn emit_indirect_call_from_parts(
     }
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
     if can_collect {
-        emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+        // _reload_frame_if_necessary (assembler.py:405-412)
+        let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+        emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
         reload_ref_roots(
             builder,
-            jf_ptr,
+            new_jf_ptr,
             ref_root_slots,
             defined_ref_vars,
             ref_root_base_ofs,
@@ -5821,9 +5827,8 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                 }
 
                 OpCode::CallAssemblerI
@@ -6273,9 +6278,8 @@ impl CraneliftBackend {
                     ) {
                         builder.def_var(var(vi), result);
                     }
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                 }
 
                 OpCode::CallReleaseGilI
@@ -6513,9 +6517,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsize => {
@@ -6547,9 +6550,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::CallMallocNurseryVarsizeFrame => {
@@ -6612,9 +6614,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.ins().jump(merge_block, &[slow_result]);
 
                     builder.switch_to_block(merge_block);
@@ -8119,9 +8120,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
 
@@ -8262,9 +8262,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 OpCode::Newunicode => {
@@ -8288,9 +8287,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                    // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    // outputs_ptr = jf_ptr;
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
                 // All OpCode variants are explicitly handled above.
@@ -10398,6 +10396,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
@@ -10569,6 +10570,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout));
@@ -10639,6 +10643,9 @@ mod tests {
                 is_array_item: true,
                 target: majit_codegen::ExitValueSourceLayout::Virtual(0),
                 value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                field_offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(
@@ -11238,7 +11245,7 @@ mod tests {
         jit_exc_clear();
 
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -13441,7 +13448,7 @@ mod tests {
         may_force_ref_values().lock().unwrap().clear();
 
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 64,
+            nursery_size: 256,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -13555,7 +13562,7 @@ mod tests {
     #[test]
     fn test_guard_not_forced_2_snapshot_roots_refs_until_force() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14220,7 +14227,7 @@ mod tests {
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_inputs() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14259,7 +14266,7 @@ mod tests {
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_results() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14314,7 +14321,7 @@ mod tests {
     #[test]
     fn test_setfield_gc_from_old_object_keeps_young_ref_alive_across_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         let old_root_tid = gc.register_type(TypeInfo::with_gc_ptrs(8, vec![0]));
@@ -14545,7 +14552,7 @@ mod tests {
     #[test]
     fn test_call_i_preserves_live_ref_inputs_across_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14593,7 +14600,7 @@ mod tests {
     #[test]
     fn test_cond_call_n_preserves_live_ref_inputs_across_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14645,7 +14652,7 @@ mod tests {
     #[test]
     fn test_deadframe_ref_survives_collection_after_execute_token() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
@@ -14682,7 +14689,7 @@ mod tests {
     #[test]
     fn test_deadframe_drop_after_backend_drop_is_safe() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 48,
+            nursery_size: 160,
             large_object_threshold: 1024,
         });
         gc.register_type(TypeInfo::simple(16));
