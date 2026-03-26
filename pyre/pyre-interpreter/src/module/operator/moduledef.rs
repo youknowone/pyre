@@ -58,4 +58,58 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "eq", w_builtin_func_new("eq", op_eq));
     namespace_store(ns, "lt", w_builtin_func_new("lt", op_lt));
     namespace_store(ns, "gt", w_builtin_func_new("gt", op_gt));
+    namespace_store(
+        ns,
+        "le",
+        w_builtin_func_new("le", |args| {
+            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Le)
+        }),
+    );
+    namespace_store(
+        ns,
+        "ge",
+        w_builtin_func_new("ge", |args| {
+            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Ge)
+        }),
+    );
+    namespace_store(
+        ns,
+        "ne",
+        w_builtin_func_new("ne", |args| {
+            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Ne)
+        }),
+    );
+    // itemgetter/attrgetter stubs — return callable objects
+    namespace_store(
+        ns,
+        "itemgetter",
+        w_builtin_func_new("itemgetter", |args| {
+            // itemgetter(key) → lambda obj: obj[key]
+            Ok(if args.is_empty() { w_none() } else { args[0] })
+        }),
+    );
+    namespace_store(
+        ns,
+        "attrgetter",
+        w_builtin_func_new("attrgetter", |args| {
+            Ok(if args.is_empty() { w_none() } else { args[0] })
+        }),
+    );
+    namespace_store(
+        ns,
+        "methodcaller",
+        w_builtin_func_new("methodcaller", |args| {
+            Ok(if args.is_empty() { w_none() } else { args[0] })
+        }),
+    );
+    namespace_store(
+        ns,
+        "length_hint",
+        w_builtin_func_new("length_hint", |args| {
+            if args.is_empty() {
+                return Ok(w_int_new(0));
+            }
+            crate::space::py_len(args[0]).or(Ok(w_int_new(0)))
+        }),
+    );
 }

@@ -58,6 +58,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_operator", crate::module::operator::moduledef::init);
     register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
     register_builtin_module("_io", crate::module::io_mod::moduledef::init);
+    register_builtin_module("io", crate::module::io_mod::moduledef::init_io);
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
@@ -66,6 +67,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_abc", init_abc);
     register_builtin_module("_functools", init_functools);
     register_builtin_module("_thread", init_thread);
+    register_builtin_module("itertools", init_itertools);
     for name in &[
         "_signal",
         "_string",
@@ -78,7 +80,6 @@ pub fn install_builtin_modules() {
         "_collections",
         "copyreg",
         "_heapq",
-        "itertools",
         "_opcode",
         "_tokenize",
         "_typing",
@@ -163,6 +164,54 @@ fn init_collections_abc(ns: &mut PyNamespace) {
     crate::namespace_store(ns, "MutableSet", crate::typedef::get_object_type());
     crate::namespace_store(ns, "ByteString", crate::typedef::get_object_type());
     crate::namespace_store(ns, "Buffer", crate::typedef::get_object_type());
+}
+
+/// itertools stub
+fn init_itertools(ns: &mut PyNamespace) {
+    // chain(*iterables) → flat iterator
+    crate::namespace_store(
+        ns,
+        "chain",
+        crate::w_builtin_func_new("chain", |args| {
+            let mut items = Vec::new();
+            for &arg in args {
+                items.extend(crate::builtins::collect_iterable_pub(arg)?);
+            }
+            let n = items.len();
+            let list = pyre_object::w_list_new(items);
+            Ok(pyre_object::w_seq_iter_new(list, n))
+        }),
+    );
+    // starmap stub
+    crate::namespace_store(
+        ns,
+        "starmap",
+        crate::w_builtin_func_new("starmap", |_| Ok(pyre_object::w_list_new(vec![]))),
+    );
+    // count(start=0, step=1)
+    crate::namespace_store(
+        ns,
+        "count",
+        crate::w_builtin_func_new("count", |_| Ok(pyre_object::w_none())),
+    );
+    // repeat
+    crate::namespace_store(
+        ns,
+        "repeat",
+        crate::w_builtin_func_new("repeat", |_| Ok(pyre_object::w_none())),
+    );
+    // islice
+    crate::namespace_store(
+        ns,
+        "islice",
+        crate::w_builtin_func_new("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
+    );
+    // groupby
+    crate::namespace_store(
+        ns,
+        "groupby",
+        crate::w_builtin_func_new("groupby", |_| Ok(pyre_object::w_none())),
+    );
 }
 
 /// _weakref stub — PyPy: pypy/module/_weakref/

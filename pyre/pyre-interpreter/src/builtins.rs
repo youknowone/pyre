@@ -740,8 +740,9 @@ fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_list_new(collect_iterable(obj)?))
 }
 
-/// Collect all items from an iterable into a Vec.
-/// PyPy: space.unpackiterable(w_iterable)
+pub(crate) fn collect_iterable_pub(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    collect_iterable(obj)
+}
 fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let it = crate::space::py_iter(obj)?;
     let mut items = Vec::new();
