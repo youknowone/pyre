@@ -10,6 +10,7 @@ pub mod descr;
 pub mod driver;
 pub mod frame_layout;
 pub mod helpers;
+pub mod state;
 pub mod virtualizable_spec;
 
 /// Auto-generated trace functions from majit-analyze.
