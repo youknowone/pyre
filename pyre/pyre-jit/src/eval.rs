@@ -947,12 +947,17 @@ fn restore_guard_failure_for_loop(
     }
 
     // RPython compile.py:710 handle_fail → resume_in_blackhole.
-    // Blackhole execution disabled: root guard fail_args encode wrong-frame
-    // locals (module-level locals in callee frame context). The blackhole
-    // runs with incorrect register values, corrupting list/dict data via
-    // side effects. Requires capture_resumedata(framestack) — per-frame
-    // resume data with correct locals per frame — to enable safely.
     LAST_GUARD_TYPED.with(|c| *c.borrow_mut() = Some(typed.clone()));
+
+    // RPython compile.py:710 handle_fail → resume_in_blackhole.
+    // Blackhole blocked: guard fail_args carry next_instr from the actual
+    // PyFrame (which may be a Cache PC) instead of from the IR constant
+    // (orgpc). Until the virtualizable next_instr is correctly virtualized
+    // in the compiled code, the blackhole would start at the wrong JitCode
+    // position. Additionally, root guard fail_args have stack_only=0 (no
+    // value stack), so the blackhole can't restore mid-opcode state.
+    // Requires: (1) virtualizable next_instr from IR constant in fail_args,
+    //           (2) pre-opcode stack values in fail_args for non-root guards.
 
     // Fallback: restore frame state for interpreter continuation.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
