@@ -2990,6 +2990,11 @@ fn build_value_type_map(
     (value_types, inputarg_types, op_def_positions)
 }
 
+/// Lightweight variant for call sites that only need merged value_types.
+fn build_value_type_map_simple(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type> {
+    build_value_type_map(inputargs, ops).0
+}
+
 fn build_ref_root_slots(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -4326,8 +4331,7 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
-        let (value_types, _inputarg_types, _op_def_positions) =
-            build_value_type_map(inputargs, ops);
+        let value_types = build_value_type_map_simple(inputargs, ops);
         let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens);
         let gc_runtime_id = self.gc_runtime_id;
         let mut defined_ref_vars: HashSet<u32> = inputargs
@@ -8167,7 +8171,7 @@ fn collect_terminal_exit_layouts(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let (value_types, _inputarg_types, _op_def_positions) = build_value_type_map(inputargs, ops);
+    let value_types = build_value_type_map_simple(inputargs, ops);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;
 
