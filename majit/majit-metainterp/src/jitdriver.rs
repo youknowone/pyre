@@ -445,61 +445,55 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CloseLoop => {
-                // Bridge tracing: close as bridge instead of loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
-                    self.bridge_info.take()
-                {
+                // compile.py retrace_needed parity: if bridge tracing
+                // reaches CloseLoop but no target tokens exist, clear
+                // bridge_info and continue tracing for one more iteration.
+                // The next CloseLoop goes through normal close_and_compile,
+                // whose preamble peeling splits the two-iteration trace into
+                // preamble (guard→merge_point) + body (one loop iteration).
+                if self.bridge_info.is_some() {
+                    let bridge_key = self.bridge_info.as_ref().unwrap().0;
                     let has_targets = self
                         .meta
                         .compiled_loops
                         .get(&bridge_key)
                         .map_or(false, |c| !c.front_target_tokens.is_empty());
-
-                    if has_targets {
-                        // Normal bridge: JUMP to existing target token.
+                    if !has_targets {
                         if crate::majit_log_enabled() {
                             eprintln!(
-                                "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
-                                bridge_key, bridge_trace_id, bridge_fail_index
-                            );
-                        }
-                        let sym = self.sym.take();
-                        self.trace_meta = None;
-                        if let Some(sym) = sym {
-                            let finish_args = S::collect_jump_args(&sym);
-                            let ok = self.meta.close_bridge(
-                                bridge_key,
-                                bridge_trace_id,
-                                bridge_fail_index,
-                                &finish_args,
-                            );
-                            if !ok {
-                                self.meta.abort_trace(false);
-                            }
-                        } else {
-                            self.meta.abort_trace(false);
-                        }
-                    } else {
-                        // No target tokens (e.g. first compile was finish_and_compile).
-                        // compile.py retrace_needed parity: compile as new loop
-                        // to create target tokens for future bridges.
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[bridge] CloseLoop -> retrace (no targets) key={}",
+                                "[bridge] CloseLoop -> continue tracing (no targets) key={}",
                                 bridge_key
                             );
                         }
-                        if let Some(sym) = self.sym.as_ref() {
-                            let jump_args = S::collect_jump_args(sym);
-                            if let Some(meta) = self.trace_meta.take() {
-                                self.meta.close_and_compile(&jump_args, meta);
-                            } else {
-                                self.meta.abort_trace(false);
-                            }
-                        } else {
+                        self.bridge_info = None;
+                        return;
+                    }
+                }
+                // Bridge tracing: close as bridge instead of loop.
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.take()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
+                            bridge_key, bridge_trace_id, bridge_fail_index
+                        );
+                    }
+                    let sym = self.sym.take();
+                    self.trace_meta = None;
+                    if let Some(sym) = sym {
+                        let finish_args = S::collect_jump_args(&sym);
+                        let ok = self.meta.close_bridge(
+                            bridge_key,
+                            bridge_trace_id,
+                            bridge_fail_index,
+                            &finish_args,
+                        );
+                        if !ok {
                             self.meta.abort_trace(false);
                         }
-                        self.sym = None;
+                    } else {
+                        self.meta.abort_trace(false);
                     }
                     return;
                 }
@@ -560,42 +554,39 @@ impl<S: JitState> JitDriver<S> {
                 jump_args,
                 loop_header_pc: _,
             } => {
-                // Bridge tracing: close as bridge instead of loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
-                    self.bridge_info.take()
-                {
+                // Same retrace logic as CloseLoop (see above).
+                if self.bridge_info.is_some() {
+                    let bridge_key = self.bridge_info.as_ref().unwrap().0;
                     let has_targets = self
                         .meta
                         .compiled_loops
                         .get(&bridge_key)
                         .map_or(false, |c| !c.front_target_tokens.is_empty());
-
-                    if has_targets {
-                        self.sym = None;
-                        self.trace_meta = None;
-                        let ok = self.meta.close_bridge(
-                            bridge_key,
-                            bridge_trace_id,
-                            bridge_fail_index,
-                            &jump_args,
-                        );
-                        if !ok {
-                            self.meta.abort_trace(false);
-                        }
-                    } else {
-                        // compile.py retrace_needed parity: compile as new loop.
+                    if !has_targets {
                         if crate::majit_log_enabled() {
                             eprintln!(
-                                "[bridge] CloseLoopWithArgs -> retrace (no targets) key={}",
+                                "[bridge] CloseLoopWithArgs -> continue tracing (no targets) key={}",
                                 bridge_key
                             );
                         }
-                        if let Some(meta) = self.trace_meta.take() {
-                            self.meta.close_and_compile(&jump_args, meta);
-                        } else {
-                            self.meta.abort_trace(false);
-                        }
-                        self.sym = None;
+                        self.bridge_info = None;
+                        return;
+                    }
+                }
+                // Bridge tracing: close as bridge instead of loop.
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                    self.bridge_info.take()
+                {
+                    self.sym = None;
+                    self.trace_meta = None;
+                    let ok = self.meta.close_bridge(
+                        bridge_key,
+                        bridge_trace_id,
+                        bridge_fail_index,
+                        &jump_args,
+                    );
+                    if !ok {
+                        self.meta.abort_trace(false);
                     }
                     return;
                 }
