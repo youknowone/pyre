@@ -100,6 +100,11 @@ impl NumberingState {
 /// RPython snapshot: the state captured at a guard point.
 /// Corresponds to RPython's SnapshotIterator output:
 /// snapshot_iter.vable_array, snapshot_iter.vref_array, snapshot_iter.framestack.
+///
+/// NOTE: RPython does not have this struct. It uses `trace.get_snapshot_iter(position)`
+/// which returns a lazy iterator over the trace's snapshot data (opencoder.py).
+/// We use an eager struct because pyre's tracing records fail_args directly
+/// on guard ops rather than using RPython's snapshot log format.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Virtualizable field boxes (resume.py:234-241).
@@ -2304,6 +2309,24 @@ impl MaterializedVirtual {
 }
 
 /// Builder for constructing ResumeData during trace compilation.
+/// TODO(RPython parity): This is a legacy builder that creates `ResumeData`
+/// (the old format). RPython's `ResumeDataVirtualAdder` (resume.py:298-493)
+/// is fundamentally different:
+///
+/// 1. Takes `(optimizer, descr, guard_op, trace, memo)` as __init__ args
+/// 2. `finish(pendingfields)`:
+///    - Calls `memo.number()` to create NumberingState
+///    - Walks virtual objects via `visitor_walk_recursive()`
+///    - Collects virtual fieldnums into `rd_virtuals` array
+///    - Patches slot 1 with `len(liveboxes)` (num_failargs)
+///    - Stores `rd_numb = numb_state.create_numbering()`
+///    - Stores `rd_consts = memo.consts`
+///    - Returns `newboxes` (the final fail_args list)
+///
+/// Porting `finish()` requires:
+/// - Access to optimizer's PtrInfo (for virtual walking)
+/// - VirtualVisitor implementation (for fieldnums collection)
+/// - Integration with `store_final_boxes_in_guard()` in optimizer.rs
 pub struct ResumeDataVirtualAdder {
     frames: Vec<FrameInfoBuilder>,
     virtuals: Vec<VirtualInfo>,
@@ -2559,6 +2582,11 @@ impl Default for ResumeDataVirtualAdder {
 /// large constant only appears once in the pool.
 /// RPython resume.py:142 ResumeDataLoopMemo.
 /// Shared constant pool + box numbering cache across all guards in a loop.
+///
+/// NOTE: RPython's ResumeDataLoopMemo also stores `metainterp_sd` and `cpu`
+/// (for box allocation during rebuild). pyre doesn't need these: the BoxEnv
+/// trait provides box access, and rebuild_from_numbering is a pure decoder.
+/// RPython's nvirtuals/nvholes/nvreused stats are kept for monitoring.
 pub struct ResumeDataLoopMemo {
     /// resume.py:147 — shared constant pool.
     /// RPython stores Const objects (with type INT/REF/FLOAT).
@@ -2653,6 +2681,13 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py:264 assign_number_to_box — returns a negative number.
+    /// resume.py:264-273 assign_number_to_box(box, boxes).
+    ///
+    /// TODO(ResumeDataVirtualAdder): RPython's version takes a `boxes`
+    /// list and mutates it: `boxes[-num - 1] = box` (for cached) or
+    /// `boxes.append(box)` (for new). This is used by
+    /// ResumeDataVirtualAdder.finish() to build the final fail_args.
+    /// Once ResumeDataVirtualAdder is ported, add the `boxes` parameter.
     pub fn assign_number_to_box(&mut self, box_id: u32) -> i32 {
         if let Some(&num) = self.cached_boxes.get(&box_id) {
             return num;
@@ -2808,9 +2843,11 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain
-        // Extension for multi-frame: append slot count before boxes
-        // so rebuild_from_numbering can determine frame boundaries.
-        // RPython uses jitcode.position_info for this; we inline it.
+        // NOTE: RPython does NOT encode slot_count per frame. It uses
+        // jitcode.position_info (runtime descriptor) to know how many
+        // registers each jitcode frame has. Since pyre doesn't have
+        // the RPython jitcode infrastructure, we encode slot_count
+        // inline so rebuild_from_numbering can split frames.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
@@ -3045,8 +3082,20 @@ fn decode_tagged(
 /// resume.py:1042-1057 rebuild_from_resumedata parity.
 ///
 /// Decode a numbering (produced by `ResumeDataLoopMemo::number()`)
-/// back into frame state. `rd_consts` is the shared constant pool,
-/// `fail_values` are the live values from the guard failure.
+/// back into frame state. `rd_consts` is the shared constant pool.
+///
+/// NOTE: RPython's rebuild_from_resumedata is an OO builder that
+/// creates MetaInterp frames and writes to blackhole registers
+/// in-place (via ResumeDataBoxReader). This is a pure functional
+/// decoder that returns RebuiltFrame structs. The caller materializes
+/// concrete interpreter state from the decoded values.
+///
+/// TODO(ResumeDataVirtualAdder): TAGVIRTUAL values are returned as
+/// `RebuiltValue::Virtual(index)`. RPython's decode_ref/decode_int
+/// calls `getvirtual_ptr(num)` / `getvirtual_int(num)` which lazily
+/// allocates the virtual object from rd_virtuals[num]. Once
+/// ResumeDataVirtualAdder is ported and rd_virtuals is populated,
+/// add a `rd_virtuals` parameter and implement materialization.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
