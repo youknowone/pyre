@@ -955,19 +955,12 @@ impl Optimizer {
                     });
                 }
 
-                // RPython parity: do NOT replace fail_args with snapshot
-                // liveboxes. Cranelift backend uses fail_args as the
-                // deadframe layout (must match inputarg types). The
-                // snapshot data is stored in rd_numb for blackhole resume.
-                // fail_args stays as-is from tracing (inputarg-based).
                 if !virtual_entries.is_empty() {
                     guard_op.rd_virtuals = Some(virtual_entries);
                 }
 
-                // rd_numb is produced post-assembly by number_guards_final
-                // using 1:1 TAGBOX mapping. Do NOT store here — the numbering
-                // from _number_boxes has "already seen" dedup that shifts
-                // TAGBOX indices away from raw_values positions.
+                // compile.py:875: guard_op.setfailargs(newboxes)
+                guard_op.fail_args = Some(liveboxes.into());
             }
             return;
         }

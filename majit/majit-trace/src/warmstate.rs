@@ -525,10 +525,6 @@ impl WarmEnterState {
                 cell.state = BaseJitCellState::NotHot;
             } else {
                 cell.abort_count += 1;
-                // RPython warmstate.py: too many aborts → don't trace here
-                if cell.abort_count > self.retrace_limit {
-                    cell.flags |= jc_flags::DONT_TRACE_HERE;
-                }
                 cell.state = BaseJitCellState::NotHot;
             }
         }
