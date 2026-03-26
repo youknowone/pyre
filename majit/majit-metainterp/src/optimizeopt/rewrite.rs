@@ -1737,6 +1737,10 @@ impl Optimization for OptRewrite {
                     if info.is_nonnull() {
                         return OptimizationResult::Remove;
                     }
+                    // rewrite.py:274-277: proven null → always fails
+                    if info.is_null() {
+                        raise_invalid_loop("GUARD_NONNULL proven to always fail");
+                    }
                 }
                 // Constant-fold: non-zero constant is always nonnull.
                 if let Some(v) = ctx.get_constant_int(obj) {
@@ -1750,6 +1754,10 @@ impl Optimization for OptRewrite {
                 if ctx.get_ptr_info(obj).is_none() {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::NonNull);
                 }
+                // rewrite.py:282: mark_last_guard(self.optimizer)
+                // Guard strengthening: record this guard's position for the arg.
+                // Future GUARD_NONNULL_CLASS/GUARD_CLASS can replace it.
+                ctx.mark_last_guard(obj);
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
