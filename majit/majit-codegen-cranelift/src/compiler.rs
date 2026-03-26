@@ -11,7 +11,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -690,14 +690,9 @@ fn var(idx: u32) -> Variable {
     Variable::from_u32(idx)
 }
 
-/// Reserved Cranelift Variable for jf_ptr (jitframe pointer).
-///
-/// RPython: EBP holds the jitframe pointer. After any collecting call,
-/// _reload_frame_if_necessary reloads EBP from the shadow stack because
-/// the GC may have moved the jitframe. Using a Cranelift Variable
-/// (rather than a raw CValue) enables redefining jf_ptr after collecting calls.
-fn jf_ptr_var() -> Variable {
-    Variable::from_u32(u32::MAX - 1)
+/// Convert a slice of Values to a Vec of BlockArgs for Cranelift 0.130 branch instructions.
+fn block_args(vals: &[CValue]) -> Vec<BlockArg> {
+    vals.iter().copied().map(BlockArg::from).collect()
 }
 
 /// Whether to use native SIMD (I64X2/F64X2) for Vec* codegen.
@@ -3596,13 +3591,12 @@ fn emit_reload_frame_if_necessary(
     //
     // After a collecting call, the GC may have moved the jitframe.
     // Read the updated jf_ptr from the shadow stack top.
-    let dummy = builder.ins().iconst(cl_types::I64, 0);
     emit_host_call(
         builder,
         ptr_type,
         call_conv,
         majit_gc::shadow_stack::majit_jf_shadow_stack_get_top_jf_ptr as *const () as usize,
-        &[dummy],
+        &[],
         Some(ptr_type),
     )
     .expect("reload returns jf_ptr")
@@ -4751,6 +4745,13 @@ impl CraneliftBackend {
             .collect();
         let has_entry_label = label_indices.first().copied() == Some(0);
 
+        // Collect all variable declarations into a map (index -> type)
+        // before declaring them sequentially. Cranelift 0.130 declare_var
+        // returns auto-assigned indices, so we must declare in order 0..max.
+        let mut var_types: std::collections::HashMap<u32, cranelift_codegen::ir::Type> =
+            std::collections::HashMap::new();
+        let mut declared_vars = std::collections::HashSet::new();
+
         // Always declare inputarg variables, even when the trace starts
         // with a LABEL (preamble peeling). Preamble guards reference
         // inputarg OpRefs in fail_args and need declared variables.
@@ -4759,13 +4760,10 @@ impl CraneliftBackend {
             if debug_declares {
                 eprintln!("[jit][declare] input var{}", i);
             }
-            builder.declare_var(var(i as u32), cl_types::I64);
-        }
-        // Declare variables for op results
-        let mut declared_vars = std::collections::HashSet::new();
-        for i in 0..num_inputs {
+            var_types.insert(i as u32, cl_types::I64);
             declared_vars.insert(i as u32);
         }
+        // Declare variables for op results
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
                 let vi = op_var_index(op, op_idx, num_inputs);
@@ -4785,7 +4783,7 @@ impl CraneliftBackend {
                 if debug_declares {
                     eprintln!("[jit][declare] op-result var{} opcode={:?}", vi, op.opcode);
                 }
-                builder.declare_var(var(vi as u32), cl_type);
+                var_types.insert(vi as u32, cl_type);
             }
             // Ensure all fail_arg OpRefs are declared as variables.
             // Virtual resume data may add extra fail_args whose OpRefs
@@ -4801,7 +4799,7 @@ impl CraneliftBackend {
                         if debug_declares {
                             eprintln!("[jit][declare] fail-arg var{} owner={:?}", arg.0, op.opcode);
                         }
-                        builder.declare_var(var(arg.0), cl_types::I64);
+                        var_types.insert(arg.0, cl_types::I64);
                     }
                 }
             }
@@ -4822,7 +4820,39 @@ impl CraneliftBackend {
                 if debug_declares {
                     eprintln!("[jit][declare] label-arg var{}", arg.0);
                 }
-                builder.declare_var(var(arg.0), cl_types::I64);
+                var_types.insert(arg.0, cl_types::I64);
+            }
+        }
+
+        // Compute loop_param_count early so legacy vars are included.
+        let loop_param_count = if let Some(&li) = label_indices.last() {
+            ops[li].args.len()
+        } else {
+            ops.iter()
+                .rev()
+                .find(|op| op.opcode == OpCode::Jump)
+                .map(|op| op.args.len())
+                .unwrap_or(num_inputs)
+        };
+
+        // Legacy no-LABEL traces can still need synthetic loop params.
+        if label_indices.is_empty() && loop_param_count > num_inputs {
+            for i in num_inputs..loop_param_count {
+                if !declared_vars.contains(&(i as u32)) {
+                    var_types.insert(i as u32, cl_types::I64);
+                    declared_vars.insert(i as u32);
+                }
+            }
+        }
+
+        // Cranelift 0.130: declare_var(ty) returns auto-assigned Variable
+        // indices (0, 1, 2, ...). Declare sequentially from 0 to max_index,
+        // using the collected type or I64 for gap indices.
+        if let Some(&max_idx) = var_types.keys().max() {
+            for i in 0..=max_idx {
+                let ty = var_types.get(&i).copied().unwrap_or(cl_types::I64);
+                let returned_var = builder.declare_var(ty);
+                debug_assert_eq!(returned_var, var(i));
             }
         }
 
@@ -4871,25 +4901,6 @@ impl CraneliftBackend {
         // [start_label] + preamble_ops + [loop_label] + body_ops
         // and JUMPs target LABEL descrs. Model that directly by creating
         // a Cranelift block per LABEL descr.
-        let loop_param_count = if let Some(&li) = label_indices.last() {
-            ops[li].args.len()
-        } else {
-            ops.iter()
-                .rev()
-                .find(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.args.len())
-                .unwrap_or(num_inputs)
-        };
-
-        // Legacy no-LABEL traces can still need synthetic loop params.
-        if label_indices.is_empty() && loop_param_count > num_inputs {
-            for i in num_inputs..loop_param_count {
-                if !declared_vars.contains(&(i as u32)) {
-                    builder.declare_var(var(i as u32), cl_types::I64);
-                    declared_vars.insert(i as u32);
-                }
-            }
-        }
 
         let mut label_blocks = Vec::with_capacity(label_indices.len());
         let mut label_blocks_by_descr = HashMap::new();
@@ -4934,7 +4945,7 @@ impl CraneliftBackend {
                     .map(|&r| resolve_opref(&mut builder, &constants, r))
                     .collect()
             };
-            builder.ins().jump(entry_label_block, &vals);
+            builder.ins().jump(entry_label_block, &block_args(&vals));
             builder.switch_to_block(entry_label_block);
             for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
                 let param = builder.block_params(entry_label_block)[i];
@@ -4953,7 +4964,7 @@ impl CraneliftBackend {
                     }
                 })
                 .collect();
-            builder.ins().jump(loop_block, &vals);
+            builder.ins().jump(loop_block, &block_args(&vals));
             builder.switch_to_block(loop_block);
             for i in 0..loop_param_count {
                 let param = builder.block_params(loop_block)[i];
@@ -4981,7 +4992,7 @@ impl CraneliftBackend {
                             .iter()
                             .map(|&r| resolve_opref(&mut builder, &constants, r))
                             .collect();
-                        builder.ins().jump(*label_block, &vals);
+                        builder.ins().jump(*label_block, &block_args(&vals));
                     }
                     builder.switch_to_block(*label_block);
                     for (i, &arg_ref) in ops[op_idx].args.iter().enumerate() {
@@ -5076,7 +5087,7 @@ impl CraneliftBackend {
                     builder.switch_to_block(no_div_block);
                     builder.seal_block(no_div_block);
                     let no_ovf = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().jump(merge_block, &[no_ovf]);
+                    builder.ins().jump(merge_block, &[BlockArg::from(no_ovf)]);
 
                     // b != 0 path: check r / b != a
                     builder.switch_to_block(div_block);
@@ -5084,7 +5095,7 @@ impl CraneliftBackend {
                     let div = builder.ins().sdiv(r, b);
                     let div_ne_a = builder.ins().icmp(IntCC::NotEqual, div, a);
                     let ovf_ext = builder.ins().uextend(cl_types::I64, div_ne_a);
-                    builder.ins().jump(merge_block, &[ovf_ext]);
+                    builder.ins().jump(merge_block, &[BlockArg::from(ovf_ext)]);
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
@@ -6036,7 +6047,9 @@ impl CraneliftBackend {
                             args_ptr,
                             JF_FRAME_ITEM0_OFS,
                         );
-                        builder.ins().jump(ca_merge_block, &[direct_result]);
+                        builder
+                            .ins()
+                            .jump(ca_merge_block, &[BlockArg::from(direct_result)]);
 
                         // ── Path A: non-finish — bridge or assembler_helper ──
                         if let Some(nonfinish_block) = nonfinish_block {
@@ -6084,7 +6097,9 @@ impl CraneliftBackend {
                                 args_ptr,
                                 JF_FRAME_ITEM0_OFS,
                             );
-                            builder.ins().jump(ca_merge_block, &[bridge_result]);
+                            builder
+                                .ins()
+                                .jump(ca_merge_block, &[BlockArg::from(bridge_result)]);
 
                             // ── assembler_helper (cold: no bridge yet) ──
                             builder.switch_to_block(extern_helper_block);
@@ -6108,7 +6123,9 @@ impl CraneliftBackend {
                                 ],
                                 Some(cl_types::I64),
                             );
-                            builder.ins().jump(ca_merge_block, &[force_result.unwrap()]);
+                            builder
+                                .ins()
+                                .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
                         }
 
                         // ── Fallback: null code_ptr, unknown finish, or deadframe ──
@@ -6168,7 +6185,7 @@ impl CraneliftBackend {
                     builder.ins().brif(
                         is_finish,
                         ca_merge_block,
-                        &[result.unwrap()],
+                        &[BlockArg::from(result.unwrap())],
                         exit_block,
                         &[],
                     );
@@ -6453,9 +6470,13 @@ impl CraneliftBackend {
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
-                    builder
-                        .ins()
-                        .brif(is_zero, cont_block, &[cond], call_block, &[]);
+                    builder.ins().brif(
+                        is_zero,
+                        cont_block,
+                        &[BlockArg::from(cond)],
+                        call_block,
+                        &[],
+                    );
 
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
@@ -6485,7 +6506,9 @@ impl CraneliftBackend {
                         }
                     }
 
-                    builder.ins().jump(cont_block, &[call_result]);
+                    builder
+                        .ins()
+                        .jump(cont_block, &[BlockArg::from(call_result)]);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
 
@@ -6591,7 +6614,7 @@ impl CraneliftBackend {
                     // Return pointer past GC header
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
-                    builder.ins().jump(merge_block, &[obj_ptr]);
+                    builder.ins().jump(merge_block, &[BlockArg::from(obj_ptr)]);
 
                     // slow: call shim (triggers minor collection)
                     builder.switch_to_block(slow_block);
@@ -6616,7 +6639,9 @@ impl CraneliftBackend {
                     .expect("GC frame allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     outputs_ptr = jf_ptr;
-                    builder.ins().jump(merge_block, &[slow_result]);
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::from(slow_result)]);
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
@@ -7401,7 +7426,7 @@ impl CraneliftBackend {
                             }
                         });
                     if let Some(target_block) = target_block {
-                        builder.ins().jump(target_block, &vals);
+                        builder.ins().jump(target_block, &block_args(&vals));
                     } else {
                         // External JUMP (bridge → loop body) — emit as
                         // Finish exit. The dispatcher will re-enter the
@@ -9366,7 +9391,9 @@ fn emit_inline_arena_take(
     let new_top = builder.ins().iadd(top, one);
     builder.ins().store(flags, new_top, top_addr, 0);
 
-    builder.ins().jump(merge_block, &[frame_ptr]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::from(frame_ptr)]);
 
     // ── slow path: call original helper ──
     builder.switch_to_block(slow_block);
@@ -9386,7 +9413,9 @@ fn emit_inline_arena_take(
             .ins()
             .call_indirect(create_sig, create_fn_addr, &[caller_frame, raw_arg]);
     let slow_frame = builder.inst_results(slow_result)[0];
-    builder.ins().jump(merge_block, &[slow_frame]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::from(slow_frame)]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
