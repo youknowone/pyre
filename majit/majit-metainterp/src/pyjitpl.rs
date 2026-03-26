@@ -38,7 +38,7 @@ pub enum BackEdgeAction {
     RunCompiled,
 }
 
-/// pyjitpl.py: result of close_and_compile / compile_loop.
+/// pyjitpl.py: result of compile_loop / compile_loop.
 ///
 /// RPython uses exceptions (raise ContinueRunningNormally on success,
 /// raise SwitchToBlackhole on fatal failure) and None returns for
@@ -339,7 +339,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) partial_trace: Option<PartialTrace>,
     /// pyjitpl.py:2390: trace position where the retrace should resume.
     /// Set to potential_retrace_position by retrace_needed(). On the next
-    /// close_and_compile, the merge point's start position is compared
+    /// compile_loop, the merge point's start position is compared
     /// against this to verify we're retracing from the correct location.
     pub(crate) retracing_from: Option<majit_trace::recorder::TracePosition>,
     /// pyjitpl.py:2374: optimizer state snapshot from the failed bridge attempt.
@@ -1468,7 +1468,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
-    pub fn close_and_compile(&mut self, jump_args: &[OpRef], mut meta: M) -> CompileOutcome {
+    pub fn compile_loop(&mut self, jump_args: &[OpRef], mut meta: M) -> CompileOutcome {
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -1576,7 +1576,7 @@ impl<M: Clone> MetaInterp<M> {
                 .collect();
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] close_and_compile GuardNotInvalidated types={:?} inputarg_types={:?} jump_args={:?}",
+                    "[jit] compile_loop GuardNotInvalidated types={:?} inputarg_types={:?} jump_args={:?}",
                     guard_fail_arg_types, inputarg_types, jump_args,
                 );
             }
@@ -2137,7 +2137,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Called when the optimizer returns "not final" (no existing target token
     /// matched). The partial trace and exported state are saved so the next
-    /// close_and_compile for this green_key can use compile_retrace.
+    /// compile_loop for this green_key can use compile_retrace.
     pub fn retrace_needed(
         &mut self,
         green_key: u64,
@@ -2505,7 +2505,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types;
         // Wrap in catch_unwind — InvalidLoop during optimization should
-        // abort the trace, not crash the process. Matches close_and_compile.
+        // abort the trace, not crash the process. Matches compile_loop.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             optimizer.optimize_with_constants_and_inputs(
                 &trace_ops,
@@ -3892,117 +3892,6 @@ impl<M: Clone> MetaInterp<M> {
 
     // ── Bridge Compilation ──────────────────────────────────────
 
-    /// Close the current bridge trace with a FINISH op, optimize, and compile
-    /// it as a bridge attached to the specified guard.
-    ///
-    /// `green_key` identifies the parent loop.
-    /// `trace_id` and `fail_index` identify the guard to attach the bridge to.
-    /// `finish_args` are the symbolic values at the bridge end (loop header state).
-    /// RPython compile.py compile_trace parity: single bridge compilation
-    /// entry point with `ends_with_jump` flag.
-    ///
-    /// - `ends_with_jump=true`: bridge JUMP to loop header (close_loop).
-    ///   Uses BridgeCompileData (inline_short_preamble=true).
-    /// - `ends_with_jump=false`: bridge returns a value (Finish).
-    ///   Uses SimpleCompileData.
-    pub fn compile_bridge_trace(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        finish_args: &[OpRef],
-        finish_arg_types: Vec<Type>,
-        ends_with_jump: bool,
-    ) -> BridgeCompileResult {
-        if ends_with_jump {
-            // Validate arg count matches loop inputargs.
-            let input_len = self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|c| {
-                    let norm = Self::normalize_trace_id(c, trace_id);
-                    Self::trace_for_exit(c, norm)
-                })
-                .map(|(_, t)| t.inputargs.len())
-                .unwrap_or(0);
-            if input_len > 0 && input_len != finish_args.len() {
-                return BridgeCompileResult::Failed;
-            }
-        }
-
-        // pyjitpl.py:3185-3196 compile_trace parity:
-        // Save position, record tentative JUMP, compile, then cut (finally).
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return BridgeCompileResult::Failed,
-        };
-        ctx.apply_replacements();
-        let cut_at = ctx.recorder.get_position();
-        // pyjitpl.py:3188: self.potential_retrace_position = cut_at
-        self.potential_retrace_position = Some(cut_at);
-        if ends_with_jump {
-            ctx.recorder.close_loop(finish_args);
-        } else {
-            ctx.recorder
-                .finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
-        }
-        let ops = ctx.recorder.ops().to_vec();
-        let inputargs = ctx.recorder.inputargs().to_vec();
-        let constants = ctx.constants.snapshot();
-
-        let label = if ends_with_jump { "jump" } else { "finish" };
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] compile_bridge_trace({}): key={}, trace_id={}, guard={}, ops={}",
-                label,
-                green_key,
-                trace_id,
-                fail_index,
-                ops.len()
-            );
-            eprintln!("--- bridge trace ({}, before opt) ---", label);
-            eprint!("{}", majit_ir::format_trace(&ops, &constants));
-        }
-
-        let fail_descr = {
-            let compiled = match self.compiled_loops.get(&green_key) {
-                Some(c) => c,
-                None => {
-                    self.cut_tentative_op(cut_at);
-                    return BridgeCompileResult::Failed;
-                }
-            };
-            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
-                Some(descr) => descr,
-                None => {
-                    self.cut_tentative_op(cut_at);
-                    return BridgeCompileResult::Failed;
-                }
-            };
-            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
-        };
-
-        self.forced_virtualizable = None;
-        let result = self.compile_bridge(
-            green_key,
-            fail_index,
-            &*fail_descr,
-            &ops,
-            &inputargs,
-            constants,
-        );
-        // pyjitpl.py:3195 — finally: self.history.cut(cut_at)
-        self.cut_tentative_op(cut_at);
-        match result {
-            true => BridgeCompileResult::Compiled,
-            false if self.retrace_after_bridge => {
-                self.retrace_after_bridge = false;
-                BridgeCompileResult::RetraceNeeded
-            }
-            false => BridgeCompileResult::Failed,
-        }
-    }
-
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
     fn cut_tentative_op(&mut self, cut_at: majit_trace::recorder::TracePosition) {
         if let Some(ctx) = self.tracing.as_mut() {
@@ -4011,7 +3900,8 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Legacy wrapper: close_bridge = compile_bridge_trace(ends_with_jump=true)
+    /// pyjitpl.py:2982-2983: close_bridge — compile_trace wrapper that
+    /// maps CompileOutcome to BridgeCompileResult.
     pub fn close_bridge(
         &mut self,
         green_key: u64,
@@ -4019,26 +3909,73 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         finish_args: &[OpRef],
     ) -> BridgeCompileResult {
-        self.compile_bridge_trace(green_key, trace_id, fail_index, finish_args, vec![], true)
+        let outcome = self.compile_trace(green_key, finish_args, Some((trace_id, fail_index)));
+        match outcome {
+            CompileOutcome::Compiled { .. } => BridgeCompileResult::Compiled,
+            _ if self.retrace_after_bridge => {
+                self.retrace_after_bridge = false;
+                BridgeCompileResult::RetraceNeeded
+            }
+            _ => BridgeCompileResult::Failed,
+        }
     }
 
-    /// Legacy wrapper: finish_bridge = compile_bridge_trace(ends_with_jump=false)
-    pub fn finish_bridge(
+    /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
+    /// exits via return (ends_with_jump=false / FINISH).
+    pub fn compile_done_with_this_frame(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
-    ) -> BridgeCompileResult {
-        self.compile_bridge_trace(
+    ) {
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        ctx.apply_replacements();
+        let cut_at = ctx.recorder.get_position();
+        ctx.recorder
+            .finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        let ops = ctx.recorder.ops().to_vec();
+        let inputargs = ctx.recorder.inputargs().to_vec();
+        let constants = ctx.constants.snapshot();
+        self.cut_tentative_op(cut_at);
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_done_with_this_frame: key={}, trace_id={}, guard={}, ops={}",
+                green_key,
+                trace_id,
+                fail_index,
+                ops.len()
+            );
+            eprintln!("--- bridge trace (finish, before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&ops, &constants));
+        }
+
+        let fail_descr = {
+            let compiled = match self.compiled_loops.get(&green_key) {
+                Some(c) => c,
+                None => return,
+            };
+            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
+                Some(descr) => descr,
+                None => return,
+            };
+            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
+        };
+
+        self.forced_virtualizable = None;
+        self.compile_bridge(
             green_key,
-            trace_id,
             fail_index,
-            finish_args,
-            finish_arg_types,
-            false,
-        )
+            &*fail_descr,
+            &ops,
+            &inputargs,
+            constants,
+        );
     }
 }
 
@@ -6024,7 +5961,7 @@ mod tests {
             ctx.const_int(1)
         };
         let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 24);
-        meta.close_and_compile(&[OpRef(0), OpRef(1), OpRef(2)], ());
+        meta.compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
 
         let compiled = meta.compiled_loops.get(&777).expect("compiled entry");
         let trace = compiled
@@ -7784,7 +7721,7 @@ mod tests {
             ctx.constants.as_mut().insert(10_000, 1);
             let _result = ctx.recorder.record_op(OpCode::IntAdd, &[i0, const_one]);
         }
-        meta.close_and_compile(&[OpRef(0)], ());
+        meta.compile_loop(&[OpRef(0)], ());
 
         let events = compile_events.lock().unwrap();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -7878,7 +7815,7 @@ mod tests {
             ctx.constants.as_mut().insert(10_000, 1);
             let _result = ctx.recorder.record_op(OpCode::IntAdd, &[i0, const_one]);
         }
-        meta.close_and_compile(&[OpRef(0)], ());
+        meta.compile_loop(&[OpRef(0)], ());
         assert_eq!(
             *compile_count.lock().unwrap(),
             1,
@@ -7915,7 +7852,7 @@ mod tests {
                 let sum = ctx.recorder.record_op(OpCode::IntAdd, &[i0, i1]);
                 let _ = ctx.recorder.record_op(OpCode::IntAdd, &[sum, const_one]);
             }
-            meta.close_and_compile(&[OpRef(0), OpRef(1)], ());
+            meta.compile_loop(&[OpRef(0), OpRef(1)], ());
         }
 
         let events = events.lock().unwrap();
