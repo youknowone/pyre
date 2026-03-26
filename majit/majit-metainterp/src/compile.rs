@@ -102,19 +102,62 @@ pub struct DeadFrameArtifacts {
 
 // ── Compilation helper functions ────────────────────────────────────────
 
-/// resume.py parity: produce rd_numb for every guard from its FINAL
-/// fail_args (post-assembly, post-normalization).
+/// resume.py parity: produce rd_numb for every guard via memo.number().
 ///
-/// For each guard: tag each fail_arg as TAGBOX/TAGCONST/TAGINT/NULLREF
-/// and store rd_numb + rd_consts on the guard op. fail_args are NOT
-/// modified — the backend compiles with the original fail_args, and
-/// rd_numb is used for recovery decoding at guard failure time.
+/// Uses _number_boxes with TAGCONST for constant pool OpRefs, dedup for
+/// duplicate boxes, NULLREF for NONE. Rebuilds fail_args to liveboxes-only
+/// (TAGBOX entries) so TAGBOX indices match raw_values positions.
+/// Cross-guard memo is shared for constant pool dedup (RPython parity).
 pub(crate) fn number_guards_final(
     ops: &mut [majit_ir::Op],
-    _constants: &HashMap<u32, i64>,
-    _constant_types: &HashMap<u32, Type>,
+    constants: &HashMap<u32, i64>,
+    constant_types: &HashMap<u32, Type>,
 ) {
-    use majit_ir::resumedata;
+    use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
+
+    struct FinalBoxEnv<'a> {
+        constants: &'a HashMap<u32, i64>,
+        constant_types: &'a HashMap<u32, Type>,
+    }
+    impl majit_ir::BoxEnv for FinalBoxEnv<'_> {
+        fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+            opref
+        }
+        fn is_const(&self, _opref: majit_ir::OpRef) -> bool {
+            // Disabled: TAGCONST separation requires verifying that the
+            // constant pool value matches the runtime fail_arg value.
+            // TODO: enable when constant_types → value verification is added.
+            false
+        }
+        fn get_const(&self, opref: majit_ir::OpRef) -> (i64, Type) {
+            let tp = self
+                .constant_types
+                .get(&opref.0)
+                .copied()
+                .unwrap_or(Type::Int);
+            let val = self.constants.get(&opref.0).copied().unwrap_or(0);
+            (val, tp)
+        }
+        fn get_type(&self, opref: majit_ir::OpRef) -> Type {
+            self.constant_types
+                .get(&opref.0)
+                .copied()
+                .unwrap_or(Type::Ref)
+        }
+        fn is_virtual_ref(&self, _opref: majit_ir::OpRef) -> bool {
+            false
+        }
+        fn is_virtual_raw(&self, _opref: majit_ir::OpRef) -> bool {
+            false
+        }
+    }
+
+    let env = FinalBoxEnv {
+        constants,
+        constant_types,
+    };
+    // RPython parity: shared memo across all guards (constant pool dedup).
+    let mut memo = ResumeDataLoopMemo::new();
 
     for op in ops.iter_mut() {
         if !op.opcode.is_guard() {
@@ -123,34 +166,24 @@ pub(crate) fn number_guards_final(
         let Some(ref fail_args) = op.fail_args else {
             continue;
         };
-        // Build rd_numb with 1:1 TAGBOX mapping (each fail_arg slot →
-        // TAGBOX(slot_index)). Constants/duplicates stay in fail_args for
-        // the backend. NONE slots → NULLREF. This produces a rd_numb that
-        // maps identically to direct decode but with explicit NULLREF for
-        // virtual slots, enabling future rd_numb-only recovery.
-        let fa_len = fail_args.len();
-        let mut numb_state = resumedata::NumberingState::new(fa_len + 4);
-        numb_state.append_int(0); // slot 0: total size (patched)
-        numb_state.append_int(fa_len as i32); // slot 1: num_failargs
-        numb_state.append_int(0); // vable_array_length
-        numb_state.append_int(0); // vref_array_length
-        // Single frame: jitcode_index=0, pc=0, slot_count=fa_len
-        numb_state.append_int(0); // jitcode_index
-        numb_state.append_int(0); // pc
-        numb_state.append_int(fa_len as i32); // slot_count
-        for (i, &opref) in fail_args.iter().enumerate() {
-            if opref.is_none() {
-                numb_state.append_short(resumedata::NULLREF);
-            } else {
-                // TAGBOX(i) — 1:1 mapping to raw_values[i].
-                let tagged =
-                    resumedata::tag(i as i32, resumedata::TAGBOX).unwrap_or(resumedata::NULLREF);
-                numb_state.append_short(tagged);
+        let boxes: Vec<majit_ir::OpRef> = fail_args.iter().copied().collect();
+        let snapshot = Snapshot::single_frame(0, boxes);
+        let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
+            continue;
+        };
+        // resume.py:406-417: extract TAGBOX entries → liveboxes (new fail_args).
+        let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
+        let mut liveboxes: Vec<majit_ir::OpRef> = vec![majit_ir::OpRef::NONE; n];
+        for (&opref_id, &tagged) in &numb_state.liveboxes {
+            let (idx, tagbits) = resumedata::untag(tagged);
+            if tagbits == resumedata::TAGBOX && (idx as usize) < liveboxes.len() {
+                liveboxes[idx as usize] = majit_ir::OpRef(opref_id);
             }
         }
-        numb_state.patch_current_size(0);
+        numb_state.patch(1, liveboxes.len() as i32);
+        op.fail_args = Some(liveboxes.into());
         op.rd_numb = Some(numb_state.create_numbering());
-        op.rd_consts = Some(Vec::new());
+        op.rd_consts = Some(memo.consts().to_vec());
     }
 }
 

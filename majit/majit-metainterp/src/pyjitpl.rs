@@ -2534,7 +2534,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.constant_types = constant_types;
+        optimizer.constant_types = constant_types.clone();
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2544,7 +2544,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace.inputargs.len(),
             )
         }));
-        let optimized_ops = match optimize_result {
+        let mut optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
                 if payload
@@ -2611,7 +2611,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             optimized_ops
         };
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         if crate::majit_log_enabled() {
             eprintln!("--- finish trace (after unbox) ---");
@@ -2647,6 +2647,8 @@ impl<M: Clone> MetaInterp<M> {
         // No preamble for FINISH traces — CALL_ASSEMBLER passes all args
         // directly (frame + ni + sd + locals). A guard before GETFIELD ops
         // ensures tagged pointers (force_cache hits) don't get dereferenced.
+
+        compile::number_guards_final(&mut optimized_ops, &constants, &constant_types);
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);
