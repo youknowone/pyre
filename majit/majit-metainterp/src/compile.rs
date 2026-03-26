@@ -123,11 +123,11 @@ pub(crate) fn number_guards_final(
         fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
             opref
         }
-        fn is_const(&self, _opref: majit_ir::OpRef) -> bool {
-            // Disabled: TAGCONST separation requires verifying that the
-            // constant pool value matches the runtime fail_arg value.
-            // TODO: enable when constant_types → value verification is added.
-            false
+        fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+            // ConstantPool OpRefs (>= 10_000) are true compile-time constants.
+            // constant_types only contains entries from ConstantPool (next_ref
+            // starts at 10_000), so no collision with optimizer make_constant.
+            self.constant_types.contains_key(&opref.0)
         }
         fn get_const(&self, opref: majit_ir::OpRef) -> (i64, Type) {
             let tp = self
