@@ -561,6 +561,7 @@ fn load_part(
             let m = load_builtin_module(partname).ok_or_else(|| crate::PyError {
                 kind: crate::PyErrorKind::ImportError,
                 message: format!("builtin module '{modulename}' failed to initialize"),
+                exc_object: std::ptr::null_mut(),
             })?;
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
@@ -661,6 +662,7 @@ fn relative_import(
     let package = package.ok_or_else(|| crate::PyError {
         kind: crate::PyErrorKind::ImportError,
         message: "attempted relative import with no known parent package".to_string(),
+        exc_object: std::ptr::null_mut(),
     })?;
 
     // Strip (level - 1) trailing components from package
@@ -673,6 +675,7 @@ fn relative_import(
             message: format!(
                 "attempted relative import beyond top-level package (package='{package}', level={level})"
             ),
+            exc_object: std::ptr::null_mut(),
         });
     }
     for _ in 0..strips {

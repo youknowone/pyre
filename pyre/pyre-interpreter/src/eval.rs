@@ -25,6 +25,10 @@ use crate::frame::PyFrame;
 /// Returns `true` if a handler was found (frame.next_instr updated to handler),
 /// `false` if the exception should propagate to the caller.
 pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
+    // GeneratorReturn is not a real exception — always propagate it.
+    if err.kind == crate::PyErrorKind::GeneratorReturn {
+        return false;
+    }
     let code = unsafe { &*frame.code };
     let pc = frame.next_instr.saturating_sub(1) as u32;
 
@@ -93,6 +97,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(err) => {
+                // GeneratorReturn: RETURN_GENERATOR unwind → return generator object
+                if err.kind == crate::PyErrorKind::GeneratorReturn {
+                    let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
+                    return Ok(gen_ptr as pyre_object::PyObjectRef);
+                }
                 if handle_exception(frame, &err) {
                     continue;
                 }
@@ -1027,6 +1036,38 @@ impl OpcodeStepExecutor for PyFrame {
     // ── load_method ──
     // PyPy: LOOKUP_METHOD — interpreter-only override.
     // For instances, pushes [attr, self] so CALL prepends self.
+    // ── return_generator ──
+    // CPython 3.12: RETURN_GENERATOR creates a generator from the current
+    // frame and returns it to the caller. PyPy: generator.py GeneratorIterator.
+    fn return_generator(&mut self) -> Result<(), Self::Error> {
+        // Copy the current frame into a heap-allocated frame for the generator.
+        // PyPy: GeneratorIterator stores the PyFrame and resumes it on __next__.
+        let code = self.code;
+        let code_ref = unsafe { &*code };
+        let n_total = code_ref.varnames.len() + code_ref.cellvars.len() + code_ref.freevars.len();
+
+        let mut gen_frame =
+            crate::frame::PyFrame::new_with_namespace(code, self.execution_context, self.namespace);
+        gen_frame.class_locals = self.class_locals;
+        gen_frame.next_instr = self.next_instr;
+        // Copy locals + cells + stack
+        for i in 0..self.valuestackdepth {
+            gen_frame.locals_cells_stack_w[i] = self.locals_cells_stack_w[i];
+        }
+        gen_frame.valuestackdepth = self.valuestackdepth;
+        gen_frame.block_stack = self.block_stack.clone();
+
+        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
+        let generator = pyre_object::generatorobject::w_generator_new(frame_ptr);
+        // Signal the eval loop to return this generator object.
+        // Encode the generator pointer in the error message for retrieval.
+        return Err(crate::PyError {
+            kind: crate::PyErrorKind::GeneratorReturn,
+            message: format!("{}", generator as usize),
+        }
+        .into());
+    }
+
     // ── load_super_attr ──
     // CPython 3.12 LOAD_SUPER_ATTR: stack = [global_super, class, self]
     // → super(class, self).attr

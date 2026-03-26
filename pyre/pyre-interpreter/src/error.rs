@@ -30,6 +30,9 @@ pub enum PyErrorKind {
     ImportError,
     NotImplementedError,
     AssertionError,
+    /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
+    /// Carries the generator PyObjectRef as message.
+    GeneratorReturn,
 }
 
 impl PyError {
@@ -106,6 +109,7 @@ impl PyError {
             PyErrorKind::ImportError => ExcKind::ImportError,
             PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
             PyErrorKind::AssertionError => ExcKind::AssertionError,
+            PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
         }
     }
 
