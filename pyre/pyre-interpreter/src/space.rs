@@ -452,6 +452,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
 
     // PyPy: descroperation.py _binop_impl
     // If b's type is a proper subtype of a's type, try reverse first.
+    // This matches Python's "subclass reflected op takes priority" rule.
     let try_reverse_first = if a_is_inst && b_is_inst {
         if let Some(rdunder) = reverse_dunder(dunder) {
             let a_type = w_instance_get_type(a);
