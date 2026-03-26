@@ -1664,7 +1664,7 @@ mod tests {
             OpRef(1),
             OpRef(2),
         ]);
-        pass.produce_potential_short_preamble_ops(&mut sb);
+        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(
@@ -1703,7 +1703,7 @@ mod tests {
             OpRef(2),
             OpRef(100),
         ]);
-        pass.produce_potential_short_preamble_ops(&mut sb);
+        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(
@@ -1737,7 +1737,7 @@ mod tests {
             OpRef(2),
             OpRef(100),
         ]);
-        pass.produce_potential_short_preamble_ops(&mut sb);
+        pass.produce_potential_short_preamble_ops(&mut sb, &ctx);
         let collected = sb.produced_ops();
         assert_eq!(collected.len(), 1);
         assert!(matches!(

@@ -171,9 +171,9 @@ pub struct Optimizer {
     pub per_guard_knowledge: Vec<(OpRef, OptimizerKnowledge)>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
-    /// optimizer.py:732 — resumedata_memo injected by majit-meta.
-    /// ResumeDataEncoder encodes guard state into compact rd_numb/rd_consts.
-    pub resume_encoder: Option<Box<dyn majit_ir::ResumeDataEncoder>>,
+    /// optimizer.py:732 — resume.ResumeDataLoopMemo.
+    /// Shared constant pool + box numbering cache across all guards in a loop.
+    pub resumedata_memo: crate::resume::ResumeDataLoopMemo,
     /// resume.py parity: per-guard snapshots from tracing time.
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Used by store_final_boxes_in_guard to rebuild fail_args from the
@@ -748,7 +748,7 @@ impl Optimizer {
             pending_bridge_knowledge: None,
             per_guard_knowledge: Vec::new(),
             constant_fold_alloc: None,
-            resume_encoder: None,
+            resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
         }
     }
@@ -2554,29 +2554,136 @@ impl Optimizer {
                 }
             }
 
-            // RPython parity: do NOT force virtuals in guard fail_args.
-            op = Self::encode_guard_virtuals(op, ctx);
+            // optimizer.py:732-748 — ResumeDataVirtualAdder.finish() parity.
+            // 1. number() tags each box (TAGBOX/TAGVIRTUAL/TAGCONST/TAGINT)
+            // 2. Walk TAGVIRTUAL entries to discover virtual fields (via PtrInfo)
+            // 3. finish() numbers new field boxes + creates rd_numb/rd_consts
+            if let Some(ref fail_args) = op.fail_args {
+                let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
+                let snapshot = crate::resume::Snapshot::single_frame(0, fail_args.to_vec());
+                match self.resumedata_memo.number(&snapshot, &env) {
+                    Ok(numb_state) => {
+                        // resume.py:414-426: walk TAGVIRTUAL entries to collect fields.
+                        // RPython does this via visitor_walk_recursive; we extract
+                        // from PtrInfo directly.
+                        let mut virtual_fields = std::collections::HashMap::new();
+                        for (&opref_id, &tagged) in &numb_state.liveboxes {
+                            let (_, tagbits) = crate::resume::untag(tagged);
+                            if tagbits == crate::resume::TAGVIRTUAL {
+                                let opref = OpRef(opref_id);
+                                if let Some(info) = ctx.get_ptr_info(opref) {
+                                    let (descr, known_class, fields) = match info {
+                                        crate::optimizeopt::info::PtrInfo::Virtual(v) => (
+                                            Some(v.descr.clone()),
+                                            v.known_class.map(|gc| gc.0 as i64),
+                                            v.fields
+                                                .iter()
+                                                .map(|(_, r)| ctx.get_replacement(*r))
+                                                .collect(),
+                                        ),
+                                        crate::optimizeopt::info::PtrInfo::VirtualStruct(v) => (
+                                            Some(v.descr.clone()),
+                                            None,
+                                            v.fields
+                                                .iter()
+                                                .map(|(_, r)| ctx.get_replacement(*r))
+                                                .collect(),
+                                        ),
+                                        _ => continue,
+                                    };
+                                    virtual_fields.insert(
+                                        opref_id,
+                                        crate::resume::VirtualFieldInfo {
+                                            descr,
+                                            known_class,
+                                            field_oprefs: fields,
+                                        },
+                                    );
+                                }
+                            }
+                        }
 
-            // optimizer.py:732-748 — encode resume data via ResumeDataEncoder.
-            if let Some(ref mut encoder) = self.resume_encoder {
-                if let Some(ref fail_args) = op.fail_args {
-                    let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
-                    let virtual_entries = op.rd_virtuals.as_deref().unwrap_or(&[]);
-                    match encoder.encode_guard(fail_args, &env, virtual_entries) {
-                        Ok((rd_numb, rd_consts, _ordered_liveboxes)) => {
-                            op.rd_numb = Some(rd_numb);
-                            op.rd_consts = Some(rd_consts);
+                        // resume.py:445: _add_pending_fields
+                        let pending: Vec<(u32, i32, OpRef, OpRef)> = ctx
+                            .pending_for_guard
+                            .iter()
+                            .map(|pf_op| {
+                                let (target, value, item_index) =
+                                    if pf_op.opcode == OpCode::SetarrayitemGc {
+                                        let idx = ctx
+                                            .get_constant_int(ctx.get_replacement(pf_op.arg(1)))
+                                            .unwrap_or(0);
+                                        (pf_op.arg(0), pf_op.arg(2), idx as i32)
+                                    } else {
+                                        (pf_op.arg(0), pf_op.arg(1), -1i32)
+                                    };
+                                let descr_idx = pf_op.descr.as_ref().map_or(0, |d| d.index());
+                                (
+                                    descr_idx,
+                                    item_index,
+                                    ctx.get_replacement(target),
+                                    ctx.get_replacement(value),
+                                )
+                            })
+                            .collect();
+
+                        // TODO: _add_optimizer_sections — requires sequential
+                        // descr indexing (RPython metainterp_sd.all_descrs).
+                        // majit's descr indices are Arc-pointer-based and exceed
+                        // i16 range. Optimizer knowledge remains in per_guard_knowledge
+                        // until a sequential descr registry is implemented.
+
+                        let (rd_numb, rd_consts, rd_virt, _rd_pf, liveboxes) = self
+                            .resumedata_memo
+                            .finish(numb_state, &env, &virtual_fields, &pending, None);
+                        op.rd_numb = Some(rd_numb);
+                        op.rd_consts = Some(rd_consts);
+                        // resume.py:488: store virtual field blueprints.
+                        if !rd_virt.is_empty() {
+                            op.rd_virtuals_info = Some(
+                                rd_virt
+                                    .into_iter()
+                                    .map(|v| {
+                                        (
+                                            v.descr.as_ref().map_or(0, |d| d.index()),
+                                            v.known_class,
+                                            v.fieldnums,
+                                        )
+                                    })
+                                    .collect(),
+                            );
                         }
-                        Err(()) => {
-                            // resume.py: TagOverflow — skip encoding, fall back to fail_args.
-                        }
+                        op.fail_args = Some(liveboxes.into());
+                    }
+                    Err(_) => {
+                        // resume.py: TagOverflow — compile.giveup().
+                        // Fall back to existing fail_args.
                     }
                 }
             }
 
-            // RPython parity: store fail_arg types using constant_types
-            // so the backend distinguishes Ref constants from Int.
-            if !self.constant_types.is_empty() {
+            // RPython parity: store fail_arg types.
+            // When rd_numb is present, use BoxEnv.get_type() for accurate typing
+            // (follows forwarding chain, distinguishes field values from virtual objects).
+            // Otherwise fall back to constant_types + PtrInfo heuristic.
+            if op.rd_numb.is_some() {
+                if let Some(ref fa) = op.fail_args {
+                    let env = crate::optimizeopt::OptBoxEnv { ctx: &*ctx };
+                    let types: Vec<majit_ir::Type> = fa
+                        .iter()
+                        .map(|opref| {
+                            if opref.is_none() {
+                                majit_ir::Type::Int
+                            } else {
+                                <crate::optimizeopt::OptBoxEnv as majit_ir::BoxEnv>::get_type(
+                                    &env, *opref,
+                                )
+                            }
+                        })
+                        .collect();
+                    op.fail_arg_types = Some(types);
+                }
+            } else if !self.constant_types.is_empty() {
                 if let Some(ref fa) = op.fail_args {
                     let types: Vec<majit_ir::Type> = fa
                         .iter()
@@ -2595,7 +2702,6 @@ impl Optimizer {
                                 } else if info.is_virtual() {
                                     majit_ir::Type::Ref
                                 } else {
-                                    // Check emitted ops for result type
                                     ctx.new_operations
                                         .iter()
                                         .find(|o| o.pos == *opref)
@@ -4035,7 +4141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimizer_encodes_direct_virtual_guard_fail_args_as_rd_virtuals() {
+    fn test_optimizer_encodes_direct_virtual_guard_fail_args_as_rd_numb() {
         let mut opt = Optimizer::default_pipeline();
         let size_descr = make_size_descr(16);
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
@@ -4062,24 +4168,25 @@ mod tests {
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("guard should survive optimization");
-        let rd_virtuals = guard
-            .rd_virtuals
-            .as_ref()
-            .expect("direct virtual fail arg should be encoded as rd_virtuals");
+
+        // New format: rd_numb encodes virtual info (TAGVIRTUAL), not rd_virtuals
+        assert!(
+            guard.rd_numb.is_some(),
+            "guard should have rd_numb (compact resume numbering)"
+        );
+        assert!(
+            guard.rd_virtuals.is_none(),
+            "rd_virtuals should be None — virtual info is in rd_numb now"
+        );
         let fail_args = guard
             .fail_args
             .as_ref()
             .expect("guard should keep fail args");
-
-        assert_eq!(rd_virtuals.len(), 1);
+        // fail_args contains only liveboxes (no virtual field values expanded)
+        // The virtual (OpRef(0)) is not in fail_args — it's encoded as TAGVIRTUAL in rd_numb
         assert!(
-            fail_args[0].is_none(),
-            "virtual fail arg slot should be replaced"
-        );
-        assert_eq!(
-            fail_args.len(),
-            2,
-            "field value should be appended as extra fail arg"
+            !fail_args.iter().any(|a| *a == OpRef(0)),
+            "virtual should not appear in fail_args (encoded in rd_numb instead)"
         );
     }
 
@@ -4297,36 +4404,9 @@ mod tests {
         assert_eq!(sp.jump_args, vec![OpRef(14)]);
     }
 
-    /// Mock ResumeDataEncoder that records calls for testing.
-    struct MockResumeEncoder {
-        calls: std::cell::RefCell<Vec<Vec<OpRef>>>,
-    }
-
-    impl MockResumeEncoder {
-        fn new() -> Self {
-            MockResumeEncoder {
-                calls: std::cell::RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl majit_ir::ResumeDataEncoder for MockResumeEncoder {
-        fn encode_guard(
-            &mut self,
-            fail_args: &[OpRef],
-            _env: &dyn majit_ir::BoxEnv,
-            _virtual_entries: &[majit_ir::GuardVirtualEntry],
-        ) -> Result<(Vec<u8>, Vec<(i64, majit_ir::Type)>, Vec<OpRef>), ()> {
-            self.calls.borrow_mut().push(fail_args.to_vec());
-            // Return minimal valid encoding
-            Ok((vec![0], vec![], fail_args.to_vec()))
-        }
-    }
-
     #[test]
-    fn test_resume_encoder_called_in_store_final_boxes() {
+    fn test_resumedata_memo_encodes_rd_numb_on_guard() {
         let mut opt = Optimizer::default_pipeline();
-        opt.resume_encoder = Some(Box::new(MockResumeEncoder::new()));
 
         let mut ops = vec![
             Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
@@ -4344,18 +4424,17 @@ mod tests {
             1024,
         );
 
-        // Guard should have rd_numb set by the encoder
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("guard should survive optimization");
         assert!(
             guard.rd_numb.is_some(),
-            "resume encoder should set rd_numb on guard"
+            "resumedata_memo should set rd_numb on guard"
         );
         assert!(
             guard.rd_consts.is_some(),
-            "resume encoder should set rd_consts on guard"
+            "resumedata_memo should set rd_consts on guard"
         );
     }
 }

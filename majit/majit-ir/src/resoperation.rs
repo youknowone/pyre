@@ -86,28 +86,6 @@ pub trait BoxEnv {
     fn is_virtual_raw(&self, opref: OpRef) -> bool;
 }
 
-/// optimizer.py:732 — ResumeDataVirtualAdder interface for the optimizer.
-///
-/// Trait-based dependency inversion: majit-opt defines the consumer,
-/// majit-meta provides the implementation (wrapping ResumeDataLoopMemo).
-/// This avoids a circular dependency between the two crates.
-pub trait ResumeDataEncoder: Send {
-    /// resume.py:389-452 — ResumeDataVirtualAdder.finish() equivalent.
-    ///
-    /// Encodes a guard's fail_args into compact resume data:
-    /// 1. Creates Snapshot from fail_args
-    /// 2. Calls memo.number(snapshot, env) → NumberingState
-    /// 3. Calls memo.finish(numb_state, virtual_entries) → rd_numb + rd_consts
-    ///
-    /// Returns (rd_numb, rd_consts, ordered_liveboxes) or Err(()) on TagOverflow.
-    fn encode_guard(
-        &mut self,
-        fail_args: &[OpRef],
-        env: &dyn BoxEnv,
-        virtual_entries: &[GuardVirtualEntry],
-    ) -> Result<(Vec<u8>, Vec<(i64, Type)>, Vec<OpRef>), ()>;
-}
-
 /// A single IR operation.
 #[derive(Clone, Debug)]
 pub struct Op {
@@ -139,11 +117,11 @@ pub struct Op {
     /// -1 means unset.
     pub rd_resume_position: i32,
     /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
-    /// Set by ResumeDataEncoder during store_final_boxes_in_guard.
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by rd_numb.
-    /// Each entry is (value, type) matching RPython's Const objects.
     pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object field info (descr_index, known_class, fieldnums).
+    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
 }
 
 impl Op {
@@ -160,6 +138,7 @@ impl Op {
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
+            rd_virtuals_info: None,
         }
     }
 
@@ -176,6 +155,7 @@ impl Op {
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
+            rd_virtuals_info: None,
         }
     }
 
