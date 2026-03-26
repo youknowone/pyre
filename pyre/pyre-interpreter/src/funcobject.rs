@@ -32,6 +32,9 @@ pub struct W_FunctionObject {
     /// Closure: tuple of cell objects from the enclosing scope,
     /// or PY_NULL if this function has no free variables.
     pub closure: PyObjectRef,
+    /// Default argument values (tuple), or PY_NULL if no defaults.
+    /// PyPy: W_Function.defs_w
+    pub defaults: PyObjectRef,
 }
 
 /// Field offset of `code_ptr` within `W_FunctionObject`, for JIT field access.
@@ -70,6 +73,7 @@ pub fn w_func_new_with_closure(
         name: name_ptr,
         globals,
         closure,
+        defaults: PY_NULL,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -127,6 +131,18 @@ pub unsafe fn w_func_get_closure(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_func_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
     unsafe { (*(obj as *mut W_FunctionObject)).closure = closure }
+}
+
+/// Get defaults tuple.
+#[inline]
+pub unsafe fn w_func_get_defaults(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_FunctionObject)).defaults }
+}
+
+/// Set defaults tuple.
+#[inline]
+pub unsafe fn w_func_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
+    unsafe { (*(obj as *mut W_FunctionObject)).defaults = defaults }
 }
 
 #[cfg(test)]
