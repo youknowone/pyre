@@ -1991,20 +1991,20 @@ extern "C" fn call_assembler_guard_failure(
     let fail_descr = &target.fail_descrs[fail_index as usize];
     let fail_count = fail_descr.increment_fail_count();
 
-    // Fast bridge dispatch: use atomic bridge_code_ptr to avoid Mutex.
+    // Fast bridge dispatch: zero-copy — pass the caller's jf_frame
+    // directly to the bridge. fail_args are already at the right offsets
+    // (callee wrote them on guard exit). No array allocation or copy needed.
     let bridge_ptr = fail_descr.bridge_code_ptr();
     if !bridge_ptr.is_null() {
-        let num_inputs = fail_descr.fail_arg_types.len();
-        let inputs = unsafe { std::slice::from_raw_parts(outputs_ptr, num_inputs) };
         let func: unsafe extern "C" fn(*mut i64) -> (*mut i64, i64) =
             unsafe { std::mem::transmute(bridge_ptr) };
-        const HW: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
-        let mut bridge_jf = [0i64; HW + FAST_PATH_MAX_OUTPUTS];
-        for (i, &val) in inputs.iter().enumerate() {
-            bridge_jf[HW + i] = val;
-        }
-        let (_result_jf, _descr) = unsafe { func(bridge_jf.as_mut_ptr()) };
-        return bridge_jf[HW];
+        // outputs_ptr points to jf_frame items (offset 64 from jf_ptr start).
+        // Recover jf_ptr by subtracting the header size.
+        let jf_ptr =
+            unsafe { (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64 };
+        let (_result_jf, _descr) = unsafe { func(jf_ptr) };
+        // Result is at jf_frame[0] = outputs_ptr[0]
+        return unsafe { *outputs_ptr };
     } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
         // RPython: bridge compilation goes through MetaInterp, not the
         // backend. Notify the bridge threshold callback so the JIT driver
