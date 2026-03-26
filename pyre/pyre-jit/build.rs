@@ -1,6 +1,6 @@
 #[path = "src/jit/call_spec.rs"]
 mod call_spec;
-#[path = "src/jit/virtualizable_spec.rs"]
+#[path = "../pyre-jit-trace/src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
 /// Build script for pyre-jit: runs majit-analyze on the ENTIRE pyre
