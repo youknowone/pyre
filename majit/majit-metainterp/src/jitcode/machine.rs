@@ -662,6 +662,9 @@ where
         let stack_ref = sym
             .ensure_linked_list_stack_ref(ctx, selected)
             .ok_or(TraceAction::Abort)?;
+        // RPython parity: jit.promote(selected) — emit GuardValue to make
+        // the stack pointer a known constant. This prevents cross-stack
+        // aliasing in the heap cache (different stacks get different constants).
         let size_descr = sym
             .linked_list_stack_size_descr()
             .ok_or(TraceAction::Abort)?;
