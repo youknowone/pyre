@@ -939,7 +939,10 @@ impl Optimizer {
             return;
         }
 
-        // Fallback path: no snapshot available.
+        // Fallback path: no snapshot available. Clear any stale rd_numb
+        // from a previous phase — it was generated with different fail_args.
+        guard_op.rd_numb = None;
+        guard_op.rd_consts = None;
         if guard_op.fail_args.is_none() {
             if let Some(ref patch) = self.patchguardop {
                 if guard_op.rd_resume_position >= 0
@@ -3078,7 +3081,7 @@ impl<'a> majit_ir::BoxEnv for OptimizerBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        self.ctx.is_constant(opref)
+        self.ctx.is_constant(opref) || self.constant_types.contains_key(&opref.0)
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, Type) {
