@@ -2029,23 +2029,52 @@ impl<M: Clone> MetaInterp<M> {
     /// compiled and installed. The caller should switch to compiled code.
     /// Returns `CompileOutcome::Cancelled` if the bridge couldn't close
     /// (retrace_needed was set, or optimization failed).
+    /// compile.py:1028 compile_trace parity.
+    /// `ends_with_jump=true`: records JUMP, uses BridgeCompileData (optimize_bridge).
+    /// `ends_with_jump=false`: records FINISH, uses SimpleCompileData (optimize_loop).
     pub fn compile_trace(
         &mut self,
         green_key: u64,
-        jump_args: &[OpRef],
+        finish_args: &[OpRef],
         bridge_origin: Option<(u64, u32)>,
     ) -> CompileOutcome {
+        self.compile_trace_inner(green_key, finish_args, bridge_origin, None)
+    }
+
+    /// compile_trace with ends_with_jump=false (FINISH).
+    pub fn compile_trace_finish(
+        &mut self,
+        green_key: u64,
+        finish_args: &[OpRef],
+        bridge_origin: Option<(u64, u32)>,
+        finish_descr: majit_ir::DescrRef,
+    ) -> CompileOutcome {
+        self.compile_trace_inner(green_key, finish_args, bridge_origin, Some(finish_descr))
+    }
+
+    fn compile_trace_inner(
+        &mut self,
+        green_key: u64,
+        finish_args: &[OpRef],
+        bridge_origin: Option<(u64, u32)>,
+        finish_descr: Option<majit_ir::DescrRef>,
+    ) -> CompileOutcome {
+        let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return CompileOutcome::Cancelled,
         };
 
-        // pyjitpl.py:3181: save position before recording JUMP
+        // pyjitpl.py:3187: save position before recording JUMP/FINISH
         let cut_at = ctx.get_trace_position();
         self.potential_retrace_position = Some(cut_at);
 
-        // pyjitpl.py:3183-3184: record tentative JUMP to compiled loop
-        ctx.recorder.close_loop(jump_args);
+        // pyjitpl.py:3189 / 3217: record tentative JUMP or FINISH
+        if let Some(descr) = finish_descr {
+            ctx.recorder.finish(finish_args, descr);
+        } else {
+            ctx.recorder.close_loop(finish_args);
+        }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
         let bridge_ops = ctx.recorder.ops().to_vec();
@@ -2058,14 +2087,15 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         let constants = ctx.constants.as_ref().clone();
 
-        // pyjitpl.py:3189: always cut — pop the tentative JUMP.
-        // close_loop sets finalized=true, so we must unset it before cut.
+        // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
         ctx.recorder.cut(cut_at);
 
+        let label = if ends_with_jump { "jump" } else { "finish" };
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] compile_trace: key={}, bridge_ops={}, origin={:?}",
+                "[jit] compile_trace({}): key={}, ops={}, origin={:?}",
+                label,
                 green_key,
                 bridge_ops.len(),
                 bridge_origin,
@@ -3921,7 +3951,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
-    /// exits via return (ends_with_jump=false / FINISH).
+    /// exits via return. Calls compile_trace with ends_with_jump=false (FINISH).
     pub fn compile_done_with_this_frame(
         &mut self,
         green_key: u64,
@@ -3930,51 +3960,12 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
     ) {
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return,
-        };
-        ctx.apply_replacements();
-        let cut_at = ctx.recorder.get_position();
-        ctx.recorder
-            .finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
-        let ops = ctx.recorder.ops().to_vec();
-        let inputargs = ctx.recorder.inputargs().to_vec();
-        let constants = ctx.constants.snapshot();
-        self.cut_tentative_op(cut_at);
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] compile_done_with_this_frame: key={}, trace_id={}, guard={}, ops={}",
-                green_key,
-                trace_id,
-                fail_index,
-                ops.len()
-            );
-            eprintln!("--- bridge trace (finish, before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&ops, &constants));
-        }
-
-        let fail_descr = {
-            let compiled = match self.compiled_loops.get(&green_key) {
-                Some(c) => c,
-                None => return,
-            };
-            let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
-                Some(descr) => descr,
-                None => return,
-            };
-            Box::new(fail_descr) as Box<dyn majit_ir::FailDescr>
-        };
-
-        self.forced_virtualizable = None;
-        self.compile_bridge(
+        let finish_descr = crate::make_fail_descr_typed(finish_arg_types);
+        self.compile_trace_finish(
             green_key,
-            fail_index,
-            &*fail_descr,
-            &ops,
-            &inputargs,
-            constants,
+            finish_args,
+            Some((trace_id, fail_index)),
+            finish_descr,
         );
     }
 }

@@ -473,15 +473,9 @@ impl<S: JitState> JitDriver<S> {
                                     self.trace_meta = None;
                                     return;
                                 }
-                                crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                    // Optimizer created a new TargetToken but
-                                    // couldn't match. Restore bridge_info for
-                                    // the next attempt (which will find the
-                                    // new token).
-                                    self.bridge_info =
-                                        Some((bridge_key, bridge_trace_id, bridge_fail_index));
-                                    return;
-                                }
+                                // RetraceNeeded: fall through to compile_loop
+                                // (pyjitpl.py:2983 → 3014-3017 parity).
+                                crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {}
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
                                     self.meta.abort_trace(false);
                                     self.sym = None;
@@ -496,9 +490,8 @@ impl<S: JitState> JitDriver<S> {
                             return;
                         }
                     }
-                    // No targets: skip bridge, fall through to Path 2
-                    // (compile_loop via compile_loop).
-                    // pyjitpl.py:2982 has_compiled_targets → false.
+                    // No targets or RetraceNeeded: fall through to
+                    // compile_loop (pyjitpl.py:3014-3017).
                     self.bridge_info = None;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
@@ -577,11 +570,7 @@ impl<S: JitState> JitDriver<S> {
                                 self.trace_meta = None;
                                 return;
                             }
-                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                self.bridge_info =
-                                    Some((bridge_key, bridge_trace_id, bridge_fail_index));
-                                return;
-                            }
+                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {}
                             crate::pyjitpl::BridgeCompileResult::Failed => {
                                 self.meta.abort_trace(false);
                                 self.sym = None;
