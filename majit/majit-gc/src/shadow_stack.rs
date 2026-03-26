@@ -115,6 +115,10 @@ struct JfShadowEntry {
     /// incminimark.py uses this to skip old-gen jitframes during minor GC.
     _category: usize,
     jf_ptr: *mut u8,
+    /// When true, this jitframe is GC-managed (old-gen allocated with header).
+    /// walk_jf_roots skips these entries — Phase 2 traces them via
+    /// remembered set + custom_trace (Option C from the plan).
+    gc_managed: bool,
 }
 
 /// Push a jitframe pointer onto the jitframe shadow stack.
@@ -124,8 +128,12 @@ struct JfShadowEntry {
 ///   MOV [shadowstack_top+WORD], ebp  // jf_ptr
 ///   ADD shadowstack_top, 2*WORD
 ///
+/// `gc_managed`: when true, this jitframe is GC-allocated (old-gen with header).
+/// walk_jf_roots will skip gc_managed entries — they are traced via
+/// remembered set + custom_trace in Phase 2 instead.
+///
 /// Returns the depth for later pop.
-pub fn push_jf(jf_ptr: *mut u8) -> usize {
+pub fn push_jf(jf_ptr: *mut u8, gc_managed: bool) -> usize {
     JF_SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
@@ -133,6 +141,7 @@ pub fn push_jf(jf_ptr: *mut u8) -> usize {
         ss.push(JfShadowEntry {
             _category: 1,
             jf_ptr,
+            gc_managed,
         });
         depth
     })
@@ -153,6 +162,21 @@ pub fn jf_depth() -> usize {
     JF_SHADOW_STACK.with(|ss| ss.borrow().len())
 }
 
+/// Collect GC-managed jitframe payload addresses from the shadow stack.
+///
+/// Returns a list of (obj_addr) for gc_managed entries. These must be
+/// treated as roots during major GC marking to prevent sweep from
+/// freeing live jitframes.
+pub fn gc_managed_jf_addrs() -> Vec<usize> {
+    JF_SHADOW_STACK.with(|ss| {
+        let ss = ss.borrow();
+        ss.iter()
+            .filter(|e| e.gc_managed && !e.jf_ptr.is_null())
+            .map(|e| e.jf_ptr as usize)
+            .collect()
+    })
+}
+
 /// Walk jitframe shadow stack entries, tracing ref slots via jf_gcmap.
 ///
 /// For each jf_ptr on the stack:
@@ -170,7 +194,14 @@ pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
             if jf_ptr.is_null() {
                 continue;
             }
-            // Read jf_gcmap field
+            // GC-managed (old-gen) jitframes are traced via remembered set +
+            // custom_trace in Phase 2. Skip here to prevent double-update
+            // conflict (both walk_jf_roots and trace_and_update_object
+            // trying to copy the same nursery ref).
+            if entry.gc_managed {
+                continue;
+            }
+            // Read jf_gcmap pointer
             let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_BYTE_OFS) as *const *const u8) };
             if gcmap_ptr.is_null() {
                 continue;
@@ -288,10 +319,10 @@ mod tests {
     fn test_jf_shadow_stack_push_pop() {
         clear();
         assert_eq!(jf_depth(), 0);
-        let depth = push_jf(0x1000 as *mut u8);
+        let depth = push_jf(0x1000 as *mut u8, false);
         assert_eq!(depth, 0);
         assert_eq!(jf_depth(), 1);
-        push_jf(0x2000 as *mut u8);
+        push_jf(0x2000 as *mut u8, false);
         assert_eq!(jf_depth(), 2);
         pop_jf_to(depth);
         assert_eq!(jf_depth(), 0);
@@ -300,12 +331,13 @@ mod tests {
     #[test]
     fn test_walk_jf_roots_with_gcmap() {
         clear();
-        // Create a fake jitframe with gcmap
+        // Create a fake jitframe with gcmap pointer.
         // Layout: 64 bytes header + frame items
         let mut jf_buf = vec![0u8; 128];
         let jf_ptr = jf_buf.as_mut_ptr();
 
-        // Set up a gcmap: [1, 0b0010] — bit 1 set
+        // Set up a gcmap: [length=1, bitmap=0b0010] — bit 1 set
+        // (bit 1 → frame_items[1] at offset 64 + 8 = 72).
         let gcmap: [isize; 2] = [1, 0b0010];
         // Write gcmap pointer to jf_gcmap field (offset 24)
         unsafe {
@@ -316,7 +348,7 @@ mod tests {
             *(jf_ptr.add(JF_FRAME_ITEM0_BYTE_OFS + 8) as *mut usize) = 0xABCD;
         }
 
-        push_jf(jf_ptr);
+        push_jf(jf_ptr, false);
 
         let mut found = Vec::new();
         walk_jf_roots(|gcref| {
