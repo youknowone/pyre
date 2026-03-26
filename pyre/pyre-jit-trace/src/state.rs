@@ -3819,8 +3819,7 @@ impl MIFrame {
                 }
 
                 if inline_decision == majit_metainterp::InlineDecision::Inline {
-                    if let Some(frame_helper) =
-                        (crate::callbacks::get().callee_frame_helper)(nargs)
+                    if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(nargs)
                     {
                         return self.inline_function_call(
                             callable,
