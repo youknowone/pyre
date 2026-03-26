@@ -1717,7 +1717,7 @@ impl<M: Clone> MetaInterp<M> {
                     if self.cancelled_too_many_times() {
                         let mut retry_constants = constants_snapshot;
                         let mut simple_opt = Optimizer::default_pipeline();
-                        simple_opt.constant_types = constant_types;
+                        simple_opt.constant_types = constant_types.clone();
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1787,8 +1787,8 @@ impl<M: Clone> MetaInterp<M> {
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
         let (inputargs, optimized_ops) = (inputargs, optimized_ops);
-        let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
-        let optimized_ops =
+        let mut optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
+        let mut optimized_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
@@ -1823,9 +1823,10 @@ impl<M: Clone> MetaInterp<M> {
             return CompileOutcome::Cancelled;
         }
 
-        // Note: guards with NONE in fail_args may have sufficient trailing
-        // fields for virtual materialization. Runtime guard-fail recovery
-        // handles this. If materialization fails, compiled code is invalidated.
+        // resume.py parity: rd_numb produced per-guard at compile time.
+        // number_guards_final builds 1:1 TAGBOX rd_numb encoding so the
+        // guard failure recovery path can decode via rebuild_from_numbering.
+        compile::number_guards_final(&mut optimized_ops, &constants, &constant_types);
 
         let compiled_constants = constants.clone();
         self.backend.set_constants(constants);

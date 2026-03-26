@@ -990,8 +990,19 @@ fn restore_guard_failure_for_loop(
             slots.join(", ")
         );
     }
-    let mut typed = decode_exit_layout_values(raw_values, exit_layout);
-    // RPython resume.py parity: materialize virtual objects from rd_virtuals.
+    // resume.py parity: rd_numb decodes the full frame from compact
+    // numbering. TAGBOX(n)→raw_values[n], TAGCONST→constant, NULLREF→null.
+    let mut typed = if let (Some(rd_numb), Some(rd_consts)) =
+        (&exit_layout.rd_numb, &exit_layout.rd_consts)
+    {
+        if rd_numb.is_empty() {
+            decode_exit_layout_values(raw_values, exit_layout)
+        } else {
+            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
+        }
+    } else {
+        decode_exit_layout_values(raw_values, exit_layout)
+    };
     materialize_recovery_virtuals(&mut typed, exit_layout);
     // Check for remaining null Ref: if materialization replaced all virtual
     // slots, null_ref count is 0 and we proceed normally. If some slots

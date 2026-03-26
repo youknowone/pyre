@@ -102,6 +102,58 @@ pub struct DeadFrameArtifacts {
 
 // ── Compilation helper functions ────────────────────────────────────────
 
+/// resume.py parity: produce rd_numb for every guard from its FINAL
+/// fail_args (post-assembly, post-normalization).
+///
+/// For each guard: tag each fail_arg as TAGBOX/TAGCONST/TAGINT/NULLREF
+/// and store rd_numb + rd_consts on the guard op. fail_args are NOT
+/// modified — the backend compiles with the original fail_args, and
+/// rd_numb is used for recovery decoding at guard failure time.
+pub(crate) fn number_guards_final(
+    ops: &mut [majit_ir::Op],
+    _constants: &HashMap<u32, i64>,
+    _constant_types: &HashMap<u32, Type>,
+) {
+    use majit_ir::resumedata;
+
+    for op in ops.iter_mut() {
+        if !op.opcode.is_guard() {
+            continue;
+        }
+        let Some(ref fail_args) = op.fail_args else {
+            continue;
+        };
+        // Build rd_numb with 1:1 TAGBOX mapping (each fail_arg slot →
+        // TAGBOX(slot_index)). Constants/duplicates stay in fail_args for
+        // the backend. NONE slots → NULLREF. This produces a rd_numb that
+        // maps identically to direct decode but with explicit NULLREF for
+        // virtual slots, enabling future rd_numb-only recovery.
+        let fa_len = fail_args.len();
+        let mut numb_state = resumedata::NumberingState::new(fa_len + 4);
+        numb_state.append_int(0); // slot 0: total size (patched)
+        numb_state.append_int(fa_len as i32); // slot 1: num_failargs
+        numb_state.append_int(0); // vable_array_length
+        numb_state.append_int(0); // vref_array_length
+        // Single frame: jitcode_index=0, pc=0, slot_count=fa_len
+        numb_state.append_int(0); // jitcode_index
+        numb_state.append_int(0); // pc
+        numb_state.append_int(fa_len as i32); // slot_count
+        for (i, &opref) in fail_args.iter().enumerate() {
+            if opref.is_none() {
+                numb_state.append_short(resumedata::NULLREF);
+            } else {
+                // TAGBOX(i) — 1:1 mapping to raw_values[i].
+                let tagged =
+                    resumedata::tag(i as i32, resumedata::TAGBOX).unwrap_or(resumedata::NULLREF);
+                numb_state.append_short(tagged);
+            }
+        }
+        numb_state.patch_current_size(0);
+        op.rd_numb = Some(numb_state.create_numbering());
+        op.rd_consts = Some(Vec::new());
+    }
+}
+
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
