@@ -17,20 +17,20 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("isinstance", || {
         w_builtin_func_new("isinstance", builtin_isinstance)
     });
-    namespace.get_or_insert_with("str", || w_builtin_func_new("str", builtin_str));
+    namespace.get_or_insert_with("str", || crate::typedef::get_builtin_type(&STR_TYPE));
     namespace.get_or_insert_with("repr", || w_builtin_func_new("repr", builtin_repr));
-    namespace.get_or_insert_with("int", || w_builtin_func_new("int", builtin_int));
-    namespace.get_or_insert_with("float", || w_builtin_func_new("float", builtin_float));
-    namespace.get_or_insert_with("bool", || w_builtin_func_new("bool", builtin_bool));
+    namespace.get_or_insert_with("int", || crate::typedef::get_builtin_type(&INT_TYPE));
+    namespace.get_or_insert_with("float", || crate::typedef::get_builtin_type(&FLOAT_TYPE));
+    namespace.get_or_insert_with("bool", || crate::typedef::get_builtin_type(&BOOL_TYPE));
     namespace.get_or_insert_with("True", || w_bool_from(true));
     namespace.get_or_insert_with("False", || w_bool_from(false));
     namespace.get_or_insert_with("None", || w_none());
     namespace.get_or_insert_with("hasattr", || w_builtin_func_new("hasattr", builtin_hasattr));
     namespace.get_or_insert_with("getattr", || w_builtin_func_new("getattr", builtin_getattr));
     namespace.get_or_insert_with("setattr", || w_builtin_func_new("setattr", builtin_setattr));
-    namespace.get_or_insert_with("tuple", || w_builtin_func_new("tuple", builtin_tuple));
-    namespace.get_or_insert_with("list", || w_builtin_func_new("list", builtin_list_ctor));
-    namespace.get_or_insert_with("dict", || w_builtin_func_new("dict", builtin_dict_ctor));
+    namespace.get_or_insert_with("tuple", || crate::typedef::get_builtin_type(&TUPLE_TYPE));
+    namespace.get_or_insert_with("list", || crate::typedef::get_builtin_type(&LIST_TYPE));
+    namespace.get_or_insert_with("dict", || crate::typedef::get_builtin_type(&DICT_TYPE));
     namespace.get_or_insert_with("object", || {
         // `object` is a W_TypeObject, not a builtin function.
         // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
@@ -292,21 +292,45 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     assert!(args.len() == 2, "isinstance() takes exactly two arguments");
     let obj = args[0];
     let cls = args[1];
-    unsafe {
-        // If cls is a W_TypeObject, check if obj is an instance of it
-        // by walking the instance's type chain (bases).
-        if is_type(cls) && is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            return Ok(w_bool_from(is_subtype(w_type, cls)));
+
+    // isinstance(obj, (cls1, cls2, ...)) — any match
+    if unsafe { is_tuple(cls) } {
+        let len = unsafe { w_tuple_len(cls) };
+        for i in 0..len {
+            if let Some(c) = unsafe { w_tuple_getitem(cls, i as i64) } {
+                if isinstance_check(obj, c) {
+                    return Ok(w_bool_from(true));
+                }
+            }
         }
-        // Fallback: type name comparison for builtin types
-        if is_str(cls) {
-            let obj_type = (*(*obj).ob_type).tp_name;
-            let check_type = w_str_get_value(cls);
-            return Ok(w_bool_from(obj_type == check_type));
-        }
+        return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(false))
+
+    Ok(w_bool_from(isinstance_check(obj, cls)))
+}
+
+/// Single-type isinstance check.
+///
+/// PyPy: baseobjspace.py `isinstance_w` → `abstract_issubclass_w`
+fn isinstance_check(obj: PyObjectRef, cls: PyObjectRef) -> bool {
+    unsafe {
+        if !is_type(cls) {
+            return false;
+        }
+        // Get the W_TypeObject for obj's type.
+        // For instances: w_instance_get_type.
+        // For builtins: type registry lookup via ob_type.
+        let obj_type = if is_instance(obj) {
+            w_instance_get_type(obj)
+        } else {
+            // Builtin object → resolve via type registry (PyPy: space.type(w_obj))
+            match crate::typedef::type_of(obj) {
+                Some(t) => t,
+                None => return false,
+            }
+        };
+        is_subtype(obj_type, cls)
+    }
 }
 
 /// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
@@ -433,6 +457,9 @@ fn builtin_classmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// `str(obj)` → convert to string
+pub(crate) fn builtin_str_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_str(args)
+}
 fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_str_new(""));
@@ -454,6 +481,9 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
+pub(crate) fn builtin_int_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_int(args)
+}
 /// `int(obj)` → convert to int
 fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -480,6 +510,9 @@ fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(0))
 }
 
+pub(crate) fn builtin_float_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_float(args)
+}
 /// `float(obj)` → convert to float
 fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -503,7 +536,9 @@ fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(floatobject::w_float_new(0.0))
 }
 
-/// `bool(obj)` → convert to bool (simplified truthiness)
+pub(crate) fn builtin_bool_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_bool(args)
+}
 /// `bool(obj)` — PyPy: operation.py bool → space.is_true
 fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -543,6 +578,9 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(w_none())
 }
 
+pub(crate) fn builtin_tuple_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_tuple(args)
+}
 fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_tuple_new(vec![]));
@@ -563,6 +601,9 @@ fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_tuple_new(vec![]))
 }
 
+pub(crate) fn builtin_list_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_list_ctor(args)
+}
 fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
@@ -583,6 +624,9 @@ fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_list_new(vec![]))
 }
 
+pub(crate) fn builtin_dict_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_dict_ctor(args)
+}
 /// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init
 fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {

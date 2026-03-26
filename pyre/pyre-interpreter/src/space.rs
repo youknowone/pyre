@@ -1576,6 +1576,17 @@ pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult 
             }
         }
     }
+    // Type objects: store in the type's own namespace (class dict).
+    // PyPy: typeobject.py type.__setattr__ → w_type.dict_w[name] = w_value
+    unsafe {
+        if is_type(obj) {
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            if !dict_ptr.is_null() {
+                crate::namespace_store(&mut *dict_ptr, name, value);
+                return Ok(w_none());
+            }
+        }
+    }
     // Store in instance dict (ATTR_TABLE)
     ATTR_TABLE.with(|table| {
         let mut table = table.borrow_mut();

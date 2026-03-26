@@ -340,6 +340,116 @@ pub fn call_callable_inline_residual(
 /// Initialize interpreter callbacks and type registry.
 ///
 /// PyPy: setup_builtin_modules / make_builtins — called once at startup.
+/// Resolve keyword arguments into positional order.
+///
+/// PyPy: argument.py `_match_signature` + `_match_keywords`
+///
+/// Given:
+///   - callable: function with code.varnames defining parameter names
+///   - args: [positional_args..., kwarg_values...] (mixed)
+///   - kwarg_names: tuple of str names for the last N args
+///
+/// Returns args rearranged so that keyword values are in the correct
+/// parameter positions. This runs BEFORE frame creation so the JIT
+/// eval loop sees correctly-positioned locals.
+pub(crate) fn resolve_kwargs(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+) -> Vec<PyObjectRef> {
+    if kwarg_names.is_null() {
+        return args.to_vec();
+    }
+    let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+        unsafe { pyre_object::w_tuple_len(kwarg_names) }
+    } else {
+        return args.to_vec();
+    };
+    if nkw == 0 {
+        return args.to_vec();
+    }
+
+    // Resolve the target function's code object.
+    // For user functions: direct code_ptr.
+    // For type objects: look up __new__ in MRO (PyPy: Arguments used by descr_call).
+    //
+    // When callable is a type, call_type_object will prepend `cls` as the first
+    // arg to __new__, so the stack args correspond to __new__'s params[1:]
+    // (skip_cls=1). For plain function calls skip_cls=0.
+    let (target_func, skip_cls) = if unsafe { crate::is_func(callable) } {
+        (callable, 0usize)
+    } else if unsafe { pyre_object::is_type(callable) } {
+        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(callable, "__new__") } {
+            if unsafe { crate::is_func(new_fn) } {
+                (new_fn, 1usize) // __new__(cls, ...) → skip cls
+            } else {
+                return args.to_vec();
+            }
+        } else {
+            return args.to_vec();
+        }
+    } else {
+        return args.to_vec();
+    };
+
+    let code_ptr = unsafe { w_func_get_code_ptr(target_func) };
+    let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
+    let total_params = code.arg_count as usize;
+    // Effective params = params visible to the caller (excludes implicit cls for types)
+    let nparams = total_params - skip_cls;
+    let n_pos = args.len() - nkw; // number of positional args
+
+    // Start with PY_NULL for all effective params
+    let mut result = vec![pyre_object::PY_NULL; nparams];
+
+    // Fill positional args (PyPy: _match_signature step 1)
+    for i in 0..n_pos.min(nparams) {
+        result[i] = args[i];
+    }
+
+    // Match keywords to parameter names (PyPy: _match_keywords)
+    // varnames[skip_cls..total_params] are the effective param names
+    for ki in 0..nkw {
+        let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+        let Some(kw_name_obj) = kw_name else { continue };
+        let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
+        let kw_value = args[n_pos + ki];
+
+        let mut matched = false;
+        for pi in 0..nparams {
+            if &*code.varnames[skip_cls + pi] == kw_str {
+                result[pi] = kw_value;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // Extra kwarg — not yet handled (**kwargs).
+        }
+    }
+
+    // Fill defaults for PY_NULL slots (PyPy: _match_signature fills defs_w)
+    let defaults = unsafe { crate::w_func_get_defaults(target_func) };
+    if !defaults.is_null() {
+        let defaults = crate::space::unwrap_cell(defaults);
+        if unsafe { pyre_object::is_tuple(defaults) } {
+            let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
+            // defaults cover the LAST ndefaults of the effective params
+            let first_default = nparams.saturating_sub(ndefaults);
+            for pi in first_default..nparams {
+                if result[pi].is_null() {
+                    let di = pi - first_default;
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
+                        result[pi] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
 pub fn register_build_class() {
     crate::typedef::install_builtin_typedefs();
 }
@@ -491,7 +601,21 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
 
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
-    let w_type = pyre_object::w_type_new(name, bases, class_ns_ptr as *mut u8);
+    // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
+    let effective_bases = if bases.is_null()
+        || !unsafe { pyre_object::is_tuple(bases) }
+        || unsafe { pyre_object::w_tuple_len(bases) } == 0
+    {
+        let obj_type = crate::typedef::get_object_type();
+        if !obj_type.is_null() {
+            pyre_object::w_tuple_new(vec![obj_type])
+        } else {
+            bases
+        }
+    } else {
+        bases
+    };
+    let w_type = pyre_object::w_type_new(name, effective_bases, class_ns_ptr as *mut u8);
 
     // CPython: if __classcell__ is in the namespace, set the cell's content
     // to the newly created class. This enables `__class__` references in methods.
