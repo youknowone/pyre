@@ -8,6 +8,7 @@
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{GcRef, Op};
+pub use trace::TypeInfo;
 
 pub mod collector;
 pub mod header;
@@ -171,6 +172,18 @@ pub trait GcAllocator: Send {
     /// Check if an object is pinned.
     fn is_pinned(&self, _obj: GcRef) -> bool {
         false
+    }
+
+    /// Register a GC type descriptor and return its type id.
+    ///
+    /// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
+    fn register_type(&mut self, _info: TypeInfo) -> u32 {
+        0
+    }
+
+    /// Number of registered GC types.
+    fn type_count(&self) -> usize {
+        0
     }
 }
 
