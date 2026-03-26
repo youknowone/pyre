@@ -452,14 +452,24 @@ pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
 // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
 
 fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    // Step 1: object.__new__ — allocate instance
-    // PyPy: descr__new__ → space.allocate_instance(W_ObjectObject, w_type)
-    let instance = pyre_object::w_instance_new(w_type);
+    // Step 1: Look up __new__ via type MRO → allocate instance
+    // PyPy: descr_call → w_newfunc = space.lookup(w_type, '__new__')
+    //       w_newobject = space.call_obj_args(w_newfunc, w_type, __args__)
+    let instance =
+        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__new__") } {
+            // Call __new__(cls, *args)
+            let mut new_args = Vec::with_capacity(1 + args.len());
+            new_args.push(w_type);
+            new_args.extend_from_slice(args);
+            crate::space_call_function(new_fn, &new_args)
+        } else {
+            // Default: allocate bare instance
+            pyre_object::w_instance_new(w_type)
+        };
 
-    // Step 2: Look up __init__ via type MRO
-    // PyPy: descr_call → space.lookup(w_newobject, '__init__') → searches type's MRO
+    // Step 2: Look up __init__ via type MRO → initialize instance
+    // PyPy: descr_call → space.lookup(w_newobject, '__init__')
     if let Some(init_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__init__") } {
-        // Call __init__(instance, *args)
         let mut init_args = Vec::with_capacity(1 + args.len());
         init_args.push(instance);
         init_args.extend_from_slice(args);
