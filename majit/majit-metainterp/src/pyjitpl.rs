@@ -136,6 +136,8 @@ pub(crate) struct StoredExitLayout {
     pub(crate) force_token_slots: Vec<usize>,
     pub(crate) recovery_layout: Option<ExitRecoveryLayout>,
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
+    pub(crate) rd_numb: Option<Vec<u8>>,
+    pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
 }
 
 impl StoredExitLayout {
@@ -150,6 +152,8 @@ impl StoredExitLayout {
             force_token_slots: self.force_token_slots.clone(),
             recovery_layout: self.recovery_layout.clone(),
             resume_layout: self.resume_layout.clone(),
+            rd_numb: self.rd_numb.clone(),
+            rd_consts: self.rd_consts.clone(),
         }
     }
 }
@@ -466,6 +470,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             })
     }
 
@@ -490,6 +496,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             })
     }
 
@@ -534,6 +542,8 @@ impl<M: Clone> MetaInterp<M> {
                         resume_layout: merged
                             .get(&layout.fail_index)
                             .and_then(|existing| existing.resume_layout.clone()),
+                        rd_numb: None,
+                        rd_consts: None,
                     },
                 );
             }
@@ -585,6 +595,8 @@ impl<M: Clone> MetaInterp<M> {
                             resume_layout: merged
                                 .get(&layout.op_index)
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
+                            rd_numb: None,
+                            rd_consts: None,
                         },
                     },
                 );
@@ -2961,6 +2973,8 @@ impl<M: Clone> MetaInterp<M> {
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout,
                     resume_layout,
+                    rd_numb: None,
+                    rd_consts: None,
                 }
             })
             .or(trace_layout)
@@ -2979,6 +2993,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: result.force_token_slots.clone(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -3086,6 +3102,8 @@ impl<M: Clone> MetaInterp<M> {
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout,
                     resume_layout,
+                    rd_numb: None,
+                    rd_consts: None,
                 }
             })
             .or(trace_layout)
@@ -3104,6 +3122,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: result.force_token_slots.clone(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -3228,6 +3248,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: descr.force_token_slots().to_vec(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -3405,6 +3427,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: descr.force_token_slots().to_vec(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -4422,6 +4446,8 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         let reconstructed_state = exit_layout
             .resume_layout
@@ -6150,6 +6176,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: Some(expected_layout.clone()),
+                rd_numb: None,
+                rd_consts: None,
             },
         );
         let mut traces = HashMap::new();
@@ -6343,6 +6371,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             },
         );
 
@@ -6394,6 +6424,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             },
         );
 
@@ -7520,6 +7552,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             },
         );
         let mut terminal_exit_layouts = HashMap::new();
@@ -7533,6 +7567,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             },
         );
         let mut traces = HashMap::new();
@@ -8193,6 +8229,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             },
         );
 
@@ -8292,6 +8330,8 @@ mod tests {
                 force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: Some(existing_resume),
+                rd_numb: None,
+                rd_consts: None,
             },
         );
 

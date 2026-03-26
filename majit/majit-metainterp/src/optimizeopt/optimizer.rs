@@ -848,40 +848,98 @@ impl Optimizer {
         self.replaces_guard.insert(old_pos, new_guard);
     }
 
-    /// optimizer.py: store_final_boxes_in_guard(op)
+    /// optimizer.py:722-752 store_final_boxes_in_guard(op, pendingfields)
     ///
-    /// RPython parity: rebuild fail_args from the tracing-time snapshot,
-    /// resolving each box through the optimizer's replacement chain.
+    /// RPython parity: rebuild fail_args from the tracing-time snapshot
+    /// via memo.number(), resolving each box through get_box_replacement().
     /// Then walk fail_args to detect virtual objects, expand fail_args
     /// with virtual field values, and record blueprints in rd_virtuals.
+    /// Produces rd_numb (compact resume numbering) stored on the guard op.
     ///
     /// resume.py: ResumeDataVirtualAdder.finish() equivalent.
     pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op, ctx: &OptContext) {
         let pending = std::mem::take(&mut self.pendingfields);
         let _ = pending;
 
-        // RPython resume.py: ResumeDataVirtualAdder looks up the snapshot
-        // via rd_resume_position and rebuilds fail_args by resolving each
-        // tracing-time box through get_box_replacement(). This ensures
-        // fail_args always reflect the current optimizer scope, even after
-        // unroll/short_preamble_inline changes the scope.
-        if guard_op.rd_resume_position >= 0 {
-            if let Some(snapshot) = self.snapshot_boxes.get(&guard_op.rd_resume_position) {
-                let new_fail_args: Vec<OpRef> = snapshot
-                    .iter()
-                    .map(|&opref| {
-                        if opref.is_none() {
-                            OpRef::NONE
-                        } else {
-                            ctx.get_replacement(opref)
+        // resume.py:396-405: look up snapshot via rd_resume_position,
+        // call memo.number(snapshot, env) to tag each box.
+        let used_snapshot = guard_op.rd_resume_position >= 0
+            && self
+                .snapshot_boxes
+                .contains_key(&guard_op.rd_resume_position);
+
+        if used_snapshot {
+            let snapshot_boxes = self.snapshot_boxes[&guard_op.rd_resume_position].clone();
+            let snapshot = majit_ir::resumedata::Snapshot::single_frame(0, snapshot_boxes);
+            let box_env = OptimizerBoxEnv {
+                ctx,
+                constant_types: &self.constant_types,
+            };
+            let mut memo = majit_ir::resumedata::ResumeDataLoopMemo::new();
+            if let Ok(numb_state) = memo.number(&snapshot, &box_env) {
+                // resume.py:406-417: separate TAGBOX from TAGVIRTUAL entries.
+                let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
+                let mut liveboxes: Vec<OpRef> = vec![OpRef::NONE; n];
+                let mut virtual_boxes: Vec<(OpRef, i32)> = Vec::new();
+                for (&opref_id, &tagged) in &numb_state.liveboxes {
+                    let (i, tagbits) = majit_ir::resumedata::untag(tagged);
+                    if tagbits == majit_ir::resumedata::TAGBOX {
+                        if (i as usize) < liveboxes.len() {
+                            liveboxes[i as usize] = OpRef(opref_id);
                         }
-                    })
-                    .collect();
-                guard_op.fail_args = Some(new_fail_args.into());
+                    } else if tagbits == majit_ir::resumedata::TAGVIRTUAL {
+                        virtual_boxes.push((OpRef(opref_id), i));
+                    }
+                }
+
+                // resume.py:419-426 + 444 _number_virtuals: walk virtual
+                // field boxes and append them to liveboxes. Records
+                // rd_virtuals for guard failure materialization.
+                let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+                for (vbox, vidx) in &virtual_boxes {
+                    let resolved = ctx.get_replacement(*vbox);
+                    let vinfo_opt = ctx.get_ptr_info(resolved).cloned();
+                    let (descr, known_class, fields_data) = match vinfo_opt {
+                        Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
+                            (vi.descr.clone(), vi.known_class, vi.fields.clone())
+                        }
+                        Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
+                            (vi.descr.clone(), None, vi.fields.clone())
+                        }
+                        _ => continue,
+                    };
+                    let base_idx = liveboxes.len();
+                    let mut fields = Vec::new();
+                    for (i, (field_idx, value_ref)) in fields_data.iter().enumerate() {
+                        let resolved_val = ctx.get_replacement(*value_ref);
+                        liveboxes.push(resolved_val);
+                        fields.push((*field_idx, base_idx + i));
+                    }
+                    virtual_entries.push(GuardVirtualEntry {
+                        original_opref: Some(*vbox),
+                        fail_arg_index: *vidx as usize,
+                        descr,
+                        known_class,
+                        fields,
+                    });
+                }
+
+                guard_op.fail_args = Some(liveboxes.into());
+                if !virtual_entries.is_empty() {
+                    guard_op.rd_virtuals = Some(virtual_entries);
+                }
+
+                // resume.py:447,450-451: patch num_failargs and store rd_numb.
+                let mut numb_state = numb_state;
+                let fa_len = guard_op.fail_args.as_ref().map_or(0, |f| f.len());
+                numb_state.patch(1, fa_len as i32);
+                guard_op.rd_numb = Some(numb_state.create_numbering());
+                guard_op.rd_consts = Some(memo.consts().to_vec());
             }
+            return;
         }
 
-        // Fallback: resolve from patchguardop when no snapshot available.
+        // Fallback path: no snapshot available.
         if guard_op.fail_args.is_none() {
             if let Some(ref patch) = self.patchguardop {
                 if guard_op.rd_resume_position >= 0
@@ -894,7 +952,11 @@ impl Optimizer {
         if guard_op.fail_args.is_none() {
             guard_op.fail_args = Some(Default::default());
         }
+        Self::expand_virtuals_in_fail_args(guard_op, ctx);
+    }
 
+    /// Legacy virtual expansion for guards without snapshot numbering.
+    fn expand_virtuals_in_fail_args(guard_op: &mut Op, ctx: &OptContext) {
         let Some(ref fail_args) = guard_op.fail_args else {
             return;
         };
@@ -911,42 +973,27 @@ impl Optimizer {
             let Some(info) = ctx.get_ptr_info(resolved) else {
                 continue;
             };
-
-            match info.clone() {
-                crate::optimizeopt::info::PtrInfo::VirtualStruct(vinfo) => {
-                    let base_idx = original_len + extra_args.len();
-                    let mut fields = Vec::new();
-                    for (i, (field_idx, value_ref)) in vinfo.fields.iter().enumerate() {
-                        let resolved_val = ctx.get_replacement(*value_ref);
-                        extra_args.push(resolved_val);
-                        fields.push((*field_idx, base_idx + i));
-                    }
-                    virtual_entries.push(GuardVirtualEntry {
-                        original_opref: Some(opref),
-                        fail_arg_index: fa_idx,
-                        descr: vinfo.descr.clone(),
-                        known_class: None,
-                        fields,
-                    });
+            let (descr, known_class, fields_data) = match info.clone() {
+                crate::optimizeopt::info::PtrInfo::VirtualStruct(vi) => (vi.descr, None, vi.fields),
+                crate::optimizeopt::info::PtrInfo::Virtual(vi) => {
+                    (vi.descr, vi.known_class, vi.fields)
                 }
-                crate::optimizeopt::info::PtrInfo::Virtual(vinfo) => {
-                    let base_idx = original_len + extra_args.len();
-                    let mut fields = Vec::new();
-                    for (i, (field_idx, value_ref)) in vinfo.fields.iter().enumerate() {
-                        let resolved_val = ctx.get_replacement(*value_ref);
-                        extra_args.push(resolved_val);
-                        fields.push((*field_idx, base_idx + i));
-                    }
-                    virtual_entries.push(GuardVirtualEntry {
-                        original_opref: Some(opref),
-                        fail_arg_index: fa_idx,
-                        descr: vinfo.descr.clone(),
-                        known_class: vinfo.known_class,
-                        fields,
-                    });
-                }
-                _ => {}
+                _ => continue,
+            };
+            let base_idx = original_len + extra_args.len();
+            let mut fields = Vec::new();
+            for (i, (field_idx, value_ref)) in fields_data.iter().enumerate() {
+                let resolved_val = ctx.get_replacement(*value_ref);
+                extra_args.push(resolved_val);
+                fields.push((*field_idx, base_idx + i));
             }
+            virtual_entries.push(GuardVirtualEntry {
+                original_opref: Some(opref),
+                fail_arg_index: fa_idx,
+                descr,
+                known_class,
+                fields,
+            });
         }
 
         if !extra_args.is_empty() {
@@ -3013,6 +3060,72 @@ impl Optimizer {
 impl Default for Optimizer {
     fn default() -> Self {
         Self::default_pipeline()
+    }
+}
+
+/// resume.py BoxEnv implementation for the optimizer.
+///
+/// Bridges OptContext (replacement chain, constants, ptr_info) to the
+/// BoxEnv trait used by ResumeDataLoopMemo::number().
+struct OptimizerBoxEnv<'a> {
+    ctx: &'a OptContext,
+    constant_types: &'a std::collections::HashMap<u32, Type>,
+}
+
+impl<'a> majit_ir::BoxEnv for OptimizerBoxEnv<'a> {
+    fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+        self.ctx.get_replacement(opref)
+    }
+
+    fn is_const(&self, opref: OpRef) -> bool {
+        self.ctx.is_constant(opref)
+    }
+
+    fn get_const(&self, opref: OpRef) -> (i64, Type) {
+        if let Some(val) = self.ctx.get_constant(opref) {
+            match val {
+                majit_ir::Value::Int(i) => (*i, Type::Int),
+                majit_ir::Value::Float(f) => (f.to_bits() as i64, Type::Float),
+                majit_ir::Value::Ref(r) => (r.0 as i64, Type::Ref),
+                majit_ir::Value::Void => (0, Type::Void),
+            }
+        } else {
+            (0, Type::Int)
+        }
+    }
+
+    fn get_type(&self, opref: OpRef) -> Type {
+        // Check constant_types first (for OpRef >= 10_000 constants).
+        if let Some(&tp) = self.constant_types.get(&opref.0) {
+            return tp;
+        }
+        // Check constants.
+        if let Some(val) = self.ctx.get_constant(opref) {
+            return match val {
+                majit_ir::Value::Int(_) => Type::Int,
+                majit_ir::Value::Float(_) => Type::Float,
+                majit_ir::Value::Ref(_) => Type::Ref,
+                majit_ir::Value::Void => Type::Void,
+            };
+        }
+        // Check producing op's result type.
+        for op in &self.ctx.new_operations {
+            if op.pos == opref {
+                return op.result_type();
+            }
+        }
+        // Default to Ref for inputargs (they're typically object references).
+        Type::Ref
+    }
+
+    fn is_virtual_ref(&self, opref: OpRef) -> bool {
+        self.ctx
+            .get_ptr_info(opref)
+            .is_some_and(|info| info.is_virtual())
+    }
+
+    fn is_virtual_raw(&self, _opref: OpRef) -> bool {
+        false // pyre has no raw virtuals
     }
 }
 
