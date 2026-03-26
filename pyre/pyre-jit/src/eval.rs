@@ -878,9 +878,13 @@ fn restore_guard_failure_for_loop(
             slots.join(", ")
         );
     }
+    // resume.py:1042-1057 rebuild_from_numbering parity: when rd_numb is
+    // available, decode the compact numbering to reconstruct ALL frame
+    // slots. raw_values only contains TAGBOX entries (liveboxes); TAGCONST
+    // and TAGVIRTUAL values come from rd_consts and materialization.
+    // TODO: enable rd_numb-based recovery once slot mapping is verified.
     let mut typed = decode_exit_layout_values(raw_values, exit_layout);
-    // RPython resume.py ResumeDataVirtualAdder parity: materialize virtual
-    // objects from rd_virtuals (ExitFrameLayout Virtual slots).
+    // Materialize virtual objects from rd_virtuals (ExitFrameLayout Virtual slots).
     materialize_recovery_virtuals(&mut typed, exit_layout);
     // Check for remaining null Ref: if materialization replaced all virtual
     // slots, null_ref count is 0 and we proceed normally. If some slots
@@ -964,6 +968,76 @@ fn restore_guard_failure_for_loop(
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
+}
+
+/// resume.py:1042-1057 rebuild_from_numbering: decode rd_numb to produce
+/// typed values. Each slot is either TAGBOX (from deadframe), TAGCONST
+/// (compile-time constant), TAGINT (small inline int), or TAGVIRTUAL
+/// (virtual object to materialize later by materialize_recovery_virtuals).
+fn rebuild_typed_from_rd_numb(
+    raw_values: &[i64],
+    rd_numb: &[u8],
+    rd_consts: &[(i64, majit_ir::Type)],
+    exit_layout: &CompiledExitLayout,
+) -> Vec<Value> {
+    use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+
+    let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
+
+    // Flatten all frame values into one typed vector.
+    // pyre single-frame: typically one frame with [frame_ptr, ni, vsd, locals..., stack...].
+    let mut typed = Vec::new();
+    for frame in &frames {
+        for val in &frame.values {
+            match val {
+                RebuiltValue::Box(idx) => {
+                    // TAGBOX: value from deadframe slot.
+                    let raw = raw_values.get(*idx).copied().unwrap_or(0);
+                    let tp = exit_layout
+                        .exit_types
+                        .get(*idx)
+                        .copied()
+                        .unwrap_or(majit_ir::Type::Int);
+                    typed.push(match tp {
+                        majit_ir::Type::Int => Value::Int(raw),
+                        majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                        majit_ir::Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                        majit_ir::Type::Void => Value::Void,
+                    });
+                }
+                RebuiltValue::Const(c, tp) => {
+                    // TAGCONST: compile-time constant with known type.
+                    typed.push(match tp {
+                        majit_ir::Type::Int => Value::Int(*c),
+                        majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                        majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
+                        majit_ir::Type::Void => Value::Void,
+                    });
+                }
+                RebuiltValue::Int(i) => {
+                    // TAGINT: small integer encoded inline.
+                    typed.push(Value::Int(*i as i64));
+                }
+                RebuiltValue::Virtual(_vidx) => {
+                    // TAGVIRTUAL: placeholder null Ref — materialized by
+                    // materialize_recovery_virtuals using ExitRecoveryLayout.
+                    typed.push(Value::Ref(majit_ir::GcRef(0)));
+                }
+                RebuiltValue::Unassigned => {
+                    typed.push(Value::Int(0));
+                }
+            }
+        }
+    }
+
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit] guard-fail: rd_numb decoded {} slots from {} frame(s)",
+            typed.len(),
+            frames.len()
+        );
+    }
+    typed
 }
 
 /// Guard failure recovery: reconstruct virtual objects from their

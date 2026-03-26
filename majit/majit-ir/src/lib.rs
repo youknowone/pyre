@@ -1,5 +1,7 @@
 pub mod descr;
 pub mod resoperation;
+pub mod resumecode;
+pub mod resumedata;
 pub mod value;
 
 // Re-export key types at crate root for convenience.

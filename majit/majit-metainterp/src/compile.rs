@@ -41,6 +41,10 @@ pub struct CompiledExitLayout {
     pub force_token_slots: Vec<usize>,
     pub recovery_layout: Option<ExitRecoveryLayout>,
     pub resume_layout: Option<ResumeLayoutSummary>,
+    /// resume.py:450 — compact resume numbering for rd_numb-based recovery.
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — constant pool referenced by rd_numb.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
 }
 
 /// Typed result from running compiled code.
@@ -270,6 +274,8 @@ pub(crate) fn build_guard_metadata(
                 is_finish,
                 recovery_layout,
                 resume_layout,
+                rd_numb: op.rd_numb.clone(),
+                rd_consts: op.rd_consts.clone(),
             },
         );
         fail_index += 1;
@@ -322,6 +328,8 @@ pub(crate) fn merge_backend_exit_layouts(
                 force_token_slots: layout.force_token_slots.clone(),
                 recovery_layout: layout.recovery_layout.clone(),
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         entry.source_op_index = layout.source_op_index;
         entry.exit_types = layout.fail_arg_types.clone();
@@ -517,6 +525,8 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 force_token_slots: layout.force_token_slots.clone(),
                 recovery_layout: layout.recovery_layout.clone(),
                 resume_layout: None,
+                rd_numb: None,
+                rd_consts: None,
             });
         entry.source_op_index = Some(layout.op_index);
         entry.exit_types = layout.exit_types.clone();
@@ -665,6 +675,8 @@ pub(crate) fn infer_terminal_exit_layout(
         force_token_slots,
         recovery_layout: None,
         resume_layout: None,
+        rd_numb: None,
+        rd_consts: None,
     })
 }
 
@@ -688,6 +700,8 @@ pub(crate) fn build_terminal_exit_layouts(
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
+                    rd_numb: None,
+                    rd_consts: None,
                 },
             );
         }

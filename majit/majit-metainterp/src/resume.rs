@@ -3081,8 +3081,8 @@ pub struct VirtualFieldValues {
 pub enum RebuiltValue {
     /// TAGINT: inline integer constant.
     Int(i32),
-    /// TAGCONST: value from constant pool.
-    Const(i64),
+    /// TAGCONST: value from constant pool with type.
+    Const(i64, majit_ir::Type),
     /// TAGBOX: live value from fail_args[index].
     Box(usize),
     /// TAGVIRTUAL: virtual object (index into rd_virtuals).
@@ -3103,13 +3103,16 @@ fn decode_tagged(
         TAGINT => RebuiltValue::Int(val),
         TAGCONST => {
             if tagged == NULLREF {
-                RebuiltValue::Const(0)
+                RebuiltValue::Const(0, majit_ir::Type::Ref)
             } else if tagged == UNINITIALIZED_TAG {
                 RebuiltValue::Unassigned
             } else {
                 let idx = (val - TAG_CONST_OFFSET) as usize;
-                let c = rd_consts.get(idx).map(|&(v, _)| v).unwrap_or(0);
-                RebuiltValue::Const(c)
+                let (c, tp) = rd_consts
+                    .get(idx)
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int));
+                RebuiltValue::Const(c, tp)
             }
         }
         TAGBOX => {
