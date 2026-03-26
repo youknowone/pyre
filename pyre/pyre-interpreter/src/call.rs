@@ -248,6 +248,17 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
         return call_type_object(frame, callable, args);
     }
 
+    // Instance with __call__ — PyPy: descroperation.py descr_call
+    if unsafe { pyre_object::is_instance(callable) } {
+        let w_type = unsafe { pyre_object::w_instance_get_type(callable) };
+        if let Some(call_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__call__") } {
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(callable);
+            call_args.extend_from_slice(args);
+            return call_callable(frame, call_fn, &call_args);
+        }
+    }
+
     dispatch_callable(
         callable,
         |callable| {
