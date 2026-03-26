@@ -192,10 +192,10 @@ impl LocalOpcodeHandler for PyFrame {
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
         let value = self.locals_cells_stack_w[idx];
         if value.is_null() {
-            return Err(PyError {
-                kind: PyErrorKind::NameError,
-                message: format!("local variable '{name}' referenced before assignment"),
-            });
+            return Err(PyError::new(
+                PyErrorKind::NameError,
+                format!("local variable '{name}' referenced before assignment"),
+            ));
         }
         Ok(value)
     }

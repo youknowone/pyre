@@ -839,10 +839,10 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             let idx = w_int_get_value(index);
             match w_list_getitem(obj, idx) {
                 Some(val) => Ok(val),
-                None => Err(PyError {
-                    kind: PyErrorKind::IndexError,
-                    message: "list index out of range".to_string(),
-                }),
+                None => Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "list index out of range",
+                )),
             }
         } else if is_tuple(obj) {
             if !is_int(index) {
@@ -851,10 +851,10 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             let idx = w_int_get_value(index);
             match w_tuple_getitem(obj, idx) {
                 Some(val) => Ok(val),
-                None => Err(PyError {
-                    kind: PyErrorKind::IndexError,
-                    message: "tuple index out of range".to_string(),
-                }),
+                None => Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "tuple index out of range",
+                )),
             }
         } else if is_dict(obj) {
             if !is_int(index) {
@@ -863,10 +863,10 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             let key = w_int_get_value(index);
             match w_dict_getitem(obj, key) {
                 Some(val) => Ok(val),
-                None => Err(PyError {
-                    kind: PyErrorKind::KeyError,
-                    message: format!("{key}"),
-                }),
+                None => Err(PyError::new(
+                    PyErrorKind::KeyError,
+                    format!("{key}"),
+                )),
             }
         } else {
             Err(PyError::type_error(format!(
@@ -888,10 +888,10 @@ pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> P
             if w_list_setitem(obj, idx, value) {
                 Ok(w_none())
             } else {
-                Err(PyError {
-                    kind: PyErrorKind::IndexError,
-                    message: "list assignment index out of range".to_string(),
-                })
+                Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "list assignment index out of range",
+                ))
             }
         } else if is_dict(obj) {
             if !is_int(index) {
@@ -953,13 +953,13 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
         unsafe {
-            Err(PyError {
-                kind: PyErrorKind::AttributeError,
-                message: format!(
+            Err(PyError::new(
+                PyErrorKind::AttributeError,
+                format!(
                     "'{}' object has no attribute '{name}'",
                     (*(*obj).ob_type).tp_name,
                 ),
-            })
+            ))
         }
     })
 }
