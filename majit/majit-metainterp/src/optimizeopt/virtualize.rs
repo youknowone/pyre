@@ -1384,6 +1384,7 @@ impl OptVirtualize {
                     fields.push((field_idx, fa_index));
                 }
                 Some(GuardVirtualEntry {
+                    original_opref: None,
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
@@ -1403,6 +1404,7 @@ impl OptVirtualize {
                     fields.push((field_idx, fa_index));
                 }
                 Some(GuardVirtualEntry {
+                    original_opref: None,
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: None,

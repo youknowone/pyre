@@ -38,6 +38,11 @@ pub struct GuardVirtualEntry {
     /// Field descriptors and their positions in fail_args:
     /// (field_descr_index, fail_arg_index_of_field_value).
     pub fields: Vec<(u32, usize)>,
+    /// Original OpRef before NONE replacement. Phase 2 uses this to
+    /// resolve through its forwarding chain when the position doesn't
+    /// match exported_jump_virtuals. RPython doesn't need this because
+    /// Phase 2 fail_args contain the original Box objects (shared graph).
+    pub original_opref: Option<OpRef>,
 }
 
 /// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
