@@ -102,6 +102,47 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                 "remove",
                 crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
             );
+            let _ = crate::space::py_setattr(
+                obj,
+                "__iter__",
+                crate::w_builtin_func_new("__iter__", |args| {
+                    // Iterate over keys of __data__ dict
+                    if !args.is_empty() {
+                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                            return crate::space::py_iter(data);
+                        }
+                    }
+                    Ok(pyre_object::w_seq_iter_new(
+                        pyre_object::w_list_new(vec![]),
+                        0,
+                    ))
+                }),
+            );
+            let _ = crate::space::py_setattr(
+                obj,
+                "__contains__",
+                crate::w_builtin_func_new("__contains__", |args| {
+                    if args.len() >= 2 {
+                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                            let found = unsafe { pyre_object::w_dict_lookup(data, args[1]) };
+                            return Ok(pyre_object::w_bool_from(found.is_some()));
+                        }
+                    }
+                    Ok(pyre_object::w_bool_from(false))
+                }),
+            );
+            let _ = crate::space::py_setattr(
+                obj,
+                "__len__",
+                crate::w_builtin_func_new("__len__", |args| {
+                    if !args.is_empty() {
+                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                            return crate::space::py_len(data);
+                        }
+                    }
+                    Ok(pyre_object::w_int_new(0))
+                }),
+            );
             Ok(obj)
         })
     });

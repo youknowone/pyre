@@ -551,7 +551,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
             let func = crate::w_builtin_func_get(callable);
             return match func(args) {
                 Ok(result) => result,
-                Err(e) => panic!("builtin call failed: {e}"),
+                Err(_) => pyre_object::w_none(), // Error in space_call_function → None fallback
             };
         }
         // User function: create frame + eval
