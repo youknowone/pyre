@@ -2032,7 +2032,26 @@ impl MIFrame {
         // RPython close_loop_args parity: JUMP args must match the target
         // label's types (inputarg_types). materialize_loop_carried_value
         // boxes values to match (e.g. Int → Ref for virtualizable locals).
-        let inputarg_types = ctx.inputarg_types();
+        //
+        // For bridge traces, ctx.inputarg_types() returns the bridge's
+        // guard fail_arg types, NOT the root loop's label types. The JUMP
+        // targets the root loop label, so we must use the root loop token's
+        // inputarg_types instead.
+        let inputarg_types = {
+            let (driver, _) = crate::driver::driver_pair();
+            if driver.is_bridge_tracing() {
+                if let Some(gk) = driver.current_trace_green_key() {
+                    driver
+                        .get_loop_token(gk)
+                        .map(|token| token.inputarg_types.clone())
+                        .unwrap_or_else(|| ctx.inputarg_types())
+                } else {
+                    ctx.inputarg_types()
+                }
+            } else {
+                ctx.inputarg_types()
+            }
+        };
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
