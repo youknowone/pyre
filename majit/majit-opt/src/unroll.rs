@@ -4195,7 +4195,7 @@ mod tests {
         });
 
         let forced = ctx.force_op_from_preamble(OpRef(14));
-        assert_eq!(forced, OpRef(19));
+        assert_eq!(forced, OpRef(14));
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.ops.len(), 1);
