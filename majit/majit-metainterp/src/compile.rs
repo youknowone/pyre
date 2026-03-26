@@ -171,8 +171,9 @@ pub(crate) fn number_guards_final(
         let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
             continue;
         };
-        // resume.py:406-417: extract TAGBOX entries → liveboxes (new fail_args).
-        let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
+        // resume.py:406-417: collect liveboxes (TAGBOX entries only).
+        let num_virtuals = numb_state.num_virtuals;
+        let n = (numb_state.liveboxes.len() as i32 - num_virtuals) as usize;
         let mut liveboxes: Vec<majit_ir::OpRef> = vec![majit_ir::OpRef::NONE; n];
         for (&opref_id, &tagged) in &numb_state.liveboxes {
             let (idx, tagbits) = resumedata::untag(tagged);
@@ -180,7 +181,24 @@ pub(crate) fn number_guards_final(
                 liveboxes[idx as usize] = majit_ir::OpRef(opref_id);
             }
         }
+
+        // resume.py:444: _number_virtuals — virtual field boxes are already
+        // numbered by memo.number() via _number_boxes. No separate walk needed
+        // post-assembly since optimizer's store_final_boxes_in_guard already
+        // expanded virtual fields into fail_args.
+
+        // resume.py:445: _add_pending_fields — pending field ops are already
+        // encoded in op.rd_pendingfields by encode_guard_virtuals_impl.
+
+        // resume.py:449: _add_optimizer_sections — optimizer knowledge
+        // (class info, heap cache) serialized separately in per_guard_knowledge.
+        // bridgeopt.py deserialization reads from that HashMap, not from
+        // numb_state. Functionally equivalent to RPython's inline serialization.
+
+        // resume.py:447: patch(1, len(liveboxes))
         numb_state.patch(1, liveboxes.len() as i32);
+
+        // resume.py:450-451: storage.rd_numb, storage.rd_consts
         op.fail_args = Some(liveboxes.into());
         op.rd_numb = Some(numb_state.create_numbering());
         op.rd_consts = Some(memo.consts().to_vec());
