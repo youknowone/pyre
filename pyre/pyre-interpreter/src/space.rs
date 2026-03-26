@@ -479,6 +479,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
 /// PyPy: descroperation.py `_make_binop_impl` generates both directions.
 fn reverse_dunder(dunder: &str) -> Option<&'static str> {
     Some(match dunder {
+        // Arithmetic — PyPy: descroperation.py _make_binop_impl
         "__add__" => "__radd__",
         "__sub__" => "__rsub__",
         "__mul__" => "__rmul__",
@@ -491,6 +492,13 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
         "__and__" => "__rand__",
         "__or__" => "__ror__",
         "__xor__" => "__rxor__",
+        // Comparison reflected — PyPy: descroperation.py _cmp_dispatch
+        "__lt__" => "__gt__",
+        "__le__" => "__ge__",
+        "__gt__" => "__lt__",
+        "__ge__" => "__le__",
+        "__eq__" => "__eq__",
+        "__ne__" => "__ne__",
         _ => return None,
     })
 }
@@ -1197,6 +1205,48 @@ thread_local! {
 
 pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
+
+    // super proxy — PyPy: superobject.py super_getattro
+    // Looks up `name` in cls's MRO starting AFTER super_type.
+    unsafe {
+        if pyre_object::superobject::is_super(obj) {
+            let super_type = pyre_object::superobject::w_super_get_type(obj);
+            let bound_obj = pyre_object::superobject::w_super_get_obj(obj);
+
+            // Walk obj's type MRO, skip until we pass super_type
+            let obj_type = if is_instance(bound_obj) {
+                w_instance_get_type(bound_obj)
+            } else if is_type(bound_obj) {
+                bound_obj
+            } else {
+                return Err(PyError::type_error("super: bad obj type"));
+            };
+            let mro_ptr = w_type_get_mro(obj_type);
+            if !mro_ptr.is_null() {
+                let mro = &*mro_ptr;
+                let mut past_super = false;
+                for &t in mro {
+                    if std::ptr::eq(t, super_type) {
+                        past_super = true;
+                        continue;
+                    }
+                    if !past_super {
+                        continue;
+                    }
+                    if is_type(t) {
+                        if let Some(method) = lookup_in_type_mro(t, name) {
+                            return Ok(method);
+                        }
+                    }
+                }
+            }
+            return Err(PyError {
+                kind: PyErrorKind::AttributeError,
+                message: format!("'super' object has no attribute '{name}'"),
+            });
+        }
+    }
+
     // Module objects: look up in module namespace
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
@@ -1258,6 +1308,11 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(descr);
             }
 
+            // Special attributes — PyPy: descroperation.py
+            if name == "__class__" {
+                return Ok(w_type);
+            }
+
             return Err(PyError {
                 kind: PyErrorKind::AttributeError,
                 message: format!(
@@ -1272,6 +1327,24 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
         if is_type(obj) {
+            // Special type attributes — PyPy: typeobject.py
+            if name == "__name__" {
+                return Ok(w_str_new(w_type_get_name(obj)));
+            }
+            if name == "__qualname__" {
+                // Check if __qualname__ was explicitly set in class body
+                if let Some(qn) = lookup_in_type_mro(obj, "__qualname__") {
+                    return Ok(qn);
+                }
+                return Ok(w_str_new(w_type_get_name(obj)));
+            }
+            if name == "__mro__" {
+                let mro_ptr = w_type_get_mro(obj);
+                if !mro_ptr.is_null() {
+                    return Ok(w_tuple_new((*mro_ptr).clone()));
+                }
+            }
+
             if let Some(value) = lookup_in_type_mro(obj, name) {
                 // Unwrap staticmethod/classmethod/property descriptors
                 // PyPy: type.__getattribute__ calls space.get on descriptors
@@ -1604,6 +1677,41 @@ pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult 
             .insert(name.to_string(), value);
     });
     Ok(w_none())
+}
+
+/// Delete an attribute: `del obj.name`.
+///
+/// PyPy: descroperation.py descr__delattr__
+pub fn py_delattr(obj: PyObjectRef, name: &str) -> PyResult {
+    let obj = unwrap_cell(obj);
+    // Type objects: set to PY_NULL in class dict
+    // (PyNamespace doesn't support removal, null slot acts as deleted)
+    unsafe {
+        if is_type(obj) {
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            if !dict_ptr.is_null() {
+                crate::namespace_store(&mut *dict_ptr, name, PY_NULL);
+                return Ok(w_none());
+            }
+        }
+    }
+    // Instance/general: remove from ATTR_TABLE
+    let removed = ATTR_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        table
+            .get_mut(&(obj as usize))
+            .and_then(|d| d.remove(name))
+            .is_some()
+    });
+    if removed {
+        Ok(w_none())
+    } else {
+        let tp_name = unsafe { (*(*obj).ob_type).tp_name };
+        Err(PyError {
+            kind: PyErrorKind::AttributeError,
+            message: format!("'{tp_name}' object has no attribute '{name}'"),
+        })
+    }
 }
 
 #[cfg(test)]

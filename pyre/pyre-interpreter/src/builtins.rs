@@ -709,8 +709,19 @@ fn builtin_object(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// `super()` — PyPy: descriptor.py W_Super
-fn builtin_super(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    panic!("super() not yet implemented (requires __class__ cell + frame introspection)");
+/// `super(cls, obj)` — PyPy: superobject.py W_Super
+///
+/// Returns a proxy that looks up methods in cls's MRO starting after cls.
+/// `py_getattr` handles the super proxy via `is_super` check.
+fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "super(): requires at least 2 arguments (zero-arg super not yet supported)",
+        ));
+    }
+    let cls = args[0];
+    let obj = args[1];
+    Ok(pyre_object::superobject::w_super_new(cls, obj))
 }
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int

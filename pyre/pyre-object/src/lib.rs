@@ -17,6 +17,7 @@ pub mod pyobject;
 pub mod rangeobject;
 pub mod sliceobject;
 pub mod strobject;
+pub mod superobject;
 pub mod tupleobject;
 pub mod typeobject;
 
@@ -39,5 +40,6 @@ pub use pyobject::*;
 pub use rangeobject::*;
 pub use sliceobject::*;
 pub use strobject::*;
+pub use superobject::*;
 pub use tupleobject::*;
 pub use typeobject::*;
