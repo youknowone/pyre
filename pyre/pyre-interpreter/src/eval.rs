@@ -66,6 +66,10 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
 /// Execute a frame — pure interpreter, no JIT.
 pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.fix_array_ptrs();
+    // Track last known execution context for call_user_func_with_args
+    if !frame.execution_context.is_null() {
+        crate::call::set_last_exec_ctx(frame.execution_context);
+    }
     eval_loop(frame)
 }
 
