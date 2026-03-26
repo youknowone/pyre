@@ -191,6 +191,7 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     );
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
+    majit_codegen_cranelift::register_materialize_virtuals(materialize_virtuals_for_bridge);
     frame.fix_array_ptrs();
 
     // RPython blackhole.py parity: during bridge tracing, concrete
@@ -1160,6 +1161,61 @@ fn rebuild_typed_from_rd_numb(
 /// field values stored as extra fail_args after null (NONE) slots.
 ///
 /// When the optimizer places a virtual in fail_args, it sets the
+/// RPython rebuild_state_after_failure parity: materialize virtual objects
+/// in raw i64 fail_args before bridge dispatch. Called from Cranelift's
+/// guard failure handler via TLS callback.
+///
+/// Virtual pattern in fail_args: null Ref slots followed by
+/// (ob_type, intval) Int pairs. Replace null Refs with boxed objects.
+fn materialize_virtuals_for_bridge(outputs: &mut [i64], types: &[majit_ir::Type]) {
+    use majit_ir::Type;
+    let w_int_type_id = pyre_object::intobject::w_int_type_id();
+
+    // Find null Ref slots (skip frame/ni/vsd at 0-2).
+    let null_slots: Vec<usize> = (3..types.len().min(outputs.len()))
+        .filter(|&i| types[i] == Type::Ref && outputs[i] == 0)
+        .collect();
+    if null_slots.is_empty() {
+        return;
+    }
+
+    let last_null = *null_slots.last().unwrap();
+    let trailing_start = last_null + 1;
+    let trailing_count = outputs.len().saturating_sub(trailing_start);
+    let needed_fields = null_slots.len() * 2;
+
+    if trailing_count >= needed_fields {
+        // Validate: first field of each pair should be W_IntObject type id.
+        let mut valid = true;
+        let mut cursor = trailing_start;
+        for _ in &null_slots {
+            if cursor + 1 >= outputs.len() {
+                valid = false;
+                break;
+            }
+            if cursor < types.len() && types[cursor] == Type::Int {
+                if outputs[cursor] as usize != w_int_type_id {
+                    valid = false;
+                    break;
+                }
+            } else {
+                valid = false;
+                break;
+            }
+            cursor += 2;
+        }
+        if valid {
+            let mut field_cursor = trailing_start;
+            for &slot_idx in &null_slots {
+                let intval = outputs[field_cursor + 1];
+                let obj = pyre_object::intobject::jit_w_int_new(intval);
+                outputs[slot_idx] = obj as i64;
+                field_cursor += 2;
+            }
+        }
+    }
+}
+
 /// virtual's slot to NONE and appends field values (ob_type, intval).
 /// On guard failure, we detect contiguous null Ref slots at the end
 /// of the locals/stack region and pair them with trailing Int fields.
