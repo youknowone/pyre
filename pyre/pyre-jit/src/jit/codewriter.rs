@@ -413,6 +413,96 @@ impl CodeWriter {
                 // the following PopJumpIfFalse guards on it.
                 Instruction::ToBool => {}
 
+                // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
+                Instruction::UnaryNegative => {
+                    assembler.pop_r(obj_tmp0);
+                    assembler.load_const_i_value(int_tmp0, 0);
+                    assembler.call_may_force_ref_typed(
+                        box_int_fn_idx,
+                        &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
+                        obj_tmp1,
+                    );
+                    assembler.load_const_i_value(int_tmp0, 11); // NB_SUBTRACT
+                    assembler.call_may_force_ref_typed(
+                        binary_op_fn_idx,
+                        &[
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
+                        ],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
+                }
+
+                // RPython: same as JumpBackward (no interrupt check in JIT)
+                Instruction::JumpBackwardNoInterrupt { delta } => {
+                    let target_py_pc =
+                        skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
+                    if target_py_pc < num_instrs {
+                        assembler.jump(labels[target_py_pc]);
+                    }
+                }
+
+                // Exception handling: residual calls to frame helpers.
+                // RPython blackhole.py handles exceptions via dedicated
+                // bhimpl_* functions. In pyre, we delegate to the frame's
+                // exception machinery via call_fn.
+                Instruction::RaiseVarargs { argc } => {
+                    let n = argc.get(op_arg) as i64;
+                    if n >= 1 {
+                        assembler.pop_r(obj_tmp0); // exception value
+                    }
+                    // Signal abort — exception raised, blackhole will
+                    // catch via LeaveFrame and check exception state.
+                    assembler.abort();
+                }
+
+                Instruction::PushExcInfo => {
+                    // TOS is the exception. Push exc_info (type, value, tb).
+                    // For blackhole: peek TOS, push (type, value) pair.
+                    // Simplified: duplicate TOS (exception value stays).
+                    assembler.dup_stack();
+                }
+
+                Instruction::CheckExcMatch => {
+                    // TOS = exception type to match, TOS1 = raised exception.
+                    // Pop type, compare, push boolean result.
+                    assembler.pop_r(obj_tmp1); // match type
+                    assembler.pop_r(obj_tmp0); // exception
+                    // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
+                    assembler.load_const_i_value(int_tmp0, 10); // isinstance op
+                    assembler.call_may_force_ref_typed(
+                        compare_fn_idx,
+                        &[
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
+                        ],
+                        obj_tmp0,
+                    );
+                    assembler.push_r(obj_tmp0);
+                }
+
+                Instruction::PopExcept => {
+                    // Clear current exception — no-op in blackhole
+                    // (exception state is in TLS, cleared by interpreter).
+                }
+
+                Instruction::Reraise { .. } => {
+                    // Re-raise current exception.
+                    assembler.abort();
+                }
+
+                Instruction::Copy { i } => {
+                    let d = i.get(op_arg) as usize;
+                    if d == 1 {
+                        assembler.dup_stack();
+                    } else {
+                        assembler.abort();
+                    }
+                }
+
                 // Unsupported: abort to interpreter fallback.
                 _ => {
                     assembler.abort();
