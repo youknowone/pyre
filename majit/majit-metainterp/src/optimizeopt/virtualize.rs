@@ -866,6 +866,10 @@ impl OptVirtualize {
         // RPython: virtual value is NOT forced in optimize_SETFIELD_GC.
         // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
         // In majit, this is handled by emit_with_guard_check or force_all_lazy.
+        // virtualize.py:204: self.make_nonnull(op.getarg(0))
+        if ctx.get_ptr_info(struct_ref).is_none() {
+            ctx.set_ptr_info(struct_ref, PtrInfo::NonNull);
+        }
         OptimizationResult::PassOn
     }
 
@@ -912,6 +916,11 @@ impl OptVirtualize {
             if let PtrInfo::Virtualizable(_) = &info {
                 return self.handle_virtualizable_first_read(op, field_idx, ctx);
             }
+        }
+        // virtualize.py:192: self.make_nonnull(op.getarg(0))
+        // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
+        if ctx.get_ptr_info(struct_ref).is_none() {
+            ctx.set_ptr_info(struct_ref, PtrInfo::NonNull);
         }
         OptimizationResult::PassOn
     }
@@ -1417,24 +1426,10 @@ impl OptVirtualize {
         }
     }
 
-    fn optimize_guard_nonnull(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let obj_ref = ctx.get_replacement(op.arg(0));
-
-        if let Some(info) = ctx.get_ptr_info(obj_ref) {
-            if info.is_nonnull() {
-                return OptimizationResult::Remove;
-            }
-        }
-
-        // Constant-fold: non-zero constant is always nonnull.
-        if let Some(value) = ctx.get_constant_int(obj_ref) {
-            if value != 0 {
-                return OptimizationResult::Remove;
-            }
-        }
-
-        ctx.set_ptr_info(obj_ref, PtrInfo::NonNull);
-        self.force_guard_fail_args(op, ctx)
+    fn optimize_guard_nonnull(&mut self, _op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
+        // RPython virtualize.py does NOT handle GUARD_NONNULL.
+        // It is handled exclusively by rewrite.py:optimize_GUARD_NONNULL.
+        OptimizationResult::PassOn
     }
 
     fn optimize_guard_nonnull_class(

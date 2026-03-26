@@ -1731,14 +1731,22 @@ impl Optimization for OptRewrite {
             // If the guarded condition is already known to be true (constant),
             // the guard can be removed entirely.
             OpCode::GuardNonnull => {
-                // GUARD_NONNULL(x): if x is a known non-null constant, remove.
-                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
+                // rewrite.py:269-278 optimize_GUARD_NONNULL
+                let obj = ctx.get_replacement(op.arg(0));
+                if let Some(info) = ctx.get_ptr_info(obj) {
+                    if info.is_nonnull() {
+                        return OptimizationResult::Remove;
+                    }
+                }
+                // Constant-fold: non-zero constant is always nonnull.
+                if let Some(v) = ctx.get_constant_int(obj) {
                     if v != 0 {
                         return OptimizationResult::Remove;
                     }
                 }
-                // rewrite.py postprocess_GUARD_NONNULL: make_nonnull(arg(0))
-                let obj = ctx.get_replacement(op.arg(0));
+                // rewrite.py:280-282 postprocess_GUARD_NONNULL:
+                // make_nonnull(arg(0)) — only set if no existing PtrInfo.
+                // optimizer.py:437-448
                 if ctx.get_ptr_info(obj).is_none() {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::NonNull);
                 }

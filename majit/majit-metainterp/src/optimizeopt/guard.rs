@@ -408,16 +408,8 @@ impl GuardStrengthenOpt {
                 false
             }
             OpCode::GuardNonnull => {
-                if self.truthy_values.contains(&op.arg(0)) {
-                    return true;
-                }
-                // RPython: import_state sets PtrInfo with is_nonnull for
-                // values that the preamble proved nonnull.
-                if let Some(info) = ctx.get_ptr_info(op.arg(0)) {
-                    if info.is_nonnull() {
-                        return true;
-                    }
-                }
+                // RPython guard.py does NOT handle GUARD_NONNULL.
+                // It is handled exclusively by rewrite.py:optimize_GUARD_NONNULL.
                 false
             }
             // rewrite.py: optimize_GUARD_CLASS — if the class is already
