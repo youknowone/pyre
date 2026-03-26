@@ -58,11 +58,9 @@ pub fn install_builtin_modules() {
     register_builtin_module("_operator", crate::module::operator::moduledef::init);
     register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
     register_builtin_module("_io", crate::module::io_mod::moduledef::init);
-    register_builtin_module("io", crate::module::io_mod::moduledef::init_io);
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
-    register_builtin_module("_collections_abc", init_collections_abc);
     register_builtin_module("_weakref", init_weakref);
     register_builtin_module("_abc", init_abc);
     register_builtin_module("_functools", init_functools);

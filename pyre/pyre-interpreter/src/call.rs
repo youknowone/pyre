@@ -702,6 +702,9 @@ fn pack_varargs(code: &pyre_bytecode::CodeObject, args: Vec<PyObjectRef>) -> Vec
 /// PyPy equivalent: pyopcode.py BUILD_CLASS →
 ///   w_methodsdict = call(body_fn)
 ///   w_newclass = call(metaclass, name, bases, methodsdict)
+/// `__build_class__(func, name, *bases, metaclass=None, **kwds)`
+///
+/// PyPy: pyopcode.py BUILD_CLASS → build_class()
 pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
@@ -710,15 +713,38 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     }
     let body_fn = args[0];
     let name_obj = args[1];
-    let bases = &args[2..];
+
+    // Check if last arg is a kwargs dict (from CALL_KW)
+    let (base_args, metaclass) = if args.len() > 2 {
+        let last = args[args.len() - 1];
+        if unsafe { pyre_object::is_dict(last) }
+            && unsafe {
+                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+            }
+        {
+            // Extract metaclass from kwargs
+            let mc =
+                unsafe { pyre_object::w_dict_lookup(last, pyre_object::w_str_new("metaclass")) };
+            (&args[2..args.len() - 1], mc)
+        } else {
+            (&args[2..], None)
+        }
+    } else {
+        (&args[2..], None)
+    };
 
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
-    let bases_tuple = pyre_object::w_tuple_new(bases.to_vec());
+    let bases_tuple = pyre_object::w_tuple_new(base_args.to_vec());
 
-    build_class_inner(body_fn, name, bases_tuple)
+    build_class_inner(body_fn, name, bases_tuple, metaclass)
 }
 
-fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> PyResult {
+fn build_class_inner(
+    body_fn: PyObjectRef,
+    name: &str,
+    bases: PyObjectRef,
+    metaclass: Option<PyObjectRef>,
+) -> PyResult {
     let code_ptr = unsafe { w_func_get_code_ptr(body_fn) };
     let globals = unsafe { w_func_get_globals(body_fn) };
     let closure = unsafe { w_func_get_closure(body_fn) };
@@ -778,7 +804,41 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
     } else {
         bases
     };
-    let w_type = pyre_object::w_type_new(name, effective_bases, class_ns_ptr as *mut u8);
+    // Create class via metaclass or default type()
+    // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
+    let w_type = if let Some(mc) = metaclass {
+        // Convert class namespace to a dict for metaclass call
+        let ns_dict = pyre_object::w_dict_new();
+        let ns = unsafe { &*class_ns_ptr };
+        for (k, &v) in ns.entries() {
+            if !v.is_null() {
+                unsafe { pyre_object::w_dict_store(ns_dict, pyre_object::w_str_new(k), v) };
+            }
+        }
+        // Call metaclass(name, bases, namespace)
+        let name_obj = pyre_object::w_str_new(name);
+        let result = crate::space_call_function(mc, &[name_obj, effective_bases, ns_dict]);
+        // If metaclass returned a W_TypeObject, set up MRO and store metaclass ref.
+        if unsafe { pyre_object::is_type(result) } {
+            let mro = unsafe { crate::space::compute_mro_pub(result) };
+            unsafe { pyre_object::w_type_set_mro(result, mro) };
+            // Store metaclass reference in ATTR_TABLE (not class dict)
+            // for metatype attribute lookup
+            crate::space::ATTR_TABLE.with(|table| {
+                table
+                    .borrow_mut()
+                    .entry(result as usize)
+                    .or_default()
+                    .insert("__metaclass__".to_string(), mc);
+            });
+        }
+        result
+    } else {
+        let w = pyre_object::w_type_new(name, effective_bases, class_ns_ptr as *mut u8);
+        let mro = unsafe { crate::space::compute_mro_pub(w) };
+        unsafe { pyre_object::w_type_set_mro(w, mro) };
+        w
+    };
 
     // CPython: if __classcell__ is in the namespace, set the cell's content
     // to the newly created class. This enables `__class__` references in methods.
@@ -788,9 +848,6 @@ fn build_class_inner(body_fn: PyObjectRef, name: &str, bases: PyObjectRef) -> Py
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
     }
-    // Cache C3 MRO (PyPy: W_TypeObject.mro_w set during ready())
-    let mro = unsafe { crate::space::compute_mro_pub(w_type) };
-    unsafe { pyre_object::w_type_set_mro(w_type, mro) };
 
     // Call __init_subclass__ on each base class
     // PyPy: typeobject.py type.__init__ → call __init_subclass__
