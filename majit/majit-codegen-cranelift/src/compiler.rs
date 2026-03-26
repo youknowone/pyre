@@ -8343,24 +8343,21 @@ impl majit_codegen::Backend for CraneliftBackend {
             &original_compiled.fail_descrs,
             source_trace_id,
             fail_descr.fail_index(),
-        )
-        .ok_or_else(|| {
-            BackendError::CompilationFailed(format!(
+        );
+        // Entry bridge (fail_index=0): no source guard — graceful skip.
+        if source_descr.is_none() && fail_descr.fail_index() != 0 {
+            return Err(BackendError::CompilationFailed(format!(
                 "source fail descr not found for trace {} fail {}",
                 source_trace_id,
                 fail_descr.fail_index()
-            ))
-        })?;
-        let caller_layout =
-            source_descr
-                .recovery_layout
-                .lock()
-                .unwrap()
-                .clone()
-                .map(|mut layout| {
-                    layout.frames.pop();
-                    layout
-                });
+            )));
+        }
+        let caller_layout = source_descr.as_ref().and_then(|d| {
+            d.recovery_layout.lock().unwrap().clone().map(|mut layout| {
+                layout.frames.pop();
+                layout
+            })
+        });
         let compiled = self.do_compile(
             inputargs,
             ops,
@@ -8397,46 +8394,45 @@ impl majit_codegen::Backend for CraneliftBackend {
             }
         }
         {
-            let existing_bridge = source_descr.bridge.lock().unwrap();
-            if let Some(ref bridge) = *existing_bridge {
-                unregister_bridge_call_assembler_expectations(bridge);
+            if let Some(ref sd) = source_descr {
+                let existing_bridge = sd.bridge.lock().unwrap();
+                if let Some(ref bridge) = *existing_bridge {
+                    unregister_bridge_call_assembler_expectations(bridge);
+                }
             }
         }
-        // RPython parity: bridge num_inputs = parent guard's fail_arg count.
-        // start_retrace_from_guard registers all fail_args as inputargs,
-        // so compiled.num_inputs already equals fail_arg_types.len().
-        let bridge_num_inputs = compiled.num_inputs;
-        source_descr.attach_bridge(BridgeData {
-            trace_id: compiled.trace_id,
-            input_types: compiled.input_types.clone(),
-            header_pc: compiled.header_pc,
-            source_guard: (source_trace_id, fail_descr.fail_index()),
-            caller_prefix_layout: compiled.caller_prefix_layout.clone(),
-            code_ptr: compiled.code_ptr,
-            fail_descrs: compiled.fail_descrs,
-            terminal_exit_layouts: compiled.terminal_exit_layouts,
-            gc_runtime_id: compiled.gc_runtime_id,
-            // RPython parity: bridge ending with JUMP to loop body needs
-            // re-entry dispatch instead of returning to interpreter.
-            loop_reentry: {
-                let has_label: HashSet<u32> = ops
-                    .iter()
-                    .filter(|o| o.opcode == OpCode::Label)
-                    .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
-                    .collect();
-                ops.last().map_or(false, |op| {
-                    op.opcode == OpCode::Jump
-                        && op
-                            .descr
-                            .as_ref()
-                            .map_or(false, |d| !has_label.contains(&d.index()))
-                })
-            },
-            num_inputs: bridge_num_inputs,
-            num_ref_roots: compiled.num_ref_roots,
-            max_output_slots: compiled.max_output_slots,
-            needs_force_frame: compiled.needs_force_frame,
-        });
+        if let Some(ref sd) = source_descr {
+            let bridge_num_inputs = compiled.num_inputs;
+            sd.attach_bridge(BridgeData {
+                trace_id: compiled.trace_id,
+                input_types: compiled.input_types.clone(),
+                header_pc: compiled.header_pc,
+                source_guard: (source_trace_id, fail_descr.fail_index()),
+                caller_prefix_layout: compiled.caller_prefix_layout.clone(),
+                code_ptr: compiled.code_ptr,
+                fail_descrs: compiled.fail_descrs,
+                terminal_exit_layouts: compiled.terminal_exit_layouts,
+                gc_runtime_id: compiled.gc_runtime_id,
+                loop_reentry: {
+                    let has_label: HashSet<u32> = ops
+                        .iter()
+                        .filter(|o| o.opcode == OpCode::Label)
+                        .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
+                        .collect();
+                    ops.last().map_or(false, |op| {
+                        op.opcode == OpCode::Jump
+                            && op
+                                .descr
+                                .as_ref()
+                                .map_or(false, |d| !has_label.contains(&d.index()))
+                    })
+                },
+                num_inputs: bridge_num_inputs,
+                num_ref_roots: compiled.num_ref_roots,
+                max_output_slots: compiled.max_output_slots,
+                needs_force_frame: compiled.needs_force_frame,
+            });
+        }
 
         Ok(info)
     }
