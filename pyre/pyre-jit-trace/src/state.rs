@@ -4774,70 +4774,49 @@ impl MIFrame {
             s.pre_opcode_stack = None;
             s.pre_opcode_stack_types = None;
         }
+        // RPython execute_ll_raised parity: store exception in
+        // last_exc_value before calling handle_possible_exception.
+        if let Err(ref err) = step_result {
+            let exc_obj = err.to_exc_object();
+            let s = self.sym_mut();
+            if s.last_exc_value.is_null() {
+                s.last_exc_value = exc_obj;
+            }
+        }
+        // RPython pyjitpl.py:1956-1957 execute_varargs: exc=True ops
+        // always call handle_possible_exception, which internally decides
+        // GUARD_EXCEPTION vs GUARD_NO_EXCEPTION.
+        if instruction_may_raise(instruction) {
+            let action = self.handle_possible_exception(code, pc);
+            if !matches!(action, TraceAction::Continue) {
+                return action;
+            }
+        }
         match step_result {
-            Err(err) => {
-                let cf = self.concrete_frame_addr;
-                self.handle_possible_exception(code, pc, err, cf)
-            }
-            other => {
-                // RPython pyjitpl.py:1956-1957: exc=True ops that didn't
-                // raise get GUARD_NO_EXCEPTION. OptPure/OptRewrite remove
-                // these when the preceding CALL_PURE was constant-folded.
-                if instruction_may_raise(instruction) {
-                    self.with_ctx(|this, ctx| {
-                        this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
-                    });
-                }
-                self.into_trace_action(other)
-            }
+            Err(_) => TraceAction::Abort,
+            other => self.into_trace_action(other),
         }
     }
 
-    /// RPython pyjitpl.py:3380 handle_possible_exception +
-    /// pyjitpl.py:2506 finishframe_exception.
+    /// RPython pyjitpl.py:3380 handle_possible_exception.
     ///
-    /// When an opcode raises during tracing and there is a handler in the
-    /// exception table, emit GUARD_EXCEPTION and continue tracing through
-    /// the handler (PUSH_EXC_INFO → CHECK_EXC_MATCH → handler body →
-    /// POP_EXCEPT → back to loop). When there is no handler, abort.
+    /// Called after every may-raise opcode. Checks last_exc_value to decide:
+    /// - exception raised → GUARD_EXCEPTION + finishframe_exception
+    /// - no exception → GUARD_NO_EXCEPTION
     pub(crate) fn handle_possible_exception(
         &mut self,
         code: &CodeObject,
         pc: usize,
-        err: PyError,
-        concrete_frame_addr: usize,
     ) -> TraceAction {
-        if let Some(entry) =
-            pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
-        {
-            let handler_pc = entry.target as usize;
-            let handler_depth = entry.depth as usize;
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][handle_possible_exception] pc={} handler={} depth={} err={}",
-                    pc, handler_pc, handler_depth, err
-                );
-            }
-
-            // RPython pyjitpl.py:3383: GUARD_EXCEPTION(exception_class).
-            // Use the concrete exception stored by execute_ll_raised
-            // (raise_varargs); fall back to err.to_exc_object() for
-            // non-raise exceptions (e.g. CALL failures).
-            let exc_obj = {
-                let stored = self.sym().last_exc_value;
-                if !stored.is_null() {
-                    stored
-                } else {
-                    err.to_exc_object()
-                }
-            };
+        if !self.sym().last_exc_value.is_null() {
+            // pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
+            let exc_obj = self.sym().last_exc_value;
             let exc_type_ptr = unsafe {
                 (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
                     .ob_header
                     .ob_type as i64
             };
 
-            // Emit GUARD_EXCEPTION — returns the exception value OpRef.
             let guard_op = self.with_ctx(|this, ctx| {
                 this.flush_to_frame_for_guard(ctx);
                 let fail_arg_types = this.build_single_frame_fail_arg_types();
@@ -4851,33 +4830,64 @@ impl MIFrame {
                 )
             });
 
-            // pyjitpl.py:3386-3389: if the exception class is already known
-            // constant (from a prior GUARD_CLASS/GUARD_EXCEPTION), represent
-            // the exception value as a constant; otherwise use the guard op.
-            let exc_opref = if self.sym().class_of_last_exc_is_const {
+            // pyjitpl.py:3386-3389: last_exc_box = ConstPtr if class known,
+            // else guard op result.
+            let _exc_opref = if self.sym().class_of_last_exc_is_const {
                 self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64))
             } else {
                 guard_op
             };
 
-            // RPython pyjitpl.py:3390: class_of_last_exc_is_const = True
+            // pyjitpl.py:3390
             self.sym_mut().class_of_last_exc_is_const = true;
 
-            // pyjitpl.py:2506 finishframe_exception: unwind symbolic + concrete
-            // stack to handler depth, push exception, continue at handler_pc.
-            //
-            // This is the RPython-parity implementation. It requires bridge
-            // compilation (Phase 3) to work efficiently: without bridges,
-            // the non-exception path hits GUARD_EXCEPTION every iteration
-            // and falls back to the interpreter. Gated behind MAJIT_EXC_TRACE
-            // until bridge compilation is ready.
+            self.finishframe_exception(code, pc, _exc_opref)
+        } else {
+            // pyjitpl.py:3397: GUARD_NO_EXCEPTION
+            self.with_ctx(|this, ctx| {
+                this.record_guard(ctx, majit_ir::OpCode::GuardNoException, &[]);
+            });
+            TraceAction::Continue
+        }
+    }
+
+    /// RPython pyjitpl.py:2506 finishframe_exception.
+    ///
+    /// Walks the frame stack looking for an exception handler.
+    /// If found: unwind stack to handler depth, push exception, continue.
+    /// If not found: abort (TODO: compile_exit_frame_with_exception).
+    fn finishframe_exception(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        exc_opref: OpRef,
+    ) -> TraceAction {
+        let exc_obj = self.sym().last_exc_value;
+        let concrete_frame_addr = self.concrete_frame_addr;
+
+        // pyjitpl.py:2510-2520: scan for catch_exception handler
+        // (Python 3.11+ exception table replaces RPython's op_catch_exception)
+        if let Some(entry) =
+            pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+        {
+            let handler_pc = entry.target as usize;
+            let handler_depth = entry.depth as usize;
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][finishframe_exception] pc={} handler={} depth={}",
+                    pc, handler_pc, handler_depth
+                );
+            }
+
+            // Gated behind MAJIT_EXC_TRACE until bridge compilation (Phase 3)
+            // is ready. Without bridges, the non-exception path hits
+            // GUARD_EXCEPTION every iteration and falls back to interpreter.
             if std::env::var("MAJIT_EXC_TRACE").is_ok() {
                 let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
                 let nlocals = self.sym().nlocals;
 
-                // Symbolic stack is stack-only (nlocals offset removed).
-                // handler_depth counts from (nlocals + ncells) base, so
-                // ncells + handler_depth is the target symbolic_stack length.
+                // Unwind symbolic stack to handler depth.
+                // handler_depth counts from (nlocals + ncells) base.
                 let target_stack_len = ncells + handler_depth;
                 {
                     let s = self.sym_mut();
@@ -4910,29 +4920,16 @@ impl MIFrame {
                 }
                 frame.push(exc_obj);
 
+                // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame
                 self.sym_mut().pending_next_instr = Some(handler_pc);
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit][handle_possible_exception] continue at handler_pc={}",
-                        handler_pc
-                    );
-                }
                 return TraceAction::Continue;
             }
             TraceAction::Abort
         } else {
-            // TODO(exception-exit): RPython finishframe_exception (pyjitpl.py:
-            // 2532-2538) pops all frames, then calls
-            // compile_exit_frame_with_exception(last_exc_box) to record a
-            // FINISH op with the exception value. This compiles the trace
-            // as a normal exit-with-exception path. pyre aborts instead,
-            // losing the optimization opportunity for traces that always
-            // exit via an uncaught exception.
+            // TODO(exception-exit): pyjitpl.py:2532-2538
+            // compile_exit_frame_with_exception(last_exc_box) → FINISH op.
             if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][handle_possible_exception] no handler pc={} err={}",
-                    pc, err
-                );
+                eprintln!("[jit][finishframe_exception] no handler pc={}", pc);
             }
             TraceAction::Abort
         }
@@ -4974,15 +4971,26 @@ impl MIFrame {
 
         self.prepare_fallthrough();
         let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        // RPython execute_ll_raised parity: store exception in last_exc_value.
+        if let Err(ref err) = step_result {
+            let exc_obj = err.to_exc_object();
+            let s = self.sym_mut();
+            if s.last_exc_value.is_null() {
+                s.last_exc_value = exc_obj;
+            }
+        }
+        if instruction_may_raise(instruction) {
+            let exc_action = self.handle_possible_exception(code, pc);
+            if !matches!(exc_action, TraceAction::Continue) {
+                return InlineTraceStepAction::Trace(exc_action);
+            }
+        }
         let action = match step_result {
             Ok(pyre_interpreter::StepResult::Return(value)) => TraceAction::Finish {
                 finish_args: vec![value.opref],
                 finish_arg_types: vec![self.value_type(value.opref)],
             },
-            Err(err) => {
-                let cf = self.concrete_frame_addr;
-                self.handle_possible_exception(code, pc, err, cf)
-            }
+            Err(_) => TraceAction::Abort,
             other => self.into_trace_action(other),
         };
         match action {
