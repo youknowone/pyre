@@ -879,6 +879,28 @@ fn restore_guard_failure_for_loop(
         driver.meta_interp_mut().warm_state_mut().decay_counters();
         return None;
     }
+    // compile.py:738 must_compile / counter.py tick parity:
+    // O(1) guard failure counter via JitCounter timetable.
+    // trace_eagerness=200: after 200 failures of the same guard,
+    // tick returns true → bridge compilation should start.
+    // Currently: log-only. Bridge compilation will use this signal.
+    {
+        let guard_hash = (exit_layout.trace_id as u64)
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(exit_layout.fail_index as u64);
+        let (driver, _) = driver_pair();
+        let should_bridge = driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .tick_guard_failure(guard_hash);
+        if should_bridge && majit_meta::majit_log_enabled() {
+            eprintln!(
+                "[jit] guard-fail: trace_eagerness threshold for guard ({}, {}), bridge TODO",
+                exit_layout.trace_id, exit_layout.fail_index
+            );
+        }
+    }
+
     // RPython compile.py:710 handle_fail → resume_in_blackhole.
     // Blackhole execution disabled: root guard fail_args encode wrong-frame
     // locals (module-level locals in callee frame context). The blackhole
