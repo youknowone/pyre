@@ -2653,11 +2653,42 @@ impl Optimizer {
                                     .collect(),
                             );
                         }
-                        op.fail_args = Some(liveboxes.into());
+                        // RPython optimizer.py:748: descr.store_final_boxes(op, newboxes).
+                        // Phase 2 label args (e.g. OpRef(65)) are optimizer-internal
+                        // OpRefs created by import_state. The Cranelift backend only
+                        // knows about the original inputargs (OpRef(0..N)). Map each
+                        // livebox OpRef back to its source inputarg using the
+                        // imported_label reverse mapping.
+                        let fail_args: Vec<OpRef> =
+                            if let Some(ref labels) = self.imported_label_args {
+                                let reverse: std::collections::HashMap<u32, OpRef> = labels
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, label)| {
+                                        // Source slot = original inputarg index.
+                                        // Virtual imports have no source slot (None
+                                        // in imported_label_source_slots); these
+                                        // should not appear as TAGBOX liveboxes.
+                                        self.imported_label_source_slots
+                                            .as_ref()
+                                            .and_then(|s| s.get(i).copied())
+                                            .filter(|s| !s.is_none())
+                                            .map(|source| (label.0, source))
+                                    })
+                                    .collect();
+                                liveboxes
+                                    .iter()
+                                    .map(|lb| reverse.get(&lb.0).copied().unwrap_or(*lb))
+                                    .collect()
+                            } else {
+                                liveboxes
+                            };
+                        op.fail_args = Some(fail_args.into());
                     }
                     Err(_) => {
-                        // resume.py: TagOverflow — compile.giveup().
-                        // Fall back to existing fail_args.
+                        // resume.py: TagOverflow → compile.giveup().
+                        // RPython raises InvalidLoop to abort this trace.
+                        panic!("resume.py: TagOverflow — compile.giveup()");
                     }
                 }
             }
