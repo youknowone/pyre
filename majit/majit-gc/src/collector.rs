@@ -342,6 +342,19 @@ impl MiniMarkGC {
             }
         });
 
+        // Phase 1c: Process jitframe shadow stack roots.
+        // RPython root_walker.walk_roots with jitframe entries —
+        // reads jf_gcmap from each jitframe and traces ref slots.
+        // assembler.py:1122 (_call_header_shadowstack) pushes jf_ptr;
+        // callbuilder.py:93 (push_gcmap) writes per-call gcmap to jf_gcmap.
+        crate::shadow_stack::walk_jf_roots(|gcref| {
+            if self.is_nursery_object_start(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
+
         // Phase 2: Process remembered set and transitive closure.
         // Objects copied to old gen may reference other nursery objects,
         // so we process until all references are resolved.

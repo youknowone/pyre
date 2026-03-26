@@ -38,7 +38,8 @@ use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
 /// Byte offset of `jf_descr` from JitFrame start.
-const JF_DESCR_OFS: i32 = 8;
+const JF_DESCR_OFS: i32 = 8; // offset_of!(JitFrame, jf_descr)
+const JF_FORWARD_OFS: i32 = 48; // offset_of!(JitFrame, jf_forward)
 /// Byte offset of `jf_gcmap` from JitFrame start.
 const JF_GCMAP_OFS: i32 = 24;
 /// Byte offset of `jf_frame[0]` from JitFrame start (header + length field).
@@ -780,36 +781,6 @@ pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
             runtime.remove_root(root as *mut GcRef);
         }
     }
-}
-
-fn with_registered_gc_roots<R>(
-    runtime_id: u64,
-    roots_ptr: u64,
-    num_roots: u64,
-    f: impl FnOnce(&mut dyn GcAllocator) -> R,
-) -> R {
-    with_gc_runtime(runtime_id, |gc| {
-        let roots_ptr = roots_ptr as usize as *mut GcRef;
-        if !roots_ptr.is_null() {
-            for slot in 0..num_roots as usize {
-                unsafe {
-                    gc.add_root(roots_ptr.add(slot));
-                }
-            }
-        }
-
-        let result = f(gc);
-
-        if !roots_ptr.is_null() {
-            for slot in 0..num_roots as usize {
-                unsafe {
-                    gc.remove_root(roots_ptr.add(slot));
-                }
-            }
-        }
-
-        result
-    })
 }
 
 fn force_frame_registry() -> &'static Mutex<HashMap<u64, Arc<ActiveForceFrame>>> {
@@ -2006,20 +1977,14 @@ extern "C" fn call_assembler_guard_failure(
     if !bridge_ptr.is_null() {
         let num_inputs = fail_descr.fail_arg_types.len();
         let inputs = unsafe { std::slice::from_raw_parts(outputs_ptr, num_inputs) };
-        let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
+        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
         const HW: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
         let mut bridge_jf = [0i64; HW + FAST_PATH_MAX_OUTPUTS];
         for (i, &val) in inputs.iter().enumerate() {
             bridge_jf[HW + i] = val;
         }
-        let mut bridge_roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
-        let _result_jf = unsafe {
-            func(
-                bridge_jf.as_mut_ptr(),
-                bridge_roots.as_mut_ptr() as *mut i64,
-            )
-        };
+        let _result_jf = unsafe { func(bridge_jf.as_mut_ptr()) };
         return bridge_jf[HW];
     } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
         // RPython: bridge compilation goes through MetaInterp, not the
@@ -2208,48 +2173,32 @@ fn call_assembler_fast_path(
 
     let actual_outputs = target.max_output_slots.max(1);
     let actual_roots = target.num_ref_roots.max(1);
-    if actual_outputs > FAST_PATH_MAX_OUTPUTS || actual_roots > FAST_PATH_MAX_ROOTS {
-        // Rare: too many outputs or GC roots for the fixed stack buffers.
-        // Fall back to the heap path, which sizes both buffers from the
-        // compiled target metadata.
+    if actual_outputs + actual_roots > FAST_PATH_MAX_OUTPUTS {
         return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
     }
 
-    let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
+    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
         unsafe { std::mem::transmute(target.code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
 
     let handle = 0u64;
 
+    // jf_buf: header + output slots + ref root slots (all in one buffer).
     const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
-    let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS];
+    let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS + FAST_PATH_MAX_ROOTS];
     for (i, &val) in inputs.iter().enumerate() {
         jf_buf[HEADER_WORDS + i] = val;
     }
 
-    let mut roots = [GcRef::NULL; FAST_PATH_MAX_ROOTS];
-    let shadow_depth = if target.num_ref_roots > 0 {
-        let mut depth = 0usize;
-        for root in roots[..target.num_ref_roots].iter() {
-            depth = majit_gc::shadow_stack::push(*root);
-        }
-        Some(depth + 1 - target.num_ref_roots)
-    } else {
-        None
-    };
-
-    let result_jf = unsafe { func(jf_buf.as_mut_ptr(), roots.as_mut_ptr() as *mut i64) };
+    let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
     let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
     let outputs = {
         let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
-        out.copy_from_slice(&jf_buf[HEADER_WORDS..]);
+        out.copy_from_slice(&jf_buf[HEADER_WORDS..HEADER_WORDS + FAST_PATH_MAX_OUTPUTS]);
         out
     };
 
-    if let Some(depth) = shadow_depth {
-        majit_gc::shadow_stack::pop_to(depth);
-    }
     drop(_jitted_guard);
 
     // Handle nested call_assembler DEADFRAME propagation
@@ -2350,6 +2299,7 @@ fn call_assembler_fast_path_heap(
     outcome: *mut i64,
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
+    let actual_outputs = target.max_output_slots.max(1);
     let (fail_index, outputs, handle, _force_frame) = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
@@ -2383,8 +2333,9 @@ fn call_assembler_fast_path_heap(
             [] | [Type::Void] => 0,
             [Type::Int] | [Type::Float] => outputs[0] as u64,
             _ => {
+                let outputs_vec = outputs[..actual_outputs].to_vec();
                 let mut frame =
-                    build_deadframe_from_outputs(outputs, fail_descr, target.gc_runtime_id);
+                    build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
                 finish_result_from_deadframe(&mut frame)
                     .expect("finish_result_from_deadframe failed") as u64
             }
@@ -2550,16 +2501,10 @@ extern "C" fn call_assembler_shim(
     0
 }
 
-/// RPython parity: alloc shims do NOT register/unregister roots.
-/// Roots are persistently registered by run_compiled_code (matching
-/// RPython's _call_header_shadowstack, assembler.py:1122-1128).
-/// The GC finds roots via the persistent registration, not per-alloc.
-extern "C" fn gc_alloc_nursery_shim(
-    runtime_id: u64,
-    _roots_ptr: u64,
-    _num_roots: u64,
-    size: u64,
-) -> u64 {
+/// RPython parity: alloc shims receive (runtime_id, ...args).
+/// Roots are persistently registered by run_compiled_code via add_root
+/// on jf_frame ref slot addresses (_call_header_shadowstack parity).
+extern "C" fn gc_alloc_nursery_shim(runtime_id: u64, size: u64) -> u64 {
     with_gc_runtime(runtime_id, |gc| {
         let obj = gc.alloc_nursery(size as usize);
         obj.0 as u64
@@ -2567,25 +2512,16 @@ extern "C" fn gc_alloc_nursery_shim(
 }
 
 /// Plain malloc fallback for New() when no GC runtime is configured.
-/// Used by non-GC languages (e.g. Aheui) where preamble peeling
-/// leaves un-virtualized New() ops that still need allocation.
 extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     let layout = std::alloc::Layout::from_size_align(size as usize, 8)
         .unwrap_or(std::alloc::Layout::new::<u8>());
     unsafe { std::alloc::alloc_zeroed(layout) as u64 }
 }
 
-extern "C" fn gc_alloc_typed_nursery_shim(
-    runtime_id: u64,
-    _roots_ptr: u64,
-    _num_roots: u64,
-    type_id: u64,
-    size: u64,
-) -> u64 {
+extern "C" fn gc_alloc_typed_nursery_shim(runtime_id: u64, type_id: u64, size: u64) -> u64 {
     // RPython rewrite.py: CALL_MALLOC_NURSERY fallback path.
     // Use no-collect allocation to avoid triggering GC during compiled code
     // execution. When nursery is full, falls back to old-gen allocation.
-    // This prevents root buffer invalidation from do_collect_nursery().
     with_gc_runtime(runtime_id, |gc| {
         let obj = gc.alloc_nursery_no_collect(size as usize);
         obj.0 as u64
@@ -2594,8 +2530,6 @@ extern "C" fn gc_alloc_typed_nursery_shim(
 
 extern "C" fn gc_alloc_varsize_shim(
     runtime_id: u64,
-    _roots_ptr: u64,
-    _num_roots: u64,
     base_size: u64,
     item_size: u64,
     length: u64,
@@ -2608,34 +2542,6 @@ extern "C" fn gc_alloc_varsize_shim(
 
 extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
     with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
-}
-
-extern "C" fn gc_register_roots_shim(runtime_id: u64, roots_ptr: u64, num_roots: u64) {
-    with_gc_runtime(runtime_id, |gc| {
-        let roots_ptr = roots_ptr as usize as *mut GcRef;
-        if roots_ptr.is_null() {
-            return;
-        }
-        for slot in 0..num_roots as usize {
-            unsafe {
-                gc.add_root(roots_ptr.add(slot));
-            }
-        }
-    });
-}
-
-extern "C" fn gc_unregister_roots_shim(runtime_id: u64, roots_ptr: u64, num_roots: u64) {
-    with_gc_runtime(runtime_id, |gc| {
-        let roots_ptr = roots_ptr as usize as *mut GcRef;
-        if roots_ptr.is_null() {
-            return;
-        }
-        for slot in 0..num_roots as usize {
-            unsafe {
-                gc.remove_root(roots_ptr.add(slot));
-            }
-        }
-    });
 }
 
 thread_local! {
@@ -3400,37 +3306,47 @@ fn emit_host_call(
     return_type.map(|_| builder.inst_results(call)[0])
 }
 
+/// RPython parity: spill live GC refs to jf_frame before a call that
+/// may trigger GC. callbuilder.py push_gcmap (1 MOV) stores the gcmap;
+/// refs are already in jf_frame slots because the backend keeps them
+/// there persistently (assembler.py _push_all_regs_to_frame).
 fn spill_ref_roots(
     builder: &mut FunctionBuilder,
-    roots_ptr: CValue,
+    jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
+    ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
-        let addr = builder.ins().iadd_imm(roots_ptr, (slot * 8) as i64);
+        let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = if defined_ref_vars.contains(&var_idx) {
             builder.use_var(var(var_idx))
         } else {
             builder.ins().iconst(cl_types::I64, 0)
         };
-        builder.ins().store(MemFlags::trusted(), val, addr, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), val, jf_ptr, offset);
     }
 }
 
+/// RPython parity: reload GC refs from jf_frame after a call — the GC
+/// may have moved objects and updated the slots in-place.
 fn reload_ref_roots(
     builder: &mut FunctionBuilder,
-    roots_ptr: CValue,
+    jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
+    ref_root_base_ofs: i32,
 ) {
     for &(var_idx, slot) in ref_root_slots {
         if !defined_ref_vars.contains(&var_idx) {
             continue;
         }
-        let addr = builder.ins().iadd_imm(roots_ptr, (slot * 8) as i64);
+        let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
         builder.def_var(var(var_idx), val);
     }
 }
@@ -3445,6 +3361,59 @@ fn ptr_arg_as_i64(
     } else {
         builder.ins().uextend(cl_types::I64, ptr)
     }
+}
+
+/// Compute per-call gcmap for ref root slots.
+///
+/// RPython regalloc.py get_gcmap (1092-1108): builds a bitmap of frame
+/// slots that hold GC references at a given call site. The bitmap bit
+/// position is the frame slot index (relative to jf_frame[0]).
+///
+/// The ref root slots are placed at frame positions
+/// `max_output_slots + 0, max_output_slots + 1, ...`.
+/// Returns a leaked `[length, data]` gcmap array pointer, or null if
+/// no ref roots exist.
+fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 {
+    if num_ref_roots == 0 {
+        return 0; // NULLGCMAP
+    }
+    let mut bitmap: usize = 0;
+    for slot in 0..num_ref_roots {
+        let bit_pos = max_output_slots + slot;
+        assert!(bit_pos < 64, "per-call gcmap exceeds single word");
+        bitmap |= 1usize << bit_pos;
+    }
+    let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
+    gcmap_arr.as_ptr() as i64
+}
+
+/// RPython push_gcmap (assembler.py:2017-2022, callbuilder.py:93-107):
+///   MOV [ebp + jf_gcmap_ofs], gcmap_ptr
+///
+/// Writes the per-call gcmap to jf_gcmap before a GC-triggering call.
+/// This tells the GC which jf_frame slots contain live refs.
+fn emit_push_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, per_call_gcmap: i64) {
+    if per_call_gcmap == 0 {
+        return;
+    }
+    let gcmap_val = builder.ins().iconst(cl_types::I64, per_call_gcmap);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+}
+
+/// RPython pop_gcmap (assembler.py:2024-2027):
+///   MOV [ebp + jf_gcmap_ofs], 0
+///
+/// Clears jf_gcmap after the call returns.
+fn emit_pop_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, per_call_gcmap: i64) {
+    if per_call_gcmap == 0 {
+        return;
+    }
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), zero, jf_ptr, JF_GCMAP_OFS);
 }
 
 fn output_transfers_current_force_token(
@@ -3489,77 +3458,52 @@ extern "C" fn copy_nonoverlapping_memory_shim(src: u64, dst: u64, size: u64) {
     }
 }
 
+/// RPython parity: emit a GC-collecting call with ref root spill/reload
+/// and push_gcmap/pop_gcmap (callbuilder.py:93-122).
+///
+/// Sequence:
+///   1. spill_ref_roots — save live refs to jf_frame
+///   2. push_gcmap — MOV [ebp+jf_gcmap], gcmap_ptr
+///   3. CALL (may trigger GC → GC reads jf_gcmap to find refs)
+///   4. pop_gcmap — MOV [ebp+jf_gcmap], 0
+///   5. reload_ref_roots — restore refs (GC may have updated them)
 fn emit_collecting_gc_call(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
-    roots_ptr: CValue,
+    jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
+    ref_root_base_ofs: i32,
+    per_call_gcmap: i64,
     runtime_id: CValue,
     func_ptr: usize,
     extra_args: &[CValue],
     return_type: Option<cranelift_codegen::ir::Type>,
 ) -> Option<CValue> {
-    spill_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
-
-    let mut args = Vec::with_capacity(extra_args.len() + 3);
-    args.push(runtime_id);
-    args.push(ptr_arg_as_i64(builder, roots_ptr, ptr_type));
-    args.push(
-        builder
-            .ins()
-            .iconst(cl_types::I64, ref_root_slots.len() as i64),
+    spill_ref_roots(
+        builder,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        ref_root_base_ofs,
     );
+    emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
+
+    let mut args = Vec::with_capacity(extra_args.len() + 1);
+    args.push(runtime_id);
     args.extend_from_slice(extra_args);
 
     let result = emit_host_call(builder, ptr_type, call_conv, func_ptr, &args, return_type);
-    reload_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
-    result
-}
-
-/// Emit an indirect call through a function pointer.
-///
-/// `op.args[0]` is the function address (as an integer/pointer).
-/// `op.args[1..]` are the call arguments.
-/// `call_descr` provides `arg_types()` and `result_type()`.
-///
-/// Float arguments are bitcast from I64 before the call, and float
-/// results are bitcast back to I64 for variable storage.
-fn emit_gc_root_registration(
-    builder: &mut FunctionBuilder,
-    ptr_type: cranelift_codegen::ir::Type,
-    call_conv: cranelift_codegen::isa::CallConv,
-    runtime_id: Option<u64>,
-    roots_ptr: CValue,
-    ref_root_slots: &[(u32, usize)],
-    register: bool,
-) {
-    let Some(runtime_id) = runtime_id else {
-        return;
-    };
-    if ref_root_slots.is_empty() {
-        return;
-    }
-
-    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-    let roots_ptr = ptr_arg_as_i64(builder, roots_ptr, ptr_type);
-    let num_roots = builder
-        .ins()
-        .iconst(cl_types::I64, ref_root_slots.len() as i64);
-    let func_ptr = if register {
-        gc_register_roots_shim as *const () as usize
-    } else {
-        gc_unregister_roots_shim as *const () as usize
-    };
-    let _ = emit_host_call(
+    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+    reload_ref_roots(
         builder,
-        ptr_type,
-        call_conv,
-        func_ptr,
-        &[runtime_id, roots_ptr, num_roots],
-        None,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        ref_root_base_ofs,
     );
+    result
 }
 
 fn emit_indirect_call_from_parts(
@@ -3571,9 +3515,11 @@ fn emit_indirect_call_from_parts(
     call_conv: cranelift_codegen::isa::CallConv,
     ptr_type: cranelift_codegen::ir::Type,
     gc_runtime_id: Option<u64>,
-    roots_ptr: CValue,
+    jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
+    ref_root_base_ofs: i32,
+    per_call_gcmap: i64,
 ) -> Option<CValue> {
     let mut sig = Signature::new(call_conv);
     let arg_types = call_descr.arg_types();
@@ -3615,14 +3561,29 @@ fn emit_indirect_call_from_parts(
         );
     }
 
-    // RPython parity: roots are persistently registered by
-    // run_compiled_code (_call_header_shadowstack, assembler.py:1122).
-    // Per-call, only spill/reload to keep roots array up-to-date.
-    // RPython's push_gcmap (callbuilder.py:39) is 1 MOV instruction;
-    // pop_gcmap (callbuilder.py:42) is 1 MOV. No function calls.
-    spill_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
+    // RPython callbuilder.py:93-122 parity:
+    //   1. spill refs to jf_frame
+    //   2. push_gcmap — MOV [ebp+jf_gcmap], gcmap_ptr
+    //   3. CALL
+    //   4. pop_gcmap — MOV [ebp+jf_gcmap], 0
+    //   5. reload refs from jf_frame
+    spill_ref_roots(
+        builder,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        ref_root_base_ofs,
+    );
+    emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
-    reload_ref_roots(builder, roots_ptr, ref_root_slots, defined_ref_vars);
+    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+    reload_ref_roots(
+        builder,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        ref_root_base_ofs,
+    );
 
     if result_type != Type::Void {
         let result = builder.inst_results(call)[0];
@@ -3669,17 +3630,17 @@ fn emit_guard_exit(
     //   POP [ebp + jf_gcmap]   — #2104
     //   POP [ebp + jf_descr]   — #2105
     // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
-    let gcmap_ptr = if info.gcmap != 0 {
+    // Skip gcmap store when null (no ref fail_args) — saves 1 iconst + 1 store.
+    if info.gcmap != 0 {
         // allocate_gcmap (gcmap.py:7-18): Array(Unsigned) [length, data...].
         let gcmap_arr = Box::leak(Box::new([1isize, info.gcmap as isize]));
-        gcmap_arr.as_ptr() as i64
-    } else {
-        0 // NULLGCMAP
-    };
-    let gcmap_val = builder.ins().iconst(cl_types::I64, gcmap_ptr);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
+        let gcmap_val = builder
+            .ins()
+            .iconst(cl_types::I64, gcmap_arr.as_ptr() as i64);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
+    }
     let idx_val = builder.ins().iconst(cl_types::I64, info.fail_index as i64);
     builder
         .ins()
@@ -3814,18 +3775,26 @@ fn run_compiled_code(
     inputs: &[i64],
     needs_force_frame: bool,
 ) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
-    // jf_ptr-based calling: JF header (64B) + items.
+    // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
+    // jitframe.py:48-52: jitframe_allocate(frame_info)
+    //
+    // RPython allocates jitframes from nursery. pyre uses Rust-managed Vec
+    // because compiled code uses no_collect alloc (gc_alloc_nursery_no_collect)
+    // which prevents GC movement during execution. The shadow stack + jf_gcmap
+    // mechanism traces ref slots identically to RPython's root_walker +
+    // jitframe_trace (jitframe.py:104-136).
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
-    let mut jf_buf = vec![0i64; header_words + depth];
-    // Write inputs to jf_frame[0..n] (after header).
+    let jf_total = header_words + depth + num_ref_roots;
+    let mut jf_buf = vec![0i64; jf_total];
+
+    // llmodel.py:306-315: set arguments in frame
     for (i, &val) in inputs.iter().enumerate() {
         jf_buf[header_words + i] = val;
     }
-    let mut roots = vec![GcRef::NULL; num_ref_roots];
-    // llmodel.py:323 parity: ll_frame = func(ll_frame, ll_threadlocal_addr)
-    let func: unsafe extern "C" fn(*mut i64, *mut i64) -> *mut i64 =
-        unsafe { std::mem::transmute(code_ptr) };
+
+    // llmodel.py:323 parity: ll_frame = func(ll_frame)
+    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
 
@@ -3836,35 +3805,23 @@ fn run_compiled_code(
         (0, None)
     };
 
-    if let Some(rid) = gc_runtime_id {
-        if num_ref_roots > 0 {
-            register_gc_roots(rid, &mut roots);
-        }
-    }
+    // _call_header_shadowstack (assembler.py:1122-1128) parity:
+    // Push jf_ptr onto the jitframe shadow stack. The GC walks this
+    // stack during collection and traces ref slots via jf_gcmap
+    // (written by push_gcmap in compiled code before GC calls).
+    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_buf.as_mut_ptr() as *mut u8);
 
-    let result_jf = with_active_force_frame(handle, || unsafe {
-        func(jf_buf.as_mut_ptr(), roots.as_mut_ptr() as *mut i64)
-    });
+    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_buf.as_mut_ptr()) });
+
+    // _call_footer_shadowstack (assembler.py:1130-1136) parity:
+    // Pop jf_ptr from shadow stack.
+    majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
+
     // llmodel.py:328 parity: return ll_frame — read from returned jitframe.
-    // RPython follows jf_forward if GC moved the frame; we read from
-    // result_jf directly (same as jf_buf when no GC move occurs).
     let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
     let mut outputs = vec![0i64; max_output_slots.max(1)];
     for i in 0..max_output_slots.min(depth) {
         outputs[i] = unsafe { *result_jf.add(header_words + i) };
-    }
-
-    // Bridge dispatch is handled by execute_with_inputs (line 3541),
-    // which checks CraneliftFailDescr.bridge after run_compiled_code
-    // returns. This matches RPython's patch_jump_for_descr pattern
-    // (assembler.py:965) — the bridge is dispatched at the caller level.
-
-    // RPython parity: _call_footer_shadowstack (assembler.py:1130-1136)
-    // pops jitframe from shadowstack at exit.
-    if let Some(rid) = gc_runtime_id {
-        if num_ref_roots > 0 {
-            unregister_gc_roots(rid, &mut roots);
-        }
     }
 
     drop(_jitted_guard);
@@ -4419,7 +4376,8 @@ impl CraneliftBackend {
 
         let mut sig = Signature::new(call_conv);
         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
-        sig.params.push(AbiParam::new(ptr_type)); // roots_ptr
+        // RPython: fn(jf_ptr, threadlocal_addr) → jf_ptr
+        // pyre: fn(jf_ptr) → jf_ptr (no threadlocal needed)
         // _call_footer (assembler.py:1097): mov eax, ebp; ret
         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
@@ -4494,11 +4452,15 @@ impl CraneliftBackend {
         builder.seal_block(entry_block);
 
         // jf_ptr serves as both inputs_ptr (entry) and outputs_ptr (exits).
-        // Items at offset 0: jf_ptr[i] = jf_ptr + i*8.
+        // RPython: EBP = jitframe pointer throughout compiled code.
         let jf_ptr = builder.block_params(entry_block)[0];
         let inputs_ptr = jf_ptr; // alias for entry loading
         let outputs_ptr = jf_ptr; // alias for guard exit stores
-        let roots_ptr = builder.block_params(entry_block)[1];
+        // Ref root slots live in jf_frame after output/fail_args area.
+        // RPython: refs are always in jf_frame; gcmap marks which slots
+        // are live at each GC point (regalloc.py get_gcmap).
+        let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
+        let per_call_gcmap = compute_per_call_gcmap(max_output_slots, ref_root_slots.len());
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
 
         let label_indices: Vec<usize> = ops
@@ -5576,9 +5538,11 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         gc_runtime_id,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                     ) {
                         builder.def_var(var(vi), result);
                     }
@@ -5691,22 +5655,7 @@ impl CraneliftBackend {
                     if use_direct {
                         let slot_addr = dispatch_slot_addr.unwrap();
 
-                        // For self-recursion (target unknown), use safe defaults
-                        let out_slots = resolved_target
-                            .as_ref()
-                            .map_or(16, |t| t.max_output_slots.max(1));
-                        let num_ref_roots = resolved_target
-                            .as_ref()
-                            .map_or(8, |t| t.num_ref_roots.max(1));
-
                         // No separate out_slot: callee writes outputs to args_slot (shared).
-                        let roots_bytes = (num_ref_roots * 8) as u32;
-                        let ca_roots_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            roots_bytes,
-                            3,
-                        ));
-                        let ca_roots_ptr = builder.ins().stack_addr(ptr_type, ca_roots_slot, 0);
 
                         // Load code_ptr and finish_index from dispatch entry.
                         // CaDispatchEntry layout: [code_ptr: 8B, finish_index: 8B]
@@ -5757,17 +5706,13 @@ impl CraneliftBackend {
                             JF_FRAME_ITEM0_OFS,
                         );
 
-                        // fn(jf_ptr, roots) → jf_ptr (_call_footer parity)
+                        // fn(jf_ptr) → jf_ptr (_call_footer parity)
                         let mut sig = Signature::new(call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                        sig.params.push(AbiParam::new(ptr_type)); // roots
                         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
                         let sig_ref = builder.import_signature(sig);
-                        let call_inst = builder.ins().call_indirect(
-                            sig_ref,
-                            code_addr,
-                            &[args_ptr, ca_roots_ptr],
-                        );
+                        let call_inst =
+                            builder.ins().call_indirect(sig_ref, code_addr, &[args_ptr]);
                         let result_jf = builder.inst_results(call_inst)[0];
                         // Read fail_index from returned jf_descr (assembler.py:2105)
                         let fail_idx_raw = builder.ins().load(
@@ -5866,20 +5811,14 @@ impl CraneliftBackend {
                             builder.seal_block(inline_bridge_block);
                             // Bridge uses callee's fail_args (in args_slot, overwritten by callee).
                             // Pass args_ptr as the bridge's jf_ptr (bridge reads inputs, writes outputs).
-                            let bridge_roots_slot = builder.create_sized_stack_slot(
-                                StackSlotData::new(StackSlotKind::ExplicitSlot, 64, 3),
-                            );
-                            let bridge_roots_ptr =
-                                builder.ins().stack_addr(ptr_type, bridge_roots_slot, 0);
                             let mut bridge_sig = Signature::new(call_conv);
                             bridge_sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                            bridge_sig.params.push(AbiParam::new(ptr_type)); // roots
                             bridge_sig.returns.push(AbiParam::new(ptr_type)); // jf_ptr
                             let bridge_sig_ref = builder.import_signature(bridge_sig);
                             let bridge_call = builder.ins().call_indirect(
                                 bridge_sig_ref,
                                 bridge_ptr_val,
-                                &[args_ptr, bridge_roots_ptr],
+                                &[args_ptr],
                             );
                             let bridge_result_jf = builder.inst_results(bridge_call)[0];
                             let bridge_result = builder.ins().load(
@@ -5935,7 +5874,14 @@ impl CraneliftBackend {
                         );
                     }
 
-                    spill_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
+                    spill_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
+                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     let result = emit_host_call(
                         &mut builder,
                         ptr_type,
@@ -5949,7 +5895,14 @@ impl CraneliftBackend {
                         ],
                         Some(cl_types::I64),
                     );
-                    reload_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
+                    emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                    reload_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
 
                     let outcome_kind = builder.ins().stack_load(cl_types::I64, outcome_slot, 0);
                     let finish_kind = builder
@@ -6062,9 +6015,11 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         gc_runtime_id,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                     ) {
                         builder.def_var(var(vi), result);
                     }
@@ -6097,7 +6052,14 @@ impl CraneliftBackend {
                     }
 
                     // Spill GC roots before the call
-                    spill_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
+                    spill_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
+                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
 
                     // Release GIL (call the pre-hook)
                     let _ = emit_host_call(
@@ -6156,8 +6118,15 @@ impl CraneliftBackend {
                         None,
                     );
 
+                    emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     // Reload roots (may have been updated by GC during call)
-                    reload_ref_roots(&mut builder, roots_ptr, &ref_root_slots, &defined_ref_vars);
+                    reload_ref_roots(
+                        &mut builder,
+                        jf_ptr,
+                        &ref_root_slots,
+                        &defined_ref_vars,
+                        ref_root_base_ofs,
+                    );
 
                     if let Some(result) = result {
                         let result_val = if result_type == Type::Float {
@@ -6199,9 +6168,11 @@ impl CraneliftBackend {
                                 call_conv,
                                 ptr_type,
                                 gc_runtime_id,
-                                roots_ptr,
+                                jf_ptr,
                                 &ref_root_slots,
                                 &defined_ref_vars,
+                                ref_root_base_ofs,
+                                per_call_gcmap,
                             );
                         }
                     }
@@ -6242,9 +6213,11 @@ impl CraneliftBackend {
                                 call_conv,
                                 ptr_type,
                                 gc_runtime_id,
-                                roots_ptr,
+                                jf_ptr,
                                 &ref_root_slots,
                                 &defined_ref_vars,
+                                ref_root_base_ofs,
+                                per_call_gcmap,
                             ) {
                                 call_result = result;
                             }
@@ -6272,9 +6245,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id,
                         gc_alloc_nursery_shim as *const () as usize,
                         &[size],
@@ -6301,9 +6276,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, length],
@@ -6361,9 +6338,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id_val,
                         gc_alloc_nursery_shim as *const () as usize,
                         &[size],
@@ -7809,9 +7788,11 @@ impl CraneliftBackend {
                             &mut builder,
                             ptr_type,
                             call_conv,
-                            roots_ptr,
+                            jf_ptr,
                             &ref_root_slots,
                             &defined_ref_vars,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
                             runtime_id,
                             gc_alloc_typed_nursery_shim as *const () as usize,
                             &[type_id_val, size_val],
@@ -7858,9 +7839,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, length],
@@ -7996,9 +7979,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, len],
@@ -8017,9 +8002,11 @@ impl CraneliftBackend {
                         &mut builder,
                         ptr_type,
                         call_conv,
-                        roots_ptr,
+                        jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
+                        ref_root_base_ofs,
+                        per_call_gcmap,
                         runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, len],
