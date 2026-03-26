@@ -1710,6 +1710,7 @@ impl Optimizer {
         // virtualization — rescan resolves these via exported_jump_virtuals.
         if self.skip_flush {
             Self::rescan_guard_virtuals(&mut ctx);
+            Self::number_all_guards(&mut ctx, &self.snapshot_boxes, &self.constant_types);
         }
 
         // Transfer exported virtual state from context to optimizer
@@ -1881,6 +1882,12 @@ impl Optimizer {
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
         // in guard fail_args before forcing remaining virtuals.
         Self::rescan_guard_virtuals(&mut ctx);
+
+        // resume.py parity: produce rd_numb for every guard with a snapshot.
+        // RPython calls store_final_boxes_in_guard at each guard emit. In majit
+        // guards are emitted directly via ctx.emit, so we run numbering as a
+        // post-pass over all emitted guards.
+        Self::number_all_guards(&mut ctx, &self.snapshot_boxes, &self.constant_types);
 
         // Force any remaining virtual refs in output ops before forwarding resolve.
         // RPython: virtuals are forced during preamble export or JUMP handling.
@@ -2750,6 +2757,107 @@ impl Optimizer {
             let op = std::mem::replace(&mut ctx.new_operations[i], placeholder);
             let updated = Self::encode_guard_virtuals_impl(op, ctx);
             ctx.new_operations[i] = updated;
+        }
+    }
+
+    /// resume.py parity: produce rd_numb for every guard that has a snapshot.
+    /// Called as a post-pass after all optimization and rescan_guard_virtuals.
+    fn number_all_guards(
+        ctx: &mut OptContext,
+        snapshot_boxes: &std::collections::HashMap<i32, Vec<OpRef>>,
+        constant_types: &std::collections::HashMap<u32, Type>,
+    ) {
+        // Collect numbering results first (immutable borrow of ctx),
+        // then apply them (mutable borrow).
+        struct GuardNumbering {
+            index: usize,
+            fail_args: Vec<OpRef>,
+            rd_virtuals: Option<Vec<GuardVirtualEntry>>,
+            rd_numb: Vec<u8>,
+            rd_consts: Vec<(i64, Type)>,
+        }
+        let box_env = OptimizerBoxEnv {
+            ctx: &*ctx,
+            constant_types,
+        };
+        let mut results: Vec<GuardNumbering> = Vec::new();
+        let len = ctx.new_operations.len();
+        for i in 0..len {
+            let op = &ctx.new_operations[i];
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            let pos = op.rd_resume_position;
+            if pos < 0 || !snapshot_boxes.contains_key(&pos) {
+                continue;
+            }
+            let snap = snapshot_boxes[&pos].clone();
+            let snapshot = majit_ir::resumedata::Snapshot::single_frame(0, snap);
+            let mut memo = majit_ir::resumedata::ResumeDataLoopMemo::new();
+            let Ok(mut numb_state) = memo.number(&snapshot, &box_env) else {
+                continue;
+            };
+            let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
+            let mut liveboxes: Vec<OpRef> = vec![OpRef::NONE; n];
+            let mut virtual_boxes: Vec<(OpRef, i32)> = Vec::new();
+            for (&opref_id, &tagged) in &numb_state.liveboxes {
+                let (idx, tagbits) = majit_ir::resumedata::untag(tagged);
+                if tagbits == majit_ir::resumedata::TAGBOX {
+                    if (idx as usize) < liveboxes.len() {
+                        liveboxes[idx as usize] = OpRef(opref_id);
+                    }
+                } else if tagbits == majit_ir::resumedata::TAGVIRTUAL {
+                    virtual_boxes.push((OpRef(opref_id), idx));
+                }
+            }
+            let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+            for (vbox, vidx) in &virtual_boxes {
+                let resolved = ctx.get_replacement(*vbox);
+                let vinfo_opt = ctx.get_ptr_info(resolved).cloned();
+                let (descr, known_class, fields_data) = match vinfo_opt {
+                    Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
+                        (vi.descr.clone(), vi.known_class, vi.fields.clone())
+                    }
+                    Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
+                        (vi.descr.clone(), None, vi.fields.clone())
+                    }
+                    _ => continue,
+                };
+                let base_idx = liveboxes.len();
+                let mut fields = Vec::new();
+                for (fi, (field_idx, value_ref)) in fields_data.iter().enumerate() {
+                    let resolved_val = ctx.get_replacement(*value_ref);
+                    liveboxes.push(resolved_val);
+                    fields.push((*field_idx, base_idx + fi));
+                }
+                virtual_entries.push(GuardVirtualEntry {
+                    original_opref: Some(*vbox),
+                    fail_arg_index: *vidx as usize,
+                    descr,
+                    known_class,
+                    fields,
+                });
+            }
+            numb_state.patch(1, liveboxes.len() as i32);
+            results.push(GuardNumbering {
+                index: i,
+                fail_args: liveboxes,
+                rd_virtuals: if virtual_entries.is_empty() {
+                    None
+                } else {
+                    Some(virtual_entries)
+                },
+                rd_numb: numb_state.create_numbering(),
+                rd_consts: memo.consts().to_vec(),
+            });
+        }
+        // Apply collected numbering results.
+        for r in results {
+            let op = &mut ctx.new_operations[r.index];
+            op.fail_args = Some(r.fail_args.into());
+            op.rd_virtuals = r.rd_virtuals;
+            op.rd_numb = Some(r.rd_numb);
+            op.rd_consts = Some(r.rd_consts);
         }
     }
 
