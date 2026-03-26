@@ -3597,29 +3597,31 @@ fn emit_indirect_call_from_parts(
         );
     }
 
-    // RPython callbuilder.py:93-122 parity:
-    //   1. spill refs to jf_frame
-    //   2. push_gcmap — MOV [ebp+jf_gcmap], gcmap_ptr
-    //   3. CALL
-    //   4. pop_gcmap — MOV [ebp+jf_gcmap], 0
-    //   5. reload refs from jf_frame
-    spill_ref_roots(
-        builder,
-        jf_ptr,
-        ref_root_slots,
-        defined_ref_vars,
-        ref_root_base_ofs,
-    );
-    emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
+    // RPython callbuilder.py parity:
+    //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
+    //   emit_no_collect(): bare CALL only
+    let can_collect = call_descr.effect_info().can_collect();
+    if can_collect {
+        spill_ref_roots(
+            builder,
+            jf_ptr,
+            ref_root_slots,
+            defined_ref_vars,
+            ref_root_base_ofs,
+        );
+        emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
+    }
     let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
-    emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
-    reload_ref_roots(
-        builder,
-        jf_ptr,
-        ref_root_slots,
-        defined_ref_vars,
-        ref_root_base_ofs,
-    );
+    if can_collect {
+        emit_pop_gcmap(builder, jf_ptr, per_call_gcmap);
+        reload_ref_roots(
+            builder,
+            jf_ptr,
+            ref_root_slots,
+            defined_ref_vars,
+            ref_root_base_ofs,
+        );
+    }
 
     if result_type != Type::Void {
         let result = builder.inst_results(call)[0];
