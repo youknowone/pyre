@@ -5,7 +5,7 @@
 //! correct calling convention and integer-based parameter passing.
 
 use majit_ir::{OpCode, OpRef, Type};
-use majit_meta::TraceCtx;
+use majit_metainterp::TraceCtx;
 
 use pyre_interpreter::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,

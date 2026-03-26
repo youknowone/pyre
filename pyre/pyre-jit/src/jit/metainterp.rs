@@ -5,7 +5,7 @@
 //! RETURN → finishframe_inline (RPython finishframe).
 
 use majit_ir::{OpRef, Type};
-use majit_meta::{TraceAction, TraceCtx};
+use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
 use pyre_bytecode::bytecode::Instruction;
 

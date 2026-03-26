@@ -155,7 +155,7 @@ fn generate_trace_functions(out: &mut String) {
 /// Auto-generated equivalent of PyPy's int_unbox annotation.
 /// Returns the raw i64 OpRef, with heapcache integration.
 fn trace_getfield_gc_int_pureornot(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
@@ -176,7 +176,7 @@ fn trace_getfield_gc_int_pureornot(
 }
 
 pub fn trace_unbox_int(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     int_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
@@ -207,7 +207,7 @@ pub fn trace_unbox_int(
 /// The helper route preserves pyre's small-int cache instead of always
 /// materializing a fresh heap object in the trace.
 pub fn trace_box_int(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     ob_type_descr: majit_ir::DescrRef,
@@ -234,7 +234,7 @@ pub fn trace_box_int(
 ///
 /// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.
 pub fn trace_int_binop_ovf(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -257,7 +257,7 @@ pub fn trace_int_binop_ovf(
 
 /// Emit a non-overflow binary int operation (bitwise ops, shifts).
 pub fn trace_int_binop(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -275,7 +275,7 @@ pub fn trace_int_binop(
 
 /// Emit a comparison between two Python ints.
 pub fn trace_int_compare(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -293,7 +293,7 @@ pub fn trace_int_compare(
 ///
 /// Returns the raw f64 OpRef.
 fn trace_getfield_gc_float_pureornot(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
@@ -313,7 +313,7 @@ fn trace_getfield_gc_float_pureornot(
 }
 
 pub fn trace_unbox_float(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     float_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
@@ -338,7 +338,7 @@ pub fn trace_unbox_float(
 
 /// Box a raw f64 into a Python float object: emit New + SetfieldGc.
 pub fn trace_box_float(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     ob_type_descr: majit_ir::DescrRef,
@@ -360,7 +360,7 @@ pub fn trace_box_float(
 
 /// Emit a binary float operation: unbox a, unbox b, emit float op, box result.
 pub fn trace_float_binop(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -378,7 +378,7 @@ pub fn trace_float_binop(
 
 /// Emit a comparison between two Python floats.
 pub fn trace_float_compare(
-    ctx: &mut majit_meta::TraceCtx,
+    ctx: &mut majit_metainterp::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,

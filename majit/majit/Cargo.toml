@@ -6,11 +6,10 @@ description = "Meta-tracing JIT compiler framework"
 
 [dependencies]
 majit-ir = { path = "../majit-ir" }
-majit-opt = { path = "../majit-opt" }
+majit-metainterp = { path = "../majit-metainterp" }
 majit-trace = { path = "../majit-trace" }
 majit-codegen = { path = "../majit-codegen" }
 majit-codegen-cranelift = { path = "../majit-codegen-cranelift" }
-majit-meta = { path = "../majit-meta" }
 majit-gc = { path = "../majit-gc" }
 majit-runtime = { path = "../majit-runtime" }
 majit-macros = { path = "../majit-macros" }

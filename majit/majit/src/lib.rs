@@ -38,7 +38,7 @@ pub use majit_codegen as codegen;
 pub use majit_codegen_cranelift as cranelift;
 
 /// Meta-interpreter: JitDriver, MetaInterp, JitState, resume, blackhole.
-pub use majit_meta as meta;
+pub use majit_metainterp as metainterp;
 
 /// GC support: nursery, oldgen, write barriers, card marking.
 pub use majit_gc as gc;

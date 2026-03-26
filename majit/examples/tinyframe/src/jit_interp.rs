@@ -34,7 +34,8 @@ fn mainloop(
     init_regs: &[(usize, i64)],
     threshold: u32,
 ) -> i64 {
-    let mut driver: majit_meta::JitDriver<TinyFrameState> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<TinyFrameState> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TinyFrameState {

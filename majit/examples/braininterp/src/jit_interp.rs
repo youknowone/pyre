@@ -37,7 +37,8 @@ struct BfState {
     },
 )]
 fn mainloop(program: &Bytecode, threshold: u32) -> String {
-    let mut driver: majit_meta::JitDriver<BfState> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<BfState> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = BfState {
@@ -133,7 +134,7 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
 fn mainloop_resume(
     program: &Bytecode,
     state: &mut BfState,
-    driver: &mut majit_meta::JitDriver<BfState>,
+    driver: &mut majit_metainterp::JitDriver<BfState>,
     mut pc: usize,
     _threshold: u32,
 ) -> String {

@@ -17,8 +17,8 @@ use std::collections::HashSet;
 
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
-use majit_meta::blackhole::ExceptionState;
-use majit_meta::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
+use majit_metainterp::blackhole::ExceptionState;
+use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
 /// RPython resume_in_blackhole parity: preserve typed fail_args from
 /// the last guard failure so the blackhole can load registers directly
@@ -45,14 +45,14 @@ enum JitAction {
 use crate::jit::descr::{JITFRAME_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
 use crate::jit::frame_layout::build_pyframe_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
-use majit_meta::JitDriver;
+use majit_metainterp::JitDriver;
 use pyre_object::floatobject::W_FloatObject;
 use pyre_object::intobject::W_IntObject;
 
 const JIT_THRESHOLD: u32 = 200;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
-    majit_meta::virtualizable::VirtualizableInfo,
+    majit_metainterp::virtualizable::VirtualizableInfo,
 );
 
 thread_local! {
@@ -67,7 +67,7 @@ thread_local! {
             gc.register_type(TypeInfo::simple(std::mem::size_of::<W_FloatObject>()));
         debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
-        let jitframe_tid = gc.register_type(majit_meta::jitframe::jitframe_type_info());
+        let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
         d.set_gc_allocator(Box::new(gc));
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
@@ -382,7 +382,7 @@ fn jit_merge_point_hook(
     code: &pyre_bytecode::CodeObject,
     pc: usize,
     driver: &mut JitDriver<PyreJitState>,
-    info: &majit_meta::virtualizable::VirtualizableInfo,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     let concrete_frame = frame as *mut PyFrame as usize;
@@ -436,7 +436,7 @@ fn can_enter_jit_hook(
     green_key: u64,
     loop_header_pc: usize,
     driver: &mut JitDriver<PyreJitState>,
-    info: &majit_meta::virtualizable::VirtualizableInfo,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     let has_compiled = driver.has_compiled_loop(green_key);
@@ -449,7 +449,7 @@ fn can_enter_jit_hook(
     // Ensure the jit state PC matches the loop header, even if
     // sync_from_virtualizable read a stale value from raw memory.
     jit_state.next_instr = loop_header_pc;
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
             green_key,
@@ -511,7 +511,7 @@ fn can_enter_jit_hook(
             } => Some(req.clone()),
             _ => None,
         };
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             let kind = match &outcome {
                 DetailedDriverRunOutcome::Finished { .. } => "finished",
                 DetailedDriverRunOutcome::Jump { .. } => "jump",
@@ -599,7 +599,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
                 green_key,
@@ -632,7 +632,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         };
 
         {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 let kind = match &outcome {
                     DetailedDriverRunOutcome::Finished { .. } => "finished",
                     DetailedDriverRunOutcome::Jump { .. } => "jump",
@@ -677,7 +677,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] probe key={} arg0={:?} tracing={}",
             green_key,
@@ -702,7 +702,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         .function_entry_count(green_key);
     let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
     let boosted = driver.is_function_boosted(green_key);
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] count key={} arg0={:?} count={} boosted={} threshold={}",
             green_key,
@@ -721,7 +721,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         .meta_interp_mut()
         .warm_state_mut()
         .reset_function_entry_count(green_key);
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][func-entry] start tracing key={} arg0={:?} count={} boosted={}",
             green_key,
@@ -743,7 +743,7 @@ fn handle_jit_outcome(
     outcome: DetailedDriverRunOutcome,
     _jit_state: &PyreJitState,
     frame: &mut PyFrame,
-    _info: &majit_meta::virtualizable::VirtualizableInfo,
+    _info: &majit_metainterp::virtualizable::VirtualizableInfo,
     green_key: u64,
 ) -> JitAction {
     match outcome {
@@ -754,7 +754,7 @@ fn handle_jit_outcome(
         } => {
             let (driver, _) = driver_pair();
             let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
                     green_key, raw_int_result, typed_values
@@ -830,7 +830,7 @@ fn restore_guard_failure_for_loop(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         let nraw = raw_values.len();
         let slots: Vec<String> = (0..nraw)
             .map(|i| format!("{:#x}", raw_values[i] as usize))
@@ -864,7 +864,7 @@ fn restore_guard_failure_for_loop(
         .iter()
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
     if has_null_ref {
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit] guard-fail: {} null Ref in frame slots [3..{}], invalidating",
                 typed[3..frame_end]
@@ -893,7 +893,7 @@ fn restore_guard_failure_for_loop(
             .meta_interp_mut()
             .warm_state_mut()
             .tick_guard_failure(guard_hash);
-        if should_bridge && majit_meta::majit_log_enabled() {
+        if should_bridge && majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit] guard-fail: trace_eagerness threshold for guard ({}, {}), bridge TODO",
                 exit_layout.trace_id, exit_layout.fail_index
@@ -911,7 +911,7 @@ fn restore_guard_failure_for_loop(
 
     // Fallback: restore frame state for interpreter continuation.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
             jit_state.next_instr, jit_state.valuestackdepth
@@ -1000,7 +1000,7 @@ fn materialize_recovery_virtuals(typed: &mut Vec<Value>, exit_layout: &CompiledE
             if let Value::Int(v) = typed[intval_pos] {
                 let obj = pyre_object::intobject::w_int_new(v);
                 typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit] materialized virtual W_IntObject(intval={}) at slot {}",
                         v, slot_idx
@@ -1093,7 +1093,7 @@ fn materialize_from_recovery_layout(
 
 pub(crate) fn build_jit_state(
     frame: &PyFrame,
-    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+    virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
@@ -1110,7 +1110,7 @@ pub(crate) fn build_jit_state(
 fn sync_jit_state_to_frame(
     jit_state: &PyreJitState,
     frame: &mut PyFrame,
-    virtualizable_info: &majit_meta::virtualizable::VirtualizableInfo,
+    virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) {
     if !jit_state.sync_to_virtualizable(virtualizable_info) {
         frame.next_instr = jit_state.next_instr;

@@ -141,7 +141,8 @@ const NEWSTR: u8 = 7;
     },
 )]
 pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
-    let mut driver: majit_meta::JitDriver<TlaState> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<TlaState> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TlaState {

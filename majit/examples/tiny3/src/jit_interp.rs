@@ -198,7 +198,8 @@ impl BytecodeExt for [u8] {
     },
 )]
 fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
-    let mut driver: majit_meta::JitDriver<Tiny3State> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<Tiny3State> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = num_args as i32;
     let mut state = Tiny3State {

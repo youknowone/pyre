@@ -9,14 +9,13 @@ members = [
     # majit
     "majit/majit",
     "majit/majit-ir",
-    "majit/majit-opt",
     "majit/majit-trace",
     "majit/majit-codegen",
     "majit/majit-codegen-cranelift",
     "majit/majit-gc",
     "majit/majit-macros",
     "majit/majit-runtime",
-    "majit/majit-meta",
+    "majit/majit-metainterp",
     "majit/majit-analyze",
     "majit/examples/tlr",
     "majit/examples/tl",
@@ -45,7 +44,7 @@ rustpython-compiler = { git = "https://github.com/RustPython/RustPython", rev = 
 rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", rev = "82432be96239db7225e836961678f3af26bf9a62" }
 
 # majit JIT framework
-majit-meta = { path = "majit/majit-meta" }
+majit-metainterp = { path = "majit/majit-metainterp" }
 majit-ir = { path = "majit/majit-ir" }
 majit-trace = { path = "majit/majit-trace" }
 
