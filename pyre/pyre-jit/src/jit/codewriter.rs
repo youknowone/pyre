@@ -31,9 +31,17 @@ use pyre_bytecode::bytecode::{CodeObject, Instruction, OpArgState};
 pub struct PyJitCode {
     pub jitcode: JitCode,
     /// py_pc → jitcode byte offset.
-    /// Used by resume_in_blackhole to locate the resume point after guard
-    /// failure.
     pub pc_map: Vec<usize>,
+    /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
+    /// Precomputed at compile time to avoid repeated bytecode scanning.
+    pub has_abort: bool,
+}
+
+impl PyJitCode {
+    /// Check if this jitcode has BC_ABORT opcodes.
+    pub fn has_abort_opcode(&self) -> bool {
+        self.has_abort
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -573,9 +581,12 @@ impl CodeWriter {
         // falling off the end is unreachable if all bytecodes are covered.
 
         // RPython: assembler.assemble() → jitcode via make_jitcode()
+        let jitcode = assembler.finish();
+        let has_abort = jitcode.code.contains(&13 /* BC_ABORT */);
         PyJitCode {
-            jitcode: assembler.finish(),
+            jitcode,
             pc_map,
+            has_abort,
         }
     }
 

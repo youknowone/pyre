@@ -820,25 +820,13 @@ pub fn resume_in_blackhole_from_fail_args(
                 _ => break,
             }
         }
-        // Root guard: fail_args[0] = virtualizable frame (callee) but
-        // ni/locals = caller's state. If ni is out of range for the
-        // virtualizable frame's code, use _caller_frame's code instead.
-        // RPython: root guard resume data encodes the caller frame.
-        let (code, nlocals, frame_ptr) = if py_pc >= code.instructions.len() {
-            let caller_code = unsafe { &*_caller_frame.code };
-            let caller_nlocals = caller_code.varnames.len();
-            if py_pc >= caller_code.instructions.len() {
-                builder.release_chain(prev_bh);
-                return BlackholeResult::Failed;
-            }
-            (
-                caller_code,
-                caller_nlocals,
-                _caller_frame as *const PyFrame as *mut PyFrame,
-            )
-        } else {
-            (code, nlocals, frame_ptr)
-        };
+        // RPython: resume data always encodes valid PCs within the
+        // frame's own code object. If py_pc is out of range, the
+        // resume data is invalid — fail cleanly.
+        if py_pc >= code.instructions.len() {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
+        }
         let vsd = match section.get(2) {
             Some(Value::Int(v)) => *v as usize,
             _ => {
@@ -849,10 +837,10 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
-        // RPython note: RPython's codewriter handles all bytecodes, so
-        // BC_ABORT never appears. pyre's codewriter has gaps (e.g., some
-        // exception/Copy paths emit BC_ABORT). Skip blackhole for these.
-        if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
+        // Skip blackhole if jitcode has actual BC_ABORT opcodes (not just
+        // data bytes that happen to equal 13). Walk bytecodes properly
+        // to distinguish opcodes from operands.
+        if pyjitcode.has_abort_opcode() {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
         }
