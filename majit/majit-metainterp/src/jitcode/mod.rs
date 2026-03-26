@@ -84,6 +84,8 @@ pub(crate) const BC_SETARRAYITEM_VABLE_R: u8 = 72;
 pub(crate) const BC_SETARRAYITEM_VABLE_F: u8 = 73;
 pub(crate) const BC_ARRAYLEN_VABLE: u8 = 74;
 pub(crate) const BC_HINT_FORCE_VIRTUALIZABLE: u8 = 75;
+/// RPython bhimpl_ref_return: callee returns a ref value.
+pub(crate) const BC_REF_RETURN: u8 = 76;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
