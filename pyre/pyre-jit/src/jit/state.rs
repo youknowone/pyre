@@ -4853,9 +4853,9 @@ impl MIFrame {
             // TODO(exception-path-tracing): pyjitpl.py:2506 finishframe_exception
             // finds catch_exception handler → frame.pc = target → ChangeFrame
             // (continues tracing through the handler inline).
-            // Blocked: inline code size causes Rust codegen regression in
-            // eval_loop_jit (same compilation unit). Move MIFrame to a
-            // separate crate to isolate.
+            // Blocked: code size in this compilation unit causes Rust codegen
+            // regression in eval_loop_jit. Requires pyre-jit-trace crate
+            // split to isolate MIFrame monomorphization.
             TraceAction::Abort
         } else {
             // TODO(exception-exit): RPython finishframe_exception (pyjitpl.py:
