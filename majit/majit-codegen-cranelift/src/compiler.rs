@@ -931,6 +931,25 @@ pub fn take_pending_force_local0() -> Option<i64> {
     PENDING_FORCE_LOCAL0.with(|c| c.take())
 }
 
+/// RPython rebuild_state_after_failure parity: callback to materialize
+/// virtual objects in fail_args before bridge dispatch. The Cranelift
+/// backend cannot depend on pyre-object, so the interpreter registers
+/// a callback that creates concrete objects from (type_ptr, raw_value) pairs.
+///
+/// Signature: fn(outputs: &mut [i64], types: &[Type]) — modifies outputs
+/// in-place, replacing null Ref slots with materialized object pointers.
+type MaterializeVirtualsFn = fn(&mut [i64], &[majit_ir::Type]);
+
+thread_local! {
+    static MATERIALIZE_VIRTUALS: std::cell::Cell<Option<MaterializeVirtualsFn>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Register the virtual materialization callback. Called from pyre-jit init.
+pub fn register_materialize_virtuals(f: MaterializeVirtualsFn) {
+    MATERIALIZE_VIRTUALS.with(|c| c.set(Some(f)));
+}
+
 /// Frame state to restore from guard failure fail_args.
 /// RPython resume_in_blackhole parity: the force_fn reads the frame state
 /// from the deadframe (outputs buffer) rather than using the corrupted frame.
@@ -2277,7 +2296,19 @@ fn call_assembler_fast_path(
     let bridge_guard = fail_descr.bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
-        let outputs_slice = &outputs[..actual_outputs];
+        // RPython rebuild_state_after_failure parity: materialize virtual
+        // objects before bridge dispatch. Virtual Ref slots are null (0)
+        // with their fields in trailing Int slots.
+        let mut bridge_outputs = outputs;
+        MATERIALIZE_VIRTUALS.with(|c| {
+            if let Some(f) = c.get() {
+                f(
+                    &mut bridge_outputs[..actual_outputs],
+                    &fail_descr.fail_arg_types,
+                );
+            }
+        });
+        let outputs_slice = &bridge_outputs[..actual_outputs];
         let mut frame =
             CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
