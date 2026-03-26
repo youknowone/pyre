@@ -1984,6 +1984,16 @@ extern "C" fn call_assembler_guard_failure(
     outputs_ptr: *const i64,
     inputs_ptr: *const i64,
 ) -> i64 {
+    // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
+    if fail_descr_ptr == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+        let frame = take_call_assembler_deadframe_from_outputs(unsafe {
+            std::slice::from_raw_parts(outputs_ptr, 16)
+        });
+        let handle = store_call_assembler_deadframe(frame);
+        // Return via PENDING_FORCE_LOCAL0 — caller will detect deadframe.
+        return handle as i64;
+    }
+
     let target = unsafe { &*fast_lookup_ca_target(token_number) };
     // RPython get_latest_descr parity: jf_descr is a FailDescr pointer.
     let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
@@ -5760,15 +5770,19 @@ impl CraneliftBackend {
                             builder
                                 .ins()
                                 .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_descr);
+                        // RPython call_assembler (llsupport/assembler.py:295-359):
+                        //   Path B: CMP [eax+jf_descr], done_descr → JE → load result
+                        //   Path A: CALL assembler_helper_adr([jf_frame, vloc])
+                        //
+                        // Path A: 2 sub-paths (bridge inline + extern helper).
+                        // Deadframe sentinel handled inside call_assembler_guard_failure.
                         let direct_finish_block = builder.create_block();
-                        let direct_nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
-                            let b = builder.create_block();
-                            Some(b)
+                        let nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
+                            Some(builder.create_block())
                         } else {
                             None
                         };
-                        let nonfinish_target =
-                            direct_nonfinish_block.unwrap_or(shim_fallback_block);
+                        let nonfinish_target = nonfinish_block.unwrap_or(shim_fallback_block);
                         builder.ins().brif(
                             is_direct_finish,
                             direct_finish_block,
@@ -5777,53 +5791,28 @@ impl CraneliftBackend {
                             &[],
                         );
 
-                        // ── Direct finish: result in jf_frame[0] ──
+                        // ── Path B: finish — load result from jf_frame[0] ──
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
-                        // Read result from returned jf_frame[0]
                         let direct_result = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
-                            result_jf,
+                            args_ptr,
                             JF_FRAME_ITEM0_OFS,
                         );
                         builder.ins().jump(ca_merge_block, &[direct_result]);
 
-                        // ── Direct guard failure: call force_fn on frame ──
-                        if let Some(nonfinish_block) = direct_nonfinish_block {
+                        // ── Path A: non-finish — bridge or assembler_helper ──
+                        if let Some(nonfinish_block) = nonfinish_block {
                             builder.switch_to_block(nonfinish_block);
                             builder.seal_block(nonfinish_block);
-                            // Check for DEADFRAME sentinel (nested CALL_ASSEMBLER
-                            // propagation) — must go through shim for that case.
-                            let deadframe_sentinel_val = builder
-                                .ins()
-                                .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
-                            let is_deadframe = builder.ins().icmp(
-                                IntCC::Equal,
-                                fail_idx_raw,
-                                deadframe_sentinel_val,
-                            );
-                            let direct_force_block = builder.create_block();
-                            builder.ins().brif(
-                                is_deadframe,
-                                shim_fallback_block,
-                                &[],
-                                direct_force_block,
-                                &[],
-                            );
 
-                            builder.switch_to_block(direct_force_block);
-                            builder.seal_block(direct_force_block);
-
-                            // RPython redirect_call_assembler parity:
-                            // Load guard_bridge_ptr from dispatch entry.
-                            // If set, call bridge directly (no extern "C" overhead).
-                            // If null, fall back to call_assembler_guard_failure.
+                            // redirect_call_assembler parity: check bridge inline.
                             let bridge_ptr_val = builder.ins().load(
                                 ptr_type,
                                 MemFlags::trusted(),
                                 entry_ptr,
-                                16, // offset of guard_bridge_ptr in CaDispatchEntry
+                                16, // guard_bridge_ptr in CaDispatchEntry
                             );
                             let bridge_null = builder.ins().iconst(ptr_type, 0);
                             let has_bridge =
@@ -5831,45 +5820,41 @@ impl CraneliftBackend {
                                     .ins()
                                     .icmp(IntCC::NotEqual, bridge_ptr_val, bridge_null);
                             let inline_bridge_block = builder.create_block();
-                            let extern_force_block = builder.create_block();
+                            let extern_helper_block = builder.create_block();
                             builder.ins().brif(
                                 has_bridge,
                                 inline_bridge_block,
                                 &[],
-                                extern_force_block,
+                                extern_helper_block,
                                 &[],
                             );
 
-                            // ── Inline bridge dispatch (hot path for base case) ──
+                            // ── Inline bridge dispatch (hot) ──
                             builder.switch_to_block(inline_bridge_block);
                             builder.seal_block(inline_bridge_block);
-                            // Bridge uses callee's fail_args (in args_slot, overwritten by callee).
-                            // Pass args_ptr as the bridge's jf_ptr (bridge reads inputs, writes outputs).
                             let mut bridge_sig = Signature::new(call_conv);
-                            bridge_sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                            bridge_sig.returns.push(AbiParam::new(ptr_type)); // jf_ptr
-                            bridge_sig.returns.push(AbiParam::new(cl_types::I64)); // jf_descr
+                            bridge_sig.params.push(AbiParam::new(ptr_type));
+                            bridge_sig.returns.push(AbiParam::new(ptr_type));
+                            bridge_sig.returns.push(AbiParam::new(cl_types::I64));
                             let bridge_sig_ref = builder.import_signature(bridge_sig);
                             let bridge_call = builder.ins().call_indirect(
                                 bridge_sig_ref,
                                 bridge_ptr_val,
                                 &[args_ptr],
                             );
-                            let bridge_result_jf = builder.inst_results(bridge_call)[0];
+                            let _bridge_jf = builder.inst_results(bridge_call)[0];
                             let bridge_result = builder.ins().load(
                                 cl_types::I64,
                                 MemFlags::trusted(),
-                                bridge_result_jf,
+                                args_ptr,
                                 JF_FRAME_ITEM0_OFS,
                             );
                             builder.ins().jump(ca_merge_block, &[bridge_result]);
 
-                            // ── Extern force fallback (cold: before bridge compiled) ──
-                            builder.switch_to_block(extern_force_block);
-                            builder.seal_block(extern_force_block);
-                            // saved_frame_ptr: input[0] before callee overwrote args_slot.
+                            // ── assembler_helper (cold: no bridge yet) ──
+                            builder.switch_to_block(extern_helper_block);
+                            builder.seal_block(extern_helper_block);
                             let frame_ptr = saved_frame_ptr;
-                            // outputs_ptr = result_jf items area (callee's fail_args)
                             let result_jf_data =
                                 builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
                             let result_jf_data_i64 =
