@@ -115,6 +115,12 @@ pub fn install_builtin_typedefs() {
 /// The global `object` type object, accessible from builtins.
 static OBJECT_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Retrieve a W_TypeObject for a builtin type by its PyType pointer.
+/// Used to register `int`, `str`, etc. as types in builtins (not functions).
+pub fn get_builtin_type(tp: &PyType) -> PyObjectRef {
+    get_type_object(tp as *const PyType).unwrap_or(PY_NULL)
+}
+
 /// Get the `object` W_TypeObject for use as a builtin.
 pub fn get_object_type() -> PyObjectRef {
     OBJECT_TYPE_OBJ
@@ -134,10 +140,31 @@ fn make_type(name: &str, _tp: &PyType, init: fn(&mut PyNamespace)) -> PyObjectRe
     type_obj
 }
 
+/// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
+/// to the builtin constructor. PyPy: each type's descr__new__ strips cls
+/// and calls the type-specific allocator.
+macro_rules! type_new_wrapper {
+    ($fn_name:ident, $ctor:path) => {
+        fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            // args[0] = cls (ignored for builtin types)
+            $ctor(&args[1..])
+        }
+    };
+}
+
+type_new_wrapper!(int_new, crate::builtins::builtin_int_pub);
+type_new_wrapper!(float_new, crate::builtins::builtin_float_pub);
+type_new_wrapper!(str_new, crate::builtins::builtin_str_pub);
+type_new_wrapper!(bool_new, crate::builtins::builtin_bool_pub);
+type_new_wrapper!(list_new, crate::builtins::builtin_list_ctor_pub);
+type_new_wrapper!(tuple_new, crate::builtins::builtin_tuple_pub);
+type_new_wrapper!(dict_new, crate::builtins::builtin_dict_ctor_pub);
+
 // ── List TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
 fn init_list_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", list_new));
     namespace_store(
         ns,
         "append",
@@ -199,6 +226,7 @@ fn init_list_typedef(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
 fn init_str_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", str_new));
     namespace_store(
         ns,
         "join",
@@ -385,6 +413,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/dictobject.py TypeDef("dict", ...)
 
 fn init_dict_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", dict_new));
     namespace_store(
         ns,
         "get",
@@ -425,6 +454,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
 fn init_tuple_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", tuple_new));
     namespace_store(
         ns,
         "index",
@@ -439,9 +469,15 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
 
-fn init_int_typedef(_ns: &mut PyNamespace) {}
-fn init_float_typedef(_ns: &mut PyNamespace) {}
-fn init_bool_typedef(_ns: &mut PyNamespace) {}
+fn init_int_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", int_new));
+}
+fn init_float_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", float_new));
+}
+fn init_bool_typedef(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", w_builtin_func_new("__new__", bool_new));
+}
 
 // ── Object TypeDef ───────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/objectobject.py TypeDef("object", ...)

@@ -1134,29 +1134,33 @@ impl OpcodeStepExecutor for PyFrame {
     // ── call_kw ──
     // PyPy: CALL_FUNCTION_KW; CPython 3.13: CALL_KW
     // Stack: [callable, self_or_null, arg1, ..., argN, kwarg_names_tuple]
+    /// CALL_KW — call with keyword arguments.
+    ///
+    /// PyPy: argument.py _match_signature
+    /// Stack: [callable, null_or_self, arg0..argN-1, kwarg_names_tuple]
+    /// The last `len(kwarg_names)` args are keyword args.
+    ///
+    /// Keyword resolution happens HERE (before frame creation) so the
+    /// JIT eval loop sees correctly-positioned locals. PyPy does this
+    /// in Arguments.parse_into_scope before the frame executes.
     fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
-        // Pop kwarg_names tuple (tells which args are keyword)
-        let _kwarg_names = self.pop();
-
-        // Pop all N args
+        let kwarg_names = self.pop();
         let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
             args.push(self.pop());
         }
         args.reverse();
-
-        // Pop self_or_null
         let self_or_null = self.pop();
-        // Pop callable
         let callable = self.pop();
 
-        // If self_or_null is non-null, prepend it to args (bound method call)
         if self_or_null != PY_NULL && !unsafe { pyre_object::is_none(self_or_null) } {
             args.insert(0, self_or_null);
         }
 
-        // Phase 1: pass all args positionally (ignore kwarg semantics)
-        let result = call_callable(self, callable, &args)?;
+        // Resolve keyword args into positional order.
+        // PyPy: argument.py _match_signature step: match keywords to argnames
+        let resolved = crate::call::resolve_kwargs(callable, &args, kwarg_names);
+        let result = call_callable(self, callable, &resolved)?;
         self.push(result);
         Ok(())
     }
