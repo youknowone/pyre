@@ -852,6 +852,37 @@ impl Optimizer {
     ///
     /// RPython parity: rebuild fail_args from the tracing-time snapshot
     /// via memo.number(), resolving each box through get_box_replacement().
+    /// Infer the IR type of an OpRef from the optimizer context.
+    /// Used by store_final_boxes_in_guard to build fail_arg_types.
+    fn infer_opref_type(
+        opref: OpRef,
+        ctx: &OptContext,
+        constant_types: &std::collections::HashMap<u32, Type>,
+    ) -> Type {
+        if opref.is_none() {
+            return Type::Int;
+        }
+        // Known constant type
+        if let Some(&t) = constant_types.get(&opref.0) {
+            return t;
+        }
+        // Emitted op result type
+        for op in ctx.new_operations.iter().rev() {
+            if op.pos == opref {
+                return op.result_type();
+            }
+        }
+        // PtrInfo → Ref type if nonnull/virtual/struct
+        if let Some(info) = ctx.get_ptr_info(opref) {
+            if info.is_nonnull() || info.is_virtual() {
+                return Type::Ref;
+            }
+        }
+        Type::Int
+    }
+
+    /// optimizer.py:722-752 store_final_boxes_in_guard(op, pendingfields)
+    ///
     /// Then walk fail_args to detect virtual objects, expand fail_args
     /// with virtual field values, and record blueprints in rd_virtuals.
     /// Produces rd_numb (compact resume numbering) stored on the guard op.
@@ -924,14 +955,11 @@ impl Optimizer {
                     });
                 }
 
-                // RPython options.failargs_limit parity: don't store
-                // excessively large fail_args. Default limit = 1000.
-                if liveboxes.len() > 30 {
-                    // Too many live boxes — skip snapshot-based fail_args.
-                    // The guard will use the original fail_args from tracing.
-                    return;
-                }
-                guard_op.fail_args = Some(liveboxes.into());
+                // RPython parity: do NOT replace fail_args with snapshot
+                // liveboxes. Cranelift backend uses fail_args as the
+                // deadframe layout (must match inputarg types). The
+                // snapshot data is stored in rd_numb for blackhole resume.
+                // fail_args stays as-is from tracing (inputarg-based).
                 if !virtual_entries.is_empty() {
                     guard_op.rd_virtuals = Some(virtual_entries);
                 }
