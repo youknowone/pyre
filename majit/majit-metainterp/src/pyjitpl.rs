@@ -97,6 +97,11 @@ pub(crate) struct CompiledTrace {
     /// Each guard gets the optimizer knowledge state at its point in the trace.
     /// Used by deserialize_optimizer_knowledge when compiling a bridge.
     pub(crate) optimizer_knowledge: HashMap<u32, OptimizerKnowledge>,
+    /// JitCode for blackhole fallback. RPython stores jitcodes globally;
+    /// in majit the JitCode is produced by #[jit_interp] lowering and
+    /// stored per-trace so BlackholeInterpreter can execute from guard
+    /// failure points.
+    pub(crate) jitcode: Option<crate::jitcode::JitCode>,
 }
 
 pub(crate) struct StoredResumeData {
@@ -1927,6 +1932,7 @@ impl<M: Clone> MetaInterp<M> {
                         terminal_exit_layouts,
                         snapshots: trace_snapshots,
                         optimizer_knowledge: HashMap::new(), // TODO: serialize from optimizer
+                        jitcode: None,
                     },
                 );
 
@@ -2425,6 +2431,7 @@ impl<M: Clone> MetaInterp<M> {
                         exit_layouts,
                         terminal_exit_layouts,
                         optimizer_knowledge: HashMap::new(),
+                        jitcode: None,
                     },
                 );
 
@@ -2744,6 +2751,7 @@ impl<M: Clone> MetaInterp<M> {
                         exit_layouts,
                         terminal_exit_layouts,
                         optimizer_knowledge: per_guard_knowledge,
+                        jitcode: None,
                     },
                 );
                 {
@@ -4221,6 +4229,7 @@ impl<M: Clone> MetaInterp<M> {
                             exit_layouts,
                             terminal_exit_layouts,
                             optimizer_knowledge: HashMap::new(),
+                            jitcode: None,
                         },
                     );
                 }
@@ -5623,6 +5632,7 @@ mod tests {
                 exit_layouts,
                 terminal_exit_layouts,
                 optimizer_knowledge: HashMap::new(),
+                jitcode: None,
                 snapshots: Vec::new(),
             },
         );
@@ -6065,6 +6075,7 @@ mod tests {
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
                 optimizer_knowledge: HashMap::new(),
+                jitcode: None,
                 snapshots: Vec::new(),
             },
         );
@@ -6172,6 +6183,7 @@ mod tests {
                 exit_layouts,
                 terminal_exit_layouts: HashMap::new(),
                 optimizer_knowledge: HashMap::new(),
+                jitcode: None,
                 snapshots: Vec::new(),
             },
         );
@@ -6468,6 +6480,7 @@ mod tests {
                 exit_layouts: HashMap::new(),
                 terminal_exit_layouts: HashMap::new(),
                 optimizer_knowledge: HashMap::new(),
+                jitcode: None,
                 snapshots: Vec::new(),
             },
         );
@@ -7567,6 +7580,7 @@ mod tests {
                 exit_layouts,
                 terminal_exit_layouts,
                 optimizer_knowledge: HashMap::new(),
+                jitcode: None,
                 snapshots: Vec::new(),
             },
         );
