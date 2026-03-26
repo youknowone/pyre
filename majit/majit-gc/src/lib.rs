@@ -8,7 +8,6 @@
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{GcRef, Op};
-pub use trace::{CustomTraceFn, TypeInfo};
 
 pub mod collector;
 pub mod header;
@@ -172,31 +171,6 @@ pub trait GcAllocator: Send {
     /// Check if an object is pinned.
     fn is_pinned(&self, _obj: GcRef) -> bool {
         false
-    }
-
-    /// Allocate a fixed-size object directly in old gen with a known type id.
-    ///
-    /// RPython parity: `gc_ll_descr.malloc_jitframe(frame_info)` allocates
-    /// jitframes that are immediately promoted to old gen (gc.py:132-135).
-    fn alloc_oldgen_typed(&mut self, _type_id: u32, size: usize) -> GcRef {
-        self.alloc_nursery(size)
-    }
-
-    /// Register a GC type descriptor and return its type id.
-    ///
-    /// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
-    fn register_type(&mut self, _info: TypeInfo) -> u32 {
-        0
-    }
-
-    /// Check if an address is in the nursery.
-    fn is_in_nursery(&self, _addr: usize) -> bool {
-        false
-    }
-
-    /// Number of registered GC types.
-    fn type_count(&self) -> usize {
-        0
     }
 }
 

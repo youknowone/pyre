@@ -487,29 +487,6 @@ impl MiniMarkGC {
     fn trace_and_update_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { header_of(obj_addr).type_id() };
         let type_info = self.types.get(type_id);
-
-        // RPython custom_trace_hook parity: if a custom trace function
-        // is registered (e.g. jitframe_custom_trace for type_id=JITFRAME),
-        // use it instead of generic offset-based tracing.
-        if let Some(trace_fn) = type_info.custom_trace {
-            let mut slots_to_update: Vec<*mut GcRef> = Vec::new();
-            unsafe {
-                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
-                    slots_to_update.push(slot_ptr);
-                });
-            }
-            for slot_ptr in slots_to_update {
-                let field_ref = unsafe { *slot_ptr };
-                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
-                    let new_ref = self.copy_nursery_object(field_ref.0);
-                    unsafe {
-                        *slot_ptr = new_ref;
-                    }
-                }
-            }
-            return;
-        }
-
         let gc_ptr_offsets: Vec<usize> = type_info.gc_ptr_offsets.clone();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
@@ -578,18 +555,6 @@ impl MiniMarkGC {
                 }
             }
         }
-
-        // Seed gray stack from GC-managed jitframes on the shadow stack.
-        // These are old-gen objects that must survive major GC sweep.
-        for obj_addr in crate::shadow_stack::gc_managed_jf_addrs() {
-            if self.oldgen.contains(obj_addr) {
-                let hdr = unsafe { header_of(obj_addr) };
-                if !hdr.has_flag(flags::VISITED) {
-                    hdr.set_flag(flags::VISITED);
-                    self.incr_state.gray_stack.push(obj_addr);
-                }
-            }
-        }
     }
 
     /// Drive incremental major-collection progress after a minor collection.
@@ -600,16 +565,6 @@ impl MiniMarkGC {
     /// outrun marking.
     fn run_major_progress_after_minor(&mut self) {
         if !self.incr_state.marking_in_progress && !self.should_start_major_cycle() {
-            return;
-        }
-
-        // Suppress major GC progress while GC-managed jitframes are live.
-        // Their jf_gcmap may be 0 (between push_gcmap sites), so the
-        // custom_trace cannot enumerate all ref slots. Starting an
-        // incremental cycle now would miss live refs in jf_frame, leading
-        // to premature sweep of reachable old-gen objects.
-        // Major GC is incremental — deferring one step is safe.
-        if !crate::shadow_stack::gc_managed_jf_addrs().is_empty() {
             return;
         }
 
@@ -676,30 +631,6 @@ impl MiniMarkGC {
     fn mark_object(&mut self, obj_addr: usize) {
         let type_id = unsafe { header_of(obj_addr).type_id() };
         let type_info = self.types.get(type_id);
-
-        // custom_trace_hook parity for major GC marking.
-        if let Some(trace_fn) = type_info.custom_trace {
-            let mut refs: Vec<GcRef> = Vec::new();
-            unsafe {
-                trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
-                    let field_ref = *slot_ptr;
-                    if !field_ref.is_null() {
-                        refs.push(field_ref);
-                    }
-                });
-            }
-            for field_ref in refs {
-                if self.is_managed_heap_object(field_ref.0) {
-                    let hdr = unsafe { header_of(field_ref.0) };
-                    if !hdr.has_flag(flags::VISITED) {
-                        hdr.set_flag(flags::VISITED);
-                        self.incr_state.gray_stack.push(field_ref.0);
-                    }
-                }
-            }
-            return;
-        }
-
         let gc_ptr_offsets = type_info.gc_ptr_offsets.clone();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
@@ -794,17 +725,6 @@ impl MiniMarkGC {
                     if !hdr.has_flag(flags::VISITED) {
                         hdr.set_flag(flags::VISITED);
                         self.incr_state.gray_stack.push(gcref.0);
-                    }
-                }
-            }
-
-            // Seed from GC-managed jitframes on shadow stack.
-            for obj_addr in crate::shadow_stack::gc_managed_jf_addrs() {
-                if self.oldgen.contains(obj_addr) {
-                    let hdr = unsafe { header_of(obj_addr) };
-                    if !hdr.has_flag(flags::VISITED) {
-                        hdr.set_flag(flags::VISITED);
-                        self.incr_state.gray_stack.push(obj_addr);
                     }
                 }
             }
@@ -1398,23 +1318,6 @@ impl GcAllocator for MiniMarkGC {
 
     fn is_pinned(&self, obj: GcRef) -> bool {
         self.is_pinned(obj)
-    }
-
-    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
-        let total_size = GcHeader::SIZE + size;
-        self.alloc_in_oldgen(type_id, total_size)
-    }
-
-    fn register_type(&mut self, info: TypeInfo) -> u32 {
-        self.types.register(info)
-    }
-
-    fn is_in_nursery(&self, addr: usize) -> bool {
-        self.nursery.contains(addr)
-    }
-
-    fn type_count(&self) -> usize {
-        self.types.len()
     }
 }
 
