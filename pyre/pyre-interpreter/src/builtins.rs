@@ -782,10 +782,13 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let name = unsafe { w_str_get_value(args[1]) };
     match crate::space::py_getattr(obj, name) {
         Ok(val) => Ok(val),
-        Err(_) => Ok(args
-            .get(2)
-            .copied()
-            .unwrap_or_else(|| panic!("getattr: attribute '{name}' not found"))),
+        Err(e) => {
+            if args.len() > 2 {
+                Ok(args[2]) // default value
+            } else {
+                Err(e) // propagate AttributeError
+            }
+        }
     }
 }
 
