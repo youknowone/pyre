@@ -1,0 +1,17 @@
+[package]
+name = "majit-metainterp"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+majit-ir = { path = "../majit-ir" }
+majit-trace = { path = "../majit-trace" }
+majit-codegen = { path = "../majit-codegen" }
+majit-codegen-cranelift = { path = "../majit-codegen-cranelift" }
+majit-gc = { path = "../majit-gc" }
+
+[dev-dependencies]
+majit-macros = { path = "../majit-macros" }
+majit-gc = { path = "../majit-gc" }
+majit-runtime = { path = "../majit-runtime" }
+smallvec = "1"

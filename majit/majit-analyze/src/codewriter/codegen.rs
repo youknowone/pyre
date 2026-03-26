@@ -392,7 +392,7 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
 
         #(#use_decls)*
 
-        use majit_meta::JitDriver;
+        use majit_metainterp::JitDriver;
 
         const DEFAULT_THRESHOLD: u32 = 1039;
 

@@ -781,7 +781,7 @@ impl<'c> Lowerer<'c> {
             };
             self.statements.push(quote! {
                 {
-                    let mut __sub = majit_meta::JitCodeBuilder::new();
+                    let mut __sub = majit_metainterp::JitCodeBuilder::new();
                     #binop_tokens
                     let __sub_idx = __builder.add_sub_jitcode(__sub.finish());
                     __builder.inline_call(__sub_idx);
@@ -2345,7 +2345,7 @@ impl<'c> Lowerer<'c> {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                             }
                             4u8 => {
-                                let __builder_fn: fn() -> (majit_meta::JitCode, u16, u8) =
+                                let __builder_fn: fn() -> (majit_metainterp::JitCode, u16, u8) =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
@@ -2392,7 +2392,7 @@ impl<'c> Lowerer<'c> {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                             }
                             4u8 => {
-                                let __builder_fn: fn() -> (majit_meta::JitCode, u16, u8) =
+                                let __builder_fn: fn() -> (majit_metainterp::JitCode, u16, u8) =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
@@ -2735,13 +2735,13 @@ fn typed_inline_arg_tokens(bindings: &[Binding]) -> TokenStream {
         let idx = index as u16;
         match binding.kind {
             BindingKind::Int => {
-                quote! { (majit_meta::JitArgKind::Int, #reg, #idx) }
+                quote! { (majit_metainterp::JitArgKind::Int, #reg, #idx) }
             }
             BindingKind::Ref => {
-                quote! { (majit_meta::JitArgKind::Ref, #reg, #idx) }
+                quote! { (majit_metainterp::JitArgKind::Ref, #reg, #idx) }
             }
             BindingKind::Float => {
-                quote! { (majit_meta::JitArgKind::Float, #reg, #idx) }
+                quote! { (majit_metainterp::JitArgKind::Float, #reg, #idx) }
             }
         }
     });
@@ -2752,9 +2752,9 @@ fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
     let args = bindings.iter().map(|binding| {
         let reg = binding.reg;
         match binding.kind {
-            BindingKind::Int => quote! { majit_meta::JitCallArg::int(#reg) },
-            BindingKind::Ref => quote! { majit_meta::JitCallArg::reference(#reg) },
-            BindingKind::Float => quote! { majit_meta::JitCallArg::float(#reg) },
+            BindingKind::Int => quote! { majit_metainterp::JitCallArg::int(#reg) },
+            BindingKind::Ref => quote! { majit_metainterp::JitCallArg::reference(#reg) },
+            BindingKind::Float => quote! { majit_metainterp::JitCallArg::float(#reg) },
         }
     });
     quote! { &[#(#args),*] }

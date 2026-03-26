@@ -5,7 +5,7 @@
 //! calls MIFrame::trace_code_step() for each bytecode, combining
 //! concrete execution and symbolic IR recording.
 
-use majit_meta::{TraceAction, TraceCtx};
+use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_bytecode::CodeObject;
 
 use crate::jit::metainterp::{MetaInterpFrame, PyreMetaInterp};

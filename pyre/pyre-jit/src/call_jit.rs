@@ -323,7 +323,7 @@ static mut ARENA_INITIALIZED: usize = 0;
 /// Returns addresses of the global arena state variables and frame
 /// layout constants needed by Cranelift to inline arena take/put.
 pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
-    use majit_meta::jitframe::*;
+    use majit_metainterp::jitframe::*;
     majit_codegen_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
@@ -532,7 +532,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 /// nursery JitFrame allocation, this function replaces the force path.
 #[allow(dead_code)]
 pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i64) -> i64 {
-    use majit_meta::jitframe::JitFrame;
+    use majit_metainterp::jitframe::JitFrame;
 
     let jf = jitframe_ptr as *mut JitFrame;
 
@@ -670,8 +670,8 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp = builder.acquire_interp()
     // Use thread-local builder pool to avoid per-call allocation.
     thread_local! {
-        static BH_BUILDER: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+        static BH_BUILDER: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
     let builder = BH_BUILDER.with(|cell| unsafe { &mut *cell.get() });
     let mut bh = builder.acquire_interp();
@@ -701,7 +701,7 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
     }
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole] setup pc={} nlocals={} regs_i_len={} local0={} frame_reg={}",
             py_pc,
@@ -768,14 +768,14 @@ pub fn resume_in_blackhole_from_fail_args(
     }
 
     thread_local! {
-        static BH_BUILDER3: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+        static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
     let builder = BH_BUILDER3.with(|cell| unsafe { &mut *cell.get() });
 
     // Build chain bottom-up: first section = callee (innermost),
     // last section = caller (outermost). Chain: callee.next = caller.
-    let mut prev_bh: Option<majit_meta::blackhole::BlackholeInterpreter> = None;
+    let mut prev_bh: Option<majit_metainterp::blackhole::BlackholeInterpreter> = None;
 
     // Process sections in REVERSE (caller first, then callee on top).
     // RPython builds the chain so that the LAST acquired interp is the
@@ -889,7 +889,7 @@ pub fn resume_in_blackhole_from_fail_args(
         return BlackholeResult::Failed;
     };
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole-resume] chain_len={} merge_pc={}",
             sections.len(),
@@ -1027,8 +1027,8 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     };
 
     thread_local! {
-        static BH_BUILDER2: std::cell::UnsafeCell<majit_meta::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_meta::blackhole::BlackholeInterpBuilder::new());
+        static BH_BUILDER2: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
     let builder = BH_BUILDER2.with(|cell| unsafe { &mut *cell.get() });
     let mut bh = builder.acquire_interp();
@@ -1052,7 +1052,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
         bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
     }
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole-merge] guard_pc={} merge_pc={} jit_pc={} merge_jit_pc={}",
             py_pc, merge_py_pc, jitcode_pc, merge_jitcode_pc,
@@ -1085,7 +1085,7 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     }
     frame.next_instr = merge_py_pc;
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole-merge] reached merge point, frame.next_instr={}",
             frame.next_instr,
@@ -1137,7 +1137,7 @@ pub extern "C" fn jit_force_recursive_call_1(
         return w_int_new(forced) as i64;
     }
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
         let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
             && !caller.locals_cells_stack_w[0].is_null()
@@ -1161,7 +1161,7 @@ pub extern "C" fn jit_force_recursive_call_1(
     let frame_ptr = create_callee_frame_impl(caller_frame, callable, &[boxed_arg_ref]);
     let result = jit_force_callee_frame(frame_ptr);
     jit_drop_callee_frame(frame_ptr);
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
         let caller_arg0 = if caller.locals_cells_stack_w.len() > 0
             && !caller.locals_cells_stack_w[0].is_null()
@@ -1307,7 +1307,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// calls re-enter compiled code through the normal portal runner path.
 pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
-    if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
+    if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!("[jit][force-self-recursive] enter arg={}", raw_int_arg);
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
@@ -1333,7 +1333,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
         }
     };
     jit_drop_callee_frame(frame_ptr);
-    if majit_meta::majit_log_enabled() && raw_int_arg <= 4 {
+    if majit_metainterp::majit_log_enabled() && raw_int_arg <= 4 {
         eprintln!(
             "[jit][force-self-recursive] exit arg={} result={} protocol={:?}",
             raw_int_arg, result, protocol
@@ -1366,7 +1366,7 @@ pub fn install_jit_call_bridge() {
 /// fail count reaches the bridge threshold. The frame state is still
 /// valid at this point (not yet reset by force_fn).
 fn on_bridge_threshold_reached(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][bridge-threshold] gk={} trace={} fail={} resume_pc={}",
             green_key, trace_id, fail_index, resume_pc
@@ -1421,8 +1421,8 @@ fn jit_blackhole_resume_from_guard(
         green_key
     };
     let (driver, _) = crate::eval::driver_pair();
-    let exception = majit_meta::blackhole::ExceptionState::default();
-    if majit_meta::majit_log_enabled() {
+    let exception = majit_metainterp::blackhole::ExceptionState::default();
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
             actual_green_key,
@@ -1445,10 +1445,10 @@ fn jit_blackhole_resume_from_guard(
         );
         let (bh_result, _bh_exc) = bh_opt?;
         match bh_result {
-            majit_meta::blackhole::BlackholeResult::Finish { values, .. } => {
+            majit_metainterp::blackhole::BlackholeResult::Finish { values, .. } => {
                 return values.first().copied();
             }
-            majit_meta::blackhole::BlackholeResult::Jump { values, .. } => {
+            majit_metainterp::blackhole::BlackholeResult::Jump { values, .. } => {
                 // Loop back: re-enter from the loop header (fail_index=0)
                 current_fail_index = 0;
                 current_values = values;
@@ -1457,7 +1457,7 @@ fn jit_blackhole_resume_from_guard(
                 // re-entry support in the blackhole yet.
                 return None;
             }
-            majit_meta::blackhole::BlackholeResult::GuardFailed { fail_values, .. } => {
+            majit_metainterp::blackhole::BlackholeResult::GuardFailed { fail_values, .. } => {
                 // Nested guard failure inside blackhole. Fall back.
                 return None;
             }
@@ -1509,7 +1509,7 @@ pub fn jit_bridge_compile_for_guard(
     let mut jit_state = build_jit_state(frame, info);
     let loop_header_pc = 0; // not used by start_bridge_tracing
 
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
             green_key, trace_id, fail_index, resume_pc
@@ -1526,7 +1526,7 @@ pub fn jit_bridge_compile_for_guard(
         resume_pc,
         loop_header_pc,
     ) {
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] start_bridge_tracing failed key={} trace={} fail={}",
                 green_key, trace_id, fail_index
@@ -1550,7 +1550,7 @@ pub fn jit_bridge_compile_for_guard(
             driver
                 .meta_interp_mut()
                 .emit_exception_bridge_prologue(exc_class, exc_value);
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-exc] exception guard bridge: class={:#x} value={:#x}",
                     exc_class, exc_value
@@ -1589,7 +1589,7 @@ pub fn jit_bridge_compile_for_guard(
         // merge_point handles Finish/CloseLoop via bridge_info.
         // If it returns an outcome, the bridge was compiled.
         if outcome.is_some() {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] compiled at step={} pc={} key={}",
                     step, pc, green_key
@@ -1601,7 +1601,7 @@ pub fn jit_bridge_compile_for_guard(
         // If the driver is no longer tracing, the bridge was compiled
         // (or aborted) inside merge_point.
         if !driver.is_tracing() {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] trace ended at step={} pc={} key={}",
                     step, pc, green_key
@@ -1618,7 +1618,7 @@ pub fn jit_bridge_compile_for_guard(
 
     // Trace didn't converge — abort.
     if driver.is_tracing() {
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] abort: too many ops key={} trace={} fail={}",
                 green_key, trace_id, fail_index
@@ -1669,12 +1669,12 @@ extern "C" fn jit_bridge_compile_callee(
     let mut constants: HashMap<u32, i64> = HashMap::new();
     constants.insert(func_const_ref.0, force_fn_ptr);
 
-    let call_descr = majit_meta::make_call_descr(&[Type::Int], Type::Int);
+    let call_descr = majit_metainterp::make_call_descr(&[Type::Int], Type::Int);
     let call_result = OpRef(1);
     let mut call_op = Op::with_descr(OpCode::CallI, &[func_const_ref, frame_opref], call_descr);
     call_op.pos = call_result;
 
-    let finish_descr = majit_meta::make_fail_descr_typed(vec![Type::Int]);
+    let finish_descr = majit_metainterp::make_fail_descr_typed(vec![Type::Int]);
     let mut finish_op = Op::with_descr(OpCode::Finish, &[call_result], finish_descr);
     finish_op.pos = OpRef(2);
 

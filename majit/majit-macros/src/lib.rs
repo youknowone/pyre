@@ -564,7 +564,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn descriptor(
                 green_types: &[majit_ir::Type],
                 red_types: &[majit_ir::Type],
-            ) -> Result<majit_meta::JitDriverStaticData, &'static str> {
+            ) -> Result<majit_metainterp::JitDriverStaticData, &'static str> {
                 if green_types.len() != Self::NUM_GREENS {
                     return Err("wrong number of green variable types");
                 }
@@ -582,7 +582,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .zip(red_types.iter().copied())
                     .map(|(name, tp)| (*name, tp))
                     .collect::<Vec<_>>();
-                let descriptor = majit_meta::JitDriverStaticData::with_virtualizable(
+                let descriptor = majit_metainterp::JitDriverStaticData::with_virtualizable(
                     greens,
                     reds,
                     Self::VIRTUALIZABLE,
@@ -603,7 +603,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        impl #generics majit_meta::DeclarativeJitDriver for #struct_name #generics {
+        impl #generics majit_metainterp::DeclarativeJitDriver for #struct_name #generics {
             const GREENS: &'static [&'static str] = <Self>::GREENS;
             const REDS: &'static [&'static str] = <Self>::REDS;
             const NUM_VARS: usize = <Self>::NUM_VARS;
@@ -614,7 +614,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn descriptor(
                 green_types: &[majit_ir::Type],
                 red_types: &[majit_ir::Type],
-            ) -> Result<majit_meta::JitDriverStaticData, &'static str> {
+            ) -> Result<majit_metainterp::JitDriverStaticData, &'static str> {
                 <Self>::descriptor(green_types, red_types)
             }
 
@@ -884,8 +884,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (majit_meta::JitCode, u16, u8) {
-            let mut __builder = majit_meta::JitCodeBuilder::new();
+        pub(crate) fn #helper_name() -> (majit_metainterp::JitCode, u16, u8) {
+            let mut __builder = majit_metainterp::JitCodeBuilder::new();
             #(#ensure_param_regs)*
             #helper_body
             (__builder.finish(), #return_reg, #return_kind_code)

@@ -14,4 +14,4 @@ majit-runtime = { path = "../majit-runtime" }
 
 [dev-dependencies]
 majit-ir = { path = "../majit-ir" }
-majit-meta = { path = "../majit-meta" }
+majit-metainterp = { path = "../majit-metainterp" }

@@ -56,7 +56,7 @@ pub struct JitFrameDescrs {
     pub jitframe_tid: u32,
     /// JitFrame fixed header size (bytes).
     pub jitframe_fixed_size: usize,
-    /// Byte offsets of JitFrame fields (from majit_meta::jitframe).
+    /// Byte offsets of JitFrame fields (from majit_metainterp::jitframe).
     pub jf_frame_info_ofs: i32,
     pub jf_descr_ofs: i32,
     pub jf_force_descr_ofs: i32,

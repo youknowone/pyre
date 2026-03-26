@@ -874,14 +874,14 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             #[inline(never)]
             #[allow(non_snake_case)]
             fn #merge_fn_name(
-                __driver: &mut majit_meta::JitDriver<#state_type>,
+                __driver: &mut majit_metainterp::JitDriver<#state_type>,
                 __env: &#env_type,
                 __pc: usize,
             ) {
                 __driver.merge_point(|__ctx, __sym| {
-                    use majit_meta::JitCodeSym;
+                    use majit_metainterp::JitCodeSym;
                     if __sym.trace_started && __pc == __sym.loop_header_pc() {
-                        return majit_meta::TraceAction::CloseLoop;
+                        return majit_metainterp::TraceAction::CloseLoop;
                     }
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
                     __sym.trace_started = true;
@@ -905,19 +905,19 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             #[inline(never)]
             #[allow(non_snake_case)]
             fn #merge_fn_name(
-                __driver: &mut majit_meta::JitDriver<#state_type>,
+                __driver: &mut majit_metainterp::JitDriver<#state_type>,
                 __env: &#env_type,
                 __pc: usize,
                 __pool: &#pool_type,
                 __sel: usize,
             ) {
                 __driver.merge_point(|__ctx, __sym| {
-                    use majit_meta::JitCodeSym;
+                    use majit_metainterp::JitCodeSym;
                     if __sym.trace_started
                         && __pc == __sym.loop_header_pc()
                         #close_selected_check
                     {
-                        return majit_meta::TraceAction::CloseLoop;
+                        return majit_metainterp::TraceAction::CloseLoop;
                     }
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
                     __sym.trace_started = true;

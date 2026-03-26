@@ -17,7 +17,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
 use majit_ir::OpCode;
-use majit_meta::jitcode::{JitCode, JitCodeBuilder};
+use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 use pyre_bytecode::bytecode::{CodeObject, Instruction, OpArgState};
 
 // ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ impl CodeWriter {
                     assembler.load_const_i_value(int_tmp0, val);
                     assembler.call_ref_typed(
                         box_int_fn_idx,
-                        &[majit_meta::jitcode::JitCallArg::int(int_tmp0)],
+                        &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                         obj_tmp0,
                     );
                     assembler.push_r(obj_tmp0);
@@ -200,8 +200,8 @@ impl CodeWriter {
                     assembler.call_ref_typed(
                         load_const_fn_idx,
                         &[
-                            majit_meta::jitcode::JitCallArg::int(frame_reg),
-                            majit_meta::jitcode::JitCallArg::int(int_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::int(frame_reg),
+                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         obj_tmp0,
                     );
@@ -226,9 +226,9 @@ impl CodeWriter {
                     assembler.call_may_force_void_typed_args(
                         store_subscr_fn_idx,
                         &[
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_meta::jitcode::JitCallArg::reference(arg_regs_start),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start),
                         ],
                     );
                 }
@@ -252,9 +252,9 @@ impl CodeWriter {
                     assembler.call_may_force_ref_typed(
                         binary_op_fn_idx,
                         &[
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_meta::jitcode::JitCallArg::int(op_code_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         obj_tmp0,
                     );
@@ -270,9 +270,9 @@ impl CodeWriter {
                     assembler.call_may_force_ref_typed(
                         compare_fn_idx,
                         &[
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_meta::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_meta::jitcode::JitCallArg::int(op_code_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         obj_tmp0,
                     );
@@ -293,7 +293,7 @@ impl CodeWriter {
                     // truth_fn: PyObjectRef → 0/1 (truthiness check)
                     assembler.call_int_typed(
                         truth_fn_idx,
-                        &[majit_meta::jitcode::JitCallArg::reference(obj_tmp0)],
+                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
                         int_tmp0,
                     );
                     if target_py_pc < num_instrs {
@@ -314,7 +314,7 @@ impl CodeWriter {
                     assembler.pop_r(obj_tmp0);
                     assembler.call_int_typed(
                         truth_fn_idx,
-                        &[majit_meta::jitcode::JitCallArg::reference(obj_tmp0)],
+                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
                         int_tmp0,
                     );
                     assembler.load_const_i_value(int_tmp1, 0);
@@ -361,8 +361,8 @@ impl CodeWriter {
                     assembler.call_may_force_ref_typed(
                         load_global_fn_idx,
                         &[
-                            majit_meta::jitcode::JitCallArg::int(frame_reg),
-                            majit_meta::jitcode::JitCallArg::int(int_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::int(frame_reg),
+                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         obj_tmp0,
                     );
@@ -396,13 +396,14 @@ impl CodeWriter {
 
                     // call_fn(callable, arg0, frame_ptr) → result
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
-                    let mut call_args = vec![majit_meta::jitcode::JitCallArg::reference(obj_tmp1)];
+                    let mut call_args =
+                        vec![majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)];
                     for i in 0..nargs {
-                        call_args.push(majit_meta::jitcode::JitCallArg::reference(
+                        call_args.push(majit_metainterp::jitcode::JitCallArg::reference(
                             arg_regs_start + i as u16,
                         ));
                     }
-                    call_args.push(majit_meta::jitcode::JitCallArg::int(frame_reg));
+                    call_args.push(majit_metainterp::jitcode::JitCallArg::int(frame_reg));
                     assembler.call_may_force_ref_typed(call_fn_idx, &call_args, obj_tmp0);
                     assembler.push_r(obj_tmp0);
                 }

@@ -9,10 +9,9 @@ pyre-bytecode = { path = "../pyre-bytecode" }
 pyre-object = { path = "../pyre-object" }
 pyre-interpreter = { path = "../pyre-interpreter" }
 majit-ir = { path = "../../majit/majit-ir" }
-majit-meta = { path = "../../majit/majit-meta" }
+majit-metainterp = { path = "../../majit/majit-metainterp" }
 majit-codegen = { path = "../../majit/majit-codegen" }
 majit-codegen-cranelift = { path = "../../majit/majit-codegen-cranelift" }
-majit-opt = { path = "../../majit/majit-opt" }
 majit-trace = { path = "../../majit/majit-trace" }
 majit-gc = { path = "../../majit/majit-gc" }
 

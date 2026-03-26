@@ -13,5 +13,5 @@ pyre-object = { workspace = true }
 pyre-bytecode = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-jit = { path = "../pyre-jit" }
-majit-opt = { path = "../../majit/majit-opt" }
+majit-metainterp = { path = "../../majit/majit-metainterp" }
 lexopt = "0.3"

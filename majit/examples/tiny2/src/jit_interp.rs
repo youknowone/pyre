@@ -202,7 +202,8 @@ impl BytecodeExt for [u8] {
 )]
 #[allow(unused_assignments, unused_variables)]
 fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold: u32) -> i64 {
-    let mut driver: majit_meta::JitDriver<Tiny2State> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<Tiny2State> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     // stacksize is updated by macro-generated code in can_enter_jit! expansion.
     let mut stacksize: i32 = num_args as i32;

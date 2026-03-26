@@ -53,16 +53,16 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]
             fn #trace_fn_name(
-                __ctx: &mut majit_meta::TraceCtx,
+                __ctx: &mut majit_metainterp::TraceCtx,
                 __sym: &mut __JitSym,
                 program: &#env_type,
                 pc: usize,
-            ) -> majit_meta::TraceAction {
-                use majit_meta::TraceAction;
+            ) -> majit_metainterp::TraceAction {
+                use majit_metainterp::TraceAction;
 
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
-                    if majit_meta::majit_log_enabled() {
+                    if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit] no jitcode for pc={} op={}",
                             pc,
@@ -72,7 +72,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     return TraceAction::AbortPermanent;
                 };
 
-                let __result = majit_meta::trace_jitcode(
+                let __result = majit_metainterp::trace_jitcode(
                     __ctx,
                     __sym,
                     &__jitcode,
@@ -81,7 +81,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     |_, _| 0i64,
                     #label_closure,
                 );
-                if majit_meta::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+                if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
                     eprintln!(
                         "[jit] trace action at pc={} op={} -> {:?}",
                         pc,
@@ -101,18 +101,18 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         quote! {
             #[allow(non_snake_case, unused_variables, unused_mut)]
             fn #trace_fn_name(
-                __ctx: &mut majit_meta::TraceCtx,
+                __ctx: &mut majit_metainterp::TraceCtx,
                 __sym: &mut __JitSym,
                 program: &#env_type,
                 pc: usize,
                 __storage: &#pool_type,
                 __selected: usize,
-            ) -> majit_meta::TraceAction {
-                use majit_meta::TraceAction;
+            ) -> majit_metainterp::TraceAction {
+                use majit_metainterp::TraceAction;
 
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
-                    if majit_meta::majit_log_enabled() {
+                    if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit] no jitcode for pc={} op={} selected={}",
                             pc,
@@ -123,7 +123,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     return TraceAction::AbortPermanent;
                 };
 
-                let __result = majit_meta::trace_jitcode(
+                let __result = majit_metainterp::trace_jitcode(
                     __ctx,
                     __sym,
                     &__jitcode,
@@ -132,7 +132,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
                     #label_closure,
                 );
-                if majit_meta::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
+                if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
                     eprintln!(
                         "[jit] trace action at pc={} op={} selected={} -> {:?}",
                         pc,
@@ -152,7 +152,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             program: &#env_type,
             pc: usize,
             __op: u8,
-        ) -> Option<majit_meta::JitCode> {
+        ) -> Option<majit_metainterp::JitCode> {
             match __op {
                 #(#jitcode_arms)*
             }
@@ -176,7 +176,7 @@ fn generate_jitcode_arm(
 
             match code {
                 Some(code) => quote! {
-                    let mut __builder = majit_meta::JitCodeBuilder::new();
+                    let mut __builder = majit_metainterp::JitCodeBuilder::new();
                     #code
                     Some(__builder.finish())
                 },
@@ -184,7 +184,7 @@ fn generate_jitcode_arm(
             }
         }
         ArmPattern::BranchGroup => quote! {
-            let mut __builder = majit_meta::JitCodeBuilder::new();
+            let mut __builder = majit_metainterp::JitCodeBuilder::new();
             match __op {
                 crate::aheui::OP_BRPOP1 => __builder.require_stack(1),
                 crate::aheui::OP_BRPOP2 => __builder.require_stack(2),
@@ -195,12 +195,12 @@ fn generate_jitcode_arm(
             Some(__builder.finish())
         },
         ArmPattern::AbortPermanent | ArmPattern::Halt => quote! {
-            let mut __builder = majit_meta::JitCodeBuilder::new();
+            let mut __builder = majit_metainterp::JitCodeBuilder::new();
             __builder.abort_permanent();
             Some(__builder.finish())
         },
         ArmPattern::Nop => quote! {
-            Some(majit_meta::JitCodeBuilder::new().finish())
+            Some(majit_metainterp::JitCodeBuilder::new().finish())
         },
         ArmPattern::Unsupported(_reason) => {
             // Complex CFG (loop/while/for in match arm) cannot be lowered to
@@ -209,7 +209,7 @@ fn generate_jitcode_arm(
             // dont_look_inside behavior for complex code patterns.
             quote! {
                 Some({
-                    let mut builder = majit_meta::JitCodeBuilder::new();
+                    let mut builder = majit_metainterp::JitCodeBuilder::new();
                     builder.abort();
                     builder.finish()
                 })

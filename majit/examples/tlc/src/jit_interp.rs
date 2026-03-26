@@ -232,7 +232,8 @@ const DEFAULT_THRESHOLD: u32 = 3;
     },
 )]
 pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
-    let mut driver: majit_meta::JitDriver<TlcState> = majit_meta::JitDriver::new(threshold);
+    let mut driver: majit_metainterp::JitDriver<TlcState> =
+        majit_metainterp::JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut stacksize: i32 = 0;
     let mut state = TlcState {

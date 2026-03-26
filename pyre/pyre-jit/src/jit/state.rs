@@ -5,8 +5,10 @@
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
-use majit_meta::virtualizable::VirtualizableInfo;
-use majit_meta::{JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx};
+use majit_metainterp::virtualizable::VirtualizableInfo;
+use majit_metainterp::{
+    JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
+};
 
 use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::frame::PendingInlineResult;
@@ -456,7 +458,7 @@ fn note_inline_trace_too_long(
     } else {
         warm_state.trace_next_iteration(root_trace_key);
     }
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][trace-through] disable_noninlinable_function key={} caller_function_key={} root_trace_key={} same_key={}",
             callee_key,
@@ -484,7 +486,7 @@ fn note_root_trace_too_long(green_key: u64) {
     let warm_state = driver.meta_interp_mut().warm_state_mut();
     warm_state.trace_next_iteration(green_key);
     warm_state.mark_force_finish_tracing(green_key);
-    if majit_meta::majit_log_enabled() {
+    if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][trace-too-long] trace_next_iteration + mark_force_finish_tracing key={}",
             green_key
@@ -1192,7 +1194,7 @@ impl PyreSym {
         }
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][init-sym] concrete_frame={:#x} nlocals={} vable_base={:?} header_pc={} func_entry={}",
                 concrete_frame,
@@ -3689,7 +3691,7 @@ impl MIFrame {
                 let callee_prefers_function_entry =
                     crate::call_jit::callable_prefers_function_entry(concrete_callable);
                 if is_self_recursive
-                    && inline_decision == majit_meta::InlineDecision::Inline
+                    && inline_decision == majit_metainterp::InlineDecision::Inline
                     && recursive_depth >= max_unroll_recursion
                 {
                     driver
@@ -3718,13 +3720,13 @@ impl MIFrame {
                         // not recursively trace-through "self"; they converge
                         // to CALL_ASSEMBLER via the pending token path below.
                         !tracing_recursive_function_entry
-                            && inline_decision == majit_meta::InlineDecision::Inline
+                            && inline_decision == majit_metainterp::InlineDecision::Inline
                             && recursive_depth < max_unroll_recursion
                     } else {
                         !callee_prefers_function_entry && !callee_has_loop
                     };
 
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][direct-call] key={} nargs={} inline_eligible={} self_recursive={} recursive_depth={} max_unroll_recursion={} prefers_func_entry={} has_loop={} inline_active={} can_trace_through={}",
                         callee_key,
@@ -3775,7 +3777,7 @@ impl MIFrame {
                                 .with_ctx(|_, ctx| Ok(ctx.const_int(pyre_object::PY_NULL as i64)));
                         }
                         Err(err) => {
-                            if majit_meta::majit_log_enabled() {
+                            if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][perform-call] build_pending failed key={} err={}, residual path",
                                     callee_key, err
@@ -3800,7 +3802,7 @@ impl MIFrame {
                 // descriptor/input mismatch and rejects the trace. Keep
                 // self-recursion on the helper-boundary path below until the
                 // framestack implementation is complete.
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][call-check] is_self={} cache_safe={} inline_active={} callee_key={}",
                         is_self_recursive,
@@ -3810,7 +3812,7 @@ impl MIFrame {
                     );
                 }
 
-                if inline_decision == majit_meta::InlineDecision::Inline {
+                if inline_decision == majit_metainterp::InlineDecision::Inline {
                     if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                         return self.inline_function_call(
                             callable,
@@ -3823,7 +3825,7 @@ impl MIFrame {
                     }
                 }
 
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][call-dispatch] callee_key={} pending_token={:?} loop_token={:?} is_self={}",
                         callee_key,
@@ -3925,7 +3927,7 @@ impl MIFrame {
                 }
 
                 match inline_decision {
-                    majit_meta::InlineDecision::CallAssembler => {
+                    majit_metainterp::InlineDecision::CallAssembler => {
                         // Trace-through: inline callee body instead of CallAssembler.
                         // Guards use parent_fail_args to avoid OpRef::NONE in fail_args.
                         if callee_inline_eligible
@@ -3947,7 +3949,7 @@ impl MIFrame {
                                     });
                                 }
                                 Err(err) => {
-                                    if majit_meta::majit_log_enabled() {
+                                    if majit_metainterp::majit_log_enabled() {
                                         eprintln!(
                                             "[jit][perform-call] call-assembler inline failed key={} err={}",
                                             callee_key, err
@@ -4084,7 +4086,7 @@ impl MIFrame {
                             });
                         }
                     }
-                    majit_meta::InlineDecision::Inline => {
+                    majit_metainterp::InlineDecision::Inline => {
                         if let Some(frame_helper) = crate::call_jit::callee_frame_helper(nargs) {
                             return self.inline_function_call(
                                 callable,
@@ -4096,7 +4098,7 @@ impl MIFrame {
                             );
                         }
                     }
-                    majit_meta::InlineDecision::ResidualCall => {}
+                    majit_metainterp::InlineDecision::ResidualCall => {}
                 }
 
                 let call_pc = self.fallthrough_pc.saturating_sub(1);
@@ -4705,7 +4707,7 @@ impl MIFrame {
 
     pub(crate) fn trace_code_step(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
         if pc >= code.instructions.len() {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][abort-reason] trace_code_step pc_oob pc={} code_len={}",
                     pc,
@@ -4716,7 +4718,7 @@ impl MIFrame {
         }
 
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][abort-reason] trace_code_step decode_failed pc={}",
                     pc
@@ -4792,7 +4794,7 @@ impl MIFrame {
             pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
         {
             let handler_pc = entry.target as usize;
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle_possible_exception] pc={} handler={} err={}",
                     pc, handler_pc, err
@@ -4826,7 +4828,7 @@ impl MIFrame {
             // MIFrame overrides (already stubbed below) to be fully wired.
             TraceAction::Abort
         } else {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle_possible_exception] no handler pc={} err={}",
                     pc, err
@@ -4842,7 +4844,7 @@ impl MIFrame {
         pc: usize,
     ) -> InlineTraceStepAction {
         if pc >= code.instructions.len() {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][abort-reason] trace_code_step_inline pc_oob pc={} code_len={}",
                     pc,
@@ -4853,7 +4855,7 @@ impl MIFrame {
         }
 
         let Some((instruction, op_arg)) = decode_instruction_at(code, pc) else {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][abort-reason] trace_code_step_inline decode_failed pc={}",
                     pc
@@ -4916,13 +4918,13 @@ pub(crate) fn trace_step_result_to_action(
                     let warm_state = driver.meta_interp_mut().warm_state_mut();
                     warm_state.disable_noninlinable_function(biggest_key);
                     warm_state.trace_next_iteration(root_green_key);
-                    if majit_meta::majit_log_enabled() {
+                    if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit][trace-too-long] biggest_inline_key={} trace_next_iteration root_key={}",
                             biggest_key, root_green_key
                         );
                     }
-                    return majit_meta::TraceAction::Abort;
+                    return majit_metainterp::TraceAction::Abort;
                 }
                 let force_finish_trace = {
                     let (driver, _) = crate::eval::driver_pair();
@@ -4930,7 +4932,7 @@ pub(crate) fn trace_step_result_to_action(
                 };
                 if force_finish_trace {
                     let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
-                    if majit_meta::majit_log_enabled() {
+                    if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit] force_finish_trace: closing loop early at key={}",
                             root_green_key
@@ -4942,7 +4944,7 @@ pub(crate) fn trace_step_result_to_action(
                     };
                 }
                 note_root_trace_too_long(root_green_key);
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][abort-reason] trace_too_long key={} root_key={}",
                         green_key, root_green_key
@@ -4998,7 +5000,7 @@ pub(crate) fn trace_step_result_to_action(
             }
         }
         Err(err) => {
-            if majit_meta::majit_log_enabled() {
+            if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][abort-reason] step_error key={} err={}",
                     state.ctx().green_key(),
@@ -5443,8 +5445,8 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     let outcome = driver
                         .meta_interp_mut()
                         .compile_trace(root_key, &jump_args, None);
-                    if matches!(outcome, majit_meta::CompileOutcome::Compiled { .. }) {
-                        if majit_meta::majit_log_enabled() {
+                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                        if majit_metainterp::majit_log_enabled() {
                             eprintln!(
                                 "[jit][reached_loop_header] compile_trace success: root={} pc={}",
                                 root_key, target
@@ -5473,7 +5475,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 };
                 ctx.add_merge_point(back_edge_key, live_args, live_types, target);
                 MIFrame::set_next_instr(this, ctx, target);
-                if majit_meta::majit_log_enabled() {
+                if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit][reached_loop_header] first visit, unroll: key={} pc={}",
                         back_edge_key, target
@@ -6485,7 +6487,7 @@ impl JitState for PyreJitState {
             return;
         };
         self.frame = value_to_usize(frame);
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
                     return None;
@@ -6558,7 +6560,7 @@ impl JitState for PyreJitState {
             self.valuestackdepth = meta.valuestackdepth;
         }
         let _ = self.sync_scalar_fields_to_frame();
-        if majit_meta::majit_log_enabled() {
+        if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
                     return None;
@@ -6576,7 +6578,7 @@ impl JitState for PyreJitState {
         &mut self,
         meta: &Self::Meta,
         values: &[Value],
-        _exception: &majit_meta::blackhole::ExceptionState,
+        _exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         if !meta.has_virtualizable {
             self.restore_values(meta, values);
@@ -6664,7 +6666,7 @@ impl JitState for PyreJitState {
         total_frames: usize,
         frame_pc: u64,
         values: &[Value],
-        _exception: &majit_meta::blackhole::ExceptionState,
+        _exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         if frame_index + 1 != total_frames {
             return true;
@@ -6860,7 +6862,7 @@ impl JitState for PyreJitState {
         &mut self,
         _meta: &Self::Meta,
         _virtual_index: usize,
-        materialized: &majit_meta::resume::MaterializedVirtual,
+        materialized: &majit_metainterp::resume::MaterializedVirtual,
     ) -> Option<majit_ir::GcRef> {
         self.materialize_virtual_ref_from_layout(materialized, &[])
     }
@@ -6869,7 +6871,7 @@ impl JitState for PyreJitState {
         &mut self,
         _meta: &Self::Meta,
         _virtual_index: usize,
-        materialized: &majit_meta::resume::MaterializedVirtual,
+        materialized: &majit_metainterp::resume::MaterializedVirtual,
         materialized_refs: &[Option<majit_ir::GcRef>],
     ) -> Option<majit_ir::GcRef> {
         self.materialize_virtual_ref_from_layout(materialized, materialized_refs)
@@ -6879,10 +6881,10 @@ impl JitState for PyreJitState {
 impl PyreJitState {
     fn materialize_virtual_ref_from_layout(
         &mut self,
-        materialized: &majit_meta::resume::MaterializedVirtual,
+        materialized: &majit_metainterp::resume::MaterializedVirtual,
         materialized_refs: &[Option<majit_ir::GcRef>],
     ) -> Option<majit_ir::GcRef> {
-        use majit_meta::resume::MaterializedVirtual;
+        use majit_metainterp::resume::MaterializedVirtual;
 
         match materialized {
             MaterializedVirtual::Struct { fields, .. }
@@ -6898,7 +6900,7 @@ impl PyreJitState {
 
     fn materialize_virtual_object(
         &mut self,
-        fields: &[(u32, majit_meta::resume::MaterializedValue)],
+        fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
         materialized_refs: &[Option<majit_ir::GcRef>],
     ) -> Option<majit_ir::GcRef> {
         let mut ob_type: usize = 0;
@@ -6953,7 +6955,7 @@ impl PyreJitState {
 
 fn materialize_virtual_raw_buffer(
     size: usize,
-    entries: &[(usize, usize, majit_meta::resume::MaterializedValue)],
+    entries: &[(usize, usize, majit_metainterp::resume::MaterializedValue)],
     materialized_refs: &[Option<majit_ir::GcRef>],
 ) -> Option<majit_ir::GcRef> {
     use std::alloc::{Layout, alloc_zeroed};
@@ -7019,8 +7021,8 @@ fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_meta::JitState;
-    use majit_meta::resume::{MaterializedValue, MaterializedVirtual};
+    use majit_metainterp::JitState;
+    use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
@@ -7360,7 +7362,7 @@ mod tests {
             &mut state,
             &meta,
             &values,
-            &majit_meta::blackhole::ExceptionState::default(),
+            &majit_metainterp::blackhole::ExceptionState::default(),
         ));
 
         assert_eq!(state.next_instr, 9);

@@ -101,8 +101,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             .collect();
         quote! {
             #[allow(non_snake_case)]
-            fn __build_virtualizable_info() -> Option<majit_meta::virtualizable::VirtualizableInfo> {
-                let mut __info = majit_meta::virtualizable::VirtualizableInfo::new(#token_offset);
+            fn __build_virtualizable_info() -> Option<majit_metainterp::virtualizable::VirtualizableInfo> {
+                let mut __info = majit_metainterp::virtualizable::VirtualizableInfo::new(#token_offset);
                 #(#field_adds)*
                 #(#array_adds)*
                 Some(__info)
@@ -116,7 +116,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 &self,
                 _meta: &Self::Meta,
                 virtualizable: &str,
-                _info: &majit_meta::virtualizable::VirtualizableInfo,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Option<*mut u8> {
                 if virtualizable == #virtualizable_name {
                     Some((&self.#pool_field as *const _ as *mut u8).cast::<u8>())
@@ -129,7 +129,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 &self,
                 _meta: &Self::Meta,
                 virtualizable: &str,
-                info: &majit_meta::virtualizable::VirtualizableInfo,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Option<Vec<usize>> {
                 if virtualizable != #virtualizable_name {
                     return None;
@@ -146,7 +146,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 &mut self,
                 _meta: &Self::Meta,
                 _virtualizable: &str,
-                _info: &majit_meta::virtualizable::VirtualizableInfo,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
                 _static_boxes: &[i64],
                 _array_boxes: &[Vec<i64>],
             ) -> bool {
@@ -157,7 +157,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 &self,
                 meta: &Self::Meta,
                 virtualizable: &str,
-                info: &majit_meta::virtualizable::VirtualizableInfo,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
                 if virtualizable != #virtualizable_name {
                     return None;
@@ -173,7 +173,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn sync_virtualizable_before_residual_call(
                 &self,
-                ctx: &mut majit_meta::trace_ctx::TraceCtx,
+                ctx: &mut majit_metainterp::trace_ctx::TraceCtx,
             ) {
                 let Some(info) = Self::__build_virtualizable_info() else {
                     return;
@@ -191,14 +191,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn sync_virtualizable_after_residual_call(
                 &self,
-                _ctx: &mut majit_meta::trace_ctx::TraceCtx,
-            ) -> majit_meta::jit_state::ResidualVirtualizableSync {
+                _ctx: &mut majit_metainterp::trace_ctx::TraceCtx,
+            ) -> majit_metainterp::jit_state::ResidualVirtualizableSync {
                 let Some(info) = Self::__build_virtualizable_info() else {
-                    return majit_meta::jit_state::ResidualVirtualizableSync::default();
+                    return majit_metainterp::jit_state::ResidualVirtualizableSync::default();
                 };
                 let obj_ptr = (&self.#pool_field as *const _ as *mut u8).cast::<u8>();
                 let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
-                majit_meta::jit_state::ResidualVirtualizableSync {
+                majit_metainterp::jit_state::ResidualVirtualizableSync {
                     updated_fields: Vec::new(),
                     forced,
                 }
@@ -267,7 +267,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     trace_started: bool,
                 }
 
-                impl majit_meta::JitCodeSym for __JitSym {
+                impl majit_metainterp::JitCodeSym for __JitSym {
                     fn current_selected(&self) -> usize {
                         self.pending_selected.unwrap_or(self.committed_selected)
                     }
@@ -335,11 +335,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                         self.pending_selected_value = None;
                     }
 
-                    fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                    fn stack(&self, _selected: usize) -> Option<&majit_metainterp::SymbolicStack> {
                         None
                     }
 
-                    fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                    fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_metainterp::SymbolicStack> {
                         None
                     }
 
@@ -366,7 +366,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                     fn fail_args_with_ctx(
                         &mut self,
-                        ctx: &mut majit_meta::TraceCtx,
+                        ctx: &mut majit_metainterp::TraceCtx,
                     ) -> Option<Vec<majit_ir::OpRef>> {
                         // Guard failures must start with the same live state
                         // as the parent loop's inputargs so attached bridges
@@ -475,7 +475,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                     fn ensure_compact_storage_loaded(
                         &mut self,
-                        ctx: &mut majit_meta::TraceCtx,
+                        ctx: &mut majit_metainterp::TraceCtx,
                         selected: usize,
                     ) -> Option<(majit_ir::OpRef, majit_ir::OpRef, majit_ir::OpRef)> {
                         if false #( || selected == #untraceable )* {
@@ -552,7 +552,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                     fn compact_storage_writeback_len(
                         &mut self,
-                        ctx: &mut majit_meta::TraceCtx,
+                        ctx: &mut majit_metainterp::TraceCtx,
                         selected: usize,
                         new_len: majit_ir::OpRef,
                     ) {
@@ -580,7 +580,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                     fn compact_storage_decode(
                         &self,
-                        ctx: &mut majit_meta::TraceCtx,
+                        ctx: &mut majit_metainterp::TraceCtx,
                         raw: majit_ir::OpRef,
                     ) -> majit_ir::OpRef {
                         #compact_decode
@@ -588,14 +588,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                     fn compact_storage_encode(
                         &self,
-                        ctx: &mut majit_meta::TraceCtx,
+                        ctx: &mut majit_metainterp::TraceCtx,
                         value: majit_ir::OpRef,
                     ) -> majit_ir::OpRef {
                         #compact_encode
                     }
                 }
 
-                impl majit_meta::JitState for #state_type {
+                impl majit_metainterp::JitState for #state_type {
                     type Meta = __JitMeta;
                     type Sym = __JitSym;
                     type Env = #env_type;
@@ -714,7 +714,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     #vable_state_hooks
 
                     fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
-                        let selected = majit_meta::JitCodeSym::current_selected_value(sym)
+                        let selected = majit_metainterp::JitCodeSym::current_selected_value(sym)
                             .unwrap_or_else(|| majit_ir::OpRef::NONE);
                         vec![sym.pool_ref, selected]
                     }
@@ -750,7 +750,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 trace_started: bool,
             }
 
-            impl majit_meta::JitCodeSym for __JitSym {
+            impl majit_metainterp::JitCodeSym for __JitSym {
                 fn current_selected(&self) -> usize {
                     self.current_selected
                 }
@@ -768,11 +768,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     self.current_selected_value = Some(value);
                 }
 
-                fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                fn stack(&self, _selected: usize) -> Option<&majit_metainterp::SymbolicStack> {
                     None
                 }
 
-                fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_metainterp::SymbolicStack> {
                     None
                 }
 
@@ -828,7 +828,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn compact_storage_decode(
                     &self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     raw: majit_ir::OpRef,
                 ) -> majit_ir::OpRef {
                     #compact_decode
@@ -836,14 +836,14 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn compact_storage_encode(
                     &self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     value: majit_ir::OpRef,
                 ) -> majit_ir::OpRef {
                     #compact_encode
                 }
             }
 
-            impl majit_meta::JitState for #state_type {
+            impl majit_metainterp::JitState for #state_type {
                 type Meta = __JitMeta;
                 type Sym = __JitSym;
                 type Env = #env_type;
@@ -1021,7 +1021,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn linked_list_writeback_tail(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                     new_tail: majit_ir::OpRef,
                 ) {
@@ -1040,7 +1040,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn ensure_linked_list_tail(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                 ) -> Option<majit_ir::OpRef> {
                     if let Some(&tail) = self.linked_list_tails.get(&selected) {
@@ -1108,7 +1108,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
                 linked_list_tails: std::collections::HashMap<usize, majit_ir::OpRef>,
                 // Keep symbolic stacks for fallback (non-linked-list storages)
-                stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
+                stacks: std::collections::HashMap<usize, majit_metainterp::SymbolicStack>,
             }
 
             #[allow(non_camel_case_types)]
@@ -1118,7 +1118,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
             }
 
-            impl majit_meta::JitCodeSym for __JitSym {
+            impl majit_metainterp::JitCodeSym for __JitSym {
                 fn current_selected(&self) -> usize {
                     self.current_selected
                 }
@@ -1154,11 +1154,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     self.current_stacksize_value = Some(value);
                 }
 
-                fn stack(&self, selected: usize) -> Option<&majit_meta::SymbolicStack> {
+                fn stack(&self, selected: usize) -> Option<&majit_metainterp::SymbolicStack> {
                     self.stacks.get(&selected)
                 }
 
-                fn stack_mut(&mut self, selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+                fn stack_mut(&mut self, selected: usize) -> Option<&mut majit_metainterp::SymbolicStack> {
                     self.stacks.get_mut(&selected)
                 }
 
@@ -1226,7 +1226,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn ensure_linked_list_stack_ref(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                 ) -> Option<majit_ir::OpRef> {
                     if false #( || selected == #untraceable )* {
@@ -1255,7 +1255,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn ensure_linked_list_head(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                 ) -> Option<majit_ir::OpRef> {
                     if let Some(&head) = self.linked_list_heads.get(&selected) {
@@ -1307,7 +1307,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn linked_list_writeback_head(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                     new_head: majit_ir::OpRef,
                 ) {
@@ -1363,7 +1363,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
                 fn linked_list_writeback_size(
                     &mut self,
-                    ctx: &mut majit_meta::TraceCtx,
+                    ctx: &mut majit_metainterp::TraceCtx,
                     selected: usize,
                     new_size: majit_ir::OpRef,
                 ) {
@@ -1384,7 +1384,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 #linked_list_queue_methods
             }
 
-            impl majit_meta::JitState for #state_type {
+            impl majit_metainterp::JitState for #state_type {
                 type Meta = __JitMeta;
                 type Sym = __JitSym;
                 type Env = #env_type;
@@ -1508,7 +1508,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
         /// Symbolic state during tracing: per-storage symbolic stacks.
         #[allow(non_camel_case_types)]
         struct __JitSym {
-            stacks: std::collections::HashMap<usize, majit_meta::SymbolicStack>,
+            stacks: std::collections::HashMap<usize, majit_metainterp::SymbolicStack>,
             current_selected: usize,
             current_selected_value: Option<majit_ir::OpRef>,
             storage_layout: Vec<(usize, usize)>,
@@ -1531,7 +1531,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         }
 
-        impl majit_meta::JitCodeSym for __JitSym {
+        impl majit_metainterp::JitCodeSym for __JitSym {
             fn current_selected(&self) -> usize {
                 self.current_selected
             }
@@ -1549,11 +1549,11 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 self.current_selected_value = Some(value);
             }
 
-            fn stack(&self, selected: usize) -> Option<&majit_meta::SymbolicStack> {
+            fn stack(&self, selected: usize) -> Option<&majit_metainterp::SymbolicStack> {
                 self.stacks.get(&selected)
             }
 
-            fn stack_mut(&mut self, selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+            fn stack_mut(&mut self, selected: usize) -> Option<&mut majit_metainterp::SymbolicStack> {
                 self.stacks.get_mut(&selected)
             }
 
@@ -1572,7 +1572,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize) {
                 self.stacks
                     .entry(selected)
-                    .or_insert_with(|| majit_meta::SymbolicStack::from_input_args(offset, len));
+                    .or_insert_with(|| majit_metainterp::SymbolicStack::from_input_args(offset, len));
                 if !self.storage_layout.iter().any(|&(s, _)| s == selected) {
                     self.storage_layout.push((selected, len));
                 }
@@ -1598,7 +1598,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #linked_list_descr_methods
         }
 
-        impl majit_meta::JitState for #state_type {
+        impl majit_metainterp::JitState for #state_type {
             type Meta = __JitMeta;
             type Sym = __JitSym;
             type Env = #env_type;
@@ -1639,7 +1639,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 for &(sidx, num_slots) in &meta.storage_layout {
                     stacks.insert(
                         sidx,
-                        majit_meta::SymbolicStack::from_input_args(offset, num_slots),
+                        majit_metainterp::SymbolicStack::from_input_args(offset, num_slots),
                     );
                     offset += num_slots;
                 }
@@ -2146,7 +2146,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             trace_started: bool,
         }
 
-        impl majit_meta::JitCodeSym for __JitSym {
+        impl majit_metainterp::JitCodeSym for __JitSym {
             fn current_selected(&self) -> usize {
                 0
             }
@@ -2159,11 +2159,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn set_current_selected_value(&mut self, _selected: usize, _value: majit_ir::OpRef) {}
 
-            fn stack(&self, _selected: usize) -> Option<&majit_meta::SymbolicStack> {
+            fn stack(&self, _selected: usize) -> Option<&majit_metainterp::SymbolicStack> {
                 None
             }
 
-            fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_meta::SymbolicStack> {
+            fn stack_mut(&mut self, _selected: usize) -> Option<&mut majit_metainterp::SymbolicStack> {
                 None
             }
 
@@ -2228,7 +2228,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         }
 
-        impl majit_meta::JitState for #state_type {
+        impl majit_metainterp::JitState for #state_type {
             type Meta = __JitMeta;
             type Sym = __JitSym;
             type Env = #env_type;
