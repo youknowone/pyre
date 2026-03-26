@@ -38,7 +38,7 @@ pub enum BackEdgeAction {
     RunCompiled,
 }
 
-/// pyjitpl.py: result of compile_loop / compile_loop.
+/// pyjitpl.py: result of compile_loop / compile_trace.
 ///
 /// RPython uses exceptions (raise ContinueRunningNormally on success,
 /// raise SwitchToBlackhole on fatal failure) and None returns for
