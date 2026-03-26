@@ -23,9 +23,10 @@ thread_local! {
     static SHADOW_STACK: RefCell<ShadowStack> = RefCell::new(ShadowStack::new());
 
     /// Thread-local jitframe shadow stack.
-    /// RPython: _call_header_shadowstack pushes jf_ptr here.
+    /// RPython: _call_header_shadowstack pushes [category, jf_ptr] pairs.
+    /// category=1 is the is_minor marker (incminimark.py optimization).
     /// GC walks this to find jitframes and trace their ref slots via jf_gcmap.
-    static JF_SHADOW_STACK: RefCell<Vec<*mut u8>> = RefCell::new(Vec::with_capacity(16));
+    static JF_SHADOW_STACK: RefCell<Vec<JfShadowEntry>> = RefCell::new(Vec::with_capacity(16));
 }
 
 /// The shadow stack itself.
@@ -105,6 +106,17 @@ const JF_GCMAP_BYTE_OFS: usize = 24; // offset_of!(JitFrame, jf_gcmap)
 const JF_FRAME_ITEM0_BYTE_OFS: usize = 64; // JITFRAME_FIXED_SIZE(56) + length(8)
 const WORD: usize = 8;
 
+/// RPython shadow stack entry: [category, jf_ptr].
+/// assembler.py:1125: MOV [ebx], 1  — the `1` is_minor marker.
+/// assembler.py:1126: MOV [ebx+WORD], ebp — the jf_ptr.
+#[derive(Clone, Copy)]
+struct JfShadowEntry {
+    /// is_minor marker. RPython uses 1 to indicate jitframe entry.
+    /// incminimark.py uses this to skip old-gen jitframes during minor GC.
+    _category: usize,
+    jf_ptr: *mut u8,
+}
+
 /// Push a jitframe pointer onto the jitframe shadow stack.
 ///
 /// RPython _call_header_shadowstack (assembler.py:1122-1128):
@@ -118,7 +130,10 @@ pub fn push_jf(jf_ptr: *mut u8) -> usize {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
         assert!(depth < MAX_SHADOW_STACK_DEPTH, "jf shadow stack overflow");
-        ss.push(jf_ptr);
+        ss.push(JfShadowEntry {
+            _category: 1,
+            jf_ptr,
+        });
         depth
     })
 }
@@ -150,7 +165,8 @@ pub fn jf_depth() -> usize {
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     JF_SHADOW_STACK.with(|ss| {
         let ss = ss.borrow();
-        for &jf_ptr in ss.iter() {
+        for entry in ss.iter() {
+            let jf_ptr = entry.jf_ptr;
             if jf_ptr.is_null() {
                 continue;
             }

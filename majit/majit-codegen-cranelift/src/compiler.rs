@@ -1018,12 +1018,14 @@ impl Drop for BridgeDepthGuard {
 // redirect_call_assembler / register_call_assembler_target update atomically.
 use std::sync::atomic::AtomicPtr;
 
-/// Dispatch entry: code_ptr at offset 0, finish_index at offset 8.
+/// Dispatch entry: code_ptr at offset 0, finish_descr_ptr at offset 8.
 /// Laid out as two 8-byte words so Cranelift can load them directly.
+/// RPython parity: finish check compares jf_descr pointer with the
+/// finish FailDescr pointer (not integer index).
 #[repr(C)]
 struct CaDispatchEntry {
     code_ptr: AtomicPtr<u8>,
-    finish_index: AtomicU64,
+    finish_descr_ptr: AtomicU64,
     /// RPython redirect_call_assembler parity: compiled bridge code pointer
     /// for the guard at finish_index. When set, Cranelift codegen can
     /// dispatch guard failures directly without extern "C" call overhead.
@@ -1045,7 +1047,7 @@ fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatch
     let entry = table.entry(token_number).or_insert_with(|| {
         Box::new(CaDispatchEntry {
             code_ptr: AtomicPtr::new(code_ptr as *mut u8),
-            finish_index: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
+            finish_descr_ptr: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
             guard_bridge_ptr: AtomicPtr::new(std::ptr::null_mut()),
         })
     });
@@ -1054,23 +1056,27 @@ fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatch
     &**entry as *const CaDispatchEntry
 }
 
-/// Update the finish_index for a token's dispatch entry.
-fn ca_dispatch_set_finish_index(token_number: u64, finish_index: u32) {
+/// Update the finish_descr_ptr for a token's dispatch entry.
+/// Stores the FailDescr pointer (not index) for direct finish comparison.
+fn ca_dispatch_set_finish_descr_ptr(token_number: u64, finish_descr_ptr: i64) {
     let table = ca_dispatch_table().lock().unwrap();
     if let Some(entry) = table.get(&token_number) {
         entry
-            .finish_index
-            .store(finish_index as u64, Ordering::Release);
+            .finish_descr_ptr
+            .store(finish_descr_ptr as u64, Ordering::Release);
     }
 }
 
-/// Update dispatch slot for redirect.
-fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8) {
+/// Update dispatch slot for redirect — updates both code_ptr and finish_descr_ptr.
+fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8, new_finish_descr_ptr: i64) {
     let table = ca_dispatch_table().lock().unwrap();
     if let Some(entry) = table.get(&old_token) {
         entry
             .code_ptr
             .store(new_code_ptr as *mut u8, Ordering::Release);
+        entry
+            .finish_descr_ptr
+            .store(new_finish_descr_ptr as u64, Ordering::Release);
     }
 }
 
@@ -1404,9 +1410,11 @@ fn register_call_assembler_target(
     invalidate_ca_thread_cache(token.number);
     // Create/update dispatch slot for direct call
     ca_dispatch_slot(token.number, compiled.code_ptr);
-    // Set the finish_index so the direct call path can check it at runtime
-    if let Some(finish_idx) = compiled.fail_descrs.iter().position(|d| d.is_finish()) {
-        ca_dispatch_set_finish_index(token.number, finish_idx as u32);
+    // Set the finish_descr_ptr so the direct call path can compare jf_descr
+    // with the finish FailDescr pointer (RPython done_with_this_frame parity).
+    if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| d.is_finish()) {
+        let ptr = Arc::as_ptr(finish_descr) as i64;
+        ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
     call_assembler_registry()
         .lock()
@@ -1478,8 +1486,16 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
         }
     }
     validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
-    // Update dispatch slot so existing compiled code sees the new target
-    ca_dispatch_redirect(old_number, new_target.code_ptr);
+    // Update dispatch slot so existing compiled code sees the new target.
+    // Must update both code_ptr AND finish_descr_ptr (the new target has
+    // different FailDescr pointers for its finish exit).
+    let new_finish_descr_ptr = new_target
+        .fail_descrs
+        .iter()
+        .find(|d| d.is_finish())
+        .map(|d| Arc::as_ptr(d) as i64)
+        .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
+    ca_dispatch_redirect(old_number, new_target.code_ptr, new_finish_descr_ptr);
     call_assembler_registry()
         .lock()
         .unwrap()
@@ -1963,12 +1979,15 @@ const FAST_PATH_MAX_ROOTS: usize = 8;
 #[inline(never)]
 extern "C" fn call_assembler_guard_failure(
     token_number: u64,
-    fail_index: u32,
+    fail_descr_ptr: i64,
     frame_ptr: i64,
     outputs_ptr: *const i64,
     inputs_ptr: *const i64,
 ) -> i64 {
     let target = unsafe { &*fast_lookup_ca_target(token_number) };
+    // RPython get_latest_descr parity: jf_descr is a FailDescr pointer.
+    let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
+    let fail_index = fail_descr_ref.fail_index();
     let fail_descr = &target.fail_descrs[fail_index as usize];
     let fail_count = fail_descr.increment_fail_count();
 
@@ -2192,7 +2211,15 @@ fn call_assembler_fast_path(
     }
 
     let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
-    let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
+    // get_latest_descr parity: jf_descr is a FailDescr pointer.
+    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+    let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+        CALL_ASSEMBLER_DEADFRAME_SENTINEL
+    } else if jf_descr_raw == 0 {
+        0u32
+    } else {
+        unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
+    };
     let outputs = {
         let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
         out.copy_from_slice(&jf_buf[HEADER_WORDS..HEADER_WORDS + FAST_PATH_MAX_OUTPUTS]);
@@ -3641,10 +3668,12 @@ fn emit_guard_exit(
             .ins()
             .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     }
-    let idx_val = builder.ins().iconst(cl_types::I64, info.fail_index as i64);
+    // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
+    // Store FailDescr POINTER (not index) to jf_descr.
+    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
     builder
         .ins()
-        .store(MemFlags::trusted(), idx_val, jf_ptr, JF_DESCR_OFS); // #2105
+        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
     // _call_footer (assembler.py:1097): mov eax, ebp; ret
     builder.ins().return_(&[jf_ptr]);
 }
@@ -3817,8 +3846,16 @@ fn run_compiled_code(
     // Pop jf_ptr from shadow stack.
     majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
 
-    // llmodel.py:328 parity: return ll_frame — read from returned jitframe.
-    let fail_index = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) } as u32;
+    // llmodel.py:412-420 get_latest_descr parity:
+    // Read jf_descr as FailDescr pointer, extract fail_index.
+    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+    let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+        CALL_ASSEMBLER_DEADFRAME_SENTINEL
+    } else if jf_descr_raw == 0 {
+        0u32
+    } else {
+        unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
+    };
     let mut outputs = vec![0i64; max_output_slots.max(1)];
     for i in 0..max_output_slots.min(depth) {
         outputs[i] = unsafe { *result_jf.add(header_words + i) };
@@ -3834,6 +3871,10 @@ struct GuardInfo {
     /// gcmap bitmap: bit i set ⇔ fail_arg[i] is Ref type.
     /// allocate_gcmap (gcmap.py:7-18) parity.
     gcmap: u64,
+    /// RPython assembler.py:2126 get_gcref_from_faildescr parity:
+    /// stores Arc::as_ptr(CraneliftFailDescr) as i64.
+    /// The FailDescr GCREF pointer is written to jf_descr on guard exit.
+    fail_descr_ptr: i64,
 }
 
 fn identity_recovery_layout(
@@ -5617,16 +5658,10 @@ impl CraneliftBackend {
                     // finish exit with primitive result type. This inlines the
                     // hot path (call target → check finish → extract result)
                     // into Cranelift IR, bypassing the shim entirely.
-                    let finish_index = resolved_target.as_ref().and_then(|t| {
-                        t.fail_descrs.iter().enumerate().find_map(|(i, d)| {
-                            if d.is_finish() {
-                                match d.fail_arg_types() {
-                                    [Type::Int] | [Type::Float] => Some(i as u32),
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            }
+                    let finish_descr = resolved_target.as_ref().and_then(|t| {
+                        t.fail_descrs.iter().find(|d| {
+                            d.is_finish()
+                                && matches!(d.fail_arg_types(), [Type::Int] | [Type::Float])
                         })
                     });
 
@@ -5649,7 +5684,7 @@ impl CraneliftBackend {
                         None
                     };
 
-                    let has_primitive_result = finish_index.is_some() || resolved_target.is_none();
+                    let has_primitive_result = finish_descr.is_some() || resolved_target.is_none();
                     let use_direct = dispatch_slot_addr.is_some() && has_primitive_result;
 
                     if use_direct {
@@ -5657,31 +5692,32 @@ impl CraneliftBackend {
 
                         // No separate out_slot: callee writes outputs to args_slot (shared).
 
-                        // Load code_ptr and finish_index from dispatch entry.
-                        // CaDispatchEntry layout: [code_ptr: 8B, finish_index: 8B]
-                        // For self-recursion, first call may see null code_ptr
-                        // and CA_FINISH_INDEX_UNKNOWN (both filled after compile).
+                        // Load code_ptr and finish_descr_ptr from dispatch entry.
+                        // CaDispatchEntry layout: [code_ptr: 8B, finish_descr_ptr: 8B]
+                        // RPython done_with_this_frame parity: compare jf_descr
+                        // with the finish FailDescr pointer directly.
                         let entry_ptr = builder.ins().iconst(ptr_type, slot_addr as i64);
                         let code_addr =
                             builder
                                 .ins()
                                 .load(ptr_type, MemFlags::trusted(), entry_ptr, 0);
-                        let runtime_finish_idx = builder.ins().load(
+                        let runtime_finish_descr = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
                             entry_ptr,
-                            8, // offset of finish_index in CaDispatchEntry
+                            8, // offset of finish_descr_ptr in CaDispatchEntry
                         );
                         let null_ptr = builder.ins().iconst(ptr_type, 0);
                         let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
-                        // Also check finish_index != CA_FINISH_INDEX_UNKNOWN
+                        // Also check finish_descr_ptr != CA_FINISH_INDEX_UNKNOWN
                         let unknown_sentinel = builder
                             .ins()
                             .iconst(cl_types::I64, CA_FINISH_INDEX_UNKNOWN as i64);
-                        let finish_unknown =
-                            builder
-                                .ins()
-                                .icmp(IntCC::Equal, runtime_finish_idx, unknown_sentinel);
+                        let finish_unknown = builder.ins().icmp(
+                            IntCC::Equal,
+                            runtime_finish_descr,
+                            unknown_sentinel,
+                        );
                         let cant_direct = builder.ins().bor(is_null, finish_unknown);
                         let direct_call_block = builder.create_block();
                         let shim_fallback_block = builder.create_block();
@@ -5722,10 +5758,11 @@ impl CraneliftBackend {
                             JF_DESCR_OFS,
                         );
 
+                        // RPython: check jf_descr == done_with_this_frame_descr
                         let is_direct_finish =
                             builder
                                 .ins()
-                                .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_idx);
+                                .icmp(IntCC::Equal, fail_idx_raw, runtime_finish_descr);
                         let direct_finish_block = builder.create_block();
                         let direct_nonfinish_block = if CALL_ASSEMBLER_FORCE_FN.get().is_some() {
                             let b = builder.create_block();
@@ -8283,11 +8320,15 @@ fn collect_guards(
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
         let descr = Arc::new(descr);
+        // assembler.py:2126 get_gcref_from_faildescr parity:
+        // store the FailDescr pointer (not index) in jf_descr.
+        let fail_descr_ptr = Arc::as_ptr(&descr) as i64;
         fail_descrs.push(descr);
         guard_infos.push(GuardInfo {
             fail_index,
             fail_arg_refs,
             gcmap,
+            fail_descr_ptr,
         });
     }
 
