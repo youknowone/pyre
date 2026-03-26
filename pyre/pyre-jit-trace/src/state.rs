@@ -1854,15 +1854,15 @@ impl MIFrame {
         self.orgpc = pc;
     }
 
-    /// Update virtualizable next_instr and valuestackdepth for JUMP / loop close.
-    /// Uses pending_next_instr (fallthrough_pc or branch target) for non-guard uses.
+    /// Update virtualizable next_instr and valuestackdepth.
+    /// RPython parity: always use orgpc (opcode start PC) for next_instr
+    /// so gen_store_back_in_vable writes a real opcode PC to the frame,
+    /// not a Cache PC. The trace loop advancement uses pending_next_instr
+    /// separately (in metainterp.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
-        let fallthrough = self.fallthrough_pc;
+        let resume_pc = self.orgpc;
         let s = self.sym_mut();
-        let pending_pc = s.pending_next_instr.take().or(Some(fallthrough));
-        if let Some(pc) = pending_pc {
-            s.vable_next_instr = ctx.const_int(pc as i64);
-        }
+        s.vable_next_instr = ctx.const_int(resume_pc as i64);
         s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
     }
 
