@@ -246,6 +246,18 @@ impl PyreMetaInterp {
             super::state::InlineTraceStepAction::Trace(
                 TraceAction::Abort | TraceAction::AbortPermanent,
             ) => {
+                // RPython finishframe_exception: if exception pending,
+                // try multi-frame unwind before giving up.
+                let has_exc = {
+                    let top = self.framestack.last().unwrap();
+                    let sym = unsafe { &*top.sym };
+                    !sym.last_exc_value.is_null()
+                };
+                if has_exc {
+                    if let Some(action) = self.finishframe_exception(ctx) {
+                        return action;
+                    }
+                }
                 ctx.truncate_inline_trace_positions(self.inline_trace_base);
                 LoopAction::Return(TraceAction::Abort)
             }
@@ -463,6 +475,140 @@ impl PyreMetaInterp {
         } else if matches!(action, TraceAction::CloseLoop) {
             ctx.set_green_key(crate::driver::make_green_key(code as *const CodeObject, pc));
         }
+    }
+
+    /// RPython pyjitpl.py:2506 finishframe_exception (multi-frame).
+    ///
+    /// Walks the framestack looking for an exception handler, popping
+    /// frames that don't have one. Structurally matches RPython's
+    /// `while self.framestack: ... self.popframe()` loop.
+    ///
+    /// Returns Some(LoopAction) if handled, None if all frames exhausted.
+    fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
+        // Gated: requires bridge compilation for efficient execution.
+        if std::env::var("MAJIT_EXC_TRACE").is_err() {
+            return None;
+        }
+
+        // RPython: while self.framestack:
+        while let Some(top) = self.framestack.last() {
+            let code = unsafe { &*top.jitcode };
+            let sym = unsafe { &*top.sym };
+            let pc = top.pc;
+
+            // RPython: if opcode == op_catch_exception → handler found
+            if let Some(entry) =
+                pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+            {
+                let handler_pc = entry.target as usize;
+                let handler_depth = entry.depth as usize;
+                let exc_opref = sym.last_exc_box;
+                let exc_obj = sym.last_exc_value;
+
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][finishframe_exception] found handler in frame depth={} handler_pc={}",
+                        self.framestack.len(),
+                        handler_pc
+                    );
+                }
+
+                // Unwind symbolic + concrete state to handler.
+                let top = self.framestack.last_mut().unwrap();
+                let sym = unsafe { &mut *top.sym };
+                let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+                let nlocals = sym.nlocals;
+                let target_stack_len = ncells + handler_depth;
+
+                sym.symbolic_stack.truncate(target_stack_len);
+                sym.symbolic_stack_types.truncate(target_stack_len);
+                sym.concrete_stack.truncate(target_stack_len);
+                sym.valuestackdepth = nlocals + target_stack_len;
+                if entry.push_lasti {
+                    sym.symbolic_stack.push(OpRef::NONE);
+                    sym.symbolic_stack_types.push(Type::Ref);
+                    sym.concrete_stack
+                        .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
+                    sym.valuestackdepth += 1;
+                }
+                sym.symbolic_stack.push(exc_opref);
+                sym.symbolic_stack_types.push(Type::Ref);
+                sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
+                sym.valuestackdepth += 1;
+                sym.pending_next_instr = Some(handler_pc);
+
+                // Sync concrete frame
+                if let Some(ref mut cf) = top.owned_concrete_frame {
+                    let target_depth = cf.nlocals() + cf.ncells() + handler_depth;
+                    while cf.valuestackdepth > target_depth {
+                        cf.pop();
+                    }
+                    if entry.push_lasti {
+                        cf.push(pyre_object::w_int_new(pc as i64));
+                    }
+                    cf.push(exc_obj);
+                    cf.next_instr = handler_pc;
+                }
+
+                // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame
+                return Some(LoopAction::Continue);
+            }
+
+            // RPython: self.popframe() — no handler in this frame
+            if top.is_inline() {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][finishframe_exception] pop inline frame, depth={}",
+                        self.framestack.len()
+                    );
+                }
+                // Propagate last_exc_value/last_exc_box to parent before popping
+                let exc_value = sym.last_exc_value;
+                let exc_box = sym.last_exc_box;
+                let exc_const = sym.class_of_last_exc_is_const;
+
+                // Pop the inline frame
+                let popped = self.framestack.pop().unwrap();
+                self.portal_call_depth -= 1;
+                ctx.pop_inline_trace_position();
+
+                // Drop callee frame in trace
+                if let Some(frame_opref) = popped.drop_frame_opref {
+                    ctx.call_void(
+                        crate::callbacks::get().jit_drop_callee_frame,
+                        &[frame_opref],
+                    );
+                }
+                let (driver, _) = crate::driver::driver_pair();
+                driver.leave_inline_frame();
+
+                // Propagate exception state to parent sym
+                if let Some(parent) = self.framestack.last() {
+                    let parent_sym = unsafe { &mut *parent.sym };
+                    parent_sym.last_exc_value = exc_value;
+                    parent_sym.last_exc_box = exc_box;
+                    parent_sym.class_of_last_exc_is_const = exc_const;
+                }
+
+                // Release inline call guard when all inline frames gone
+                if !self.framestack.iter().any(|f| f.is_inline()) {
+                    self.inline_call_guard = None;
+                }
+                continue; // check parent frame
+            }
+
+            // Root frame with no handler → compile_exit_frame_with_exception
+            // pyjitpl.py:2532-2538: FINISH op with exception value.
+            let exc_opref = sym.last_exc_box;
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[jit][finishframe_exception] root frame, no handler → FINISH");
+            }
+            return Some(LoopAction::Return(TraceAction::Finish {
+                finish_args: vec![exc_opref],
+                finish_arg_types: vec![Type::Ref],
+            }));
+        }
+        None
     }
 }
 
