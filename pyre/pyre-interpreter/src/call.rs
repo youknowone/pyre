@@ -370,7 +370,11 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> PyObjectRef {
 
     match build_class_inner(body_fn, name, bases_tuple) {
         Ok(cls) => cls,
-        Err(e) => panic!("__build_class__ failed: {e}"),
+        Err(e) => {
+            // Propagate as exception object — the caller's exception handler
+            // will catch it (e.g., try/except ImportError in datetime.py).
+            e.to_exc_object()
+        }
     }
 }
 

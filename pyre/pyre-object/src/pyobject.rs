@@ -67,7 +67,7 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
-    unsafe { std::ptr::eq((*obj).ob_type, tp as *const PyType) }
+    !obj.is_null() && unsafe { std::ptr::eq((*obj).ob_type, tp as *const PyType) }
 }
 
 #[inline]

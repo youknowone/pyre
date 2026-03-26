@@ -28,11 +28,16 @@ use pyre_object::*;
 /// Unwrap a cell object to its contents. Non-cells pass through.
 #[inline(always)]
 pub fn unwrap_cell(obj: PyObjectRef) -> PyObjectRef {
-    if !obj.is_null() && unsafe { is_cell(obj) } {
+    if obj.is_null() {
+        return obj;
+    }
+    if unsafe { is_cell(obj) } {
         let inner = unsafe { w_cell_get(obj) };
         if !inner.is_null() {
             return inner;
         }
+        // Cell with null content — return cell itself (caller will handle)
+        return obj;
     }
     obj
 }
@@ -975,6 +980,11 @@ pub fn py_negative(a: PyObjectRef) -> PyResult {
         // Instance __neg__
         if let Some(result) = try_instance_unaryop(a, "__neg__") {
             return result;
+        }
+        if a.is_null() {
+            return Err(PyError::type_error(
+                "bad operand type for unary -: 'NoneType'",
+            ));
         }
         Err(PyError::type_error(format!(
             "bad operand type for unary -: '{}'",
