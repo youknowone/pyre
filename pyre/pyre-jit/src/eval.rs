@@ -919,17 +919,11 @@ fn restore_guard_failure_for_loop(
     }
 
     // RPython compile.py:701 handle_fail → _trace_and_compile_from_bridge.
-    if let Some((gk, tid, fi, _rpc)) = crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take()) {
-        if restored {
-            let frame = unsafe { &mut *(jit_state.frame as *mut pyre_interpreter::frame::PyFrame) };
-            frame.next_instr = jit_state.next_instr;
-            frame.valuestackdepth = jit_state.valuestackdepth;
-            crate::call_jit::jit_bridge_compile_for_guard(gk, tid, fi, frame, jit_state.next_instr);
-            // Restore frame state after bridge tracing (bridge may modify it).
-            frame.next_instr = jit_state.next_instr;
-            frame.valuestackdepth = jit_state.valuestackdepth;
-        }
-    }
+    // TODO(bridge-compile): RPython calls _trace_and_compile_from_bridge
+    // here to trace + compile a bridge from the guard failure point.
+    // pyre consumes and discards. Port compile_bridge_trace +
+    // bridge_info wiring to enable.
+    crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
 }
