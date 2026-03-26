@@ -26,8 +26,12 @@ pub mod eval;
 pub mod jit;
 mod trace_verify;
 
-// Include auto-generated trace dispatch table and helpers (top-level access)
-include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
+// Re-export auto-generated trace functions from pyre-jit-trace
+pub use pyre_jit_trace::{
+    CANONICAL_TRACE_PATTERNS, GRAPH_FUNCTIONS, trace_box_float, trace_box_int, trace_float_binop,
+    trace_float_compare, trace_int_binop, trace_int_binop_ovf, trace_int_compare,
+    trace_unbox_float, trace_unbox_int,
+};
 
 #[cfg(test)]
 mod tests {
