@@ -30,6 +30,7 @@ members = [
     "pyre/pyre-bytecode",
     "pyre/pyre-interpreter",
     "pyre/pyre-jit",
+    "pyre/pyre-jit-trace",
     "pyre/pyrex",
 ]
 

@@ -1,22 +1,17 @@
 [package]
-name = "pyre-jit"
+name = "pyre-jit-trace"
 version.workspace = true
 edition.workspace = true
-description = "Auto-generated JIT for pyre — rpython/jit/ equivalent"
+description = "Trace-time JIT for pyre — MIFrame and tracing logic, isolated from eval_loop_jit compilation unit"
 
 [dependencies]
 pyre-bytecode = { path = "../pyre-bytecode" }
 pyre-object = { path = "../pyre-object" }
 pyre-interpreter = { path = "../pyre-interpreter" }
 majit-ir = { path = "../../majit/majit-ir" }
-majit-metainterp = { path = "../../majit/majit-metainterp" }
+majit-meta = { path = "../../majit/majit-meta" }
 majit-codegen = { path = "../../majit/majit-codegen" }
 majit-codegen-cranelift = { path = "../../majit/majit-codegen-cranelift" }
+majit-opt = { path = "../../majit/majit-opt" }
 majit-trace = { path = "../../majit/majit-trace" }
 majit-gc = { path = "../../majit/majit-gc" }
-pyre-jit-trace = { path = "../pyre-jit-trace" }
-
-[build-dependencies]
-majit-analyze = { path = "../../majit/majit-analyze" }
-serde_json = "1"
-syn = { version = "2", features = ["full", "visit"] }
