@@ -619,7 +619,7 @@ impl OpcodeStepExecutor for PyFrame {
 
         let module = crate::importing::importhook(
             name,
-            PY_NULL, // w_globals (not used for absolute imports)
+            self.namespace as PyObjectRef, // for relative imports: __name__/__package__
             w_fromlist,
             level,
             self.execution_context,

@@ -290,11 +290,25 @@ fn load_source_module(
     let file_obj = pyre_object::w_str_new(&pathname_str);
     crate::namespace_store(&mut namespace, "__file__", file_obj);
 
+    // Set __package__ — PyPy: _prepare_module sets __package__
+    // For "a.b.c" → __package__ = "a.b"; for "a" → __package__ = "a"
+    let pkg = if let Some(dot) = modulename.rfind('.') {
+        &modulename[..dot]
+    } else {
+        modulename
+    };
+    crate::namespace_store(&mut namespace, "__package__", pyre_object::w_str_new(pkg));
+
     let ns_ptr = Box::into_raw(namespace);
+
+    // Create the module object BEFORE execution and register in sys.modules.
+    // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
+    // This prevents infinite recursion on circular imports.
+    let module = w_module_new(modulename, ns_ptr as *mut u8);
+    set_sys_module(modulename, module);
+
     exec_code_module(code, ns_ptr, execution_context)?;
 
-    // Create the module object (PyPy: Module(space, w_name) with w_dict)
-    let module = w_module_new(modulename, ns_ptr as *mut u8);
     Ok(module)
 }
 
@@ -306,19 +320,26 @@ fn load_package(
     dirpath: &Path,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // Add package directory to sys.path BEFORE executing __init__.py,
+    // so that relative sub-imports within the package can find siblings.
+    // PyPy: sets __path__ on module before exec.
+    add_sys_path(dirpath);
+
     let init_path = dirpath.join("__init__.py");
     let module = load_source_module(modulename, &init_path, execution_context)?;
 
-    // Set __path__ on the module namespace (PyPy: space.setattr(w_mod, '__path__', ...))
+    // Set __path__ and __package__ on the module namespace
     let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
     let path_str = pyre_object::w_str_new(&dirpath.to_string_lossy());
     let path_list = pyre_object::w_list_new(vec![path_str]);
     unsafe {
         crate::namespace_store(&mut *ns_ptr, "__path__", path_list);
+        crate::namespace_store(
+            &mut *ns_ptr,
+            "__package__",
+            pyre_object::w_str_new(modulename),
+        );
     }
-
-    // Add package directory to sys.path for sub-imports
-    add_sys_path(dirpath);
 
     Ok(module)
 }
@@ -349,17 +370,16 @@ fn load_part(
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // PyPy: getbuiltinmodule() path
-            load_builtin_module(partname).ok_or_else(|| {
-                crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
-                    format!("builtin module '{modulename}' failed to initialize"),
-                )
-            })?
+            let m = load_builtin_module(partname).ok_or_else(|| crate::PyError {
+                kind: crate::PyErrorKind::ImportError,
+                message: format!("builtin module '{modulename}' failed to initialize"),
+            })?;
+            // Store builtin modules in cache immediately
+            set_sys_module(modulename, m);
+            m
         }
     };
 
-    // Store in sys.modules cache (PyPy: space.sys.setmodule / sys.modules[name] = mod)
-    set_sys_module(modulename, module);
     Ok(Some(module))
 }
 
@@ -416,7 +436,7 @@ fn absolute_import(
 
 pub fn importhook(
     name: &str,
-    _w_globals: PyObjectRef,
+    w_globals: PyObjectRef,
     w_fromlist: PyObjectRef,
     level: i64,
     execution_context: *const PyExecutionContext,
@@ -428,16 +448,97 @@ pub fn importhook(
         ));
     }
 
-    // Level 0 = absolute import (the common case)
-    // Level > 0 = relative import (not yet supported)
     if level > 0 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("relative imports not yet supported (level={level})"),
-        ));
+        return relative_import(name, w_globals, w_fromlist, level, execution_context);
     }
 
     absolute_import(name, w_fromlist, execution_context)
+}
+
+/// Relative import: `from .foo import bar` (level=1), `from ..foo import bar` (level=2).
+///
+/// PyPy: importing.py `_relative_import()`.
+/// Resolves the package base from __package__ or __name__ in w_globals,
+/// strips `level - 1` trailing components, then does absolute import.
+fn relative_import(
+    name: &str,
+    w_globals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    // Get the package name from the calling module's globals.
+    // PyPy: pkgname = globals.get('__package__') or globals.get('__name__')
+    let package = resolve_package_name(w_globals);
+    let package = package.ok_or_else(|| crate::PyError {
+        kind: crate::PyErrorKind::ImportError,
+        message: "attempted relative import with no known parent package".to_string(),
+    })?;
+
+    // Strip (level - 1) trailing components from package
+    // PyPy: for dotted name "a.b.c" with level=2, strip "c" → "a.b", then strip "b" → "a"
+    let mut parts: Vec<&str> = package.split('.').collect();
+    let strips = (level - 1) as usize;
+    if strips >= parts.len() {
+        return Err(crate::PyError {
+            kind: crate::PyErrorKind::ImportError,
+            message: format!(
+                "attempted relative import beyond top-level package (package='{package}', level={level})"
+            ),
+        });
+    }
+    for _ in 0..strips {
+        parts.pop();
+    }
+    let base = parts.join(".");
+
+    // Build the fully-qualified module name
+    let fqn = if name.is_empty() {
+        base.clone()
+    } else {
+        format!("{base}.{name}")
+    };
+
+    absolute_import(&fqn, w_fromlist, execution_context)
+}
+
+/// Extract the package name from the calling module's globals namespace.
+///
+/// PyPy: importing.py — checks __package__ first, falls back to __name__,
+/// strips the last component if __name__ has dots (module in a package).
+fn resolve_package_name(w_globals: PyObjectRef) -> Option<String> {
+    if w_globals.is_null() {
+        return None;
+    }
+    let ns = w_globals as *const crate::PyNamespace;
+    let ns = unsafe { &*ns };
+
+    // Try __package__ first (PyPy: space.finditem_str(w_globals, '__package__'))
+    if let Some(&pkg) = ns.get("__package__") {
+        if !pkg.is_null() && unsafe { pyre_object::is_str(pkg) } {
+            let s = unsafe { pyre_object::w_str_get_value(pkg) };
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+
+    // Fallback: __name__ (for modules inside packages)
+    if let Some(&name_obj) = ns.get("__name__") {
+        if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+            let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+            // If the module has a __path__, it's a package — use __name__ as-is
+            if ns.get("__path__").is_some() {
+                return Some(name.to_string());
+            }
+            // Otherwise strip the last component (module name within package)
+            if let Some(dot) = name.rfind('.') {
+                return Some(name[..dot].to_string());
+            }
+        }
+    }
+
+    None
 }
 
 // ── import_from ──────────────────────────────────────────────────────
