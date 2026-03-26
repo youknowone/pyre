@@ -193,11 +193,29 @@ pub fn new_builtin_namespace() -> PyNamespace {
 
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let parts: Vec<String> = args
+    // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch)
+    let (positional, end, sep) = if !args.is_empty() && unsafe { is_dict(*args.last().unwrap()) } {
+        let kwargs = *args.last().unwrap();
+        let end_key = w_str_new("end");
+        let sep_key = w_str_new("sep");
+        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, end_key) };
+        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
+        let end_str = end_val
+            .map(|v| unsafe { crate::py_str(v) })
+            .unwrap_or_else(|| "\n".to_string());
+        let sep_str = sep_val
+            .map(|v| unsafe { crate::py_str(v) })
+            .unwrap_or_else(|| " ".to_string());
+        (&args[..args.len() - 1], end_str, sep_str)
+    } else {
+        (args, "\n".to_string(), " ".to_string())
+    };
+
+    let parts: Vec<String> = positional
         .iter()
         .map(|&obj| format!("{}", PyDisplay(obj)))
         .collect();
-    println!("{}", parts.join(" "));
+    print!("{}{}", parts.join(&sep), end);
     Ok(w_none())
 }
 
@@ -684,7 +702,7 @@ fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Ok(w_tuple_new(items));
         }
     }
-    Ok(w_tuple_new(vec![]))
+    Ok(w_tuple_new(collect_iterable(obj)?))
 }
 
 pub(crate) fn builtin_list_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -697,7 +715,12 @@ fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let obj = args[0];
     unsafe {
         if is_list(obj) {
-            return Ok(obj);
+            // Copy the list
+            let n = w_list_len(obj);
+            let items: Vec<_> = (0..n)
+                .filter_map(|i| w_list_getitem(obj, i as i64))
+                .collect();
+            return Ok(w_list_new(items));
         }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
@@ -707,7 +730,23 @@ fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             return Ok(w_list_new(items));
         }
     }
-    Ok(w_list_new(vec![]))
+    // Consume iterator — PyPy: listobject.py W_ListObject(iterable)
+    Ok(w_list_new(collect_iterable(obj)?))
+}
+
+/// Collect all items from an iterable into a Vec.
+/// PyPy: space.unpackiterable(w_iterable)
+fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let it = crate::space::py_iter(obj)?;
+    let mut items = Vec::new();
+    loop {
+        match crate::space::py_next(it) {
+            Ok(v) => items.push(v),
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(items)
 }
 
 pub(crate) fn builtin_dict_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
