@@ -109,7 +109,7 @@ impl PyreMetaInterp {
         let cf_addr = top.concrete_frame_addr();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
-        let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc);
+        let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc, pc);
         let action = fs.trace_code_step(code, pc);
         let pending = fs.pending_inline_frame.take();
         drop(fs);
@@ -162,7 +162,7 @@ impl PyreMetaInterp {
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
         let inline_action = {
-            let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc);
+            let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc, pc);
             fs.parent_fail_args = Some(pfa);
             fs.parent_fail_arg_types = Some(pfa_types);
             let result = fs.trace_code_step_inline(code, pc);
