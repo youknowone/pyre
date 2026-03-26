@@ -2026,21 +2026,9 @@ impl MIFrame {
             )
         };
         // RPython close_loop_args parity: JUMP args must match the target
-        // label's types. For root traces, use inputarg types (= label types).
-        // For bridge traces, the inputarg types are the guard's fail_arg
-        // types (may be Int for unboxed locals), but the target Label
-        // (Phase 1) expects all-Ref for virtualizable locals. Force all-Ref
-        // so materialize_loop_carried_value boxes Int back to Ref.
-        let is_bridge = {
-            let (driver, _) = crate::eval::driver_pair();
-            driver.is_bridge_tracing()
-        };
-        let inputarg_types = if is_bridge {
-            // Bridge → target is Phase 1 (all-Ref for vable slots).
-            vec![Type::Ref; 3 + nlocals + stack.len()]
-        } else {
-            ctx.inputarg_types()
-        };
+        // label's types (inputarg_types). materialize_loop_carried_value
+        // boxes values to match (e.g. Int → Ref for virtualizable locals).
+        let inputarg_types = ctx.inputarg_types();
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
@@ -4862,56 +4850,13 @@ impl MIFrame {
             // RPython pyjitpl.py:3390: class_of_last_exc_is_const = True
             self.sym_mut().class_of_last_exc_is_const = true;
 
-            // RPython pyjitpl.py:2506 finishframe_exception: found a
-            // catch handler — adjust stack and continue at handler_pc.
-            let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
-            let nlocals = self.sym().nlocals;
-            let target_stack_only = ncells + handler_depth;
-            {
-                let s = self.sym_mut();
-                s.symbolic_stack.truncate(target_stack_only);
-                s.symbolic_stack_types.truncate(target_stack_only);
-                s.concrete_stack.truncate(target_stack_only);
-                s.valuestackdepth = nlocals + target_stack_only;
-
-                // Push exception value onto symbolic stack (interpreter
-                // pushes exc before PUSH_EXC_INFO).
-                if entry.push_lasti {
-                    let lasti_obj = pyre_object::w_int_new(pc as i64);
-                    let lasti_opref = OpRef::NONE; // placeholder
-                    s.symbolic_stack.push(lasti_opref);
-                    s.symbolic_stack_types.push(Type::Ref);
-                    s.concrete_stack.push(ConcreteValue::Ref(lasti_obj));
-                    s.valuestackdepth += 1;
-                }
-                s.symbolic_stack.push(exc_opref);
-                s.symbolic_stack_types.push(Type::Ref);
-                s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
-                s.valuestackdepth += 1;
-            }
-
-            // Sync concrete frame: unwind stack to handler depth, push exc.
-            let frame =
-                unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
-            let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
-            while frame.valuestackdepth > target_depth {
-                frame.pop();
-            }
-            if entry.push_lasti {
-                frame.push(pyre_object::w_int_new(pc as i64));
-            }
-            frame.push(exc_obj);
-
-            // Continue tracing at handler_pc.
-            self.sym_mut().pending_next_instr = Some(handler_pc);
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][handle_possible_exception] continue at handler_pc={} vsd={}",
-                    handler_pc,
-                    self.sym().valuestackdepth
-                );
-            }
-            TraceAction::Continue
+            // TODO(exception-path-tracing): pyjitpl.py:2506 finishframe_exception
+            // finds catch_exception handler → frame.pc = target → ChangeFrame
+            // (continues tracing through the handler inline).
+            // Blocked: inline code size causes Rust codegen regression in
+            // eval_loop_jit (same compilation unit). Move MIFrame to a
+            // separate crate to isolate.
+            TraceAction::Abort
         } else {
             // TODO(exception-exit): RPython finishframe_exception (pyjitpl.py:
             // 2532-2538) pops all frames, then calls
@@ -5527,14 +5472,11 @@ impl ControlFlowOpcodeHandler for MIFrame {
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
             // pyjitpl.py:2979-2983: compile_trace — attempt to connect to
-            // the ROOT loop's existing compiled targets. For root traces only;
-            // bridge traces close via merge_point's close_bridge path which
-            // handles bridge_info properly (avoids double compilation).
+            // the ROOT loop's existing compiled targets.
             {
                 let root_key = ctx.root_green_key();
                 let (driver, _) = crate::eval::driver_pair();
-                let is_bridge = driver.is_bridge_tracing();
-                if !is_bridge && driver.meta_interp().has_compiled_targets(root_key) {
+                if driver.meta_interp().has_compiled_targets(root_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
@@ -5554,33 +5496,6 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
             }
             if !ctx.has_merge_point(back_edge_key) {
-                // Bridge traces close at the first back-edge.
-                //
-                // TODO(bridge-retrace): RPython (pyjitpl.py:3034-3036) does
-                // NOT close bridges here — it appends a merge_point and
-                // continues tracing. On the second iteration, the merge_point
-                // matches and compile_retrace closes the bridge with an
-                // unrolled preamble. pyre closes immediately because retrace
-                // infrastructure (partial_trace, compile_retrace) is not yet
-                // ported. When retrace lands, remove this early-close and
-                // let bridges fall through to the merge_point append path.
-                let is_bridge = {
-                    let (driver, _) = crate::eval::driver_pair();
-                    driver.is_bridge_tracing()
-                };
-                if is_bridge {
-                    MIFrame::set_next_instr(this, ctx, target);
-                    let oprefs = MIFrame::close_loop_args(this, ctx);
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!(
-                            "[jit][reached_loop_header] bridge close: key={} pc={}",
-                            back_edge_key, target
-                        );
-                    }
-                    return Ok(Some(
-                        oprefs.into_iter().map(FrontendOp::opref_only).collect(),
-                    ));
-                }
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
                     let s = this.sym();
