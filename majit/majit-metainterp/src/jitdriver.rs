@@ -1492,7 +1492,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl FnOnce(
+        on_guard_failure: impl Fn(
             &mut S,
             &S::Meta,
             &[i64],
@@ -2033,7 +2033,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl FnOnce(
+        on_guard_failure: impl Fn(
             &mut S,
             &S::Meta,
             &[i64],
@@ -2089,7 +2089,6 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let mut live_values = live_values;
-        let mut on_guard_failure = Some(on_guard_failure);
         loop {
             let result = self
                 .meta
@@ -2130,40 +2129,13 @@ impl<S: JitState> JitDriver<S> {
                 return Some(target_pc);
             }
 
-            // Try to restore interpreter state from guard failure values.
-            let resume_pc = on_guard_failure
-                .take()
-                .and_then(|f| f(state, &result_meta, &raw_values, &exit_layout));
+            // RPython parity: guard failure → blackhole_from_resumedata.
+            // on_guard_failure restores interpreter state from fail_args.
+            // Called on every guard failure (Fn, not FnOnce).
+            let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
 
-            // Guard failures where restore returns None (e.g. GuardNotInvalidated
-            // with insufficient fail_args for full restore): re-enter compiled
-            // code instead of falling back to the interpreter. This avoids the
-            // JIT entry/exit overhead for periodic epoch invalidation.
             let Some(resume_pc) = resume_pc else {
-                state.restore_values(&result_meta, &typed_values);
-                self.sync_after(state, &result_meta, descriptor.as_ref());
-                // Try to re-enter compiled code
-                if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
-                    if state.is_compatible(meta) {
-                        let meta = meta.clone();
-                        let nd = self.driver_descriptor_for(state, &meta);
-                        if self.sync_before(state, &meta, nd.as_ref()) {
-                            let nl = state.extract_live_values(&meta);
-                            if Self::live_values_match_descriptor(nd.as_ref(), &nl) {
-                                if let Some(v) = self.extend_compiled_live_values(
-                                    key_hash,
-                                    state,
-                                    &meta,
-                                    nd.as_ref(),
-                                    nl,
-                                ) {
-                                    live_values = v;
-                                    continue; // re-enter compiled code
-                                }
-                            }
-                        }
-                    }
-                }
+                // Could not restore — fall back to interpreter at target_pc
                 return Some(target_pc);
             };
 
