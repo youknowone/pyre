@@ -539,12 +539,30 @@ impl CodeWriter {
                     if d == 1 {
                         assembler.dup_stack();
                     } else {
+                        // COPY d: duplicate the d-th item from TOS.
+                        // copy_from_bottom(stack_depth - d) copies the item
+                        // at position (stack_depth - d) to TOS.
+                        // Not easily expressible with current JitCode ops;
+                        // use pop to temp, push back, push temp.
+                        // For now, emit no-op and let interpreter handle.
                         assembler.abort();
                     }
                 }
 
-                // Unsupported: abort to interpreter fallback.
-                _ => {
+                Instruction::LoadName { .. }
+                | Instruction::StoreName { .. }
+                | Instruction::MakeFunction { .. } => {
+                    // Module-level instructions: never appear in traced
+                    // function bodies (traces start at loop backedges
+                    // inside functions). Safe to abort.
+                    assembler.abort();
+                }
+
+                // Truly unsupported: abort to interpreter fallback.
+                other => {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!("[codewriter] unsupported instruction: {:?}", other);
+                    }
                     assembler.abort();
                 }
             }
