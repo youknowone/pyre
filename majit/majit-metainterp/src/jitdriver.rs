@@ -213,6 +213,12 @@ pub struct JitDriver<S: JitState> {
     epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
     /// Handle for the background invalidation thread.
     _invalidation_thread: Option<std::thread::JoinHandle<()>>,
+    /// RPython metainterp_sd.jitcodes parity: factory callback that
+    /// produces JitCode for a given (program, pc, op) triple.
+    /// Used by BlackholeInterpreter to resume from guard failure points.
+    /// Registered by #[jit_interp] macro at startup.
+    jitcode_factory:
+        Option<Box<dyn Fn(&S::Env, usize, u8) -> Option<crate::jitcode::JitCode> + Send>>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -251,7 +257,20 @@ impl<S: JitState> JitDriver<S> {
             is_recursive: false,
             epoch_qmut,
             _invalidation_thread: Some(invalidation_thread),
+            jitcode_factory: None,
         }
+    }
+
+    /// Register a JitCode factory callback for blackhole resume.
+    ///
+    /// RPython: `metainterp_sd.jitcodes` stores pre-compiled JitCodes.
+    /// In majit, the `#[jit_interp]` macro generates JitCode on-demand
+    /// from the interpreter bytecode. This callback provides that.
+    pub fn register_jitcode_factory(
+        &mut self,
+        factory: impl Fn(&S::Env, usize, u8) -> Option<crate::jitcode::JitCode> + Send + 'static,
+    ) {
+        self.jitcode_factory = Some(Box::new(factory));
     }
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
@@ -282,7 +301,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// RPython resume_in_blackhole parity: resume execution from the guard
-    /// failure point using the IR-based blackhole interpreter.
+    /// failure point using the blackhole interpreter.
     pub fn blackhole_guard_failure(
         &self,
         green_key: u64,
@@ -296,6 +315,44 @@ impl<S: JitState> JitDriver<S> {
     )> {
         self.meta
             .blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
+    }
+
+    /// RPython resume_in_blackhole parity: resume from guard failure using
+    /// the jitcode-based BlackholeInterpreter.
+    ///
+    /// Uses the registered jitcode_factory to produce a JitCode for the
+    /// guard failure's resume_pc, then runs the BlackholeInterpreter from
+    /// that point to complete the iteration.
+    pub fn blackhole_resume_jitcode(
+        &self,
+        env: &S::Env,
+        resume_pc: usize,
+        resume_op: u8,
+        fail_values: &[i64],
+        inputarg_count: usize,
+    ) -> Option<crate::blackhole::BlackholeInterpreter> {
+        let factory = self.jitcode_factory.as_ref()?;
+        let jitcode = factory(env, resume_pc, resume_op)?;
+
+        let mut bh = crate::blackhole::BlackholeInterpreter::new();
+        bh.setposition(jitcode, 0);
+
+        // Set inputarg register values from fail_values
+        for (i, &val) in fail_values.iter().take(inputarg_count).enumerate() {
+            bh.setarg_i(i, val);
+        }
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[bh-jitcode] resume at pc={} op={} inputargs={}",
+                resume_pc, resume_op, inputarg_count
+            );
+        }
+
+        // Run the blackhole interpreter
+        bh.run();
+
+        Some(bh)
     }
 
     /// Register an interpreter boxing helper for the raw-int finish protocol.
