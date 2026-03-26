@@ -173,6 +173,11 @@ pub struct Optimizer {
     /// optimizer.py:732 — resumedata_memo injected by majit-meta.
     /// ResumeDataEncoder encodes guard state into compact rd_numb/rd_consts.
     pub resume_encoder: Option<Box<dyn majit_ir::ResumeDataEncoder>>,
+    /// resume.py parity: per-guard snapshots from tracing time.
+    /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
+    /// Used by store_final_boxes_in_guard to rebuild fail_args from the
+    /// tracing-time snapshot via the optimizer's replacement chain.
+    pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -713,6 +718,7 @@ impl Optimizer {
             per_guard_knowledge: Vec::new(),
             constant_fold_alloc: None,
             resume_encoder: None,
+            snapshot_boxes: std::collections::HashMap::new(),
         }
     }
 
@@ -811,24 +817,40 @@ impl Optimizer {
         self.replaces_guard.insert(old_pos, new_guard);
     }
 
-    /// optimizer.py: store_final_boxes_in_guard(guard_op, pendingfields)
-    ///
-    /// In RPython, this stores pending field writes into the guard's resume
-    /// data (`rd_pendingfields`) so they can be replayed on guard failure.
-    /// In majit, pending fields are currently emitted as ops before the guard
-    /// (see `emit_guard_operation`) or kept deferred in heap.rs lazy sets.
-    /// This method is reserved for future resume data integration.
     /// optimizer.py: store_final_boxes_in_guard(op)
     ///
-    /// RPython parity: walk fail_args, detect virtual objects, expand
-    /// fail_args with virtual field values, record blueprints in rd_virtuals.
+    /// RPython parity: rebuild fail_args from the tracing-time snapshot,
+    /// resolving each box through the optimizer's replacement chain.
+    /// Then walk fail_args to detect virtual objects, expand fail_args
+    /// with virtual field values, and record blueprints in rd_virtuals.
+    ///
     /// resume.py: ResumeDataVirtualAdder.finish() equivalent.
     pub fn store_final_boxes_in_guard(&mut self, guard_op: &mut Op, ctx: &OptContext) {
         let pending = std::mem::take(&mut self.pendingfields);
-        // RPython resume.py: ResumeDataVirtualAdder uses rd_resume_position
-        // to look up the snapshot (fail_args) for this guard. In majit, when
-        // fail_args is None, we resolve it from patchguardop's fail_args
-        // via rd_resume_position (equivalent to snapshot lookup).
+        let _ = pending;
+
+        // RPython resume.py: ResumeDataVirtualAdder looks up the snapshot
+        // via rd_resume_position and rebuilds fail_args by resolving each
+        // tracing-time box through get_box_replacement(). This ensures
+        // fail_args always reflect the current optimizer scope, even after
+        // unroll/short_preamble_inline changes the scope.
+        if guard_op.rd_resume_position >= 0 {
+            if let Some(snapshot) = self.snapshot_boxes.get(&guard_op.rd_resume_position) {
+                let new_fail_args: Vec<OpRef> = snapshot
+                    .iter()
+                    .map(|&opref| {
+                        if opref.is_none() {
+                            OpRef::NONE
+                        } else {
+                            ctx.get_replacement(opref)
+                        }
+                    })
+                    .collect();
+                guard_op.fail_args = Some(new_fail_args.into());
+            }
+        }
+
+        // Fallback: resolve from patchguardop when no snapshot available.
         if guard_op.fail_args.is_none() {
             if let Some(ref patch) = self.patchguardop {
                 if guard_op.rd_resume_position >= 0
@@ -841,7 +863,6 @@ impl Optimizer {
         if guard_op.fail_args.is_none() {
             guard_op.fail_args = Some(Default::default());
         }
-        let _ = pending;
 
         let Some(ref fail_args) = guard_op.fail_args else {
             return;

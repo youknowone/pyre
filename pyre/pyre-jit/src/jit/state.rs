@@ -2087,21 +2087,18 @@ impl MIFrame {
         let fail_args = self.build_single_frame_fail_args(ctx);
 
         // opencoder.py:819 parity: capture snapshot of frame state.
-        // Each fail_arg slot becomes a SnapshotTagged::Box(n) where n
-        // is the slot's position in fail_args. Constants (OpRef >= 10_000)
-        // become SnapshotTagged::Const. This ensures resume data is
-        // independent of optimizer transformations to fail_args.
+        // Store actual OpRef values (not fail_args indices) so the
+        // optimizer can resolve them through the replacement chain
+        // when rebuilding fail_args in store_final_boxes_in_guard.
         let snapshot_boxes: Vec<majit_trace::recorder::SnapshotTagged> = fail_args
             .iter()
-            .enumerate()
-            .map(|(i, &opref)| {
+            .map(|&opref| {
                 if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Box(i as u32)
-                } else if opref.0 >= 10_000 {
-                    let val = ctx.constant_value(opref).unwrap_or(0);
-                    majit_trace::recorder::SnapshotTagged::Const(val)
+                    majit_trace::recorder::SnapshotTagged::Const(0)
                 } else {
-                    majit_trace::recorder::SnapshotTagged::Box(i as u32)
+                    // Store the actual OpRef value (includes constants >= 10_000).
+                    // The optimizer resolves these via get_replacement().
+                    majit_trace::recorder::SnapshotTagged::Box(opref.0)
                 }
             })
             .collect();

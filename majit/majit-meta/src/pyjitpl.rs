@@ -1632,6 +1632,30 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
 
+        // resume.py parity: convert tracing-time snapshots to flat OpRef
+        // vectors so the optimizer can rebuild fail_args from snapshot in
+        // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
+        let snapshot_map: std::collections::HashMap<i32, Vec<majit_ir::OpRef>> = trace_snapshots
+            .iter()
+            .enumerate()
+            .map(|(id, snap)| {
+                use majit_trace::recorder::SnapshotTagged;
+                let boxes: Vec<majit_ir::OpRef> = snap
+                    .frames
+                    .iter()
+                    .flat_map(|f| f.boxes.iter())
+                    .map(|t| match t {
+                        SnapshotTagged::Box(n) => majit_ir::OpRef(*n),
+                        SnapshotTagged::Const(_) | SnapshotTagged::Virtual(_) => {
+                            majit_ir::OpRef::NONE
+                        }
+                    })
+                    .collect();
+                (id as i32, boxes)
+            })
+            .collect();
+        unroll_opt.snapshot_boxes = snapshot_map.clone();
+
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
         // array slots through the loop as virtual state instead of heap traffic.
@@ -1665,6 +1689,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.constant_types = constant_types;
                         simple_opt.resume_encoder =
                             Some(Box::new(crate::resume::ResumeDataLoopMemoEncoder::new()));
+                        simple_opt.snapshot_boxes = snapshot_map.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
