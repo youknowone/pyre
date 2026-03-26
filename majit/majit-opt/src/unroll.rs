@@ -56,6 +56,10 @@ pub struct UnrollOptimizer {
     /// Injected by majit-meta when the optimizer is set up.
     pub resume_encoder_factory:
         Option<Box<dyn Fn() -> Box<dyn majit_ir::ResumeDataEncoder> + Send>>,
+    /// resume.py parity: per-guard snapshot boxes from tracing time.
+    /// Passed through to Phase 1 and Phase 2 optimizers for
+    /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
+    pub snapshot_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
 }
 
 impl UnrollOptimizer {
@@ -69,6 +73,7 @@ impl UnrollOptimizer {
             max_retrace_guards: 15,
             imported_state: None,
             resume_encoder_factory: None,
+            snapshot_boxes: std::collections::HashMap::new(),
         }
     }
 
@@ -198,6 +203,7 @@ impl UnrollOptimizer {
             if let Some(ref factory) = self.resume_encoder_factory {
                 opt_p1.resume_encoder = Some(factory());
             }
+            opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -271,6 +277,7 @@ impl UnrollOptimizer {
         if let Some(ref factory) = self.resume_encoder_factory {
             opt_p2.resume_encoder = Some(factory());
         }
+        opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
@@ -1425,7 +1432,13 @@ impl OptUnroll {
                         *arg = mapped;
                     }
                 }
-                if let Some(ref mut fail_args) = new_op.fail_args {
+                // RPython unroll.py:405-409: copy_and_change only copies args,
+                // NOT fail_args. store_final_boxes_in_guard rebuilds fail_args
+                // from the snapshot later. Clear fail_args to prevent stale
+                // preamble-scope OpRefs from leaking into the body loop.
+                if new_op.opcode.is_guard() {
+                    new_op.fail_args = None;
+                } else if let Some(ref mut fail_args) = new_op.fail_args {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
                             *arg = mapped;
