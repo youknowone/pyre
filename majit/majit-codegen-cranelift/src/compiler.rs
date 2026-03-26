@@ -47,6 +47,82 @@ const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
 /// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
 /// gcmap bit positions are offset by this amount.
 const JITFRAME_FIXED_SIZE: u32 = 7;
+/// GC type id for JitFrame objects.
+/// Registered via `register_type` with a `jitframe_custom_trace` hook.
+/// RPython parity: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace).
+const JITFRAME_GC_TYPE_ID: u32 = 2;
+
+/// Custom trace function for GC-managed jitframes.
+///
+/// RPython parity: jitframe.py:104-136 `jitframe_trace`.
+/// Reads jf_gcmap pointer and calls `f` for each ref slot in jf_frame.
+///
+/// jf_gcmap stores a pointer to `[length: isize, data: usize[length]]` bitmap
+/// (written by emit_push_gcmap via compute_per_call_gcmap / emit_guard_exit).
+/// Each bit in data[i] at position `bitindex` maps to frame slot
+/// `i * 64 + bitindex`. Slots at positions < JITFRAME_FIXED_SIZE are header
+/// fields and are never GC refs; slots >= JITFRAME_FIXED_SIZE index into
+/// jf_frame[slot - JITFRAME_FIXED_SIZE].
+///
+/// # Safety
+/// `obj_addr` must point to a valid JitFrame payload (after GC header).
+unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
+    let jf_ptr = obj_addr as *const u8;
+    // Read jf_gcmap pointer (byte offset 24 from jf_ptr).
+    let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
+    if gcmap_ptr.is_null() {
+        return;
+    }
+    // gcmap format: [length: isize, data: usize[length]]
+    let gcmap_lgt = unsafe { *(gcmap_ptr as *const isize) };
+    let frame_items = unsafe { jf_ptr.add(JF_FRAME_ITEM0_OFS as usize) };
+    let mut no: isize = 0;
+    while no < gcmap_lgt {
+        let word = unsafe { *(gcmap_ptr.add(8 + 8 * no as usize) as *const usize) };
+        let mut bitindex: usize = 0;
+        while bitindex < 64 {
+            if word & (1usize << bitindex) != 0 {
+                let index = no as usize * 64 + bitindex;
+                let slot_ptr = unsafe { frame_items.add(8 * index) as *mut GcRef };
+                let gcref = unsafe { *slot_ptr };
+                if !gcref.is_null() {
+                    f(slot_ptr);
+                }
+            }
+            bitindex += 1;
+        }
+        no += 1;
+    }
+}
+
+/// Ensure the JITFRAME GC type (type_id=2) is registered with the GC.
+///
+/// RPython parity: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace).
+/// Must be called before allocating GC-managed jitframes.
+/// Pre-registers placeholder types for ids 0 and 1 if the GC has no types yet.
+fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) {
+    use majit_gc::TypeInfo;
+
+    let current_count = gc.type_count();
+    if current_count == 0 {
+        // GC doesn't implement type registration (e.g. TrackingGc stub).
+        // alloc_oldgen_typed will fall back to alloc_nursery.
+        return;
+    }
+    if current_count > JITFRAME_GC_TYPE_ID as usize {
+        // Type_id=2 slot already exists (registered by a prior call or test setup).
+        return;
+    }
+
+    // Register placeholder types until we reach JITFRAME_GC_TYPE_ID.
+    while gc.type_count() < JITFRAME_GC_TYPE_ID as usize {
+        gc.register_type(TypeInfo::simple(8));
+    }
+
+    // Register JITFRAME with custom_trace at type_id=2.
+    let id = gc.register_type(TypeInfo::with_custom_trace(0, jitframe_custom_trace));
+    debug_assert_eq!(id, JITFRAME_GC_TYPE_ID);
+}
 
 #[derive(Debug)]
 struct BuiltinFieldDescr {
@@ -3850,24 +3926,41 @@ fn run_compiled_code(
 ) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
-    //
-    // RPython allocates jitframes from nursery. pyre uses Rust-managed Vec
-    // because compiled code uses no_collect alloc (gc_alloc_nursery_no_collect)
-    // which prevents GC movement during execution. The shadow stack + jf_gcmap
-    // mechanism traces ref slots identically to RPython's root_walker +
-    // jitframe_trace (jitframe.py:104-136).
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let jf_total = header_words + depth + num_ref_roots;
-    let mut jf_buf = vec![0i64; jf_total];
+    let payload_bytes = jf_total * 8;
+
+    // gc.py:132-135 malloc_jitframe parity:
+    // When GC has type registry (MiniMarkGC), allocate jitframe in old gen
+    // with GC header. Old-gen jitframes are traced via remembered set +
+    // custom_trace (Phase 2), preventing double-update conflict with walk_jf_roots.
+    // When GC is a stub (TrackingGc) or absent, fall back to Vec<i64>.
+    let use_gc_alloc = gc_runtime_id
+        .map(|id| with_gc_runtime(id, |gc| gc.type_count() > 0))
+        .unwrap_or(false);
+    let (jf_ptr, _jf_buf_keepalive): (*mut i64, Option<Vec<i64>>) = if use_gc_alloc {
+        let runtime_id = gc_runtime_id.unwrap();
+        let gcref = with_gc_runtime(runtime_id, |gc| {
+            let gcref = gc.alloc_oldgen_typed(JITFRAME_GC_TYPE_ID, payload_bytes);
+            // llmodel.py:322 parity: gc_writebarrier(ll_frame)
+            // Puts jitframe into remembered set so Phase 2 traces its ref slots.
+            gc.write_barrier(gcref);
+            gcref
+        });
+        (gcref.0 as *mut i64, None)
+    } else {
+        let mut buf = vec![0i64; jf_total];
+        let ptr = buf.as_mut_ptr();
+        (ptr, Some(buf))
+    };
 
     // llmodel.py:306-315: set arguments in frame
     for (i, &val) in inputs.iter().enumerate() {
-        jf_buf[header_words + i] = val;
+        unsafe { *jf_ptr.add(header_words + i) = val };
     }
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
-    // Returns (jf_ptr, jf_descr) — second value is FailDescr pointer in rdx.
     let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
 
     let _jitted_guard = majit_codegen::JittedGuard::enter();
@@ -3880,18 +3973,18 @@ fn run_compiled_code(
     };
 
     // _call_header_shadowstack (assembler.py:1122-1128) parity:
-    // Push jf_ptr onto the jitframe shadow stack. The GC walks this
-    // stack during collection and traces ref slots via jf_gcmap
-    // (written by push_gcmap in compiled code before GC calls).
-    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_buf.as_mut_ptr() as *mut u8);
+    // Push jf_ptr onto the jitframe shadow stack.
+    // gc_managed=true for old-gen alloc: walk_jf_roots skips these
+    // (Phase 2 traces via remembered set + custom_trace instead).
+    let gc_managed = use_gc_alloc;
+    let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_ptr as *mut u8, gc_managed);
 
-    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_buf.as_mut_ptr()) });
+    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_ptr) });
 
     // llmodel.py:412-420 get_latest_descr: read jf_descr from returned frame.
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
     // _call_footer_shadowstack (assembler.py:1130-1136) parity:
-    // Pop jf_ptr from shadow stack.
     majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
     let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         CALL_ASSEMBLER_DEADFRAME_SENTINEL
@@ -4180,7 +4273,10 @@ impl CraneliftBackend {
         backend
     }
 
-    pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
+    pub fn set_gc_allocator(&mut self, mut gc: Box<dyn GcAllocator>) {
+        // Register JITFRAME type_id=2 with custom_trace before storing
+        // the GC, so alloc_oldgen_typed(JITFRAME_GC_TYPE_ID, ...) works.
+        ensure_jitframe_type_registered(gc.as_mut());
         if let Some(runtime_id) = self.gc_runtime_id {
             replace_gc_runtime(runtime_id, gc);
         } else {
