@@ -1479,6 +1479,18 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
+    // Generator/coroutine methods — PyPy: generator.py GeneratorIterator
+    unsafe {
+        if pyre_object::generatorobject::is_generator(obj) {
+            match name {
+                "close" | "send" | "throw" | "__next__" | "__iter__" => {
+                    return Ok(crate::w_builtin_func_new("gen_method", gen_stub_method));
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Module objects: look up in module namespace
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
@@ -1613,7 +1625,21 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
-    // Special attributes on any object
+    // Common special attributes — return defaults for any object type
+    if name == "__doc__"
+        || name == "__module__"
+        || name == "__wrapped__"
+        || name == "__annotations__"
+    {
+        // Check ATTR_TABLE first, then return None as default
+        let found = ATTR_TABLE.with(|table| {
+            let table = table.borrow();
+            table
+                .get(&(obj as usize))
+                .and_then(|d| d.get(name).copied())
+        });
+        return Ok(found.unwrap_or(w_none()));
+    }
     if name == "__dict__" {
         let d = pyre_object::w_dict_new();
         ATTR_TABLE.with(|table| {
@@ -2053,6 +2079,19 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
         }
     }
     Err(PyError::type_error("not an iterator"))
+}
+
+/// Stub method for generator.close/send/throw — no-op.
+fn gen_stub_method(args: &[PyObjectRef]) -> PyResult {
+    // close(): mark exhausted
+    if !args.is_empty() {
+        unsafe {
+            if pyre_object::generatorobject::is_generator(args[0]) {
+                pyre_object::generatorobject::w_generator_set_exhausted(args[0]);
+            }
+        }
+    }
+    Ok(w_none())
 }
 
 /// Resume a generator frame until YIELD_VALUE or RETURN_VALUE.

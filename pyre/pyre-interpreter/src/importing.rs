@@ -61,6 +61,7 @@ pub fn install_builtin_modules() {
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
+    register_builtin_module("_collections_abc", init_collections_abc);
     register_builtin_module("_weakref", init_weakref);
     register_builtin_module("_abc", init_abc);
     register_builtin_module("_functools", init_functools);
@@ -114,6 +115,55 @@ pub fn install_builtin_modules() {
 
 /// Empty module initializer for C-extension stubs.
 fn empty_module_init(_ns: &mut PyNamespace) {}
+
+/// _collections_abc stub — provides _check_methods for io.py etc.
+/// The real _collections_abc.py requires ABCMeta (metaclass support).
+fn init_collections_abc(ns: &mut PyNamespace) {
+    // _check_methods(C, *methods) — check if class C has all methods
+    crate::namespace_store(
+        ns,
+        "_check_methods",
+        crate::w_builtin_func_new("_check_methods", |args| {
+            // args[0] = C (class), args[1..] = method names
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(true));
+            }
+            let cls = args[0];
+            for &method_name in &args[1..] {
+                let name = unsafe { pyre_object::w_str_get_value(method_name) };
+                // Check if method exists in class MRO
+                let found = if unsafe { pyre_object::is_type(cls) } {
+                    unsafe { crate::space::lookup_in_type_mro_pub(cls, name) }.is_some()
+                } else {
+                    false
+                };
+                if !found {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+            }
+            Ok(pyre_object::w_bool_from(true))
+        }),
+    );
+    // Stub ABC classes
+    crate::namespace_store(ns, "Hashable", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Awaitable", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Coroutine", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Iterator", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Generator", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Iterable", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Callable", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Sized", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Container", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Collection", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Sequence", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "MutableSequence", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Mapping", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "MutableMapping", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Set", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "MutableSet", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "ByteString", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Buffer", crate::typedef::get_object_type());
+}
 
 /// _weakref stub — PyPy: pypy/module/_weakref/
 fn init_weakref(ns: &mut PyNamespace) {
