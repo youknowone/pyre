@@ -847,6 +847,13 @@ pub fn resume_in_blackhole_from_fail_args(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_or_compile_jitcode(code, &writer);
+        // Safety: skip blackhole if jitcode contains BC_ABORT between
+        // guard_pc and the end. BC_ABORT causes side-effect corruption
+        // when the blackhole executes past unsupported bytecodes.
+        if pyjitcode.jitcode.code.contains(&13 /* BC_ABORT */) {
+            builder.release_chain(prev_bh);
+            return BlackholeResult::Failed;
+        }
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
         } else {
@@ -944,6 +951,13 @@ pub fn resume_in_blackhole_from_fail_args(
             }
             builder.release_interp(bh);
             return BlackholeResult::MergePoint;
+        }
+
+        // BC_ABORT: unsupported bytecode hit during execution.
+        // Return Failed so caller falls back to restore_guard_failure_values.
+        if bh.aborted {
+            builder.release_interp(bh);
+            return BlackholeResult::Failed;
         }
 
         // DoneWithThisFrame: callee finished (RETURN_VALUE).

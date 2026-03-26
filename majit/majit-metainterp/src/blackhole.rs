@@ -766,6 +766,10 @@ pub struct BlackholeInterpreter {
     pub merge_point_jitcode_pc: Option<usize>,
     /// Set to true when `run()` exited via merge point (not LeaveFrame).
     pub reached_merge_point: bool,
+    /// True when run() hit BC_ABORT (unsupported bytecode). Callers
+    /// must not treat abort as DoneWithThisFrame — side effects from
+    /// partial execution have corrupted state.
+    pub aborted: bool,
 }
 
 impl Default for BlackholeInterpreter {
@@ -791,6 +795,7 @@ impl BlackholeInterpreter {
             current_selected: 0,
             merge_point_jitcode_pc: None,
             reached_merge_point: false,
+            aborted: false,
         }
     }
 
@@ -1219,6 +1224,7 @@ impl BlackholeInterpreter {
                 return Err(LeaveFrame);
             }
             BC_ABORT | BC_ABORT_PERMANENT => {
+                self.aborted = true;
                 return Err(LeaveFrame);
             }
             BC_INLINE_CALL => {
@@ -1469,6 +1475,7 @@ impl BlackholeInterpBuilder {
         interp.runtime_stacks.clear();
         interp.merge_point_jitcode_pc = None;
         interp.reached_merge_point = false;
+        interp.aborted = false;
         self.pool.push(interp);
     }
 

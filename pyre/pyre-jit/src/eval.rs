@@ -830,10 +830,7 @@ fn handle_jit_outcome(
         }
         DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
             // RPython compile.py:710 handle_fail → resume_in_blackhole.
-            // Blocked: typed_values[1] contains caller's ni, not callee's.
-            // Fix the resume PC encoding in trace compiler, then activate:
-            // JitAction::ContinueRunningNormally
-            JitAction::Continue
+            JitAction::ContinueRunningNormally
         }
         DetailedDriverRunOutcome::GuardFailure {
             restored: false, ..
