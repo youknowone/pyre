@@ -52,6 +52,7 @@ pub fn register_builtin_module(name: &'static str, init: fn(&mut PyNamespace)) {
 /// `install_mixedmodule()` for each module in objspace.usemodules.
 pub fn install_builtin_modules() {
     register_builtin_module("math", crate::module::math::moduledef::init);
+    register_builtin_module("cmath", crate::module::math::cmath_moduledef::init);
     register_builtin_module("time", crate::module::time::moduledef::init);
     register_builtin_module("sys", crate::module::sys::moduledef::init);
     register_builtin_module("operator", crate::module::operator::moduledef::init);
