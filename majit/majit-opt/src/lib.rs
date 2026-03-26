@@ -878,6 +878,18 @@ impl OptContext {
         self.get_constant(opref).cloned()
     }
 
+    /// RPython box.type parity: find the result type of the operation
+    /// that produces this OpRef. Returns None if the OpRef is an
+    /// inputarg or was not produced by any emitted operation.
+    pub fn get_op_result_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
+        for op in self.new_operations.iter().rev() {
+            if op.pos == opref && op.result_type() != majit_ir::Type::Void {
+                return Some(op.result_type());
+            }
+        }
+        None
+    }
+
     /// optimizer.py: clear_newoperations()
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {

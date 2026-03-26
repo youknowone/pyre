@@ -2676,15 +2676,27 @@ impl Optimizer {
         }
 
         if !extra_fail_args.is_empty() {
-            // RPython parity: store_final_boxes_in_guard creates a new
-            // ResumeGuardDescr with updated fail_arg_types matching the
-            // expanded fail_args. We must update the descriptor's types
-            // to include the extra field values.
+            // store_final_boxes_in_guard parity: RPython reads types from
+            // box.type, not from the MetaFailDescr. Re-infer base types
+            // from the optimizer context so that unboxed Int values in
+            // formerly-Ref slots get the correct type after preamble peeling.
             if let Some(ref descr) = op.descr {
                 if let Some(fd) = descr.as_fail_descr() {
-                    let mut types = fd.fail_arg_types().to_vec();
-                    // Extra fail_args are field values — all Int for now
-                    // (W_Int fields are vtable ptr and int value).
+                    let mut types: Vec<majit_ir::Type> = fail_args[..original_len]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &opref)| {
+                            if opref.is_none() {
+                                // Virtual slot — type from original descriptor.
+                                fd.fail_arg_types()
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(majit_ir::Type::Ref)
+                            } else {
+                                Self::infer_fail_arg_type(opref, fd, i, ctx)
+                            }
+                        })
+                        .collect();
                     for _ in 0..extra_fail_args.len() {
                         types.push(majit_ir::Type::Int);
                     }
@@ -2702,6 +2714,34 @@ impl Optimizer {
             op.rd_virtuals = Some(virtual_entries);
         }
         op
+    }
+
+    /// RPython box.type parity: infer the type of a fail_arg OpRef from
+    /// the optimizer context. Checks PtrInfo (Virtual/Instance → Ref),
+    /// constant type, and falls back to the original descriptor type.
+    fn infer_fail_arg_type(
+        opref: OpRef,
+        fd: &dyn majit_ir::descr::FailDescr,
+        slot: usize,
+        ctx: &OptContext,
+    ) -> majit_ir::Type {
+        let resolved = ctx.get_replacement(opref);
+        // Constants carry explicit types.
+        if let Some(val) = ctx.get_constant(resolved) {
+            return val.get_type();
+        }
+        // PtrInfo indicates Ref (Virtual, Instance, KnownClass, etc.)
+        // BUT: after preamble peeling, an OpRef may have KnownClass PtrInfo
+        // while carrying an unboxed Int value in the body loop. Check if
+        // the OpRef was produced by an Int-typed operation.
+        if let Some(result_type) = ctx.get_op_result_type(resolved) {
+            return result_type;
+        }
+        // Fallback: original descriptor type.
+        fd.fail_arg_types()
+            .get(slot)
+            .copied()
+            .unwrap_or(majit_ir::Type::Ref)
     }
 }
 
