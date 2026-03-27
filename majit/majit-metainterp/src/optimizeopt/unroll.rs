@@ -1741,23 +1741,26 @@ impl OptUnroll {
         if !seen.insert(target) {
             return;
         }
+        // RPython setinfo_from_preamble parity (unroll.py:73-75):
+        // RPython does NOT propagate preamble constants via
+        // make_constant/replace_op in setinfo_from_preamble. It only
+        // calls set_forwarded(info) which sets PtrInfo (known_class etc.)
+        // WITHOUT making the box a compile-time constant in the optimizer.
+        //
+        // Propagating constants here causes Phase 2 to constant-fold
+        // GetfieldGcPureI on loop-variant W_IntObject pointers (e.g.,
+        // sign_obj), leading to InvalidLoop when the guard checks the
+        // opposite branch.
+        //
+        // Only import constant pool entries (OpRef >= 10000) that are
+        // truly invariant. All other constants are handled via PtrInfo
+        // below (known_class, instance, etc.).
         if let Some(value) = &info.constant {
-            let const_opref = if target.0 < 10_000 {
-                static NEXT_IMPORT_CONST: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(10_100);
-                let new_idx = NEXT_IMPORT_CONST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let new_ref = OpRef(new_idx);
-                ctx.replace_op(target, new_ref);
-                new_ref
-            } else {
-                target
-            };
-            ctx.make_constant(const_opref, value.clone());
-            if let Value::Ref(ptr) = value {
-                ctx.set_ptr_info(
-                    const_opref,
-                    crate::optimizeopt::info::PtrInfo::Constant(*ptr),
-                );
+            if target.0 >= 10_000 {
+                ctx.make_constant(target, value.clone());
+                if let Value::Ref(ptr) = value {
+                    ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::Constant(*ptr));
+                }
             }
         }
         if let Some(ptr_info) = info.ptr_info.clone() {
@@ -1809,15 +1812,20 @@ impl OptUnroll {
                 }
             }
         }
-        if let Some(bound) = info.int_bound.as_ref() {
-            let widened = bound.widen();
-            if widened.lower > i64::MIN {
-                ctx.int_lower_bounds.insert(target, widened.lower);
-            }
-            ctx.imported_int_bounds.insert(target, widened);
-        }
+        // RPython setinfo_from_preamble parity (unroll.py:73-75):
+        // RPython does NOT import IntBound from preamble to Phase 2.
+        // IntBound is computed independently by the IntBounds pass from
+        // guards and operations in the body loop. Importing preamble
+        // bounds causes Phase 2 to over-specialize on preamble-time
+        // values (e.g., sign=-1 bound [-1,-1] makes IntEq(sign,1)
+        // provably false → InvalidLoop).
+        //
+        // Only import int_lower_bound hints for array bounds checks
+        // (nonnegative constraints from guards in the preamble).
         if let Some(lower) = info.int_lower_bound {
-            ctx.int_lower_bounds.insert(target, lower);
+            if lower >= 0 {
+                ctx.int_lower_bounds.insert(target, lower);
+            }
         }
     }
 

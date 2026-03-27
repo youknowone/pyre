@@ -1542,15 +1542,22 @@ fn export_single_value(
     // iterations. RPython's setinfo_from_preamble_list calls
     // item.set_forwarded(None) — info is completely cleared for ALL types.
     if let Some(value) = ctx.get_constant(opref) {
-        // RPython resume.py:204: isinstance(box, Const) — export all true
-        // constants. Constant pool entries (>= 10000) are always constant.
-        // GcRef values (type pointers like ob_type) are invariant across
-        // iterations. Only skip trace-computed Int/Float constants that may
-        // differ across iterations (e.g., loop counter at entry).
-        let is_invariant = opref.0 >= 10000 || matches!(value, Value::Ref(_));
-        if is_invariant {
+        // RPython setinfo_from_preamble parity (unroll.py:73-75):
+        // Only export LEVEL_CONSTANT for constant pool entries (>= 10000).
+        // These are truly invariant across iterations (e.g., type pointers
+        // loaded via LOAD_CONST bytecodes).
+        //
+        // Trace-computed Ref constants (e.g., W_IntObject(-1) pointer for
+        // sign) are NOT invariant — a different W_IntObject may be used on
+        // the next iteration. Exporting them as Constant causes Phase 2 to
+        // constant-fold GetfieldGcPureI(sign_obj), leading to InvalidLoop.
+        // RPython handles this by only setting PtrInfo (known_class) on
+        // such boxes, not making them compile-time constants.
+        if opref.0 >= 10000 {
             return VirtualStateInfo::Constant(value.clone());
         }
+        // Trace-computed constants: export as Unknown (RPython LEVEL_UNKNOWN).
+        // Phase 2 will re-compute their values from runtime state.
         return VirtualStateInfo::Unknown;
     }
 
