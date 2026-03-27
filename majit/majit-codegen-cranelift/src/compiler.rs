@@ -2351,16 +2351,13 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     }
     let fail_arg_types = fail_descr.fail_arg_types();
 
-    // RPython compile.py: DoneWithThisFrameDescr{Int,Ref,Float}.
-    // Find the value to return in the bridge based on fail_arg type.
+    // Find the value to return in the bridge.
+    // Look for Ref (boxed int → unbox) or Int (raw value → return directly)
+    // after the virtualizable header (idx >= 3).
     let ref_idx = fail_arg_types
         .iter()
         .enumerate()
         .position(|(i, tp)| i >= 3 && *tp == Type::Ref);
-    let float_idx = fail_arg_types
-        .iter()
-        .enumerate()
-        .position(|(i, tp)| i >= 3 && *tp == Type::Float);
     let int_idx = fail_arg_types
         .iter()
         .enumerate()
@@ -2370,7 +2367,7 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     let num_inputs = fail_arg_types.len() as u32;
 
     if let Some(ref_idx) = ref_idx {
-        // Boxed: GetfieldGcI(n_boxed, intval_offset) → Finish(raw_n)
+        // Boxed int: GetfieldGcI(n_boxed, intval_offset) → Finish(raw_n)
         let n_boxed = OpRef(ref_idx as u32);
         let intval_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
         let unboxed = OpRef(num_inputs);
@@ -2383,15 +2380,6 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         );
         let mut finish_op = Op::with_descr(OpCode::Finish, &[unboxed], finish_descr);
         finish_op.pos = OpRef(num_inputs + 1);
-        bridge_ops.push(finish_op);
-    } else if let Some(float_idx) = float_idx {
-        // Raw float: Finish with Float type so handle_jit_outcome re-boxes correctly.
-        let raw_val = OpRef(float_idx as u32);
-        let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs, vec![Type::Float], true),
-        );
-        let mut finish_op = Op::with_descr(OpCode::Finish, &[raw_val], finish_descr);
-        finish_op.pos = OpRef(num_inputs);
         bridge_ops.push(finish_op);
     } else if let Some(int_idx) = int_idx {
         // Raw int: Finish(raw_value) directly

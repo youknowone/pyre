@@ -680,6 +680,10 @@ impl PtrInfo {
     }
 
     /// info.py: setfield(field_descr, value) — set a field on a virtual object.
+    /// info.py:176-200 setfield — update the field value in the virtual.
+    /// RPython: _fields[fielddescr.get_index()] = op. In majit, fields
+    /// is a (field_idx, OpRef) list; field_descrs is managed separately
+    /// by OptVirtualize (optimize_setfield_gc).
     pub fn set_field(&mut self, field_idx: u32, value: OpRef) {
         match self {
             PtrInfo::Instance(v) => {

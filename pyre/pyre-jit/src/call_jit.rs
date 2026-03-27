@@ -679,19 +679,12 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-    // RPython: resumereader.consume_one_section(curbh) — load register values
-    // For pyre: fast locals → registers, value stack → runtime stack.
-    // Locals go to BOTH i and r register files: the codewriter uses ref
-    // registers for object values (pop_r/push_r) and int registers for
-    // some opcodes (LOAD_FAST in binary_op context, truth checks).
+    // RPython resume.py:1381-1430 consume_one_section: load register values.
+    // pyre fast locals → int registers (blackhole dispatch reads as i64).
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
-            let val = frame.locals_cells_stack_w[i] as i64;
-            bh.setarg_i(i, val);
-            if i < bh.registers_r.len() {
-                bh.setarg_r(i, val);
-            }
+            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
         }
     }
 
@@ -1721,6 +1714,8 @@ extern "C" fn jit_bridge_compile_callee(
     let mut constants: HashMap<u32, i64> = HashMap::new();
     constants.insert(func_const_ref.0, force_fn_ptr);
 
+    // pyjitpl.py:3198: compile_done_with_this_frame selects descr based
+    // on result_type. result_type=Int → done_with_this_frame_descr_int.
     let call_descr = majit_metainterp::make_call_descr(&[Type::Int], Type::Int);
     let call_result = OpRef(1);
     let mut call_op = Op::with_descr(OpCode::CallI, &[func_const_ref, frame_opref], call_descr);
