@@ -4277,7 +4277,13 @@ impl<M: Clone> MetaInterp<M> {
             None => return (false, false),
         };
 
-        let recorder = self.warm_state.start_retrace(&fail_descr.fail_arg_types);
+        // RPython rebuild_state_after_failure parity: bridge inputargs are
+        // derived from the materialized frame state, not the raw fail_args
+        // (which include virtual field values as extra Int slots).
+        // Use the root loop's inputarg_types (= token.inputarg_types) for
+        // bridge recorder — these reflect the post-materialization types.
+        let bridge_input_types = &compiled.token.inputarg_types;
+        let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));

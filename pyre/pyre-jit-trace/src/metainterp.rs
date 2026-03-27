@@ -485,12 +485,7 @@ impl PyreMetaInterp {
     ///
     /// Returns Some(LoopAction) if handled, None if all frames exhausted.
     fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
-        // Gated: requires bridge compilation for efficient execution.
-        if std::env::var("MAJIT_EXC_TRACE").is_err() {
-            return None;
-        }
-
-        // RPython: while self.framestack:
+        // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
             let code = unsafe { &*top.jitcode };
             let sym = unsafe { &*top.sym };

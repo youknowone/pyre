@@ -192,7 +192,7 @@ pub fn trace_unbox_int(
         ctx.record_guard_typed_with_fail_args(
             OpCode::GuardClass,
             &[ob_type, type_const],
-            vec![majit_ir::Type::Int; fail_args.len()],
+            vec![majit_ir::Type::Ref; fail_args.len()],
             fail_args,
         );
         ctx.heap_cache_mut()
@@ -250,7 +250,7 @@ pub fn trace_int_binop_ovf(
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     ctx.record_guard_typed_with_fail_args(
         OpCode::GuardNoOverflow, &[],
-        vec![majit_ir::Type::Int; fail_args.len()], fail_args,
+        vec![majit_ir::Type::Ref; fail_args.len()], fail_args,
     );
     trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
 }
@@ -327,7 +327,7 @@ pub fn trace_unbox_float(
         ctx.record_guard_typed_with_fail_args(
             OpCode::GuardClass,
             &[ob_type, type_const],
-            vec![majit_ir::Type::Int; fail_args.len()],
+            vec![majit_ir::Type::Ref; fail_args.len()],
             fail_args,
         );
         ctx.heap_cache_mut()

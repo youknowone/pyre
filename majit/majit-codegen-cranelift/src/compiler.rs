@@ -948,6 +948,135 @@ fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
     *saved_data_root = Some(saved_data);
 }
 
+/// RPython rebuild_state_after_failure parity: materialize virtual objects
+/// in raw fail_args before bridge dispatch, using recovery_layout if available.
+///
+/// The optimizer may inline virtual field values directly into fail_args
+/// (e.g., [frame, ni, vsd, ob_type_s, intval_s, ob_type_i, intval_i])
+/// instead of using null-Ref placeholders. This function reconstructs
+/// boxed objects and produces a compacted output matching bridge inputargs.
+fn materialize_for_bridge(
+    outputs: &mut Vec<i64>,
+    types: &[majit_ir::Type],
+    recovery: Option<&majit_codegen::ExitRecoveryLayout>,
+    bridge_num_inputs: usize,
+) {
+    // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
+    if let Some(recovery) = recovery {
+        if !recovery.virtual_layouts.is_empty() && !recovery.frames.is_empty() {
+            let frame_layout = &recovery.frames[0];
+            let mut rebuilt = Vec::with_capacity(frame_layout.slots.len());
+            for slot in &frame_layout.slots {
+                match slot {
+                    majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                        rebuilt.push(outputs.get(*idx).copied().unwrap_or(0));
+                    }
+                    majit_codegen::ExitValueSourceLayout::Constant(c) => {
+                        rebuilt.push(*c);
+                    }
+                    majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                        if let Some(vl) = recovery.virtual_layouts.get(*vidx) {
+                            if let Some(obj) = materialize_single_virtual(vl, outputs) {
+                                rebuilt.push(obj);
+                            } else {
+                                rebuilt.push(0);
+                            }
+                        } else {
+                            rebuilt.push(0);
+                        }
+                    }
+                    _ => rebuilt.push(0),
+                }
+            }
+            *outputs = rebuilt;
+            return;
+        }
+    }
+    // Phase 2: compact virtual field pairs when outputs has more slots
+    // than bridge expects. Pattern: [frame, ni, vsd, ob_type_0, intval_0,
+    // ob_type_1, intval_1, ...] → [frame, ni, vsd, boxed_0, boxed_1, ...].
+    // RPython rebuild_state_after_failure materializes virtuals from
+    // rd_virtuals before bridge dispatch.
+    if bridge_num_inputs > 0 && outputs.len() > bridge_num_inputs {
+        let prefix = 3; // frame, ni, vsd
+        let object_slots = bridge_num_inputs - prefix;
+        let field_pairs = outputs.len() - prefix;
+        if object_slots > 0 && field_pairs == object_slots * 2 {
+            let mut compacted = outputs[..prefix].to_vec();
+            for i in 0..object_slots {
+                let ob_type = outputs[prefix + i * 2];
+                let intval = outputs[prefix + i * 2 + 1];
+                // Materialize via callback
+                let mut temp = vec![0i64, ob_type, intval];
+                let temp_types = vec![
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ];
+                MATERIALIZE_VIRTUALS.with(|c| {
+                    if let Some(f) = c.get() {
+                        f(&mut temp, &temp_types);
+                    }
+                });
+                compacted.push(temp[0]);
+            }
+            *outputs = compacted;
+            return;
+        }
+    }
+    // Phase 3: original heuristic fallback.
+    MATERIALIZE_VIRTUALS.with(|c| {
+        if let Some(f) = c.get() {
+            f(outputs, types);
+        }
+    });
+}
+
+/// Materialize a single virtual from its layout and raw output values.
+/// Uses the MATERIALIZE_VIRTUALS callback for actual object allocation.
+fn materialize_single_virtual(
+    vl: &majit_codegen::ExitVirtualLayout,
+    outputs: &[i64],
+) -> Option<i64> {
+    match vl {
+        majit_codegen::ExitVirtualLayout::Object { fields, .. }
+        | majit_codegen::ExitVirtualLayout::Struct { fields, .. } => {
+            if fields.len() == 2 {
+                let ob_type_val = resolve_virtual_field_value(&fields[0].1, outputs)?;
+                let intval = resolve_virtual_field_value(&fields[1].1, outputs)?;
+                // Use a temporary buffer with the [Ref(0), Int, Int] pattern
+                // so the heuristic materializer can box it.
+                let mut temp = vec![0i64, ob_type_val, intval];
+                let temp_types = vec![
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ];
+                MATERIALIZE_VIRTUALS.with(|c| {
+                    if let Some(f) = c.get() {
+                        f(&mut temp, &temp_types);
+                    }
+                });
+                if temp[0] != 0 { Some(temp[0]) } else { None }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve_virtual_field_value(
+    source: &majit_codegen::ExitValueSourceLayout,
+    outputs: &[i64],
+) -> Option<i64> {
+    match source {
+        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
+        majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+        _ => None,
+    }
+}
+
 fn get_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
     frame
         .saved_data_root
@@ -2041,9 +2170,21 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
+            // RPython rebuild_state_after_failure parity: materialize virtual
+            // objects from recovery_layout before bridge dispatch.
+            let mut mat_outputs = outputs.clone();
+            materialize_for_bridge(
+                &mut mat_outputs,
+                &fail_descr.fail_arg_types,
+                fail_descr.recovery_layout.lock().unwrap().as_ref(),
+                bridge.num_inputs,
+            );
             if bridge.loop_reentry {
-                let bridge_frame =
-                    CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                let bridge_frame = CraneliftBackend::execute_bridge(
+                    bridge,
+                    &mat_outputs,
+                    &fail_descr.fail_arg_types,
+                );
                 drop(bridge_guard);
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
@@ -2056,7 +2197,11 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 }
                 return bridge_frame;
             }
-            return CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            return CraneliftBackend::execute_bridge(
+                bridge,
+                &mat_outputs,
+                &fail_descr.fail_arg_types,
+            );
         }
         drop(bridge_guard);
 
@@ -4535,12 +4680,21 @@ impl CraneliftBackend {
             let bridge_guard = fail_descr.bridge.lock().unwrap();
             if let Some(ref bridge) = *bridge_guard {
                 release_force_token(handle);
+                // RPython rebuild_state_after_failure parity: materialize
+                // virtual objects before bridge dispatch.
+                let mut mat_outputs = outputs.clone();
+                materialize_for_bridge(
+                    &mut mat_outputs,
+                    &fail_descr.fail_arg_types,
+                    fail_descr.recovery_layout.lock().unwrap().as_ref(),
+                    bridge.num_inputs,
+                );
+                // Truncate to bridge.num_inputs: heuristic materializer replaces
+                // null Ref slots in-place but trailing virtual fields remain.
+                mat_outputs.truncate(bridge.num_inputs);
                 if bridge.loop_reentry {
-                    // Bridge JUMP → loop re-entry: execute bridge, extract
-                    // outputs, loop back to re-enter compiled code directly
-                    // (like RPython's inline jmp to the loop header).
                     let bridge_frame =
-                        Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                        Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
                     drop(bridge_guard);
                     let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                         .expect("bridge deadframe must have descriptor");
@@ -4553,7 +4707,7 @@ impl CraneliftBackend {
                     }
                     return bridge_frame;
                 }
-                return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                return Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
             }
             drop(bridge_guard);
 
@@ -4645,6 +4799,11 @@ impl CraneliftBackend {
             release_force_token(handle);
         }
 
+        // Bridge guard failure: return bridge's deadframe directly.
+        // The bridge's fail_args contain the full frame state needed
+        // for interpreter resume (bridge inputargs include parent locals).
+        // RPython resume.py:rebuild_state_after_failure uses the bridge's
+        // rd_numb/rd_virtuals to reconstruct frame state.
         DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
