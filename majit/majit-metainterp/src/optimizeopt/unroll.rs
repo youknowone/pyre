@@ -404,7 +404,28 @@ impl UnrollOptimizer {
                 })
                 .unwrap_or_default();
             let mut current_label_args = label_args.clone();
-            current_label_args.extend(initial_sp.used_boxes.iter().copied());
+            // RPython Box parity: each used_box is a distinct Box even
+            // when two virtuals share the same OpRef. Allocate fresh
+            // OpRefs for duplicates so the LABEL carries independent slots.
+            {
+                let mut seen_used = std::collections::HashSet::new();
+                let mut next_fresh = current_label_args
+                    .iter()
+                    .chain(initial_sp.used_boxes.iter())
+                    .map(|a| a.0)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .max(body_num_inputs as u32 + 100);
+                for &ub in &initial_sp.used_boxes {
+                    if seen_used.insert(ub) {
+                        current_label_args.push(ub);
+                    } else {
+                        current_label_args.push(OpRef(next_fresh));
+                        next_fresh += 1;
+                    }
+                }
+            }
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
@@ -2392,13 +2413,12 @@ fn assemble_peeled_trace_with_jump_args(
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
     let mut filtered_extra_label_args = Vec::new();
     let mut filtered_extra_jump_args = Vec::new();
-    let mut seen_extra_label_args = std::collections::HashSet::new();
+    // RPython Box parity: do NOT deduplicate extra_label_args.
+    // Each used_box is a distinct Box in RPython. Duplicates pass through
+    // to label_scope_dedup which assigns fresh OpRefs for each occurrence.
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if constants.contains_key(&label_arg.0)
-            || label_args.contains(&label_arg)
-            || !seen_extra_label_args.insert(label_arg)
-        {
+        if constants.contains_key(&label_arg.0) || label_args.contains(&label_arg) {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
