@@ -3992,10 +3992,11 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         // compile.py:701-717: handle_fail applies to ALL guards.
-        // Bridge-on-bridge requires rebuild_state_after_failure (resume.py)
-        // to reconstruct box state from deadframe. Until fully ported,
-        // restricted to root-loop guards where interpreter state matches
-        // fail_arg_types. TODO: remove once resume.py parity is complete.
+        // Bridge-on-bridge needs the concrete frame to match fail_arg_types.
+        // RPython rebuild_from_resumedata constructs a synthetic MIFrame
+        // from deadframe values — pyre uses the interpreter frame directly,
+        // which has more slots than fail_arg_types for bridge guards.
+        // TODO: construct synthetic frame from fail_args for bridge guards.
         if trace_id != compiled.root_trace_id {
             return false;
         }
