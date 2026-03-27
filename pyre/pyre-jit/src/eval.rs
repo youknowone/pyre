@@ -9,11 +9,10 @@
 
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
+use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
-use pyre_object::w_none;
 use std::cell::{Cell, UnsafeCell};
-use std::collections::HashSet;
 
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
@@ -48,6 +47,7 @@ use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
 use pyre_object::floatobject::W_FloatObject;
 use pyre_object::intobject::W_IntObject;
+use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
 const JIT_THRESHOLD: u32 = 200;
 type JitDriverPair = (
@@ -95,6 +95,404 @@ thread_local! {
 #[inline]
 pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// pypy/module/pypyjit/interp_jit.py compatibility type.
+///
+/// This is a structural placeholder for the RPython `PyPyJitDriver`.
+#[derive(Clone, Copy)]
+#[allow(clippy::module_name_repetitions)]
+pub struct PyPyJitDriver;
+
+impl PyPyJitDriver {
+    pub fn new(
+        get_printable_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> String>,
+        get_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef>,
+        get_unique_id: Option<fn(usize, bool, pyre_object::PyObjectRef) -> usize>,
+        should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
+        name: Option<&'static str>,
+        is_recursive: bool,
+    ) -> Self {
+        let _ = (
+            get_printable_location,
+            get_location,
+            get_unique_id,
+            should_unroll_one_iteration,
+            name,
+            is_recursive,
+        );
+        PyPyJitDriver
+    }
+
+    pub fn jit_merge_point(
+        &self,
+        _frame: &mut PyFrame,
+        _ec: *const PyExecutionContext,
+        _next_instr: usize,
+        _pycode: pyre_object::PyObjectRef,
+        _is_being_profiled: bool,
+    ) {
+        let _ = (_ec, _pycode, _next_instr, _is_being_profiled);
+        let _ = self;
+    }
+
+    pub fn can_enter_jit(
+        &self,
+        _frame: &mut PyFrame,
+        _ec: *const PyExecutionContext,
+        _next_instr: usize,
+        _is_being_profiled: bool,
+        _pycode: pyre_object::PyObjectRef,
+    ) {
+        let _ = self;
+        let _ = (_ec, _next_instr, _is_being_profiled, _pycode);
+    }
+}
+
+pub const pypyjitdriver: PyPyJitDriver = PyPyJitDriver;
+
+#[allow(clippy::module_name_repetitions)]
+pub struct __extend__;
+
+impl __extend__ {
+    /// Equivalent of `PyFrame` extension point used by `interp_jit.py`.
+    pub fn dispatch(
+        &self,
+        frame: &mut PyFrame,
+        pycode: pyre_object::PyObjectRef,
+        next_instr: usize,
+        _ec: *const PyExecutionContext,
+    ) -> PyResult {
+        let _ = (pycode, next_instr, _ec);
+        frame.next_instr = next_instr;
+        match eval_loop_jit(frame) {
+            LoopResult::Done(result) => result,
+            LoopResult::ContinueRunningNormally => Ok(w_none()),
+        }
+    }
+
+    pub fn jump_absolute(
+        &self,
+        frame: &mut PyFrame,
+        jumpto: usize,
+        ec: *mut PyExecutionContext,
+    ) -> usize {
+        let _ = self;
+        let decr_by = _get_adapted_tick_counter();
+        if !ec.is_null() && decr_by > 0 {
+            unsafe {
+                let exec_ctx = &mut *ec;
+                exec_ctx.bytecode_trace(frame as *mut PyFrame, decr_by);
+            }
+        }
+        frame.next_instr = jumpto;
+        jumpto
+    }
+}
+
+#[inline]
+fn _get_adapted_tick_counter() -> usize {
+    let trace_length = 0usize;
+    let decr_by = trace_length / 32;
+    decr_by.clamp(1, 100)
+}
+
+#[derive(Clone, Copy)]
+pub struct W_NotFromAssembler {
+    space: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+}
+
+impl W_NotFromAssembler {
+    pub fn __init__(
+        &mut self,
+        space: pyre_object::PyObjectRef,
+        w_callable: pyre_object::PyObjectRef,
+    ) {
+        self.space = space;
+        self.w_callable = w_callable;
+    }
+
+    pub fn descr_call(&self, __args__: &[pyre_object::PyObjectRef]) -> Self {
+        _call_not_in_trace(self.space, self.w_callable, __args__);
+        *self
+    }
+}
+
+pub fn not_from_assembler_new(
+    space: pyre_object::PyObjectRef,
+    _w_subtype: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+) -> W_NotFromAssembler {
+    let _ = _w_subtype;
+    W_NotFromAssembler { space, w_callable }
+}
+
+#[allow(unused_variables)]
+pub fn _call_not_in_trace(
+    space: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+    args: &[pyre_object::PyObjectRef],
+) {
+    let _ = space;
+    let _ = pyre_interpreter::baseobjspace::call_function(w_callable, args);
+}
+
+#[inline]
+fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) -> Option<u64> {
+    // Safety: this follows existing wrappers that treat `W_CodeObject`
+    // as an owned pointer to a `CodeObject`.
+    let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
+    if code_ptr.is_null() {
+        return None;
+    }
+    Some(make_green_key(
+        code_ptr as *const pyre_bytecode::CodeObject,
+        next_instr,
+    ))
+}
+
+/// RPython interp_jit.py helper: get_printable_location.
+pub fn get_printable_location(
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> String {
+    let mut opcode = "<eof>".to_string();
+    let mut code_name = "<unknown>".to_string();
+    let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
+    if !code_ptr.is_null() {
+        let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
+        code_name = code.obj_name.to_string();
+        if let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, next_instr) {
+            opcode = format!("{:?}", instr);
+        }
+    }
+    format!("{code_name} #{next_instr} {opcode}")
+}
+
+/// RPython interp_jit.py helper: get_unique_id.
+pub fn get_unique_id(
+    _next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> usize {
+    // A stable process-local unique-id equivalent using the code pointer.
+    unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) as usize }
+}
+
+/// RPython interp_jit.py helper: get_location.
+pub fn get_location(
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    let (filename, line, name, opcode) =
+        match unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) } {
+            x if x.is_null() => (
+                "<unknown>".to_string(),
+                0,
+                "<unknown>".to_string(),
+                "<eof>".to_string(),
+            ),
+            code_ptr => {
+                let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
+                let (_opcode, opname) =
+                    match pyre_interpreter::decode_instruction_at(code, next_instr) {
+                        Some((instruction, _)) => {
+                            (format!("{instruction:?}"), format!("{:?}", instruction))
+                        }
+                        None => ("<eof>".to_string(), "<eof>".to_string()),
+                    };
+                let line = code
+                    .locations
+                    .get(next_instr)
+                    .and_then(|(start, _)| Some(start.line.get() as usize))
+                    .unwrap_or_else(|| {
+                        code.first_line_number
+                            .map(|line| line.get())
+                            .unwrap_or(0)
+                            .saturating_add(next_instr)
+                    });
+                (
+                    code.source_path.to_string(),
+                    line,
+                    code.obj_name.to_string(),
+                    opname,
+                )
+            }
+        };
+    let _ = opcode;
+    w_tuple_new(vec![
+        w_str_new(&filename),
+        w_int_new(line as i64),
+        w_str_new(&name),
+        w_int_new(next_instr as i64),
+        w_str_new(&opcode),
+    ])
+}
+
+/// RPython interp_jit.py helper: should_unroll_one_iteration.
+pub fn should_unroll_one_iteration(
+    _next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> bool {
+    match unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) } {
+        ptr if ptr.is_null() => false,
+        code_ptr => {
+            let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
+            code.flags.contains(pyre_bytecode::CodeFlags::GENERATOR)
+        }
+    }
+}
+
+/// RPython interp_jit.py helper: get_jitcell_at_key.
+pub fn get_jitcell_at_key(
+    _space: pyre_object::PyObjectRef,
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    let key = green_key_from_pycode(next_instr, w_pycode);
+    let (driver, _) = driver_pair();
+    w_bool_from(key.is_some_and(|green_key| driver.has_compiled_loop(green_key)))
+}
+
+/// RPython interp_jit.py helper: dont_trace_here.
+pub fn dont_trace_here(
+    _space: pyre_object::PyObjectRef,
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+        return;
+    };
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .disable_noninlinable_function(green_key);
+}
+
+/// RPython interp_jit.py helper: mark_as_being_traced.
+pub fn mark_as_being_traced(
+    _space: pyre_object::PyObjectRef,
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+        return;
+    };
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .mark_as_being_traced(green_key);
+}
+
+/// RPython interp_jit.py helper: trace_next_iteration.
+pub fn trace_next_iteration(
+    _space: pyre_object::PyObjectRef,
+    next_instr: usize,
+    _is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+        return;
+    };
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .trace_next_iteration(green_key);
+}
+
+/// RPython interp_jit.py helper: trace_next_iteration_hash.
+pub fn trace_next_iteration_hash(_space: pyre_object::PyObjectRef, green_key_hash: usize) {
+    let _ = _space;
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .trace_next_iteration(green_key_hash as u64);
+}
+
+/// RPython interp_jit.py helper: residual_call.
+pub fn residual_call(
+    _space: pyre_object::PyObjectRef,
+    callable: pyre_object::PyObjectRef,
+    args: &[pyre_object::PyObjectRef],
+) -> pyre_object::PyObjectRef {
+    let _ = _space;
+    pyre_interpreter::baseobjspace::call_function(callable, args)
+}
+
+/// RPython interp_jit.py helper: set_param.
+pub fn set_param(
+    _space: pyre_object::PyObjectRef,
+    __args__: &[pyre_object::PyObjectRef],
+) -> pyre_object::PyObjectRef {
+    let _ = _space;
+    let (driver, _) = driver_pair();
+
+    match __args__ {
+        [] => {}
+        [w_text] if unsafe { pyre_object::is_str(*w_text) } => {
+            let text = unsafe { pyre_object::w_str_get_value(*w_text) };
+            let warm_state = driver.meta_interp_mut().warm_state_mut();
+            for token in text.split(',').map(str::trim) {
+                if token.is_empty() {
+                    continue;
+                }
+                if token == "off" {
+                    warm_state.set_param("threshold", 0);
+                    continue;
+                }
+                if token == "default" {
+                    warm_state.set_default_params();
+                    continue;
+                }
+                if let Some((name, value)) = token.split_once('=') {
+                    let value = value.trim();
+                    if name == "enable_opts" {
+                        warm_state.set_param_enable_opts(value);
+                    } else if let Ok(parsed) = value.parse::<i64>() {
+                        warm_state.set_param(name, parsed);
+                    }
+                }
+            }
+        }
+        [w_name, w_value] if unsafe { pyre_object::is_str(*w_name) } => {
+            let warm_state = driver.meta_interp_mut().warm_state_mut();
+            if unsafe { pyre_object::is_str(*w_value) } {
+                let name = unsafe { pyre_object::w_str_get_value(*w_name) };
+                let value = unsafe { pyre_object::w_str_get_value(*w_value) };
+                if name == "enable_opts" {
+                    warm_state.set_param_enable_opts(value);
+                } else {
+                    // Keep parity with pypy: non-numeric values are rejected in
+                    // higher layers; this shim accepts only recognized keys.
+                }
+            } else if unsafe { pyre_object::is_int(*w_value) } {
+                let name = unsafe { pyre_object::w_str_get_value(*w_name) };
+                let intval = unsafe { pyre_object::w_int_get_value(*w_value) };
+                warm_state.set_param(name, intval);
+            }
+        }
+        _ => {}
+    }
+    w_none()
+}
+
+/// RPython interp_jit.py helper: releaseall.
+pub fn releaseall(_space: pyre_object::PyObjectRef) {
+    let _ = _space;
+    let (driver, _) = driver_pair();
+    driver.invalidate_all_compiled();
+    driver.meta_interp_mut().warm_state_mut().invalidate_all();
 }
 
 fn init_callbacks() {
