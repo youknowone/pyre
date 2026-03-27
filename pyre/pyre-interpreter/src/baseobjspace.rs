@@ -1410,6 +1410,20 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// PyPy-compatible lookup that returns `None` instead of raising `KeyError`.
+pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Option<PyObjectRef> {
+    match getitem(obj, index) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            if err.kind == crate::PyErrorKind::KeyError {
+                None
+            } else {
+                panic!("space.finditem: unexpected {err:?}");
+            }
+        }
+    }
+}
+
 /// Set item by index: `obj[index] = value`.
 
 pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
@@ -1450,6 +1464,96 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
             )))
         }
     }
+}
+
+/// PyPy-compatible string-keyed item lookup that returns `None` on miss.
+pub fn finditem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    finditem(obj, w_str_new(key))
+}
+
+/// PyPy-compatible identity check returning a raw boolean value.
+pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    std::ptr::eq(w_one, w_two)
+}
+
+/// PyPy-compatible identity check returning a Python bool object.
+pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
+    w_bool_from(is_w(w_one, w_two))
+}
+
+/// Python-level `not` operation.
+pub fn not_(obj: PyObjectRef) -> PyObjectRef {
+    w_bool_from(!is_true(obj))
+}
+
+/// PyPy-compatible attribute lookup returning `None` when not found.
+pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    if unsafe { is_none(obj) } {
+        return None;
+    }
+    match getattr(obj, name) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            if err.kind == crate::PyErrorKind::AttributeError
+                || err.kind == crate::PyErrorKind::NameError
+            {
+                None
+            } else {
+                panic!("space.findattr: unexpected {err:?}");
+            }
+        }
+    }
+}
+
+/// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
+pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool {
+    let (exc_type, check_class) = (exc_type, check_class);
+    if unsafe { is_none(check_class) || is_none(exc_type) } {
+        return false;
+    }
+
+    let is_tuple_check = unsafe { is_tuple(check_class) };
+    if is_tuple_check {
+        let len = unsafe { w_tuple_len(check_class) };
+        for i in 0..len {
+            let candidate = unsafe { w_tuple_getitem(check_class, i as i64) };
+            if let Some(candidate) = candidate {
+                if exception_match(exc_type, candidate) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    if unsafe { is_list(check_class) } {
+        let len = unsafe { w_list_len(check_class) };
+        for i in 0..len {
+            let candidate = unsafe { w_list_getitem(check_class, i as i64) };
+            if let Some(candidate) = candidate {
+                if exception_match(exc_type, candidate) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    if !unsafe { is_type(check_class) } {
+        return false;
+    }
+
+    if is_w(exc_type, check_class) {
+        return true;
+    }
+
+    let mro_ptr = unsafe { w_type_get_mro(exc_type) };
+    if mro_ptr.is_null() {
+        return false;
+    }
+
+    let mro = unsafe { &*mro_ptr };
+    mro.iter().any(|&klass| is_w(klass, check_class))
 }
 
 /// Get the length of a container: `len(obj)`.
