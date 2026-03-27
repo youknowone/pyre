@@ -308,7 +308,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if let Some(val) = self.ctx.get_constant(opref) {
             return val.get_type();
         }
-        // Check emitted op result type first (most accurate for concrete values)
+        // RPython: box.type — check constant_types_for_numbering (includes
+        // inputarg types and constant pool types registered by the tracer).
+        if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
+            return tp;
+        }
+        // Check emitted op result type (most accurate for concrete values)
         let resolved = self.ctx.get_replacement(opref);
         for op in &self.ctx.new_operations {
             if op.pos == resolved {
@@ -317,6 +322,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
         // PtrInfo presence → Ref type (for non-emitted ops like input args)
         if self.ctx.get_ptr_info(opref).is_some() {
+            return majit_ir::Type::Ref;
+        }
+        // info.py: ConstPtrInfo → Ref
+        if let Some(crate::optimizeopt::info::PtrInfo::Constant(_)) = self.ctx.get_ptr_info(opref) {
             return majit_ir::Type::Ref;
         }
         majit_ir::Type::Int
@@ -961,6 +970,12 @@ impl OptContext {
     /// (replacement chain, constants, virtual info).
     fn number_guard_inline(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
+
+        // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
+        // already produced rd_numb + liveboxes. Don't overwrite.
+        if op.rd_numb.is_some() {
+            return;
+        }
 
         // RPython: every guard has a snapshot (from capture_resumedata).
         // Use tracing-time snapshot if available, otherwise build from
