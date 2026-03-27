@@ -1674,6 +1674,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_snapshots = trace.snapshots.clone();
 
+        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
@@ -1718,6 +1719,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
+        unroll_opt.numbering_type_overrides = numbering_overrides.clone();
 
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in

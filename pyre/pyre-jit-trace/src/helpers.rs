@@ -487,7 +487,11 @@ pub fn emit_box_int_inline(
     // heapcache: track allocation as unescaped
     ctx.heap_cache_mut().new_object(new_op);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)
+    // RPython ConstPtr parity: type descriptor is a GcRef pointer.
+    // Use const_int (Cranelift treats as i64) but register Ref type so
+    // resume data / consumer switchover correctly identifies it as Ref.
     let type_const = ctx.const_int(int_type_addr);
+    ctx.mark_const_type(type_const, majit_ir::Type::Ref);
     let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
     ctx.heap_cache_mut()
@@ -511,6 +515,7 @@ pub fn emit_box_float_inline(
     let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
     let type_const = ctx.const_int(float_type_addr);
+    ctx.mark_const_type(type_const, majit_ir::Type::Ref);
     let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
     ctx.heap_cache_mut()

@@ -73,6 +73,8 @@ pub struct UnrollOptimizer {
         majit_ir::OpRef,
         crate::optimizeopt::optimizer::OptimizerKnowledge,
     )>,
+    /// RPython parity: GcRef constants that need Ref type for resume data.
+    pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
 impl UnrollOptimizer {
@@ -82,6 +84,7 @@ impl UnrollOptimizer {
             target_tokens: Vec::new(),
             retraced_count: 0,
             constant_types: std::collections::HashMap::new(),
+            numbering_type_overrides: std::collections::HashMap::new(),
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
@@ -239,6 +242,7 @@ impl UnrollOptimizer {
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
             opt_p1.constant_types = self.constant_types.clone();
+            opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
@@ -317,6 +321,7 @@ impl UnrollOptimizer {
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
         opt_p2.constant_types = self.constant_types.clone();
+        opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // RPython compile.py:278-284 parity: save Phase 1 results.

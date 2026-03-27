@@ -119,6 +119,9 @@ pub struct Optimizer {
     /// Types of constant OpRefs from ConstantPool.constant_types.
     /// Used to distinguish Ref constants from Int in guard fail_args.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// RPython parity: GcRef constants (ob_type etc.) recorded as const_int
+    /// need Ref type for resume data but must NOT trigger Cranelift GC root.
+    pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython unroll.py: virtual structures found in JUMP args during preamble.
     /// Populated by OptVirtualize.export_virtual_for_preamble().
     pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
@@ -744,6 +747,7 @@ impl Optimizer {
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
+            numbering_type_overrides: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
             exported_loop_state: None,
@@ -1318,6 +1322,12 @@ impl Optimizer {
         // at each guard emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
+        // RPython parity: merge numbering_type_overrides (ob_type Ref types)
+        // into constant_types_for_numbering. These override Int → Ref for
+        // resume data only, not for Cranelift backend.
+        for (&k, &v) in &self.numbering_type_overrides {
+            ctx.constant_types_for_numbering.entry(k).or_insert(v);
+        }
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {

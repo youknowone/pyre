@@ -18,6 +18,10 @@ pub struct ConstantPool {
     constants: HashMap<u32, i64>,
     /// Type of each constant OpRef. Populated by `get_or_insert_typed`.
     constant_types: HashMap<u32, Type>,
+    /// Resume-data-only type overrides. Not exposed to Cranelift backend.
+    /// RPython parity: GcRef pointers recorded as const_int need Ref type
+    /// for resume data encoding without triggering GC root tracking.
+    numbering_type_overrides: HashMap<u32, Type>,
     next_ref: u32,
 }
 
@@ -26,6 +30,7 @@ impl ConstantPool {
         ConstantPool {
             constants: HashMap::new(),
             constant_types: HashMap::new(),
+            numbering_type_overrides: HashMap::new(),
             next_ref: 10_000,
         }
     }
@@ -56,6 +61,17 @@ impl ConstantPool {
         self.constant_types.get(&opref.0).copied()
     }
 
+    /// Mark an existing constant with a specific type for resume data only.
+    /// RPython parity: GcRef pointers stored via const_int() need Ref type
+    /// for correct resume data encoding, but Cranelift must treat them as Int
+    /// (no GC root tracking for static type descriptor pointers).
+    pub fn mark_type(&mut self, opref: OpRef, tp: Type) {
+        // Store in numbering_type_overrides only — NOT constant_types.
+        // This type info is for resume data (consumer switchover) only,
+        // NOT for Cranelift backend (which would trigger GC root tracking).
+        self.numbering_type_overrides.insert(opref.0, tp);
+    }
+
     /// Consume the pool and return the constants map and type map.
     pub fn into_inner(self) -> HashMap<u32, i64> {
         self.constants
@@ -64,6 +80,11 @@ impl ConstantPool {
     /// Consume the pool, returning both value and type maps.
     pub fn into_inner_with_types(self) -> (HashMap<u32, i64>, HashMap<u32, Type>) {
         (self.constants, self.constant_types)
+    }
+
+    /// Get numbering type overrides (for resume data only, not Cranelift).
+    pub fn numbering_type_overrides(&self) -> &HashMap<u32, Type> {
+        &self.numbering_type_overrides
     }
 
     /// Get a mutable reference to the inner constants map.
