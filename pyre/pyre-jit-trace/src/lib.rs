@@ -5,13 +5,6 @@
 //! from pyre-jit's eval_loop_jit to prevent MIFrame's monomorphization
 //! of `execute_opcode_step<E>` from bloating the eval loop's codegen.
 
-/// Cached check for MAJIT_EXC_TRACE environment variable.
-pub fn exc_trace_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("MAJIT_EXC_TRACE").is_ok());
-    *ENABLED
-}
-
 pub mod callbacks;
 pub mod descr;
 pub mod driver;
