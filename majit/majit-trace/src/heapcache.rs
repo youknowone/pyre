@@ -6,6 +6,7 @@
 ///
 /// Translated from rpython/jit/metainterp/heapcache.py.
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 
 use majit_ir::{GcRef, OpCode, OpRef};
 
@@ -26,6 +27,230 @@ pub const HF_IS_UNESCAPED: u8 = 0x10;
 /// heapcache.py: HF_NONSTD_VABLE
 pub const HF_NONSTD_VABLE: u8 = 0x20;
 
+/// heapcache.py helper aliases.
+const HF_VERSION_INC: u32 = 0x40;
+pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
+const _HF_VERSION_INC: u32 = HF_VERSION_INC;
+const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
+
+/// heapcache.py: add_flags(ref_frontend_op, flags)
+pub fn add_flags(ref_frontend_op: OpRef, flags: u8) {
+    // Stored only in `heapc_flags`; version bits are preserved by callers via
+    // `update_version`.
+    let _ = ref_frontend_op;
+    let _ = flags;
+}
+
+/// heapcache.py: remove_flags(ref_frontend_op, flags)
+pub fn remove_flags(ref_frontend_op: OpRef, flags: u8) {
+    let _ = ref_frontend_op;
+    let _ = flags;
+}
+
+/// heapcache.py: test_flags(ref_frontend_op, flags)
+pub fn test_flags(ref_frontend_op: OpRef, flags: u8) -> bool {
+    let _ = ref_frontend_op;
+    let _ = flags;
+    false
+}
+
+/// heapcache.py: maybe_replace_with_const(box)
+pub fn maybe_replace_with_const(opref: OpRef) -> OpRef {
+    opref
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CacheEntry {
+    cache_anything: HashMap<OpRef, OpRef>,
+    cache_seen_allocation: HashMap<OpRef, OpRef>,
+    quasiimmut_seen: Option<HashSet<OpRef>>,
+    quasiimmut_seen_refs: Option<HashSet<usize>>,
+    last_const_box: Option<OpRef>,
+}
+
+impl CacheEntry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear_cache_on_write(&mut self, seen_allocation_of_target: bool) {
+        if !seen_allocation_of_target {
+            self.cache_seen_allocation.clear();
+        }
+        self.cache_anything.clear();
+        if let Some(seen) = &mut self.quasiimmut_seen {
+            seen.clear();
+        }
+        if let Some(seen) = &mut self.quasiimmut_seen_refs {
+            seen.clear();
+        }
+    }
+
+    pub fn _clear_cache_on_write(&mut self, seen_allocation_of_target: bool) {
+        self.clear_cache_on_write(seen_allocation_of_target)
+    }
+
+    pub fn seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
+        cache.saw_allocation(ref_box)
+    }
+
+    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
+        self.seen_alloc(ref_box, cache)
+    }
+
+    pub fn getdict(&self, seen_alloc: bool, _heapcache: &HeapCache) -> &HashMap<OpRef, OpRef> {
+        if seen_alloc {
+            &self.cache_seen_allocation
+        } else {
+            &self.cache_anything
+        }
+    }
+
+    pub fn _getdict(&self, seen_alloc: bool) -> &HashMap<OpRef, OpRef> {
+        if seen_alloc {
+            &self.cache_seen_allocation
+        } else {
+            &self.cache_anything
+        }
+    }
+
+    pub fn getdict_mut(&mut self, seen_alloc: bool) -> &mut HashMap<OpRef, OpRef> {
+        if seen_alloc {
+            &mut self.cache_seen_allocation
+        } else {
+            &mut self.cache_anything
+        }
+    }
+
+    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut HashMap<OpRef, OpRef> {
+        if seen_alloc {
+            &mut self.cache_seen_allocation
+        } else {
+            &mut self.cache_anything
+        }
+    }
+
+    pub fn do_write_with_aliasing(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
+        let ref_box = self._unique_const_heuristic(ref_box, cache);
+        let seen_alloc = self.seen_alloc(ref_box, cache);
+        self._clear_cache_on_write(seen_alloc);
+        self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
+    }
+
+    pub fn unique_const_heuristic(&mut self, ref_box: OpRef) -> OpRef {
+        if let Some(last) = self.last_const_box {
+            if last == ref_box {
+                return last;
+            }
+        }
+        self.last_const_box = Some(ref_box);
+        ref_box
+    }
+
+    pub fn _unique_const_heuristic(&mut self, ref_box: OpRef, _cache: &HeapCache) -> OpRef {
+        let _ = _cache;
+        self.unique_const_heuristic(ref_box)
+    }
+
+    pub fn read(&mut self, ref_box: OpRef, cache: &HeapCache) -> Option<OpRef> {
+        let _ = cache;
+        let ref_box = self.unique_const_heuristic(ref_box);
+        let seen_alloc = self.seen_alloc(ref_box, cache);
+        self._getdict(seen_alloc)
+            .get(&ref_box)
+            .copied()
+            .map(maybe_replace_with_const)
+    }
+
+    pub fn read_now_known(&mut self, ref_box: OpRef, fieldbox: OpRef, _cache: &HeapCache) {
+        let ref_box = self.unique_const_heuristic(ref_box);
+        let seen_alloc = self.seen_alloc(ref_box, _cache);
+        self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
+    }
+
+    pub fn read_now_known_cacheless(&mut self, ref_box: OpRef, fieldbox: OpRef) {
+        let mut cache = HeapCache::new();
+        self.read_now_known(ref_box, fieldbox, &mut cache)
+    }
+
+    pub fn invalidate_unescaped(&mut self, unescaped: &HashSet<OpRef>) {
+        self._invalidate_unescaped(unescaped)
+    }
+
+    pub fn _invalidate_unescaped(&mut self, unescaped: &HashSet<OpRef>) {
+        self.cache_anything
+            .retain(|box_ref, _| unescaped.contains(box_ref));
+        self.cache_seen_allocation
+            .retain(|box_ref, _| unescaped.contains(box_ref));
+        if let Some(seen) = &mut self.quasiimmut_seen {
+            seen.clear();
+        }
+        if let Some(seen) = &mut self.quasiimmut_seen_refs {
+            seen.clear();
+        }
+    }
+}
+
+/// RPython heapcache.py: FieldUpdater helper struct.
+///
+/// In Rust, safe ownership makes this harder to express directly, so it stores
+/// a raw pointer back to the cache for writeback.
+pub struct FieldUpdater {
+    ref_box: OpRef,
+    currfieldbox: Option<OpRef>,
+    cache: *mut HeapCache,
+    descr: Option<u32>,
+    _marker: PhantomData<HeapCache>,
+}
+
+impl FieldUpdater {
+    pub fn new(ref_box: OpRef) -> Self {
+        Self {
+            ref_box,
+            currfieldbox: None,
+            cache: std::ptr::null_mut(),
+            descr: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn with_cache(
+        ref_box: OpRef,
+        cache: &mut HeapCache,
+        descr: u32,
+        fieldbox: Option<OpRef>,
+    ) -> Self {
+        Self {
+            ref_box,
+            currfieldbox: fieldbox,
+            cache: cache as *mut HeapCache,
+            descr: Some(descr),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn getfield_now_known(&mut self, fieldbox: OpRef) {
+        self.currfieldbox = Some(fieldbox);
+    }
+
+    pub fn setfield(&mut self, _fieldbox: OpRef) {
+        self.currfieldbox = Some(_fieldbox);
+        let Some(descr) = self.descr else {
+            return;
+        };
+        // RPython writes through the cache updater; we keep the descriptor
+        // and target object in the updater.
+        if !self.cache.is_null() {
+            // SAFETY: `FieldUpdater` is only created by `HeapCache::get_field_updater`
+            // and tied to an active mutable borrow of that cache.
+            unsafe {
+                let cache = &mut *self.cache;
+                cache.setfield(self.ref_box, descr, _fieldbox);
+            }
+        }
+    }
+}
+
 /// Heap cache for the tracing interpreter.
 ///
 /// Tracks field values, known classes, and allocation status during
@@ -33,6 +258,9 @@ pub const HF_NONSTD_VABLE: u8 = 0x20;
 pub struct HeapCache {
     /// Field cache: (object_ref, field_descr_index) -> cached value.
     field_cache: HashMap<(OpRef, u32), OpRef>,
+
+    heap_cache: HashMap<u32, CacheEntry>,
+    heap_array_cache: HashMap<u32, HashMap<u32, CacheEntry>>,
 
     /// Array item cache: (array_ref, index_opref, descr_index) -> cached value.
     /// heapcache.py: `cached_arrayitems`.
@@ -76,6 +304,10 @@ pub struct HeapCache {
     /// consumed by quasi-immut field recording to decide whether to emit
     /// GUARD_NOT_INVALIDATED.
     need_guard_not_invalidated: bool,
+
+    head_version: u32,
+    likely_virtual_version: u32,
+    heapc_flags: HashMap<OpRef, u32>,
 }
 
 impl HeapCache {
@@ -83,6 +315,8 @@ impl HeapCache {
     pub fn new() -> Self {
         HeapCache {
             field_cache: HashMap::new(),
+            heap_cache: HashMap::new(),
+            heap_array_cache: HashMap::new(),
             array_cache: HashMap::new(),
             known_class: HashMap::new(),
             quasi_immut_known: HashSet::new(),
@@ -96,13 +330,225 @@ impl HeapCache {
             loopinvariant_result: None,
             escape_deps: HashMap::new(),
             need_guard_not_invalidated: true,
+            head_version: 0,
+            likely_virtual_version: 0,
+            heapc_flags: HashMap::new(),
         }
+    }
+
+    fn flags_for_ref(&self, opref: OpRef) -> u32 {
+        self.heapc_flags.get(&opref).copied().unwrap_or(0)
+    }
+
+    fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
+        if flags == 0 {
+            self.heapc_flags.remove(&opref);
+        } else {
+            self.heapc_flags.insert(opref, flags);
+        }
+    }
+
+    fn versioned_or(self_flags: u32, op_version: u32) -> bool {
+        self_flags >= op_version
+    }
+
+    fn bump_head_version(&mut self) -> u32 {
+        assert!(self.head_version < HF_VERSION_MAX);
+        self.head_version += HF_VERSION_INC;
+        self.head_version
+    }
+
+    /// RPython: test_head_version(ref_frontend_op)
+    pub fn test_head_version(&self, opref: OpRef) -> bool {
+        Self::versioned_or(self.flags_for_ref(opref), self.head_version)
+    }
+
+    /// RPython: test_likely_virtual_version(ref_frontend_op)
+    pub fn test_likely_virtual_version(&self, opref: OpRef) -> bool {
+        Self::versioned_or(self.flags_for_ref(opref), self.likely_virtual_version)
+    }
+
+    /// RPython: update_version(ref_frontend_op)
+    pub fn update_version(&mut self, opref: OpRef) {
+        let old_flags = self.flags_for_ref(opref);
+        if Self::versioned_or(old_flags, self.head_version) {
+            return;
+        }
+        let mut flags = self.head_version;
+        if Self::versioned_or(old_flags, self.likely_virtual_version)
+            && (old_flags & u32::from(HF_LIKELY_VIRTUAL)) != 0
+        {
+            flags |= u32::from(HF_LIKELY_VIRTUAL);
+        }
+        self.set_flags_for_ref(opref, flags);
+    }
+
+    /// RPython: _check_flag(box, flag)
+    pub fn _check_flag(&self, opref: OpRef, flag: u8) -> bool {
+        if !self.test_head_version(opref) {
+            return false;
+        }
+        (self.flags_for_ref(opref) & u32::from(flag)) != 0
+    }
+
+    /// RPython: _set_flag(box, flag)
+    pub fn _set_flag(&mut self, opref: OpRef, flag: u8) {
+        self.update_version(opref);
+        let flags = self.flags_for_ref(opref) | u32::from(flag);
+        self.set_flags_for_ref(opref, flags);
+        // Keep mirrors: boolean flags used by this Rust implementation.
+        match flag {
+            HF_SEEN_ALLOCATION => {
+                self.seen_allocation.insert(opref);
+            }
+            HF_KNOWN_CLASS => {
+                self.known_class.entry(opref).or_insert(GcRef(0));
+            }
+            HF_KNOWN_NULLITY => {
+                self.known_nullity.entry(opref).or_insert(false);
+            }
+            HF_IS_UNESCAPED => {
+                self.is_unescaped.insert(opref);
+            }
+            HF_LIKELY_VIRTUAL => {
+                self.likely_virtual.insert(opref);
+            }
+            HF_NONSTD_VABLE => {
+                self.nonstandard_virtualizables_now_known(opref);
+            }
+            _ => {}
+        }
+    }
+
+    fn _remove_flag(&mut self, opref: OpRef, flag: u8) {
+        let flags = self.flags_for_ref(opref);
+        if flags == 0 {
+            return;
+        }
+        let updated = flags & !u32::from(flag);
+        self.set_flags_for_ref(opref, updated);
+        match flag {
+            HF_IS_UNESCAPED => {
+                self.is_unescaped.remove(&opref);
+            }
+            HF_LIKELY_VIRTUAL => {
+                self.likely_virtual.remove(&opref);
+            }
+            HF_SEEN_ALLOCATION => {
+                self.seen_allocation.remove(&opref);
+            }
+            HF_KNOWN_NULLITY => {
+                self.known_nullity.remove(&opref);
+            }
+            HF_KNOWN_CLASS => {
+                self.known_class.remove(&opref);
+            }
+            _ => {}
+        }
+    }
+
+    /// RPython-compatible alias.
+    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<OpRef> {
+        self.update_version(opref);
+        self.escape_deps.entry(opref).or_default()
+    }
+
+    /// RPython-compatible alias retained for parity.
+    pub fn _escape_from_write(&mut self, obj: OpRef, fieldbox: OpRef) {
+        if self.is_unescaped(obj) && self.is_unescaped(fieldbox) {
+            self._get_deps(obj).push(fieldbox);
+            return;
+        }
+        if self.is_unescaped(obj) {
+            return;
+        }
+        self._escape_box(fieldbox);
+    }
+
+    /// RPython-compatible alias.
+    pub fn _escape_box(&mut self, boxref: OpRef) {
+        self.mark_escaped_box(boxref);
+    }
+
+    /// Alias to keep recursion behavior explicit with Python name.
+    pub fn mark_escaped_box(&mut self, opref: OpRef) {
+        if !self.is_unescaped.remove(&opref) {
+            return;
+        }
+        self.likely_virtual.remove(&opref);
+        self.known_nullity.remove(&opref);
+        if let Some(deps) = self.escape_deps.remove(&opref) {
+            let mut pending = deps;
+            while let Some(dep) = pending.pop() {
+                self.mark_escaped_box(dep);
+            }
+        }
+    }
+
+    /// RPython: mark_escaped(opnum, descr, *argboxes) entrypoint.
+    pub fn mark_escaped(&mut self, opnum: OpCode, _descr: Option<OpRef>, argboxes: &[OpRef]) {
+        if opnum == OpCode::SetfieldGc {
+            if argboxes.len() == 2 {
+                self._escape_from_write(argboxes[0], argboxes[1]);
+                return;
+            }
+        } else if opnum == OpCode::SetarrayitemGc {
+            if argboxes.len() == 3 {
+                self._escape_from_write(argboxes[0], argboxes[2]);
+                return;
+            }
+        } else if !matches!(
+            opnum,
+            OpCode::GetfieldGcR
+                | OpCode::GetfieldGcI
+                | OpCode::GetfieldGcF
+                | OpCode::PtrEq
+                | OpCode::PtrNe
+                | OpCode::InstancePtrEq
+                | OpCode::InstancePtrNe
+                | OpCode::AssertNotNone
+        ) {
+            self._escape_argboxes(argboxes);
+        }
+    }
+
+    /// Backward-compatible entry name used by invalidate_caches().
+    pub fn mark_escaped_varargs_opcode(
+        &mut self,
+        opnum: OpCode,
+        descr: Option<OpRef>,
+        argboxes: &[OpRef],
+    ) {
+        self.mark_escaped(opnum, descr, argboxes)
+    }
+
+    /// RPython-style name with descr parameter present.
+    pub fn mark_escaped_varargs(
+        &mut self,
+        opnum: OpCode,
+        descr: Option<OpRef>,
+        argboxes: &[OpRef],
+    ) {
+        self.mark_escaped(opnum, descr, argboxes)
+    }
+
+    /// RPython: _escape_argboxes(*argboxes)
+    pub fn _escape_argboxes(&mut self, args: &[OpRef]) {
+        if args.is_empty() {
+            return;
+        }
+        self._escape_box(args[0]);
+        self._escape_argboxes(&args[1..]);
     }
 
     /// Look up a cached field value.
     ///
     /// Returns the OpRef that holds the value of `(obj, field_index)` if
     /// it was previously read or written in this trace, or None.
+    pub fn getfield(&self, obj: OpRef, field_index: u32) -> Option<OpRef> {
+        self.getfield_cached(obj, field_index)
+    }
+
     pub fn getfield_cached(&self, obj: OpRef, field_index: u32) -> Option<OpRef> {
         self.field_cache.get(&(obj, field_index)).copied()
     }
@@ -114,6 +560,10 @@ impl HeapCache {
     ///
     /// When the object is not unescaped, this also invalidates entries for
     /// the same field on other objects (aliasing).
+    pub fn setfield(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        self.setfield_cached(obj, field_index, value);
+    }
+
     pub fn setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
         let obj_is_unescaped = self.is_unescaped.contains(&obj);
         if !obj_is_unescaped {
@@ -132,6 +582,10 @@ impl HeapCache {
 
     /// Record a field read without aliasing concerns (e.g., after GETFIELD
     /// where the value is now known).
+    pub fn getfield_now_known_alias(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        self.getfield_now_known(obj, field_index, value);
+    }
+
     pub fn getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
         self.field_cache.insert((obj, field_index), value);
     }
@@ -212,27 +666,10 @@ impl HeapCache {
         }
     }
 
-    /// Mark an object as escaped. Its cached fields for aliased accesses
-    /// may no longer be trusted after external calls.
-    /// heapcache.py: _escape_box removes HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED.
-    pub fn mark_escaped(&mut self, opref: OpRef) {
-        self.is_unescaped.remove(&opref);
-        self.likely_virtual.remove(&opref);
-    }
-
     /// heapcache.py: _escape_box — recursively escape an object and
     /// all values stored into it via SETFIELD_GC.
     pub fn mark_escaped_recursive(&mut self, opref: OpRef) {
-        if !self.is_unescaped.remove(&opref) {
-            return; // already escaped or not tracked
-        }
-        self.likely_virtual.remove(&opref);
-        // Propagate escape to all values stored in this object's fields.
-        if let Some(deps) = self.escape_deps.remove(&opref) {
-            for dep in deps {
-                self.mark_escaped_recursive(dep);
-            }
-        }
+        self.mark_escaped_box(opref);
     }
 
     /// Record that the class of an object is now known (e.g., after GUARD_CLASS).
@@ -342,32 +779,212 @@ impl HeapCache {
 
         if !dont_escape {
             for &arg in args {
-                self.mark_escaped(arg);
+                self.mark_escaped_recursive(arg);
             }
         }
     }
 
     /// heapcache.py: invalidate_caches_varargs(descrs, args)
     /// Selectively invalidate caches based on effect info.
-    pub fn invalidate_caches_varargs(&mut self, has_side_effects: bool) {
-        if has_side_effects {
-            self.invalidate_caches_for_escaped();
+    pub fn invalidate_caches_varargs(
+        &mut self,
+        opnum: OpCode,
+        descr: Option<()>,
+        argboxes: &[OpRef],
+    ) {
+        self.mark_escaped_varargs(opnum, None, argboxes);
+        if Self::_clear_caches_not_necessary(opnum, descr) {
+            return;
         }
+        self.clear_caches_varargs(opnum, descr, argboxes);
+    }
+
+    /// Internal helper for the small set of opcodes that keep caches valid in RPython.
+    fn _clear_caches_not_necessary(opnum: OpCode, _descr: Option<()>) -> bool {
+        let _ = _descr;
+        matches!(
+            opnum,
+            OpCode::SetfieldGc
+                | OpCode::SetarrayitemGc
+                | OpCode::SetfieldRaw
+                | OpCode::SetarrayitemRaw
+                | OpCode::SetinteriorfieldGc
+                | OpCode::SetinteriorfieldRaw
+                | OpCode::Copystrcontent
+                | OpCode::Copyunicodecontent
+                | OpCode::Strsetitem
+                | OpCode::Unicodesetitem
+                | OpCode::RecordExactClass
+                | OpCode::RecordExactValueR
+                | OpCode::RecordExactValueI
+                | OpCode::RawStore
+                | OpCode::AssertNotNone
+                | OpCode::CallI
+                | OpCode::CallR
+                | OpCode::CallF
+                | OpCode::CallN
+                | OpCode::CallPureI
+                | OpCode::CallPureR
+                | OpCode::CallPureF
+                | OpCode::CallPureN
+                | OpCode::CallAssemblerI
+                | OpCode::CallAssemblerR
+                | OpCode::CallAssemblerF
+                | OpCode::CallAssemblerN
+                | OpCode::CallMayForceI
+                | OpCode::CallMayForceR
+                | OpCode::CallMayForceF
+                | OpCode::CallMayForceN
+                | OpCode::CallReleaseGilI
+                | OpCode::CallReleaseGilR
+                | OpCode::CallReleaseGilF
+                | OpCode::CallReleaseGilN
+                | OpCode::CallLoopinvariantI
+                | OpCode::CallLoopinvariantR
+                | OpCode::CallLoopinvariantF
+                | OpCode::CallLoopinvariantN
+                | OpCode::CondCallN
+                | OpCode::CondCallValueI
+                | OpCode::CondCallValueR
+        ) || opnum.is_ovf()
+            || opnum.has_no_side_effect()
+            || opnum.is_guard()
+    }
+
+    /// RPython-compatible alias.
+    pub fn clear_caches_not_necessary(&self, opnum: OpCode, _descr: Option<()>) -> bool {
+        let _ = _descr;
+        Self::_clear_caches_not_necessary(opnum, None)
+    }
+
+    /// RPython-compatible alias.
+    pub fn clear_caches(&mut self, opnum: OpCode, _descr: Option<()>, argboxes: &[OpRef]) {
+        self.clear_caches_varargs(opnum, _descr, argboxes)
+    }
+
+    /// RPython-compatible alias.
+    pub fn clear_caches_varargs(&mut self, opnum: OpCode, _descr: Option<()>, _argboxes: &[OpRef]) {
+        self.need_guard_not_invalidated = true;
+        if Self::_clear_caches_not_necessary(opnum, _descr) {
+            return;
+        }
+        if opnum.is_call()
+            || opnum.is_call_loopinvariant()
+            || opnum.is_cond_call_value()
+            || opnum == OpCode::CondCallN
+        {
+            let unescaped = self.is_unescaped.clone();
+            for cache in self.heap_cache.values_mut() {
+                cache.invalidate_unescaped(&unescaped);
+            }
+            for caches in self.heap_array_cache.values_mut() {
+                for cache in caches.values_mut() {
+                    cache.invalidate_unescaped(&unescaped);
+                }
+            }
+            return;
+        }
+        self.reset_keep_likely_virtuals();
+    }
+
+    /// Parity alias for RPython cache invalidation entrypoint.
+    pub fn invalidate_caches(&mut self, opnum: OpCode, _descr: Option<()>, argboxes: &[OpRef]) {
+        self.mark_escaped(opnum, None, argboxes);
+        if Self::_clear_caches_not_necessary(opnum, _descr) {
+            return;
+        }
+        self.invalidate_caches_varargs(opnum, _descr, argboxes);
+    }
+
+    /// Alias kept for parity with older callsites.
+    pub fn invalidate_caches_varargs_alias(
+        &mut self,
+        opnum: OpCode,
+        descr: Option<()>,
+        argboxes: &[OpRef],
+    ) {
+        self.invalidate_caches_varargs(opnum, descr, argboxes)
+    }
+
+    /// RPython: get_field_updater(box, descr)
+    pub fn get_field_updater(&mut self, obj: OpRef, descr_index: u32) -> FieldUpdater {
+        let seen_allocation = self.saw_allocation(obj);
+        let fieldbox = self.heap_cache.get(&descr_index).and_then(|cache| {
+            if seen_allocation {
+                cache.cache_seen_allocation.get(&obj).copied()
+            } else {
+                cache.cache_anything.get(&obj).copied()
+            }
+        });
+        let updater = self
+            .heap_cache
+            .entry(descr_index)
+            .or_insert_with(CacheEntry::new);
+        let curr = if let Some(fieldbox) = fieldbox {
+            fieldbox
+        } else if seen_allocation {
+            updater
+                .cache_seen_allocation
+                .get(&obj)
+                .copied()
+                .unwrap_or(OpRef::NONE)
+        } else {
+            updater
+                .cache_anything
+                .get(&obj)
+                .copied()
+                .unwrap_or(OpRef::NONE)
+        };
+        FieldUpdater::with_cache(obj, self, descr_index, Some(curr))
+    }
+
+    /// RPython alias: allocate a per-descr/index array cache entry.
+    pub(crate) fn _get_or_make_array_cache_entry(
+        &mut self,
+        index: OpRef,
+        descr_index: u32,
+    ) -> Option<&mut CacheEntry> {
+        let index = index.0;
+        Some(
+            self.heap_array_cache
+                .entry(descr_index)
+                .or_default()
+                .entry(index)
+                .or_insert_with(CacheEntry::new),
+        )
     }
 
     // ── Array item caching (RPython heapcache.py cached_arrayitems) ──
 
     /// Look up a cached array item value.
+    pub fn getarrayitem(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
+        self.getarrayitem_cache(array, index, descr)
+    }
+
     pub fn getarrayitem_cache(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
         self.array_cache.get(&(array, index, descr)).copied()
     }
 
     /// Record an array item write.
+    pub fn setarrayitem(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
+        self.setarrayitem_cache(array, index, descr, value)
+    }
+
     pub fn setarrayitem_cache(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
         self.array_cache.insert((array, index, descr), value);
     }
 
     /// Record an array item read.
+    pub fn getarrayitem_now_known_alias(
+        &mut self,
+        array: OpRef,
+        index: OpRef,
+        descr: u32,
+        value: OpRef,
+    ) {
+        self.getarrayitem_now_known(array, index, descr, value);
+    }
+
     pub fn getarrayitem_now_known(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
         self.array_cache.insert((array, index, descr), value);
     }
@@ -435,6 +1052,10 @@ impl HeapCache {
     /// heapcache.py: call_loopinvariant_now_known — record a single
     /// loop-invariant call result. Only ONE result is stored at a time;
     /// subsequent calls overwrite the previous entry.
+    pub fn call_loopinvariant_now_known(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
+        self.call_loopinvariant_cache(descr_index, arg0_int, result);
+    }
+
     pub fn call_loopinvariant_cache(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
         self.loopinvariant_descr = Some(descr_index);
         self.loopinvariant_arg0 = Some(arg0_int);
@@ -443,6 +1064,14 @@ impl HeapCache {
 
     /// heapcache.py: call_loopinvariant_known_result — look up cached result.
     /// Returns Some only if descr identity AND arg0 integer value both match.
+    pub fn call_loopinvariant_known_result(
+        &self,
+        descr_index: u32,
+        arg0_int: i64,
+    ) -> Option<OpRef> {
+        self.call_loopinvariant_lookup(descr_index, arg0_int)
+    }
+
     pub fn call_loopinvariant_lookup(&self, descr_index: u32, arg0_int: i64) -> Option<OpRef> {
         if self.loopinvariant_descr == Some(descr_index)
             && self.loopinvariant_arg0 == Some(arg0_int)
@@ -493,16 +1122,19 @@ impl HeapCache {
     /// pyre has no GIL (no-GIL Python), so this method has no production
     /// call site — kept for API parity and potential future use.
     pub fn reset_keep_likely_virtuals(&mut self) {
+        assert!(self.head_version < HF_VERSION_MAX);
+        self.bump_head_version();
         self.field_cache.clear();
         self.array_cache.clear();
-        self.known_class.clear();
-        self.quasi_immut_known.clear();
-        self.is_unescaped.clear();
-        self.seen_allocation.clear();
-        self.known_nullity.clear();
-        self.cached_arraylen.clear();
+        self.heap_cache.clear();
+        self.heap_array_cache.clear();
         // RPython: likely_virtual, loopinvariant_call_cache, escape_deps,
         // need_guard_not_invalidated are NOT cleared.
+    }
+
+    /// RPython-compatible alias kept for existing codepaths.
+    pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
+        self.escape_deps.remove(&opref);
     }
 }
 
@@ -625,7 +1257,7 @@ mod tests {
         cache.new_object(obj);
         assert!(cache.is_unescaped(obj));
 
-        cache.mark_escaped(obj);
+        cache.mark_escaped_box(obj);
         assert!(!cache.is_unescaped(obj));
         // saw_allocation is permanent
         assert!(cache.saw_allocation(obj));

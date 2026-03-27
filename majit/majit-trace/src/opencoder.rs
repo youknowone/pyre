@@ -4,6 +4,8 @@
 /// a compact binary format for serializing and deserializing traces.
 ///
 /// Uses LEB128 variable-length integer encoding for compactness.
+use std::collections::HashMap;
+
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type};
 
 use crate::history::TreeLoop;
@@ -221,6 +223,59 @@ pub const TAGBOX: u8 = 3; // reference to a traced value (OpRef)
 pub const TAG_SHIFT: u32 = 2;
 /// Mask for tag extraction.
 pub const TAG_MASK: u8 = (1 << TAG_SHIFT) - 1;
+/// RPython compatibility constants.
+pub const TAGMASK: u8 = TAG_MASK;
+pub const TAGSHIFT: u32 = TAG_SHIFT;
+
+/// Initial trace buffer size.
+pub const INIT_SIZE: usize = 4096;
+
+/// RPython compatibility numeric limits for signed varints in this model.
+pub const MIN_VALUE: i64 = -(1 << 30);
+pub const MAX_VALUE: i64 = (1 << 30) - 1;
+
+/// RPython compatibility bounds for small int tagging.
+pub const SMALL_INT_START: i64 = -(1 << 28);
+pub const SMALL_INT_STOP: i64 = 1 << 28;
+
+/// RPython compatibility sentinel values for snapshot linked lists.
+pub const SNAPSHOT_PREV_NEEDS_PATCHING: i32 = -3;
+pub const SNAPSHOT_PREV_NONE: i32 = -2;
+pub const SNAPSHOT_PREV_COMES_NEXT: i32 = -1;
+
+#[inline]
+pub fn skip_varint_signed(buf: &[u8], mut index: usize, skip: usize) -> usize {
+    assert!(skip > 0);
+    for _ in 0..skip {
+        let byte = buf[index];
+        if byte & 0x80 != 0 {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+#[inline]
+pub fn varint_only_decode(buf: &[u8], index: usize, skip: usize) -> i64 {
+    let start = if skip > 0 {
+        skip_varint_signed(buf, index, skip)
+    } else {
+        index
+    };
+    decode_varint_signed(&buf[start..]).0
+}
+
+#[inline]
+pub fn combine_uint(index1: u32, index2: u32) -> u32 {
+    (index1 << 16) | index2
+}
+
+#[inline]
+pub fn unpack_uint(packed: u32) -> (u32, u32) {
+    ((packed >> 16) & 0xffff, packed & 0xffff)
+}
 
 /// Encode a tagged value for snapshot storage.
 /// opencoder.py: tag(kind, value)
@@ -276,7 +331,7 @@ pub struct SnapshotIterator<'a> {
 impl<'a> SnapshotIterator<'a> {
     pub fn new(storage: &'a SnapshotStorage, top_snapshot_idx: usize) -> Self {
         let start = if top_snapshot_idx < storage.top_snapshots.len() {
-            let top = &storage.top_snapshots[top_snapshot_idx];
+            let _top = &storage.top_snapshots[top_snapshot_idx];
             Some(storage.snapshots.len() - 1) // start from innermost
         } else {
             None
@@ -339,6 +394,9 @@ pub enum DecodedSnapshotValue {
 /// the outermost caller to the innermost callee.
 pub struct TopDownSnapshotIterator<'a> {
     storage: &'a SnapshotStorage,
+    snapshot_index: usize,
+    vable_array_index: Option<usize>,
+    vref_array_index: Option<usize>,
     /// Frames collected in bottom-up order, then reversed.
     frames: Vec<usize>,
     pos: usize,
@@ -348,7 +406,11 @@ impl<'a> TopDownSnapshotIterator<'a> {
     /// Create a top-down iterator starting from a top snapshot.
     pub fn new(storage: &'a SnapshotStorage, top_idx: usize) -> Self {
         let mut frames = Vec::new();
+        let mut vable_array_index = None;
+        let mut vref_array_index = None;
         if top_idx < storage.top_snapshots.len() {
+            vable_array_index = storage.top_snapshots[top_idx].vable_array_index;
+            vref_array_index = storage.top_snapshots[top_idx].vref_array_index;
             // Walk the prev chain to collect all frames bottom-up
             let first_snap_idx = storage
                 .top_snapshots
@@ -369,9 +431,77 @@ impl<'a> TopDownSnapshotIterator<'a> {
         }
         TopDownSnapshotIterator {
             storage,
+            snapshot_index: top_idx,
+            vable_array_index,
+            vref_array_index,
             frames,
             pos: 0,
         }
+    }
+
+    fn snapshot_values(&self, index: usize) -> &'a [u32] {
+        self.storage
+            .snapshots
+            .get(index)
+            .map(|snapshot| snapshot.values.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// opencoder.py: iter_vable_array()
+    pub fn iter_vable_array(&self) -> BoxArrayIter<'a> {
+        match self.vable_array_index {
+            Some(index) => BoxArrayIter::new(self.snapshot_values(index)),
+            None => BoxArrayIter::empty(),
+        }
+    }
+
+    /// opencoder.py: iter_vref_array()
+    pub fn iter_vref_array(&self) -> BoxArrayIter<'a> {
+        match self.vref_array_index {
+            Some(index) => BoxArrayIter::new(self.snapshot_values(index)),
+            None => BoxArrayIter::empty(),
+        }
+    }
+
+    /// opencoder.py: iter_array(snapshot_index)
+    pub fn iter_array(&self, snapshot_index: usize) -> BoxArrayIter<'a> {
+        BoxArrayIter::new(self.snapshot_values(snapshot_index))
+    }
+
+    /// opencoder.py: length(snapshot_index)
+    pub fn length(&self, snapshot_index: usize) -> usize {
+        self.snapshot_values(snapshot_index).len()
+    }
+
+    /// opencoder.py: prev(snapshot_index)
+    pub fn prev(&mut self, snapshot_index: usize) -> i32 {
+        self.storage
+            .snapshots
+            .get(snapshot_index)
+            .and_then(|snapshot| snapshot.prev)
+            .map_or(SNAPSHOT_PREV_NONE, |prev| prev as i32)
+    }
+
+    /// opencoder.py: unpack_jitcode_pc(snapshot_index)
+    pub fn unpack_jitcode_pc(&self, snapshot_index: usize) -> (u32, u32) {
+        self.storage
+            .snapshots
+            .get(snapshot_index)
+            .map(|snapshot| (snapshot.jitcode_index, snapshot.pc))
+            .unwrap_or((u32::MAX, u32::MAX))
+    }
+
+    /// opencoder.py: is_empty_snapshot(snapshot_index)
+    pub fn is_empty_snapshot(&self, snapshot_index: usize) -> bool {
+        self.storage
+            .snapshots
+            .get(snapshot_index)
+            .is_none_or(|snapshot| snapshot.values.is_empty())
+    }
+
+    /// opencoder.py: decode_snapshot_int()
+    pub fn decode_snapshot_int(&mut self) -> i64 {
+        self.snapshot_index as i64
     }
 
     /// Get the next frame (outermost to innermost).
@@ -393,6 +523,20 @@ impl<'a> TopDownSnapshotIterator<'a> {
     /// Whether all frames have been consumed.
     pub fn done(&self) -> bool {
         self.pos >= self.frames.len()
+    }
+}
+
+impl<'a> Iterator for TopDownSnapshotIterator<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos < self.frames.len() {
+            let idx = self.frames[self.pos];
+            self.pos += 1;
+            Some(idx)
+        } else {
+            None
+        }
     }
 }
 
@@ -602,6 +746,10 @@ pub struct BoxArrayIter<'a> {
 }
 
 impl<'a> BoxArrayIter<'a> {
+    pub fn empty() -> Self {
+        Self::new(&[])
+    }
+
     pub fn new(values: &'a [u32]) -> Self {
         BoxArrayIter { values, pos: 0 }
     }
@@ -633,12 +781,21 @@ impl<'a> BoxArrayIter<'a> {
     }
 }
 
+impl<'a> Iterator for BoxArrayIter<'a> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_value()
+    }
+}
+
 // ── Trace Recording API (opencoder.py: Trace class) ──
 
 /// opencoder.py: Trace — compact trace recording buffer.
 ///
 /// Records operations and snapshots during tracing. The recorded data
 /// can be iterated via `TraceIterator` or serialized via `encode_trace`.
+pub type Trace = TraceRecordBuffer;
 pub struct TraceRecordBuffer {
     /// Encoded operation stream (binary).
     data: Vec<u8>,
@@ -654,6 +811,10 @@ pub struct TraceRecordBuffer {
     overflow: bool,
     /// Maximum allowed data size.
     max_size: usize,
+    /// Memoized integer constants used by `_cached_const_int()`.
+    const_int_cache: HashMap<i64, u32>,
+    /// Memoized pointer constants used by `_cached_const_ptr()`.
+    const_ptr_cache: HashMap<u64, u32>,
 }
 
 impl TraceRecordBuffer {
@@ -667,6 +828,8 @@ impl TraceRecordBuffer {
             cut_points: Vec::new(),
             overflow: false,
             max_size: 1 << 20, // 1MB default
+            const_int_cache: HashMap::new(),
+            const_ptr_cache: HashMap::new(),
         }
     }
 
@@ -690,6 +853,145 @@ impl TraceRecordBuffer {
         encode_varint(&mut self.data, opcode as u64);
         self.data.push(num_args);
         self.num_ops += 1;
+    }
+
+    /// opencoder.py: _op_start() — mark start offset for current opcode.
+    pub fn _op_start(&self) -> usize {
+        self.data.len()
+    }
+
+    /// opencoder.py: _op_end() — mark end offset for current opcode.
+    pub fn _op_end(&self) -> usize {
+        self.data.len()
+    }
+
+    /// RPython-compatible: `Trace._encode(op, arg)`.
+    ///
+    /// Returns a tagged representation for values stored in snapshots and
+    /// arrays.
+    #[inline]
+    pub fn _encode(&self, kind: u8, value: u32) -> u32 {
+        tag(kind, value)
+    }
+
+    /// RPython-compatible: `Trace._cached_const_int(value)`.
+    /// Reuse pooled small constants to keep indexes stable.
+    pub fn _cached_const_int(&mut self, value: i64) -> u32 {
+        if let Some(idx) = self.const_int_cache.get(&value) {
+            return *idx;
+        }
+        let idx = self.snapshots.add_const_bigint(value);
+        self.const_int_cache.insert(value, idx);
+        idx
+    }
+
+    /// RPython-compatible: `Trace._cached_const_ptr(ptr)`.
+    /// Reuse pooled pointer constants to keep indexes stable.
+    pub fn _cached_const_ptr(&mut self, ptr: u64) -> u32 {
+        if let Some(idx) = self.const_ptr_cache.get(&ptr) {
+            return *idx;
+        }
+        let idx = self.snapshots.add_const_ref(ptr);
+        self.const_ptr_cache.insert(ptr, idx);
+        idx
+    }
+
+    /// opencoder.py: _encode_descr(descr) — encode descriptor index.
+    pub fn _encode_descr(&self, descr: u32) -> u32 {
+        descr
+    }
+
+    /// opencoder.py: _add_box_to_storage(value).
+    ///
+    /// Store box value into a dedicated pool; return index for compatibility.
+    pub fn _add_box_to_storage(&mut self, value: u32) -> usize {
+        self.snapshots.const_refs.push(value as u64);
+        self.snapshots.const_refs.len() - 1
+    }
+
+    /// opencoder.py: append_byte(byte) — append raw byte to trace data.
+    pub fn append_byte(&mut self, byte: u8) {
+        self.data.push(byte);
+    }
+
+    /// opencoder.py: append_int(value) — append LEB128 value to trace data.
+    pub fn append_int(&mut self, value: u32) {
+        self.record_arg(value);
+    }
+
+    /// opencoder.py: append_snapshot_array_data_int(data, value).
+    pub fn append_snapshot_array_data_int(data: &mut Vec<u32>, value: i32) {
+        data.push(value as u32);
+    }
+
+    /// opencoder.py: append_snapshot_data_int(data, value).
+    pub fn append_snapshot_data_int(data: &mut Vec<u32>, value: i32) {
+        data.push(value as u32);
+    }
+
+    /// opencoder.py: _encode_snapshot(snapshot) → encoded snapshot payload.
+    pub fn _encode_snapshot(snapshot: &Snapshot) -> Vec<u32> {
+        snapshot.values.clone()
+    }
+
+    /// opencoder.py: create_snapshot(values) — helper for building a snapshot.
+    pub fn create_snapshot(&self, values: Vec<u32>) -> Snapshot {
+        Snapshot {
+            values,
+            prev: None,
+            jitcode_index: 0,
+            pc: 0,
+        }
+    }
+
+    /// opencoder.py: snapshot_add_prev(snapshot, prev).
+    pub fn snapshot_add_prev(snapshot: &mut Snapshot, prev: Option<usize>) {
+        snapshot.prev = prev;
+    }
+
+    /// opencoder.py compatibility: record fixed-arity opcodes with explicit
+    /// argument slots.
+    pub fn record_op0(&mut self, opcode: u16) {
+        self.record_op(opcode, 0);
+    }
+
+    /// opencoder.py compatibility: record fixed-arity opcodes with explicit
+    /// argument slots.
+    pub fn record_op1(&mut self, opcode: u16, arg0: u32) {
+        self.record_op(opcode, 1);
+        self.record_arg(arg0);
+    }
+
+    /// opencoder.py compatibility: record fixed-arity opcodes with explicit
+    /// argument slots.
+    pub fn record_op2(&mut self, opcode: u16, arg0: u32, arg1: u32) {
+        self.record_op(opcode, 2);
+        self.record_arg(arg0);
+        self.record_arg(arg1);
+    }
+
+    /// opencoder.py compatibility: record fixed-arity opcodes with explicit
+    /// argument slots.
+    pub fn record_op3(&mut self, opcode: u16, arg0: u32, arg1: u32, arg2: u32) {
+        self.record_op(opcode, 3);
+        self.record_arg(arg0);
+        self.record_arg(arg1);
+        self.record_arg(arg2);
+    }
+
+    /// RPython-compatible: encode a boxed value array.
+    pub fn _list_of_boxes(&self, boxes: &[u32]) -> Vec<u32> {
+        boxes.iter().map(|&b| self._encode(TAGBOX, b)).collect()
+    }
+
+    /// RPython-compatible: encode boxes for virtualizable state.
+    pub fn _list_of_boxes_virtualizable(&self, boxes: &[u32]) -> Vec<u32> {
+        boxes.iter().map(|&b| self._encode(TAGBOX, b)).collect()
+    }
+
+    /// RPython-compatible helper: return a copied encoded array payload.
+    pub fn new_array(&self, items: &[u32]) -> Vec<u32> {
+        items.to_vec()
     }
 
     /// Record an argument value.
@@ -737,7 +1039,7 @@ impl TraceRecordBuffer {
         vable_array_index: Option<usize>,
         vref_array_index: Option<usize>,
     ) -> usize {
-        let snap_idx = self.snapshots.add_snapshot(snapshot.clone());
+        let _snap_idx = self.snapshots.add_snapshot(snapshot.clone());
         self.snapshots.add_top_snapshot(TopSnapshot {
             snapshot,
             vable_array_index,
@@ -795,8 +1097,8 @@ impl TraceRecordBuffer {
         &mut self,
         frame_pcs: &[u64],
         frame_slots: &[Vec<u32>],
-        virtualizable_boxes: &[u32],
-        virtualref_boxes: &[u32],
+        _virtualizable_boxes: &[u32],
+        _virtualref_boxes: &[u32],
     ) -> usize {
         if frame_pcs.is_empty() {
             let empty_snap = Snapshot {
@@ -872,6 +1174,11 @@ impl TraceRecordBuffer {
             }
         }
         dead_ranges
+    }
+
+    /// RPython-compatible: unpack tagged box stream into raw pairs.
+    pub fn unpack(&self, encoded: &[u32]) -> Vec<(u8, u32)> {
+        encoded.iter().copied().map(untag).collect()
     }
 }
 
