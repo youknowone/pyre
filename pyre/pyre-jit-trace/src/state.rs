@@ -5020,8 +5020,11 @@ impl MIFrame {
             self.sym_mut().pending_next_instr = Some(handler_pc);
             TraceAction::Continue
         } else {
-            // TODO(exception-exit): pyjitpl.py:2532-2538
-            // compile_exit_frame_with_exception(last_exc_box) → FINISH op.
+            // No handler in this frame — return Abort so metainterp's
+            // multi-frame finishframe_exception can pop this frame and
+            // try the parent (pyjitpl.py:2520 self.popframe() loop).
+            // Root frame with no handler → metainterp emits FINISH
+            // (pyjitpl.py:2532 compile_exit_frame_with_exception).
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][finishframe_exception] no handler pc={}", pc);
             }
