@@ -1224,7 +1224,7 @@ fn restore_guard_failure_for_loop(
             .tick_guard_failure(guard_hash);
         if should_bridge && majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] guard-fail: trace_eagerness threshold for guard ({}, {}), bridge TODO",
+                "[jit] guard-fail: trace_eagerness threshold for guard ({}, {}), bridge pending",
                 exit_layout.trace_id, exit_layout.fail_index
             );
         }
@@ -1243,10 +1243,9 @@ fn restore_guard_failure_for_loop(
     }
 
     // RPython compile.py:701 handle_fail → _trace_and_compile_from_bridge.
-    // TODO(bridge-compile): RPython calls _trace_and_compile_from_bridge
-    // here to trace + compile a bridge from the guard failure point.
-    // pyre consumes and discards. Port compile_bridge_trace +
-    // bridge_info wiring to enable.
+    // Bridge compilation is handled at the eval_loop_jit / try_function_entry_jit
+    // level (where frame is available). This callback only restores state;
+    // consume the pending request so it doesn't leak to the next guard failure.
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
