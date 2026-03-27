@@ -8967,10 +8967,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         // on ALL guards. Bridges share the parent loop's invalidation flag.
         // We clone the Arc to keep the flag alive as long as the bridge exists.
         let invalidated_arc = original_token.invalidated.clone();
-        // TODO: Re-enable bridge invalidation once GuardNotInvalidated
-        // codegen handles flag_ptr lifetime correctly for all backends.
-        // For now, bridges don't check the invalidation flag.
-        let _flag_ptr =
+        let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
         let original_compiled = original_token
             .compiled
@@ -9006,7 +9003,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         let compiled = self.do_compile(
             inputargs,
             ops,
-            None, // bridge invalidation disabled pending flag_ptr lifetime fix
+            Some(flag_ptr), // compile.py:186: bridges share parent's invalidation flag
             Some((source_trace_id, fail_descr.fail_index())),
             caller_layout.as_ref(),
         )?;
