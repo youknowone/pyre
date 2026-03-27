@@ -2074,12 +2074,12 @@ impl<S: JitState> JitDriver<S> {
         // compile.py handle_fail -> pyjitpl.handle_guard_failure ->
         // rebuild_state_after_failure() resumes the current interpreter
         // position and traces forward from there.
-        let trace_meta = state.build_meta(resume_pc, env);
+        let mut trace_meta = state.build_meta(resume_pc, env);
 
         let live_values = state.extract_live(&trace_meta);
         let live_types = state.live_value_types(&trace_meta);
 
-        let (ok, is_exception_guard) = self.meta.start_retrace_from_guard(
+        let (ok, is_exception_guard, fail_types) = self.meta.start_retrace_from_guard(
             green_key,
             trace_id,
             fail_index,
@@ -2088,6 +2088,11 @@ impl<S: JitState> JitDriver<S> {
         );
         if !ok {
             return false;
+        }
+
+        // resume.py:1042 parity: adjust meta to match fail_arg_types shape.
+        if let Some(ref ftypes) = fail_types {
+            S::update_meta_for_bridge(&mut trace_meta, ftypes);
         }
 
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));

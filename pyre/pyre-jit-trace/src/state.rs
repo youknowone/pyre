@@ -6663,6 +6663,20 @@ impl JitState for PyreJitState {
         meta.merge_pc = new_pc;
     }
 
+    fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
+        // resume.py:1042: bridge inputargs = rebuild_from_resumedata output.
+        // Adjust meta to match fail_arg_types shape, not interpreter frame.
+        // Layout: [frame(Ref), next_instr(Int), valuestackdepth(Int), slots...]
+        if fail_arg_types.len() >= 3 {
+            let n_slots = fail_arg_types.len() - 3;
+            let nlocals = meta.num_locals.min(n_slots);
+            let stack_only = n_slots.saturating_sub(nlocals);
+            meta.num_locals = nlocals;
+            meta.valuestackdepth = nlocals + stack_only;
+            meta.slot_types = fail_arg_types[3..].to_vec();
+        }
+    }
+
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
         meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.

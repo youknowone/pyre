@@ -3310,6 +3310,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
+            // compile.py:783-784: jitcounter.tick(hash, increment)
             self.warm_state.tick_guard_failure(info.guard_hash);
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
@@ -3462,7 +3463,6 @@ impl<M: Clone> MetaInterp<M> {
                     compiling: false,
                 });
             // compile.py:783-784: jitcounter.tick(hash, increment)
-            // Returns true when threshold reached AND auto-resets counter.
             let guard_hash = info.guard_hash;
             let must_compile = self.warm_state.tick_guard_failure(guard_hash) && !info.compiling;
             self.stats.guard_failures += 1;
@@ -4302,10 +4302,10 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         _fail_values: &[i64],
         _live_types: &[Type],
-    ) -> (bool, bool) {
+    ) -> (bool, bool, Option<Vec<Type>>) {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
-            None => return (false, false),
+            None => return (false, false, None),
         };
 
         // RPython compile.py:932 invent_fail_descr_for_op:
@@ -4321,7 +4321,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
             Some(descr) => descr,
-            None => return (false, false),
+            None => return (false, false, None),
         };
 
         // compile.py:797-811 / resume.py:1042: bridge inputargs come from
@@ -4344,7 +4344,12 @@ impl<M: Clone> MetaInterp<M> {
             hook(green_key);
         }
 
-        (true, is_exception_guard)
+        // Return fail_arg_types so the caller can adjust trace_meta
+        // to match the guard's shape (not the interpreter frame's shape).
+        // resume.py:1042: rebuild_from_resumedata produces boxes matching
+        // fail_arg_types — bridge tracing must use the same shape.
+        let fail_types = bridge_input_types.to_vec();
+        (true, is_exception_guard, Some(fail_types))
     }
 
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
@@ -4491,10 +4496,9 @@ impl<M: Clone> MetaInterp<M> {
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
 
-        // Decide what to do next
-        // compile.py:701-709: handle_fail — two branches only:
-        // 1. must_compile → CompileBridge
-        // 2. else → resume_in_blackhole (ResumeInterpreter)
+        // compile.py:701-709: handle_fail — must_compile → bridge, else → blackhole.
+        // The guard counter was already ticked in the caller's guard failure
+        // handler. Use should_compile_bridge_in_trace (would_fire + !compiling).
         let action = if self.should_compile_bridge_in_trace(green_key, trace_id, fail_index) {
             GuardRecoveryAction::CompileBridge
         } else {
