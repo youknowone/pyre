@@ -4169,41 +4169,89 @@ impl<M: Clone> MetaInterp<M> {
     /// (compiling field) and counting infrastructure are in place for
     /// when the backend issue is resolved.
     /// compile.py:738 handle_fail: register guard failure + tick counter.
-    /// Called on every guard failure to ensure the per-guard counter
-    /// accumulates toward the bridge compilation threshold.
-    pub fn track_guard_failure(&mut self, green_key: u64, trace_id: u64, fail_index: u32) {
-        let Some(compiled) = self.compiled_loops.get_mut(&green_key) else {
-            return;
-        };
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let info = compiled
-            .guard_failures
-            .entry((trace_id, fail_index))
-            .or_insert_with(|| GuardFailureInfo {
-                guard_hash: self.warm_state.fetch_next_hash(),
-                compiling: false,
-                per_value: None,
-                copied_from: None,
-            });
-        self.warm_state.tick_guard_failure(info.guard_hash);
+    ///
+    /// RPython uses guard descr's rd_loop_token to find the owning
+    /// compiled loop directly. In majit, the dispatch key may differ
+    /// from the guard's owning key (nested traces share compiled code).
+    /// Search all compiled entries when the dispatch key doesn't own
+    /// this guard's trace. Returns the owning green_key.
+    pub fn track_guard_failure(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> u64 {
+        // Fast path: dispatch key owns this trace.
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            if compiled.traces.contains_key(&tid) {
+                let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+                let tid = Self::normalize_trace_id(compiled, trace_id);
+                let info = compiled
+                    .guard_failures
+                    .entry((tid, fail_index))
+                    .or_insert_with(|| GuardFailureInfo {
+                        guard_hash: self.warm_state.fetch_next_hash(),
+                        compiling: false,
+                        per_value: None,
+                        copied_from: None,
+                    });
+                self.warm_state.tick_guard_failure(info.guard_hash);
+                return green_key;
+            }
+        }
+        // Slow path: search all compiled entries (rd_loop_token parity).
+        let mut owning_key = green_key;
+        for (&key, compiled) in &self.compiled_loops {
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            if compiled.traces.contains_key(&tid) {
+                owning_key = key;
+                break;
+            }
+        }
+        if owning_key != green_key {
+            let compiled = self.compiled_loops.get_mut(&owning_key).unwrap();
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            let info = compiled
+                .guard_failures
+                .entry((tid, fail_index))
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
+                    compiling: false,
+                    per_value: None,
+                    copied_from: None,
+                });
+            self.warm_state.tick_guard_failure(info.guard_hash);
+        }
+        owning_key
     }
 
+    /// compile.py:701-717 handle_fail / must_compile.
     pub fn must_compile(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return false;
+        // Search owning compiled entry (same logic as track_guard_failure).
+        let check = |compiled: &CompiledEntry<M>, tid: u64| -> bool {
+            compiled
+                .guard_failures
+                .get(&(tid, fail_index))
+                .is_some_and(|info| {
+                    !info.compiling
+                        && !Self::stack_almost_full()
+                        && self.warm_state.counter.would_fire(info.guard_hash)
+                })
         };
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        // compile.py:701-717: handle_fail applies to ALL guards.
-        compiled
-            .guard_failures
-            .get(&(trace_id, fail_index))
-            .is_some_and(|info| {
-                // compile.py:702-703: must_compile AND NOT stack_almost_full
-                // compile.py:750-751: ST_BUSY_FLAG check
-                !info.compiling
-                    && !Self::stack_almost_full()
-                    && self.warm_state.counter.would_fire(info.guard_hash)
-            })
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            if check(compiled, tid) {
+                return true;
+            }
+        }
+        for compiled in self.compiled_loops.values() {
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            if check(compiled, tid) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn bridge_fail_descr_proxy(
