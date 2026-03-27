@@ -1369,14 +1369,14 @@ impl OptRewrite {
             }
         }
 
-        // rewrite.py postprocess_GUARD_VALUE: after guard passes,
-        // arg(0) is known to equal arg(1). If arg(1) is a constant,
-        // propagate that constant to arg(0).
-        if let Some(v) = ctx.get_constant_int(arg1) {
-            ctx.make_constant(arg0, Value::Int(v));
+        // rewrite.py postprocess_GUARD_VALUE:
+        //   box = get_box_replacement(op.getarg(0))
+        //   self.make_constant(box, op.getarg(1))
+        let box_ref = ctx.get_replacement(arg0);
+        if let Some(v) = ctx.get_constant(arg1).cloned() {
+            ctx.make_constant(box_ref, v);
         } else {
-            // Even without constant: arg(0) forwards to arg(1)
-            ctx.replace_op(arg0, arg1);
+            ctx.replace_op(box_ref, arg1);
         }
         OptimizationResult::PassOn
     }

@@ -51,6 +51,7 @@ pub use jit_state::{
 pub use jitcode::{
     ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
     JitCodeRuntime, JitCodeSym, LivenessInfo, MIFrame, MIFrameStack, trace_jitcode,
+    trace_jitcode_with_runtime,
 };
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_codegen::CompiledTraceInfo;
