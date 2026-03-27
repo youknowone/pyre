@@ -1012,12 +1012,13 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let snapshot_boxes_ref = snapshot_boxes.clone();
-        let snapshot = Snapshot::single_frame(0, snapshot_boxes);
+        let snapshot = Snapshot::single_frame(0, snapshot_boxes.clone());
 
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {
             ctx: &'a OptContext,
+            /// OpRef.0 values that are known to be virtual from fail_args analysis.
+            virtual_oprefs: &'a HashSet<u32>,
         }
         impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
             fn get_box_replacement(&self, opref: OpRef) -> OpRef {
@@ -1072,9 +1073,12 @@ impl OptContext {
             }
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
                 // resume.py:210-216 is_virtual check.
-                // Walk the replacement chain to find virtual info.
-                // The virtual PtrInfo may be on an intermediate opref
-                // (e.g., Phase 2 replacement of a Phase 1 inputarg).
+                // First: check if this opref was identified as virtual
+                // from the fail_args NONE pattern.
+                if self.virtual_oprefs.contains(&opref.0) {
+                    return true;
+                }
+                // Second: walk replacement chain for PtrInfo::Virtual.
                 let mut check = opref;
                 for _ in 0..20 {
                     if self
@@ -1099,7 +1103,31 @@ impl OptContext {
             }
         }
 
-        let env = InlineBoxEnv { ctx: self };
+        // resume.py parity: identify virtual slots from fail_args.
+        // RPython's optimizer keeps PtrInfo::Virtual on replacement boxes;
+        // pyre's Phase 2 detaches virtual info from Phase 1 inputargs.
+        // Build a set of snapshot oprefs that are virtual (fail_args=NONE).
+        let virtual_oprefs: HashSet<u32> = op
+            .fail_args
+            .as_ref()
+            .map(|fa| {
+                fa.iter()
+                    .enumerate()
+                    .filter(|(i, opref)| {
+                        *i >= 3
+                            && opref.is_none()
+                            && *i < snapshot_boxes.len()
+                            && !snapshot_boxes[*i].is_none()
+                    })
+                    .map(|(i, _)| snapshot_boxes[i].0)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let env = InlineBoxEnv {
+            ctx: self,
+            virtual_oprefs: &virtual_oprefs,
+        };
         let mut memo = ResumeDataLoopMemo::new();
         let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
             return;
@@ -1122,7 +1150,7 @@ impl OptContext {
         // at a specific position in the snapshot — that's the frame slot index.
         let mut vidx_to_frame_pos: std::collections::HashMap<i32, usize> =
             std::collections::HashMap::new();
-        for (snap_pos, &snap_opref) in snapshot_boxes_ref.iter().enumerate() {
+        for (snap_pos, &snap_opref) in snapshot_boxes.iter().enumerate() {
             if !snap_opref.is_none() {
                 // Resolve through replacement chain (same as _number_boxes does
                 // via env.get_box_replacement) to match numb_state.liveboxes keys.

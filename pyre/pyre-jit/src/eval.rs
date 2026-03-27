@@ -429,10 +429,9 @@ fn jit_merge_point_hook(
 /// warmstate.py:446-511 maybe_compile_and_run.
 ///
 /// RPython: cell lookup (O(1)) → compiled → enter. No cell → counter.
-/// Pyre gates behind counter.tick because guard failures without
-/// complete bridge compilation cause repeated entry overhead.
-/// celltable hint infrastructure ready for activation when bridge
-/// compilation handles all guard failure paths.
+/// Cell-first requires guard failure recovery without null Ref — blocked
+/// by Phase 1 inputarg virtual materialization. Counter gating limits
+/// compiled entry frequency to avoid repeated guard failure overhead.
 #[cold]
 #[inline(never)]
 fn maybe_compile_and_run(
@@ -1450,16 +1449,24 @@ fn materialize_recovery_virtuals(
         return;
     }
 
-    // Check if trailing values after the LAST null slot contain enough
-    // Int pairs to reconstruct all null slots as virtuals.
+    // Check if trailing values after the LAST null/zero slot contain
+    // enough Int pairs to reconstruct all null slots as virtuals.
+    // Skip past any Int(0) slots that are also NONE virtuals (unboxed ints).
     let last_null = *null_slots.last().unwrap();
-    let trailing_start = last_null + 1;
+    let mut trailing_start = last_null + 1;
+    while trailing_start < typed.len() {
+        if matches!(typed[trailing_start], Value::Int(0)) {
+            trailing_start += 1;
+        } else {
+            break;
+        }
+    }
     let trailing_count = typed.len() - trailing_start;
     let needed_fields = null_slots.len() * 2;
 
     if trailing_count >= needed_fields {
-        // Validate: first field of each pair should be a W_IntObject type id.
-        // If not, the trailing data is not virtual field data.
+        // Validate: first field of each (ob_type, payload) pair should be
+        // a W_IntObject type id. ALL null slots must have valid field data.
         let w_int_type_id = pyre_object::intobject::w_int_type_id();
         let mut valid = true;
         let mut check_cursor = trailing_start;
@@ -1488,15 +1495,16 @@ fn materialize_recovery_virtuals(
         // Enough trailing fields: reconstruct virtuals
         let mut field_cursor = trailing_start;
         for &slot_idx in &null_slots {
-            let intval_pos = field_cursor + 1;
-            if intval_pos >= typed.len() {
+            let _ob_type_pos = field_cursor;
+            let payload_pos = field_cursor + 1;
+            if payload_pos >= typed.len() {
                 break;
             }
-            if let Value::Int(v) = typed[intval_pos] {
+            if let Value::Int(v) = typed[payload_pos] {
                 let intval = decode_recovery_int_payload(
                     v,
                     typed,
-                    raw_values.get(intval_pos).copied(),
+                    raw_values.get(payload_pos).copied(),
                     raw_values,
                     &exit_layout.exit_types,
                 );
