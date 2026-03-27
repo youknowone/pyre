@@ -1208,26 +1208,20 @@ fn restore_guard_failure_for_loop(
             return None;
         }
     }
-    // compile.py:738 must_compile / counter.py tick parity:
-    // O(1) guard failure counter via JitCounter timetable.
-    // trace_eagerness=200: after 200 failures of the same guard,
-    // tick returns true → bridge compilation should start.
-    // Currently: log-only. Bridge compilation will use this signal.
+    // compile.py:783-784: jitcounter.tick(hash, increment).
+    // This is the counting point for guards reached via
+    // try_function_entry_jit → run_compiled_detailed path.
+    // The canonical tick is in handle_guard_failure_in_trace_with_savedata
+    // for guards reached via run_compiled_detailed_with_bridge_keyed.
     {
         let guard_hash = (exit_layout.trace_id as u64)
             .wrapping_mul(0x9E3779B97F4A7C15)
             .wrapping_add(exit_layout.fail_index as u64);
         let (driver, _) = driver_pair();
-        let should_bridge = driver
+        driver
             .meta_interp_mut()
             .warm_state_mut()
             .tick_guard_failure(guard_hash);
-        if should_bridge && majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit] guard-fail: trace_eagerness threshold for guard ({}, {}), bridge pending",
-                exit_layout.trace_id, exit_layout.fail_index
-            );
-        }
     }
 
     // RPython compile.py:710 handle_fail → resume_in_blackhole.
