@@ -65,7 +65,7 @@ impl Snapshot {
         n += self.vable_array.len();
         n += self.vref_array.len();
         for f in &self.framestack {
-            n += 3 + f.boxes.len(); // jitcode_index + pc + slot_count + boxes
+            n += 2 + f.boxes.len(); // jitcode_index + pc + boxes
         }
         n
     }
@@ -272,10 +272,13 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain
+        // RPython does NOT encode slot_count per frame — it reads tagged
+        // values until the frame ends (using jitcode.position_info at
+        // rebuild time). For single-frame snapshots the reader simply
+        // consumes all remaining tagged values after jitcode_index + pc.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
-            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -362,13 +365,16 @@ pub fn rebuild_from_numbering(
     }
 
     // Frames.
+    // RPython does NOT encode slot_count — it uses jitcode.position_info
+    // to know how many registers each frame has. For single-frame (all we
+    // support), after reading jitcode_index and pc, consume ALL remaining
+    // tagged values.
     let mut frames = Vec::new();
-    while reader.has_more() {
+    if reader.has_more() {
         let jitcode_index = reader.next_item();
         let pc = reader.next_item();
-        let slot_count = reader.next_item() as usize;
-        let mut values = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
+        let mut values = Vec::new();
+        while reader.has_more() {
             let tagged = reader.next_item() as i16;
             values.push(decode_tagged(tagged, num_failargs, rd_consts));
         }
