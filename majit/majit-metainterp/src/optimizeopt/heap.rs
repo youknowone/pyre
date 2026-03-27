@@ -2318,15 +2318,15 @@ mod tests {
 
     #[test]
     fn test_imported_short_field_cache_replays_into_heap() {
-        use crate::optimizeopt::info::{PreambleFieldOp, PtrInfo};
+        use crate::optimizeopt::info::{PreambleOp, PtrInfo};
         let d = descr(55);
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 2);
-        // RPython PreambleOp parity: store PreambleFieldOp in PtrInfo
+        // RPython PreambleOp parity: store PreambleOp in PtrInfo
         ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
         ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
             d.index(),
-            PreambleFieldOp {
+            PreambleOp {
                 op: OpRef(100),
                 resolved: OpRef(1),
                 invented_name: false,
@@ -2353,12 +2353,12 @@ mod tests {
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 4);
 
-        // RPython PreambleOp parity: store PreambleFieldOp in PtrInfo
-        use crate::optimizeopt::info::{PreambleFieldOp, PtrInfo};
+        // RPython PreambleOp parity: store PreambleOp in PtrInfo
+        use crate::optimizeopt::info::{PreambleOp, PtrInfo};
         ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
         ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
             d_head.index(),
-            PreambleFieldOp {
+            PreambleOp {
                 op: OpRef(100),
                 resolved: OpRef(1),
                 invented_name: false,

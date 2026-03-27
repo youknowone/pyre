@@ -17,7 +17,7 @@ use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 /// typing). Rust requires a separate storage (`preamble_fields`) with
 /// the same read-before-regular-fields semantics.
 #[derive(Clone, Debug)]
-pub struct PreambleFieldOp {
+pub struct PreambleOp {
     /// Phase 1 result box — RPython: PreambleOp.op (aka HeapOp.res)
     pub op: OpRef,
     /// Fresh Phase 2 OpRef with distinct identity from label_args.
@@ -810,7 +810,7 @@ impl PtrInfo {
     /// shortpreamble.py:73-79: HeapOp.produce_op stores PreambleOp in _fields.
     /// RPython: `opinfo.setfield(descr, struct, pop, optheap, cf)`
     /// where `pop` is a PreambleOp wrapper.
-    pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleFieldOp) {
+    pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleOp) {
         match self {
             PtrInfo::Instance(v) => {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
@@ -825,9 +825,9 @@ impl PtrInfo {
     }
 
     /// heap.py:177-187: CachedField._getfield detects PreambleOp in _fields.
-    /// Returns and removes the PreambleFieldOp if present for this field.
+    /// Returns and removes the PreambleOp if present for this field.
     /// RPython: `isinstance(res, PreambleOp)` check in _getfield.
-    pub fn take_preamble_field(&mut self, field_idx: u32) -> Option<PreambleFieldOp> {
+    pub fn take_preamble_field(&mut self, field_idx: u32) -> Option<PreambleOp> {
         match self {
             PtrInfo::Instance(v) => {
                 if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
@@ -1200,7 +1200,7 @@ pub struct InstancePtrInfo {
     /// shortpreamble.py:11-49: PreambleOp wrappers stored during Phase 2
     /// import. RPython stores these in `_fields[]` (mixed with regular
     /// values); Rust uses a separate Vec with read-before-fields semantics.
-    pub preamble_fields: Vec<(u32, PreambleFieldOp)>,
+    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1217,7 +1217,7 @@ pub struct StructPtrInfo {
     /// Original field descriptors keyed by field index.
     pub field_descrs: Vec<(u32, DescrRef)>,
     /// shortpreamble.py:11-49: PreambleOp wrappers (same as InstancePtrInfo).
-    pub preamble_fields: Vec<(u32, PreambleFieldOp)>,
+    pub preamble_fields: Vec<(u32, PreambleOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
