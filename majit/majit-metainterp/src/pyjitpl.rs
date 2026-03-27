@@ -1852,12 +1852,19 @@ impl<M: Clone> MetaInterp<M> {
         }));
         let compile_result = match compile_result {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                let is_invalid_loop = e
+                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .is_some();
                 if crate::majit_log_enabled() {
-                    eprintln!("[jit] compile_loop panicked, aborting trace at key={green_key}");
+                    let kind = if is_invalid_loop {
+                        "InvalidLoop"
+                    } else {
+                        "panic"
+                    };
+                    eprintln!("[jit] compile_loop {kind}, aborting trace at key={green_key}");
                 }
-                // RPython: backend failure is non-permanent — allow retry.
-                self.warm_state.abort_tracing(green_key, false);
+                self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
                 self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
@@ -1977,8 +1984,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                // RPython: backend compilation failure is non-permanent.
-                self.warm_state.abort_tracing(green_key, false);
+                // Backend compilation failure — permanent abort.
+                self.warm_state.abort_tracing(green_key, true);
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
@@ -3872,17 +3879,17 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         // Only compile bridges for root-loop guards, not bridge guards.
+        // RPython handle_fail applies to all guards, but our bridge
+        // compilation infrastructure doesn't yet handle bridge-on-bridge
+        // correctly (guard fail_args layout mismatch). Restricting to
+        // root-loop guards until the resume data is fully ported.
         if trace_id != compiled.root_trace_id {
             return false;
         }
         compiled
             .guard_failures
             .get(&(trace_id, fail_index))
-            .is_some_and(|info| {
-                // RPython: bridge_compiled is checked by the backend (has_bridge
-                // on fail_descr). Here we only check the fail count threshold.
-                self.warm_state.should_compile_bridge(info.fail_count)
-            })
+            .is_some_and(|info| self.warm_state.should_compile_bridge(info.fail_count))
     }
 
     /// Get the failure count for a guard in a specific compiled trace.
