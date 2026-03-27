@@ -102,9 +102,6 @@ pub struct DeadFrameArtifacts {
 
 // ── Compilation helper functions ────────────────────────────────────────
 
-// number_guards_final removed: rd_numb is now produced inline during
-// optimization via ctx.emit() → number_guard_inline (RPython parity).
-
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
