@@ -59,6 +59,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_operator", crate::module::operator::moduledef::init);
     register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
     register_builtin_module("_io", crate::module::io_mod::moduledef::init);
+    register_builtin_module("_sre", crate::module::sre_mod::moduledef::init);
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
@@ -72,7 +73,6 @@ pub fn install_builtin_modules() {
         "_signal",
         "_string",
         "_stat",
-        "_sre",
         "_codecs",
         "_locale",
         "_warnings",

@@ -10,3 +10,4 @@ malachite-bigint = { workspace = true }
 num-traits = { workspace = true }
 num-integer = { workspace = true }
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }
+sre-engine = "0.4.3"

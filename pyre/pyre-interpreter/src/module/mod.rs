@@ -7,5 +7,6 @@ pub mod builtins_mod;
 pub mod io_mod;
 pub mod math;
 pub mod operator;
+pub mod sre_mod;
 pub mod sys;
 pub mod time;

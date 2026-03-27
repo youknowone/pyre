@@ -946,6 +946,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("call_function_ex not implemented").into())
     }
 
+    // yield from / send
+    fn get_yield_from_iter(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("yield from not implemented").into())
+    }
+    fn send_value(&mut self, _target: usize) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("send not implemented").into())
+    }
+    fn end_send(&mut self) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("end_send not implemented").into())
+    }
+
     // Class
     fn load_build_class(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("load_build_class not implemented").into())
@@ -1688,11 +1699,26 @@ where
         | Instruction::GetAIter
         | Instruction::GetANext
         | Instruction::EndAsyncFor
-        | Instruction::Send { .. }
-        | Instruction::EndSend
-        | Instruction::GetYieldFromIter
         | Instruction::CleanupThrow => {
-            Err(crate::PyError::type_error("async/generator send not yet implemented").into())
+            Err(crate::PyError::type_error("async not yet implemented").into())
+        }
+
+        // yield from: handled by PyFrame override in eval.rs
+        Instruction::GetYieldFromIter => {
+            executor.get_yield_from_iter()?;
+            Ok(StepResult::Continue)
+        }
+
+        Instruction::Send { .. } => {
+            let target =
+                jump_target_forward(&code.instructions, next_instr, u32::from(op_arg) as usize);
+            executor.send_value(target)?;
+            Ok(StepResult::Continue)
+        }
+
+        Instruction::EndSend => {
+            executor.end_send()?;
+            Ok(StepResult::Continue)
         }
 
         // ── Misc stubs ──

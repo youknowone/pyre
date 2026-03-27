@@ -18,7 +18,34 @@ use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 use pyre_object::*;
 
 use crate::call::call_callable;
+use std::cell::Cell;
+
+// Thread-local current exception for bare `raise` (RAISE_VARARGS 0).
+// PyPy: executioncontext.py sys_exc_info — the current active exception.
+thread_local! {
+    static CURRENT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(PY_NULL) };
+    pub(crate) static CURRENT_FRAME: Cell<*mut PyFrame> = const { Cell::new(std::ptr::null_mut()) };
+}
 use crate::frame::PyFrame;
+
+struct CurrentFrameGuard {
+    previous: *mut PyFrame,
+}
+
+impl Drop for CurrentFrameGuard {
+    fn drop(&mut self) {
+        CURRENT_FRAME.with(|current| current.set(self.previous));
+    }
+}
+
+fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
+    let previous = CURRENT_FRAME.with(|current| {
+        let previous = current.get();
+        current.set(frame as *mut PyFrame);
+        previous
+    });
+    CurrentFrameGuard { previous }
+}
 
 /// Try to dispatch an exception using the exception table or block stack.
 ///
@@ -79,6 +106,7 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 }
 
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
+    let _current_frame_guard = install_current_frame(frame);
     let code = unsafe { &*frame.code };
 
     loop {
@@ -334,6 +362,25 @@ impl IterOpcodeHandler for PyFrame {
                     let result = crate::space_call_function(iter_method, &[iter]);
                     self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
                     return Ok(());
+                }
+            }
+            // Type object: metaclass __iter__ (NOT the type's own MRO)
+            // CPython: iter(X) calls type(X).__iter__(X)
+            if pyre_object::is_type(iter) {
+                let mc = crate::space::ATTR_TABLE.with(|table| {
+                    table
+                        .borrow()
+                        .get(&(iter as usize))
+                        .and_then(|d| d.get("__metaclass__").copied())
+                });
+                if let Some(metaclass) = mc {
+                    if let Some(method) =
+                        crate::space::lookup_in_type_mro_pub(metaclass, "__iter__")
+                    {
+                        let result = crate::space_call_function(method, &[iter]);
+                        self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -613,12 +660,49 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
         match argc {
-            0 => Err(PyError::runtime_error("no active exception to re-raise")),
+            0 => {
+                // Bare `raise` — re-raise current exception
+                // PyPy: executioncontext.py sys_exc_info
+                let exc = CURRENT_EXCEPTION.with(|c| c.get());
+                if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
+                    Err(PyError::runtime_error("no active exception to re-raise"))
+                } else if unsafe { pyre_object::is_exception(exc) } {
+                    Err(unsafe { PyError::from_exc_object(exc) })
+                } else {
+                    Err(PyError::runtime_error("no active exception to re-raise"))
+                }
+            }
             1 => {
                 let exc = self.pop();
                 unsafe {
                     if pyre_object::is_exception(exc) {
                         Err(PyError::from_exc_object(exc))
+                    } else if crate::is_builtin_func(exc) {
+                        // raise TypeError → call TypeError() to create instance
+                        // PyPy: RAISE_VARARGS calls type to create exception instance
+                        let func = crate::w_builtin_func_get(exc);
+                        match func(&[]) {
+                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
+                                Err(PyError::from_exc_object(exc_obj))
+                            }
+                            Ok(exc_obj) => {
+                                // Treat non-exception return as RuntimeError
+                                Err(PyError::runtime_error(&crate::py_str(exc_obj)))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else if pyre_object::is_type(exc) {
+                        // raise SomeType → call type() to create instance
+                        let result = crate::space_call_function(exc, &[]);
+                        if pyre_object::is_exception(result) {
+                            Err(PyError::from_exc_object(result))
+                        } else {
+                            Err(PyError::runtime_error(
+                                "exceptions must derive from BaseException",
+                            ))
+                        }
+                    } else if pyre_object::is_str(exc) {
+                        Err(PyError::runtime_error(pyre_object::w_str_get_value(exc)))
                     } else {
                         Err(PyError::runtime_error(
                             "exceptions must derive from BaseException",
@@ -817,10 +901,14 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── PushExcInfo ──
+    // PyPy: executioncontext.py enter_frame / normalize_exception
     fn push_exc_info(&mut self) -> Result<(), Self::Error> {
         let exc = self.pop();
-        // Push "previous exception" (None for now — no exc_info chain)
-        self.push(pyre_object::w_none());
+        // Save previous exception, set current
+        let prev = CURRENT_EXCEPTION.with(|c| c.get());
+        CURRENT_EXCEPTION.with(|c| c.set(exc));
+        // Push "previous exception" for later restore
+        self.push(prev);
         // Push the exception value back
         self.push(exc);
         Ok(())
@@ -854,16 +942,20 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── PopExcept ──
     fn pop_except(&mut self) -> Result<(), Self::Error> {
-        // CPython 3.13: restore previous exc_info from stack
-        // At this point stack has [prev_exc] from PUSH_EXC_INFO
-        let _prev_exc = self.pop();
+        // Restore previous exc_info from stack
+        let prev_exc = self.pop();
+        CURRENT_EXCEPTION.with(|c| c.set(prev_exc));
         Ok(())
     }
 
     // ── Reraise ──
+    // CPython: RERAISE raises the exception that's on TOS.
+    // The exception table handler (handle_exception) unwinds the stack.
+    // We peek TOS to get the exception but do NOT pop — handle_exception
+    // will set the stack to the correct depth.
     fn reraise(&mut self) -> Result<(), Self::Error> {
-        let exc = self.pop();
-        let _prev = self.pop(); // previous exc_info
+        // TOS is the exception, TOS1 is prev_exc_info
+        let exc = self.peek();
         unsafe {
             if pyre_object::is_exception(exc) {
                 Err(PyError::from_exc_object(exc))
@@ -912,13 +1004,16 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BuildSet ──
     fn build_set(&mut self, count: usize) -> Result<(), Self::Error> {
-        // Phase 1: build as list (no set type yet)
+        // PyPy: setobject.py BUILD_SET → W_SetObject
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             items.push(self.pop());
         }
         items.reverse();
-        self.push(pyre_object::w_list_new(items)); // TODO: proper set type
+        // Create a proper set using the builtin set() constructor,
+        // then add each item.
+        let set_obj = crate::builtins::builtin_set_from_items(&items)?;
+        self.push(set_obj);
         Ok(())
     }
 
@@ -1058,6 +1153,39 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    // ── yield from / send ──
+    fn get_yield_from_iter(&mut self) -> Result<(), Self::Error> {
+        let iterable = self.pop();
+        let iter = crate::space::py_iter(iterable)?;
+        self.push(iter);
+        Ok(())
+    }
+
+    fn send_value(&mut self, target: usize) -> Result<(), Self::Error> {
+        let _value = self.pop(); // sent value
+        let iter = self.peek();
+        match crate::space::py_next(iter) {
+            Ok(result) => {
+                self.push(result);
+                Ok(())
+            }
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                // Don't pop iterator — END_SEND will handle it
+                self.push(pyre_object::w_none()); // push result (None)
+                self.next_instr = target;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn end_send(&mut self) -> Result<(), Self::Error> {
+        let result = self.pop();
+        let _iter = self.pop();
+        self.push(result);
+        Ok(())
+    }
+
     // ── load_method ──
     // PyPy: LOOKUP_METHOD — interpreter-only override.
     // For instances, pushes [attr, self] so CALL prepends self.
@@ -1069,7 +1197,8 @@ impl OpcodeStepExecutor for PyFrame {
         // detected in call_user_function_with_eval), RETURN_GENERATOR fires
         // during the first __next__() resume. It's a no-op in that case —
         // the generator object was already created at call time.
-        // Just continue execution (the next instruction is POP_TOP + RESUME).
+        // Push dummy value for the following POP_TOP to consume.
+        self.push(pyre_object::w_none());
         return Ok(());
 
         // Legacy path for CPython-style RETURN_GENERATOR (not used with RustPython compiler):
@@ -1130,6 +1259,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = self.pop();
         let attr = crate::space::py_getattr(obj, name)?;
+        if unsafe { pyre_object::is_method(attr) } {
+            self.push(attr);
+            self.push(PY_NULL);
+            return Ok(());
+        }
         self.push(attr);
         // Bind self only for regular instance method calls.
         // staticmethod/classmethod descriptors already unwrap to the raw
@@ -1151,7 +1285,16 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
-                    _ => obj, // regular method: bind self
+                    Some(d) if crate::is_builtin_func(d) => PY_NULL,
+                    Some(_) => obj, // found in type MRO → bind self (method)
+                    None => {
+                        // Not found in type MRO → found in instance __dict__.
+                        // PyPy: instance __dict__ attrs bypass descriptor protocol.
+                        // User functions in instance dict: no binding.
+                        // Builtin functions stored per-instance (e.g. set methods
+                        // stored via ATTR_TABLE): bind self.
+                        if crate::is_func(attr) { PY_NULL } else { obj }
+                    }
                 }
             } else if pyre_object::is_type(obj) {
                 // Type object: check for classmethod in type's MRO
@@ -1306,9 +1449,32 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: LOAD_LOCALS; CPython: LOAD_LOCALS
     // Pushes the current namespace dict onto the stack.
     fn load_locals(&mut self) -> Result<(), Self::Error> {
-        // In pyre, "locals" in a class body is the namespace dict.
-        // Phase 1: push a new empty dict (class body locals placeholder)
-        self.push(pyre_object::w_dict_new());
+        let dict = pyre_object::w_dict_new();
+        unsafe {
+            if !self.class_locals.is_null() {
+                for (key, &value) in (*self.class_locals).entries() {
+                    if !value.is_null() {
+                        pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                    }
+                }
+            } else {
+                let code = &*self.code;
+                for (idx, name) in code.varnames.iter().enumerate() {
+                    let value = self.locals_cells_stack_w[idx];
+                    if !value.is_null() {
+                        pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
+                    }
+                }
+                if self.nlocals() == 0 && !self.namespace.is_null() {
+                    for (key, &value) in (*self.namespace).entries() {
+                        if !value.is_null() {
+                            pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                        }
+                    }
+                }
+            }
+        }
+        self.push(dict);
         Ok(())
     }
 
@@ -3252,6 +3418,207 @@ for x in [1, 2, 3]:
                 assert_eq!(w_int_get_value(w_list_getitem(result, 2).unwrap()), 6);
             },
             Err(e) => panic!("list comprehension failed: {} ({:?})", e.message, e.kind),
+        }
+    }
+
+    #[test]
+    fn test_globals_builtin_uses_current_module_namespace() {
+        let source = "x = 41\nresult = globals()['x'] + 1";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("globals() failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_locals_builtin_uses_current_function_locals() {
+        let source = "\
+def f(a, b):
+    c = a + b
+    return locals()['a'] + locals()['b'] + locals()['c']
+result = f(2, 3)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("locals() in function failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 10);
+        }
+    }
+
+    #[test]
+    fn test_locals_builtin_uses_class_namespace() {
+        let source = "\
+x = 1
+class C:
+    y = 2
+    snap = locals()
+result = C.snap['y'] + globals()['x']";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("locals() in class failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 3);
+        }
+    }
+
+    #[test]
+    fn test_bound_method_materialized_by_attribute_access() {
+        let source = "\
+class C:
+    def add(self, x):
+        return x + 1
+c = C()
+m = c.add
+result = m(41)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bound method lookup failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_bound_method_lookup_materializes_method_object() {
+        let source = "\
+class C:
+    def add(self, x):
+        return x + 1
+c = C()
+m = c.add";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bound method lookup setup failed");
+        unsafe {
+            let c_obj = *(*frame.namespace).get("c").unwrap();
+            let m_obj = *(*frame.namespace).get("m").unwrap();
+            assert!(pyre_object::is_method(m_obj));
+            assert!(std::ptr::eq(pyre_object::w_method_get_self(m_obj), c_obj));
+        }
+    }
+
+    #[test]
+    fn test_builtin_type_method_materialized_by_attribute_access() {
+        let source = "\
+xs = []
+m = xs.append
+m(42)
+result = len(xs)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("builtin type method lookup failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 1);
+        }
+    }
+
+    #[test]
+    fn test_builtin_function_stored_on_class_is_not_bound() {
+        let source = "\
+class C:
+    f = len
+c = C()
+result = c.f([1, 2, 3])";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("builtin function descriptor semantics failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 3);
+        }
+    }
+
+    #[test]
+    fn test_metaclass_method_materialized_by_attribute_access() {
+        let source = "\
+class Meta(type):
+    def pick(cls):
+        return cls
+class C(metaclass=Meta):
+    pass
+bound = C.pick
+result = bound()";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("metaclass descriptor lookup failed");
+        let result = unsafe { *(*frame.namespace).get("result").unwrap() };
+        let c_obj = unsafe { *(*frame.namespace).get("C").unwrap() };
+        assert!(std::ptr::eq(result, c_obj));
+    }
+
+    #[test]
+    fn test_staticmethod_prepare_is_called_with_bound_lookup() {
+        let source = "\
+class Meta(type):
+    @staticmethod
+    def __prepare__(name, bases):
+        return {'seed': 41}
+class C(metaclass=Meta):
+    value = seed + 1
+result = C.value";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("__prepare__ lookup failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_function_dunder_globals_and_code_are_materialized() {
+        let source = "\
+x = 7
+def f(a, *, b=3):
+    return a + b + x
+g = f.__globals__
+code = f.__code__";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("function dunder lookup failed");
+        let globals = unsafe { *(*frame.namespace).get("g").unwrap() };
+        let code = unsafe { *(*frame.namespace).get("code").unwrap() };
+        unsafe {
+            let x = pyre_object::w_dict_lookup(globals, pyre_object::w_str_new("x")).unwrap();
+            assert_eq!(w_int_get_value(x), 7);
+            let argcount = crate::space::py_getattr(code, "co_argcount").unwrap();
+            assert_eq!(w_int_get_value(argcount), 1);
+            let kwonly = crate::space::py_getattr(code, "co_kwonlyargcount").unwrap();
+            assert_eq!(w_int_get_value(kwonly), 1);
+            let name = crate::space::py_getattr(code, "co_name").unwrap();
+            assert_eq!(w_str_get_value(name), "f");
+            let varnames = crate::space::py_getattr(code, "co_varnames").unwrap();
+            let first = w_tuple_getitem(varnames, 0).unwrap();
+            assert_eq!(w_str_get_value(first), "a");
+        }
+    }
+
+    #[test]
+    fn test_vars_builtin_raises_type_error_without_dict() {
+        let source = "\
+result = 0
+try:
+    vars(1)
+except TypeError:
+    result = 1";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("vars() exception path failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 1);
+        }
+    }
+
+    #[test]
+    fn test_type_builtin_rejects_invalid_arity() {
+        let source = "\
+result = 0
+try:
+    type()
+except TypeError:
+    result = 1";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("type() exception path failed");
+        unsafe {
+            let result = *(*frame.namespace).get("result").unwrap();
+            assert_eq!(w_int_get_value(result), 1);
         }
     }
 }

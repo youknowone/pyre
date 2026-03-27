@@ -3,10 +3,10 @@ use std::sync::OnceLock;
 
 use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{
-    PY_NULL, PyObjectRef, W_SeqIterator, is_int, is_list, is_range_iter, is_seq_iter, is_tuple,
-    w_dict_new, w_dict_setitem, w_dict_store, w_int_get_value, w_list_getitem, w_list_len,
-    w_list_new, w_range_iter_has_next, w_range_iter_next, w_tuple_getitem, w_tuple_len,
-    w_tuple_new,
+    PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_int, is_list, is_range_iter, is_seq_iter,
+    is_str, is_tuple, w_dict_new, w_dict_setitem, w_dict_store, w_int_get_value, w_int_new,
+    w_list_getitem, w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next,
+    w_str_get_value, w_str_new, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
 
 use crate::{
@@ -600,6 +600,15 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         if is_list(seq) {
             return Ok(w_list_len(seq));
         }
+        if is_str(seq) {
+            return Ok(w_str_get_value(seq).chars().count());
+        }
+        // Try __len__ on instances
+        if is_instance(seq) {
+            if let Ok(len_val) = crate::space::py_len(seq) {
+                return Ok(w_int_get_value(len_val) as usize);
+            }
+        }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
             (*(*seq).ob_type).tp_name
@@ -616,6 +625,21 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         if is_list(seq) {
             return w_list_getitem(seq, index as i64)
                 .ok_or_else(|| PyError::type_error("list index out of range"));
+        }
+        if is_str(seq) {
+            let s = w_str_get_value(seq);
+            return s
+                .chars()
+                .nth(index)
+                .map(|c| {
+                    let mut buf = [0u8; 4];
+                    w_str_new(c.encode_utf8(&mut buf))
+                })
+                .ok_or_else(|| PyError::type_error("string index out of range"));
+        }
+        // Try py_getitem for instances
+        if is_instance(seq) {
+            return crate::space::py_getitem(seq, w_int_new(index as i64));
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
@@ -635,13 +659,32 @@ pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
 }
 
 pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
-    let len = sequence_len(seq)?;
-    if len != count {
-        return Err(PyError::type_error(format!(
-            "not enough values to unpack (expected {count}, got {len})"
-        )));
+    // Fast path for known sequence types
+    if let Ok(len) = sequence_len(seq) {
+        if len != count {
+            return Err(PyError::type_error(format!(
+                "not enough values to unpack (expected {count}, got {len})"
+            )));
+        }
+        return (0..count).map(|idx| sequence_getitem(seq, idx)).collect();
     }
-    (0..count).map(|idx| sequence_getitem(seq, idx)).collect()
+    // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
+    // PyPy: ObjSpace.unpackiterable
+    let iter = crate::space::py_iter(seq)?;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        match crate::space::py_next(iter) {
+            Ok(val) => items.push(val),
+            Err(e) if e.kind == PyErrorKind::StopIteration => {
+                return Err(PyError::type_error(format!(
+                    "not enough values to unpack (expected {count}, got {})",
+                    items.len()
+                )));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(items)
 }
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {

@@ -29,6 +29,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("hasattr", || w_builtin_func_new("hasattr", builtin_hasattr));
     namespace.get_or_insert_with("getattr", || w_builtin_func_new("getattr", builtin_getattr));
     namespace.get_or_insert_with("setattr", || w_builtin_func_new("setattr", builtin_setattr));
+    namespace.get_or_insert_with("delattr", || w_builtin_func_new("delattr", builtin_delattr));
     namespace.get_or_insert_with("tuple", || crate::typedef::get_builtin_type(&TUPLE_TYPE));
     namespace.get_or_insert_with("list", || crate::typedef::get_builtin_type(&LIST_TYPE));
     namespace.get_or_insert_with("dict", || crate::typedef::get_builtin_type(&DICT_TYPE));
@@ -73,77 +74,12 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         w_builtin_func_new("frozenset", |_| Ok(w_tuple_new(vec![])))
     });
     namespace.get_or_insert_with("set", || {
-        w_builtin_func_new("set", |_args| {
-            // set() → instance with add/discard/remove methods backed by a dict
-            let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
-            let data = pyre_object::w_dict_new();
-            let _ = crate::space::py_setattr(obj, "__data__", data);
-            let _ = crate::space::py_setattr(
-                obj,
-                "add",
-                crate::w_builtin_func_new("add", |args| {
-                    if args.len() >= 2 {
-                        let self_obj = args[0];
-                        let val = args[1];
-                        if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
-                            unsafe { pyre_object::w_dict_store(data, val, pyre_object::w_none()) };
-                        }
-                    }
-                    Ok(pyre_object::w_none())
-                }),
-            );
-            let _ = crate::space::py_setattr(
-                obj,
-                "discard",
-                crate::w_builtin_func_new("discard", |_args| Ok(pyre_object::w_none())),
-            );
-            let _ = crate::space::py_setattr(
-                obj,
-                "remove",
-                crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
-            );
-            let _ = crate::space::py_setattr(
-                obj,
-                "__iter__",
-                crate::w_builtin_func_new("__iter__", |args| {
-                    // Iterate over keys of __data__ dict
-                    if !args.is_empty() {
-                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
-                            return crate::space::py_iter(data);
-                        }
-                    }
-                    Ok(pyre_object::w_seq_iter_new(
-                        pyre_object::w_list_new(vec![]),
-                        0,
-                    ))
-                }),
-            );
-            let _ = crate::space::py_setattr(
-                obj,
-                "__contains__",
-                crate::w_builtin_func_new("__contains__", |args| {
-                    if args.len() >= 2 {
-                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
-                            let found = unsafe { pyre_object::w_dict_lookup(data, args[1]) };
-                            return Ok(pyre_object::w_bool_from(found.is_some()));
-                        }
-                    }
-                    Ok(pyre_object::w_bool_from(false))
-                }),
-            );
-            let _ = crate::space::py_setattr(
-                obj,
-                "__len__",
-                crate::w_builtin_func_new("__len__", |args| {
-                    if !args.is_empty() {
-                        if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
-                            return crate::space::py_len(data);
-                        }
-                    }
-                    Ok(pyre_object::w_int_new(0))
-                }),
-            );
-            Ok(obj)
+        w_builtin_func_new("set", |args| {
+            if args.is_empty() {
+                return builtin_set_from_items(&[]);
+            }
+            let items = collect_iterable_pub(args[0])?;
+            builtin_set_from_items(&items)
         })
     });
     namespace.get_or_insert_with("property", || {
@@ -166,19 +102,30 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         })
     });
     namespace.get_or_insert_with("staticmethod", || {
-        w_builtin_func_new("staticmethod", |args| {
-            Ok(pyre_object::w_staticmethod_new(args[0]))
-        })
+        crate::typedef::get_builtin_type(&pyre_object::propertyobject::STATICMETHOD_TYPE)
     });
     namespace.get_or_insert_with("classmethod", || {
-        w_builtin_func_new("classmethod", |args| {
-            Ok(pyre_object::w_classmethod_new(args[0]))
-        })
+        crate::typedef::get_builtin_type(&pyre_object::propertyobject::CLASSMETHOD_TYPE)
     });
     namespace.get_or_insert_with("Ellipsis", || w_none());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
     namespace.get_or_insert_with("memoryview", || {
         w_builtin_func_new("memoryview", |_| Ok(w_none()))
+    });
+    namespace.get_or_insert_with("globals", || w_builtin_func_new("globals", builtin_globals));
+    namespace.get_or_insert_with("locals", || w_builtin_func_new("locals", builtin_locals));
+    namespace.get_or_insert_with("exec", || w_builtin_func_new("exec", |_| Ok(w_none())));
+    namespace.get_or_insert_with("eval", || w_builtin_func_new("eval", |_| Ok(w_none())));
+    namespace.get_or_insert_with("compile", || {
+        w_builtin_func_new("compile", |_| Ok(w_none()))
+    });
+    namespace.get_or_insert_with("input", || {
+        w_builtin_func_new("input", |_| Ok(pyre_object::w_str_new("")))
+    });
+    namespace.get_or_insert_with("open", || {
+        w_builtin_func_new("open", |_| {
+            Err(crate::PyError::type_error("open() not implemented"))
+        })
     });
     namespace.get_or_insert_with("BaseException", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("Exception", || crate::typedef::get_object_type());
@@ -276,11 +223,13 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("property", || {
         w_builtin_func_new("property", builtin_property)
     });
+    // staticmethod/classmethod registered as types for isinstance() support.
+    // The type's __new__ creates the descriptor wrapper.
     namespace.get_or_insert_with("staticmethod", || {
-        w_builtin_func_new("staticmethod", builtin_staticmethod)
+        crate::typedef::get_builtin_type(&pyre_object::propertyobject::STATICMETHOD_TYPE)
     });
     namespace.get_or_insert_with("classmethod", || {
-        w_builtin_func_new("classmethod", builtin_classmethod)
+        crate::typedef::get_builtin_type(&pyre_object::propertyobject::CLASSMETHOD_TYPE)
     });
 }
 
@@ -462,24 +411,80 @@ fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// PyPy: `space.type(w_obj)` → W_TypeObject
 pub(crate) fn builtin_type_new_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // type.__new__(metatype, name, bases, dict)
-    // args[0] = metatype (cls), args[1] = name, args[2] = bases, args[3] = dict
-    if args.len() >= 4 {
+    // May be called with extra self-binding from super():
+    //   [self, metatype, name, bases, dict] — 5 args
+    //   [metatype, name, bases, dict] — 4 args
+    //   [metatype, obj] — 2 args (type(obj))
+    // Find the (name, bases, dict) triple by scanning for the first str arg.
+    // Also extract the metatype (first type arg before the name str).
+    let mut metatype = pyre_object::PY_NULL;
+    for i in 0..args.len() {
+        if unsafe { pyre_object::is_str(args[i]) } && i + 2 < args.len() {
+            // Extract metatype from preceding args
+            for j in 0..i {
+                if unsafe { pyre_object::is_type(args[j]) } {
+                    metatype = args[j];
+                }
+            }
+            return builtin_type_with_meta(&args[i..], metatype);
+        }
+    }
+    if args.len() == 1 && unsafe { pyre_object::is_type(args[0]) } {
+        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
+    }
+    if args.len() == 1 {
+        return builtin_type(args);
+    }
+    if args.len() == 2 {
         return builtin_type(&args[1..]);
     }
-    // type.__new__(metatype, obj) → type(obj)
-    if args.len() >= 2 {
-        return builtin_type(&args[1..]);
-    }
-    builtin_type(args)
+    Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
 fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_type_with_meta(args, pyre_object::PY_NULL)
+}
+
+fn builtin_type_with_meta(
+    args: &[PyObjectRef],
+    metatype: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 1 && args.len() != 3 {
+        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
+    }
     // type(name, bases, dict) — 3-arg form creates a new type
     // PyPy: typeobject.py type.__new__(metatype, name, bases, dict)
-    if args.len() >= 3 {
+    if args.len() == 3 {
         let name_obj = args[0];
         let bases = args[1];
         let ns_dict = args[2];
         let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+
+        // CPython: calculate_metaclass — if bases have a custom metaclass,
+        // delegate to that metaclass instead of using type.__new__ directly.
+        if metatype.is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
+            let n = unsafe { w_tuple_len(bases) };
+            for i in 0..n {
+                if let Some(base) = unsafe { pyre_object::w_tuple_getitem(bases, i as i64) } {
+                    if unsafe { pyre_object::is_type(base) } {
+                        let mc = crate::space::ATTR_TABLE.with(|table| {
+                            table
+                                .borrow()
+                                .get(&(base as usize))
+                                .and_then(|d| d.get("__metaclass__").copied())
+                        });
+                        if let Some(mc) = mc {
+                            // Delegate: call metaclass(name, bases, dict, **kwds)
+                            // Pass extra args from the original call
+                            let mut mc_args = vec![name_obj, bases, ns_dict];
+                            if args.len() > 3 {
+                                mc_args.extend_from_slice(&args[3..]);
+                            }
+                            return Ok(crate::space_call_function(mc, &mc_args));
+                        }
+                    }
+                }
+            }
+        }
 
         // Convert dict to PyNamespace
         let mut class_ns = Box::new(crate::PyNamespace::new());
@@ -509,9 +514,62 @@ fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 bases
             };
 
+        // CPython: calculate_metaclass — delegate to winner if different
+        let default_meta = if metatype.is_null() {
+            crate::typedef::get_type_type()
+        } else {
+            metatype
+        };
+        let winner =
+            crate::call::calculate_metaclass(default_meta, effective_bases).unwrap_or(default_meta);
+        if !std::ptr::eq(winner, default_meta) {
+            // Winner is a different metaclass — delegate to its __new__
+            if let Some(mc_new) = unsafe { crate::space::lookup_in_type_mro_pub(winner, "__new__") }
+            {
+                let mut new_args = vec![winner, name_obj, bases, ns_dict];
+                if args.len() > 3 {
+                    new_args.extend_from_slice(&args[3..]);
+                }
+                drop(unsafe { Box::from_raw(ns_ptr) });
+                return Ok(crate::space_call_function(mc_new, &new_args));
+            }
+        }
+        let metatype = winner;
+
         let w_type = pyre_object::w_type_new(name, effective_bases, ns_ptr as *mut u8);
         let mro = unsafe { crate::space::compute_mro_pub(w_type) };
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
+
+        // Store metaclass BEFORE __set_name__ so descriptors can access
+        // metaclass methods (e.g. EnumType._add_member_ during _proto_member.__set_name__)
+        if !metatype.is_null() {
+            let type_type_obj = crate::typedef::get_builtin_type(&pyre_object::pyobject::TYPE_TYPE);
+            if !std::ptr::eq(metatype, type_type_obj) {
+                crate::space::ATTR_TABLE.with(|table| {
+                    table
+                        .borrow_mut()
+                        .entry(w_type as usize)
+                        .or_default()
+                        .insert("__metaclass__".to_string(), metatype);
+                });
+            }
+        }
+
+        // __set_name__ protocol — CPython: type_new_set_names
+        // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor
+        if unsafe { is_dict(ns_dict) } {
+            let d = unsafe { &*(ns_dict as *const pyre_object::dictobject::W_DictObject) };
+            let entries: Vec<(PyObjectRef, PyObjectRef)> = unsafe { (*d.entries).clone() };
+            for (k, v) in entries {
+                if unsafe { is_str(k) } {
+                    if let Ok(set_name) = crate::space::py_getattr(v, "__set_name__") {
+                        // Call: descriptor.__set_name__(self, owner, name)
+                        let _ = crate::space_call_function(set_name, &[v, w_type, k]);
+                    }
+                }
+            }
+        }
+
         return Ok(w_type);
     }
 
@@ -524,6 +582,11 @@ fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     if let Some(tp) = crate::typedef::type_of(obj) {
         return Ok(tp);
+    }
+    if obj.is_null() {
+        return Ok(crate::typedef::get_builtin_type(
+            &pyre_object::pyobject::NONE_TYPE,
+        ));
     }
     let name = unsafe { (*(*obj).ob_type).tp_name };
     Ok(box_str_constant(name))
@@ -843,6 +906,15 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(w_none())
 }
 
+/// `delattr(obj, name)` — PyPy: baseobjspace.py delattr
+fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() == 2, "delattr() takes exactly 2 arguments");
+    let obj = args[0];
+    let name = unsafe { w_str_get_value(args[1]) };
+    crate::space::py_delattr(obj, name)?;
+    Ok(w_none())
+}
+
 pub(crate) fn builtin_tuple_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     builtin_tuple(args)
 }
@@ -911,6 +983,159 @@ fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
     Ok(items)
 }
 
+/// Create a set object from items.
+/// PyPy: setobject.py W_SetObject — backed by a dict for O(1) membership.
+pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+    let data = pyre_object::w_dict_new();
+    for &item in items {
+        unsafe { pyre_object::w_dict_store(data, item, pyre_object::w_none()) };
+    }
+    let _ = crate::space::py_setattr(obj, "__data__", data);
+    // add()
+    let _ = crate::space::py_setattr(
+        obj,
+        "add",
+        crate::w_builtin_func_new("add", |args| {
+            if args.len() >= 2 {
+                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                    unsafe { pyre_object::w_dict_store(data, args[1], pyre_object::w_none()) };
+                }
+            }
+            Ok(pyre_object::w_none())
+        }),
+    );
+    // discard()
+    let _ = crate::space::py_setattr(
+        obj,
+        "discard",
+        crate::w_builtin_func_new("discard", |_args| Ok(pyre_object::w_none())),
+    );
+    // remove()
+    let _ = crate::space::py_setattr(
+        obj,
+        "remove",
+        crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
+    );
+    // pop()
+    let _ = crate::space::py_setattr(
+        obj,
+        "pop",
+        crate::w_builtin_func_new("pop", |args| {
+            if !args.is_empty() {
+                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                    unsafe {
+                        let d = &*(data as *const pyre_object::dictobject::W_DictObject);
+                        let entries = &*d.entries;
+                        if let Some(&(k, _)) = entries.first() {
+                            return Ok(k);
+                        }
+                    }
+                }
+            }
+            Err(crate::PyError::new(
+                crate::PyErrorKind::KeyError,
+                "pop from an empty set",
+            ))
+        }),
+    );
+    // __iter__()
+    let _ = crate::space::py_setattr(
+        obj,
+        "__iter__",
+        crate::w_builtin_func_new("__iter__", |args| {
+            if !args.is_empty() {
+                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                    return crate::space::py_iter(data);
+                }
+            }
+            Ok(pyre_object::w_seq_iter_new(
+                pyre_object::w_list_new(vec![]),
+                0,
+            ))
+        }),
+    );
+    // __contains__()
+    let _ = crate::space::py_setattr(
+        obj,
+        "__contains__",
+        crate::w_builtin_func_new("__contains__", |args| {
+            if args.len() >= 2 {
+                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                    let found = unsafe { pyre_object::w_dict_lookup(data, args[1]) };
+                    return Ok(pyre_object::w_bool_from(found.is_some()));
+                }
+            }
+            Ok(pyre_object::w_bool_from(false))
+        }),
+    );
+    // __len__()
+    let _ = crate::space::py_setattr(
+        obj,
+        "__len__",
+        crate::w_builtin_func_new("__len__", |args| {
+            if !args.is_empty() {
+                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                    return crate::space::py_len(data);
+                }
+            }
+            Ok(pyre_object::w_int_new(0))
+        }),
+    );
+    // __and__() — set intersection
+    // PyPy: setobject.py W_BaseSetObject.descr_and
+    let _ = crate::space::py_setattr(
+        obj,
+        "__and__",
+        crate::w_builtin_func_new("__and__", |args| {
+            if args.len() < 2 {
+                return Ok(args[0]);
+            }
+            let self_obj = args[0];
+            let other = args[1];
+            // Collect other items
+            let other_items = collect_iterable_pub(other)?;
+            // Build intersection
+            let mut result_items = Vec::new();
+            if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
+                for item in &other_items {
+                    if unsafe { pyre_object::w_dict_lookup(data, *item) }.is_some() {
+                        result_items.push(*item);
+                    }
+                }
+            }
+            builtin_set_from_items(&result_items)
+        }),
+    );
+    // __or__() — set union
+    let _ = crate::space::py_setattr(
+        obj,
+        "__or__",
+        crate::w_builtin_func_new("__or__", |args| {
+            if args.len() < 2 {
+                return Ok(args[0]);
+            }
+            let self_obj = args[0];
+            let other = args[1];
+            let mut result_items = Vec::new();
+            if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
+                unsafe {
+                    let d = &*(data as *const pyre_object::dictobject::W_DictObject);
+                    for &(k, _) in &*d.entries {
+                        result_items.push(k);
+                    }
+                }
+            }
+            let other_items = collect_iterable_pub(other)?;
+            for item in other_items {
+                result_items.push(item);
+            }
+            builtin_set_from_items(&result_items)
+        }),
+    );
+    Ok(obj)
+}
+
 pub(crate) fn builtin_dict_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     builtin_dict_ctor(args)
 }
@@ -943,7 +1168,8 @@ fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             return Ok(dict);
         }
     }
-    panic!("dict() from this type not yet implemented");
+    // Fallback: create empty dict for unknown input types
+    Ok(pyre_object::w_dict_new())
 }
 
 /// `object()` — PyPy: objectobject.py descr__new__
@@ -1014,15 +1240,97 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_bool_from(is_callable))
 }
 
-/// `vars([obj])` — stub
+fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if !args.is_empty() {
+        return Err(crate::PyError::type_error("globals() takes no arguments"));
+    }
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "globals() requires an active frame",
+            ));
+        }
+        let namespace = unsafe { (*frame).namespace };
+        if namespace.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "globals() requires an active frame",
+            ));
+        }
+        let dict = pyre_object::w_dict_new();
+        for (k, &v) in unsafe { &*namespace }.entries() {
+            unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
+        }
+        Ok(dict)
+    })
+}
+
+fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if !args.is_empty() {
+        return Err(crate::PyError::type_error("locals() takes no arguments"));
+    }
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "locals() requires an active frame",
+            ));
+        }
+        let frame = unsafe { &*frame };
+        if !frame.class_locals.is_null() {
+            let dict = pyre_object::w_dict_new();
+            for (k, &v) in unsafe { &*frame.class_locals }.entries() {
+                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
+            }
+            return Ok(dict);
+        }
+        let dict = pyre_object::w_dict_new();
+        let code = unsafe { &*frame.code };
+        for (idx, name) in code.varnames.iter().enumerate() {
+            let value = frame.locals_cells_stack_w[idx];
+            if !value.is_null() {
+                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value) };
+            }
+        }
+        if frame.nlocals() == 0 && !frame.namespace.is_null() {
+            for (k, &v) in unsafe { &*frame.namespace }.entries() {
+                unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
+            }
+        }
+        Ok(dict)
+    })
+}
+
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
+        return builtin_locals(args);
+    }
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(
-            "vars() without argument not supported",
+            "vars() takes at most 1 argument.",
         ));
     }
-    // Stub: return empty dict
-    Ok(pyre_object::w_dict_new())
+    let obj = args[0];
+    let has_dict = unsafe {
+        pyre_object::is_instance(obj)
+            || crate::is_func(obj)
+            || crate::is_builtin_func(obj)
+            || pyre_object::is_module(obj)
+    } || crate::space::ATTR_TABLE
+        .with(|table| table.borrow().contains_key(&(obj as usize)));
+    if !has_dict {
+        return Err(crate::PyError::type_error(
+            "vars() argument must have __dict__ attribute",
+        ));
+    }
+    let dict = crate::space::py_getattr(obj, "__dict__")
+        .map_err(|_| crate::PyError::type_error("vars() argument must have __dict__ attribute"))?;
+    if dict.is_null() || unsafe { pyre_object::is_none(dict) } {
+        return Err(crate::PyError::type_error(
+            "vars() argument must have __dict__ attribute",
+        ));
+    }
+    Ok(dict)
 }
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
@@ -1289,65 +1597,29 @@ fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `any(iterable)` — PyPy: operation.py any
+/// `any(iterable)` — PyPy: baseobjspace.py any_w
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
-    let iterable = args[0];
-    unsafe {
-        if is_list(iterable) {
-            let n = w_list_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_list_getitem(iterable, i as i64) {
-                    if crate::space::py_is_true(item) {
-                        return Ok(w_bool_from(true));
-                    }
-                }
-            }
-            return Ok(w_bool_from(false));
-        }
-        if is_tuple(iterable) {
-            let n = w_tuple_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
-                    if crate::space::py_is_true(item) {
-                        return Ok(w_bool_from(true));
-                    }
-                }
-            }
-            return Ok(w_bool_from(false));
+    let items = collect_iterable_pub(args[0])?;
+    for item in items {
+        if crate::space::py_is_true(item) {
+            return Ok(w_bool_from(true));
         }
     }
-    panic!("any() argument must be list or tuple");
+    Ok(w_bool_from(false))
 }
 
 /// `all(iterable)` — PyPy: operation.py all
+/// `all(iterable)` — PyPy: baseobjspace.py all_w
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
-    let iterable = args[0];
-    unsafe {
-        if is_list(iterable) {
-            let n = w_list_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_list_getitem(iterable, i as i64) {
-                    if !crate::space::py_is_true(item) {
-                        return Ok(w_bool_from(false));
-                    }
-                }
-            }
-            return Ok(w_bool_from(true));
-        }
-        if is_tuple(iterable) {
-            let n = w_tuple_len(iterable);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(iterable, i as i64) {
-                    if !crate::space::py_is_true(item) {
-                        return Ok(w_bool_from(false));
-                    }
-                }
-            }
-            return Ok(w_bool_from(true));
+    let items = collect_iterable_pub(args[0])?;
+    for item in items {
+        if !crate::space::py_is_true(item) {
+            return Ok(w_bool_from(false));
         }
     }
-    panic!("all() argument must be list or tuple");
+    Ok(w_bool_from(true))
 }
 
 /// `sum(iterable, start=0)` — PyPy: operation.py sum

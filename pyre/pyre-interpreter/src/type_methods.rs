@@ -706,77 +706,98 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 // ── Dict methods ─────────────────────────────────────────────────────
 
-pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
-    let dict = args[0];
-    let key = args[1];
-    let default = args.get(2).copied().unwrap_or_else(w_none);
+/// Resolve the actual backing W_DictObject for either a plain dict or
+/// a dict subclass instance (which stores data in `__dict_data__`).
+///
+/// PyPy: W_DictMultiObject subclass instances ARE dicts, so no indirection
+/// is needed. In pyre, dict subclass instances are W_InstanceObject with a
+/// backing dict stored as an attribute.
+pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        if is_int(key) {
-            Ok(w_dict_lookup(dict, key).unwrap_or(default))
-        } else {
-            Ok(default)
+        if is_dict(obj) {
+            return obj;
+        }
+        if is_instance(obj) {
+            if let Ok(backing) = crate::space::py_getattr(obj, "__dict_data__") {
+                if is_dict(backing) {
+                    return backing;
+                }
+            }
         }
     }
+    pyre_object::PY_NULL
+}
+
+pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(args.len() >= 2);
+    let dict = resolve_dict_backing(args[0]);
+    let key = args[1];
+    let default = args.get(2).copied().unwrap_or_else(w_none);
+    if dict.is_null() {
+        return Ok(default);
+    }
+    unsafe { Ok(w_dict_lookup(dict, key).unwrap_or(default)) }
 }
 
 /// PyPy: dictobject.py descr_keys — returns dict_keys view.
-/// Simplified: returns list of int keys from our int-keyed dict.
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let dict = args[0];
-    unsafe {
-        if is_dict(dict) {
-            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*d.entries;
-            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
-            return Ok(w_list_new(keys));
-        }
+    let dict = resolve_dict_backing(args[0]);
+    if dict.is_null() {
+        return Ok(w_list_new(vec![]));
     }
-    Ok(w_list_new(vec![]))
+    unsafe {
+        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+        let entries = &*d.entries;
+        let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
+        Ok(w_list_new(keys))
+    }
 }
 
 /// PyPy: dictobject.py descr_values
 pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let dict = args[0];
-    unsafe {
-        if is_dict(dict) {
-            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*d.entries;
-            let values: Vec<PyObjectRef> = entries.iter().map(|&(_, v)| v).collect();
-            return Ok(w_list_new(values));
-        }
+    let dict = resolve_dict_backing(args[0]);
+    if dict.is_null() {
+        return Ok(w_list_new(vec![]));
     }
-    Ok(w_list_new(vec![]))
+    unsafe {
+        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+        let entries = &*d.entries;
+        let values: Vec<PyObjectRef> = entries.iter().map(|&(_, v)| v).collect();
+        Ok(w_list_new(values))
+    }
 }
 
 /// PyPy: dictobject.py descr_items
 pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    let dict = args[0];
-    unsafe {
-        if is_dict(dict) {
-            let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*d.entries;
-            let items: Vec<PyObjectRef> = entries
-                .iter()
-                .map(|&(k, v)| w_tuple_new(vec![k, v]))
-                .collect();
-            return Ok(w_list_new(items));
-        }
+    let dict = resolve_dict_backing(args[0]);
+    if dict.is_null() {
+        return Ok(w_list_new(vec![]));
     }
-    Ok(w_list_new(vec![]))
+    unsafe {
+        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
+        let entries = &*d.entries;
+        let items: Vec<PyObjectRef> = entries
+            .iter()
+            .map(|&(k, v)| w_tuple_new(vec![k, v]))
+            .collect();
+        Ok(w_list_new(items))
+    }
 }
 
 /// PyPy: dictobject.py descr_update — dict.update(other)
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "update() takes at least 1 argument");
-    let dict = args[0];
-    let other = args[1];
-    unsafe {
-        if is_dict(other) {
-            let src = &*(other as *const pyre_object::dictobject::W_DictObject);
+    let dict = resolve_dict_backing(args[0]);
+    let other_raw = resolve_dict_backing(args[1]);
+    if dict.is_null() {
+        return Ok(w_none());
+    }
+    if !other_raw.is_null() {
+        unsafe {
+            let src = &*(other_raw as *const pyre_object::dictobject::W_DictObject);
             let entries = &*src.entries;
             for &(k, v) in entries {
                 w_dict_store(dict, k, v);
@@ -789,11 +810,11 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// PyPy: dictobject.py descr_pop
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "dict.pop() takes at least 1 argument");
-    let dict = args[0];
+    let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied();
-    unsafe {
-        if is_dict(dict) {
+    if !dict.is_null() {
+        unsafe {
             if let Some(val) = w_dict_lookup(dict, key) {
                 return Ok(val);
             }
@@ -804,11 +825,11 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
-    let dict = args[0];
+    let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
-    unsafe {
-        if is_dict(dict) {
+    if !dict.is_null() {
+        unsafe {
             if let Some(existing) = w_dict_lookup(dict, key) {
                 return Ok(existing);
             }
