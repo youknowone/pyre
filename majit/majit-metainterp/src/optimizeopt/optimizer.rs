@@ -178,6 +178,9 @@ pub struct Optimizer {
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Propagated to OptContext for number_guard_inline.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
+    /// Phase 2 minimum position: all new ops get pos >= this.
+    /// Set by unroll.rs after Phase 1, propagated to OptContext.
+    pub phase2_min_pos: Option<u32>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -762,6 +765,7 @@ impl Optimizer {
             constant_fold_alloc: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
+            phase2_min_pos: None,
         }
     }
 
@@ -1317,6 +1321,9 @@ impl Optimizer {
         // at each guard emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
+        if let Some(min_pos) = self.phase2_min_pos {
+            ctx.set_phase2_min_pos(min_pos);
+        }
 
         // Pre-populate known constants so passes can see them.
         for (&idx, &val) in constants.iter() {
