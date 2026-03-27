@@ -4192,15 +4192,18 @@ impl<M: Clone> MetaInterp<M> {
                         remap.insert(src_ref, majit_ir::OpRef(i as u32));
                     }
                 }
-                // RPython parity: virtual (NONE) slots have original_opref
-                // in rd_virtuals. Map these to the fail_arg index too so
-                // bridge knowledge (known_classes) applies to virtual args.
+                // Bridge knowledge for virtual (NONE) slots: the virtual's
+                // field values are at fail_args positions recorded in
+                // GuardVirtualEntry.fields. No original_opref needed.
                 if let Some(ref rd_virts) = guard_op.rd_virtuals {
                     for entry in rd_virts {
-                        if let Some(orig) = entry.original_opref {
-                            remap
-                                .entry(orig)
-                                .or_insert(majit_ir::OpRef(entry.fail_arg_index as u32));
+                        for &(_field_idx, fa_pos) in &entry.fields {
+                            if fa_pos < fail_args.len() {
+                                let src = fail_args[fa_pos];
+                                if !src.is_none() {
+                                    remap.entry(src).or_insert(majit_ir::OpRef(fa_pos as u32));
+                                }
+                            }
                         }
                     }
                 }
