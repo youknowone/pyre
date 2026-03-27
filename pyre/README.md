@@ -18,10 +18,16 @@ Measured on Apple M-series, single core:
 
 | Benchmark | pyre (JIT) | PyPy 7.3 | CPython 3.14 | vs CPython |
 |-----------|-----------|----------|--------------|------------|
-| fib_loop(100k) | 0.06s | 0.08s | 0.14s | **2.3x** |
-| inline_helper(1M) | 0.11s | 0.02s | 0.21s | **1.9x** |
+| int_loop | 0.05s | 0.04s | 1.72s | **34x** |
+| fib_loop | 0.07s | 0.05s | 0.09s | **1.3x** |
+| inline_helper | 0.00s | 0.01s | 0.36s | **∞** |
+| fib_recursive | 0.21s | 0.07s | 0.81s | **3.9x** |
+| nbody | 1.63s | 0.02s | 0.19s | — |
+| fannkuch | 2.14s | 0.04s | 0.23s | — |
+| raise_catch | 0.30s | 0.01s | 0.05s | — |
+| spectral_norm | 0.21s | 0.01s | 0.03s | — |
 
-pyre matches PyPy on tight integer loops and is consistently faster than CPython where the JIT fires.
+Integer-heavy benchmarks where the JIT fires are competitive with PyPy. Float-heavy workloads (nbody, spectral_norm) and exception-heavy paths (raise_catch) run correctly but are not yet JIT-compiled — they fall back to the interpreter.
 
 Run `pyre/check.sh` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
@@ -64,6 +70,13 @@ pyre/
 ## Relationship to PyPy
 
 pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/objspace/`). Every module, type, and function in the original Python codebase exists in the Rust port under the same name at the same relative location — only snake_case conversion is applied to method names. This naming parity makes it possible to read the PyPy source alongside pyre and see exactly what each piece corresponds to.
+
+## Key differences from PyPy
+
+- **No annotator/rtyper.** RPython translates Python to C via a whole-program type inferencer. pyre runs `majit-analyze` at `cargo build` time instead — same role, but static analysis on Rust source rather than RPython translation.
+- **Proc macros instead of decorators.** `@jit.elidable` becomes `#[elidable]`, `driver.jit_merge_point(...)` becomes `jit_merge_point!`. Same semantics, Rust syntax.
+- **No GIL.** pyre is free-threaded from day one. GIL-dependent code paths in PyPy (heapcache resets on GIL release, `release_gil` effect info, etc.) simply don't exist.
+- **Python 3.14, not 2.7.** PyPy's main branch targets Python 2.7/3.10. pyre targets CPython 3.14 bytecodes directly, using RustPython's compiler frontend.
 
 ## Relationship to majit
 
