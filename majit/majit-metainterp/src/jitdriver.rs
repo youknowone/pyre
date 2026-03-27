@@ -902,6 +902,11 @@ impl<S: JitState> JitDriver<S> {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             let live_values = {
                 if !state.is_compatible(&compiled_meta) {
+                    // RPython parity: incompatible state means this entry
+                    // was overwritten by a retrace with different merge_pc.
+                    // Invalidate so the next back_edge starts a fresh trace
+                    // at the correct PC instead of failing 14000+ times.
+                    self.meta.invalidate_loop(green_key);
                     return false;
                 }
                 if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
@@ -1586,6 +1591,9 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            // RPython parity: invalidate mismatched entry so next attempt
+            // starts a fresh trace at the correct PC.
+            self.meta.invalidate_loop(green_key);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
