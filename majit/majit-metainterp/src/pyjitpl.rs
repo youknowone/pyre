@@ -67,12 +67,12 @@ pub enum CompileOutcome {
 }
 
 /// Per-guard failure tracking for bridge compilation decisions.
-/// compile.py: ResumeGuardDescr.status field.
+/// compile.py:685-688: ResumeGuardDescr.status field packs ST_BUSY_FLAG
+/// + ST_TYPE_MASK + jitcounter hash into a single integer.
 pub(crate) struct GuardFailureInfo {
-    /// Number of times this guard has failed.
-    pub(crate) fail_count: u32,
-    /// Whether a bridge has been compiled for this guard.
-    pub(crate) bridge_compiled: bool,
+    /// compile.py:746: hash for jitcounter.tick(). Assigned at compile
+    /// time via store_hash() (compile.py:826-830).
+    pub(crate) guard_hash: u64,
     /// compile.py:741-751, 786-795: ST_BUSY_FLAG — true while bridge
     /// compilation is in progress for this guard. Prevents re-entrant
     /// tracing from the same guard during recursive calls.
@@ -2895,17 +2895,16 @@ impl<M: Clone> MetaInterp<M> {
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
+            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, info.fail_count
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
                 );
             }
 
@@ -2913,7 +2912,7 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
 
@@ -2947,17 +2946,16 @@ impl<M: Clone> MetaInterp<M> {
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
+            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, info.fail_count
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
                 );
             }
 
@@ -2965,7 +2963,7 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
 
@@ -2995,17 +2993,16 @@ impl<M: Clone> MetaInterp<M> {
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
+            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, info.fail_count
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
                 );
             }
 
@@ -3013,7 +3010,7 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
 
@@ -3112,33 +3109,26 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        let mut guard_fail_count = None;
         if !effective_is_finish {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
-            guard_fail_count = Some(info.fail_count);
-        }
-        if let Some(fail_count) = guard_fail_count {
+            self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, fail_count
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
                 );
             }
-
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
-
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
 
@@ -3246,33 +3236,26 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        let mut guard_fail_count = None;
         if !effective_is_finish {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
-            guard_fail_count = Some(info.fail_count);
-        }
-        if let Some(fail_count) = guard_fail_count {
+            self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard failure at key={}, guard={}, count={}",
-                    green_key, fail_index, fail_count
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
                 );
             }
-
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
-
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
         let exception = ExceptionState {
@@ -3323,17 +3306,16 @@ impl<M: Clone> MetaInterp<M> {
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
+            self.warm_state.tick_guard_failure(info.guard_hash);
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, info.fail_count);
+                hook(green_key, fail_index, 0);
             }
         }
 
@@ -3475,48 +3457,43 @@ impl<M: Clone> MetaInterp<M> {
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
-                .or_insert(GuardFailureInfo {
-                    fail_count: 0,
-                    bridge_compiled: false,
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                 });
-            info.fail_count += 1;
-            let fail_count = info.fail_count;
-            let bridge_compiled = info.bridge_compiled;
+            // compile.py:783-784: jitcounter.tick(hash, increment)
+            // Returns true when threshold reached AND auto-resets counter.
+            let guard_hash = info.guard_hash;
+            let must_compile = self.warm_state.tick_guard_failure(guard_hash) && !info.compiling;
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
-                hook(green_key, fail_index, fail_count);
+                hook(green_key, fail_index, 0);
             }
 
-            // RPython compile.py:697-706 (must_compile → _trace_and_compile_from_bridge):
-            // When guard fails >= trace_eagerness times, trigger bridge hook.
-            // The hook (set by pyre) compiles a bridge for the alternative path.
-            if fail_count >= self.trace_eagerness && self.trace_eagerness > 0 && !bridge_compiled {
+            // compile.py:701-709: handle_fail → must_compile → start_compiling
+            if must_compile {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] bridge threshold reached: key={} trace={} guard={} count={}",
-                        green_key, trace_id, fail_index, fail_count
+                        "[jit] bridge threshold reached: key={} trace={} guard={}",
+                        green_key, trace_id, fail_index
                     );
                 }
-                // compile.py:786-788: start_compiling — set ST_BUSY_FLAG
-                // before bridge compilation to prevent re-entrant tracing.
+                // compile.py:786-788: start_compiling
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
                         info.compiling = true;
                     }
                 }
-                // compile.py:714: invoke bridge compilation callback.
+                // compile.py:706-708: _trace_and_compile_from_bridge
                 if let Some(ref hook) = self.hooks.on_bridge_threshold {
                     hook(green_key, trace_id, fail_index);
                 }
-                // compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
-                // Also mark bridge_compiled to avoid re-triggering threshold.
+                // compile.py:790-795: done_compiling
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
                         info.compiling = false;
-                        info.bridge_compiled = true;
                     }
                 }
             }
@@ -3775,9 +3752,10 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         let key = (compiled.root_trace_id, fail_index);
-        compiled.guard_failures.get(&key).is_some_and(|info| {
-            !info.bridge_compiled && self.warm_state.should_compile_bridge(info.fail_count)
-        })
+        compiled
+            .guard_failures
+            .get(&key)
+            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash))
     }
 
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
@@ -3794,13 +3772,14 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Get the guard failure count for a specific guard.
+    /// Check if a guard's counter would fire (read-only).
     pub fn get_guard_failure_count(&self, green_key: u64, fail_index: u32) -> u32 {
-        self.compiled_loops
+        let would = self
+            .compiled_loops
             .get(&green_key)
             .and_then(|c| c.guard_failures.get(&(c.root_trace_id, fail_index)))
-            .map(|info| info.fail_count)
-            .unwrap_or(0)
+            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash));
+        if would { self.trace_eagerness } else { 0 }
     }
 
     // ── Call Assembler Support ──────────────────────────────────
@@ -3961,26 +3940,25 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|info| {
                 // compile.py:750-751: ST_BUSY_FLAG — if already compiling
                 // a bridge from this guard (e.g. recursive call), skip.
-                !info.compiling && self.warm_state.should_compile_bridge(info.fail_count)
+                !info.compiling && self.warm_state.counter.would_fire(info.guard_hash)
             })
     }
 
-    /// Get the failure count for a guard in a specific compiled trace.
-    pub fn get_guard_failure_count_in_trace(
+    /// compile.py:783-784: check if guard counter would fire (without ticking).
+    pub fn would_compile_bridge_in_trace(
         &self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-    ) -> u32 {
+    ) -> bool {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return 0;
+            return false;
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         compiled
             .guard_failures
             .get(&(trace_id, fail_index))
-            .map(|info| info.fail_count)
-            .unwrap_or(0)
+            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash))
     }
 
     fn bridge_fail_descr_proxy(
@@ -4235,12 +4213,11 @@ impl<M: Clone> MetaInterp<M> {
                     compiled
                         .guard_failures
                         .entry((source_trace_id, fail_index))
-                        .or_insert(GuardFailureInfo {
-                            fail_count: 0,
-                            bridge_compiled: false,
+                        .or_insert_with(|| GuardFailureInfo {
+                            guard_hash: source_trace_id
+                                ^ (fail_index as u64).wrapping_mul(777767777),
                             compiling: false,
-                        })
-                        .bridge_compiled = true;
+                        });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
                     let mut terminal_exit_layouts =
@@ -4537,10 +4514,7 @@ impl<M: Clone> MetaInterp<M> {
         // Decide what to do next
         let action = if self.should_compile_bridge_in_trace(green_key, trace_id, fail_index) {
             GuardRecoveryAction::CompileBridge
-        } else if self.get_guard_failure_count_in_trace(green_key, trace_id, fail_index)
-            >= self.trace_eagerness
-            && self.trace_eagerness > 0
-        {
+        } else if self.would_compile_bridge_in_trace(green_key, trace_id, fail_index) {
             GuardRecoveryAction::RetraceFromGuard
         } else {
             GuardRecoveryAction::ResumeInterpreter
