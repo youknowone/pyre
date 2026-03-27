@@ -22,6 +22,7 @@ pub mod strobject;
 pub mod superobject;
 pub mod tupleobject;
 pub mod typeobject;
+pub mod unionobject;
 
 pub use boolobject::*;
 pub use cellobject::*;
@@ -47,3 +48,4 @@ pub use strobject::*;
 pub use superobject::*;
 pub use tupleobject::*;
 pub use typeobject::*;
+pub use unionobject::*;

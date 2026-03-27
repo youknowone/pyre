@@ -323,6 +323,12 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
     );
 
+    // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
+    reg.insert(
+        &pyre_object::UNION_TYPE as *const PyType as usize,
+        new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
+    );
+
     let _ = TYPEOBJECT_CACHE.set(reg);
 }
 
@@ -1084,6 +1090,45 @@ fn init_tuple_type(ns: &mut PyNamespace) {
 // ── Type TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
 
+/// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
+fn init_union_type(ns: &mut PyNamespace) {
+    // UnionType.__args__ — returns the tuple of union member types
+    namespace_store(
+        ns,
+        "__args__",
+        builtin_code_new("__args__", |args| {
+            let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            if unsafe { pyre_object::is_union(self_) } {
+                Ok(unsafe { pyre_object::w_union_get_args(self_) })
+            } else {
+                Ok(pyre_object::PY_NULL)
+            }
+        }),
+    );
+    // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
+    namespace_store(
+        ns,
+        "__or__",
+        builtin_code_new("__or__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
+            }
+            Ok(pyre_object::w_union_new(args[0], args[1]))
+        }),
+    );
+    // UnionType.__ror__
+    namespace_store(
+        ns,
+        "__ror__",
+        builtin_code_new("__ror__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
+            }
+            Ok(pyre_object::w_union_new(args[1], args[0]))
+        }),
+    );
+}
+
 fn init_type_type(ns: &mut PyNamespace) {
     // type.__new__(metatype, name, bases, dict) — creates new type
     namespace_store(
@@ -1319,5 +1364,48 @@ fn init_object_type(ns: &mut PyNamespace) {
         ns,
         "__subclasshook__",
         builtin_code_new("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
+    );
+    // PyPy: objectobject.py descr___setattr__
+    // object.__setattr__(self, name, value) → setattr dispatch
+    namespace_store(
+        ns,
+        "__setattr__",
+        builtin_code_new("__setattr__", |args| {
+            if args.len() < 3 {
+                return Err(crate::PyError::type_error(
+                    "__setattr__ requires 3 arguments",
+                ));
+            }
+            let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+            crate::baseobjspace::setattr(args[0], name, args[2])
+        }),
+    );
+    // PyPy: objectobject.py descr___delattr__
+    namespace_store(
+        ns,
+        "__delattr__",
+        builtin_code_new("__delattr__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(
+                    "__delattr__ requires 2 arguments",
+                ));
+            }
+            let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+            crate::baseobjspace::delattr(args[0], name)
+        }),
+    );
+    // PyPy: objectobject.py descr___getattribute__
+    namespace_store(
+        ns,
+        "__getattribute__",
+        builtin_code_new("__getattribute__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(
+                    "__getattribute__ requires 2 arguments",
+                ));
+            }
+            let name = unsafe { pyre_object::w_str_get_value(args[1]) };
+            crate::baseobjspace::getattr(args[0], name)
+        }),
     );
 }

@@ -1049,6 +1049,14 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// Check if an object can participate in `X | Y` union syntax.
+///
+/// PyPy equivalent: _unionable() in _pypy_generic_alias.py
+#[inline]
+fn unionable(obj: PyObjectRef) -> bool {
+    unsafe { is_none(obj) || is_type(obj) || pyre_object::is_union(obj) }
+}
+
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1064,13 +1072,14 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__or__") {
             return result;
         }
-        // type | type — Python 3.10+ union types
-        if is_type(a) {
-            if let Some(w_metatype) = crate::typedef::gettypefor((*a).ob_type) {
-                if let Some(method) = lookup_in_type_where(w_metatype, "__or__") {
-                    return Ok(crate::call_function(method, &[a, b]));
-                }
-            }
+        // type | type — PEP 604 union types (Python 3.10+)
+        // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union
+        if unionable(a) && unionable(b) {
+            return Ok(pyre_object::w_union_new(a, b));
+        }
+        // set | set bitwise OR
+        if let Some(result) = try_instance_binop(a, b, "__ror__") {
+            return result;
         }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for |: '{}' and '{}'",
@@ -1835,9 +1844,12 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
 
             // Step 4: non-data descriptor
+            // PyPy: descroperation.py — invoke __get__ to bind methods
             if let Some(descr) = w_descr {
+                // Builtin methods found via type MRO must be bound to the
+                // instance (PyPy: function.py Function.__get__ returns bound method)
                 if crate::is_builtin_code(descr) {
-                    return Ok(descr);
+                    return Ok(pyre_object::w_method_new(descr, obj, w_type));
                 }
                 if let Some(result) = get(descr, obj, w_type) {
                     return Ok(result);
@@ -2655,6 +2667,9 @@ pub fn wrappable_class_name(class: PyObjectRef) -> String {
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
+    if obj.is_null() {
+        return Err(PyError::type_error("'NoneType' object is not iterable"));
+    }
     unsafe {
         // Builtin iterables
         if is_list(obj) {
