@@ -4104,12 +4104,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the Cranelift backend's bridge chaining path). The ST_BUSY_FLAG
     /// (compiling field) and counting infrastructure are in place for
     /// when the backend issue is resolved.
-    pub fn must_compile(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> bool {
+    pub fn must_compile(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return false;
         };

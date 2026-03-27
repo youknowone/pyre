@@ -702,9 +702,10 @@ fn bound_reached(
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
-    // RPython decays ALL counters (×0.96). Pyre resets per-key because
-    // full decay changes other keys' compilation timing, causing wrong
-    // output (nbody). Root: integer counters + lossy hash collisions.
+    // RPython calls decay_all_counters (all keys ×0.96). Pyre uses
+    // per-key reset because counter gating + decay changes OTHER
+    // keys' compilation timing → wrong output. When cell-first is
+    // enabled (guard failure recovery complete), switch to full decay.
     driver
         .meta_interp_mut()
         .warm_state_mut()
