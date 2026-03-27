@@ -27,10 +27,9 @@ use majit_ir::{Op, OpCode, OpRef};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub use crate::optimizeopt::dependency::schedule_operations;
-pub use crate::optimizeopt::dependency::{DepNode, DependencyGraph};
+pub use crate::optimizeopt::dependency::{DependencyGraph, Node};
 pub use crate::optimizeopt::schedule::{
-    AccumulationPack, CostModel, GenericCostModel, GuardAnalysis, PackGroup, PackSet,
-    are_adjacent_memory_refs,
+    AccumPack, CostModel, GenericCostModel, GuardAnalysis, Pack, PackSet, are_adjacent_memory_refs,
 };
 
 /// vector.py: VectorLoop — wraps a loop body for vectorization analysis.
@@ -254,7 +253,7 @@ impl VectorizingOptimizer {
         loop {
             let before = pack_set.num_packs();
             // follow_def_uses: for each pack, check if dependents can form new packs
-            let current_packs: Vec<PackGroup> = pack_set.packs.clone();
+            let current_packs: Vec<Pack> = pack_set.packs.clone();
             for pack in &current_packs {
                 if pack.members.len() >= 2 {
                     let left = pack.members[0];
@@ -267,7 +266,7 @@ impl VectorizingOptimizer {
                                 && !graph.has_dependency(l_user, r_user)
                             {
                                 if let Some(vec_op) = graph.nodes[l_user].op.opcode.to_vector() {
-                                    pack_set.add_pack(PackGroup {
+                                    pack_set.add_pack(Pack {
                                         scalar_opcode: graph.nodes[l_user].op.opcode,
                                         vector_opcode: vec_op,
                                         members: vec![l_user, r_user],
@@ -360,7 +359,7 @@ impl VectorizingOptimizer {
         }
 
         // Filter by cost model
-        let profitable: Vec<&PackGroup> = groups
+        let profitable: Vec<&Pack> = groups
             .iter()
             .filter(|g| self.cost_model.is_profitable(g))
             .collect();
@@ -601,7 +600,7 @@ mod tests {
     #[test]
     fn test_cost_model_profitable() {
         let cm = CostModel::new();
-        let group = PackGroup {
+        let group = Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3], // 4 ops
@@ -611,7 +610,7 @@ mod tests {
         // Let's adjust: with default params, need enough ops
         assert!(!cm.is_profitable(&group)); // 3 < 4
 
-        let group5 = PackGroup {
+        let group5 = Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3, 4], // 5 ops → savings = 4 > cost = 4
@@ -622,7 +621,7 @@ mod tests {
     #[test]
     fn test_cost_model_too_small() {
         let cm = CostModel::new();
-        let group = PackGroup {
+        let group = Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0], // Only 1 op
@@ -637,14 +636,14 @@ mod tests {
             pack_cost: 1,
             scalar_save: 2,
         };
-        let group = PackGroup {
+        let group = Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1], // savings = 1*2 = 2, cost = 2*1 = 2 → not profitable
         };
         assert!(!cm.is_profitable(&group));
 
-        let group3 = PackGroup {
+        let group3 = Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2], // savings = 2*2 = 4, cost = 2*1 = 2 → profitable
@@ -842,12 +841,12 @@ mod tests {
     #[test]
     fn test_pack_set_merge() {
         let mut ps = PackSet::new();
-        ps.add_pack(PackGroup {
+        ps.add_pack(Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1],
         });
-        ps.add_pack(PackGroup {
+        ps.add_pack(Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![2, 3],
