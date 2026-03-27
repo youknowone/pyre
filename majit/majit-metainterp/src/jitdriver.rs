@@ -1774,14 +1774,8 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        // compile.py:701 handle_fail: track guard failure + tick counter.
-        // RPython's must_compile increments the per-guard counter on every
-        // failure and returns true when the threshold fires.
-        // compile.py:738 handle_fail: track + tick, returns owning key.
-        let owning_key = self
-            .meta
-            .track_guard_failure(green_key, trace_id, fail_index);
-        let should_bridge = self.meta.must_compile(owning_key, trace_id, fail_index);
+        // compile.py:701-717 handle_fail / must_compile: single tick+check.
+        let (should_bridge, owning_key) = self.meta.must_compile(green_key, trace_id, fail_index);
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();
         if restored {
@@ -2305,7 +2299,8 @@ impl<S: JitState> JitDriver<S> {
             materialize_pending_fields(&exit_layout, &raw_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
 
-            let should_bridge = self.meta.must_compile(key_hash, trace_id, fail_index);
+            let (should_bridge, _owning_key) =
+                self.meta.must_compile(key_hash, trace_id, fail_index);
             if should_bridge {
                 let bridge_ok = self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
