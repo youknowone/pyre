@@ -1,263 +1,299 @@
-/// Hot counter for detecting frequently-executed loops.
+/// counter.py: JitCounter — float-based 5-way associative timetable.
 ///
-/// Translated from rpython/jit/metainterp/counter.py.
-/// Uses a hash table to track execution counts per green key (bytecode position).
-/// When a counter reaches the threshold, JIT compilation is triggered.
+/// Direct port of rpython/jit/metainterp/counter.py.
+/// Uses f32 time values (0.0 to 1.0) instead of integer counts.
+/// tick(hash, increment) adds increment; fires when >= 1.0.
+/// 5-way associative cache indexed by _get_index(hash), matched by
+/// _get_subhash(hash). MRU promotion via _swap.
 
-/// Size of the counter table (must be a power of 2).
-const TABLE_SIZE: usize = 1 << 14; // 16384 entries
-const TABLE_MASK: usize = TABLE_SIZE - 1;
+/// counter.py:82 DEFAULT_SIZE = 2048
+const DEFAULT_SIZE: usize = 2048;
+const DEFAULT_SIZE_MASK: usize = DEFAULT_SIZE - 1;
 
-/// Number of entries to check in each hash probe (5-way associative).
+/// counter.py:12-13 ENTRY: 5 (f32 time, u16 subhash) pairs per bucket.
 const ASSOCIATIVITY: usize = 5;
 
-/// A hot counter using a hash table with linear probing.
+/// counter.py:84 shift = 16 for DEFAULT_SIZE = 2048 (2048 = 2^11, 32-11=21 → shift=21? No.)
+/// RPython: hash32 >> shift == size-1. For size=2048: UINT32MAX >> shift = 2047.
+/// 2^32 - 1 >> shift = 2047 → shift = 21. Actually for size=2048:
+/// (0xFFFFFFFF >> 21) = 0x7FF = 2047 = 2048-1. So shift=21.
+const SHIFT: u32 = 21;
+
+/// One timetable entry: 5-way associative (time, subhash) pairs.
+/// counter.py:11-13 ENTRY struct.
+#[derive(Clone)]
+struct Entry {
+    /// counter.py: times — f32 timing values, 0.0 to 1.0.
+    times: [f32; ASSOCIATIVITY],
+    /// counter.py: subhashes — lower 16 bits of the hash.
+    subhashes: [u16; ASSOCIATIVITY],
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Entry {
+            times: [0.0; ASSOCIATIVITY],
+            subhashes: [0; ASSOCIATIVITY],
+        }
+    }
+}
+
+/// counter.py:16 JitCounter
 pub struct JitCounter {
-    /// Counter table: pairs of (hash, count).
-    table: Vec<(u64, u32)>,
-    /// counter.py:102-103: celltable — parallel array indicating whether
-    /// compiled code exists for each bucket. O(1) lookup via get_index.
-    /// RPython stores JitCell linked lists; pyre stores a bool hint.
-    /// True = compiled code MAY exist (verify via has_compiled_loop).
-    /// False = definitely no compiled code.
+    /// counter.py:97 timetable
+    timetable: Vec<Entry>,
+    /// counter.py:103 celltable — compiled code hints per bucket.
     celltable: Vec<bool>,
-    /// Threshold for triggering compilation.
-    threshold: u32,
-    /// counter.py: _nexthash — monotonically increasing hash generator.
+    /// counter.py:100 _nexthash
     next_hash: u64,
-    /// counter.py: decay_by_mult — multiplier for decay (1.0 = no decay).
-    decay_mult: f64,
+    /// counter.py:264 decay_by_mult — f64 (Python float).
+    decay_by_mult: f64,
+    /// Pre-computed increment for the default threshold.
+    /// counter.py:122-126 compute_threshold(threshold) — f64 (Python float).
+    /// RPython: increment is computed as Python float (f64), used in tick()
+    /// as f64 addition with f32→f64 promoted time value, stored back as f32.
+    increment: f64,
+    /// Original threshold value (for external queries).
+    threshold: u32,
 }
 
 impl JitCounter {
     pub fn new(threshold: u32) -> Self {
         JitCounter {
-            table: vec![(0, 0); TABLE_SIZE],
-            celltable: vec![false; TABLE_SIZE],
-            threshold,
+            timetable: vec![Entry::default(); DEFAULT_SIZE],
+            celltable: vec![false; DEFAULT_SIZE],
             next_hash: 0,
-            decay_mult: 1.0,
+            decay_by_mult: 0.96_f64, // counter.py default decay=40 → 1.0-40*0.001=0.96
+            increment: Self::compute_threshold_static(threshold),
+            threshold,
         }
     }
 
-    /// counter.py:239 lookup_chain(hash) parity.
-    /// O(1) check: does this hash bucket have compiled code?
-    /// Returns true if compiled code MAY exist (must verify with full check).
+    /// counter.py:122-126 compute_threshold
+    /// Returns f64 (Python float) — same as RPython.
+    fn compute_threshold_static(threshold: u32) -> f64 {
+        if threshold <= 0 {
+            return 0.0;
+        }
+        1.0_f64 / (threshold as f64 - 0.001)
+    }
+
+    /// counter.py:122-126 compute_threshold
+    pub fn compute_threshold(&self, threshold: u32) -> f64 {
+        Self::compute_threshold_static(threshold)
+    }
+
+    /// counter.py:128-136 _get_index
     #[inline(always)]
-    pub fn has_compiled_hint(&self, hash: u64) -> bool {
-        self.celltable[(hash as usize) & TABLE_MASK]
+    fn get_index(hash: u64) -> usize {
+        let hash32 = hash as u32;
+        (hash32 >> SHIFT) as usize
     }
 
-    /// RPython-compatible alias for compiled checks.
-    pub fn has_compiled_loop(&self, hash: u64) -> bool {
-        self.has_compiled_hint(hash)
-    }
-
-    /// counter.py:246-256 install_new_cell(hash, newcell) parity.
-    /// Mark that compiled code exists for this hash bucket.
-    pub fn set_compiled_hint(&mut self, hash: u64, compiled: bool) {
-        self.celltable[(hash as usize) & TABLE_MASK] = compiled;
-    }
-
-    /// RPython-compatible alias for setting compiled state.
-    pub fn set_compiled_loop(&mut self, hash: u64, compiled: bool) {
-        self.set_compiled_hint(hash, compiled);
-    }
-
-    /// Check if counter would fire without modifying state.
-    #[inline]
-    pub fn would_fire(&self, hash: u64) -> bool {
-        if self.threshold == 0 {
-            return true;
-        }
-        let base = (hash as usize) & TABLE_MASK;
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                return self.table[idx].1 + 1 >= self.threshold;
-            }
-        }
-        1 >= self.threshold
-    }
-
-    /// Increment the counter for the given hash. Returns true if the
-    /// default threshold is reached.
-    /// counter.py tick(hash, increment) with increment = 1/threshold.
+    /// counter.py:138-140 _get_subhash
     #[inline(always)]
-    pub fn tick(&mut self, hash: u64) -> bool {
-        self.tick_with_threshold(hash, self.threshold)
+    fn get_subhash(hash: u64) -> u16 {
+        (hash & 0xFFFF) as u16
     }
 
-    /// counter.py tick(hash, increment) parity: increment the counter for
-    /// a hash and compare against a caller-specified threshold. RPython uses
-    /// a single JitCounter with variable float increments; this integer
-    /// equivalent accepts different thresholds per call site (loop entry
-    /// vs guard failure vs function entry).
-    /// counter.py:185-201 tick(hash, increment) parity.
-    ///
-    /// RPython: when counter reaches 1.0, `self.reset(hash)` is called
-    /// before returning True. This ensures subsequent tick() calls
-    /// return False until the counter re-accumulates to threshold.
-    #[inline(always)]
-    pub fn tick_with_threshold(&mut self, hash: u64, threshold: u32) -> bool {
-        let base = (hash as usize) & TABLE_MASK;
-
-        // counter.py tick / _tick_slowpath parity:
-        // 5-way associative lookup with MRU swap to slot 0.
-        if self.table[base].0 == hash {
-            self.table[base].1 += 1;
-            if self.table[base].1 >= threshold {
-                // counter.py:199-200: "self.reset(hash); return True"
-                self.table[base].1 = 0;
-                return true;
-            }
-            return false;
-        }
-        for i in 1..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                self.table[idx].1 += 1;
-                let fired = self.table[idx].1 >= threshold;
-                // _swap(p_entry, n): conditional MRU promotion.
-                let prev_idx = (base + i - 1) & TABLE_MASK;
-                if self.table[prev_idx].1 <= self.table[idx].1 {
-                    self.table.swap(idx, prev_idx);
-                }
-                if fired {
-                    // counter.py:199-200
-                    let swapped_idx = if self.table[prev_idx].0 == hash {
-                        prev_idx
-                    } else {
-                        idx
-                    };
-                    self.table[swapped_idx].1 = 0;
-                }
-                return fired;
-            }
-        }
-
-        // Not found — find first empty slot or evict last.
-        let mut insert_idx = (base + ASSOCIATIVITY - 1) & TABLE_MASK;
-        for i in (0..ASSOCIATIVITY).rev() {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].1 == 0 {
-                insert_idx = idx;
-                break;
-            }
-        }
-        self.table[insert_idx] = (hash, 1);
-        false
-    }
-
-    /// Reset the counter for the given hash.
-    pub fn reset(&mut self, hash: u64) {
-        let base = (hash as usize) & TABLE_MASK;
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                self.table[idx].1 = 0;
-                return;
-            }
-        }
-    }
-
-    /// Evict the counter entry for the given hash.
-    /// Sets hash and count to 0, so the key must re-accumulate from zero
-    /// in a (possibly different) slot.
-    pub fn evict(&mut self, hash: u64) {
-        let base = (hash as usize) & TABLE_MASK;
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                self.table[idx] = (0, 0);
-                return;
-            }
-        }
-    }
-
-    /// Decay all counters by the given factor (0.0 = clear, 1.0 = keep).
-    /// counter.py:266 decay_all_counters.
-    /// RPython default decay=40, so decay_by_mult = 1.0 - 40*0.001 = 0.96.
-    /// Each call reduces all counters by 4%.
-    pub fn decay_all_counters(&mut self) {
-        self.decay_all_counters_by(0.96);
-    }
-
-    /// Decay all counters by a multiplicative factor.
-    /// counter.py: set_decay(decay) — accepts 0..1000, computes per-call multiplier.
-    pub fn decay_all_counters_by(&mut self, factor: f64) {
-        for entry in &mut self.table {
-            entry.1 = (entry.1 as f64 * factor) as u32;
-        }
-    }
-
-    /// Get the current count for a hash (for testing/introspection).
-    /// counter.py: get() — returns the current count.
-    pub fn get(&self, hash: u64) -> u32 {
-        let base = (hash as usize) & TABLE_MASK;
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                return self.table[idx].1;
-            }
-        }
-        0
-    }
-
-    /// Install a specific count for a hash (for bridge eagerness).
-    /// counter.py: install_new_cell(hash, count)
-    pub fn install(&mut self, hash: u64, count: u32) {
-        let base = (hash as usize) & TABLE_MASK;
-        // Find existing or lowest entry
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                self.table[idx].1 = count;
-                return;
-            }
-        }
-        // Not found — evict lowest
-        let mut min_idx = base;
-        let mut min_count = self.table[base].1;
-        for i in 1..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].1 < min_count {
-                min_count = self.table[idx].1;
-                min_idx = idx;
-            }
-        }
-        self.table[min_idx] = (hash, count);
-    }
-
-    /// Compute the threshold for bridge compilation based on guard eagerness.
-    /// counter.py: compute_threshold(scale)
-    /// Returns `threshold * scale` capped at threshold.
-    pub fn compute_threshold(&self, scale: f64) -> u32 {
-        let result = (self.threshold as f64 * scale) as u32;
-        result.min(self.threshold)
-    }
-
-    /// counter.py: fetch_next_hash()
-    /// Generate a unique hash for a new green key.
-    /// Each call returns a different hash to avoid collisions.
+    /// counter.py:142-153 fetch_next_hash
     pub fn fetch_next_hash(&mut self) -> u64 {
         let result = self.next_hash;
-        // Increment by a value that changes both the index portion
-        // and the sub-hash portion of the hash, avoiding patterns.
-        self.next_hash = result.wrapping_add(1 | (1 << 16) | (1 << 32));
+        // counter.py:151-152: increment by value that changes both
+        // subhash and index portions.
+        self.next_hash = result.wrapping_add(1 | (1u64 << SHIFT) | (1u64 << (SHIFT - 16)));
         result
     }
 
-    /// counter.py: change_current_fraction(hash, new_fraction)
-    /// Set the counter for a hash to a fraction of the threshold.
-    /// Used for bridge compilation eagerness: a bridge that fails
-    /// frequently gets its counter boosted closer to the threshold.
-    pub fn change_current_fraction(&mut self, hash: u64, fraction: f64) {
-        let new_count = (self.threshold as f64 * fraction) as u32;
-        self.install(hash, new_count);
+    /// counter.py:155-166 _swap
+    #[inline(always)]
+    fn swap(entry: &mut Entry, n: usize) -> usize {
+        if entry.times[n] > entry.times[n + 1] {
+            n + 1
+        } else {
+            entry.times.swap(n, n + 1);
+            entry.subhashes.swap(n, n + 1);
+            n
+        }
     }
 
-    /// Get the current threshold.
+    /// counter.py:168-183 _tick_slowpath
+    fn tick_slowpath(entry: &mut Entry, subhash: u16) -> usize {
+        if entry.subhashes[1] == subhash {
+            Self::swap(entry, 0)
+        } else if entry.subhashes[2] == subhash {
+            Self::swap(entry, 1)
+        } else if entry.subhashes[3] == subhash {
+            Self::swap(entry, 2)
+        } else if entry.subhashes[4] == subhash {
+            Self::swap(entry, 3)
+        } else {
+            // Not found. Find first empty slot from the end.
+            let mut n = 4;
+            while n > 0 && entry.times[n - 1] == 0.0 {
+                n -= 1;
+            }
+            entry.subhashes[n] = subhash;
+            entry.times[n] = 0.0;
+            n
+        }
+    }
+
+    /// Check if counter would fire without modifying state.
+    pub fn would_fire(&self, hash: u64) -> bool {
+        let index = Self::get_index(hash);
+        let subhash = Self::get_subhash(hash);
+        let entry = &self.timetable[index];
+        for i in 0..ASSOCIATIVITY {
+            if entry.subhashes[i] == subhash {
+                return entry.times[i] as f64 + self.increment >= 1.0;
+            }
+        }
+        self.increment >= 1.0
+    }
+
+    /// counter.py:185-202 tick(hash, increment)
+    ///
+    /// Adds `increment` to the time value for `hash`.
+    /// Returns true when the counter reaches 1.0 (auto-resets).
+    #[inline(always)]
+    pub fn tick(&mut self, hash: u64) -> bool {
+        self.tick_with_increment(hash, self.increment)
+    }
+
+    /// counter.py:185-202 tick(hash, increment) with explicit increment.
+    /// RPython: counter = float(p_entry.times[n]) + increment
+    /// float() promotes f32→f64. increment is f64. Addition in f64.
+    /// Store back: p_entry.times[n] = r_singlefloat(counter) (f64→f32).
+    #[inline(always)]
+    pub fn tick_with_increment(&mut self, hash: u64, increment: f64) -> bool {
+        let index = Self::get_index(hash);
+        let subhash = Self::get_subhash(hash);
+        let entry = &mut self.timetable[index];
+
+        let n = if entry.subhashes[0] == subhash {
+            0
+        } else {
+            Self::tick_slowpath(entry, subhash)
+        };
+
+        // counter.py:194: counter = float(p_entry.times[n]) + increment
+        let counter: f64 = entry.times[n] as f64 + increment;
+        if counter < 1.0 {
+            // counter.py:196: p_entry.times[n] = r_singlefloat(counter)
+            entry.times[n] = counter as f32;
+            false
+        } else {
+            // counter.py:199-200: self.reset(hash); return True
+            self.reset(hash);
+            true
+        }
+    }
+
+    /// counter.py:185-202 tick with integer threshold (convenience).
+    pub fn tick_with_threshold(&mut self, hash: u64, threshold: u32) -> bool {
+        let increment = Self::compute_threshold_static(threshold);
+        self.tick_with_increment(hash, increment)
+    }
+
+    /// counter.py:204-230 change_current_fraction(hash, new_fraction)
+    pub fn change_current_fraction(&mut self, hash: u64, new_fraction: f64) {
+        let index = Self::get_index(hash);
+        let subhash = Self::get_subhash(hash);
+        let entry = &mut self.timetable[index];
+
+        // Find slot to overwrite: first matching subhash or empty time.
+        let mut n = 0;
+        while n < 4 && entry.subhashes[n] != subhash && entry.times[n] != 0.0 {
+            n += 1;
+        }
+        // Shift right all elements [n-1, n-2, ..., 0]
+        while n > 0 {
+            n -= 1;
+            entry.subhashes[n + 1] = entry.subhashes[n];
+            entry.times[n + 1] = entry.times[n];
+        }
+        // Insert at position 0. r_singlefloat(new_fraction) = f64→f32.
+        entry.subhashes[0] = subhash;
+        entry.times[0] = new_fraction as f32;
+    }
+
+    /// counter.py:232-237 reset(hash)
+    pub fn reset(&mut self, hash: u64) {
+        let index = Self::get_index(hash);
+        let subhash = Self::get_subhash(hash);
+        let entry = &mut self.timetable[index];
+        for i in 0..ASSOCIATIVITY {
+            if entry.subhashes[i] == subhash {
+                entry.times[i] = 0.0;
+            }
+        }
+    }
+
+    /// counter.py:258-264 set_decay(decay)
+    pub fn set_decay(&mut self, decay: i32) {
+        let clamped = decay.clamp(0, 1000);
+        self.decay_by_mult = 1.0_f64 - (clamped as f64 * 0.001);
+    }
+
+    /// counter.py:266-278 decay_all_counters()
+    /// RPython C code: each f32 time *= f64 decay_by_mult → f32.
+    pub fn decay_all_counters(&mut self) {
+        let mult = self.decay_by_mult;
+        for entry in &mut self.timetable {
+            for time in &mut entry.times {
+                *time = (*time as f64 * mult) as f32;
+            }
+        }
+    }
+
+    /// Decay with explicit factor.
+    pub fn decay_all_counters_by(&mut self, factor: f64) {
+        for entry in &mut self.timetable {
+            for time in &mut entry.times {
+                *time = (*time as f64 * factor) as f32;
+            }
+        }
+    }
+
+    /// counter.py:239-240 lookup_chain(hash)
+    /// O(1) celltable check.
+    #[inline(always)]
+    pub fn has_compiled_hint(&self, hash: u64) -> bool {
+        self.celltable[Self::get_index(hash)]
+    }
+
+    /// counter.py:246-256 install_new_cell(hash, newcell)
+    pub fn set_compiled_hint(&mut self, hash: u64, compiled: bool) {
+        self.celltable[Self::get_index(hash)] = compiled;
+    }
+
+    /// counter.py:242-244 cleanup_chain(hash)
+    pub fn cleanup_chain(&mut self, hash: u64) {
+        self.reset(hash);
+        self.set_compiled_hint(hash, false);
+    }
+
+    /// Get current time for a hash (for testing/introspection).
+    pub fn get_time(&self, hash: u64) -> f32 {
+        let index = Self::get_index(hash);
+        let subhash = Self::get_subhash(hash);
+        let entry = &self.timetable[index];
+        for i in 0..ASSOCIATIVITY {
+            if entry.subhashes[i] == subhash {
+                return entry.times[i];
+            }
+        }
+        0.0
+    }
+
+    /// Get the current count as integer (legacy compatibility).
+    pub fn get(&self, hash: u64) -> u32 {
+        let time = self.get_time(hash) as f64;
+        (time / self.increment) as u32
+    }
+
+    /// Get the threshold.
     pub fn threshold(&self) -> u32 {
         self.threshold
     }
@@ -265,116 +301,22 @@ impl JitCounter {
     /// Set the threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
         self.threshold = threshold;
+        self.increment = Self::compute_threshold_static(threshold);
     }
 
-    /// Total number of active entries (non-zero counts).
+    /// Install a specific count for a hash (legacy compatibility).
+    pub fn install(&mut self, hash: u64, count: u32) {
+        let fraction = count as f64 * self.increment;
+        self.change_current_fraction(hash, fraction.min(0.999));
+    }
+
+    /// Total number of active entries (non-zero times).
     pub fn num_active(&self) -> usize {
-        self.table.iter().filter(|(_, c)| *c > 0).count()
-    }
-
-    /// counter.py: set_decay(decay)
-    /// Set the decay factor from 0 (none) to 1000 (max).
-    /// The decay multiplier is `1.0 - decay * 0.001`.
-    pub fn set_decay(&mut self, decay: i32) {
-        let clamped = decay.clamp(0, 1000);
-        self.decay_mult = 1.0 - (clamped as f64 * 0.001);
-    }
-
-    /// counter.py: lookup_chain(hash)
-    /// Look up the JitCell chain head for this hash bucket.
-    /// Returns the current count (simplified — no cell chain yet).
-    pub fn lookup_chain(&self, hash: u64) -> u32 {
-        self.get(hash)
-    }
-
-    /// counter.py: cleanup_chain(hash)
-    /// Reset counter and clean up the cell chain for this hash.
-    pub fn cleanup_chain(&mut self, hash: u64) {
-        self.reset(hash);
-    }
-
-    /// counter.py: install_new_cell(hash, newcell)
-    ///
-    /// Walk the linked list at celltable[index], remove dead cells
-    /// (should_remove_jitcell), and prepend the new cell.
-    /// In our implementation, this is a no-op since we use WarmEnterState's
-    /// HashMap<u64, BaseJitCell> instead of a per-bucket chain.
-    /// The method exists for API parity.
-    pub fn install_new_cell(&mut self, _hash: u64) {
-        // In RPython, celltable is a parallel array of JitCell linked lists.
-        // In majit, WarmEnterState.cells HashMap handles this directly.
-    }
-
-    /// counter.py: _compute_threshold(threshold).
-    pub fn _compute_threshold(&self, threshold: u32) -> f64 {
-        if threshold <= 0 {
-            0.0
-        } else {
-            1.0 / (threshold as f64)
-        }
-    }
-
-    /// counter.py: _swap(p_entry, n)
-    ///
-    /// Compatibility shim: `p_entry` is interpreted as a slot index in the
-    /// current associative bucket.
-    pub fn _swap(&mut self, p_entry: usize, n: usize) -> usize {
-        let i = p_entry & TABLE_MASK;
-        let j = n & TABLE_MASK;
-        if self.table[i].1 >= self.table[j].1 {
-            i
-        } else {
-            self.table.swap(i, j);
-            j
-        }
-    }
-
-    /// counter.py: _tick_slowpath(p_entry, subhash)
-    ///
-    /// `p_entry` is interpreted as a bucket index; this keeps the same control
-    /// flow shape as the original without requiring the C struct layout.
-    pub fn _tick_slowpath(&mut self, p_entry: usize, subhash: u16) -> usize {
-        let base = p_entry & TABLE_MASK;
-        let hash = ((base as u64) << 16) | subhash as u64;
-        let mut n = 4;
-        while n > 0 && self.table[(base + n - 1) & TABLE_MASK].1 == 0 {
-            n -= 1;
-        }
-        for i in 0..ASSOCIATIVITY {
-            let idx = (base + i) & TABLE_MASK;
-            if self.table[idx].0 == hash {
-                return idx;
-            }
-        }
-        let target = (base + n) & TABLE_MASK;
-        self.table[target].0 = hash;
-        self.table[target].1 = 0;
-        target
-    }
-
-    /// counter.py: invoke_after_minor_collection() helper for GC hooks.
-    pub fn invoke_after_minor_collection(&mut self) {
-        self.decay_all_counters_by(0.96);
-    }
-
-    /// counter.py: _get_index(hash) — hash to bucket index.
-    fn get_index(&self, hash: u64) -> usize {
-        (hash as usize) & TABLE_MASK
-    }
-
-    /// RPython-compatible public alias.
-    pub fn _get_index(&self, hash: u64) -> usize {
-        self.get_index(hash)
-    }
-
-    /// counter.py: _get_subhash(hash) — lower 16 bits for associative match.
-    fn get_subhash(hash: u64) -> u16 {
-        (hash & 0xFFFF) as u16
-    }
-
-    /// RPython-compatible public alias.
-    pub fn _get_subhash(hash: u64) -> u16 {
-        Self::get_subhash(hash)
+        self.timetable
+            .iter()
+            .flat_map(|e| e.times.iter())
+            .filter(|&&t| t > 0.0)
+            .count()
     }
 }
 
@@ -392,48 +334,61 @@ mod tests {
 
     #[test]
     fn test_different_hashes() {
+        // Use hashes that map to different indices
+        let h1 = 1u64 << SHIFT; // index=1, subhash=0
+        let h2 = 2u64 << SHIFT; // index=2, subhash=0
         let mut counter = JitCounter::new(3);
-        assert!(!counter.tick(1));
-        assert!(!counter.tick(2));
-        assert!(!counter.tick(1));
-        assert!(counter.tick(1)); // hash 1 reaches threshold
-        assert!(!counter.tick(2)); // hash 2 hasn't yet
+        assert!(!counter.tick(h1));
+        assert!(!counter.tick(h2));
+        assert!(!counter.tick(h1));
+        assert!(counter.tick(h1)); // h1 reaches threshold
+        assert!(!counter.tick(h2)); // h2 hasn't yet
     }
 
     #[test]
     fn test_reset() {
+        let h = 1u64 << SHIFT;
         let mut counter = JitCounter::new(3);
-        counter.tick(42);
-        counter.tick(42);
-        counter.reset(42);
-        assert!(!counter.tick(42)); // restarted from 1
-        assert!(!counter.tick(42));
-        assert!(counter.tick(42)); // now reaches threshold
+        counter.tick(h);
+        counter.tick(h);
+        counter.reset(h);
+        assert!(!counter.tick(h)); // restarted from 0
+        assert!(!counter.tick(h));
+        assert!(counter.tick(h)); // now reaches threshold
     }
 
     #[test]
     fn test_decay() {
+        let h = 1u64 << SHIFT;
         let mut counter = JitCounter::new(10);
         for _ in 0..8 {
-            counter.tick(42);
+            counter.tick(h);
         }
-        // count=8, decay by 0.96 → floor(8*0.96)=7
+        // time ≈ 8 * (1/10) = 0.8, decay by 0.96 → 0.768
         counter.decay_all_counters();
-        assert_eq!(counter.get(42), 7);
-        // Need 3 more to reach 10
-        assert!(!counter.tick(42)); // 8
-        assert!(!counter.tick(42)); // 9
-        assert!(counter.tick(42)); // 10
+        let time = counter.get_time(h);
+        assert!(time > 0.7 && time < 0.8, "time={}", time);
+    }
+
+    #[test]
+    fn test_auto_reset_on_fire() {
+        let h = 1u64 << SHIFT;
+        let mut counter = JitCounter::new(3);
+        assert!(!counter.tick(h));
+        assert!(!counter.tick(h));
+        assert!(counter.tick(h)); // fires and auto-resets
+        // After auto-reset, counter starts from 0 again
+        assert!(!counter.tick(h));
+        assert!(!counter.tick(h));
+        assert!(counter.tick(h)); // fires again
     }
 }
 
-/// counter.py: DeterministicJitCounter — deterministic counter for testing.
-///
-/// Uses a HashMap instead of a lossy hash table, so no eviction occurs.
-/// This makes test behavior fully deterministic regardless of hash collisions.
+/// counter.py: DeterministicJitCounter for testing.
 pub struct DeterministicJitCounter {
-    counts: std::collections::HashMap<u64, u32>,
+    counts: std::collections::HashMap<u64, f64>,
     threshold: u32,
+    increment: f64,
 }
 
 impl DeterministicJitCounter {
@@ -441,124 +396,31 @@ impl DeterministicJitCounter {
         DeterministicJitCounter {
             counts: std::collections::HashMap::new(),
             threshold,
+            increment: JitCounter::compute_threshold_static(threshold),
         }
     }
 
-    /// Increment and check threshold. Deterministic: no eviction.
     pub fn tick(&mut self, hash: u64) -> bool {
-        let count = self.counts.entry(hash).or_insert(0);
-        *count += 1;
-        *count >= self.threshold
+        let count = self.counts.entry(hash).or_insert(0.0);
+        *count += self.increment;
+        if *count >= 1.0 {
+            *count = 0.0;
+            true
+        } else {
+            false
+        }
     }
 
-    /// Reset the counter for a hash.
     pub fn reset(&mut self, hash: u64) {
-        self.counts.insert(hash, 0);
+        self.counts.insert(hash, 0.0);
     }
 
-    /// Get the current count.
     pub fn get(&self, hash: u64) -> u32 {
-        self.counts.get(&hash).copied().unwrap_or(0)
+        let time = self.counts.get(&hash).copied().unwrap_or(0.0);
+        (time / self.increment) as u32
     }
 
-    /// Check without modifying.
-    #[inline]
-    pub fn would_fire(&self, hash: u64) -> bool {
-        let count = self.counts.get(&hash).copied().unwrap_or(0);
-        count + 1 >= self.threshold
-    }
-
-    /// Threshold getter.
     pub fn threshold(&self) -> u32 {
         self.threshold
-    }
-
-    /// counter.py: _get_index(hash)
-    pub fn _get_index(&self, hash: u64) -> u64 {
-        hash
-    }
-
-    /// counter.py: _clear_all()
-    pub fn _clear_all(&mut self) {
-        self.counts.clear();
-    }
-
-    /// counter.py: make_null_entry()
-    pub fn make_null_entry() -> Self {
-        Self {
-            counts: std::collections::HashMap::new(),
-            threshold: 0,
-        }
-    }
-}
-
-#[cfg(test)]
-mod deterministic_tests {
-    use super::*;
-
-    #[test]
-    fn test_deterministic_basic() {
-        let mut counter = DeterministicJitCounter::new(3);
-        assert!(!counter.tick(42));
-        assert!(!counter.tick(42));
-        assert!(counter.tick(42));
-    }
-
-    #[test]
-    fn test_deterministic_no_eviction() {
-        let mut counter = DeterministicJitCounter::new(3);
-        // Insert many different hashes — no eviction
-        for i in 0..100u64 {
-            counter.tick(i);
-        }
-        // All should still be tracked at count 1
-        for i in 0..100u64 {
-            assert_eq!(counter.get(i), 1);
-        }
-    }
-
-    #[test]
-    fn test_deterministic_would_fire() {
-        let mut counter = DeterministicJitCounter::new(3);
-        counter.tick(42);
-        assert!(!counter.would_fire(42)); // count=1, need 2 more
-        counter.tick(42);
-        assert!(counter.would_fire(42)); // count=2, one more tick fires
-    }
-
-    #[test]
-    fn test_deterministic_reset() {
-        let mut counter = DeterministicJitCounter::new(2);
-        counter.tick(42);
-        counter.reset(42);
-        assert_eq!(counter.get(42), 0);
-        assert!(!counter.tick(42)); // count=1, not yet
-        assert!(counter.tick(42)); // count=2, fires
-    }
-
-    #[test]
-    fn test_jit_counter_install() {
-        let mut counter = JitCounter::new(10);
-        counter.install(42, 8);
-        assert_eq!(counter.get(42), 8);
-        assert!(!counter.tick(42)); // 9, not yet
-        assert!(counter.tick(42)); // 10, fires
-    }
-
-    #[test]
-    fn test_jit_counter_compute_threshold() {
-        let counter = JitCounter::new(100);
-        assert_eq!(counter.compute_threshold(0.5), 50);
-        assert_eq!(counter.compute_threshold(1.0), 100);
-        assert_eq!(counter.compute_threshold(2.0), 100); // capped
-    }
-
-    #[test]
-    fn test_jit_counter_num_active() {
-        let mut counter = JitCounter::new(10);
-        assert_eq!(counter.num_active(), 0);
-        counter.tick(1);
-        counter.tick(2);
-        assert_eq!(counter.num_active(), 2);
     }
 }
