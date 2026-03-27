@@ -4,7 +4,7 @@
 //!
 //! Each builtin type (list, str, dict, tuple, int, float, bool, etc.)
 //! gets a W_TypeObject with methods pre-installed in its namespace.
-//! `py_getattr` looks up the type object from the registry and searches
+//! `getattr` looks up the type object from the registry and searches
 //! its namespace via MRO, exactly like user-defined classes.
 //!
 //! This eliminates the `builtin_type_method` match-based dispatch and
@@ -27,7 +27,7 @@ static TYPE_REGISTRY: OnceLock<HashMap<usize, usize>> = OnceLock::new();
 /// Look up the W_TypeObject for a builtin type.
 ///
 /// PyPy: `space.type(w_obj)` → W_TypeObject
-pub fn get_type_object(tp: *const PyType) -> Option<PyObjectRef> {
+pub fn lookup_typeobject(tp: *const PyType) -> Option<PyObjectRef> {
     TYPE_REGISTRY
         .get()
         .and_then(|reg| reg.get(&(tp as usize)).copied())
@@ -40,7 +40,7 @@ pub fn get_type_object(tp: *const PyType) -> Option<PyObjectRef> {
 /// - Instance of user class → w_instance_get_type
 /// - Builtin object → type registry lookup
 /// - Type object → type of type (not implemented, returns None)
-pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
+pub fn space_type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
     }
@@ -60,10 +60,10 @@ pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
                 return Some(metaclass);
             }
             // Default: type of type is type
-            return get_type_object(&pyre_object::pyobject::TYPE_TYPE);
+            return lookup_typeobject(&pyre_object::pyobject::TYPE_TYPE);
         }
         let tp = (*obj).ob_type;
-        get_type_object(tp)
+        lookup_typeobject(tp)
     }
 }
 
@@ -72,8 +72,8 @@ pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// PyPy: each W_XxxObject.typedef = TypeDef("xxx", ...) is set at
 /// module load time. In pyre, we do it once at startup.
 ///
-/// Must be called before any py_getattr on builtin objects.
-pub fn install_builtin_typedefs() {
+/// Must be called before any getattr on builtin objects.
+pub fn init_typeobjects() {
     if TYPE_REGISTRY.get().is_some() {
         return;
     }
@@ -82,7 +82,7 @@ pub fn install_builtin_typedefs() {
 
     // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
     // MRO = [object]. All other types inherit from object.
-    let object_type = make_type_root("object", init_object_typedef);
+    let object_type = make_type_root("object", init_object_type);
     reg.insert(
         &INSTANCE_TYPE as *const PyType as usize,
         object_type as usize,
@@ -91,55 +91,55 @@ pub fn install_builtin_typedefs() {
 
     // type — PyPy: typeobject.py, bases=(object,)
     // type.__new__(metatype, name, bases, dict) creates new types
-    let type_type = make_type_with_base("type", init_type_typedef, object_type);
+    let type_type = make_type_with_base("type", init_type_type, object_type);
     reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
     let _ = TYPE_TYPE_OBJ.set(type_type as usize);
 
     // int — PyPy: intobject.py W_IntObject.typedef, bases=(object,)
-    let int_type = make_type_with_base("int", init_int_typedef, object_type);
+    let int_type = make_type_with_base("int", init_int_type, object_type);
     reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
 
     // float — PyPy: floatobject.py, bases=(object,)
     reg.insert(
         &FLOAT_TYPE as *const PyType as usize,
-        make_type_with_base("float", init_float_typedef, object_type) as usize,
+        make_type_with_base("float", init_float_type, object_type) as usize,
     );
 
     // bool — PyPy: boolobject.py, bases=(int,)
     reg.insert(
         &BOOL_TYPE as *const PyType as usize,
-        make_type_with_base("bool", init_bool_typedef, int_type) as usize,
+        make_type_with_base("bool", init_bool_type, int_type) as usize,
     );
 
     // str — PyPy: unicodeobject.py, bases=(object,)
     reg.insert(
         &STR_TYPE as *const PyType as usize,
-        make_type_with_base("str", init_str_typedef, object_type) as usize,
+        make_type_with_base("str", init_str_type, object_type) as usize,
     );
 
     // list — PyPy: listobject.py, bases=(object,)
     reg.insert(
         &LIST_TYPE as *const PyType as usize,
-        make_type_with_base("list", init_list_typedef, object_type) as usize,
+        make_type_with_base("list", init_list_type, object_type) as usize,
     );
 
     // tuple — PyPy: tupleobject.py, bases=(object,)
     reg.insert(
         &TUPLE_TYPE as *const PyType as usize,
-        make_type_with_base("tuple", init_tuple_typedef, object_type) as usize,
+        make_type_with_base("tuple", init_tuple_type, object_type) as usize,
     );
 
     // dict — PyPy: dictobject.py, bases=(object,)
     reg.insert(
         &DICT_TYPE as *const PyType as usize,
-        make_type_with_base("dict", init_dict_typedef, object_type) as usize,
+        make_type_with_base("dict", init_dict_type, object_type) as usize,
     );
 
     // function — PyPy: funcobject.py
     // Functions are descriptors: function.__get__ returns a bound method.
     reg.insert(
         &crate::FUNCTION_TYPE as *const PyType as usize,
-        make_type_with_base("function", init_function_typedef, object_type) as usize,
+        make_type_with_base("function", init_function_type, object_type) as usize,
     );
 
     // builtin_function_or_method
@@ -147,31 +147,31 @@ pub fn install_builtin_typedefs() {
         &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
         make_type_with_base(
             "builtin_function_or_method",
-            init_builtin_function_typedef,
+            init_builtin_function_type,
             object_type,
         ) as usize,
     );
 
     reg.insert(
         &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
-        make_type_with_base("method", init_method_typedef, object_type) as usize,
+        make_type_with_base("method", init_method_type, object_type) as usize,
     );
 
     reg.insert(
         &crate::pycode::CODE_TYPE as *const PyType as usize,
-        make_type_with_base("code", init_code_typedef, object_type) as usize,
+        make_type_with_base("code", init_code_type, object_type) as usize,
     );
 
     // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
     reg.insert(
         &pyre_object::propertyobject::STATICMETHOD_TYPE as *const PyType as usize,
-        make_type_with_base("staticmethod", init_staticmethod_typedef, object_type) as usize,
+        make_type_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
     );
 
     // classmethod — PyPy: function.py ClassMethod, bases=(object,)
     reg.insert(
         &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const PyType as usize,
-        make_type_with_base("classmethod", init_classmethod_typedef, object_type) as usize,
+        make_type_with_base("classmethod", init_classmethod_type, object_type) as usize,
     );
 
     // NoneType — bases=(object,)
@@ -191,19 +191,19 @@ static TYPE_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// Retrieve a W_TypeObject for a builtin type by its PyType pointer.
 /// Used to register `int`, `str`, etc. as types in builtins (not functions).
 /// Get the `type` W_TypeObject for use as a builtin.
-pub fn get_type_type() -> PyObjectRef {
+pub fn gettypetype() -> PyObjectRef {
     TYPE_TYPE_OBJ
         .get()
         .map(|v| *v as PyObjectRef)
         .unwrap_or(PY_NULL)
 }
 
-pub fn get_builtin_type(tp: &PyType) -> PyObjectRef {
-    get_type_object(tp as *const PyType).unwrap_or(PY_NULL)
+pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
+    lookup_typeobject(tp as *const PyType).unwrap_or(PY_NULL)
 }
 
 /// Get the `object` W_TypeObject for use as a builtin.
-pub fn get_object_type() -> PyObjectRef {
+pub fn getobjecttype() -> PyObjectRef {
     OBJECT_TYPE_OBJ
         .get()
         .map(|v| *v as PyObjectRef)
@@ -245,7 +245,7 @@ fn make_type_with_base(name: &str, init: fn(&mut PyNamespace), base: PyObjectRef
 /// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
 /// to the builtin constructor. PyPy: each type's descr__new__ strips cls
 /// and calls the type-specific allocator.
-macro_rules! type_new_wrapper {
+macro_rules! descr_new_wrapper {
     ($fn_name:ident, $ctor:path) => {
         fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // args[0] = cls (ignored for builtin types)
@@ -254,19 +254,19 @@ macro_rules! type_new_wrapper {
     };
 }
 
-type_new_wrapper!(int_new, crate::builtins::builtin_int_pub);
-type_new_wrapper!(float_new, crate::builtins::builtin_float_pub);
-type_new_wrapper!(str_new, crate::builtins::builtin_str_pub);
+descr_new_wrapper!(int_descr_new, crate::builtins::builtin_int_pub);
+descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float_pub);
+descr_new_wrapper!(str_descr_new, crate::builtins::builtin_str_pub);
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
 /// with a backing dict for storage. PyPy: dictobject.py descr__new__
-fn dict_new_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {
         pyre_object::PY_NULL
     } else {
         args[0]
     };
-    let dict_type = crate::typedef::get_builtin_type(&pyre_object::pyobject::DICT_TYPE);
+    let dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
 
     // If cls IS dict (not a subclass), use normal dict constructor
     if cls.is_null() || std::ptr::eq(cls, dict_type) {
@@ -277,7 +277,7 @@ fn dict_new_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // PyPy: allocate W_DictObject with custom type
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
-    let _ = crate::baseobjspace::py_setattr(instance, "__dict_data__", backing);
+    let _ = crate::baseobjspace::setattr(instance, "__dict_data__", backing);
 
     // Initialize from args if provided
     if args.len() > 1 {
@@ -294,16 +294,16 @@ fn dict_new_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     Ok(instance)
 }
-type_new_wrapper!(bool_new, crate::builtins::builtin_bool_pub);
-type_new_wrapper!(list_new, crate::builtins::builtin_list_ctor_pub);
-type_new_wrapper!(tuple_new, crate::builtins::builtin_tuple_pub);
-// dict_new handled by dict_new_subclass above (supports dict subclasses)
+descr_new_wrapper!(bool_descr_new, crate::builtins::builtin_bool_pub);
+descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor_pub);
+descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple_pub);
+// dict_new handled by dict_descr_new above (supports dict subclasses)
 
 // ── List TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
-fn init_list_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", list_new));
+fn init_list_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", list_descr_new));
     namespace_store(
         ns,
         "append",
@@ -364,8 +364,8 @@ fn init_list_typedef(ns: &mut PyNamespace) {
 // ── Str TypeDef ──────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
-fn init_str_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", str_new));
+fn init_str_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", str_descr_new));
     namespace_store(
         ns,
         "join",
@@ -555,7 +555,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
-                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -566,7 +566,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
-            crate::baseobjspace::py_len(args[0])
+            crate::baseobjspace::len(args[0])
         }),
     );
     namespace_store(
@@ -576,7 +576,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__"));
             }
-            crate::baseobjspace::py_getitem(args[0], args[1])
+            crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
     namespace_store(
@@ -586,7 +586,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            crate::baseobjspace::py_iter(args[0])
+            crate::baseobjspace::iter(args[0])
         }),
     );
     namespace_store(
@@ -596,7 +596,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__add__"));
             }
-            crate::baseobjspace::py_add(args[0], args[1])
+            crate::baseobjspace::add(args[0], args[1])
         }),
     );
     namespace_store(
@@ -606,7 +606,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mul__"));
             }
-            crate::baseobjspace::py_mul(args[0], args[1])
+            crate::baseobjspace::mul(args[0], args[1])
         }),
     );
     namespace_store(
@@ -616,7 +616,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mod__"));
             }
-            crate::baseobjspace::py_mod(args[0], args[1])
+            crate::baseobjspace::mod_(args[0], args[1])
         }),
     );
     // maketrans — PyPy: unicodeobject.py descr_maketrans
@@ -670,12 +670,8 @@ fn init_str_typedef(ns: &mut PyNamespace) {
 // ── Dict TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/dictobject.py TypeDef("dict", ...)
 
-fn init_dict_typedef(ns: &mut PyNamespace) {
-    namespace_store(
-        ns,
-        "__new__",
-        builtin_code_new("__new__", dict_new_subclass),
-    );
+fn init_dict_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", dict_descr_new));
     namespace_store(
         ns,
         "get",
@@ -724,7 +720,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                     pyre_object::w_dict_store(args[0], args[1], args[2]);
                 } else if pyre_object::is_instance(args[0]) {
                     // dict subclass — store in __dict_data__ backing dict
-                    if let Ok(backing) = crate::baseobjspace::py_getattr(args[0], "__dict_data__") {
+                    if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__") {
                         if pyre_object::is_dict(backing) {
                             pyre_object::w_dict_store(backing, args[1], args[2]);
                         }
@@ -743,17 +739,17 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             }
             unsafe {
                 if pyre_object::is_dict(args[0]) {
-                    return crate::baseobjspace::py_getitem(args[0], args[1]);
+                    return crate::baseobjspace::getitem(args[0], args[1]);
                 }
                 if pyre_object::is_instance(args[0]) {
-                    if let Ok(backing) = crate::baseobjspace::py_getattr(args[0], "__dict_data__") {
+                    if let Ok(backing) = crate::baseobjspace::getattr(args[0], "__dict_data__") {
                         if pyre_object::is_dict(backing) {
-                            return crate::baseobjspace::py_getitem(backing, args[1]);
+                            return crate::baseobjspace::getitem(backing, args[1]);
                         }
                     }
                 }
             }
-            crate::baseobjspace::py_getitem(args[0], args[1])
+            crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
     namespace_store(
@@ -771,7 +767,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                 ));
             }
             Ok(pyre_object::w_bool_from(
-                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -788,7 +784,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                     unsafe { pyre_object::w_dict_len(dict) } as i64,
                 ));
             }
-            crate::baseobjspace::py_len(args[0])
+            crate::baseobjspace::len(args[0])
         }),
     );
     namespace_store(
@@ -801,9 +797,9 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             let dict = crate::type_methods::resolve_dict_backing(args[0]);
             if !dict.is_null() {
                 // Iterate over dict keys
-                return crate::baseobjspace::py_iter(dict);
+                return crate::baseobjspace::iter(dict);
             }
-            crate::baseobjspace::py_iter(args[0])
+            crate::baseobjspace::iter(args[0])
         }),
     );
     namespace_store(
@@ -813,7 +809,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
             }
-            crate::baseobjspace::py_delitem(args[0], args[1])?;
+            crate::baseobjspace::delitem(args[0], args[1])?;
             Ok(pyre_object::w_none())
         }),
     );
@@ -824,7 +820,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
-            crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
+            crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
         }),
     );
     namespace_store(
@@ -890,8 +886,8 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
-fn init_tuple_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", tuple_new));
+fn init_tuple_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", tuple_descr_new));
     namespace_store(
         ns,
         "index",
@@ -910,7 +906,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
-                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -933,7 +929,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            crate::baseobjspace::py_iter(args[0])
+            crate::baseobjspace::iter(args[0])
         }),
     );
 }
@@ -943,7 +939,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
 // ── Type TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
 
-fn init_type_typedef(ns: &mut PyNamespace) {
+fn init_type_type(ns: &mut PyNamespace) {
     // type.__new__(metatype, name, bases, dict) — creates new type
     namespace_store(
         ns,
@@ -961,7 +957,7 @@ fn init_type_typedef(ns: &mut PyNamespace) {
 /// function/builtin_function_or_method — PyPy: funcobject.py Function typedef
 /// Functions are descriptors: __get__ returns the function itself (for class access)
 /// or a bound method (for instance access).
-fn init_function_typedef(ns: &mut PyNamespace) {
+fn init_function_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__get__",
@@ -978,7 +974,7 @@ fn init_function_typedef(ns: &mut PyNamespace) {
     );
 }
 
-fn init_builtin_function_typedef(ns: &mut PyNamespace) {
+fn init_builtin_function_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__get__",
@@ -988,7 +984,7 @@ fn init_builtin_function_typedef(ns: &mut PyNamespace) {
     );
 }
 
-fn init_method_typedef(ns: &mut PyNamespace) {
+fn init_method_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__func__",
@@ -1011,10 +1007,10 @@ fn init_method_typedef(ns: &mut PyNamespace) {
     );
 }
 
-fn init_code_typedef(_ns: &mut PyNamespace) {}
+fn init_code_type(_ns: &mut PyNamespace) {}
 
 /// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
-fn init_staticmethod_typedef(ns: &mut PyNamespace) {
+fn init_staticmethod_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
@@ -1031,7 +1027,7 @@ fn init_staticmethod_typedef(ns: &mut PyNamespace) {
 }
 
 /// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
-fn init_classmethod_typedef(ns: &mut PyNamespace) {
+fn init_classmethod_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
@@ -1046,14 +1042,14 @@ fn init_classmethod_typedef(ns: &mut PyNamespace) {
     );
 }
 
-fn init_int_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", int_new));
+fn init_int_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", int_descr_new));
 }
-fn init_float_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", float_new));
+fn init_float_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", float_descr_new));
 }
-fn init_bool_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", bool_new));
+fn init_bool_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", bool_descr_new));
 }
 
 // ── Object TypeDef ───────────────────────────────────────────────────
@@ -1062,7 +1058,7 @@ fn init_bool_typedef(ns: &mut PyNamespace) {
 /// `object.__new__(cls)` — allocate a bare instance of cls.
 ///
 /// PyPy: objectobject.py descr__new__
-fn object_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(
         !args.is_empty(),
         "object.__new__() requires a type argument"
@@ -1077,13 +1073,17 @@ fn object_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `object.__init__(self)` — no-op base __init__.
-fn object_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn object_descr_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-fn init_object_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", builtin_code_new("__new__", object_new));
-    namespace_store(ns, "__init__", builtin_code_new("__init__", object_init));
+fn init_object_type(ns: &mut PyNamespace) {
+    namespace_store(ns, "__new__", builtin_code_new("__new__", object_descr_new));
+    namespace_store(
+        ns,
+        "__init__",
+        builtin_code_new("__init__", object_descr_init),
+    );
     // PyPy: objectobject.py — default comparison/hash/repr for all objects
     namespace_store(
         ns,

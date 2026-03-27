@@ -133,7 +133,7 @@ fn init_collections_abc(ns: &mut PyNamespace) {
                 let name = unsafe { pyre_object::w_str_get_value(method_name) };
                 // Check if method exists in class MRO
                 let found = if unsafe { pyre_object::is_type(cls) } {
-                    unsafe { crate::baseobjspace::lookup_in_type_mro_pub(cls, name) }.is_some()
+                    unsafe { crate::baseobjspace::lookup_in_type(cls, name) }.is_some()
                 } else {
                     false
                 };
@@ -145,32 +145,32 @@ fn init_collections_abc(ns: &mut PyNamespace) {
         }),
     );
     // Stub ABC classes
-    crate::namespace_store(ns, "Hashable", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Awaitable", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Coroutine", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Iterator", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Generator", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Iterable", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Callable", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Sized", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Container", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Collection", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Sequence", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "MutableSequence", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Mapping", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "MutableMapping", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Set", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "MutableSet", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "ByteString", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Buffer", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "Reversible", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "MappingView", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "KeysView", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "ItemsView", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "ValuesView", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "AsyncIterator", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::get_object_type());
-    crate::namespace_store(ns, "AsyncIterable", crate::typedef::get_object_type());
+    crate::namespace_store(ns, "Hashable", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Awaitable", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Coroutine", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Iterator", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Generator", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Iterable", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Callable", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Sized", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Container", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Collection", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Sequence", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "MutableSequence", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Mapping", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "MutableMapping", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Set", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "MutableSet", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "ByteString", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Buffer", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Reversible", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "MappingView", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "KeysView", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "ItemsView", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "ValuesView", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "AsyncIterator", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "AsyncIterable", crate::typedef::getobjecttype());
 }
 
 /// itertools stub
@@ -229,12 +229,12 @@ fn init_contextvars(ns: &mut PyNamespace) {
         "ContextVar",
         crate::builtin_code_new("ContextVar", |args| {
             // Return stub object with get/set methods
-            let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+            let obj = pyre_object::w_instance_new(crate::typedef::getobjecttype());
             if !args.is_empty() {
-                let _ = crate::baseobjspace::py_setattr(obj, "name", args[0]);
+                let _ = crate::baseobjspace::setattr(obj, "name", args[0]);
             }
             // get() returns default or raises LookupError
-            let _ = crate::baseobjspace::py_setattr(
+            let _ = crate::baseobjspace::setattr(
                 obj,
                 "get",
                 crate::builtin_code_new("get", |args| {
@@ -246,7 +246,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
                     }
                 }),
             );
-            let _ = crate::baseobjspace::py_setattr(
+            let _ = crate::baseobjspace::setattr(
                 obj,
                 "set",
                 crate::builtin_code_new("set", |_| Ok(pyre_object::w_none())),
@@ -905,8 +905,8 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
         }
     }
 
-    // Fallback: try py_getattr (for non-module objects or attrs set via setattr)
-    match crate::baseobjspace::py_getattr(module, name) {
+    // Fallback: try getattr (for non-module objects or attrs set via setattr)
+    match crate::baseobjspace::getattr(module, name) {
         Ok(value) => Ok(value),
         Err(_) => Err(crate::PyError::new(
             crate::PyErrorKind::ImportError,

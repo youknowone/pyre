@@ -3,7 +3,7 @@
 //! PyPy equivalent: pypy/module/__builtin__/descriptor.py → W_Property
 //!
 //! A property holds fget, fset, fdel function references.
-//! Used by the descriptor protocol in py_getattr/py_setattr.
+//! Used by the descriptor protocol in getattr/setattr.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 

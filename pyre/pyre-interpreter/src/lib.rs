@@ -73,7 +73,7 @@ pub fn space_call_function_or_identity(
     unsafe {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = baseobjspace::lookup_in_type_mro_pub(w_type, dunder) {
+            if let Some(method) = baseobjspace::lookup_in_type(w_type, dunder) {
                 return space_call_function(method, &[obj]);
             }
         }

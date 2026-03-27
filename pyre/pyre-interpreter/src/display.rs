@@ -18,7 +18,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
             return None;
         }
         let w_type = pyre_object::w_instance_get_type(obj);
-        let method = crate::baseobjspace::lookup_in_type_mro_pub(w_type, name)?;
+        let method = crate::baseobjspace::lookup_in_type(w_type, name)?;
         if method.is_null() {
             return None;
         }
