@@ -451,6 +451,10 @@ pub struct JitCellToken {
     pub invalidated: Arc<AtomicBool>,
     /// Alternative loop versions to compile immediately after the main loop.
     pub version_info: Option<LoopVersionInfo>,
+    /// history.py:449: _keepalive_jitcell_tokens — set of other tokens
+    /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
+    /// Prevents the target from being evicted while this loop is alive.
+    pub keepalive_tokens: Vec<u64>,
 }
 
 impl JitCellToken {
@@ -462,6 +466,16 @@ impl JitCellToken {
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
+            keepalive_tokens: Vec::new(),
+        }
+    }
+
+    /// history.py:451-453: record_jump_to — record that this loop can
+    /// jump to another JitCellToken (via CALL_ASSEMBLER or JUMP).
+    /// Prevents the MemoryManager from evicting the target.
+    pub fn record_jump_to(&mut self, target_number: u64) {
+        if !self.keepalive_tokens.contains(&target_number) {
+            self.keepalive_tokens.push(target_number);
         }
     }
 
