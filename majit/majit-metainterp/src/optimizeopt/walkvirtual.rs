@@ -50,7 +50,7 @@ pub fn walk_virtuals(virtuals: &[(OpRef, PtrInfo)], visitor: &mut impl VirtualVi
             PtrInfo::VirtualArrayStruct(v) => visitor.visit_varraystruct(*opref, v),
             PtrInfo::VirtualRawBuffer(v) => visitor.visit_vrawbuffer(*opref, v),
             PtrInfo::Virtualizable(v) => visitor.visit_virtualizable(*opref, v),
-            PtrInfo::NonNull
+            PtrInfo::NonNull { .. }
             | PtrInfo::Constant(_)
             | PtrInfo::KnownClass { .. }
             | PtrInfo::Instance(_)
@@ -151,6 +151,7 @@ mod tests {
                     known_class: None,
                     fields: vec![(0, OpRef(10))],
                     field_descrs: Vec::new(),
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -158,6 +159,7 @@ mod tests {
                 PtrInfo::VirtualArray(VirtualArrayInfo {
                     descr: descr_ref(),
                     items: vec![OpRef(20), OpRef(21)],
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -166,6 +168,7 @@ mod tests {
                     descr: descr_ref(),
                     fields: vec![(0, OpRef(30))],
                     field_descrs: Vec::new(),
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -173,6 +176,7 @@ mod tests {
                 PtrInfo::VirtualArrayStruct(VirtualArrayStructInfo {
                     descr: descr_ref(),
                     element_fields: vec![vec![(0, OpRef(40))]],
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -180,16 +184,18 @@ mod tests {
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                     size: 16,
                     entries: vec![(0, 8, OpRef(50))],
+                    last_guard_pos: -1,
                 }),
             ),
             // Non-virtual entries should be skipped.
-            (OpRef(5), PtrInfo::NonNull),
+            (OpRef(5), PtrInfo::nonnull()),
             (OpRef(6), PtrInfo::Constant(GcRef::NULL)),
             (
                 OpRef(7),
                 PtrInfo::KnownClass {
                     class_ptr: GcRef::NULL,
                     is_nonnull: true,
+                    last_guard_pos: -1,
                 },
             ),
         ];
@@ -224,6 +230,7 @@ mod tests {
                     known_class: None,
                     fields: vec![(0, OpRef(10)), (1, OpRef(11))],
                     field_descrs: Vec::new(),
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -231,6 +238,7 @@ mod tests {
                 PtrInfo::VirtualArray(VirtualArrayInfo {
                     descr: descr_ref(),
                     items: vec![OpRef(20)],
+                    last_guard_pos: -1,
                 }),
             ),
             (
@@ -238,6 +246,7 @@ mod tests {
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                     size: 16,
                     entries: vec![(0, 8, OpRef(30)), (8, 8, OpRef(31))],
+                    last_guard_pos: -1,
                 }),
             ),
         ];
@@ -254,13 +263,14 @@ mod tests {
     #[test]
     fn walk_skips_non_virtual() {
         let virtuals: Vec<(OpRef, PtrInfo)> = vec![
-            (OpRef(0), PtrInfo::NonNull),
+            (OpRef(0), PtrInfo::nonnull()),
             (OpRef(1), PtrInfo::Constant(GcRef::NULL)),
             (
                 OpRef(2),
                 PtrInfo::KnownClass {
                     class_ptr: GcRef::NULL,
                     is_nonnull: false,
+                    last_guard_pos: -1,
                 },
             ),
         ];

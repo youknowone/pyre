@@ -91,13 +91,21 @@ impl OpInfo {
 pub enum PtrInfo {
     /// Known to be non-null, nothing else.
     /// info.py: NonNullPtrInfo
-    NonNull,
+    NonNull {
+        /// info.py:91-92: NonNullPtrInfo.last_guard_pos = -1
+        last_guard_pos: i32,
+    },
     /// Known constant pointer.
-    /// info.py: ConstPtrInfo
+    /// info.py: ConstPtrInfo (does NOT inherit NonNullPtrInfo)
     Constant(GcRef),
     /// Known class (type) of the object.
     /// info.py: NonNullPtrInfo with _known_class set
-    KnownClass { class_ptr: GcRef, is_nonnull: bool },
+    KnownClass {
+        class_ptr: GcRef,
+        is_nonnull: bool,
+        /// info.py:91-92
+        last_guard_pos: i32,
+    },
     /// Non-virtual GC object with cached field info.
     /// info.py: InstancePtrInfo (is_virtual = False)
     Instance(InstancePtrInfo),
@@ -131,7 +139,51 @@ impl PtrInfo {
 
     /// Create a NonNull PtrInfo.
     pub fn nonnull() -> Self {
-        PtrInfo::NonNull
+        PtrInfo::NonNull { last_guard_pos: -1 }
+    }
+
+    // ── info.py:100-118: last_guard_pos methods ──
+
+    /// info.py:100-103: get_last_guard
+    pub fn get_last_guard_pos(&self) -> Option<usize> {
+        let pos = match self {
+            PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos,
+            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos,
+            PtrInfo::Instance(i) => i.last_guard_pos,
+            PtrInfo::Struct(s) => s.last_guard_pos,
+            PtrInfo::Array(a) => a.last_guard_pos,
+            PtrInfo::Virtual(v) => v.last_guard_pos,
+            PtrInfo::VirtualArray(v) => v.last_guard_pos,
+            PtrInfo::VirtualStruct(v) => v.last_guard_pos,
+            PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos,
+            PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos,
+            PtrInfo::Virtualizable(v) => v.last_guard_pos,
+            PtrInfo::Constant(_) => return None, // ConstPtrInfo has no last_guard_pos
+        };
+        if pos < 0 { None } else { Some(pos as usize) }
+    }
+
+    /// info.py:111-118: mark_last_guard
+    pub fn set_last_guard_pos(&mut self, pos: i32) {
+        match self {
+            PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos = pos,
+            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos = pos,
+            PtrInfo::Instance(i) => i.last_guard_pos = pos,
+            PtrInfo::Struct(s) => s.last_guard_pos = pos,
+            PtrInfo::Array(a) => a.last_guard_pos = pos,
+            PtrInfo::Virtual(v) => v.last_guard_pos = pos,
+            PtrInfo::VirtualArray(v) => v.last_guard_pos = pos,
+            PtrInfo::VirtualStruct(v) => v.last_guard_pos = pos,
+            PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos = pos,
+            PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos = pos,
+            PtrInfo::Virtualizable(v) => v.last_guard_pos = pos,
+            PtrInfo::Constant(_) => {} // ConstPtrInfo: no-op
+        }
+    }
+
+    /// info.py:108-109: reset_last_guard_pos
+    pub fn reset_last_guard_pos(&mut self) {
+        self.set_last_guard_pos(-1);
     }
 
     /// Create a Constant PtrInfo.
@@ -144,6 +196,7 @@ impl PtrInfo {
         PtrInfo::KnownClass {
             class_ptr,
             is_nonnull,
+            last_guard_pos: -1,
         }
     }
 
@@ -154,6 +207,7 @@ impl PtrInfo {
             known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         })
     }
 
@@ -163,6 +217,7 @@ impl PtrInfo {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         })
     }
 
@@ -172,6 +227,7 @@ impl PtrInfo {
             descr,
             lenbound,
             items: Vec::new(),
+            last_guard_pos: -1,
         })
     }
 
@@ -182,6 +238,7 @@ impl PtrInfo {
             known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         })
     }
 
@@ -190,6 +247,7 @@ impl PtrInfo {
         PtrInfo::VirtualArray(VirtualArrayInfo {
             descr,
             items: vec![OpRef::NONE; length],
+            last_guard_pos: -1,
         })
     }
 
@@ -199,6 +257,7 @@ impl PtrInfo {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         })
     }
 
@@ -208,7 +267,7 @@ impl PtrInfo {
     /// info.py: is_nonnull()
     pub fn is_nonnull(&self) -> bool {
         match self {
-            PtrInfo::NonNull => true,
+            PtrInfo::NonNull { .. } => true,
             PtrInfo::Constant(gcref) => !gcref.is_null(),
             PtrInfo::KnownClass { is_nonnull, .. } => *is_nonnull,
             PtrInfo::Instance(_)
@@ -494,6 +553,7 @@ impl PtrInfo {
                         .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
+                    last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::New, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
@@ -540,6 +600,7 @@ impl PtrInfo {
                         .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
+                    last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
                 new_op.descr = Some(vinfo.descr.clone());
@@ -583,7 +644,7 @@ impl PtrInfo {
     /// Returns a list of opcodes and expected values for guards.
     pub fn make_guards(&self) -> Vec<majit_ir::OpCode> {
         match self {
-            PtrInfo::NonNull => vec![majit_ir::OpCode::GuardNonnull],
+            PtrInfo::NonNull { .. } => vec![majit_ir::OpCode::GuardNonnull],
             PtrInfo::KnownClass { .. } => vec![majit_ir::OpCode::GuardNonnullClass],
             PtrInfo::Instance(info) if info.known_class.is_some() => {
                 vec![majit_ir::OpCode::GuardNonnullClass]
@@ -644,7 +705,7 @@ impl PtrInfo {
     pub fn same_info(&self, other: &PtrInfo) -> bool {
         match (self, other) {
             (PtrInfo::Constant(a), PtrInfo::Constant(b)) => a == b,
-            (PtrInfo::NonNull, PtrInfo::NonNull) => true,
+            (PtrInfo::NonNull { .. }, PtrInfo::NonNull { .. }) => true,
             (PtrInfo::Instance(a), PtrInfo::Instance(b)) => {
                 a.descr.as_ref().map(|d| d.index()) == b.descr.as_ref().map(|d| d.index())
                     && a.known_class == b.known_class
@@ -1048,6 +1109,8 @@ pub struct VirtualInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors, preserving offset/size/type info for forcing.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A virtual array.
@@ -1057,6 +1120,8 @@ pub struct VirtualArrayInfo {
     pub descr: DescrRef,
     /// Element values.
     pub items: Vec<OpRef>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A non-virtual object with cached field info.
@@ -1072,6 +1137,8 @@ pub struct InstancePtrInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors keyed by field index.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A non-virtual GC struct with cached field info.
@@ -1085,6 +1152,8 @@ pub struct StructPtrInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors keyed by field index.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A non-virtual GC array with cached item info and lenbound.
@@ -1098,6 +1167,8 @@ pub struct ArrayPtrInfo {
     pub lenbound: IntBound,
     /// Cached item values for constant indices.
     pub items: Vec<OpRef>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A virtual struct (no vtable).
@@ -1109,6 +1180,8 @@ pub struct VirtualStructInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors keyed by field_index, used for force.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A virtual array of structs (interior field access pattern).
@@ -1122,6 +1195,8 @@ pub struct VirtualArrayStructInfo {
     pub descr: DescrRef,
     /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
     pub element_fields: Vec<Vec<(u32, OpRef)>>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// A virtual raw memory buffer.
@@ -1138,6 +1213,8 @@ pub struct VirtualRawBufferInfo {
     /// Sorted by offset. Invariant: `entries[i].0 + entries[i].1 <= entries[i+1].0`
     /// (no overlapping writes).
     pub entries: Vec<(usize, usize, OpRef)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 /// Error returned when a raw buffer operation violates invariants.
@@ -1284,6 +1361,8 @@ pub struct VirtualizableFieldState {
     /// Tracked array field values: (array_field_index, element_values).
     /// Indices correspond to VirtualizableInfo::array_fields order.
     pub arrays: Vec<(u32, Vec<OpRef>)>,
+    /// info.py:91-92
+    pub last_guard_pos: i32,
 }
 
 #[cfg(test)]
@@ -1300,6 +1379,7 @@ mod tests {
         VirtualRawBufferInfo {
             size,
             entries: Vec::new(),
+            last_guard_pos: -1,
         }
     }
 
@@ -1523,7 +1603,7 @@ mod tests {
         assert!(!OpInfo::Unknown.is_nonnull());
         assert!(OpInfo::Constant(Value::Int(42)).is_nonnull());
         assert!(!OpInfo::Constant(Value::Int(0)).is_nonnull());
-        assert!(OpInfo::Ptr(PtrInfo::NonNull).is_nonnull());
+        assert!(OpInfo::Ptr(PtrInfo::nonnull()).is_nonnull());
     }
 
     #[test]

@@ -1144,7 +1144,7 @@ impl OptHeap {
         let struct_ref = ctx.get_replacement(op.arg(0));
         self.known_nonnull.insert(struct_ref);
         if ctx.get_ptr_info(struct_ref).is_none() {
-            ctx.set_ptr_info(struct_ref, crate::optimizeopt::info::PtrInfo::NonNull);
+            ctx.set_ptr_info(struct_ref, crate::optimizeopt::info::PtrInfo::nonnull());
         }
         self.cache_field(obj, field_idx, op.pos, op.descr.as_ref());
         // Save immutable fields in the permanent cache — they survive all

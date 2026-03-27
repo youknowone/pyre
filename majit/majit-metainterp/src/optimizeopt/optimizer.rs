@@ -332,6 +332,7 @@ impl Optimizer {
                             known_class: *known_class,
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -347,6 +348,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
                             items: imported_items,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -368,6 +370,7 @@ impl Optimizer {
                             descr: descr.clone(),
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -396,6 +399,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
                             element_fields: imported_elements,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -417,6 +421,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualRawBufferInfo {
                             size: *size,
                             entries: imported_entries,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -427,11 +432,12 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::KnownClass {
                         class_ptr: *class_ptr,
                         is_nonnull: true,
+                        last_guard_pos: -1,
                     },
                 );
             }
             VirtualStateInfo::NonNull => {
-                ctx.set_ptr_info(opref, crate::optimizeopt::info::PtrInfo::NonNull);
+                ctx.set_ptr_info(opref, crate::optimizeopt::info::PtrInfo::nonnull());
             }
             VirtualStateInfo::IntBounded(bound) => {
                 let widened = bound.widen();
@@ -507,6 +513,7 @@ impl Optimizer {
                                 known_class: *known_class,
                                 fields,
                                 field_descrs,
+                                last_guard_pos: -1,
                             },
                         ),
                     );
@@ -519,6 +526,7 @@ impl Optimizer {
                                 descr: iv.size_descr.clone(),
                                 fields,
                                 field_descrs,
+                                last_guard_pos: -1,
                             },
                         ),
                     );
@@ -570,6 +578,7 @@ impl Optimizer {
                             known_class: *known_class,
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -594,6 +603,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
                             items: imported_items,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -626,6 +636,7 @@ impl Optimizer {
                             descr: descr.clone(),
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -661,6 +672,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
                             element_fields: imported_elements,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -689,6 +701,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualRawBufferInfo {
                             size: *size,
                             entries: imported_entries,
+                            last_guard_pos: -1,
                         },
                     ),
                 );
@@ -2379,7 +2392,7 @@ impl Optimizer {
                             } else if let Some(info) = ctx.get_ptr_info(*opref) {
                                 if matches!(
                                     info,
-                                    crate::optimizeopt::info::PtrInfo::NonNull
+                                    crate::optimizeopt::info::PtrInfo::NonNull { .. }
                                         | crate::optimizeopt::info::PtrInfo::Instance(_)
                                 ) {
                                     majit_ir::Type::Ref
@@ -3745,6 +3758,7 @@ mod tests {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef(11))],
                 field_descrs: Vec::new(),
+                last_guard_pos: -1,
             }),
         );
         ctx.replace_op(OpRef(11), OpRef(20));
@@ -3754,6 +3768,7 @@ mod tests {
                 descr,
                 fields: Vec::new(),
                 field_descrs: Vec::new(),
+                last_guard_pos: -1,
             }),
         );
 
@@ -3774,7 +3789,7 @@ mod tests {
                 assert_eq!(info.fields[0].0, 1);
             }
             // After full forcing the info might become NonNull or similar
-            Some(PtrInfo::NonNull) => {}
+            Some(PtrInfo::NonNull { .. }) => {}
             other => panic!("expected virtual struct or non-null after forcing, got {other:?}"),
         }
     }
@@ -3792,6 +3807,7 @@ mod tests {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef(11))],
                 field_descrs: vec![(1, field_descr.clone())],
+                last_guard_pos: -1,
             }),
         );
 
@@ -3825,6 +3841,7 @@ mod tests {
                 descr: descr.clone(),
                 fields: vec![(1, OpRef(11))],
                 field_descrs: vec![(1, field_descr.clone())],
+                last_guard_pos: -1,
             }),
         );
 
