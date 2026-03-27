@@ -282,11 +282,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     let is_portal: bool = &*code.obj_name != "<module>";
-    // RPython warmstate.py bound_reached → MetaInterp.compile_and_run_once:
-    // tracing starts synchronously in RPython. In pyre, tracing is async
-    // (jit_merge_point_hook feeds bytecodes to the tracer). The pending_trace
-    // flag defers trace START to the jit_merge_point position so the trace
-    // captures loop header values, not back-edge values.
+    // RPython warmstate.py:437-444 compile_and_run_once navigates
+    // internally to the jit_merge_point before tracing. Pyre's tracing
+    // is async (jit_merge_point_hook feeds bytecodes), so pending_trace
+    // defers bound_reached to the jit_merge_point position.
     let mut pending_trace: Option<(u64, usize)> = None;
 
     loop {
@@ -300,11 +299,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
-        // At runtime jit_merge_point only handles trace feed (when
-        // tracing is active) and deferred trace start (pending_trace).
+        // Handles deferred bound_reached and trace feed.
         if is_portal {
-            // Deferred bound_reached: counter fired at can_enter_jit,
-            // actual tracing begins at jit_merge_point position.
+            // Deferred bound_reached from can_enter_jit.
             if let Some((key, header_pc)) = pending_trace {
                 if pc == header_pc && !driver.is_tracing() {
                     pending_trace = None;
@@ -467,11 +464,11 @@ fn maybe_compile_and_run(
     env: &PyreEnv,
     pending_trace: &mut Option<(u64, usize)>,
 ) -> Option<LoopResult> {
-    // warmstate.py:446-511: counter tick gates both compiled entry
-    // and trace start. RPython checks the cell (compiled code) before
-    // the counter, but pyre's has_compiled_loop is O(HashMap) — too
-    // expensive for every back-edge. Counter gating matches RPython's
-    // amortized O(1) cell lookup via jitcounter timetable.
+    // warmstate.py:446-511 maybe_compile_and_run.
+    // RPython checks the cell (compiled code) before the counter.
+    // Pyre gates behind counter.tick because has_compiled_loop is
+    // O(HashMap) — too expensive per back-edge. tick auto-resets
+    // (counter.py:199-200) so it fires once per threshold period.
     if driver
         .meta_interp_mut()
         .warm_state_mut()
@@ -487,7 +484,10 @@ fn maybe_compile_and_run(
         if driver.has_compiled_loop(green_key) {
             return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
         }
-        // warmstate.py:466-468: no compiled → bound_reached (deferred)
+        // warmstate.py:425-444: bound_reached.
+        // RPython calls synchronously. Pyre defers to jit_merge_point
+        // because compile_and_run_once internally starts tracing at the
+        // jit_merge_point position, not at the can_enter_jit position.
         *pending_trace = Some((green_key, loop_header_pc));
     }
     None
@@ -510,7 +510,6 @@ fn execute_assembler(
     frame.next_instr = entry_pc;
     let mut jit_state = build_jit_state(frame, info);
     jit_state.next_instr = entry_pc;
-    jit_state.valuestackdepth = frame.valuestackdepth;
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -691,6 +690,11 @@ fn bound_reached(
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
+    // RPython decays ALL counters; pyre resets only this key.
+    // Full decay_all_counters reduces OTHER keys' counters too,
+    // which interferes with pyre's counter-gated entry for those keys.
+    // TODO: implement full decay_all_counters when counter gating is
+    // replaced with O(1) cell lookup.
     driver
         .meta_interp_mut()
         .warm_state_mut()
