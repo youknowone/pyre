@@ -4689,6 +4689,9 @@ mod tests {
                 is_array_item: false,
                 target: ExitValueSourceLayout::ExitValue(0),
                 value: ExitValueSourceLayout::Constant(1),
+                field_offset: 0,
+                field_size: 0,
+                field_type: majit_ir::Type::Int,
             }],
         };
 
@@ -4725,6 +4728,9 @@ mod tests {
                 is_array_item: true,
                 target: ExitValueSourceLayout::Virtual(1),
                 value: ExitValueSourceLayout::ExitValue(1),
+                field_offset: 0,
+                field_size: 0,
+                field_type: majit_ir::Type::Int,
             }
         );
     }
