@@ -185,7 +185,7 @@ pub struct OptContext {
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
-    /// encode_guard_virtuals_impl to create GuardVirtualEntry for
+    /// store_final_boxes_in_guard to create GuardVirtualEntry for
     /// NONE positions inherited from Phase 1 virtualization.
     pub imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
     /// Phase 2 imported label args (OpRefs in Phase 2 namespace).

@@ -861,9 +861,9 @@ impl Optimizer {
     }
 
     // RPython optimizer.py:722-752 store_final_boxes_in_guard and
-    // optimizer.py:649-670 emit_guard_operation are handled by
-    // emit_with_guard_check + encode_guard_virtuals + number_guard_inline.
-    // The standalone functions were dead code (no call sites) and removed.
+    // optimizer.py:649-670 emit_guard_operation are implemented inside
+    // emit_with_guard_check: _copy_resume_data_from, store_final_boxes_in_guard,
+    // force_box on fail_args, and number_guard_inline in ctx.emit().
 
     /// optimizer.py: add_pending_field(op)
     /// Queue a SETFIELD_GC to be emitted before the next guard.
@@ -1306,7 +1306,7 @@ impl Optimizer {
         // in fail_args inherited from Phase 1 virtualization.
         ctx.imported_virtuals = self.imported_virtuals.clone();
         ctx.imported_label_args = self.imported_label_args.clone();
-        // Phase 1's exported_jump_virtuals tell encode_guard_virtuals_impl
+        // Phase 1's exported_jump_virtuals tell store_final_boxes_in_guard
         // which fail_args positions are virtual (using jump_arg_index).
         if ctx.exported_jump_virtuals.is_empty() {
             ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
@@ -2369,7 +2369,7 @@ impl Optimizer {
                 op.rd_resume_position = last.rd_resume_position;
             } else {
                 // optimizer.py:678: store_final_boxes_in_guard
-                op = Self::encode_guard_virtuals(op, ctx);
+                op = Self::store_final_boxes_in_guard(op, ctx);
                 // optimizer.py:681-683: force_box on fail_args for unrolling.
                 if let Some(ref fa) = op.fail_args {
                     let fargs: Vec<OpRef> = fa.iter().copied().collect();
@@ -2546,16 +2546,13 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py: store_final_boxes_in_guard — encode virtual objects
-    /// in guard fail_args as rd_virtuals for lazy reconstruction on guard
-    /// failure. RPython does this in the optimizer's store_final_boxes_in_guard,
-    /// which runs for every guard regardless of which pass emits it.
-    fn encode_guard_virtuals(op: Op, ctx: &mut OptContext) -> Op {
-        Self::encode_guard_virtuals_impl(op, ctx)
-    }
-
-    #[allow(dead_code)]
-    fn encode_guard_virtuals_impl(mut op: Op, ctx: &mut OptContext) -> Op {
+    /// optimizer.py:722-752 store_final_boxes_in_guard
+    ///
+    /// Encode virtual objects in guard fail_args via rd_virtuals for lazy
+    /// reconstruction on guard failure. Resolves all fail_args through
+    /// get_box_replacement, replaces virtual OpRefs with NONE, appends
+    /// virtual field values, and creates GuardVirtualEntry for materialization.
+    fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
         use majit_ir::GuardVirtualEntry;
 
@@ -3691,16 +3688,14 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("guard should survive optimization");
 
-        // Dual-write mode: BOTH rd_numb and rd_virtuals are set.
-        // rd_numb encodes TAGVIRTUAL entries; rd_virtuals has GuardVirtualEntry
-        // for the legacy consumer path (encode_guard_virtuals).
+        // resume.py parity: rd_numb + rd_virtuals from store_final_boxes_in_guard.
         assert!(
             guard.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
         assert!(
             guard.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
+            "rd_virtuals should be set (GuardVirtualEntry from store_final_boxes_in_guard)"
         );
         let fail_args = guard
             .fail_args

@@ -1249,19 +1249,19 @@ impl OptVirtualize {
     /// Resolve guard fail_args without forcing virtuals.
     ///
     /// RPython parity: virtualize.py does NOT force virtuals in fail_args.
-    /// Virtual encoding is handled by optimizer.rs encode_guard_virtuals
+    /// Virtual encoding is handled by optimizer.rs store_final_boxes_in_guard
     /// (store_final_boxes_in_guard equivalent) at emit time.
     /// Force virtual references in guard fail_args and re-resolve all args.
     ///
     /// RPython parity: virtualize.py does NOT force fail_args (it uses
     /// rd_virtuals for lazy reconstruction). majit currently forces because
     /// pyre hasn't implemented materialize_virtual_ref yet. When it does,
-    /// this method should skip forcing and let encode_guard_virtuals handle it.
+    /// this method should skip forcing and let store_final_boxes_in_guard handle it.
     /// RPython parity: virtualize.py does NOT force fail_args.
-    /// encode_guard_virtuals in optimizer.rs handles virtual encoding at emit time.
+    /// store_final_boxes_in_guard in optimizer.rs handles virtual encoding at emit time.
     fn force_guard_fail_args(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // RPython parity: don't force fail_args.
-        // encode_guard_virtuals handles encoding at emit time.
+        // store_final_boxes_in_guard handles encoding at emit time.
         let mut guard_op = op.clone();
 
         // RPython parity: isinstance(box, Const) → skip forcing.
@@ -2082,7 +2082,7 @@ impl Optimization for OptVirtualize {
                 }
 
                 // RPython parity: don't force fail_args.
-                // encode_guard_virtuals in optimizer.rs handles encoding at emit time.
+                // store_final_boxes_in_guard in optimizer.rs handles encoding at emit time.
                 if is_guard {
                     let mut guard_op = op.clone();
 
@@ -3932,7 +3932,7 @@ mod tests {
         );
         assert!(
             guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
@@ -3992,7 +3992,7 @@ mod tests {
         );
         assert!(
             guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
@@ -4074,7 +4074,7 @@ mod tests {
         );
         assert!(
             guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
@@ -4120,7 +4120,7 @@ mod tests {
         );
         assert!(
             guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from encode_guard_virtuals)"
+            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
