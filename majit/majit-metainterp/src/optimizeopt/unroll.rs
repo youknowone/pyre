@@ -2310,6 +2310,9 @@ impl OptUnroll {
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     let obj_resolved = ctx.get_replacement(obj);
+                    // RPython shortpreamble.py: opinfo = getptrinfo(obj)
+                    // Ensure PtrInfo exists so set_preamble_field can store.
+                    ctx.ensure_ptr_info(obj_resolved);
                     if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                         info.set_preamble_field(
                             descr_idx,

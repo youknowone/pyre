@@ -3113,9 +3113,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_pipeline_has_8_passes() {
+    fn test_default_pipeline_has_9_passes() {
+        // RPython __init__.py:15-22 ALL_OPTS: 9 passes including OptEarlyForce
         let opt = Optimizer::default_pipeline();
-        assert_eq!(opt.num_passes(), 8);
+        assert_eq!(opt.num_passes(), 9);
     }
 
     #[test]
