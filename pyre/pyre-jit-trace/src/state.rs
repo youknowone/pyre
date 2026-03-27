@@ -4984,12 +4984,7 @@ impl MIFrame {
             }
 
             // pyjitpl.py:2506 finishframe_exception: unwind stack to handler,
-            // push exception, continue tracing at handler_pc.
-            // TODO: remove gate when bridge optimizer generate_guards is fixed
-            // (VirtualStruct vs NonNull mismatch for bridge inputargs).
-            if std::env::var_os("MAJIT_EXC_TRACE").is_none() {
-                return TraceAction::Abort;
-            }
+            // pyjitpl.py:2517: frame.pc = target; raise ChangeFrame
             let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
             let nlocals = self.sym().nlocals;
             let target_stack_len = ncells + handler_depth;

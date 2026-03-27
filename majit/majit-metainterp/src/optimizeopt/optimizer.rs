@@ -2603,13 +2603,18 @@ impl Optimizer {
                     if let Some(head_ref) = head {
                         let resolved = ctx.get_replacement(head_ref);
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
-                            if info.is_virtual() {
+                            // RPython resume.py parity: encode virtual fields for
+                            // NONE slots. Also handle Instance (forced virtual) —
+                            // the fields are still tracked after force.
+                            let fields_vec = match &info {
+                                PtrInfo::VirtualStruct(v) if info.is_virtual() => Some(&v.fields),
+                                PtrInfo::Virtual(v) if info.is_virtual() => Some(&v.fields),
+                                // Forced virtual: Instance retains fields from force_virtual_instance
+                                PtrInfo::Instance(v) if !v.fields.is_empty() => Some(&v.fields),
+                                _ => None,
+                            };
+                            if let Some(fields_vec) = fields_vec {
                                 let base_idx = original_len + extra_fail_args.len();
-                                let fields_vec = match &info {
-                                    PtrInfo::VirtualStruct(v) => &v.fields,
-                                    PtrInfo::Virtual(v) => &v.fields,
-                                    _ => continue,
-                                };
                                 let mut fields = Vec::new();
                                 for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
                                     let rv = ctx.get_replacement(*vref);
@@ -2619,10 +2624,14 @@ impl Optimizer {
                                 let descr = match &info {
                                     PtrInfo::VirtualStruct(v) => v.descr.clone(),
                                     PtrInfo::Virtual(v) => v.descr.clone(),
+                                    PtrInfo::Instance(v) => {
+                                        v.descr.clone().unwrap_or_else(|| virt.size_descr.clone())
+                                    }
                                     _ => continue,
                                 };
                                 let known_class = match &info {
                                     PtrInfo::Virtual(v) => v.known_class,
+                                    PtrInfo::Instance(v) => v.known_class,
                                     _ => None,
                                 };
                                 virtual_entries.push(GuardVirtualEntry {
