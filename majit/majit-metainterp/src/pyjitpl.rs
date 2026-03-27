@@ -393,9 +393,6 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
-    /// memmgr.py: MemoryManager — generation-based loop aging.
-    /// pyjitpl.py:2900: try_to_free_some_loops() calls next_generation().
-    pub(crate) memory_manager: majit_trace::memmgr::LoopAging,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -704,7 +701,6 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
-            memory_manager: majit_trace::memmgr::LoopAging::new(0),
         }
     }
 
@@ -3833,7 +3829,7 @@ impl<M: Clone> MetaInterp<M> {
     /// memory manager's generation counter. Old loops not accessed
     /// for max_age generations are candidates for eviction.
     pub fn try_to_free_some_loops(&mut self) {
-        let evicted = self.memory_manager.next_generation();
+        let evicted = self.warm_state.memory_manager.next_generation();
         for key in evicted {
             self.compiled_loops.remove(&key);
             if crate::majit_log_enabled() {

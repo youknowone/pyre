@@ -285,6 +285,9 @@ pub struct WarmEnterState {
     pureop_historylength: u32,
     /// warmstate.py: set_param_decay — counter decay factor.
     decay: u32,
+    /// warmspot.py:110: memory_manager — generation-based loop aging.
+    /// pyjitpl.py:2348: try_to_free_some_loops calls next_generation().
+    pub memory_manager: crate::memmgr::LoopAging,
 }
 
 /// Result of checking whether a green key is hot.
@@ -359,6 +362,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
             decay: 40,
+            memory_manager: crate::memmgr::LoopAging::new(0),
         }
     }
 
@@ -389,6 +393,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
             decay: 40,
+            memory_manager: crate::memmgr::LoopAging::new(0),
         }
     }
 
