@@ -175,6 +175,7 @@ pub use crate::memmgr::LoopAging;
 /// Default number of guard failures before triggering bridge compilation.
 /// PyPy default: trace_eagerness = 200
 const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
+const DEFAULT_THRESHOLD: u32 = 200;
 
 /// PyPy default: function_threshold = 1619 (prime, above threshold)
 const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
@@ -820,6 +821,42 @@ impl WarmEnterState {
         if cell.flags & jc_flags::TRACING == 0 {
             cell.state = BaseJitCellState::DontTraceHere;
         }
+    }
+
+    /// Mark a callee as currently being traced.
+    ///
+    /// This is the warm-state equivalent of PyPy's `mark_as_being_traced()`.
+    pub fn mark_as_being_traced(&mut self, callee_key: u64) {
+        let cell = self
+            .cells
+            .entry(callee_key)
+            .or_insert_with(BaseJitCell::new);
+        cell.flags |= jc_flags::TRACING;
+        if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+            cell.state = BaseJitCellState::Tracing;
+            cell.tracing_generation = self.tracing_generation;
+        }
+    }
+
+    /// Restore warm-state parameters to default values.
+    pub fn set_default_params(&mut self) {
+        self.set_threshold(DEFAULT_THRESHOLD);
+        self.set_bridge_threshold(DEFAULT_BRIDGE_THRESHOLD);
+        self.set_trace_limit(DEFAULT_TRACE_LIMIT);
+        self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD);
+        self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH);
+        self.inlining = true;
+        self.disable_unrolling_threshold = 0;
+        self.pureop_historylength = 16;
+        self.decay = 40;
+        self.max_retrace_guards = 15;
+        self.max_unroll_loops = 0;
+        self.retrace_limit = DEFAULT_RETRACE_LIMIT;
+        self.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
+        self.loop_longevity = 1000;
+        self.vec_cost = 0;
+        self.vectorize = false;
+        self.set_param_enable_opts("all");
     }
 
     /// Mirror RPython warmstate.py `mark_force_finish_tracing(greenkey)`.
