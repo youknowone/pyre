@@ -1774,6 +1774,11 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
+        // compile.py:701 handle_fail: track guard failure + tick counter.
+        // RPython's must_compile increments the per-guard counter on every
+        // failure and returns true when the threshold fires.
+        self.meta
+            .track_guard_failure(green_key, trace_id, fail_index);
         let should_bridge = self.meta.must_compile(green_key, trace_id, fail_index);
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();

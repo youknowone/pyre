@@ -4168,6 +4168,26 @@ impl<M: Clone> MetaInterp<M> {
     /// the Cranelift backend's bridge chaining path). The ST_BUSY_FLAG
     /// (compiling field) and counting infrastructure are in place for
     /// when the backend issue is resolved.
+    /// compile.py:738 handle_fail: register guard failure + tick counter.
+    /// Called on every guard failure to ensure the per-guard counter
+    /// accumulates toward the bridge compilation threshold.
+    pub fn track_guard_failure(&mut self, green_key: u64, trace_id: u64, fail_index: u32) {
+        let Some(compiled) = self.compiled_loops.get_mut(&green_key) else {
+            return;
+        };
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let info = compiled
+            .guard_failures
+            .entry((trace_id, fail_index))
+            .or_insert_with(|| GuardFailureInfo {
+                guard_hash: self.warm_state.fetch_next_hash(),
+                compiling: false,
+                per_value: None,
+                copied_from: None,
+            });
+        self.warm_state.tick_guard_failure(info.guard_hash);
+    }
+
     pub fn must_compile(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return false;
