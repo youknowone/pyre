@@ -83,6 +83,11 @@ pub(crate) struct GuardFailureInfo {
     /// the fail_arg index + type tag used to compute per-value hash.
     /// None for non-GUARD_VALUE guards (TY_NONE).
     pub(crate) per_value: Option<(u32, Type)>,
+    /// compile.py:832-843: ResumeGuardCopiedDescr — if Some, this guard
+    /// shares resume data with another guard (the "prev" descr).
+    /// Points to (trace_id, fail_index) of the original guard.
+    /// Blackhole resume should use the original's resume data.
+    pub(crate) copied_from: Option<(u64, u32)>,
 }
 
 pub(crate) struct CompiledTrace {
@@ -2965,6 +2970,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3017,6 +3023,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3065,6 +3072,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3187,6 +3195,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
@@ -3315,6 +3324,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
@@ -3381,6 +3391,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             // compile.py:783-784: jitcounter.tick(hash, increment)
             self.warm_state.tick_guard_failure(info.guard_hash);
@@ -3534,6 +3545,7 @@ impl<M: Clone> MetaInterp<M> {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
                     per_value: None,
+                    copied_from: None,
                 });
             // compile.py:741-784: must_compile — for GUARD_VALUE (per_value
             // is Some), skip tick here. Per-value tick happens in
@@ -3938,6 +3950,7 @@ impl<M: Clone> MetaInterp<M> {
                         guard_hash: self.warm_state.fetch_next_hash(),
                         compiling: false,
                         per_value: None,
+                        copied_from: None,
                     });
                 return info.guard_hash;
             }
@@ -4397,6 +4410,7 @@ impl<M: Clone> MetaInterp<M> {
                                 ^ (fail_index as u64).wrapping_mul(777767777),
                             compiling: false,
                             per_value: None,
+                            copied_from: None,
                         });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
@@ -4790,6 +4804,7 @@ impl<M: Clone> MetaInterp<M> {
                                 guard_hash: self.warm_state.fetch_next_hash(),
                                 compiling: false,
                                 per_value: None,
+                                copied_from: None,
                             });
                         if info.per_value.is_none() {
                             // compile.py:816-824: store fail_arg index + type
