@@ -3915,10 +3915,10 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         // compile.py:701-717: handle_fail applies to ALL guards.
-        // Bridge-on-bridge requires RPython's rebuild_state_after_failure
-        // (resume.py) to reconstruct box state from deadframe. Without it,
-        // bridge tracing starts from interpreter frame state which may
-        // differ from the guard's fail_args, causing incorrect bridges.
+        // Bridge-on-bridge requires rebuild_state_after_failure (resume.py)
+        // to reconstruct box state from deadframe. Until fully ported,
+        // restricted to root-loop guards where interpreter state matches
+        // fail_arg_types. TODO: remove once resume.py parity is complete.
         if trace_id != compiled.root_trace_id {
             return false;
         }
@@ -4301,7 +4301,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         _fail_values: &[i64],
-        live_types: &[Type],
+        _live_types: &[Type],
     ) -> (bool, bool) {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
@@ -4324,15 +4324,12 @@ impl<M: Clone> MetaInterp<M> {
             None => return (false, false),
         };
 
-        // resume.py: rebuild_state_after_failure produces boxes from
-        // deadframe. Bridge inputargs = those boxes. For root-loop guards,
-        // the caller's live_types match fail_arg_types. For bridge guards,
-        // they may differ — bridge-on-bridge is gated until resume.py parity.
-        let bridge_input_types = if live_types.is_empty() {
-            fail_descr.fail_arg_types()
-        } else {
-            live_types
-        };
+        // compile.py:797-811 / resume.py:1042: bridge inputargs come from
+        // rebuild_from_resumedata, which produces boxes matching the guard's
+        // fail_arg_types exactly. Always use fail_arg_types regardless of
+        // what the interpreter's live_types say — they may differ for
+        // bridge guards where the optimizer reduced the fail_args count.
+        let bridge_input_types = fail_descr.fail_arg_types();
         let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
