@@ -393,6 +393,9 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
+    /// memmgr.py: MemoryManager — generation-based loop aging.
+    /// pyjitpl.py:2900: try_to_free_some_loops() calls next_generation().
+    pub(crate) memory_manager: majit_trace::memmgr::LoopAging,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -701,6 +704,7 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
+            memory_manager: majit_trace::memmgr::LoopAging::new(0),
         }
     }
 
@@ -3825,6 +3829,19 @@ impl<M: Clone> MetaInterp<M> {
         if would { self.trace_eagerness } else { 0 }
     }
 
+    /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
+    /// memory manager's generation counter. Old loops not accessed
+    /// for max_age generations are candidates for eviction.
+    pub fn try_to_free_some_loops(&mut self) {
+        let evicted = self.memory_manager.next_generation();
+        for key in evicted {
+            self.compiled_loops.remove(&key);
+            if crate::majit_log_enabled() {
+                eprintln!("[jit][memmgr] evicted loop key={}", key);
+            }
+        }
+    }
+
     /// compile.py:826-830: get the jitcounter hash for a guard.
     /// Returns the hash allocated via store_hash (fetch_next_hash).
     /// Looks up by trace_id across all compiled loops.
@@ -4492,6 +4509,8 @@ impl<M: Clone> MetaInterp<M> {
         savedata: Option<GcRef>,
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
+        // pyjitpl.py:2900: try_to_free_some_loops
+        self.try_to_free_some_loops();
         let trace_id = self.compiled_loops.get(&green_key)?.root_trace_id;
         self.handle_guard_failure_in_trace_with_savedata(
             green_key,
