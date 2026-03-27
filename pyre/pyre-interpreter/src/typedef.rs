@@ -63,6 +63,10 @@ pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// Must be called before any py_getattr on builtin objects.
 pub fn install_builtin_typedefs() {
+    if TYPE_REGISTRY.get().is_some() {
+        return;
+    }
+
     let mut reg: HashMap<usize, usize> = HashMap::new();
 
     // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef

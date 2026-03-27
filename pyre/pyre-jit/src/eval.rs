@@ -705,6 +705,30 @@ fn bound_reached(
 /// Called at every portal entry (function call). Must be fast for the
 /// common case (no compiled code, not tracing, threshold not reached).
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
+    if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+        let code = unsafe { &*frame.code };
+        if code.obj_name.as_str() == "fannkuch" && frame.next_instr == 0 {
+            use std::sync::OnceLock;
+            static DUMPED: OnceLock<()> = OnceLock::new();
+            if DUMPED.get().is_none() {
+                let _ = DUMPED.set(());
+                let mut state = pyre_bytecode::OpArgState::default();
+                eprintln!("-- fannkuch bytecode dump --");
+                for (pc, unit) in code.instructions.iter().copied().enumerate() {
+                    let (instr, oparg) = state.get(unit);
+                    eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
+                }
+                for pc in [
+                    72usize, 99, 129, 131, 141, 155, 168, 179, 234, 245, 447, 449,
+                ] {
+                    eprintln!(
+                        "decode[{pc}] = {:?}",
+                        pyre_interpreter::decode_instruction_at(code, pc)
+                    );
+                }
+            }
+        }
+    }
     let green_key = make_green_key(frame.code, frame.next_instr);
     let (driver, info) = driver_pair();
 
@@ -1069,6 +1093,17 @@ fn restore_guard_failure_for_loop(
     exit_layout: &CompiledExitLayout,
 ) -> Option<usize> {
     if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
+            exit_layout.trace_id,
+            exit_layout.fail_index,
+            exit_layout.source_op_index,
+            exit_layout.rd_numb.as_ref().map(|v| v.len()).unwrap_or(0),
+            exit_layout.recovery_layout.is_some(),
+            exit_layout.resume_layout.is_some(),
+        );
+    }
+    if majit_metainterp::majit_log_enabled() {
         let nraw = raw_values.len();
         let slots: Vec<String> = (0..nraw)
             .map(|i| format!("{:#x}", raw_values[i] as usize))
@@ -1095,6 +1130,12 @@ fn restore_guard_failure_for_loop(
             rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
         }
     };
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit] rebuilt typed prefix: {:?}",
+            typed.iter().take(6).collect::<Vec<_>>()
+        );
+    }
     materialize_recovery_virtuals(&mut typed, raw_values, exit_layout);
     // resume.py:993-1007 _prepare_pendingfields: replay deferred
     // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
@@ -1669,8 +1710,27 @@ def fannkuch(n):
 
 r = fannkuch(6)";
         let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+            let mut state = pyre_bytecode::OpArgState::default();
+            for (pc, unit) in code.instructions.iter().copied().enumerate() {
+                let (instr, oparg) = state.get(unit);
+                eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
+            }
+            for pc in [72usize, 99, 129, 131, 141, 168, 179, 447, 449] {
+                eprintln!(
+                    "decode[{pc}] = {:?}",
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                );
+            }
+        }
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
+        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+            let mut keys: Vec<_> = unsafe { (*frame.namespace).keys().cloned().collect() };
+            keys.sort();
+            eprintln!("module result: {:?}", result);
+            eprintln!("module namespace keys: {:?}", keys);
+        }
         unsafe {
             let r = *(*frame.namespace).get("r").unwrap();
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 999);

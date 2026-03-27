@@ -25,8 +25,8 @@
 /// IR definitions: opcodes, types, values, descriptors.
 pub use majit_ir as ir;
 
-/// Optimization pipeline: 8-pass default + auxiliary passes.
-pub use majit_opt as opt;
+/// Optimization pipeline: translated RPython optimizeopt passes.
+pub use majit_metainterp::optimizeopt as opt;
 
 /// Trace recording: hot counting, recorder, warm state.
 pub use majit_trace as trace;

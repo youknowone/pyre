@@ -723,7 +723,7 @@ mod tests {
             abs,
             |callable| {
                 let func = unsafe { crate::w_builtin_func_get(callable) };
-                Ok(func(&[w_int_new(-9)]))
+                func(&[w_int_new(-9)])
             },
             |_callable| panic!("builtin callable should not take user branch"),
         )

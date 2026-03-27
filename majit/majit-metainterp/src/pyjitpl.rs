@@ -165,6 +165,28 @@ impl StoredExitLayout {
     }
 }
 
+fn snapshot_map_from_trace_snapshots(
+    trace_snapshots: &[majit_trace::recorder::Snapshot],
+) -> std::collections::HashMap<i32, Vec<majit_ir::OpRef>> {
+    trace_snapshots
+        .iter()
+        .enumerate()
+        .map(|(id, snap)| {
+            use majit_trace::recorder::SnapshotTagged;
+            let boxes: Vec<majit_ir::OpRef> = snap
+                .frames
+                .iter()
+                .flat_map(|f| f.boxes.iter())
+                .map(|t| match t {
+                    SnapshotTagged::Box(n) => majit_ir::OpRef(*n),
+                    SnapshotTagged::Const(_) | SnapshotTagged::Virtual(_) => majit_ir::OpRef::NONE,
+                })
+                .collect();
+            (id as i32, boxes)
+        })
+        .collect()
+}
+
 fn normalize_root_loop_entry_contract(
     mut inputargs: Vec<InputArg>,
     mut optimized_ops: Vec<Op>,
@@ -2100,7 +2122,10 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        let constants = ctx.constants.as_ref().clone();
+        let constants = ctx.constants.snapshot();
+        let constant_types = ctx.constants.constant_types_snapshot();
+        let trace_snapshots = ctx.recorder.snapshots().to_vec();
+        let snapshot_boxes = snapshot_map_from_trace_snapshots(&trace_snapshots);
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2138,6 +2163,8 @@ impl<M: Clone> MetaInterp<M> {
                     &bridge_ops,
                     &bridge_inputargs,
                     constants,
+                    constant_types,
+                    snapshot_boxes,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2163,6 +2190,8 @@ impl<M: Clone> MetaInterp<M> {
                     &bridge_ops,
                     &bridge_inputargs,
                     constants,
+                    constant_types,
+                    snapshot_boxes,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2284,6 +2313,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types;
+        unroll_opt.snapshot_boxes = snapshot_map_from_trace_snapshots(&trace.snapshots);
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
@@ -3013,6 +3043,7 @@ impl<M: Clone> MetaInterp<M> {
             .exit_layout
             .clone()
             .map(|layout| {
+                let trace_layout_ref = trace_layout.as_ref();
                 let mut resume_layout = trace_layout
                     .as_ref()
                     .and_then(|tl| tl.resume_layout.clone());
@@ -3024,20 +3055,21 @@ impl<M: Clone> MetaInterp<M> {
                 CompiledExitLayout {
                     trace_id,
                     fail_index: layout.fail_index,
-                    source_op_index: layout.source_op_index.or_else(|| {
-                        trace_layout
-                            .as_ref()
-                            .and_then(|layout| layout.source_op_index)
-                    }),
+                    source_op_index: layout
+                        .source_op_index
+                        .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
                     exit_types: layout.fail_arg_types,
                     is_finish: layout.is_finish,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout,
+                    recovery_layout: layout.recovery_layout.or_else(|| {
+                        trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
+                    }),
                     resume_layout,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals_info: None,
+                    rd_numb: trace_layout_ref.and_then(|layout| layout.rd_numb.clone()),
+                    rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
+                    rd_virtuals_info: trace_layout_ref
+                        .and_then(|layout| layout.rd_virtuals_info.clone()),
                 }
             })
             .or(trace_layout)
@@ -3144,6 +3176,7 @@ impl<M: Clone> MetaInterp<M> {
             .exit_layout
             .clone()
             .map(|layout| {
+                let trace_layout_ref = trace_layout.as_ref();
                 let mut resume_layout = trace_layout
                     .as_ref()
                     .and_then(|tl| tl.resume_layout.clone());
@@ -3155,20 +3188,21 @@ impl<M: Clone> MetaInterp<M> {
                 CompiledExitLayout {
                     trace_id,
                     fail_index: layout.fail_index,
-                    source_op_index: layout.source_op_index.or_else(|| {
-                        trace_layout
-                            .as_ref()
-                            .and_then(|layout| layout.source_op_index)
-                    }),
+                    source_op_index: layout
+                        .source_op_index
+                        .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
                     exit_types: layout.fail_arg_types,
                     is_finish: layout.is_finish,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout,
+                    recovery_layout: layout.recovery_layout.or_else(|| {
+                        trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
+                    }),
                     resume_layout,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals_info: None,
+                    rd_numb: trace_layout_ref.and_then(|layout| layout.rd_numb.clone()),
+                    rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
+                    rd_virtuals_info: trace_layout_ref
+                        .and_then(|layout| layout.rd_virtuals_info.clone()),
                 }
             })
             .or(trace_layout)
@@ -4029,6 +4063,8 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
+        constant_types: HashMap<u32, Type>,
+        snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -4037,6 +4073,8 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
+        optimizer.constant_types = constant_types;
+        optimizer.snapshot_boxes = snapshot_boxes;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();

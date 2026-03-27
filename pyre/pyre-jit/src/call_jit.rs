@@ -1738,6 +1738,8 @@ extern "C" fn jit_bridge_compile_callee(
             &bridge_ops,
             &bridge_inputargs,
             constants,
+            HashMap::new(),
+            HashMap::new(),
         );
     }
 
