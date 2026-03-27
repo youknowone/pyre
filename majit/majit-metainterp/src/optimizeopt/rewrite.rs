@@ -5,7 +5,20 @@
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
 
+use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
+
+/// rewrite.py: loop_invariant_results value.
+/// RPython stores PreambleOp or regular Box (AbstractResOp) directly
+/// in the dict. In Rust, we use an enum to distinguish.
+#[derive(Clone, Debug)]
+enum LoopInvariantEntry {
+    /// Regular result (already forced or body-computed).
+    Direct(OpRef),
+    /// shortpreamble.py:148-159: LoopInvariantOp.produce_op stores
+    /// PreambleOp(op, preamble_op, invented_name) in the dict.
+    Preamble(PreambleOp),
+}
 
 #[cold]
 #[inline(never)]
@@ -43,8 +56,9 @@ pub struct OptRewrite {
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
     bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
-    /// Key: function pointer (arg0 as i64), Value: result OpRef.
-    loop_invariant_results: std::collections::HashMap<i64, OpRef>,
+    /// Key: function pointer (arg0 as i64).
+    /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
+    loop_invariant_results: std::collections::HashMap<i64, LoopInvariantEntry>,
 }
 
 impl OptRewrite {
@@ -2066,30 +2080,49 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            // rewrite.py: optimize_CALL_LOOPINVARIANT_I
-            // Check loop_invariant_results cache first. If the same
-            // function pointer was already called, reuse the result.
-            // Otherwise demote to a plain CALL and cache the result.
+            // rewrite.py:448-470: optimize_CALL_LOOPINVARIANT_I
             OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN => {
-                // arg(0) is the function pointer — use as cache key
                 if let Some(func_val) = ctx.get_constant_int(op.arg(0)) {
-                    if let Some(&cached_result) = ctx.imported_loop_invariant_results.get(&func_val)
-                    {
-                        let cached_result = ctx.force_op_from_preamble(cached_result);
-                        self.loop_invariant_results.insert(func_val, cached_result);
+                    // RPython: LoopInvariantOp.produce_op stores PreambleOp
+                    // in loop_invariant_results during import. Transfer from
+                    // ctx.imported_loop_invariant_results on first access.
+                    if let Some(&imported) = ctx.imported_loop_invariant_results.get(&func_val) {
+                        if !self.loop_invariant_results.contains_key(&func_val) {
+                            // RPython shortpreamble.py:158-159
+                            let source = ctx.imported_short_source(imported);
+                            self.loop_invariant_results.insert(
+                                func_val,
+                                LoopInvariantEntry::Preamble(PreambleOp {
+                                    op: source,
+                                    resolved: imported,
+                                    invented_name: false,
+                                }),
+                            );
+                        }
                     }
-                    if let Some(&cached_result) = self.loop_invariant_results.get(&func_val) {
-                        // Cache hit: reuse previous result
+                    // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
+                    // → force_op_from_preamble → replace in dict
+                    if let Some(entry) = self.loop_invariant_results.get(&func_val).cloned() {
+                        let cached_result = match entry {
+                            LoopInvariantEntry::Preamble(ref pop) => {
+                                let forced = ctx.force_op_from_preamble(pop.resolved);
+                                self.loop_invariant_results
+                                    .insert(func_val, LoopInvariantEntry::Direct(forced));
+                                forced
+                            }
+                            LoopInvariantEntry::Direct(r) => r,
+                        };
                         let cached_result = ctx.get_replacement(cached_result);
                         ctx.replace_op(op.pos, cached_result);
                         self.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
                     // Cache miss: demote and record result
-                    self.loop_invariant_results.insert(func_val, op.pos);
+                    self.loop_invariant_results
+                        .insert(func_val, LoopInvariantEntry::Direct(op.pos));
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let mut new_op = Op::new(call_opcode, &op.args);
@@ -2146,14 +2179,18 @@ impl Optimization for OptRewrite {
     fn export_loopinvariant_results(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
             .iter()
-            .map(|(&func_ptr, &result)| (func_ptr, result))
+            .filter_map(|(&func_ptr, entry)| match entry {
+                LoopInvariantEntry::Direct(r) => Some((func_ptr, *r)),
+                LoopInvariantEntry::Preamble(pop) => Some((func_ptr, pop.resolved)),
+            })
             .collect()
     }
 
     /// rewrite.py: deserialize_optrewrite — import loopinvariant results.
     fn import_loopinvariant_results(&mut self, entries: &[(i64, OpRef)]) {
         for &(func_ptr, result) in entries {
-            self.loop_invariant_results.insert(func_ptr, result);
+            self.loop_invariant_results
+                .insert(func_ptr, LoopInvariantEntry::Direct(result));
         }
     }
 }
