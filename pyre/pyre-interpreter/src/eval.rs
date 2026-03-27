@@ -678,10 +678,10 @@ impl OpcodeStepExecutor for PyFrame {
                 unsafe {
                     if pyre_object::is_exception(exc) {
                         Err(PyError::from_exc_object(exc))
-                    } else if crate::is_builtin_func(exc) {
+                    } else if crate::is_builtin_code(exc) {
                         // raise TypeError → call TypeError() to create instance
                         // PyPy: RAISE_VARARGS calls type to create exception instance
-                        let func = crate::w_builtin_func_get(exc);
+                        let func = crate::builtin_code_get(exc);
                         match func(&[]) {
                             Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
                                 Err(PyError::from_exc_object(exc_obj))
@@ -866,7 +866,7 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.13: copy n freevars from function closure to frame cell slots
     fn copy_free_vars(&mut self, _count: usize) -> Result<(), Self::Error> {
         // Phase 1: no-op — closure passing needs call-site integration
-        // The closure tuple is on the W_FunctionObject, but COPY_FREE_VARS
+        // The closure tuple is on the Function, but COPY_FREE_VARS
         // runs inside the callee frame which doesn't have a reference to
         // the function object. Need to pass closure during frame creation.
         Ok(())
@@ -887,13 +887,13 @@ impl OpcodeStepExecutor for PyFrame {
         let attr = self.pop(); // TOS1 = attribute value (closure tuple etc.)
         match flag {
             MakeFunctionFlag::Closure => unsafe {
-                crate::w_func_set_closure(func, attr);
+                crate::function_set_closure(func, attr);
             },
             MakeFunctionFlag::Defaults => unsafe {
-                crate::w_func_set_defaults(func, attr);
+                crate::function_set_defaults(func, attr);
             },
             MakeFunctionFlag::KwOnlyDefaults => unsafe {
-                crate::w_func_set_kwdefaults(func, attr);
+                crate::function_set_kwdefaults(func, attr);
             },
             _ => {} // annotations, etc.
         }
@@ -929,8 +929,8 @@ impl OpcodeStepExecutor for PyFrame {
                 if pyre_object::is_str(exc_type) {
                     let type_name = pyre_object::w_str_get_value(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
-                } else if crate::is_builtin_func(exc_type) {
-                    let type_name = crate::w_builtin_func_name(exc_type);
+                } else if crate::is_builtin_code(exc_type) {
+                    let type_name = crate::builtin_code_name(exc_type);
                     pyre_object::exc_kind_matches(kind, type_name)
                 } else {
                     true
@@ -1289,7 +1289,7 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
-                    Some(d) if crate::is_builtin_func(d) => PY_NULL,
+                    Some(d) if crate::is_builtin_code(d) => PY_NULL,
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {
                         // Not found in type MRO → found in instance __dict__.
@@ -1297,7 +1297,11 @@ impl OpcodeStepExecutor for PyFrame {
                         // User functions in instance dict: no binding.
                         // Builtin functions stored per-instance (e.g. set methods
                         // stored via ATTR_TABLE): bind self.
-                        if crate::is_func(attr) { PY_NULL } else { obj }
+                        if crate::is_function(attr) {
+                            PY_NULL
+                        } else {
+                            obj
+                        }
                     }
                 }
             } else if pyre_object::is_type(obj) {
@@ -1409,7 +1413,7 @@ impl OpcodeStepExecutor for PyFrame {
         // Resolve keyword args into positional order.
         // PyPy: argument.py _match_signature step: match keywords to argnames
         let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
-        let resolved = if unsafe { crate::is_builtin_func(callable_unwrapped) } {
+        let resolved = if unsafe { crate::is_builtin_code(callable_unwrapped) } {
             // Builtin functions: pack kwargs into a dict as last arg
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
                 unsafe { pyre_object::w_tuple_len(kwarg_names) }
@@ -1710,7 +1714,7 @@ impl OpcodeStepExecutor for PyFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PyExecutionContext, w_func_new};
+    use crate::{PyExecutionContext, function_new};
     use pyre_bytecode::*;
     use std::rc::Rc;
 

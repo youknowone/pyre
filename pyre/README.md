@@ -36,7 +36,7 @@ cargo build --release -p pyrex
 
 pyre follows PyPy's meta-tracing approach:
 
-1. The **interpreter** (`pyre-interp`) executes Python bytecodes normally.
+1. The **interpreter** (`pyre-interpreter`) executes Python bytecodes normally.
 2. When a loop or function becomes hot, **majit** records the interpreter's execution as a linear trace of IR operations.
 3. The trace passes through an **8-pass optimizer** — the same pipeline as PyPy: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap.
 4. The optimized IR is compiled to **native machine code** via Cranelift.
@@ -56,9 +56,7 @@ pyre has no Global Interpreter Lock. RPython/PyPy features that depend on the GI
 pyre/
 ├── pyre-object      # Python object types (W_IntObject, W_FloatObject, W_ListObject, ...)
 ├── pyre-bytecode    # Bytecode definitions (re-exports RustPython compiler-core)
-├── pyre-objspace    # Object space — type coercion, arithmetic, comparisons
-├── pyre-runtime     # Opcode dispatch and runtime operations
-├── pyre-interp      # Interpreter frame and eval loop
+├── pyre-interpreter # Object space, interpreter frame, eval loop, opcode dispatch
 ├── pyre-jit         # JIT integration — trace recording, call bridges, inlining
 └── pyrex            # Executable entry point (builds the `pyre` binary)
 ```

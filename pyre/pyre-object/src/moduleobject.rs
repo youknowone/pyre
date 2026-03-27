@@ -13,8 +13,8 @@ use crate::pyobject::*;
 ///
 /// Layout: `[ob_type | name: *mut String | dict: *mut u8]`
 ///
-/// `dict` is a raw pointer to a `PyNamespace` (from pyre-runtime).
-/// We store it as `*mut u8` to avoid a circular dependency on pyre-runtime.
+/// `dict` is a raw pointer to a `PyNamespace` (from pyre-interpreter).
+/// We store it as `*mut u8` to avoid a circular dependency on pyre-interpreter.
 #[repr(C)]
 pub struct W_ModuleObject {
     pub ob_header: PyObject,

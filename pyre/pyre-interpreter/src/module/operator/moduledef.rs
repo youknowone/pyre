@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/module/operator/
 
-use crate::{PyNamespace, namespace_store, w_builtin_func_new};
+use crate::{PyNamespace, builtin_code_new, namespace_store};
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -60,31 +60,31 @@ fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 pub fn init(ns: &mut PyNamespace) {
-    namespace_store(ns, "index", w_builtin_func_new("index", op_index));
-    namespace_store(ns, "add", w_builtin_func_new("add", op_add));
-    namespace_store(ns, "sub", w_builtin_func_new("sub", op_sub));
-    namespace_store(ns, "mul", w_builtin_func_new("mul", op_mul));
-    namespace_store(ns, "eq", w_builtin_func_new("eq", op_eq));
-    namespace_store(ns, "lt", w_builtin_func_new("lt", op_lt));
-    namespace_store(ns, "gt", w_builtin_func_new("gt", op_gt));
+    namespace_store(ns, "index", builtin_code_new("index", op_index));
+    namespace_store(ns, "add", builtin_code_new("add", op_add));
+    namespace_store(ns, "sub", builtin_code_new("sub", op_sub));
+    namespace_store(ns, "mul", builtin_code_new("mul", op_mul));
+    namespace_store(ns, "eq", builtin_code_new("eq", op_eq));
+    namespace_store(ns, "lt", builtin_code_new("lt", op_lt));
+    namespace_store(ns, "gt", builtin_code_new("gt", op_gt));
     namespace_store(
         ns,
         "le",
-        w_builtin_func_new("le", |args| {
+        builtin_code_new("le", |args| {
             crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
         }),
     );
     namespace_store(
         ns,
         "ge",
-        w_builtin_func_new("ge", |args| {
+        builtin_code_new("ge", |args| {
             crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
         }),
     );
     namespace_store(
         ns,
         "ne",
-        w_builtin_func_new("ne", |args| {
+        builtin_code_new("ne", |args| {
             crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Ne)
         }),
     );
@@ -92,7 +92,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "itemgetter",
-        w_builtin_func_new("itemgetter", |args| {
+        builtin_code_new("itemgetter", |args| {
             // itemgetter(key) → lambda obj: obj[key]
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
@@ -100,21 +100,21 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "attrgetter",
-        w_builtin_func_new("attrgetter", |args| {
+        builtin_code_new("attrgetter", |args| {
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
     );
     namespace_store(
         ns,
         "methodcaller",
-        w_builtin_func_new("methodcaller", |args| {
+        builtin_code_new("methodcaller", |args| {
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
     );
     namespace_store(
         ns,
         "length_hint",
-        w_builtin_func_new("length_hint", |args| {
+        builtin_code_new("length_hint", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }

@@ -54,7 +54,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "_getframe",
-        crate::w_builtin_func_new("_getframe", |_| {
+        crate::builtin_code_new("_getframe", |_| {
             let frame_type = crate::typedef::get_object_type();
             let frame = pyre_object::w_instance_new(frame_type);
             let _ = crate::baseobjspace::py_setattr(frame, "f_locals", w_dict_new());
@@ -69,7 +69,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "exc_info",
-        crate::w_builtin_func_new("exc_info", |_| {
+        crate::builtin_code_new("exc_info", |_| {
             Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
         }),
     );
@@ -103,24 +103,24 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "getdefaultencoding",
-        crate::w_builtin_func_new("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
+        crate::builtin_code_new("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
     );
     // sys.getrecursionlimit / setrecursionlimit
     namespace_store(
         ns,
         "getrecursionlimit",
-        crate::w_builtin_func_new("getrecursionlimit", |_| Ok(w_int_new(1000))),
+        crate::builtin_code_new("getrecursionlimit", |_| Ok(w_int_new(1000))),
     );
     namespace_store(
         ns,
         "setrecursionlimit",
-        crate::w_builtin_func_new("setrecursionlimit", |_| Ok(w_none())),
+        crate::builtin_code_new("setrecursionlimit", |_| Ok(w_none())),
     );
     // sys.intern
     namespace_store(
         ns,
         "intern",
-        crate::w_builtin_func_new("intern", |args| {
+        crate::builtin_code_new("intern", |args| {
             Ok(if args.is_empty() {
                 w_str_new("")
             } else {
@@ -151,6 +151,6 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "addaudithook",
-        crate::w_builtin_func_new("addaudithook", |_| Ok(w_none())),
+        crate::builtin_code_new("addaudithook", |_| Ok(w_none())),
     );
 }

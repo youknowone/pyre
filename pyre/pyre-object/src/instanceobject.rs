@@ -4,7 +4,7 @@
 //!
 //! An instance holds a pointer to its W_TypeObject (class).
 //! Per-instance attributes are stored in the thread-local ATTR_TABLE
-//! side table (pyre-objspace), matching PyPy's instance __dict__.
+//! side table, matching PyPy's instance __dict__.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 

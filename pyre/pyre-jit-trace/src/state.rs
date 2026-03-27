@@ -174,8 +174,8 @@ use pyre_interpreter::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
     PyError, PyNamespace, PyObjectArray, SharedOpcodeHandler, StackOpcodeHandler,
-    TruthOpcodeHandler, decode_instruction_at, execute_opcode_step, is_builtin_func, is_func,
-    range_iter_continues, w_builtin_func_name, w_func_get_code_ptr, w_func_get_globals,
+    TruthOpcodeHandler, builtin_code_name, decode_instruction_at, execute_opcode_step,
+    function_get_code, function_get_globals, is_builtin_code, is_function, range_iter_continues,
 };
 
 use crate::descr::{
@@ -3678,8 +3678,8 @@ impl MIFrame {
         }
 
         unsafe {
-            if is_builtin_func(concrete_callable) {
-                let builtin_name = w_builtin_func_name(concrete_callable);
+            if is_builtin_code(concrete_callable) {
+                let builtin_name = builtin_code_name(concrete_callable);
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {
@@ -3725,8 +3725,8 @@ impl MIFrame {
                     crate::helpers::emit_trace_call_known_builtin(ctx, callable, &boxed_args)
                 });
             }
-            if is_func(concrete_callable) {
-                let callee_code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
+            if is_function(concrete_callable) {
+                let callee_code_ptr = function_get_code(concrete_callable) as *const CodeObject;
                 let callee_key = crate::driver::make_green_key(callee_code_ptr, 0);
                 let callee_code = unsafe { &*callee_code_ptr };
                 let callee_has_loop = code_has_backward_jump(callee_code);
@@ -3906,7 +3906,7 @@ impl MIFrame {
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
                     let callee_nlocals = {
-                        let code_ptr = w_func_get_code_ptr(concrete_callable) as *const CodeObject;
+                        let code_ptr = function_get_code(concrete_callable) as *const CodeObject;
                         (&*code_ptr).varnames.len()
                     };
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
@@ -4222,9 +4222,9 @@ impl MIFrame {
         let caller_code = self.sym().concrete_code;
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
-        let code_ptr = unsafe { w_func_get_code_ptr(concrete_callable) } as *const CodeObject;
-        let globals = unsafe { w_func_get_globals(concrete_callable) };
-        let closure = unsafe { pyre_interpreter::w_func_get_closure(concrete_callable) };
+        let code_ptr = unsafe { function_get_code(concrete_callable) } as *const CodeObject;
+        let globals = unsafe { function_get_globals(concrete_callable) };
+        let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             code_ptr,
@@ -4238,7 +4238,7 @@ impl MIFrame {
         let callee_code = unsafe { &*callee_frame.code };
         let callee_nlocals = callee_code.varnames.len();
         let caller_namespace = caller_namespace_ptr;
-        let callee_globals = unsafe { w_func_get_globals(concrete_callable) };
+        let callee_globals = unsafe { function_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
             && callee_globals == caller_namespace
             && callee_nlocals == args.len();
@@ -4412,7 +4412,7 @@ impl MIFrame {
                         let callee_frame =
                             ctx.call_ref_typed(helper, &[this.frame(), raw_arg], &helper_arg_types);
                         let callee_nlocals = unsafe {
-                            let code_ptr = w_func_get_code_ptr(concrete_callable)
+                            let code_ptr = function_get_code(concrete_callable)
                                 as *const pyre_bytecode::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
@@ -5263,11 +5263,11 @@ impl SharedOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         if !concrete_callable.is_null() && concrete_args.iter().all(|v| !v.is_null()) {
             unsafe {
-                if pyre_interpreter::is_builtin_func(concrete_callable) {
-                    let func = pyre_interpreter::w_builtin_func_get(concrete_callable);
+                if pyre_interpreter::is_builtin_code(concrete_callable) {
+                    let func = pyre_interpreter::builtin_code_get(concrete_callable);
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = ConcreteValue::from_pyobj(result);
-                } else if pyre_interpreter::is_func(concrete_callable) {
+                } else if pyre_interpreter::is_function(concrete_callable) {
                     use std::cell::Cell;
                     thread_local! {
                         static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
@@ -6109,8 +6109,8 @@ impl OpcodeStepExecutor for MIFrame {
                     if pyre_object::is_str(exc_type_obj) {
                         let type_name = pyre_object::w_str_get_value(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
-                    } else if pyre_interpreter::is_builtin_func(exc_type_obj) {
-                        let type_name = pyre_interpreter::w_builtin_func_name(exc_type_obj);
+                    } else if pyre_interpreter::is_builtin_code(exc_type_obj) {
+                        let type_name = pyre_interpreter::builtin_code_name(exc_type_obj);
                         pyre_object::exc_kind_matches(kind, type_name)
                     } else {
                         true // unrecognized type format → match
@@ -8836,7 +8836,7 @@ mod tests {
 //
 // The shared frame layout contract now also lives in `pyre-jit/src/frame_layout.rs`
 // so the tracer can compute the same offsets without depending on
-// `pyre-interp`. Driver registration still happens in `pyre-interp/src/eval.rs`.
+// `pyre-interpreter`. Driver registration still happens in `pyre-jit/src/eval.rs`.
 
 pub struct PendingInlineFrame {
     pub sym: PyreSym,

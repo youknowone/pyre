@@ -10,8 +10,8 @@ use pyre_object::{
 };
 
 use crate::{
-    PyError, PyErrorKind, PyNamespace, is_builtin_func, is_func, w_builtin_func_get,
-    w_code_get_ptr, w_func_get_code_ptr, w_func_new,
+    PyError, PyErrorKind, PyNamespace, builtin_code_get, function_get_code, function_new,
+    is_builtin_code, is_function, w_code_get_ptr,
 };
 
 pub fn make_function_from_code_obj(
@@ -20,7 +20,7 @@ pub fn make_function_from_code_obj(
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
-    w_func_new(code_ptr, code.qualname.to_string(), globals)
+    function_new(code_ptr, code.qualname.to_string(), globals)
 }
 
 fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
@@ -81,7 +81,7 @@ pub fn register_jit_function_caller(caller: JitFunctionCaller) {
 fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     let callable = callable as PyObjectRef;
     unsafe {
-        let func = w_builtin_func_get(callable);
+        let func = builtin_code_get(callable);
         let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
         match func(arg_slice) {
             Ok(result) => result as i64,
@@ -93,7 +93,7 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
 fn call_user_function_with_args(frame_ptr: i64, callable: i64, args: &[i64]) -> i64 {
     let Some(caller) = JIT_FUNCTION_CALLER.get().copied() else {
         let callable = callable as PyObjectRef;
-        let code_ptr = unsafe { w_func_get_code_ptr(callable) };
+        let code_ptr = unsafe { function_get_code(callable) };
         panic!("jit function caller bridge is not installed for code_ptr={code_ptr:p}");
     };
     caller(frame_ptr, callable, args.as_ptr(), args.len() as i64)
@@ -248,9 +248,9 @@ where
     FUser: FnOnce(PyObjectRef) -> Result<R, PyError>,
 {
     unsafe {
-        if is_builtin_func(callable) {
+        if is_builtin_code(callable) {
             on_builtin(callable)
-        } else if is_func(callable) {
+        } else if is_function(callable) {
             on_user(callable)
         } else {
             Err(PyError::type_error(format!(
@@ -765,7 +765,7 @@ mod tests {
         let result = dispatch_callable(
             abs,
             |callable| {
-                let func = unsafe { crate::w_builtin_func_get(callable) };
+                let func = unsafe { crate::builtin_code_get(callable) };
                 func(&[w_int_new(-9)])
             },
             |_callable| panic!("builtin callable should not take user branch"),

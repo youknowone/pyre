@@ -25,7 +25,7 @@ pub struct W_TypeObject {
     pub name: *mut String,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
-    /// Raw pointer to the class namespace (PyNamespace from pyre-runtime).
+    /// Raw pointer to the class namespace (PyNamespace from pyre-interpreter).
     pub dict: *mut u8,
     /// Cached C3 MRO — PyPy: W_TypeObject.mro_w.
     /// Computed once at type creation and cached.

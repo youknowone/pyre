@@ -1566,7 +1566,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if pyre_object::generatorobject::is_generator(obj) {
             match name {
                 "close" | "send" | "throw" | "__next__" | "__iter__" => {
-                    return Ok(crate::w_builtin_func_new("gen_method", gen_stub_method));
+                    return Ok(crate::builtin_code_new("gen_method", gen_stub_method));
                 }
                 _ => {}
             }
@@ -1631,7 +1631,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
 
             // Step 4: non-data descriptor
             if let Some(descr) = w_descr {
-                if crate::is_builtin_func(descr) {
+                if crate::is_builtin_code(descr) {
                     return Ok(descr);
                 }
                 if let Some(result) = call_descriptor_get(descr, obj, w_type) {
@@ -1755,7 +1755,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
     if let Some(type_obj) = crate::typedef::type_of(obj) {
         if let Some(method) = unsafe { lookup_in_type_mro(type_obj, name) } {
-            if unsafe { crate::is_builtin_func(method) } {
+            if unsafe { crate::is_builtin_code(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, type_obj));
             }
             if let Some(result) = unsafe { call_descriptor_get(method, obj, type_obj) } {
@@ -1767,7 +1767,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
 
     // Function object attributes — PyPy: funcobject.py W_Function
     // Check ATTR_TABLE first (for dynamically set attrs like __name__, __doc__)
-    if unsafe { crate::is_func(obj) || crate::is_builtin_func(obj) } {
+    if unsafe { crate::is_function(obj) || crate::is_builtin_code(obj) } {
         let found = ATTR_TABLE.with(|table| {
             table
                 .borrow()
@@ -1779,28 +1779,28 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
     unsafe {
-        if crate::is_func(obj) {
+        if crate::is_function(obj) {
             match name {
                 "__code__" => {
                     let code_ptr =
-                        crate::w_func_get_code_ptr(obj) as *const pyre_bytecode::CodeObject;
+                        crate::function_get_code(obj) as *const pyre_bytecode::CodeObject;
                     if code_ptr.is_null() {
                         return Ok(w_none());
                     }
                     return Ok(crate::pycode::box_code_constant(&*code_ptr));
                 }
                 "__name__" => {
-                    return Ok(w_str_new(crate::w_func_get_name(obj)));
+                    return Ok(w_str_new(crate::function_get_name(obj)));
                 }
                 "__closure__" => {
-                    let closure = crate::w_func_get_closure(obj);
+                    let closure = crate::function_get_closure(obj);
                     return Ok(if closure.is_null() { w_none() } else { closure });
                 }
                 "__globals__" => {
-                    return Ok(namespace_to_dict(crate::w_func_get_globals(obj)));
+                    return Ok(namespace_to_dict(crate::function_get_globals(obj)));
                 }
                 "__defaults__" => {
-                    let defaults = crate::w_func_get_defaults(obj);
+                    let defaults = crate::function_get_defaults(obj);
                     return Ok(if defaults.is_null() {
                         w_none()
                     } else {
@@ -1808,7 +1808,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     });
                 }
                 "__kwdefaults__" => {
-                    let kwdefaults = crate::w_func_get_kwdefaults(obj);
+                    let kwdefaults = crate::function_get_kwdefaults(obj);
                     return Ok(if kwdefaults.is_null() {
                         w_none()
                     } else {
@@ -1826,11 +1826,11 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                         return Ok(value);
                     }
                     let code_ptr =
-                        crate::w_func_get_code_ptr(obj) as *const pyre_bytecode::CodeObject;
+                        crate::function_get_code(obj) as *const pyre_bytecode::CodeObject;
                     if !code_ptr.is_null() {
                         return Ok(w_str_new((*code_ptr).qualname.as_ref()));
                     }
-                    return Ok(w_str_new(crate::w_func_get_name(obj)));
+                    return Ok(w_str_new(crate::function_get_name(obj)));
                 }
                 _ => {}
             }

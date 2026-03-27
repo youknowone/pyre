@@ -7,24 +7,24 @@
 //! import machinery (importing.rs), builtin functions (builtins.rs),
 //! type definitions (typedef.rs), and builtin modules (module/).
 
-// ── Former pyre-runtime modules ──
+// ── Core interpreter modules ──
 pub mod baseobjspace;
-pub mod builtinfunc;
 pub mod builtins;
 pub mod display;
 pub mod error;
 pub mod executioncontext;
 pub mod frame_array;
-pub mod funcobject;
+pub mod function;
+pub mod gateway;
 pub mod opcode_ops;
-pub mod opcode_step;
 pub mod pycode;
+pub mod pyopcode;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod type_methods;
 pub mod typedef;
 
-// ── Former pyre-interp modules ──
+// ── Execution and import modules ──
 pub mod call;
 pub mod eval;
 pub mod importing;
@@ -33,18 +33,18 @@ pub mod pyframe;
 
 // ── Re-exports ──
 pub use baseobjspace::*;
-pub use builtinfunc::*;
 pub use builtins::*;
 pub use display::*;
 pub use error::*;
 pub use executioncontext::*;
 pub use frame_array::*;
-pub use funcobject::*;
+pub use function::*;
+pub use gateway::*;
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
-pub use opcode_step::*;
 pub use pycode::*;
 pub use pyframe::*;
+pub use pyopcode::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
 

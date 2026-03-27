@@ -3,23 +3,21 @@ mod call_spec;
 #[path = "src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
-/// Build script for pyre-jit: runs majit-analyze on the ENTIRE pyre
+/// Build script for pyre-jit: runs majit-analyze on the active pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
 ///
 /// Analyzes all source files from:
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
-/// - pyre-runtime (opcode step, shared handlers, runtime ops)
-/// - pyre-interp (PyFrame, eval loop, JIT hints)
+/// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let pyre_base = format!("{manifest_dir}/..");
 
-    // Collect ALL source files from the pyre interpreter crates
+    // Collect ALL source files from the active interpreter crates.
     let source_dirs = [
         format!("{pyre_base}/pyre-object/src"),
-        format!("{pyre_base}/pyre-runtime/src"),
-        format!("{pyre_base}/pyre-interp/src"),
+        format!("{pyre_base}/pyre-interpreter/src"),
     ];
 
     let mut sources = Vec::new();

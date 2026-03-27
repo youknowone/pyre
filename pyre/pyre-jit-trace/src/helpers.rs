@@ -1,7 +1,7 @@
 //! JIT helper functions — `extern "C"` wrappers called from compiled traces.
 //!
 //! The JIT backend (Cranelift) emits C-ABI calls to these functions.
-//! Each wraps a pyre-object or pyre-objspace operation with the
+//! Each wraps a pyre-object or pyre-interpreter operation with the
 //! correct calling convention and integer-based parameter passing.
 
 use majit_ir::{OpCode, OpRef, Type};
@@ -621,8 +621,8 @@ mod tests {
         let func = jit_make_function_from_globals(0, code_obj as i64) as PyObjectRef;
 
         unsafe {
-            assert!(pyre_interpreter::is_func(func));
-            assert_eq!(pyre_interpreter::w_func_get_code_ptr(func), code_ptr);
+            assert!(pyre_interpreter::is_function(func));
+            assert_eq!(pyre_interpreter::function_get_code(func), code_ptr);
         }
     }
 

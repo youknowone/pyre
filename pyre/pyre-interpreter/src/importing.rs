@@ -57,9 +57,9 @@ pub fn install_builtin_modules() {
     register_builtin_module("sys", crate::module::sys::moduledef::init);
     register_builtin_module("operator", crate::module::operator::moduledef::init);
     register_builtin_module("_operator", crate::module::operator::moduledef::init);
-    register_builtin_module("builtins", crate::module::builtins_mod::moduledef::init);
-    register_builtin_module("_io", crate::module::io_mod::moduledef::init);
-    register_builtin_module("_sre", crate::module::sre_mod::moduledef::init);
+    register_builtin_module("builtins", crate::module::__builtin__::moduledef::init);
+    register_builtin_module("_io", crate::module::_io::moduledef::init);
+    register_builtin_module("_sre", crate::module::_sre::moduledef::init);
 
     // Minimal C-extension stubs required for stdlib import chains.
     // PyPy: these are all implemented as mixed modules under pypy/module/.
@@ -123,7 +123,7 @@ fn init_collections_abc(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "_check_methods",
-        crate::w_builtin_func_new("_check_methods", |args| {
+        crate::builtin_code_new("_check_methods", |args| {
             // args[0] = C (class), args[1..] = method names
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(true));
@@ -179,7 +179,7 @@ fn init_itertools(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "chain",
-        crate::w_builtin_func_new("chain", |args| {
+        crate::builtin_code_new("chain", |args| {
             let mut items = Vec::new();
             for &arg in args {
                 items.extend(crate::builtins::collect_iterable_pub(arg)?);
@@ -193,31 +193,31 @@ fn init_itertools(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "starmap",
-        crate::w_builtin_func_new("starmap", |_| Ok(pyre_object::w_list_new(vec![]))),
+        crate::builtin_code_new("starmap", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     // count(start=0, step=1)
     crate::namespace_store(
         ns,
         "count",
-        crate::w_builtin_func_new("count", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("count", |_| Ok(pyre_object::w_none())),
     );
     // repeat
     crate::namespace_store(
         ns,
         "repeat",
-        crate::w_builtin_func_new("repeat", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("repeat", |_| Ok(pyre_object::w_none())),
     );
     // islice
     crate::namespace_store(
         ns,
         "islice",
-        crate::w_builtin_func_new("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
+        crate::builtin_code_new("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     // groupby
     crate::namespace_store(
         ns,
         "groupby",
-        crate::w_builtin_func_new("groupby", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("groupby", |_| Ok(pyre_object::w_none())),
     );
 }
 
@@ -227,7 +227,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "ContextVar",
-        crate::w_builtin_func_new("ContextVar", |args| {
+        crate::builtin_code_new("ContextVar", |args| {
             // Return stub object with get/set methods
             let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
             if !args.is_empty() {
@@ -237,7 +237,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
             let _ = crate::baseobjspace::py_setattr(
                 obj,
                 "get",
-                crate::w_builtin_func_new("get", |args| {
+                crate::builtin_code_new("get", |args| {
                     // Return default if provided
                     if args.len() > 1 {
                         Ok(args[1])
@@ -249,7 +249,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
             let _ = crate::baseobjspace::py_setattr(
                 obj,
                 "set",
-                crate::w_builtin_func_new("set", |_| Ok(pyre_object::w_none())),
+                crate::builtin_code_new("set", |_| Ok(pyre_object::w_none())),
             );
             Ok(obj)
         }),
@@ -257,17 +257,17 @@ fn init_contextvars(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "Context",
-        crate::w_builtin_func_new("Context", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("Context", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "Token",
-        crate::w_builtin_func_new("Token", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("Token", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "copy_context",
-        crate::w_builtin_func_new("copy_context", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("copy_context", |_| Ok(pyre_object::w_none())),
     );
 }
 
@@ -277,7 +277,7 @@ fn init_weakref(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "ref",
-        crate::w_builtin_func_new("ref", |args| {
+        crate::builtin_code_new("ref", |args| {
             Ok(if args.is_empty() {
                 pyre_object::w_none()
             } else {
@@ -288,7 +288,7 @@ fn init_weakref(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "proxy",
-        crate::w_builtin_func_new("proxy", |args| {
+        crate::builtin_code_new("proxy", |args| {
             Ok(if args.is_empty() {
                 pyre_object::w_none()
             } else {
@@ -299,12 +299,12 @@ fn init_weakref(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "getweakrefcount",
-        crate::w_builtin_func_new("getweakrefcount", |_| Ok(pyre_object::w_int_new(0))),
+        crate::builtin_code_new("getweakrefcount", |_| Ok(pyre_object::w_int_new(0))),
     );
     crate::namespace_store(
         ns,
         "getweakrefs",
-        crate::w_builtin_func_new("getweakrefs", |_| Ok(pyre_object::w_list_new(vec![]))),
+        crate::builtin_code_new("getweakrefs", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
 }
 
@@ -313,46 +313,46 @@ fn init_abc(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "get_cache_token",
-        crate::w_builtin_func_new("get_cache_token", |_| Ok(pyre_object::w_int_new(0))),
+        crate::builtin_code_new("get_cache_token", |_| Ok(pyre_object::w_int_new(0))),
     );
     crate::namespace_store(
         ns,
         "_abc_init",
-        crate::w_builtin_func_new("_abc_init", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("_abc_init", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "_abc_register",
-        crate::w_builtin_func_new("_abc_register", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("_abc_register", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "_abc_instancecheck",
-        crate::w_builtin_func_new("_abc_instancecheck", |_args| {
+        crate::builtin_code_new("_abc_instancecheck", |_args| {
             Ok(pyre_object::w_bool_from(false))
         }),
     );
     crate::namespace_store(
         ns,
         "_abc_subclasscheck",
-        crate::w_builtin_func_new("_abc_subclasscheck", |_args| {
+        crate::builtin_code_new("_abc_subclasscheck", |_args| {
             Ok(pyre_object::w_bool_from(false))
         }),
     );
     crate::namespace_store(
         ns,
         "_get_dump",
-        crate::w_builtin_func_new("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![]))),
+        crate::builtin_code_new("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![]))),
     );
     crate::namespace_store(
         ns,
         "_reset_registry",
-        crate::w_builtin_func_new("_reset_registry", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("_reset_registry", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "_reset_caches",
-        crate::w_builtin_func_new("_reset_caches", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("_reset_caches", |_| Ok(pyre_object::w_none())),
     );
 }
 
@@ -361,14 +361,14 @@ fn init_functools(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "reduce",
-        crate::w_builtin_func_new("reduce", |_| {
+        crate::builtin_code_new("reduce", |_| {
             Err(crate::PyError::type_error("reduce not implemented"))
         }),
     );
     crate::namespace_store(
         ns,
         "cmp_to_key",
-        crate::w_builtin_func_new("cmp_to_key", |_| {
+        crate::builtin_code_new("cmp_to_key", |_| {
             Err(crate::PyError::type_error("cmp_to_key not implemented"))
         }),
     );
@@ -379,27 +379,27 @@ fn init_thread(ns: &mut PyNamespace) {
     crate::namespace_store(
         ns,
         "allocate_lock",
-        crate::w_builtin_func_new("allocate_lock", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("allocate_lock", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "LockType",
-        crate::w_builtin_func_new("LockType", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("LockType", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "RLock",
-        crate::w_builtin_func_new("RLock", |_| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("RLock", |_| Ok(pyre_object::w_none())),
     );
     crate::namespace_store(
         ns,
         "get_ident",
-        crate::w_builtin_func_new("get_ident", |_| Ok(pyre_object::w_int_new(1))),
+        crate::builtin_code_new("get_ident", |_| Ok(pyre_object::w_int_new(1))),
     );
     crate::namespace_store(
         ns,
         "_count",
-        crate::w_builtin_func_new("_count", |_| Ok(pyre_object::w_int_new(1))),
+        crate::builtin_code_new("_count", |_| Ok(pyre_object::w_int_new(1))),
     );
 }
 
