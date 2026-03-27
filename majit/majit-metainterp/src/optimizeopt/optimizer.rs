@@ -2542,7 +2542,6 @@ impl Optimizer {
                 // automatically via set_forwarded. In pyre, use body
                 // label args to find the current Phase 2 OpRef.
                 if !virtual_entries.iter().any(|e| e.fail_arg_index == fa_idx) {
-                    // Body label args map frame slots to Phase 2 OpRefs.
                     let label_ref = ctx
                         .imported_label_args
                         .as_ref()
@@ -2551,35 +2550,12 @@ impl Optimizer {
                     if let Some(resolved) = resolved {
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
                             if info.is_virtual() {
-                                let base_idx = original_len + extra_fail_args.len();
-                                let fields_vec = match &info {
-                                    PtrInfo::VirtualStruct(v) => &v.fields,
-                                    PtrInfo::Virtual(v) => &v.fields,
-                                    _ => continue,
-                                };
-                                let mut fields = Vec::new();
-                                for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
-                                    let rv = ctx.get_replacement(*vref);
-                                    extra_fail_args.push(rv);
-                                    fields.push((*fidx, base_idx + i));
+                                if let Some(entry) = Self::encode_virtual_for_guard(
+                                    &info, fa_idx, original_len, &mut extra_fail_args, ctx,
+                                ) {
+                                    virtual_entries.push(entry);
                                 }
-                                let descr = match &info {
-                                    PtrInfo::VirtualStruct(v) => v.descr.clone(),
-                                    PtrInfo::Virtual(v) => v.descr.clone(),
-                                    _ => continue,
-                                };
-                                let known_class = match &info {
-                                    PtrInfo::Virtual(v) => v.known_class,
-                                    _ => None,
-                                };
-                                virtual_entries.push(GuardVirtualEntry {
-                                    fail_arg_index: fa_idx,
-                                    descr,
-                                    known_class,
-                                    fields,
-                                });
                             } else {
-                                // Not virtual — resolve to concrete value.
                                 fail_args[fa_idx] = resolved;
                             }
                         }
@@ -2598,73 +2574,14 @@ impl Optimizer {
                 continue;
             }
 
-            // Encode virtual metadata
-            match &info {
-                PtrInfo::Virtual(vinfo) => {
-                    let mut fields = Vec::with_capacity(vinfo.fields.len());
-                    for &(field_idx, value_ref) in &vinfo.fields {
-                        let mut final_ref = ctx.get_replacement(value_ref);
-                        // Nested virtual field values must be forced to concrete.
-                        if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                            if nested.is_virtual() {
-                                let mut nested_mut = nested;
-                                let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
-                                final_ref = ctx.get_replacement(forced);
-                            }
-                        }
-                        let fa_index = original_len + extra_fail_args.len();
-                        extra_fail_args.push(final_ref);
-                        let descr_idx = vinfo
-                            .field_descrs
-                            .iter()
-                            .find(|(idx, _)| *idx == field_idx)
-                            .map(|(_, d)| d.index())
-                            .unwrap_or(field_idx);
-                        fields.push((descr_idx, fa_index));
-                    }
-                    virtual_entries.push(GuardVirtualEntry {
-                        fail_arg_index: fa_idx,
-                        descr: vinfo.descr.clone(),
-                        known_class: vinfo.known_class,
-                        fields,
-                    });
-                    fail_args[fa_idx] = OpRef::NONE;
-                }
-                PtrInfo::VirtualStruct(vinfo) => {
-                    let mut fields = Vec::with_capacity(vinfo.fields.len());
-                    for &(field_idx, value_ref) in &vinfo.fields {
-                        let mut final_ref = ctx.get_replacement(value_ref);
-                        // Nested virtual field values must be forced to concrete.
-                        if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                            if nested.is_virtual() {
-                                let mut nested_mut = nested;
-                                let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
-                                final_ref = ctx.get_replacement(forced);
-                            }
-                        }
-                        let fa_index = original_len + extra_fail_args.len();
-                        extra_fail_args.push(final_ref);
-                        let descr_idx = vinfo
-                            .field_descrs
-                            .iter()
-                            .find(|(idx, _)| *idx == field_idx)
-                            .map(|(_, d)| d.index())
-                            .unwrap_or(field_idx);
-                        fields.push((descr_idx, fa_index));
-                    }
-                    virtual_entries.push(GuardVirtualEntry {
-                        fail_arg_index: fa_idx,
-                        descr: vinfo.descr.clone(),
-                        known_class: None,
-                        fields,
-                    });
-                    fail_args[fa_idx] = OpRef::NONE;
-                }
-                _ => {
-                    // Unsupported virtual kind — leave as-is (will be forced
-                    // by virtualize pass or emitted as concrete)
-                    fail_args[fa_idx] = resolved;
-                }
+            // resume.py ResumeDataVirtualAdder: encode virtual metadata
+            if let Some(entry) = Self::encode_virtual_for_guard(
+                &info, fa_idx, original_len, &mut extra_fail_args, ctx,
+            ) {
+                virtual_entries.push(entry);
+                fail_args[fa_idx] = OpRef::NONE;
+            } else {
+                fail_args[fa_idx] = resolved;
             }
         }
 
@@ -2712,6 +2629,49 @@ impl Optimizer {
     /// RPython box.type parity: infer the type of a fail_arg OpRef from
     /// the optimizer context. Checks PtrInfo (Virtual/Instance → Ref),
     /// constant type, and falls back to the original descriptor type.
+    /// resume.py ResumeDataVirtualAdder parity: encode a virtual's fields
+    /// as extra fail_args + GuardVirtualEntry. Shared by NONE-slot resolution
+    /// and non-NONE virtual encoding paths.
+    fn encode_virtual_for_guard(
+        info: &crate::optimizeopt::info::PtrInfo,
+        fa_idx: usize,
+        original_len: usize,
+        extra_fail_args: &mut Vec<OpRef>,
+        ctx: &mut OptContext,
+    ) -> Option<majit_ir::GuardVirtualEntry> {
+        use crate::optimizeopt::info::PtrInfo;
+        let (fields_vec, field_descrs, descr, known_class) = match info {
+            PtrInfo::Virtual(v) => (&v.fields, &v.field_descrs, v.descr.clone(), v.known_class),
+            PtrInfo::VirtualStruct(v) => (&v.fields, &v.field_descrs, v.descr.clone(), None),
+            _ => return None,
+        };
+        let base_idx = original_len + extra_fail_args.len();
+        let mut fields = Vec::with_capacity(fields_vec.len());
+        for &(field_idx, value_ref) in fields_vec {
+            let mut final_ref = ctx.get_replacement(value_ref);
+            if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
+                if nested.is_virtual() {
+                    let mut nested_mut = nested;
+                    let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
+                    final_ref = ctx.get_replacement(forced);
+                }
+            }
+            extra_fail_args.push(final_ref);
+            let descr_idx = field_descrs
+                .iter()
+                .find(|(idx, _)| *idx == field_idx)
+                .map(|(_, d)| d.index())
+                .unwrap_or(field_idx);
+            fields.push((descr_idx, base_idx + fields.len()));
+        }
+        Some(majit_ir::GuardVirtualEntry {
+            fail_arg_index: fa_idx,
+            descr,
+            known_class,
+            fields,
+        })
+    }
+
     fn infer_fail_arg_type(
         opref: OpRef,
         fd: &dyn majit_ir::descr::FailDescr,
