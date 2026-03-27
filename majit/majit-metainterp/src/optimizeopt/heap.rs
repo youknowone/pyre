@@ -1077,30 +1077,21 @@ impl OptHeap {
 
         // Virtualizable fields are loop-variant; skip caching/import.
         let is_vable_field = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
-        if is_vable_field {
-            ctx.imported_short_fields.remove(&key);
-            ctx.imported_short_field_descrs.remove(&key);
-        }
 
         // heap.py:177-187: CachedField._getfield — PreambleOp detection.
-        // Consume PreambleFieldOp from PtrInfo._fields (stored by
-        // HeapOp.produce_op during Phase 2 import). The actual value
-        // comes from imported_short_fields (a fresh OpRef matching
-        // RPython's PreambleOp.op distinct identity).
+        //   res = opinfo.getfield(descr, optheap)
+        //   if isinstance(res, PreambleOp):
+        //       res = optheap.optimizer.force_op_from_preamble(res)
+        //       opinfo.setfield(descr, None, res, optheap=optheap)
+        //   return res
         if !is_vable_field {
-            let _ = ctx
+            if let Some(pop) = ctx
                 .get_ptr_info_mut(obj)
-                .and_then(|info| info.take_preamble_field(field_idx));
-        }
-
-        // Consume the imported short field.
-        if !is_vable_field {
-            if let Some(cached) = ctx.imported_short_fields.remove(&key) {
+                .and_then(|info| info.take_preamble_field(field_idx))
+            {
+                let cached = pop.resolved;
                 ctx.force_op_from_preamble(cached);
-                let d = ctx
-                    .imported_short_field_descrs
-                    .remove(&key)
-                    .or_else(|| op.descr.clone());
+                let d = op.descr.clone();
                 if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
                     if d.as_ref().map_or(false, |dd| dd.is_always_pure()) {
                         self.immutable_field_descrs.insert(key.1);
@@ -2327,11 +2318,20 @@ mod tests {
 
     #[test]
     fn test_imported_short_field_cache_replays_into_heap() {
+        use crate::optimizeopt::info::{PreambleFieldOp, PtrInfo};
         let d = descr(55);
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 2);
-        ctx.imported_short_fields
-            .insert((OpRef(0), d.index()), OpRef(1));
+        // RPython PreambleOp parity: store PreambleFieldOp in PtrInfo
+        ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
+        ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
+            d.index(),
+            PreambleFieldOp {
+                op: OpRef(100),
+                resolved: OpRef(1),
+                invented_name: false,
+            },
+        );
 
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
         op.pos = OpRef(2);
@@ -2353,9 +2353,17 @@ mod tests {
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 4);
 
-        // Simulate short preamble import: (obj=0, head_field) → OpRef(1)
-        ctx.imported_short_fields
-            .insert((OpRef(0), d_head.index()), OpRef(1));
+        // RPython PreambleOp parity: store PreambleFieldOp in PtrInfo
+        use crate::optimizeopt::info::{PreambleFieldOp, PtrInfo};
+        ctx.set_ptr_info(OpRef(0), PtrInfo::instance(None, None));
+        ctx.get_ptr_info_mut(OpRef(0)).unwrap().set_preamble_field(
+            d_head.index(),
+            PreambleFieldOp {
+                op: OpRef(100),
+                resolved: OpRef(1),
+                invented_name: false,
+            },
+        );
 
         // First getfield on head: consumes the import, caches the value.
         let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], d_head.clone());

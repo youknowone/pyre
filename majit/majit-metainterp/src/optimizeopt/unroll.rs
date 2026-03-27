@@ -2216,36 +2216,31 @@ impl OptUnroll {
                         continue;
                     };
                     // RPython shortpreamble.py:62-85: HeapOp.produce_op
-                    // stores PreambleOp(self.res, preamble_op, invented_name)
-                    // in opinfo._fields. PreambleOp.op (= self.res) is the
-                    // Phase 1 Box with distinct identity from Phase 2 inputarg
-                    // Boxes. In majit, allocate a fresh OpRef to achieve the
-                    // same identity isolation (no import_box forwarding).
+                    // pop = PreambleOp(self.res, preamble_op, invented_name)
+                    // opinfo.setfield(descr, struct, pop, optheap, cf)
+                    //
+                    // Allocate a fresh OpRef (PreambleOp.op identity isolation)
+                    // and store PreambleFieldOp in PtrInfo._fields.
+                    // CachedField._getfield (heap.py:177-187) will detect it
+                    // via take_preamble_field and call force_op_from_preamble.
                     let _slot_value = resolve_result(result);
                     let value = ctx.alloc_op_position();
-                    // Register constant for the struct arg (deferred from above)
                     if let Some((csrc, cval)) = const_to_register {
                         ctx.make_constant(csrc, cval);
                     }
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
-                    // RPython: opinfo.setfield(descr, struct, pop, optheap, cf)
-                    // Store PreambleFieldOp in PtrInfo._fields for the struct.
                     let obj_resolved = ctx.get_replacement(obj);
                     if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                         info.set_preamble_field(
                             descr_idx,
                             crate::optimizeopt::info::PreambleFieldOp {
                                 op: source,
+                                resolved: value,
                                 invented_name,
                             },
                         );
                     }
-                    // Also store in imported_short_fields for backward compat
-                    // (consumed by optimize_getfield _getfield path).
-                    ctx.imported_short_fields.insert((obj, descr_idx), value);
-                    ctx.imported_short_field_descrs
-                        .insert((obj, descr_idx), descr.clone());
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
                             "[jit] import_short_heap_field: obj={obj:?} descr_idx={descr_idx} value={value:?} preamble_op={source:?}"
@@ -3885,18 +3880,18 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        // RPython PreambleOp parity: imported value is in imported_short_fields
-        // AND a PreambleFieldOp is stored in PtrInfo._fields for the struct.
-        assert_eq!(
-            ctx2.imported_short_fields.get(&(OpRef(10), 0)).copied(),
-            Some(OpRef(11))
-        );
-        assert_eq!(
-            ctx2.imported_short_field_descrs
-                .get(&(OpRef(10), 0))
-                .map(|d| d.index()),
-            Some(0)
-        );
+        // RPython PreambleOp parity: PreambleFieldOp stored in PtrInfo._fields.
+        // No imported_short_fields for heap fields — PtrInfo is the single
+        // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
+        let obj_resolved = ctx2.get_replacement(OpRef(10));
+        let pop = ctx2
+            .get_ptr_info_mut(obj_resolved)
+            .and_then(|info| info.take_preamble_field(0));
+        assert!(pop.is_some(), "PreambleFieldOp must be in PtrInfo._fields");
+        let pop = pop.unwrap();
+        assert_eq!(pop.op, OpRef(11)); // Phase 1 source
+        assert_ne!(pop.resolved, OpRef(10)); // fresh, not label_arg
+        assert_ne!(pop.resolved, OpRef(11));
     }
 
     #[test]
@@ -3942,16 +3937,16 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        assert_eq!(
-            ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied(),
-            Some(OpRef(11))
-        );
-        assert_eq!(
-            ctx2.imported_short_field_descrs
-                .get(&(OpRef(10), 56))
-                .map(|d| d.index()),
-            Some(56)
-        );
+        // RPython PreambleOp parity: PreambleFieldOp in PtrInfo._fields
+        let obj_resolved = ctx2.get_replacement(OpRef(10));
+        let pop = ctx2
+            .get_ptr_info_mut(obj_resolved)
+            .and_then(|info| info.take_preamble_field(56));
+        assert!(pop.is_some());
+        let pop = pop.unwrap();
+        assert_eq!(pop.op, OpRef(11));
+        assert_ne!(pop.resolved, OpRef(10));
+        assert_ne!(pop.resolved, OpRef(11));
     }
 
     #[test]

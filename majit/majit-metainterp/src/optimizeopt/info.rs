@@ -20,6 +20,10 @@ use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 pub struct PreambleFieldOp {
     /// Phase 1 result box — RPython: PreambleOp.op (aka HeapOp.res)
     pub op: OpRef,
+    /// Fresh Phase 2 OpRef with distinct identity from label_args.
+    /// Returned by force_op_from_preamble as the resolved field value.
+    /// (Rust equivalent of RPython's Phase 1 Box identity isolation.)
+    pub resolved: OpRef,
     /// RPython: PreambleOp.invented_name
     pub invented_name: bool,
 }
