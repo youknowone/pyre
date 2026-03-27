@@ -273,7 +273,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        self.ctx.is_constant(opref)
+        // RPython resume.py:204: isinstance(box, Const)
+        // Checks both optimizer constant map AND PtrInfo::Constant (ConstPtrInfo).
+        if self.ctx.is_constant(opref) {
+            return true;
+        }
+        // info.py: ConstPtrInfo.is_constant() → True
+        matches!(
+            self.ctx.get_ptr_info(opref),
+            Some(crate::optimizeopt::info::PtrInfo::Constant(_))
+        )
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
@@ -281,7 +290,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             Some(Value::Int(v)) => (*v, majit_ir::Type::Int),
             Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
             Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
-            _ => (0, majit_ir::Type::Int),
+            _ => {
+                // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo
+                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
+                    self.ctx.get_ptr_info(opref)
+                {
+                    (gcref.0 as i64, majit_ir::Type::Ref)
+                } else {
+                    (0, majit_ir::Type::Int)
+                }
+            }
         }
     }
 
