@@ -485,16 +485,7 @@ fn maybe_compile_and_run(
         }
         // warmstate.py:482-511: compiled code → execute_assembler
         if driver.has_compiled_loop(green_key) {
-            if let Some(r) = execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
-            {
-                return Some(r);
-            }
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .counter
-                .reset(green_key);
-            return None;
+            return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
         }
         // warmstate.py:466-468: no compiled → bound_reached (deferred)
         *pending_trace = Some((green_key, loop_header_pc));
@@ -644,22 +635,18 @@ fn bound_reached(
             restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
-        let was_tracing = driver.is_tracing();
+        // warmstate.py:437-444: start tracing via driver.bound_reached.
+        // Uses the driver's bound_reached which bypasses the counter
+        // (tick already auto-reset) and starts tracing unconditionally.
         let had_compiled = driver.has_compiled_loop(green_key);
-        let result = driver.back_edge_or_run_compiled_keyed(
-            green_key,
-            loop_header_pc,
-            &mut jit_state,
-            env,
-            || {},
-        );
-        if !was_tracing && driver.is_tracing() {
+        driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
+        if driver.is_tracing() {
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
         }
         if !had_compiled && driver.has_compiled_loop(green_key) {
             register_quasi_immutable_deps(green_key);
         }
-        result
+        None
     } else {
         None
     };
