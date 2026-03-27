@@ -2347,17 +2347,49 @@ impl Optimizer {
             ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
-            // RPython resume.py:570-574: _add_optimizer_sections captures the
-            // optimizer's knowledge AT THIS GUARD POINT. Snapshot heap fields
-            // (the part that changes during optimization) per-guard. Known
-            // classes and loopinvariant are stable across the trace.
+            // optimizer.py:652-686 emit_guard_operation
+            let opcode = op.opcode;
+
+            // optimizer.py:661-664: guard chain management.
+            if (opcode == OpCode::GuardNoException || opcode == OpCode::GuardException)
+                && self.last_guard_op.as_ref().is_some_and(|last| {
+                    last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2
+                })
+            {
+                self.last_guard_op = None;
+            }
+
+            // optimizer.py:672-683: _copy_resume_data_from / store_final_boxes_in_guard.
+            let shared = op.descr.is_none() && self.last_guard_op.is_some();
+            if shared {
+                // optimizer.py:688-695: _copy_resume_data_from
+                let last = self.last_guard_op.as_ref().unwrap();
+                op.descr = last.descr.clone();
+                op.fail_args = last.fail_args.clone();
+                op.rd_resume_position = last.rd_resume_position;
+            } else {
+                // optimizer.py:678: store_final_boxes_in_guard
+                op = Self::encode_guard_virtuals(op, ctx);
+                // optimizer.py:681-683: force_box on fail_args for unrolling.
+                if let Some(ref fa) = op.fail_args {
+                    let fargs: Vec<OpRef> = fa.iter().copied().collect();
+                    for farg in fargs {
+                        if !farg.is_none() {
+                            self.force_box(farg, ctx);
+                        }
+                    }
+                }
+            }
+
+            // resume.py:570-574: _add_optimizer_sections captures the
+            // optimizer's knowledge AT THIS GUARD POINT.
             {
                 let mut heap_fields = Vec::new();
                 for pass in &self.passes {
                     let fields = pass.export_cached_fields();
                     if !fields.is_empty() {
                         heap_fields = fields;
-                        break; // only one pass (heap) exports fields
+                        break;
                     }
                 }
                 if !heap_fields.is_empty() {
@@ -2371,13 +2403,6 @@ impl Optimizer {
                     ));
                 }
             }
-
-            // rd_numb is produced post-assembly by number_guards_final.
-            // Do not encode here — _number_boxes dedup shifts TAGBOX indices
-            // away from raw_values positions after assembly remapping.
-
-            // Expand fail_args with virtual field values (legacy consumer path).
-            op = Self::encode_guard_virtuals(op, ctx);
 
             // RPython parity: store fail_arg types using constant_types.
             if !self.constant_types.is_empty() {
@@ -2485,7 +2510,14 @@ impl Optimizer {
                     }
                 }
             }
-            self.last_guard_op = Some(op.clone());
+            // optimizer.py:679: update last_guard_op only for fresh guards
+            // (not shared). optimizer.py:684-685: GUARD_EXCEPTION breaks chain.
+            if !shared {
+                self.last_guard_op = Some(op.clone());
+            }
+            if opcode == OpCode::GuardException {
+                self.last_guard_op = None;
+            }
         } else if !op.opcode.has_no_side_effect()
             && !op.opcode.is_ovf()
             && !op.opcode.is_jit_debug()
