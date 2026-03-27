@@ -5532,8 +5532,8 @@ impl NamespaceOpcodeHandler for MIFrame {
                     this.sym_mut()
                         .symbolic_namespace_slots
                         .insert(slot, call_result);
-                    call_result
-                });
+                    Ok::<_, pyre_interpreter::PyError>(call_result)
+                })?;
                 return Ok(FrontendOp::new(opref, result_concrete));
             }
         }
