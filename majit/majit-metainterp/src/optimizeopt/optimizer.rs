@@ -4,6 +4,7 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
 /// Chains multiple optimization passes and drives operations through them.
 use crate::optimizeopt::{
+    earlyforce::OptEarlyForce,
     guard::GuardStrengthenOpt,
     heap::OptHeap,
     intbounds::OptIntBounds,
@@ -2828,7 +2829,9 @@ impl Optimizer {
 
 impl Optimizer {
     /// Create an optimizer with the standard pass pipeline.
-    /// Order: IntBounds -> Rewrite -> Virtualize -> String -> Pure -> Guard -> Simplify -> Heap
+    /// RPython __init__.py:15-22 ALL_OPTS:
+    ///   IntBounds → Rewrite → Virtualize → String → Pure → EarlyForce → Heap
+    /// Guard + Simplify are conditional (__init__.py:40-42).
     pub fn default_pipeline() -> Self {
         let mut opt = Self::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
@@ -2836,6 +2839,7 @@ impl Optimizer {
         opt.add_pass(Box::new(OptVirtualize::new()));
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
+        opt.add_pass(Box::new(OptEarlyForce::new()));
         opt.add_pass(Box::new(GuardStrengthenOpt::new()));
         opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
@@ -2850,6 +2854,7 @@ impl Optimizer {
         opt.add_pass(Box::new(OptVirtualize::with_virtualizable(config)));
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
+        opt.add_pass(Box::new(OptEarlyForce::new()));
         opt.add_pass(Box::new(GuardStrengthenOpt::new()));
         opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
