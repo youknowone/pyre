@@ -3843,6 +3843,20 @@ impl<M: Clone> MetaInterp<M> {
         if would { self.trace_eagerness } else { 0 }
     }
 
+    /// rstack.py stack_almost_full: True if stack is > 15/16th full.
+    /// compile.py:703: skip bridge compilation when stack space is low.
+    #[inline]
+    pub fn stack_almost_full() -> bool {
+        // rstack.py: checks if remaining stack < 1/16 of total.
+        // Rust approximation: a local variable's address gives the
+        // approximate stack pointer. Thread stacks are typically 8MB.
+        // 1/16 of 8MB = 512KB. Conservative threshold: 256KB.
+        const MIN_REMAINING: usize = 256 * 1024;
+        let local_var: usize = 0;
+        let sp = &local_var as *const usize as usize;
+        sp < MIN_REMAINING
+    }
+
     /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
     /// memory manager's generation counter. Old loops not accessed
     /// for max_age generations are candidates for eviction.
@@ -4039,9 +4053,11 @@ impl<M: Clone> MetaInterp<M> {
             .guard_failures
             .get(&(trace_id, fail_index))
             .is_some_and(|info| {
-                // compile.py:750-751: ST_BUSY_FLAG — if already compiling
-                // a bridge from this guard (e.g. recursive call), skip.
-                !info.compiling && self.warm_state.counter.would_fire(info.guard_hash)
+                // compile.py:702-703: must_compile AND NOT stack_almost_full
+                // compile.py:750-751: ST_BUSY_FLAG check
+                !info.compiling
+                    && !Self::stack_almost_full()
+                    && self.warm_state.counter.would_fire(info.guard_hash)
             })
     }
 
