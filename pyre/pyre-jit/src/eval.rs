@@ -1495,8 +1495,7 @@ fn materialize_recovery_virtuals(
         // Enough trailing fields: reconstruct virtuals
         let mut field_cursor = trailing_start;
         for &slot_idx in &null_slots {
-            let _ob_type_pos = field_cursor;
-            let payload_pos = field_cursor + 1;
+            let payload_pos = field_cursor + 1; // field_cursor = ob_type, +1 = payload
             if payload_pos >= typed.len() {
                 break;
             }
