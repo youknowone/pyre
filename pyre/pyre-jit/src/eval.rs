@@ -1387,7 +1387,7 @@ fn materialize_recovery_virtuals(
     // Try recovery layout first (rd_virtuals parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
-            if materialize_from_recovery_layout(typed, raw_values, exit_layout, recovery) {
+            if materialize_from_recovery_layout(typed, raw_values, recovery) {
                 return;
             }
         }
@@ -1471,7 +1471,6 @@ fn materialize_recovery_virtuals(
 fn materialize_from_recovery_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
-    _exit_layout: &CompiledExitLayout,
     recovery: &majit_codegen::ExitRecoveryLayout,
 ) -> bool {
     let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
