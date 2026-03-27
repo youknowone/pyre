@@ -537,8 +537,12 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     let jf = jitframe_ptr as *mut JitFrame;
 
     // warmspot.py:1022 — fail_descr = cpu.get_latest_descr(deadframe)
-    let descr = unsafe { JitFrame::get_latest_descr(jf) };
-    let _ = descr; // TODO: dispatch on descr type (Finish vs Guard)
+    // compile.py:701 handle_fail: dispatches on fail_descr to either
+    // _trace_and_compile_from_bridge or resume_in_blackhole.
+    // In pyre, bridge compilation is driven by eval.rs (via
+    // PENDING_BRIDGE_REQUEST), and this force path always resumes
+    // in the interpreter (blackhole equivalent).
+    let _descr = unsafe { JitFrame::get_latest_descr(jf) };
 
     // For now, reconstruct a PyFrame and run it in the interpreter.
     // This is the "blackhole" path — RPython resume.py parity.
@@ -1395,10 +1399,10 @@ pub fn install_jit_call_bridge() {
         // threshold. Replaces the deferred pending queue.
         majit_codegen_cranelift::register_bridge_threshold_callback(on_bridge_threshold_reached);
         majit_codegen_cranelift::register_inline_frame_arena(arena_global_info());
-        // TODO: register MetaInterp-level bridge threshold hook for guards
-        // hit via run_compiled_detailed_with_values (try_function_entry_jit).
-        // Currently disabled — bridge compilation from this path needs
-        // proper resume_pc propagation and frame state management.
+        // Bridge compilation for guards hit via try_function_entry_jit is
+        // handled at the eval.rs level: run_compiled_detailed_with_bridge_keyed
+        // returns BridgeCompilationRequest, and try_function_entry_jit calls
+        // jit_bridge_compile_for_guard after releasing the driver borrow.
     });
 }
 
