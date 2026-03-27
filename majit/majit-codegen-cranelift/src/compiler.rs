@@ -3219,7 +3219,9 @@ fn build_value_type_map(
         if let Some(ref fat) = op.fail_arg_types {
             if let Some(ref fa) = op.fail_args {
                 for (i, &opref) in fa.iter().enumerate() {
-                    if !opref.is_none() && !value_types.contains_key(&opref.0) {
+                    // Skip constant pool entries — their type is resolved
+                    // via constants map in resolve_opref, not value_types.
+                    if !opref.is_none() && opref.0 < 10_000 && !value_types.contains_key(&opref.0) {
                         if let Some(&tp) = fat.get(i) {
                             value_types.insert(opref.0, tp);
                         }
@@ -8832,6 +8834,14 @@ fn collect_guards(
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
+                    // RPython regalloc.py:1092-1108 parity: only GC-track
+                    // frame slots holding heap object VARIABLES, not constant
+                    // pool entries. Static type descriptor pointers (ConstPtr)
+                    // are not GC-managed and must not be scanned.
+                    let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
+                    if constants.contains_key(&opref_id) {
+                        continue; // constant — not a GC root
+                    }
                     let val = i as u32 + JITFRAME_FIXED_SIZE;
                     if val < 64 {
                         bits |= 1u64 << val;
