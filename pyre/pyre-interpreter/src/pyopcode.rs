@@ -4,9 +4,9 @@ use pyre_bytecode::bytecode::{
 };
 
 use crate::{
-    PyBigInt, PyError, SharedOpcodeHandler, exec_build_list, exec_build_map, exec_build_tuple,
-    exec_call, exec_list_append, exec_load_attr, exec_make_function, exec_store_attr,
-    exec_store_subscr, exec_unpack_sequence,
+    PyBigInt, PyError, SharedOpcodeHandler, opcode_build_list, opcode_build_map,
+    opcode_build_tuple, opcode_call, opcode_list_append, opcode_load_attr, opcode_make_function,
+    opcode_store_attr, opcode_store_subscr, opcode_unpack_sequence,
 };
 
 pub enum StepResult<V> {
@@ -222,7 +222,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
     }
 }
 
-pub fn exec_load_const<H: ConstantOpcodeHandler + ?Sized>(
+pub fn opcode_load_const<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
     constant: &ConstantData,
 ) -> Result<(), PyError> {
@@ -230,7 +230,7 @@ pub fn exec_load_const<H: ConstantOpcodeHandler + ?Sized>(
     handler.push_value(value)
 }
 
-pub fn exec_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
+pub fn opcode_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
     value: i64,
 ) -> Result<(), PyError> {
@@ -238,7 +238,7 @@ pub fn exec_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
     handler.push_value(value)
 }
 
-pub fn exec_load_fast_checked<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_load_fast_checked<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx: usize,
     name: &str,
@@ -247,7 +247,7 @@ pub fn exec_load_fast_checked<H: LocalOpcodeHandler + ?Sized>(
     handler.push_value(value)
 }
 
-pub fn exec_load_fast_pair_checked<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_load_fast_pair_checked<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx1: usize,
     name1: &str,
@@ -260,7 +260,7 @@ pub fn exec_load_fast_pair_checked<H: LocalOpcodeHandler + ?Sized>(
     handler.push_value(v2)
 }
 
-pub fn exec_store_fast<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_store_fast<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx: usize,
 ) -> Result<(), PyError> {
@@ -268,7 +268,7 @@ pub fn exec_store_fast<H: LocalOpcodeHandler + ?Sized>(
     handler.store_local_value(idx, value)
 }
 
-pub fn exec_load_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_load_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx1: usize,
     idx2: usize,
@@ -279,7 +279,7 @@ pub fn exec_load_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
     handler.push_value(v2)
 }
 
-pub fn exec_store_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_store_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     store_idx: usize,
     load_idx: usize,
@@ -290,7 +290,7 @@ pub fn exec_store_fast_load_fast<H: LocalOpcodeHandler + ?Sized>(
     handler.push_value(loaded)
 }
 
-pub fn exec_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
+pub fn opcode_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx1: usize,
     idx2: usize,
@@ -301,7 +301,7 @@ pub fn exec_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
     handler.store_local_value(idx2, v2)
 }
 
-pub fn exec_store_name<H: NamespaceOpcodeHandler + ?Sized>(
+pub fn opcode_store_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
 ) -> Result<(), PyError> {
@@ -309,7 +309,7 @@ pub fn exec_store_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler.store_name_value(name, value)
 }
 
-pub fn exec_load_name<H: NamespaceOpcodeHandler + ?Sized>(
+pub fn opcode_load_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
 ) -> Result<(), PyError> {
@@ -317,12 +317,12 @@ pub fn exec_load_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler.push_value(value)
 }
 
-pub fn exec_load_global<H: NamespaceOpcodeHandler + ?Sized>(
+pub fn opcode_load_global<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
     push_null: bool,
 ) -> Result<(), PyError> {
-    exec_load_name(handler, name)?;
+    opcode_load_name(handler, name)?;
     if push_null {
         let null = handler.null_value()?;
         handler.push_value(null)?;
@@ -330,17 +330,19 @@ pub fn exec_load_global<H: NamespaceOpcodeHandler + ?Sized>(
     Ok(())
 }
 
-pub fn exec_pop_top<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
+pub fn opcode_pop_top<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let _ = handler.pop_value()?;
     Ok(())
 }
 
-pub fn exec_push_null<H: NamespaceOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
+pub fn opcode_push_null<H: NamespaceOpcodeHandler + ?Sized>(
+    handler: &mut H,
+) -> Result<(), PyError> {
     let null = handler.null_value()?;
     handler.push_value(null)
 }
 
-pub fn exec_copy_value<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_copy_value<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     depth: usize,
 ) -> Result<(), PyError> {
@@ -348,19 +350,19 @@ pub fn exec_copy_value<H: SharedOpcodeHandler + ?Sized>(
     handler.push_value(value)
 }
 
-pub fn exec_swap<H: StackOpcodeHandler + ?Sized>(
+pub fn opcode_swap<H: StackOpcodeHandler + ?Sized>(
     handler: &mut H,
     depth: usize,
 ) -> Result<(), PyError> {
     handler.swap_values(depth)
 }
 
-pub fn exec_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
+pub fn opcode_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let iter = handler.peek_at(0)?;
     handler.ensure_iter_value(iter)
 }
 
-pub fn exec_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(
+pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
 ) -> Result<(), PyError> {
@@ -380,14 +382,14 @@ pub fn exec_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(
     }
 }
 
-pub fn exec_unary_not<H: TruthOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
+pub fn opcode_unary_not<H: TruthOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let value = handler.pop_value()?;
     let truth = handler.truth_value(value)?;
     let result = handler.bool_value_from_truth(truth, true)?;
     handler.push_value(result)
 }
 
-pub fn exec_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
+pub fn opcode_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
     op: BinaryOperator,
 ) -> Result<(), PyError> {
@@ -397,7 +399,7 @@ pub fn exec_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
     handler.push_value(result)
 }
 
-pub fn exec_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
+pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
     op: ComparisonOperator,
 ) -> Result<(), PyError> {
@@ -407,7 +409,7 @@ pub fn exec_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
     handler.push_value(result)
 }
 
-pub fn exec_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
+pub fn opcode_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
@@ -415,7 +417,7 @@ pub fn exec_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
     handler.push_value(result)
 }
 
-pub fn exec_unary_invert<H: ArithmeticOpcodeHandler + ?Sized>(
+pub fn opcode_unary_invert<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
@@ -423,7 +425,7 @@ pub fn exec_unary_invert<H: ArithmeticOpcodeHandler + ?Sized>(
     handler.push_value(result)
 }
 
-fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
+fn opcode_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
     jump_if_true: bool,
@@ -447,28 +449,28 @@ fn exec_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
     handler.set_next_instr(next_target)
 }
 
-pub fn exec_pop_jump_if_false<H: BranchOpcodeHandler + ?Sized>(
+pub fn opcode_pop_jump_if_false<H: BranchOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
 ) -> Result<(), PyError> {
-    exec_pop_jump_if(handler, target, false)
+    opcode_pop_jump_if(handler, target, false)
 }
 
-pub fn exec_pop_jump_if_true<H: BranchOpcodeHandler + ?Sized>(
+pub fn opcode_pop_jump_if_true<H: BranchOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
 ) -> Result<(), PyError> {
-    exec_pop_jump_if(handler, target, true)
+    opcode_pop_jump_if(handler, target, true)
 }
 
-pub fn exec_jump_forward<H: ControlFlowOpcodeHandler + ?Sized>(
+pub fn opcode_jump_forward<H: ControlFlowOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
 ) -> Result<(), PyError> {
     handler.set_next_instr(target)
 }
 
-pub fn exec_jump_backward<H: ControlFlowOpcodeHandler + ?Sized>(
+pub fn opcode_jump_backward<H: ControlFlowOpcodeHandler + ?Sized>(
     handler: &mut H,
     target: usize,
 ) -> Result<StepResult<H::Value>, PyError> {
@@ -476,7 +478,7 @@ pub fn exec_jump_backward<H: ControlFlowOpcodeHandler + ?Sized>(
     handler.close_loop(target)
 }
 
-pub fn exec_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
+pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
     handler: &mut H,
 ) -> Result<StepResult<H::Value>, PyError> {
     let value = handler.pop_value()?;
@@ -490,21 +492,21 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: ConstantOpcodeHandler,
     {
-        exec_load_const(self, constant).map_err(Into::into)
+        opcode_load_const(self, constant).map_err(Into::into)
     }
 
     fn load_small_int(&mut self, value: i64) -> Result<(), Self::Error>
     where
         Self: ConstantOpcodeHandler,
     {
-        exec_load_small_int(self, value).map_err(Into::into)
+        opcode_load_small_int(self, value).map_err(Into::into)
     }
 
     fn load_fast_checked(&mut self, idx: usize, name: &str) -> Result<(), Self::Error>
     where
         Self: LocalOpcodeHandler,
     {
-        exec_load_fast_checked(self, idx, name).map_err(Into::into)
+        opcode_load_fast_checked(self, idx, name).map_err(Into::into)
     }
 
     fn load_fast_pair_checked(
@@ -517,126 +519,126 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: LocalOpcodeHandler,
     {
-        exec_load_fast_pair_checked(self, idx1, name1, idx2, name2).map_err(Into::into)
+        opcode_load_fast_pair_checked(self, idx1, name1, idx2, name2).map_err(Into::into)
     }
 
     fn store_fast(&mut self, idx: usize) -> Result<(), Self::Error>
     where
         Self: LocalOpcodeHandler,
     {
-        exec_store_fast(self, idx).map_err(Into::into)
+        opcode_store_fast(self, idx).map_err(Into::into)
     }
 
     fn load_fast_load_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), Self::Error>
     where
         Self: LocalOpcodeHandler,
     {
-        exec_load_fast_load_fast(self, idx1, idx2).map_err(Into::into)
+        opcode_load_fast_load_fast(self, idx1, idx2).map_err(Into::into)
     }
 
     fn store_fast_load_fast(&mut self, store_idx: usize, load_idx: usize) -> Result<(), Self::Error>
     where
         Self: LocalOpcodeHandler,
     {
-        exec_store_fast_load_fast(self, store_idx, load_idx).map_err(Into::into)
+        opcode_store_fast_load_fast(self, store_idx, load_idx).map_err(Into::into)
     }
 
     fn store_fast_store_fast(&mut self, idx1: usize, idx2: usize) -> Result<(), Self::Error>
     where
         Self: LocalOpcodeHandler,
     {
-        exec_store_fast_store_fast(self, idx1, idx2).map_err(Into::into)
+        opcode_store_fast_store_fast(self, idx1, idx2).map_err(Into::into)
     }
 
     fn store_name(&mut self, name: &str) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        exec_store_name(self, name).map_err(Into::into)
+        opcode_store_name(self, name).map_err(Into::into)
     }
 
     fn load_name(&mut self, name: &str) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        exec_load_name(self, name).map_err(Into::into)
+        opcode_load_name(self, name).map_err(Into::into)
     }
 
     fn load_global(&mut self, name: &str, push_null: bool) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        exec_load_global(self, name, push_null).map_err(Into::into)
+        opcode_load_global(self, name, push_null).map_err(Into::into)
     }
 
     fn pop_top(&mut self) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_pop_top(self).map_err(Into::into)
+        opcode_pop_top(self).map_err(Into::into)
     }
 
     fn push_null(&mut self) -> Result<(), Self::Error>
     where
         Self: NamespaceOpcodeHandler,
     {
-        exec_push_null(self).map_err(Into::into)
+        opcode_push_null(self).map_err(Into::into)
     }
 
     fn copy_value(&mut self, depth: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_copy_value(self, depth).map_err(Into::into)
+        opcode_copy_value(self, depth).map_err(Into::into)
     }
 
     fn swap(&mut self, depth: usize) -> Result<(), Self::Error>
     where
         Self: StackOpcodeHandler,
     {
-        exec_swap(self, depth).map_err(Into::into)
+        opcode_swap(self, depth).map_err(Into::into)
     }
 
     fn binary_op(&mut self, op: BinaryOperator) -> Result<(), Self::Error>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        exec_binary_op(self, op).map_err(Into::into)
+        opcode_binary_op(self, op).map_err(Into::into)
     }
 
     fn compare_op(&mut self, op: ComparisonOperator) -> Result<(), Self::Error>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        exec_compare_op(self, op).map_err(Into::into)
+        opcode_compare_op(self, op).map_err(Into::into)
     }
 
     fn unary_negative(&mut self) -> Result<(), Self::Error>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        exec_unary_negative(self).map_err(Into::into)
+        opcode_unary_negative(self).map_err(Into::into)
     }
 
     fn unary_not(&mut self) -> Result<(), Self::Error>
     where
         Self: TruthOpcodeHandler,
     {
-        exec_unary_not(self).map_err(Into::into)
+        opcode_unary_not(self).map_err(Into::into)
     }
 
     fn unary_invert(&mut self) -> Result<(), Self::Error>
     where
         Self: ArithmeticOpcodeHandler,
     {
-        exec_unary_invert(self).map_err(Into::into)
+        opcode_unary_invert(self).map_err(Into::into)
     }
 
     fn jump_forward(&mut self, target: usize) -> Result<(), Self::Error>
     where
         Self: ControlFlowOpcodeHandler,
     {
-        exec_jump_forward(self, target).map_err(Into::into)
+        opcode_jump_forward(self, target).map_err(Into::into)
     }
 
     fn jump_backward(
@@ -646,35 +648,35 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: ControlFlowOpcodeHandler,
     {
-        exec_jump_backward(self, target).map_err(Into::into)
+        opcode_jump_backward(self, target).map_err(Into::into)
     }
 
     fn pop_jump_if_false(&mut self, target: usize) -> Result<(), Self::Error>
     where
         Self: BranchOpcodeHandler,
     {
-        exec_pop_jump_if_false(self, target).map_err(Into::into)
+        opcode_pop_jump_if_false(self, target).map_err(Into::into)
     }
 
     fn pop_jump_if_true(&mut self, target: usize) -> Result<(), Self::Error>
     where
         Self: BranchOpcodeHandler,
     {
-        exec_pop_jump_if_true(self, target).map_err(Into::into)
+        opcode_pop_jump_if_true(self, target).map_err(Into::into)
     }
 
     fn make_function(&mut self) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_make_function(self).map_err(Into::into)
+        opcode_make_function(self).map_err(Into::into)
     }
 
     fn call(&mut self, nargs: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_call(self, nargs).map_err(Into::into)
+        opcode_call(self, nargs).map_err(Into::into)
     }
 
     fn return_value(
@@ -683,56 +685,56 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: ControlFlowOpcodeHandler,
     {
-        exec_return_value(self).map_err(Into::into)
+        opcode_return_value(self).map_err(Into::into)
     }
 
     fn build_list(&mut self, size: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_build_list(self, size).map_err(Into::into)
+        opcode_build_list(self, size).map_err(Into::into)
     }
 
     fn build_tuple(&mut self, size: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_build_tuple(self, size).map_err(Into::into)
+        opcode_build_tuple(self, size).map_err(Into::into)
     }
 
     fn build_map(&mut self, size: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_build_map(self, size).map_err(Into::into)
+        opcode_build_map(self, size).map_err(Into::into)
     }
 
     fn store_subscr(&mut self) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_store_subscr(self).map_err(Into::into)
+        opcode_store_subscr(self).map_err(Into::into)
     }
 
     fn list_append(&mut self, depth: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_list_append(self, depth).map_err(Into::into)
+        opcode_list_append(self, depth).map_err(Into::into)
     }
 
     fn unpack_sequence(&mut self, count: usize) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_unpack_sequence(self, count).map_err(Into::into)
+        opcode_unpack_sequence(self, count).map_err(Into::into)
     }
 
     fn load_attr(&mut self, name: &str) -> Result<(), Self::Error>
     where
         Self: SharedOpcodeHandler,
     {
-        exec_load_attr(self, name).map_err(Into::into)
+        opcode_load_attr(self, name).map_err(Into::into)
     }
 
     /// LOAD_ATTR with is_method=true. Default: push [attr, NULL].
@@ -755,21 +757,21 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: SharedOpcodeHandler,
     {
-        exec_store_attr(self, name).map_err(Into::into)
+        opcode_store_attr(self, name).map_err(Into::into)
     }
 
     fn get_iter(&mut self) -> Result<(), Self::Error>
     where
         Self: IterOpcodeHandler,
     {
-        exec_get_iter(self).map_err(Into::into)
+        opcode_get_iter(self).map_err(Into::into)
     }
 
     fn for_iter(&mut self, target: usize) -> Result<(), Self::Error>
     where
         Self: IterOpcodeHandler + ControlFlowOpcodeHandler,
     {
-        exec_for_iter(self, target).map_err(Into::into)
+        opcode_for_iter(self, target).map_err(Into::into)
     }
 
     fn end_for(&mut self) -> Result<(), Self::Error> {
@@ -780,7 +782,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: SharedOpcodeHandler,
     {
-        exec_pop_top(self).map_err(Into::into)
+        opcode_pop_top(self).map_err(Into::into)
     }
 
     // ── Closures / cells ──

@@ -1332,7 +1332,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── call ──
     // PyPy: CALL_FUNCTION — interpreter-only override.
     // Handles null_or_self prepend for instance method calls.
-    // The default trait impl (exec_call) always discards null_or_self,
+    // The default trait impl (opcode_call) always discards null_or_self,
     // which is what the JIT tracer uses — no trace/concrete divergence.
     fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
         let mut args = Vec::with_capacity(nargs);

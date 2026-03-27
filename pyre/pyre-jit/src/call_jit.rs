@@ -2168,7 +2168,7 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
 
     let name = code.names[idx].as_ref();
     // PyFrame.namespace = globals; look up name there.
-    // exec_load_name dispatches through the NamespaceOpcodeHandler trait;
+    // opcode_load_name dispatches through the NamespaceOpcodeHandler trait;
     // for the blackhole we call the namespace directly.
     let ns = unsafe { &*frame.namespace };
     match ns.get(name) {
