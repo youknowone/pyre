@@ -4364,10 +4364,10 @@ impl<M: Clone> MetaInterp<M> {
             None => return (false, false),
         };
 
-        // compile.py:797-811: bridge inputargs come from
-        // rebuild_state_after_failure. For root-loop guards, the caller's
-        // live_types match fail_arg_types. For bridge guards, they may
-        // differ — bridge-on-bridge is gated until resume.py parity.
+        // resume.py: rebuild_state_after_failure produces boxes from
+        // deadframe. Bridge inputargs = those boxes. For root-loop guards,
+        // the caller's live_types match fail_arg_types. For bridge guards,
+        // they may differ — bridge-on-bridge is gated until resume.py parity.
         let bridge_input_types = if live_types.is_empty() {
             fail_descr.fail_arg_types()
         } else {
