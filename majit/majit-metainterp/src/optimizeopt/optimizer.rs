@@ -2551,7 +2551,11 @@ impl Optimizer {
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
                             if info.is_virtual() {
                                 if let Some(entry) = Self::encode_virtual_for_guard(
-                                    &info, fa_idx, original_len, &mut extra_fail_args, ctx,
+                                    &info,
+                                    fa_idx,
+                                    original_len,
+                                    &mut extra_fail_args,
+                                    ctx,
                                 ) {
                                     virtual_entries.push(entry);
                                 }
@@ -2576,7 +2580,11 @@ impl Optimizer {
 
             // resume.py ResumeDataVirtualAdder: encode virtual metadata
             if let Some(entry) = Self::encode_virtual_for_guard(
-                &info, fa_idx, original_len, &mut extra_fail_args, ctx,
+                &info,
+                fa_idx,
+                original_len,
+                &mut extra_fail_args,
+                ctx,
             ) {
                 virtual_entries.push(entry);
                 fail_args[fa_idx] = OpRef::NONE;
