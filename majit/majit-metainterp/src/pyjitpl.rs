@@ -3948,10 +3948,10 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         // compile.py:701-717: handle_fail applies to ALL guards.
-        // RPython compiles bridges from bridge guards (bridge-on-bridge).
-        // Currently restricted to root-loop guards: bridge-on-bridge
-        // tracing produces incorrect Cranelift code (SEGFAULT in nbody).
-        // Infrastructure (ST_BUSY_FLAG, counting, metadata) is ready.
+        // Bridge-on-bridge requires RPython's rebuild_state_after_failure
+        // (resume.py) to reconstruct box state from deadframe. Without it,
+        // bridge tracing starts from interpreter frame state which may
+        // differ from the guard's fail_args, causing incorrect bridges.
         if trace_id != compiled.root_trace_id {
             return false;
         }
@@ -4364,10 +4364,10 @@ impl<M: Clone> MetaInterp<M> {
             None => return (false, false),
         };
 
-        // RPython pyjitpl.py:3284-3286 / 2904-2919 parity:
-        // bridge tracing starts from rebuild_state_after_failure(), i.e. the
-        // reconstructed live boxes, not the raw guard fail_args layout.
-        // The caller passes those live box kinds explicitly.
+        // compile.py:797-811: bridge inputargs come from
+        // rebuild_state_after_failure. For root-loop guards, the caller's
+        // live_types match fail_arg_types. For bridge guards, they may
+        // differ — bridge-on-bridge is gated until resume.py parity.
         let bridge_input_types = if live_types.is_empty() {
             fail_descr.fail_arg_types()
         } else {
