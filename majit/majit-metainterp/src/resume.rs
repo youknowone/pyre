@@ -157,6 +157,7 @@ pub struct SimpleBoxEnv {
     pub replacements: HashMap<u32, majit_ir::OpRef>,
     pub types: HashMap<u32, majit_ir::Type>,
     pub virtuals: std::collections::HashSet<u32>,
+    pub virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo>,
 }
 
 impl SimpleBoxEnv {
@@ -166,6 +167,7 @@ impl SimpleBoxEnv {
             replacements: HashMap::new(),
             types: HashMap::new(),
             virtuals: std::collections::HashSet::new(),
+            virtual_fields: HashMap::new(),
         }
     }
 }
@@ -194,6 +196,9 @@ impl BoxEnv for SimpleBoxEnv {
     }
     fn is_virtual_raw(&self, opref: majit_ir::OpRef) -> bool {
         self.virtuals.contains(&opref.0)
+    }
+    fn get_virtual_fields(&self, opref: majit_ir::OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
+        self.virtual_fields.get(&opref.0).cloned()
     }
 }
 
@@ -2730,6 +2735,38 @@ impl ResumeDataLoopMemo {
         std::mem::take(&mut self.consts)
     }
 
+    /// resume.py:370-374 register_box — add a non-const, non-seen box to
+    /// new_liveboxes with UNASSIGNED or UNASSIGNEDVIRTUAL tag.
+    fn register_box_in_new_liveboxes(
+        &self,
+        opref: majit_ir::OpRef,
+        env: &dyn majit_ir::BoxEnv,
+        liveboxes_from_env: &HashMap<u32, i16>,
+        new_liveboxes: &mut HashMap<u32, i16>,
+        new_liveboxes_order: &mut Vec<u32>,
+    ) {
+        if opref.is_none()
+            || env.is_const(opref)
+            || liveboxes_from_env.contains_key(&opref.0)
+            || new_liveboxes.contains_key(&opref.0)
+        {
+            return;
+        }
+        // resume.py:212-216: check if field is virtual
+        let is_virtual = match env.get_type(opref) {
+            majit_ir::Type::Ref => env.is_virtual_ref(opref),
+            majit_ir::Type::Int => env.is_virtual_raw(opref),
+            _ => false,
+        };
+        let t = if is_virtual {
+            UNASSIGNEDVIRTUAL
+        } else {
+            UNASSIGNED
+        };
+        new_liveboxes.insert(opref.0, t);
+        new_liveboxes_order.push(opref.0);
+    }
+
     /// resume.py:560-568 _gettagged — resolve an OpRef to its tagged number.
     /// Looks up in liveboxes_from_env first, then new_liveboxes, then constant.
     fn _gettagged(
@@ -2900,12 +2937,12 @@ impl ResumeDataLoopMemo {
     /// resume.py:389-452 ResumeDataVirtualAdder.finish() — exact port.
     ///
     /// `numb_state`: output of `number()`
-    /// `env`: BoxEnv for resolving box properties (constants, types)
-    /// `virtual_fields`: maps opref_id → (descr, known_class, field_oprefs)
-    ///   from the optimizer's PtrInfo walk. RPython discovers these via
-    ///   `visitor_walk_recursive`; in majit the optimizer provides them.
-    /// `pending_setfields`: resume.py:520-558 _add_pending_fields.
-    ///   Each entry is (descr_index, item_index, target_opref, value_opref).
+    /// `env`: BoxEnv for resolving box properties (constants, types).
+    ///   Virtual fields are discovered via `env.get_virtual_fields()`,
+    ///   matching RPython's `visitor_walk_recursive` callback pattern.
+    /// `pending_setfields`: resume.py:428-442, 520-558 _add_pending_fields.
+    ///   Raw SetfieldGc/SetarrayitemGc ops — target and value are extracted
+    ///   inside finish(), matching RPython's `op.getarg()` pattern.
     /// `optimizer_knowledge`: bridgeopt.py:63 serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
     ///
@@ -2914,8 +2951,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         mut numb_state: NumberingState,
         env: &dyn majit_ir::BoxEnv,
-        virtual_fields: &HashMap<u32, VirtualFieldInfo>,
-        pending_setfields: &[(u32, i32, majit_ir::OpRef, majit_ir::OpRef)],
+        pending_setfields: &[majit_ir::Op],
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> (
         Vec<u8>,
@@ -2935,17 +2971,18 @@ impl ResumeDataLoopMemo {
         // Insertion-order tracking for _number_virtuals (RPython dict is ordered).
         let mut new_liveboxes_order: Vec<u32> = Vec::new();
 
-        // RPython iterates liveboxes_from_env in insertion order (snapshot order).
-        // Rust HashMap has no insertion order. Sort by tag value: TAGBOX entries
-        // by their index (0, 1, 2...), TAGVIRTUAL entries by their index.
-        // This matches the snapshot order because _number_boxes assigns indices
-        // sequentially as it encounters boxes in the snapshot.
+        // resume.py:414-426: iterate liveboxes_from_env, discover virtual fields.
+        // RPython iterates in insertion order; we sort by tag for determinism.
         let mut sorted_liveboxes: Vec<(u32, i16)> =
             numb_state.liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
         sorted_liveboxes.sort_by_key(|&(_, tagged)| {
             let (val, tagbits) = untag(tagged);
             (tagbits, val)
         });
+
+        // Collect virtual fields discovered via env.get_virtual_fields()
+        // (resume.py:419-426 visitor_walk_recursive pattern).
+        let mut virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo> = HashMap::new();
 
         for &(opref_id, tagged) in &sorted_liveboxes {
             let (i, tagbits) = untag(tagged);
@@ -2955,31 +2992,60 @@ impl ResumeDataLoopMemo {
                 }
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
-                if let Some(vf) = virtual_fields.get(&opref_id) {
+                // resume.py:419-426: info.visitor_walk_recursive(box, self)
+                if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
                     // resume.py:362-368: register_virtual_fields
                     for &field_opref in &vf.field_oprefs {
                         // resume.py:370-374: register_box
-                        if !field_opref.is_none()
-                            && !env.is_const(field_opref)
-                            && !numb_state.liveboxes.contains_key(&field_opref.0)
-                            && !new_liveboxes.contains_key(&field_opref.0)
-                        {
-                            // resume.py:212-216: check if field is virtual
-                            let is_virtual = match env.get_type(field_opref) {
-                                majit_ir::Type::Ref => env.is_virtual_ref(field_opref),
-                                majit_ir::Type::Int => env.is_virtual_raw(field_opref),
-                                _ => false,
-                            };
-                            let tag = if is_virtual {
-                                UNASSIGNEDVIRTUAL
-                            } else {
-                                UNASSIGNED
-                            };
-                            new_liveboxes.insert(field_opref.0, tag);
-                            new_liveboxes_order.push(field_opref.0);
-                        }
+                        self.register_box_in_new_liveboxes(
+                            field_opref,
+                            env,
+                            &numb_state.liveboxes,
+                            &mut new_liveboxes,
+                            &mut new_liveboxes_order,
+                        );
                     }
+                    virtual_fields.insert(opref_id, vf);
                 }
+            }
+        }
+
+        // resume.py:428-442: process pending_setfields — register_box on
+        // target and value, then visitor_walk_recursive on virtual fieldbox.
+        for setfield_op in pending_setfields {
+            let box_opref = env.get_box_replacement(setfield_op.args[0]);
+            let (fieldbox, _item_index) = if setfield_op.opcode == majit_ir::OpCode::SetarrayitemGc
+            {
+                (env.get_box_replacement(setfield_op.args[2]), -1i32)
+            } else {
+                (env.get_box_replacement(setfield_op.args[1]), -1i32)
+            };
+            self.register_box_in_new_liveboxes(
+                box_opref,
+                env,
+                &numb_state.liveboxes,
+                &mut new_liveboxes,
+                &mut new_liveboxes_order,
+            );
+            self.register_box_in_new_liveboxes(
+                fieldbox,
+                env,
+                &numb_state.liveboxes,
+                &mut new_liveboxes,
+                &mut new_liveboxes_order,
+            );
+            // resume.py:440-442: info.visitor_walk_recursive(fieldbox, self)
+            if let Some(vf) = env.get_virtual_fields(fieldbox) {
+                for &field_opref in &vf.field_oprefs {
+                    self.register_box_in_new_liveboxes(
+                        field_opref,
+                        env,
+                        &numb_state.liveboxes,
+                        &mut new_liveboxes,
+                        &mut new_liveboxes_order,
+                    );
+                }
+                virtual_fields.insert(fieldbox.0, vf);
             }
         }
 
@@ -3026,7 +3092,7 @@ impl ResumeDataLoopMemo {
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
 
-            for (&opref_id, vf) in virtual_fields {
+            for (&opref_id, vf) in &virtual_fields {
                 // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
                 let tagged = numb_state
                     .liveboxes
@@ -3072,7 +3138,7 @@ impl ResumeDataLoopMemo {
                         .collect();
                     rd_virtuals[num as usize] = VirtualFieldValues {
                         descr: vf.descr.clone(),
-                        known_class: vf.known_class,
+                        known_class: vf.known_class.map(|gc| gc.0 as i64),
                         fieldnums,
                     };
                 }
@@ -3086,9 +3152,25 @@ impl ResumeDataLoopMemo {
             }
         }
 
-        // resume.py:445: _add_pending_fields(pending_setfields)
+        // resume.py:445, 520-558: _add_pending_fields(pending_setfields)
         let mut rd_pendingfields_tagged = Vec::new();
-        for &(descr_index, item_index, target, value) in pending_setfields {
+        for setfield_op in pending_setfields {
+            let target = env.get_box_replacement(setfield_op.args[0]);
+            let (value, item_index) = if setfield_op.opcode == majit_ir::OpCode::SetarrayitemGc {
+                let fieldbox = env.get_box_replacement(setfield_op.args[2]);
+                // resume.py:534: itemindex = boxindex.getint()
+                let idx_opref = env.get_box_replacement(setfield_op.args[1]);
+                let item_idx = if env.is_const(idx_opref) {
+                    let (v, _) = env.get_const(idx_opref);
+                    v as i32
+                } else {
+                    0
+                };
+                (fieldbox, item_idx)
+            } else {
+                (env.get_box_replacement(setfield_op.args[1]), -1i32)
+            };
+            let descr_index = setfield_op.descr.as_ref().map_or(0, |d| d.index());
             let num = self._gettagged(target, env, &numb_state.liveboxes, &new_liveboxes);
             let fieldnum = self._gettagged(value, env, &numb_state.liveboxes, &new_liveboxes);
             rd_pendingfields_tagged.push(TaggedPendingField {
@@ -3393,21 +3475,8 @@ pub struct OptimizerKnowledgeForResume {
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
 }
 
-/// Input to ResumeDataLoopMemo.finish() — virtual field info from the optimizer.
-///
-/// resume.py:359-368 — `register_virtual_fields` equivalent.
-/// The optimizer walks PtrInfo::Virtual/VirtualStruct to discover fields,
-/// then passes the results here. RPython discovers these via
-/// `info.visitor_walk_recursive(box, self)` callback pattern.
-#[derive(Debug, Clone)]
-pub struct VirtualFieldInfo {
-    /// Type descriptor for the virtual object.
-    pub descr: Option<majit_ir::DescrRef>,
-    /// Known class pointer (for NewWithVtable).
-    pub known_class: Option<i64>,
-    /// Resolved field OpRefs (after get_box_replacement).
-    pub field_oprefs: Vec<majit_ir::OpRef>,
-}
+// VirtualFieldInfo removed: replaced by majit_ir::VirtualFieldsInfo.
+// finish() now discovers virtual fields via env.get_virtual_fields().
 
 /// A single value decoded from tagged resume numbering.
 #[derive(Debug, Clone, PartialEq)]
@@ -4904,9 +4973,8 @@ mod tests {
 
         let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
-        let empty_vfields = HashMap::new();
         let (rd_numb, rd_consts, _rd_virtuals, _rd_pf, liveboxes) =
-            memo.finish(numb_state, &env, &empty_vfields, &[], None);
+            memo.finish(numb_state, &env, &[], None);
 
         // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)
         assert_eq!(liveboxes.len(), 2);

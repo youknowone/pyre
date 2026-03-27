@@ -325,6 +325,32 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // pyre doesn't have Int-typed virtual objects
         false
     }
+
+    fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
+        let resolved = self.ctx.get_replacement(opref);
+        let info = self.ctx.get_ptr_info(resolved)?;
+        match info {
+            PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: vi.known_class,
+                field_oprefs: vi
+                    .fields
+                    .iter()
+                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .collect(),
+            }),
+            PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: None,
+                field_oprefs: vi
+                    .fields
+                    .iter()
+                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl OptContext {
