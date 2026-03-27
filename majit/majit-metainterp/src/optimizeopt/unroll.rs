@@ -273,15 +273,6 @@ impl UnrollOptimizer {
         };
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
-        // RPython compile.py parity: Phase 2 ops must not collide with Phase 1
-        // positions. Set phase2_min_pos so all new Phase 2 ops get pos > p1_max.
-        let p1_max_pos = p1_ops
-            .iter()
-            .map(|op| op.pos.0)
-            .filter(|&p| p != u32::MAX)
-            .max()
-            .unwrap_or(num_inputs as u32);
-        opt_p2.phase2_min_pos = Some(p1_max_pos + 1);
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
@@ -2525,15 +2516,7 @@ fn assemble_peeled_trace_with_jump_args(
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
-    // Phase A parity: also account for Phase 2 op positions so assembly-
-    // allocated positions (aliases, labels) don't collide with Phase 2.
-    let p2_all_max = p2_ops
-        .iter()
-        .map(|op| op.pos.0)
-        .filter(|&p| p != u32::MAX)
-        .max()
-        .unwrap_or(0);
-    let mut max_pos = result_max.max(p1_all_max).max(p2_all_max);
+    let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
     let mut alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
     for alias in imported_short_aliases {
