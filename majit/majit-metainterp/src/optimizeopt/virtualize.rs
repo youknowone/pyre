@@ -520,6 +520,7 @@ impl OptVirtualize {
             known_class: vinfo.known_class,
             fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
         // Mark as no longer virtual FIRST (avoids infinite recursion)
@@ -600,6 +601,7 @@ impl OptVirtualize {
             descr: vinfo.descr.clone(),
             fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
         // Mark as no longer virtual FIRST (avoids infinite recursion)

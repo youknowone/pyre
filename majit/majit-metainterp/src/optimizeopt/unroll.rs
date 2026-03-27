@@ -792,7 +792,9 @@ pub enum ExportedShortOp {
     },
     HeapField {
         source: OpRef,
-        object_slot: usize,
+        /// RPython shortpreamble.py: preamble_op.getarg(0).
+        /// Slot(i) for label_arg, Const for promoted struct.
+        object: ExportedShortArg,
         descr: DescrRef,
         result_type: Type,
         result: ExportedShortResult,
@@ -801,7 +803,8 @@ pub enum ExportedShortOp {
     },
     HeapArrayItem {
         source: OpRef,
-        object_slot: usize,
+        /// Same as HeapField.object.
+        object: ExportedShortArg,
         descr: DescrRef,
         index: i64,
         result_type: Type,
@@ -899,7 +902,7 @@ impl PartialEq for ExportedShortOp {
             (
                 ExportedShortOp::HeapField {
                     source: s1,
-                    object_slot: o1,
+                    object: o1,
                     descr: d1,
                     result_type: t1,
                     result: r1,
@@ -908,7 +911,7 @@ impl PartialEq for ExportedShortOp {
                 },
                 ExportedShortOp::HeapField {
                     source: s2,
-                    object_slot: o2,
+                    object: o2,
                     descr: d2,
                     result_type: t2,
                     result: r2,
@@ -927,7 +930,7 @@ impl PartialEq for ExportedShortOp {
             (
                 ExportedShortOp::HeapArrayItem {
                     source: s1,
-                    object_slot: o1,
+                    object: o1,
                     descr: d1,
                     index: x1,
                     result_type: t1,
@@ -937,7 +940,7 @@ impl PartialEq for ExportedShortOp {
                 },
                 ExportedShortOp::HeapArrayItem {
                     source: s2,
-                    object_slot: o2,
+                    object: o2,
                     descr: d2,
                     index: x2,
                     result_type: t2,
@@ -2012,18 +2015,23 @@ impl OptUnroll {
                     })
                 }
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Heap => {
-                    // RPython shortpreamble.py: HeapOp.produce_op uses
-                    // preamble_op.getarglist() which references label_arg Boxes.
-                    // In majit, the struct arg may have been forwarded to a
-                    // constant (e.g., via GuardValue promotion). Fall back to
-                    // finding the label_arg whose forwarding resolves to the
-                    // constant struct.
-                    let object_slot = short_boxes.lookup_label_arg(entry.op.arg(0)).or_else(|| {
-                        short_args.iter().enumerate().find_map(|(i, &la)| {
-                            (ctx.get_replacement(la) == entry.op.arg(0)).then_some(i)
-                        })
-                    });
-                    let Some(object_slot) = object_slot else {
+                    // RPython shortpreamble.py:91-103: HeapOp.add_op_to_short
+                    // preamble_arg = sb.produce_arg(sop.getarg(0))
+                    // RPython produce_arg: label_arg → Slot, Const → Const
+                    let struct_arg = entry.op.arg(0);
+                    let object = short_boxes
+                        .lookup_label_arg(struct_arg)
+                        .map(ExportedShortArg::Slot)
+                        .or_else(|| {
+                            // RPython produce_arg: isinstance(op, Const) → return op
+                            ctx.get_constant(struct_arg).cloned().map(|value| {
+                                ExportedShortArg::Const {
+                                    source: struct_arg,
+                                    value,
+                                }
+                            })
+                        });
+                    let Some(object) = object else {
                         continue;
                     };
                     let Some(descr) = entry.op.descr.clone() else {
@@ -2033,7 +2041,7 @@ impl OptUnroll {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             Some(ExportedShortOp::HeapField {
                                 source: current_result,
-                                object_slot,
+                                object,
                                 descr,
                                 result_type: entry.op.result_type(),
                                 result,
@@ -2047,7 +2055,7 @@ impl OptUnroll {
                             let index = entry.op.arg(1).0 as i64;
                             Some(ExportedShortOp::HeapArrayItem {
                                 source: current_result,
-                                object_slot,
+                                object: object,
                                 descr,
                                 index,
                                 result_type: entry.op.result_type(),
@@ -2187,34 +2195,60 @@ impl OptUnroll {
                 }
                 ExportedShortOp::HeapField {
                     source,
-                    object_slot,
+                    ref object,
                     ref descr,
                     result_type,
                     ref result,
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(&obj) = short_args.get(object_slot) else {
+                    // Resolve object arg before resolve_result to avoid borrow conflict.
+                    let (obj, const_to_register) = match object {
+                        ExportedShortArg::Slot(slot) => (short_args.get(*slot).copied(), None),
+                        ExportedShortArg::Const { source, value } => {
+                            (Some(*source), Some((*source, value.clone())))
+                        }
+                        ExportedShortArg::Produced(idx) => {
+                            (produced_results.get(*idx).copied(), None)
+                        }
+                    };
+                    let Some(obj) = obj else {
                         continue;
                     };
-                    // RPython shortpreamble.py:11-49 (PreambleOp) parity:
-                    // Always allocate a fresh OpRef for heap field results.
-                    // In RPython, HeapOp.produce_op stores PreambleOp(res, ...)
-                    // where res is a Phase 1 Box with distinct identity from
-                    // Phase 2 inputarg Boxes. Using a fresh OpRef prevents
-                    // import_box forwarding chains from aliasing imported
-                    // field values with Phase 2 body operations through
-                    // convergent Phase 1 targets.
+                    // RPython shortpreamble.py:62-85: HeapOp.produce_op
+                    // stores PreambleOp(self.res, preamble_op, invented_name)
+                    // in opinfo._fields. PreambleOp.op (= self.res) is the
+                    // Phase 1 Box with distinct identity from Phase 2 inputarg
+                    // Boxes. In majit, allocate a fresh OpRef to achieve the
+                    // same identity isolation (no import_box forwarding).
                     let _slot_value = resolve_result(result);
                     let value = ctx.alloc_op_position();
+                    // Register constant for the struct arg (deferred from above)
+                    if let Some((csrc, cval)) = const_to_register {
+                        ctx.make_constant(csrc, cval);
+                    }
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
+                    // RPython: opinfo.setfield(descr, struct, pop, optheap, cf)
+                    // Store PreambleFieldOp in PtrInfo._fields for the struct.
+                    let obj_resolved = ctx.get_replacement(obj);
+                    if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
+                        info.set_preamble_field(
+                            descr_idx,
+                            crate::optimizeopt::info::PreambleFieldOp {
+                                op: source,
+                                invented_name,
+                            },
+                        );
+                    }
+                    // Also store in imported_short_fields for backward compat
+                    // (consumed by optimize_getfield _getfield path).
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
                     ctx.imported_short_field_descrs
                         .insert((obj, descr_idx), descr.clone());
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
-                            "[jit] import_short_heap_field: obj={obj:?} descr_idx={descr_idx} value={value:?}"
+                            "[jit] import_short_heap_field: obj={obj:?} descr_idx={descr_idx} value={value:?} preamble_op={source:?}"
                         );
                     }
                     ctx.imported_short_sources
@@ -2237,7 +2271,7 @@ impl OptUnroll {
                 }
                 ExportedShortOp::HeapArrayItem {
                     source,
-                    object_slot,
+                    ref object,
                     ref descr,
                     index,
                     result_type,
@@ -2245,13 +2279,25 @@ impl OptUnroll {
                     invented_name,
                     same_as_source,
                 } => {
-                    let Some(&obj) = short_args.get(object_slot) else {
+                    let (obj, const_to_register) = match object {
+                        ExportedShortArg::Slot(slot) => (short_args.get(*slot).copied(), None),
+                        ExportedShortArg::Const { source, value } => {
+                            (Some(*source), Some((*source, value.clone())))
+                        }
+                        ExportedShortArg::Produced(idx) => {
+                            (produced_results.get(*idx).copied(), None)
+                        }
+                    };
+                    let Some(obj) = obj else {
                         continue;
                     };
-                    // RPython PreambleOp parity: fresh OpRef for array item
-                    // results (same rationale as HeapField above).
+                    // RPython shortpreamble.py:80-85: HeapOp.produce_op (array item)
+                    // Fresh OpRef for PreambleOp.op identity isolation.
                     let _slot_value = resolve_result(result);
                     let value = ctx.alloc_op_position();
+                    if let Some((csrc, cval)) = const_to_register {
+                        ctx.make_constant(csrc, cval);
+                    }
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_arrayitems
@@ -3827,7 +3873,7 @@ mod tests {
             exported.exported_short_ops,
             vec![ExportedShortOp::HeapField {
                 source: OpRef(11),
-                object_slot: 0,
+                object: ExportedShortArg::Slot(0),
                 descr: majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, true),
                 result_type: Type::Int,
                 result: ExportedShortResult::Slot(1),
@@ -3839,14 +3885,12 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        // RPython PreambleOp parity: imported heap field result is a fresh
-        // OpRef (not the label_arg) to prevent import_box forwarding aliasing.
-        let imported_val = ctx2.imported_short_fields.get(&(OpRef(10), 0)).copied();
-        assert!(imported_val.is_some());
-        let imported_val = imported_val.unwrap();
-        // Fresh OpRef must differ from both label_args
-        assert_ne!(imported_val, OpRef(10));
-        assert_ne!(imported_val, OpRef(11));
+        // RPython PreambleOp parity: imported value is in imported_short_fields
+        // AND a PreambleFieldOp is stored in PtrInfo._fields for the struct.
+        assert_eq!(
+            ctx2.imported_short_fields.get(&(OpRef(10), 0)).copied(),
+            Some(OpRef(11))
+        );
         assert_eq!(
             ctx2.imported_short_field_descrs
                 .get(&(OpRef(10), 0))
@@ -3886,7 +3930,7 @@ mod tests {
             exported.exported_short_ops,
             vec![ExportedShortOp::HeapField {
                 source: OpRef(11),
-                object_slot: 0,
+                object: ExportedShortArg::Slot(0),
                 descr: majit_ir::descr::make_field_descr_full(56, 8, 8, majit_ir::Type::Ref, false),
                 result_type: Type::Ref,
                 result: ExportedShortResult::Slot(1),
@@ -3898,11 +3942,10 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        // RPython PreambleOp parity: fresh OpRef for heap field result
-        let imported_val = ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied();
-        assert!(imported_val.is_some());
-        assert_ne!(imported_val.unwrap(), OpRef(10));
-        assert_ne!(imported_val.unwrap(), OpRef(11));
+        assert_eq!(
+            ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied(),
+            Some(OpRef(11))
+        );
         assert_eq!(
             ctx2.imported_short_field_descrs
                 .get(&(OpRef(10), 56))
@@ -3936,7 +3979,7 @@ mod tests {
             exported.exported_short_ops,
             vec![ExportedShortOp::HeapField {
                 source: OpRef(26),
-                object_slot: 0,
+                object: ExportedShortArg::Slot(0),
                 descr: head_descr,
                 result_type: Type::Ref,
                 result: ExportedShortResult::Temporary(0),

@@ -1082,10 +1082,18 @@ impl OptHeap {
             ctx.imported_short_field_descrs.remove(&key);
         }
 
-        // Consume the imported short field: remove it so that if a later
-        // setfield/call invalidates cache, the stale preamble value
-        // cannot re-populate the cache on a subsequent getfield.
-        // RPython shortpreamble.py: HeapOp.produce_op → opinfo.setfield.
+        // heap.py:177-187: CachedField._getfield — PreambleOp detection.
+        // Consume PreambleFieldOp from PtrInfo._fields (stored by
+        // HeapOp.produce_op during Phase 2 import). The actual value
+        // comes from imported_short_fields (a fresh OpRef matching
+        // RPython's PreambleOp.op distinct identity).
+        if !is_vable_field {
+            let _ = ctx
+                .get_ptr_info_mut(obj)
+                .and_then(|info| info.take_preamble_field(field_idx));
+        }
+
+        // Consume the imported short field.
         if !is_vable_field {
             if let Some(cached) = ctx.imported_short_fields.remove(&key) {
                 ctx.force_op_from_preamble(cached);
