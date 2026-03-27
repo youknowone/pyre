@@ -828,11 +828,12 @@ impl<S: JitState> JitDriver<S> {
         // portal. Nested function calls are prevented by JIT_TRACING
         // flag in eval_loop_jit.
         if self.meta.is_tracing() {
-            // pyjitpl.py:2973-2977 compile_trace: if the current green_key
-            // has compiled code with target tokens, compile the current
-            // trace as a bridge to that existing compiled code.
-            // Bridge traces skip this — they use close_bridge via merge_point.
-            if !self.is_bridge_tracing() && self.meta.has_compiled_targets(green_key) {
+            // pyjitpl.py:2979-2990 reached_loop_header: if the current
+            // green_key has compiled code with target tokens, compile the
+            // current trace (loop or bridge) as a JUMP to that code.
+            // RPython does NOT skip bridge traces — bridge → existing loop
+            // JUMP is the primary bridge closure mechanism.
+            if self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
                     if matches!(
