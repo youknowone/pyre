@@ -1501,11 +1501,12 @@ impl MIFrame {
         } else {
             s.stack_only_depth()
         };
-        let is_bridge = s.pre_opcode_vsd.is_some() && {
-            let (driver, _) = crate::driver::driver_pair();
-            driver.is_bridge_tracing()
-        };
-        if s.vable_array_base.is_some() && (!s.is_function_entry_trace || is_bridge) {
+        // RPython resume.py parity: virtualizable fail_args always use Ref
+        // for locals/stack slots. Virtual objects are represented as TAGVIRTUAL
+        // (null Ref) with field values in trailing slots. The optimizer unboxes
+        // to Int internally, but fail_args maintain Ref for correct bridge
+        // inputarg types after materialization.
+        if s.vable_array_base.is_some() {
             let total_slots = s.symbolic_local_types.len() + stack_only;
             virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
         } else if let Some(ref pre_types) = s.pre_opcode_stack_types {
@@ -4953,51 +4954,11 @@ impl MIFrame {
                 );
             }
 
-            // Gated behind MAJIT_EXC_TRACE until bridge compilation (Phase 3)
-            // is ready. Without bridges, the non-exception path hits
-            // GUARD_EXCEPTION every iteration and falls back to interpreter.
-            if std::env::var("MAJIT_EXC_TRACE").is_ok() {
-                let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
-                let nlocals = self.sym().nlocals;
-
-                // Unwind symbolic stack to handler depth.
-                // handler_depth counts from (nlocals + ncells) base.
-                let target_stack_len = ncells + handler_depth;
-                {
-                    let s = self.sym_mut();
-                    s.symbolic_stack.truncate(target_stack_len);
-                    s.symbolic_stack_types.truncate(target_stack_len);
-                    s.concrete_stack.truncate(target_stack_len);
-                    s.valuestackdepth = nlocals + target_stack_len;
-                    if entry.push_lasti {
-                        s.symbolic_stack.push(OpRef::NONE);
-                        s.symbolic_stack_types.push(Type::Ref);
-                        s.concrete_stack
-                            .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
-                        s.valuestackdepth += 1;
-                    }
-                    s.symbolic_stack.push(exc_opref);
-                    s.symbolic_stack_types.push(Type::Ref);
-                    s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
-                    s.valuestackdepth += 1;
-                }
-
-                // Sync concrete frame to match symbolic state.
-                let frame =
-                    unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
-                let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
-                while frame.valuestackdepth > target_depth {
-                    frame.pop();
-                }
-                if entry.push_lasti {
-                    frame.push(pyre_object::w_int_new(pc as i64));
-                }
-                frame.push(exc_obj);
-
-                // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame
-                self.sym_mut().pending_next_instr = Some(handler_pc);
-                return TraceAction::Continue;
-            }
+            // pyjitpl.py:2506 finishframe_exception: found handler.
+            // RPython continues tracing at handler_pc (raise ChangeFrame).
+            // Blocked: optimizer short-preamble bug drops SetfieldGc for
+            // the second virtual in bridge JUMP args, causing infinite loop.
+            // TODO: activate when inline_short_preamble is fixed.
             TraceAction::Abort
         } else {
             // TODO(exception-exit): pyjitpl.py:2532-2538
@@ -6189,6 +6150,14 @@ impl OpcodeStepExecutor for MIFrame {
             };
             self.with_ctx(|this, ctx| {
                 this.guard_object_class(ctx, exc_val.opref, exc_class_ptr);
+                // Emit residual call to set pending exception in compiled code.
+                // GUARD_EXCEPTION checks jit_exc_type_matches(); without this
+                // call, no exception would be pending and the guard always fails.
+                let exc_type_const = ctx.const_int(exc_class_ptr as i64);
+                ctx.call_void(
+                    majit_codegen_cranelift::jit_exc_raise as *const (),
+                    &[exc_val.opref, exc_type_const],
+                );
             });
         }
         // RPython pyjitpl.py:2745 execute_ll_raised: store concrete
