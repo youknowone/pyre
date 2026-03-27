@@ -279,7 +279,7 @@ impl UnrollOptimizer {
         let imported = build_imported_virtuals(&jump_virtuals);
         opt_p2.imported_virtuals = imported;
         // Phase 1's exported_jump_virtuals: tells Phase 2's
-        // encode_guard_virtuals_impl which fail_args positions are virtual.
+        // store_final_boxes_in_guard which fail_args positions are virtual.
         opt_p2.exported_jump_virtuals = jump_virtuals.clone();
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Don't flush lazy sets — virtuals remain virtual until JUMP handling.

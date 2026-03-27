@@ -234,7 +234,7 @@ pub(crate) fn build_guard_metadata(
             // resume.py:1042-1057 parity: build frame_slots from rd_numb.
             // rd_numb encodes TAGBOX/TAGCONST/TAGVIRTUAL per frame slot.
             //
-            // Infrastructure constraint: encode_guard_virtuals_impl (which
+            // Infrastructure constraint: store_final_boxes_in_guard (which
             // has no RPython equivalent) replaces virtual OpRefs with NONE
             // in fail_args. The 1:1 TAGBOX path in number_guard_inline
             // then encodes them as NULLREF instead of TAGVIRTUAL. We
