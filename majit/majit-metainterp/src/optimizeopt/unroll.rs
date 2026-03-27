@@ -52,10 +52,16 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
-    /// RPython pyjitpl.py:3014 parity: Phase 1 exported_state saved for
+    /// RPython compile.py:278-284 parity: Phase 1 results saved for
     /// retrace_needed when Phase 2 raises InvalidLoop.
-    /// Arc<Mutex<>> to allow access outside catch_unwind.
+    /// Arc<Mutex<>> because catch_unwind moves self into the closure;
+    /// the Arc is cloned before move, allowing access after Phase 2 panic.
+    /// RPython doesn't need this indirection because Phase 1 and Phase 2
+    /// are separate calls in compile_loop (compile.py:278, 294).
     pub phase1_exported_state: std::sync::Arc<std::sync::Mutex<Option<ExportedState>>>,
+    /// Phase 1 preamble ops (terminal JUMP excluded by optimizer).
+    /// RPython compile.py:279: partial_trace.operations.
+    pub phase1_preamble_ops: std::sync::Arc<std::sync::Mutex<Option<Vec<Op>>>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
@@ -80,6 +86,7 @@ impl UnrollOptimizer {
             max_retrace_guards: 15,
             imported_state: None,
             phase1_exported_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            phase1_preamble_ops: std::sync::Arc::new(std::sync::Mutex::new(None)),
             snapshot_boxes: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
         }
@@ -290,9 +297,14 @@ impl UnrollOptimizer {
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
-        // Save for retrace_needed if Phase 2 raises InvalidLoop.
+        // RPython compile.py:278-284 parity: save Phase 1 results.
+        // If Phase 2 raises InvalidLoop, compile_loop uses these for
+        // retrace_needed (RPython partial_trace.operations + exported_state).
         if let Ok(mut guard) = self.phase1_exported_state.lock() {
             *guard = Some(exported_state.clone());
+        }
+        if let Ok(mut guard) = self.phase1_preamble_ops.lock() {
+            *guard = Some(p1_ops.clone());
         }
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
