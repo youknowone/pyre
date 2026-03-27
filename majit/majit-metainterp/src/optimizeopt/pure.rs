@@ -1124,6 +1124,7 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
+            preamble_pure_ops: Vec::new(),
         }));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,

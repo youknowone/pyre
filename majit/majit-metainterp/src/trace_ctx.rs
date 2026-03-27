@@ -367,6 +367,14 @@ impl TraceCtx {
             .get_or_insert_typed(value, majit_ir::Type::Ref)
     }
 
+    /// Mark an existing constant OpRef with a specific type.
+    /// Used when const_int() was called but the value is actually a Ref pointer
+    /// (e.g., ob_type field). This preserves Cranelift's Int treatment while
+    /// recording the true type for resume data.
+    pub fn mark_const_type(&mut self, opref: OpRef, tp: majit_ir::Type) {
+        self.constants.mark_type(opref, tp);
+    }
+
     /// Return the type of a constant OpRef, if recorded.
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         self.constants.constant_type(opref)
