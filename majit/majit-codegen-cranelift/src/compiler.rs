@@ -4694,8 +4694,9 @@ impl CraneliftBackend {
                         current_inputs = (0..num_outputs)
                             .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
                             .collect();
-                        continue; // re-enter loop
+                        continue;
                     }
+                    // Bridge internal guard fail — return deadframe to caller
                     return bridge_frame;
                 }
                 return Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
