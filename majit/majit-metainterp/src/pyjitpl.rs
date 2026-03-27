@@ -1743,9 +1743,11 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
 
-        // RPython pyjitpl.py:3014 parity: save Phase 1 exported_state
-        // before catch_unwind for retrace_needed if Phase 2 InvalidLoop.
+        // RPython compile.py:278-284 parity: clone Arc references to
+        // Phase 1 results before catch_unwind moves unroll_opt. If Phase 2
+        // raises InvalidLoop, these are used for retrace_needed.
         let phase1_es = unroll_opt.phase1_exported_state.clone();
+        let phase1_ops = unroll_opt.phase1_preamble_ops.clone();
 
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
@@ -1811,29 +1813,31 @@ impl<M: Clone> MetaInterp<M> {
                         // but cancel_count < limit — set up retrace with
                         // Phase 1 preamble so the next compile_loop call
                         // uses compile_retrace with new runtime values.
-                        if let Ok(guard) = phase1_es.lock() {
-                            if let Some(es) = guard.clone() {
-                                if crate::majit_log_enabled() {
-                                    eprintln!(
-                                        "[jit] retrace_needed after InvalidLoop at key={}",
-                                        green_key,
-                                    );
-                                }
-                                self.potential_retrace_position =
-                                    Some(majit_trace::recorder::TracePosition {
-                                        op_count: 0,
-                                        ops_len: 0,
-                                    });
-                                self.retrace_needed(
+                        // RPython compile.py:278-284 parity: use Phase 1
+                        // preamble ops (JUMP excluded by optimizer) instead of
+                        // raw trace ops. This matches RPython's partial_trace.operations.
+                        let p1_ops = phase1_ops.lock().ok().and_then(|g| g.clone());
+                        let es = phase1_es.lock().ok().and_then(|g| g.clone());
+                        if let (Some(preamble_ops), Some(es)) = (p1_ops, es) {
+                            if crate::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit] retrace_needed after InvalidLoop at key={} preamble_ops={}",
                                     green_key,
-                                    trace_ops_snapshot.clone(),
-                                    trace.inputargs.clone(),
-                                    constants_snapshot.clone(),
-                                    es,
+                                    preamble_ops.len(),
                                 );
-                            } else {
-                                self.warm_state.abort_tracing(green_key, false);
                             }
+                            self.potential_retrace_position =
+                                Some(majit_trace::recorder::TracePosition {
+                                    op_count: 0,
+                                    ops_len: 0,
+                                });
+                            self.retrace_needed(
+                                green_key,
+                                preamble_ops,
+                                trace.inputargs.clone(),
+                                constants_snapshot.clone(),
+                                es,
+                            );
                         } else {
                             self.warm_state.abort_tracing(green_key, false);
                         }
@@ -2450,19 +2454,9 @@ impl<M: Clone> MetaInterp<M> {
         // JUMP into last_op (not in _newoperations). body_ops (from
         // assemble_peeled_trace_with_jump_args) contains Label + body + JUMP.
         //
-        // pyre deviation: partial.ops are raw trace ops (not optimized
-        // preamble), which DO contain a terminal JUMP from close_loop.
-        // Strip the JUMP only if present at the end, preserving all other
-        // ops. This is a temporary measure until partial.ops stores the
-        // optimized preamble result (RPython's partial_trace.operations).
-        let mut partial_ops = partial.ops;
-        if partial_ops
-            .last()
-            .map_or(false, |op| op.opcode == majit_ir::OpCode::Jump)
-        {
-            partial_ops.pop();
-        }
-        let mut combined_ops = partial_ops;
+        // pyre parity: partial.ops now stores Phase 1 optimized preamble
+        // ops (JUMP excluded), matching RPython's partial_trace.operations.
+        let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
         // Merge constants from partial trace with new constants.
         for (k, v) in partial.constants {
