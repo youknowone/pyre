@@ -4784,11 +4784,11 @@ impl CraneliftBackend {
         }
         drop(bridge_guard);
 
-        // RPython parity: trigger bridge compilation for bridge guards
-        // just like for loop guards (handle_fail / must_compile).
+        // compile.py:701-717: handle_fail / must_compile — trigger bridge
+        // compilation for bridge guards just like for loop guards.
         let fail_count = fail_descr.get_fail_count();
         if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-            let gk = bridge.header_pc; // green_key = original loop's key
+            let gk = bridge.header_pc;
             let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
             notify_bridge_threshold(gk, bridge.trace_id, fail_index, resume_pc);
         }

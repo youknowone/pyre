@@ -3947,8 +3947,11 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        // TODO: remove this root-only restriction once the Cranelift
-        // bridge chaining backend handles bridge guard fail_args correctly.
+        // compile.py:701-717: handle_fail applies to ALL guards.
+        // RPython compiles bridges from bridge guards (bridge-on-bridge).
+        // Currently restricted to root-loop guards: bridge-on-bridge
+        // tracing produces incorrect Cranelift code (SEGFAULT in nbody).
+        // Infrastructure (ST_BUSY_FLAG, counting, metadata) is ready.
         if trace_id != compiled.root_trace_id {
             return false;
         }
