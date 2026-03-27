@@ -664,7 +664,7 @@ impl OptContext {
                 }
                 ExportedShortOp::HeapField {
                     source,
-                    object_slot,
+                    object,
                     descr,
                     result_type,
                     result,
@@ -676,7 +676,12 @@ impl OptContext {
                     else {
                         return false;
                     };
-                    let Some(&obj) = short_args.get(*object_slot) else {
+                    let obj = match object {
+                        ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
+                        ExportedShortArg::Const { source, .. } => Some(*source),
+                        ExportedShortArg::Produced(_) => None,
+                    };
+                    let Some(obj) = obj else {
                         return false;
                     };
                     let opcode = match result_type {

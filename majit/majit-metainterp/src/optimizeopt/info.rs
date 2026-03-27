@@ -6,6 +6,24 @@ use crate::optimizeopt::intutils::IntBound;
 /// pointer info, virtual object state).
 use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
+/// shortpreamble.py:11-49: PreambleOp
+///
+/// Wrapper stored in PtrInfo._fields during Phase 2 import.
+/// When `_getfield` (heap.py:177-187) encounters this in a field slot,
+/// it calls `force_op_from_preamble()` to lazily resolve the value
+/// via the short preamble builder.
+///
+/// RPython stores PreambleOp directly in `_fields[]` (Python's dynamic
+/// typing). Rust requires a separate storage (`preamble_fields`) with
+/// the same read-before-regular-fields semantics.
+#[derive(Clone, Debug)]
+pub struct PreambleFieldOp {
+    /// Phase 1 result box — RPython: PreambleOp.op (aka HeapOp.res)
+    pub op: OpRef,
+    /// RPython: PreambleOp.invented_name
+    pub invented_name: bool,
+}
+
 /// Information about an operation's result, attached during optimization.
 ///
 /// info.py: AbstractInfo hierarchy — the base class for all optimization info.
@@ -207,6 +225,7 @@ impl PtrInfo {
             known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -217,6 +236,7 @@ impl PtrInfo {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            preamble_fields: Vec::new(),
             last_guard_pos: -1,
         })
     }
@@ -553,6 +573,7 @@ impl PtrInfo {
                         .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
+                    preamble_fields: Vec::new(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::New, &[]);
@@ -570,11 +591,6 @@ impl PtrInfo {
                         .iter()
                         .find(|(idx, _)| *idx == field_idx)
                         .map(|(_, d)| d.clone());
-                    // RPython: descriptors always exist — _fields[i] maps
-                    // to descr.get_all_fielddescrs()[i]. In pyre, field_descrs
-                    // is a separate list that should always be in sync with
-                    // fields. A missing descriptor indicates a structural
-                    // bug in field/descriptor propagation.
                     debug_assert!(
                         descr.is_some(),
                         "force_to_ops: field_idx={} has value but no descriptor \
@@ -590,7 +606,6 @@ impl PtrInfo {
                 alloc_ref
             }
             PtrInfo::Virtual(vinfo) => {
-                // RPython info.py: _is_virtual = False, _fields retained.
                 let preserved = PtrInfo::Instance(InstancePtrInfo {
                     descr: Some(vinfo.descr.clone()),
                     known_class: vinfo.known_class,
@@ -600,6 +615,7 @@ impl PtrInfo {
                         .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
+                    preamble_fields: Vec::new(),
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -784,6 +800,46 @@ impl PtrInfo {
                 v.fields.push((field_idx, value));
             }
             _ => {}
+        }
+    }
+
+    /// shortpreamble.py:73-79: HeapOp.produce_op stores PreambleOp in _fields.
+    /// RPython: `opinfo.setfield(descr, struct, pop, optheap, cf)`
+    /// where `pop` is a PreambleOp wrapper.
+    pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleFieldOp) {
+        match self {
+            PtrInfo::Instance(v) => {
+                v.preamble_fields.retain(|(k, _)| *k != field_idx);
+                v.preamble_fields.push((field_idx, pop));
+            }
+            PtrInfo::Struct(v) => {
+                v.preamble_fields.retain(|(k, _)| *k != field_idx);
+                v.preamble_fields.push((field_idx, pop));
+            }
+            _ => {}
+        }
+    }
+
+    /// heap.py:177-187: CachedField._getfield detects PreambleOp in _fields.
+    /// Returns and removes the PreambleFieldOp if present for this field.
+    /// RPython: `isinstance(res, PreambleOp)` check in _getfield.
+    pub fn take_preamble_field(&mut self, field_idx: u32) -> Option<PreambleFieldOp> {
+        match self {
+            PtrInfo::Instance(v) => {
+                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
+                    Some(v.preamble_fields.remove(pos).1)
+                } else {
+                    None
+                }
+            }
+            PtrInfo::Struct(v) => {
+                if let Some(pos) = v.preamble_fields.iter().position(|(k, _)| *k == field_idx) {
+                    Some(v.preamble_fields.remove(pos).1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1137,6 +1193,10 @@ pub struct InstancePtrInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors keyed by field index.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// shortpreamble.py:11-49: PreambleOp wrappers stored during Phase 2
+    /// import. RPython stores these in `_fields[]` (mixed with regular
+    /// values); Rust uses a separate Vec with read-before-fields semantics.
+    pub preamble_fields: Vec<(u32, PreambleFieldOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1152,6 +1212,8 @@ pub struct StructPtrInfo {
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors keyed by field index.
     pub field_descrs: Vec<(u32, DescrRef)>,
+    /// shortpreamble.py:11-49: PreambleOp wrappers (same as InstancePtrInfo).
+    pub preamble_fields: Vec<(u32, PreambleFieldOp)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
