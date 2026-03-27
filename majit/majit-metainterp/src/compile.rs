@@ -330,6 +330,71 @@ pub(crate) fn build_guard_metadata(
                 virtual_layouts,
                 pending_field_layouts: vec![],
             })
+        } else if op.rd_numb.is_some() {
+            // Consumer switchover path: rd_numb contains the full frame encoding.
+            // Build recovery_layout directly from rd_numb without rd_virtuals.
+            use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout};
+            let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+                (&op.rd_numb, &op.rd_consts)
+            {
+                use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let mut slots = Vec::new();
+                for frame in &frames {
+                    for val in &frame.values {
+                        slots.push(match val {
+                            RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
+                            RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
+                            RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
+                            RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                            RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
+                        });
+                    }
+                }
+                slots
+            } else {
+                vec![]
+            };
+            let virtual_layouts: Vec<majit_codegen::ExitVirtualLayout> = op
+                .rd_virtuals_info
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(descr_idx, known_class, fieldnums)| {
+                            majit_codegen::ExitVirtualLayout::Struct {
+                                type_id: known_class.map_or(0, |kc| kc as u32),
+                                descr_index: *descr_idx,
+                                fields: fieldnums
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(fi, &fnum)| {
+                                        let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                                        let source = if tagbits == majit_ir::resumedata::TAGBOX {
+                                            ExitValueSourceLayout::ExitValue(val as usize)
+                                        } else {
+                                            ExitValueSourceLayout::Constant(val as i64)
+                                        };
+                                        (fi as u32, source)
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ExitRecoveryLayout {
+                frames: vec![majit_codegen::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: None,
+                    source_guard: None,
+                    pc: 0,
+                    slots: frame_slots,
+                    slot_types: None,
+                }],
+                virtual_layouts,
+                pending_field_layouts: vec![],
+            })
         } else {
             None
         };
