@@ -191,7 +191,7 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     );
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
-    majit_codegen_cranelift::register_materialize_virtuals(materialize_virtuals_for_bridge);
+    majit_codegen_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
     frame.fix_array_ptrs();
 
     // RPython blackhole.py parity: during bridge tracing, concrete
@@ -1137,7 +1137,7 @@ fn restore_guard_failure_for_loop(
             typed.iter().take(6).collect::<Vec<_>>()
         );
     }
-    materialize_recovery_virtuals(&mut typed, raw_values, exit_layout);
+    rebuild_state_after_failure_with_exit_layout(&mut typed, raw_values, exit_layout);
     // resume.py:993-1007 _prepare_pendingfields: replay deferred
     // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
     replay_pending_fields(&typed, exit_layout);
@@ -1230,7 +1230,7 @@ fn restore_guard_failure_for_loop(
 /// resume.py:1042-1057 rebuild_from_numbering: decode rd_numb to produce
 /// typed values. Each slot is either TAGBOX (from deadframe), TAGCONST
 /// (compile-time constant), TAGINT (small inline int), or TAGVIRTUAL
-/// (virtual object to materialize later by materialize_recovery_virtuals).
+/// (virtual object to materialize later by rebuild_state_after_failure_with_exit_layout).
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -1312,7 +1312,7 @@ fn _prepare_next_section(
 ///
 /// Virtual pattern in fail_args: null Ref slots followed by
 /// (ob_type, intval) Int pairs. Replace null Refs with boxed objects.
-fn materialize_virtuals_for_bridge(outputs: &mut [i64], types: &[majit_ir::Type]) {
+fn rebuild_state_after_failure(outputs: &mut [i64], types: &[majit_ir::Type]) {
     use majit_ir::Type;
     let w_int_type_id = pyre_object::intobject::w_int_type_id();
 
@@ -1428,7 +1428,7 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
 /// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
 /// Only apply when trailing fields are available (2 Int per null slot).
 /// Otherwise, replace remaining null Refs with w_none() for safety.
-fn materialize_recovery_virtuals(
+fn rebuild_state_after_failure_with_exit_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
@@ -1436,7 +1436,12 @@ fn materialize_recovery_virtuals(
     // Try recovery layout first (rd_virtuals parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
-            if materialize_from_recovery_layout(typed, raw_values, exit_layout, recovery) {
+            if rebuild_state_after_failure_from_recovery_layout(
+                typed,
+                raw_values,
+                exit_layout,
+                recovery,
+            ) {
                 return;
             }
         }
@@ -1532,7 +1537,7 @@ fn materialize_recovery_virtuals(
 /// resume.py parity: materialize virtuals using recovery layout (rd_virtuals).
 /// Field values are read from raw_values (deadframe) since rd_numb-decoded
 /// typed array only contains frame slots, not the appended virtual fields.
-fn materialize_from_recovery_layout(
+fn rebuild_state_after_failure_from_recovery_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,

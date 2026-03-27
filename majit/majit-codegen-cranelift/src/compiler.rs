@@ -956,7 +956,7 @@ fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
 /// (e.g., [frame, ni, vsd, ob_type_s, intval_s, ob_type_i, intval_i])
 /// instead of using null-Ref placeholders. This function reconstructs
 /// boxed objects and produces a compacted output matching bridge inputargs.
-fn materialize_for_bridge(
+fn rebuild_state_after_failure(
     outputs: &mut Vec<i64>,
     types: &[majit_ir::Type],
     recovery: Option<&majit_codegen::ExitRecoveryLayout>,
@@ -977,7 +977,9 @@ fn materialize_for_bridge(
                     }
                     majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
                         if let Some(vl) = recovery.virtual_layouts.get(*vidx) {
-                            if let Some(obj) = materialize_single_virtual(vl, outputs) {
+                            if let Some(obj) =
+                                rebuild_state_after_failure_single_virtual(vl, outputs)
+                            {
                                 rebuilt.push(obj);
                             } else {
                                 rebuilt.push(0);
@@ -1014,7 +1016,7 @@ fn materialize_for_bridge(
                     majit_ir::Type::Int,
                     majit_ir::Type::Int,
                 ];
-                MATERIALIZE_VIRTUALS.with(|c| {
+                REBUILD_STATE_AFTER_FAILURE.with(|c| {
                     if let Some(f) = c.get() {
                         f(&mut temp, &temp_types);
                     }
@@ -1026,7 +1028,7 @@ fn materialize_for_bridge(
         }
     }
     // Phase 3: original heuristic fallback.
-    MATERIALIZE_VIRTUALS.with(|c| {
+    REBUILD_STATE_AFTER_FAILURE.with(|c| {
         if let Some(f) = c.get() {
             f(outputs, types);
         }
@@ -1034,8 +1036,8 @@ fn materialize_for_bridge(
 }
 
 /// Materialize a single virtual from its layout and raw output values.
-/// Uses the MATERIALIZE_VIRTUALS callback for actual object allocation.
-fn materialize_single_virtual(
+/// Uses the REBUILD_STATE_AFTER_FAILURE callback for actual object allocation.
+fn rebuild_state_after_failure_single_virtual(
     vl: &majit_codegen::ExitVirtualLayout,
     outputs: &[i64],
 ) -> Option<i64> {
@@ -1053,7 +1055,7 @@ fn materialize_single_virtual(
                     majit_ir::Type::Int,
                     majit_ir::Type::Int,
                 ];
-                MATERIALIZE_VIRTUALS.with(|c| {
+                REBUILD_STATE_AFTER_FAILURE.with(|c| {
                     if let Some(f) = c.get() {
                         f(&mut temp, &temp_types);
                     }
@@ -1186,16 +1188,16 @@ pub fn take_pending_force_local0() -> Option<i64> {
 ///
 /// Signature: fn(outputs: &mut [i64], types: &[Type]) — modifies outputs
 /// in-place, replacing null Ref slots with materialized object pointers.
-type MaterializeVirtualsFn = fn(&mut [i64], &[majit_ir::Type]);
+type RebuildStateAfterFailureFn = fn(&mut [i64], &[majit_ir::Type]);
 
 thread_local! {
-    static MATERIALIZE_VIRTUALS: std::cell::Cell<Option<MaterializeVirtualsFn>> =
+    static REBUILD_STATE_AFTER_FAILURE: std::cell::Cell<Option<RebuildStateAfterFailureFn>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Register the virtual materialization callback. Called from pyre-jit init.
-pub fn register_materialize_virtuals(f: MaterializeVirtualsFn) {
-    MATERIALIZE_VIRTUALS.with(|c| c.set(Some(f)));
+pub fn register_rebuild_state_after_failure(f: RebuildStateAfterFailureFn) {
+    REBUILD_STATE_AFTER_FAILURE.with(|c| c.set(Some(f)));
 }
 
 /// Frame state to restore from guard failure fail_args.
@@ -2174,7 +2176,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // RPython rebuild_state_after_failure parity: materialize virtual
             // objects from recovery_layout before bridge dispatch.
             let mut mat_outputs = outputs.clone();
-            materialize_for_bridge(
+            rebuild_state_after_failure(
                 &mut mat_outputs,
                 &fail_descr.fail_arg_types,
                 fail_descr.recovery_layout.lock().unwrap().as_ref(),
@@ -2565,7 +2567,7 @@ fn call_assembler_fast_path(
         // objects before bridge dispatch. Virtual Ref slots are null (0)
         // with their fields in trailing Int slots.
         let mut bridge_outputs = outputs.to_vec();
-        materialize_for_bridge(
+        rebuild_state_after_failure(
             &mut bridge_outputs,
             &fail_descr.fail_arg_types,
             fail_descr.recovery_layout.lock().unwrap().as_ref(),
@@ -4675,7 +4677,7 @@ impl CraneliftBackend {
                 // RPython rebuild_state_after_failure parity: materialize
                 // virtual objects before bridge dispatch.
                 let mut mat_outputs = outputs.clone();
-                materialize_for_bridge(
+                rebuild_state_after_failure(
                     &mut mat_outputs,
                     &fail_descr.fail_arg_types,
                     fail_descr.recovery_layout.lock().unwrap().as_ref(),
