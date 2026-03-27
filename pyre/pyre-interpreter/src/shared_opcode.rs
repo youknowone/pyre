@@ -47,13 +47,13 @@ fn pop_n<H: SharedOpcodeHandler + ?Sized>(
     Ok(values)
 }
 
-pub fn exec_make_function<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
+pub fn opcode_make_function<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
     let code_obj = handler.pop_value()?;
     let func = handler.make_function(code_obj)?;
     handler.push_value(func)
 }
 
-pub fn exec_call<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     nargs: usize,
 ) -> OpcodeResult<()> {
@@ -102,7 +102,7 @@ pub fn exec_call<H: SharedOpcodeHandler + ?Sized>(
     }
 }
 
-pub fn exec_build_list<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_build_list<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     size: usize,
 ) -> OpcodeResult<()> {
@@ -111,7 +111,7 @@ pub fn exec_build_list<H: SharedOpcodeHandler + ?Sized>(
     handler.push_value(list)
 }
 
-pub fn exec_build_tuple<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_build_tuple<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     size: usize,
 ) -> OpcodeResult<()> {
@@ -120,7 +120,7 @@ pub fn exec_build_tuple<H: SharedOpcodeHandler + ?Sized>(
     handler.push_value(tuple)
 }
 
-pub fn exec_build_map<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_build_map<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     size: usize,
 ) -> OpcodeResult<()> {
@@ -129,14 +129,14 @@ pub fn exec_build_map<H: SharedOpcodeHandler + ?Sized>(
     handler.push_value(dict)
 }
 
-pub fn exec_store_subscr<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
+pub fn opcode_store_subscr<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
     let key = handler.pop_value()?;
     let obj = handler.pop_value()?;
     let value = handler.pop_value()?;
     handler.store_subscr(obj, key, value)
 }
 
-pub fn exec_list_append<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_list_append<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     depth: usize,
 ) -> OpcodeResult<()> {
@@ -148,7 +148,7 @@ pub fn exec_list_append<H: SharedOpcodeHandler + ?Sized>(
     handler.list_append(list, value)
 }
 
-pub fn exec_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     count: usize,
 ) -> OpcodeResult<()> {
@@ -160,7 +160,7 @@ pub fn exec_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     Ok(())
 }
 
-pub fn exec_load_attr<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_load_attr<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
 ) -> OpcodeResult<()> {
@@ -169,7 +169,7 @@ pub fn exec_load_attr<H: SharedOpcodeHandler + ?Sized>(
     handler.push_value(attr)
 }
 
-pub fn exec_store_attr<H: SharedOpcodeHandler + ?Sized>(
+pub fn opcode_store_attr<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,
 ) -> OpcodeResult<()> {
