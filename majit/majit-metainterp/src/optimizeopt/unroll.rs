@@ -1767,10 +1767,11 @@ impl OptUnroll {
                             crate::optimizeopt::info::PtrInfo::KnownClass {
                                 class_ptr,
                                 is_nonnull: true,
+                                last_guard_pos: -1,
                             },
                         );
                     } else if info.nonnull {
-                        ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::NonNull);
+                        ctx.set_ptr_info(target, crate::optimizeopt::info::PtrInfo::nonnull());
                     }
                 }
             }
@@ -1915,20 +1916,22 @@ impl OptUnroll {
             PtrInfo::KnownClass {
                 class_ptr,
                 is_nonnull,
+                ..
             } => {
                 ctx.set_ptr_info(
                     opref,
                     PtrInfo::KnownClass {
                         class_ptr,
                         is_nonnull,
+                        last_guard_pos: -1,
                     },
                 );
             }
             PtrInfo::Constant(ptr) => {
                 ctx.set_ptr_info(opref, PtrInfo::Constant(ptr));
             }
-            PtrInfo::NonNull => {
-                ctx.set_ptr_info(opref, PtrInfo::NonNull);
+            PtrInfo::NonNull { .. } => {
+                ctx.set_ptr_info(opref, PtrInfo::nonnull());
             }
             PtrInfo::Virtualizable(info) => {
                 ctx.set_ptr_info(opref, PtrInfo::Virtualizable(info));

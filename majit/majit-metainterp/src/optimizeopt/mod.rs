@@ -205,10 +205,6 @@ pub struct OptContext {
     /// slots the trace depends on. After compilation, per-slot watchers
     /// are registered.
     pub quasi_immutable_deps: HashSet<(u64, u32)>,
-    /// info.py:91-92: NonNullPtrInfo.last_guard_pos — index into new_operations
-    /// of the last guard emitted for this OpRef. Used by guard strengthening
-    /// (GUARD_NONNULL → GUARD_NONNULL_CLASS, etc.) in rewrite.py.
-    pub last_guard_positions: HashMap<OpRef, usize>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
@@ -404,7 +400,6 @@ impl OptContext {
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
-            last_guard_positions: HashMap::new(),
         }
     }
 
@@ -453,7 +448,6 @@ impl OptContext {
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
-            last_guard_positions: HashMap::new(),
         }
     }
 
@@ -878,21 +872,21 @@ impl OptContext {
     /// NEXT position has ptr_info set (it's a terminal, like RPython's
     /// get_box_replacement stopping at _forwarded=Info).
     /// info.py:111-118: mark_last_guard — record the last guard position
-    /// for an OpRef. Used by guard strengthening (rewrite.py:291, 408, 433).
+    /// on the PtrInfo for an OpRef. RPython: opinfo.mark_last_guard(optimizer).
     pub fn mark_last_guard(&mut self, opref: OpRef) {
-        if let Some(last_op) = self.new_operations.last() {
-            if last_op.opcode.is_guard() {
-                self.last_guard_positions
-                    .insert(opref, self.new_operations.len() - 1);
-            }
+        let pos = match self.new_operations.last() {
+            Some(op) if op.opcode.is_guard() => (self.new_operations.len() - 1) as i32,
+            _ => return,
+        };
+        if let Some(info) = self.get_ptr_info_mut(opref) {
+            info.set_last_guard_pos(pos);
         }
     }
 
-    /// info.py:100-103: get_last_guard — retrieve the last guard op for an OpRef.
+    /// info.py:100-103: get_last_guard — retrieve the last guard op via PtrInfo.
     pub fn get_last_guard(&self, opref: OpRef) -> Option<&Op> {
-        self.last_guard_positions
-            .get(&opref)
-            .and_then(|&pos| self.new_operations.get(pos))
+        let pos = self.get_ptr_info(opref)?.get_last_guard_pos()?;
+        self.new_operations.get(pos)
     }
 
     /// RPython get_box_replacement: follow the forwarding chain until

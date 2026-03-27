@@ -120,6 +120,7 @@ impl OptVirtualize {
             Some(PtrInfo::KnownClass {
                 class_ptr: existing,
                 is_nonnull,
+                ..
             }) => PtrInfo::KnownClass {
                 class_ptr: if existing.is_null() {
                     class_ptr
@@ -127,14 +128,16 @@ impl OptVirtualize {
                     existing
                 },
                 is_nonnull: is_nonnull || !class_ptr.is_null(),
+                last_guard_pos: -1,
             },
-            Some(PtrInfo::NonNull)
+            Some(PtrInfo::NonNull { .. })
             | Some(PtrInfo::Constant(_))
             | Some(PtrInfo::Struct(_))
             | Some(PtrInfo::Array(_))
             | None => PtrInfo::KnownClass {
                 class_ptr,
                 is_nonnull: true,
+                last_guard_pos: -1,
             },
         };
         ctx.set_ptr_info(obj_ref, updated);
@@ -159,6 +162,7 @@ impl OptVirtualize {
             fields: vec![],
             field_descrs: vec![],
             arrays: vec![],
+            last_guard_pos: -1,
         };
         let mut flat_input_idx = 1usize;
 
@@ -234,6 +238,7 @@ impl OptVirtualize {
                             fields: vec![],
                             field_descrs: vec![],
                             arrays: vec![],
+                            last_guard_pos: -1,
                         }),
                     );
                 }
@@ -281,7 +286,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OpRef {
         // Mark as no longer virtual (prevents infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit SETFIELD_RAW for each tracked field, using the original DescrRef
         for (field_idx, value_ref) in &vinfo.fields {
@@ -515,9 +520,10 @@ impl OptVirtualize {
             known_class: vinfo.known_class,
             fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
+            last_guard_pos: -1,
         });
         // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -556,7 +562,7 @@ impl OptVirtualize {
         let len = vinfo.items.len();
 
         // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit the length constant and NEW_ARRAY
         let len_ref = self.emit_constant_int(ctx, len as i64);
@@ -594,9 +600,10 @@ impl OptVirtualize {
             descr: vinfo.descr.clone(),
             fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
+            last_guard_pos: -1,
         });
         // Mark as no longer virtual FIRST (avoids infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit NEW
         let mut alloc_op = Op::new(OpCode::New, &[]);
@@ -634,7 +641,7 @@ impl OptVirtualize {
         let num_elements = vinfo.element_fields.len();
 
         // Mark as no longer virtual FIRST
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit NEW_ARRAY for the outer array
         let len_ref = self.emit_constant_int(ctx, num_elements as i64);
@@ -669,7 +676,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OpRef {
         // Mark as no longer virtual FIRST
-        ctx.set_ptr_info(opref, PtrInfo::NonNull);
+        ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
         // Emit CALL_MALLOC_NURSERY or equivalent raw allocation
         let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
@@ -781,6 +788,7 @@ impl OptVirtualize {
             known_class: None,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::Virtual(vinfo));
         OptimizationResult::Remove
@@ -792,6 +800,7 @@ impl OptVirtualize {
             descr,
             fields: Vec::new(),
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
@@ -803,7 +812,11 @@ impl OptVirtualize {
             if size >= 0 && size <= 1024 {
                 let descr = op.descr.clone().expect("NEW_ARRAY needs descr");
                 let items = vec![OpRef::NONE; size as usize];
-                let vinfo = VirtualArrayInfo { descr, items };
+                let vinfo = VirtualArrayInfo {
+                    descr,
+                    items,
+                    last_guard_pos: -1,
+                };
                 ctx.set_ptr_info(op.pos, PtrInfo::VirtualArray(vinfo));
                 return OptimizationResult::Remove;
             }
@@ -868,7 +881,7 @@ impl OptVirtualize {
         // In majit, this is handled by emit_with_guard_check or force_all_lazy.
         // virtualize.py:204: self.make_nonnull(op.getarg(0))
         if ctx.get_ptr_info(struct_ref).is_none() {
-            ctx.set_ptr_info(struct_ref, PtrInfo::NonNull);
+            ctx.set_ptr_info(struct_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -920,7 +933,7 @@ impl OptVirtualize {
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
         if ctx.get_ptr_info(struct_ref).is_none() {
-            ctx.set_ptr_info(struct_ref, PtrInfo::NonNull);
+            ctx.set_ptr_info(struct_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1460,6 +1473,7 @@ impl OptVirtualize {
                 PtrInfo::KnownClass {
                     class_ptr,
                     is_nonnull: true,
+                    ..
                 } => {
                     if expected_class
                         .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
@@ -1474,7 +1488,7 @@ impl OptVirtualize {
         if let Some(class_ptr) = expected_class {
             self.record_known_class(obj_ref, class_ptr, ctx);
         } else {
-            ctx.set_ptr_info(obj_ref, PtrInfo::NonNull);
+            ctx.set_ptr_info(obj_ref, PtrInfo::nonnull());
         }
         self.force_guard_fail_args(op, ctx)
     }
@@ -1515,7 +1529,7 @@ impl OptVirtualize {
         // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
         // that was virtualized). Clear that to prevent accidental forcing
         // of unrelated virtuals when the vref struct is forced.
-        ctx.set_ptr_info(token_ref, PtrInfo::NonNull);
+        ctx.set_ptr_info(token_ref, PtrInfo::nonnull());
 
         // Use a sentinel OpRef for the NULL constant in the `forced` field.
         // We don't emit it now; when the virtual struct is forced, the
@@ -1532,6 +1546,7 @@ impl OptVirtualize {
             descr: vref_descr,
             fields,
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
 
@@ -1885,6 +1900,7 @@ impl Optimization for OptVirtualize {
                                         crate::optimizeopt::info::VirtualRawBufferInfo {
                                             size: size as usize,
                                             entries: Vec::new(),
+                                            last_guard_pos: -1,
                                         },
                                     );
                                     ctx.set_ptr_info(op.pos, info);
@@ -2404,6 +2420,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: vec![],
                 arrays: vec![(0, vec![OpRef::NONE])],
+                last_guard_pos: -1,
             }),
         );
 
@@ -2440,6 +2457,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: vec![],
                 arrays: vec![(0, vec![OpRef::NONE])],
+                last_guard_pos: -1,
             }),
         );
 
@@ -2849,6 +2867,7 @@ mod tests {
                 known_class: None,
                 fields: vec![(field_descr.index(), OpRef(20))],
                 field_descrs: vec![(field_descr.index(), field_descr.clone())],
+                last_guard_pos: -1,
             }),
         );
 
@@ -3543,6 +3562,7 @@ mod tests {
                 PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                     size,
                     entries: Vec::new(),
+                    last_guard_pos: -1,
                 }),
             );
         }

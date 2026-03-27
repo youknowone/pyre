@@ -1752,7 +1752,7 @@ impl Optimization for OptRewrite {
                 // make_nonnull(arg(0)) — only set if no existing PtrInfo.
                 // optimizer.py:437-448
                 if ctx.get_ptr_info(obj).is_none() {
-                    ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::NonNull);
+                    ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
                 // rewrite.py:282: mark_last_guard(self.optimizer)
                 // Guard strengthening: record this guard's position for the arg.

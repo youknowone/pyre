@@ -1618,12 +1618,13 @@ fn export_single_value(
             PtrInfo::KnownClass {
                 class_ptr,
                 is_nonnull: _,
+                ..
             } => {
                 return VirtualStateInfo::KnownClass {
                     class_ptr: *class_ptr,
                 };
             }
-            PtrInfo::NonNull => {
+            PtrInfo::NonNull { .. } => {
                 return VirtualStateInfo::NonNull;
             }
             PtrInfo::Constant(gcref) => {
@@ -1694,6 +1695,7 @@ fn import_single_value(
                 known_class: *known_class,
                 fields: vfields,
                 field_descrs: field_descrs.clone(),
+                last_guard_pos: -1,
             }));
         }
         VirtualStateInfo::VirtualArray { descr, items, .. } => {
@@ -1707,6 +1709,7 @@ fn import_single_value(
             ptr_info[idx] = Some(PtrInfo::VirtualArray(VirtualArrayInfo {
                 descr: descr.clone(),
                 items: vitems,
+                last_guard_pos: -1,
             }));
         }
         VirtualStateInfo::VirtualStruct {
@@ -1725,6 +1728,7 @@ fn import_single_value(
                 descr: descr.clone(),
                 fields: vfields,
                 field_descrs: field_descrs.clone(),
+                last_guard_pos: -1,
             }));
         }
         VirtualStateInfo::VirtualArrayStruct {
@@ -1745,6 +1749,7 @@ fn import_single_value(
             ptr_info[idx] = Some(PtrInfo::VirtualArrayStruct(VirtualArrayStructInfo {
                 descr: descr.clone(),
                 element_fields: imported_elements,
+                last_guard_pos: -1,
             }));
         }
         VirtualStateInfo::VirtualRawBuffer { size, entries } => {
@@ -1758,16 +1763,18 @@ fn import_single_value(
             ptr_info[idx] = Some(PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
                 size: *size,
                 entries: imported_entries,
+                last_guard_pos: -1,
             }));
         }
         VirtualStateInfo::KnownClass { class_ptr } => {
             ptr_info[idx] = Some(PtrInfo::KnownClass {
                 class_ptr: *class_ptr,
                 is_nonnull: true,
+                last_guard_pos: -1,
             });
         }
         VirtualStateInfo::NonNull => {
-            ptr_info[idx] = Some(PtrInfo::NonNull);
+            ptr_info[idx] = Some(PtrInfo::nonnull());
         }
         VirtualStateInfo::IntBounded(bound) => {
             // RPython virtualstate.py NotVirtualStateInfoInt: propagate
@@ -2024,6 +2031,7 @@ mod tests {
             known_class: None,
             fields: vec![(0, field_ref)],
             field_descrs: Vec::new(),
+            last_guard_pos: -1,
         }));
 
         let state = export_state(&[opref], &ctx, &ptr_info);
@@ -2071,6 +2079,7 @@ mod tests {
         ptr_info[0] = Some(PtrInfo::KnownClass {
             class_ptr: GcRef(0x100),
             is_nonnull: true,
+            last_guard_pos: -1,
         });
 
         let state = export_state(&[opref], &ctx, &ptr_info);
@@ -2165,6 +2174,7 @@ mod tests {
                 descr,
                 fields: vec![(0, OpRef::NONE), (8, field_value)],
                 field_descrs: Vec::new(),
+                last_guard_pos: -1,
             }),
         );
 
@@ -2215,6 +2225,7 @@ mod tests {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
+                last_guard_pos: -1,
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
