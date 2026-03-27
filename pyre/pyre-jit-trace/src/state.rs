@@ -2879,8 +2879,8 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         op: BinaryOperator,
-        _concrete_lhs: PyObjectRef,
-        _concrete_rhs: PyObjectRef,
+        concrete_lhs: PyObjectRef,
+        concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
         let op_code = match op {
@@ -2896,11 +2896,18 @@ impl MIFrame {
             _ => return self.trace_binary_value(a, b, op),
         };
 
+        // Determine which operands are int (need int→float cast) vs float.
+        // RPython: float_add etc. call space.float_w() which dispatches on
+        // type — int objects go through int2float (CastIntToFloat).
+        let lhs_is_int = (!concrete_lhs.is_null() && unsafe { is_int(concrete_lhs) })
+            || self.value_type(a) == Type::Int;
+        let rhs_is_int = (!concrete_rhs.is_null() && unsafe { is_int(concrete_rhs) })
+            || self.value_type(b) == Type::Int;
+
         self.with_ctx(|this, ctx| {
             let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-            // Inline trace_unbox_float but use this.record_guard for correct
-            // fail_arg types (generated trace_unbox_float hardcodes all types
-            // as Int, losing Float type info needed for guard recovery).
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            // Unbox a float object to raw f64.
             let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
                 if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
                     let ob_type =
@@ -2922,13 +2929,36 @@ impl MIFrame {
                     }
                 }
             };
+            // Unbox an int object to raw i64, then CastIntToFloat → f64.
+            // RPython: space.float_w(w_int) → float(w_int.intval)
+            let unbox_int_to_float =
+                |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
+                    let fail_args = this.current_fail_args(ctx);
+                    let raw_int = if this.value_type(obj) == Type::Int {
+                        obj
+                    } else {
+                        crate::generated::trace_unbox_int(
+                            ctx,
+                            obj,
+                            int_type_addr,
+                            crate::descr::ob_type_descr(),
+                            crate::descr::int_intval_descr(),
+                            &fail_args,
+                        )
+                    };
+                    ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
+                };
             let lhs_raw = if this.value_type(a) == Type::Float {
                 a
+            } else if lhs_is_int {
+                unbox_int_to_float(this, ctx, a)
             } else {
                 unbox_float(this, ctx, a)
             };
             let rhs_raw = if this.value_type(b) == Type::Float {
                 b
+            } else if rhs_is_int {
+                unbox_int_to_float(this, ctx, b)
             } else {
                 unbox_float(this, ctx, b)
             };
