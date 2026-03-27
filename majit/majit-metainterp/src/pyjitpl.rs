@@ -3852,6 +3852,11 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.clear();
     }
 
+    /// Remove compiled loop for a specific green_key.
+    pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.compiled_loops.remove(&green_key);
+    }
+
     /// Return all green keys that have compiled loops.
     pub fn all_compiled_keys(&self) -> Vec<u64> {
         self.compiled_loops.keys().copied().collect()

@@ -303,18 +303,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // At runtime jit_merge_point only handles trace feed (when
         // tracing is active) and deferred trace start (pending_trace).
         if is_portal {
-            // Deferred trace start: counter fired at back-edge, actual
-            // tracing begins at the loop header (jit_merge_point position).
+            // Deferred bound_reached: counter fired at can_enter_jit,
+            // actual tracing begins at jit_merge_point position.
             if let Some((key, header_pc)) = pending_trace {
                 if pc == header_pc && !driver.is_tracing() {
                     pending_trace = None;
                     if let Some(loop_result) =
-                        can_enter_jit_hook(frame, key, header_pc, driver, info, &env)
+                        bound_reached(frame, key, header_pc, driver, info, &env)
                     {
                         return loop_result;
                     }
-                    // RPython warmstate.py:429 decay_all_counters parity
-                    driver.meta_interp_mut().warm_state_mut().counter.reset(key);
                 }
             }
             let tracing_depth = driver.meta_interp().tracing_call_depth;
@@ -371,33 +369,18 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
-                // RPython warmstate.py:446-511 maybe_compile_and_run:
-                // cell lookup → compiled → enter, else → counter tick → bound_reached.
+                // RPython interp_jit.py:114 → warmstate.py:446
                 let green_key = make_green_key(frame.code, loop_header_pc);
-                if driver
-                    .meta_interp_mut()
-                    .warm_state_mut()
-                    .counter
-                    .tick(green_key)
-                    && !driver.is_tracing()
-                {
-                    if driver.has_compiled_loop(green_key) {
-                        // RPython warmstate.py:482-511: compiled code exists.
-                        if let Some(loop_result) =
-                            can_enter_jit_hook(frame, green_key, loop_header_pc, driver, info, &env)
-                        {
-                            return loop_result;
-                        }
-                        driver
-                            .meta_interp_mut()
-                            .warm_state_mut()
-                            .counter
-                            .reset(green_key);
-                    } else {
-                        // RPython warmstate.py:466-468 bound_reached:
-                        // defer trace start to jit_merge_point.
-                        pending_trace = Some((green_key, loop_header_pc));
-                    }
+                if let Some(loop_result) = maybe_compile_and_run(
+                    frame,
+                    green_key,
+                    loop_header_pc,
+                    driver,
+                    info,
+                    &env,
+                    &mut pending_trace,
+                ) {
+                    return loop_result;
                 }
             }
             Ok(StepResult::CloseLoop { .. }) => {}
@@ -466,13 +449,162 @@ fn jit_merge_point_hook(
     None
 }
 
-/// RPython warmstate.py:446-511 maybe_compile_and_run slow path.
-/// Called when counter threshold fires. Handles both compiled code
-/// entry (warmstate.py:482-511) and trace start (warmstate.py:425-444
-/// bound_reached).
+/// RPython warmstate.py:446-511 maybe_compile_and_run.
+///
+/// Entry point to the JIT. Called at can_enter_jit (back-edge).
+/// 1. counter tick (pyre uses counter gating; RPython uses O(1) cell lookup)
+/// 2. JC_TRACING check
+/// 3. compiled code exists → execute_assembler
+/// 4. no compiled → bound_reached (deferred to jit_merge_point)
 #[cold]
 #[inline(never)]
-fn can_enter_jit_hook(
+fn maybe_compile_and_run(
+    frame: &mut PyFrame,
+    green_key: u64,
+    loop_header_pc: usize,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+    pending_trace: &mut Option<(u64, usize)>,
+) -> Option<LoopResult> {
+    // warmstate.py:446-511: counter tick gates both compiled entry
+    // and trace start. RPython checks the cell (compiled code) before
+    // the counter, but pyre's has_compiled_loop is O(HashMap) — too
+    // expensive for every back-edge. Counter gating matches RPython's
+    // amortized O(1) cell lookup via jitcounter timetable.
+    if driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .counter
+        .tick(green_key)
+        && !driver.is_tracing()
+    {
+        // warmstate.py:473-477: JC_TRACING
+        if driver.meta_interp().is_tracing_key(green_key) {
+            return None;
+        }
+        // warmstate.py:482-511: compiled code → execute_assembler
+        if driver.has_compiled_loop(green_key) {
+            if let Some(r) = execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
+            {
+                return Some(r);
+            }
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .counter
+                .reset(green_key);
+            return None;
+        }
+        // warmstate.py:466-468: no compiled → bound_reached (deferred)
+        *pending_trace = Some((green_key, loop_header_pc));
+    }
+    None
+}
+
+/// RPython warmstate.py:387-423 execute_assembler.
+///
+/// Run compiled machine code for a given green_key. Handles the
+/// fail_descr outcomes: DoneWithThisFrame, GuardFailure, etc.
+#[cold]
+#[inline(never)]
+fn execute_assembler(
+    frame: &mut PyFrame,
+    green_key: u64,
+    entry_pc: usize,
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+) -> Option<LoopResult> {
+    frame.next_instr = entry_pc;
+    let mut jit_state = build_jit_state(frame, info);
+    jit_state.next_instr = entry_pc;
+    jit_state.valuestackdepth = frame.valuestackdepth;
+
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][execute-assembler] key={} pc={} arg0={:?}",
+            green_key,
+            entry_pc,
+            debug_first_arg_int(frame),
+        );
+    }
+
+    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+        green_key,
+        entry_pc,
+        &mut jit_state,
+        env,
+        || {},
+        restore_guard_failure_for_loop,
+    );
+
+    // warmstate.py:410-421: handle fail_descr outcomes
+    let bridge_request = match &outcome {
+        DetailedDriverRunOutcome::GuardFailure {
+            bridge_request: Some(req),
+            ..
+        } => Some(req.clone()),
+        _ => None,
+    };
+
+    if majit_metainterp::majit_log_enabled() {
+        let kind = match &outcome {
+            DetailedDriverRunOutcome::Finished { .. } => "finished",
+            DetailedDriverRunOutcome::Jump { .. } => "jump",
+            DetailedDriverRunOutcome::Abort { .. } => "abort",
+            DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
+            DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
+        };
+        eprintln!(
+            "[jit][execute-assembler] outcome key={} pc={} kind={}",
+            green_key, entry_pc, kind
+        );
+    }
+
+    let result = match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+        JitAction::Return(result) => Some(LoopResult::Done(result)),
+        JitAction::ContinueRunningNormally => {
+            // compile.py:710 handle_fail → resume_in_blackhole
+            let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+            if let Some(ref vals) = typed {
+                match crate::call_jit::resume_in_blackhole_from_fail_args(frame, vals, entry_pc) {
+                    crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                        Some(LoopResult::ContinueRunningNormally)
+                    }
+                    crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                        Some(LoopResult::Done(r))
+                    }
+                    crate::call_jit::BlackholeResult::Failed => None,
+                }
+            } else {
+                None
+            }
+        }
+        JitAction::Continue => None,
+    };
+
+    // compile.py handle_fail → _trace_and_compile_from_bridge
+    if let Some(req) = bridge_request {
+        crate::call_jit::jit_bridge_compile_for_guard(
+            req.green_key,
+            req.trace_id,
+            req.fail_index,
+            frame,
+            req.resume_pc,
+        );
+    }
+
+    result
+}
+
+/// RPython warmstate.py:425-444 bound_reached.
+///
+/// Called when counter threshold fires and no compiled code exists.
+/// Starts tracing via back_edge_or_run_compiled_keyed.
+#[cold]
+#[inline(never)]
+fn bound_reached(
     frame: &mut PyFrame,
     green_key: u64,
     loop_header_pc: usize,
@@ -480,24 +612,28 @@ fn can_enter_jit_hook(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let has_compiled = driver.has_compiled_loop(green_key);
-    frame.next_instr = loop_header_pc;
-    let mut jit_state = build_jit_state(frame, info);
-    jit_state.next_instr = loop_header_pc;
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][root-backedge] enter key={} pc={} arg0={:?} has_compiled={}",
+            "[jit][bound-reached] key={} pc={} arg0={:?}",
             green_key,
             loop_header_pc,
             debug_first_arg_int(frame),
-            has_compiled
         );
     }
-    // RPython warmstate.py:473-477 JC_TRACING
+    // warmstate.py:430
+    if stack_almost_full() {
+        return None;
+    }
+    // warmstate.py:437-444: MetaInterp.compile_and_run_once
+    frame.next_instr = loop_header_pc;
+    let mut jit_state = build_jit_state(frame, info);
+    jit_state.next_instr = loop_header_pc;
+    // warmstate.py:473-477 JC_TRACING
     if driver.meta_interp().is_tracing_key(green_key) {
         return None;
     }
-    // RPython warmstate.py:482-511: compiled code exists → enter
+    // warmstate.py:482-511 + warmstate.py:437-444 combined:
+    // compiled code → run, else → start tracing.
     let outcome = if driver.has_compiled_loop(green_key) {
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -508,9 +644,6 @@ fn can_enter_jit_hook(
             restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
-        if stack_almost_full() {
-            return None;
-        }
         let was_tracing = driver.is_tracing();
         let had_compiled = driver.has_compiled_loop(green_key);
         let result = driver.back_edge_or_run_compiled_keyed(
@@ -523,8 +656,6 @@ fn can_enter_jit_hook(
         if !was_tracing && driver.is_tracing() {
             driver.meta_interp_mut().tracing_call_depth = Some(call_depth());
         }
-        // RPython compile.py:204-207 (record_loop_or_bridge) parity:
-        // register quasi-immutable watchers after compilation.
         if !had_compiled && driver.has_compiled_loop(green_key) {
             register_quasi_immutable_deps(green_key);
         }
@@ -533,9 +664,6 @@ fn can_enter_jit_hook(
         None
     };
     if let Some(outcome) = outcome {
-        // RPython compile.py handle_fail parity: extract bridge request
-        // before consuming outcome. Bridge compilation happens after the
-        // driver borrow is released.
         let bridge_request = match &outcome {
             DetailedDriverRunOutcome::GuardFailure {
                 bridge_request: Some(req),
@@ -543,25 +671,9 @@ fn can_enter_jit_hook(
             } => Some(req.clone()),
             _ => None,
         };
-        if majit_metainterp::majit_log_enabled() {
-            let kind = match &outcome {
-                DetailedDriverRunOutcome::Finished { .. } => "finished",
-                DetailedDriverRunOutcome::Jump { .. } => "jump",
-                DetailedDriverRunOutcome::Abort { .. } => "abort",
-                DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
-                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
-            };
-            eprintln!(
-                "[jit][root-backedge] outcome key={} pc={} kind={}",
-                green_key, loop_header_pc, kind
-            );
-        }
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(LoopResult::Done(result)),
             JitAction::ContinueRunningNormally => {
-                // RPython compile.py:710 handle_fail → resume_in_blackhole.
-                // Run blackhole from guard PC to merge point using typed
-                // fail_args directly (not from frame).
                 let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
                 if let Some(ref vals) = typed {
                     match crate::call_jit::resume_in_blackhole_from_fail_args(
@@ -570,28 +682,17 @@ fn can_enter_jit_hook(
                         loop_header_pc,
                     ) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            // RPython bhimpl_jit_merge_point → ContinueRunningNormally.
-                            // Frame is at loop_header_pc with correct state.
-                            // handle_jitexception re-enters eval_loop_jit where
-                            // counter >= threshold → immediate compiled code entry.
                             return Some(LoopResult::ContinueRunningNormally);
                         }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrame(result) => {
-                            // RPython DoneWithThisFrame: blackhole completed
-                            // the function. The result is final.
-                            return Some(LoopResult::Done(result));
+                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                            return Some(LoopResult::Done(r));
                         }
-                        crate::call_jit::BlackholeResult::Failed => {
-                            // Blackhole couldn't run. Interpreter continues
-                            // from the restored frame state.
-                        }
+                        crate::call_jit::BlackholeResult::Failed => {}
                     }
                 }
             }
             JitAction::Continue => {}
         }
-        // RPython compile.py handle_fail → _trace_and_compile_from_bridge:
-        // Compile bridge for guards that fail >= bridge_threshold times.
         if let Some(req) = bridge_request {
             crate::call_jit::jit_bridge_compile_for_guard(
                 req.green_key,
@@ -602,6 +703,12 @@ fn can_enter_jit_hook(
             );
         }
     }
+    // warmstate.py:429 jitcounter.decay_all_counters()
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .counter
+        .reset(green_key);
     driver.meta_interp_mut().tracing_call_depth = None;
     None
 }
