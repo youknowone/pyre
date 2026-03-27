@@ -16,7 +16,7 @@ use pyre_bytecode::{CodeObject, Mode, compile_source_with_filename};
 use pyre_object::*;
 
 use crate::eval::eval_frame_plain;
-use crate::frame::PyFrame;
+use crate::pyframe::PyFrame;
 
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
@@ -133,7 +133,7 @@ fn init_collections_abc(ns: &mut PyNamespace) {
                 let name = unsafe { pyre_object::w_str_get_value(method_name) };
                 // Check if method exists in class MRO
                 let found = if unsafe { pyre_object::is_type(cls) } {
-                    unsafe { crate::space::lookup_in_type_mro_pub(cls, name) }.is_some()
+                    unsafe { crate::baseobjspace::lookup_in_type_mro_pub(cls, name) }.is_some()
                 } else {
                     false
                 };
@@ -231,10 +231,10 @@ fn init_contextvars(ns: &mut PyNamespace) {
             // Return stub object with get/set methods
             let obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
             if !args.is_empty() {
-                let _ = crate::space::py_setattr(obj, "name", args[0]);
+                let _ = crate::baseobjspace::py_setattr(obj, "name", args[0]);
             }
             // get() returns default or raises LookupError
-            let _ = crate::space::py_setattr(
+            let _ = crate::baseobjspace::py_setattr(
                 obj,
                 "get",
                 crate::w_builtin_func_new("get", |args| {
@@ -246,7 +246,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
                     }
                 }),
             );
-            let _ = crate::space::py_setattr(
+            let _ = crate::baseobjspace::py_setattr(
                 obj,
                 "set",
                 crate::w_builtin_func_new("set", |_| Ok(pyre_object::w_none())),
@@ -906,7 +906,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     }
 
     // Fallback: try py_getattr (for non-module objects or attrs set via setattr)
-    match crate::space::py_getattr(module, name) {
+    match crate::baseobjspace::py_getattr(module, name) {
         Ok(value) => Ok(value),
         Err(_) => Err(crate::PyError::new(
             crate::PyErrorKind::ImportError,

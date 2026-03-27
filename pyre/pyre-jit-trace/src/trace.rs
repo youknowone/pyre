@@ -22,13 +22,13 @@ pub fn trace_bytecode(
     sym: &mut PyreSym,
     code: &CodeObject,
     start_pc: usize,
-    mut concrete_frame: Box<pyre_interpreter::frame::PyFrame>,
-) -> (TraceAction, Box<pyre_interpreter::frame::PyFrame>) {
+    mut concrete_frame: Box<pyre_interpreter::pyframe::PyFrame>,
+) -> (TraceAction, Box<pyre_interpreter::pyframe::PyFrame>) {
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.
     concrete_frame.next_instr = start_pc;
-    let cf_addr = &*concrete_frame as *const pyre_interpreter::frame::PyFrame as usize;
+    let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
     let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,

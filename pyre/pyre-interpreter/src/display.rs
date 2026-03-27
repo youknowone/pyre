@@ -18,7 +18,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
             return None;
         }
         let w_type = pyre_object::w_instance_get_type(obj);
-        let method = crate::space::lookup_in_type_mro_pub(w_type, name)?;
+        let method = crate::baseobjspace::lookup_in_type_mro_pub(w_type, name)?;
         if method.is_null() {
             return None;
         }
@@ -38,7 +38,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
 /// # Safety
 /// `obj` must be a valid pointer to a known Python object type.
 pub unsafe fn py_repr(obj: PyObjectRef) -> String {
-    let obj = crate::space::unwrap_cell(obj);
+    let obj = crate::baseobjspace::unwrap_cell(obj);
     if obj.is_null() {
         return "NULL".to_string();
     }
@@ -139,7 +139,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
 
 /// Format for str() — tries __str__ first, then __repr__.
 pub unsafe fn py_str(obj: PyObjectRef) -> String {
-    let obj = crate::space::unwrap_cell(obj);
+    let obj = crate::baseobjspace::unwrap_cell(obj);
     if obj.is_null() {
         return "NULL".to_string();
     }

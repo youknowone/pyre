@@ -23,7 +23,7 @@ pub struct MetaInterpFrame {
     pub greenkey: Option<u64>,
     pub concrete_frame: usize,
     /// Box for heap stability across Vec reallocs.
-    pub owned_concrete_frame: Option<Box<pyre_interpreter::frame::PyFrame>>,
+    pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
     pub parent_fail_args: Vec<OpRef>,
     pub parent_fail_arg_types: Vec<Type>,
     pub drop_frame_opref: Option<OpRef>,
@@ -39,7 +39,7 @@ impl MetaInterpFrame {
 
     fn concrete_frame_addr(&self) -> usize {
         if let Some(ref cf) = self.owned_concrete_frame {
-            &**cf as *const pyre_interpreter::frame::PyFrame as usize
+            &**cf as *const pyre_interpreter::pyframe::PyFrame as usize
         } else {
             self.concrete_frame
         }
@@ -305,7 +305,7 @@ impl PyreMetaInterp {
         let mut owned_sym = Box::new(pending.sym);
         let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
         let mut owned_cf = Box::new(pending.concrete_frame);
-        let cf_addr = &*owned_cf as *const pyre_interpreter::frame::PyFrame as usize;
+        let cf_addr = &*owned_cf as *const pyre_interpreter::pyframe::PyFrame as usize;
 
         let frame = MetaInterpFrame {
             sym: sym_ptr,

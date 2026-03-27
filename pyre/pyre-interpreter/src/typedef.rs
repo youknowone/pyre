@@ -50,7 +50,7 @@ pub fn type_of(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         if is_type(obj) {
             // Check for custom metaclass in ATTR_TABLE
-            let mc = crate::space::ATTR_TABLE.with(|table| {
+            let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
                 table
                     .borrow()
                     .get(&(obj as usize))
@@ -158,7 +158,7 @@ pub fn install_builtin_typedefs() {
     );
 
     reg.insert(
-        &crate::codeobject::CODE_TYPE as *const PyType as usize,
+        &crate::pycode::CODE_TYPE as *const PyType as usize,
         make_type_with_base("code", init_code_typedef, object_type) as usize,
     );
 
@@ -277,7 +277,7 @@ fn dict_new_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // PyPy: allocate W_DictObject with custom type
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
-    let _ = crate::space::py_setattr(instance, "__dict_data__", backing);
+    let _ = crate::baseobjspace::py_setattr(instance, "__dict_data__", backing);
 
     // Initialize from args if provided
     if args.len() > 1 {
@@ -555,7 +555,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
-                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -566,7 +566,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
-            crate::space::py_len(args[0])
+            crate::baseobjspace::py_len(args[0])
         }),
     );
     namespace_store(
@@ -576,7 +576,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__"));
             }
-            crate::space::py_getitem(args[0], args[1])
+            crate::baseobjspace::py_getitem(args[0], args[1])
         }),
     );
     namespace_store(
@@ -586,7 +586,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            crate::space::py_iter(args[0])
+            crate::baseobjspace::py_iter(args[0])
         }),
     );
     namespace_store(
@@ -596,7 +596,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__add__"));
             }
-            crate::space::py_add(args[0], args[1])
+            crate::baseobjspace::py_add(args[0], args[1])
         }),
     );
     namespace_store(
@@ -606,7 +606,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mul__"));
             }
-            crate::space::py_mul(args[0], args[1])
+            crate::baseobjspace::py_mul(args[0], args[1])
         }),
     );
     namespace_store(
@@ -616,7 +616,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mod__"));
             }
-            crate::space::py_mod(args[0], args[1])
+            crate::baseobjspace::py_mod(args[0], args[1])
         }),
     );
     // maketrans — PyPy: unicodeobject.py descr_maketrans
@@ -724,7 +724,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                     pyre_object::w_dict_store(args[0], args[1], args[2]);
                 } else if pyre_object::is_instance(args[0]) {
                     // dict subclass — store in __dict_data__ backing dict
-                    if let Ok(backing) = crate::space::py_getattr(args[0], "__dict_data__") {
+                    if let Ok(backing) = crate::baseobjspace::py_getattr(args[0], "__dict_data__") {
                         if pyre_object::is_dict(backing) {
                             pyre_object::w_dict_store(backing, args[1], args[2]);
                         }
@@ -743,17 +743,17 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             }
             unsafe {
                 if pyre_object::is_dict(args[0]) {
-                    return crate::space::py_getitem(args[0], args[1]);
+                    return crate::baseobjspace::py_getitem(args[0], args[1]);
                 }
                 if pyre_object::is_instance(args[0]) {
-                    if let Ok(backing) = crate::space::py_getattr(args[0], "__dict_data__") {
+                    if let Ok(backing) = crate::baseobjspace::py_getattr(args[0], "__dict_data__") {
                         if pyre_object::is_dict(backing) {
-                            return crate::space::py_getitem(backing, args[1]);
+                            return crate::baseobjspace::py_getitem(backing, args[1]);
                         }
                     }
                 }
             }
-            crate::space::py_getitem(args[0], args[1])
+            crate::baseobjspace::py_getitem(args[0], args[1])
         }),
     );
     namespace_store(
@@ -771,7 +771,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                 ));
             }
             Ok(pyre_object::w_bool_from(
-                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -788,7 +788,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
                     unsafe { pyre_object::w_dict_len(dict) } as i64,
                 ));
             }
-            crate::space::py_len(args[0])
+            crate::baseobjspace::py_len(args[0])
         }),
     );
     namespace_store(
@@ -801,9 +801,9 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             let dict = crate::type_methods::resolve_dict_backing(args[0]);
             if !dict.is_null() {
                 // Iterate over dict keys
-                return crate::space::py_iter(dict);
+                return crate::baseobjspace::py_iter(dict);
             }
-            crate::space::py_iter(args[0])
+            crate::baseobjspace::py_iter(args[0])
         }),
     );
     namespace_store(
@@ -813,7 +813,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
             }
-            crate::space::py_delitem(args[0], args[1])?;
+            crate::baseobjspace::py_delitem(args[0], args[1])?;
             Ok(pyre_object::w_none())
         }),
     );
@@ -824,7 +824,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
-            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq)
+            crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
         }),
     );
     namespace_store(
@@ -910,7 +910,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
-                crate::space::py_contains(args[0], args[1]).unwrap_or(false),
+                crate::baseobjspace::py_contains(args[0], args[1]).unwrap_or(false),
             ))
         }),
     );
@@ -933,7 +933,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
-            crate::space::py_iter(args[0])
+            crate::baseobjspace::py_iter(args[0])
         }),
     );
 }
@@ -1067,7 +1067,7 @@ fn object_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         !args.is_empty(),
         "object.__new__() requires a type argument"
     );
-    let cls = crate::space::unwrap_cell(args[0]);
+    let cls = crate::baseobjspace::unwrap_cell(args[0]);
     // cls should be a W_TypeObject — create instance of it
     if unsafe { is_type(cls) } {
         return Ok(w_instance_new(cls));

@@ -718,7 +718,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             return obj;
         }
         if is_instance(obj) {
-            if let Ok(backing) = crate::space::py_getattr(obj, "__dict_data__") {
+            if let Ok(backing) = crate::baseobjspace::py_getattr(obj, "__dict_data__") {
                 if is_dict(backing) {
                     return backing;
                 }

@@ -2,15 +2,15 @@
 //!
 //! PyPy equivalent: pypy/interpreter/
 //!
-//! Contains the object space (space.rs), bytecode evaluation (eval.rs),
-//! frame management (frame.rs), function call dispatch (call.rs),
+//! Contains the object space (baseobjspace.rs), bytecode evaluation (eval.rs),
+//! frame management (pyframe.rs), function call dispatch (call.rs),
 //! import machinery (importing.rs), builtin functions (builtins.rs),
 //! type definitions (typedef.rs), and builtin modules (module/).
 
 // ── Former pyre-runtime modules ──
+pub mod baseobjspace;
 pub mod builtinfunc;
 pub mod builtins;
-pub mod codeobject;
 pub mod display;
 pub mod error;
 pub mod executioncontext;
@@ -18,23 +18,23 @@ pub mod frame_array;
 pub mod funcobject;
 pub mod opcode_ops;
 pub mod opcode_step;
+pub mod pycode;
 pub mod runtime_ops;
 pub mod shared_opcode;
-pub mod space;
 pub mod type_methods;
 pub mod typedef;
 
 // ── Former pyre-interp modules ──
 pub mod call;
 pub mod eval;
-pub mod frame;
 pub mod importing;
 pub mod module;
+pub mod pyframe;
 
 // ── Re-exports ──
+pub use baseobjspace::*;
 pub use builtinfunc::*;
 pub use builtins::*;
-pub use codeobject::*;
 pub use display::*;
 pub use error::*;
 pub use executioncontext::*;
@@ -43,11 +43,12 @@ pub use funcobject::*;
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use opcode_step::*;
+pub use pycode::*;
+pub use pyframe::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
-pub use space::*;
 
-// ── space.call_function ──────────────────────────────────────────────
+// ── baseobjspace.call_function ───────────────────────────────────────
 //
 // PyPy: baseobjspace.py call_function — unified callable dispatch.
 // Now a direct function (no callback needed — interpreter is in the same crate).
@@ -72,7 +73,7 @@ pub fn space_call_function_or_identity(
     unsafe {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = space::lookup_in_type_mro_pub(w_type, dunder) {
+            if let Some(method) = baseobjspace::lookup_in_type_mro_pub(w_type, dunder) {
                 return space_call_function(method, &[obj]);
             }
         }

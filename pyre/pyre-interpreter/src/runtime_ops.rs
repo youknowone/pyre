@@ -605,7 +605,7 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
         }
         // Try __len__ on instances
         if is_instance(seq) {
-            if let Ok(len_val) = crate::space::py_len(seq) {
+            if let Ok(len_val) = crate::baseobjspace::py_len(seq) {
                 return Ok(w_int_get_value(len_val) as usize);
             }
         }
@@ -639,7 +639,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         }
         // Try py_getitem for instances
         if is_instance(seq) {
-            return crate::space::py_getitem(seq, w_int_new(index as i64));
+            return crate::baseobjspace::py_getitem(seq, w_int_new(index as i64));
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",
@@ -670,10 +670,10 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
     // PyPy: ObjSpace.unpackiterable
-    let iter = crate::space::py_iter(seq)?;
+    let iter = crate::baseobjspace::py_iter(seq)?;
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        match crate::space::py_next(iter) {
+        match crate::baseobjspace::py_next(iter) {
             Ok(val) => items.push(val),
             Err(e) if e.kind == PyErrorKind::StopIteration => {
                 return Err(PyError::type_error(format!(

@@ -9,7 +9,7 @@
 
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
-use pyre_interpreter::frame::PyFrame;
+use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
 use pyre_object::w_none;
 use std::cell::{Cell, UnsafeCell};

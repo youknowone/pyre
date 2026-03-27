@@ -13,8 +13,8 @@ pub fn binary_value(
     b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let a = crate::space::unwrap_cell(a);
-    let b = crate::space::unwrap_cell(b);
+    let a = crate::baseobjspace::unwrap_cell(a);
+    let b = crate::baseobjspace::unwrap_cell(b);
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => py_add(a, b),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => py_sub(a, b),
@@ -65,8 +65,8 @@ pub fn compare_value(
     b: PyObjectRef,
     op: ComparisonOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let a = crate::space::unwrap_cell(a);
-    let b = crate::space::unwrap_cell(b);
+    let a = crate::baseobjspace::unwrap_cell(a);
+    let b = crate::baseobjspace::unwrap_cell(b);
     let cmp_op = match op {
         ComparisonOperator::Less => CompareOp::Lt,
         ComparisonOperator::LessOrEqual => CompareOp::Le,
@@ -100,17 +100,17 @@ pub fn compare_value_from_tag(
 }
 
 pub fn unary_negative_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let value = crate::space::unwrap_cell(value);
+    let value = crate::baseobjspace::unwrap_cell(value);
     py_negative(value)
 }
 
 pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let value = crate::space::unwrap_cell(value);
+    let value = crate::baseobjspace::unwrap_cell(value);
     py_invert(value)
 }
 
 pub fn truth_value(value: PyObjectRef) -> bool {
-    let value = crate::space::unwrap_cell(value);
+    let value = crate::baseobjspace::unwrap_cell(value);
     py_is_true(value)
 }
 
