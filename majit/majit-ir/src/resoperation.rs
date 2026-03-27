@@ -139,6 +139,60 @@ pub struct Op {
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info (descr_index, known_class, fieldnums).
     pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
+    /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
+    /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
+    pub vecinfo: Option<VectorizationInfo>,
+}
+
+/// resoperation.py:156-200: Per-op vector metadata for the vectorizer.
+/// Tracks how a scalar op maps to SIMD lanes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorizationInfo {
+    /// 'i' for integer, 'f' for float, '\0' for unset
+    pub datatype: char,
+    /// Byte size per element (-1 = machine word)
+    pub bytesize: i8,
+    /// Whether the values are signed
+    pub signed: bool,
+    /// Number of SIMD lanes (-1 = unset)
+    pub count: i16,
+}
+
+impl VectorizationInfo {
+    /// resoperation.py:156-162: default values
+    pub fn new() -> Self {
+        VectorizationInfo {
+            datatype: '\0',
+            bytesize: -1,
+            signed: true,
+            count: -1,
+        }
+    }
+
+    /// resoperation.py:212-217: setinfo
+    pub fn setinfo(&mut self, datatype: char, bytesize: i8, signed: bool) {
+        self.datatype = datatype;
+        self.bytesize = bytesize;
+        self.signed = signed;
+    }
+
+    /// resoperation.py:219-222: getbytesize (uses word size if -1)
+    pub fn getbytesize(&self) -> usize {
+        if self.bytesize == -1 {
+            8
+        } else {
+            self.bytesize as usize
+        }
+    }
+
+    /// resoperation.py:224-227: getcount
+    pub fn getcount(&self) -> usize {
+        if self.count == -1 {
+            1
+        } else {
+            self.count as usize
+        }
+    }
 }
 
 impl Op {
@@ -156,6 +210,7 @@ impl Op {
             rd_numb: None,
             rd_consts: None,
             rd_virtuals_info: None,
+            vecinfo: None,
         }
     }
 
@@ -173,6 +228,7 @@ impl Op {
             rd_numb: None,
             rd_consts: None,
             rd_virtuals_info: None,
+            vecinfo: None,
         }
     }
 

@@ -11,7 +11,7 @@ use crate::optimizeopt::dependency::DependencyGraph;
 
 /// A group of independent, isomorphic operations that can be packed.
 #[derive(Clone, Debug)]
-pub struct PackGroup {
+pub struct Pack {
     /// The scalar opcode of the group members.
     pub scalar_opcode: OpCode,
     /// The vector opcode to replace them with.
@@ -25,7 +25,7 @@ pub struct PackGroup {
 #[derive(Clone, Debug, Default)]
 pub struct PackSet {
     /// All packs found so far.
-    pub packs: Vec<PackGroup>,
+    pub packs: Vec<Pack>,
 }
 
 impl PackSet {
@@ -34,7 +34,7 @@ impl PackSet {
     }
 
     /// Add a pack to the set.
-    pub fn add_pack(&mut self, pack: PackGroup) {
+    pub fn add_pack(&mut self, pack: Pack) {
         self.packs.push(pack);
     }
 
@@ -90,7 +90,7 @@ impl PackSet {
                             && !self.already_packed(uright)
                         {
                             let sc = graph.nodes[uleft].op.opcode;
-                            self.packs.push(PackGroup {
+                            self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![uleft, uright],
@@ -107,7 +107,7 @@ impl PackSet {
                             && !self.already_packed(dright)
                         {
                             let sc = graph.nodes[dleft].op.opcode;
-                            self.packs.push(PackGroup {
+                            self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![dleft, dright],
@@ -209,7 +209,7 @@ pub fn are_adjacent_memory_refs(
 /// (e.g., sum += array[i]) that can be vectorized with horizontal
 /// reduction instructions.
 #[derive(Clone, Debug)]
-pub struct AccumulationPack {
+pub struct AccumPack {
     /// The scalar opcode of the accumulation (e.g., IntAdd, FloatAdd).
     pub scalar_opcode: OpCode,
     /// The initial accumulator value OpRef.
@@ -318,7 +318,7 @@ impl GenericCostModel {
     }
 
     /// Estimate total savings from vectorizing a pack group.
-    pub fn estimate_savings(&self, group: &PackGroup) -> i32 {
+    pub fn estimate_savings(&self, group: &Pack) -> i32 {
         let n = group.members.len() as i32;
         let per_op = self.op_cost(group.scalar_opcode);
         // Savings = (n-1) ops eliminated * per-op cost
@@ -356,7 +356,7 @@ impl CostModel {
     /// Estimate whether vectorizing a group is profitable.
     ///
     /// Returns true if the estimated savings outweigh the pack/unpack costs.
-    pub fn is_profitable(&self, group: &PackGroup) -> bool {
+    pub fn is_profitable(&self, group: &Pack) -> bool {
         let n = group.members.len() as i32;
         if n < self.min_pack_size as i32 {
             return false;

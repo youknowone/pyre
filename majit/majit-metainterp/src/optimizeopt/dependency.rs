@@ -6,12 +6,12 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::optimizeopt::schedule::PackGroup;
+use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};
 
 /// A node in the dependency graph.
 #[derive(Clone, Debug)]
-pub struct DepNode {
+pub struct Node {
     /// Index in the ops list.
     pub idx: usize,
     /// The operation.
@@ -25,7 +25,7 @@ pub struct DepNode {
 /// Dependency graph for a loop body.
 #[derive(Clone, Debug)]
 pub struct DependencyGraph {
-    pub nodes: Vec<DepNode>,
+    pub nodes: Vec<Node>,
 }
 
 impl DependencyGraph {
@@ -36,10 +36,10 @@ impl DependencyGraph {
     /// - Both access memory and at least one is a write (memory dependency)
     /// - One is a guard (control dependency)
     pub fn build(ops: &[Op]) -> Self {
-        let mut nodes: Vec<DepNode> = ops
+        let mut nodes: Vec<Node> = ops
             .iter()
             .enumerate()
-            .map(|(idx, op)| DepNode {
+            .map(|(idx, op)| Node {
                 idx,
                 op: op.clone(),
                 deps: Vec::new(),
@@ -100,8 +100,8 @@ impl DependencyGraph {
     ///
     /// Two ops are "isomorphic" if they have the same opcode and their
     /// args come from independent sources (no data dependency between them).
-    pub fn find_packable_groups(&self) -> Vec<PackGroup> {
-        let mut groups: Vec<PackGroup> = Vec::new();
+    pub fn find_packable_groups(&self) -> Vec<Pack> {
+        let mut groups: Vec<Pack> = Vec::new();
         let mut used: HashSet<usize> = HashSet::new();
 
         // Group by opcode
@@ -156,7 +156,7 @@ impl DependencyGraph {
                 for &idx in &group_indices {
                     used.insert(idx);
                 }
-                groups.push(PackGroup {
+                groups.push(Pack {
                     scalar_opcode: *opcode,
                     vector_opcode: vec_opcode,
                     members: group_indices,
