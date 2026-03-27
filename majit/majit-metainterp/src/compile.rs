@@ -172,7 +172,33 @@ pub(crate) fn build_guard_metadata(
         // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
-        let rd_virtuals_info = op.rd_virtuals_info.clone();
+        // resume.py _number_virtuals parity: build rd_virtuals_info from
+        // GuardVirtualEntry. Each entry is (descr_index, known_class, fieldnums)
+        // where fieldnums are TAGBOX references into fail_args.
+        let rd_virtuals_info = if let Some(ref entries) = op.rd_virtuals {
+            let info: Vec<(u32, Option<i64>, Vec<i16>)> = entries
+                .iter()
+                .map(|entry| {
+                    let descr_idx = entry.descr.index();
+                    let known_class = entry.known_class.map(|gc| gc.as_usize() as i64);
+                    let fieldnums: Vec<i16> = entry
+                        .fields
+                        .iter()
+                        .map(|(_field_descr, fail_arg_idx)| {
+                            majit_ir::resumedata::tag(
+                                *fail_arg_idx as i32,
+                                majit_ir::resumedata::TAGBOX,
+                            )
+                            .unwrap_or(majit_ir::resumedata::NULLREF)
+                        })
+                        .collect();
+                    (descr_idx, known_class, fieldnums)
+                })
+                .collect();
+            Some(info)
+        } else {
+            op.rd_virtuals_info.clone()
+        };
 
         // Build recovery_layout from rd_virtuals (GuardVirtualEntry).
         let recovery_layout = if let Some(ref entries) = op.rd_virtuals {

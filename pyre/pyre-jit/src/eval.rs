@@ -429,10 +429,10 @@ fn jit_merge_point_hook(
 /// warmstate.py:446-511 maybe_compile_and_run.
 ///
 /// RPython: cell lookup (O(1)) → compiled → enter. No cell → counter.
-/// Pyre: counter tick gates all paths because guard failures without
-/// bridge compilation cause repeated entry overhead. The celltable
-/// hint infrastructure (counter.py:102) is ready for future use when
-/// bridge compilation is implemented.
+/// Pyre gates behind counter.tick because guard failures without
+/// complete bridge compilation cause repeated entry overhead.
+/// celltable hint infrastructure ready for activation when bridge
+/// compilation handles all guard failure paths.
 #[cold]
 #[inline(never)]
 fn maybe_compile_and_run(
@@ -1139,8 +1139,6 @@ fn restore_guard_failure_for_loop(
     }
     // resume.py parity: rd_numb decodes the full frame from compact
     // numbering. TAGBOX(n)→raw_values[n], TAGCONST→constant, NULLREF→null.
-    // resume.py parity: ALL guards have rd_numb (produced inline by
-    // number_guard_inline during optimization). No fallback needed.
     let mut typed = {
         let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
         let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
@@ -1177,24 +1175,38 @@ fn restore_guard_failure_for_loop(
     let has_null_ref = typed[3..frame_end]
         .iter()
         .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
+    // resume.py parity: null Ref slots in the frame are virtual objects
+    // whose rd_numb encoding used NULLREF (incomplete virtual tracking).
+    // Fall back to raw values from the deadframe for these slots.
+    // RPython's full virtual materialization via rd_virtuals would
+    // reconstruct the objects; pyre uses the raw Cranelift output
+    // which already had materialize_virtuals_for_bridge applied.
     if has_null_ref {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit] guard-fail: {} null Ref in frame slots [3..{}], invalidate trace {}",
-                typed[3..frame_end]
-                    .iter()
-                    .filter(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))))
-                    .count(),
-                frame_end,
-                exit_layout.trace_id
-            );
+        let raw_typed = decode_exit_layout_values(raw_values, exit_layout);
+        for i in 3..frame_end {
+            if matches!(typed[i], Value::Ref(majit_ir::GcRef(0))) {
+                if let Some(raw_val) = raw_typed.get(i) {
+                    if !matches!(raw_val, Value::Ref(majit_ir::GcRef(0))) {
+                        typed[i] = raw_val.clone();
+                    }
+                }
+            }
         }
-        // Incomplete resume data → can't restore frame safely.
-        // Invalidate only the specific trace that produced this guard,
-        // not all compiled loops. Other loops continue working.
-        let (driver, _) = driver_pair();
-        driver.invalidate_compiled_trace(exit_layout.trace_id);
-        return None;
+        // Recheck after raw fallback
+        let still_null = typed[3..frame_end]
+            .iter()
+            .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
+        if still_null {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], invalidate trace {}",
+                    frame_end, exit_layout.trace_id
+                );
+            }
+            let (driver, _) = driver_pair();
+            driver.invalidate_compiled_trace(exit_layout.trace_id);
+            return None;
+        }
     }
     // compile.py:738 must_compile / counter.py tick parity:
     // O(1) guard failure counter via JitCounter timetable.

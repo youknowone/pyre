@@ -183,8 +183,8 @@ fn snapshot_map_from_trace_snapshots(
                 .iter()
                 .flat_map(|f| f.boxes.iter())
                 .map(|t| match t {
-                    SnapshotTagged::Box(n) => majit_ir::OpRef(*n),
-                    SnapshotTagged::Const(_) | SnapshotTagged::Virtual(_) => majit_ir::OpRef::NONE,
+                    SnapshotTagged::Box(n) | SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+                    SnapshotTagged::Const(_) => majit_ir::OpRef::NONE,
                 })
                 .collect();
             (id as i32, boxes)
