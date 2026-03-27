@@ -4111,6 +4111,18 @@ impl<M: Clone> MetaInterp<M> {
                         remap.insert(src_ref, majit_ir::OpRef(i as u32));
                     }
                 }
+                // RPython parity: virtual (NONE) slots have original_opref
+                // in rd_virtuals. Map these to the fail_arg index too so
+                // bridge knowledge (known_classes) applies to virtual args.
+                if let Some(ref rd_virts) = guard_op.rd_virtuals {
+                    for entry in rd_virts {
+                        if let Some(orig) = entry.original_opref {
+                            remap
+                                .entry(orig)
+                                .or_insert(majit_ir::OpRef(entry.fail_arg_index as u32));
+                        }
+                    }
+                }
                 // Also map constants: they keep their original OpRef
                 // (constants are in the bridge's constant pool too).
                 for (&idx, _) in trace.constants.iter() {

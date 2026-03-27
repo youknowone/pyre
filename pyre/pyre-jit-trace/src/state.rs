@@ -4985,9 +4985,9 @@ impl MIFrame {
 
             // pyjitpl.py:2506 finishframe_exception: unwind stack to handler,
             // push exception, continue tracing at handler_pc.
-            // Gated: bridge virtual handling needs optimizer force_virtual
-            // for virtual JUMP args in jump_to_preamble fallback path.
-            if !crate::exc_trace_enabled() {
+            // TODO: remove gate when bridge optimizer generate_guards is fixed
+            // (VirtualStruct vs NonNull mismatch for bridge inputargs).
+            if std::env::var_os("MAJIT_EXC_TRACE").is_none() {
                 return TraceAction::Abort;
             }
             let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
@@ -5012,8 +5012,7 @@ impl MIFrame {
                 s.valuestackdepth += 1;
             }
             // Sync concrete frame.
-            let frame =
-                unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+            let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
             let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
             while frame.valuestackdepth > target_depth {
                 frame.pop();
