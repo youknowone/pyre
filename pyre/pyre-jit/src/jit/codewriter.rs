@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use majit_ir::OpCode;
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 use pyre_bytecode::bytecode::{CodeObject, Instruction, OpArgState};
+use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -256,7 +257,9 @@ impl CodeWriter {
 
                 // RPython jtransform.py: rewrite_op_int_add etc.
                 Instruction::BinaryOp { op } => {
-                    let op_val = op.get(op_arg) as u32;
+                    let op_val = binary_op_tag(op.get(op_arg))
+                        .expect("unsupported binary op tag in jitcode lowering")
+                        as u32;
                     assembler.pop_r(obj_tmp1); // rhs
                     assembler.pop_r(obj_tmp0); // lhs
                     // RPython: residual_call for generic binary dispatch,
@@ -276,7 +279,7 @@ impl CodeWriter {
 
                 // RPython jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
-                    let op_val = opname.get(op_arg) as u32;
+                    let op_val = compare_op_tag(opname.get(op_arg)) as u32;
                     assembler.pop_r(obj_tmp1); // rhs
                     assembler.pop_r(obj_tmp0); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
@@ -435,7 +438,11 @@ impl CodeWriter {
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                         obj_tmp1,
                     );
-                    assembler.load_const_i_value(int_tmp0, 11); // NB_SUBTRACT
+                    assembler.load_const_i_value(
+                        int_tmp0,
+                        binary_op_tag(pyre_bytecode::bytecode::BinaryOperator::Subtract)
+                            .expect("subtract must have a jit binary-op tag"),
+                    );
                     assembler.call_may_force_ref_typed(
                         binary_op_fn_idx,
                         &[
