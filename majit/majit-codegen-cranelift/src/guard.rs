@@ -54,6 +54,11 @@ pub struct BridgeData {
     /// the parent loop instead of returning to the interpreter.
     /// Set for bridges that reach the loop's merge_point.
     pub loop_reentry: bool,
+    /// compile.py:186: record_loop_or_bridge sets descr.rd_loop_token = clt
+    /// on ALL guards (loop and bridge). The bridge shares the parent loop's
+    /// invalidation flag (AtomicBool). Holding an Arc clone keeps the flag
+    /// alive as long as the bridge exists.
+    pub invalidated_arc: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 unsafe impl Send for BridgeData {}

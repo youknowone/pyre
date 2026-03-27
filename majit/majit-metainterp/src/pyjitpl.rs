@@ -67,11 +67,16 @@ pub enum CompileOutcome {
 }
 
 /// Per-guard failure tracking for bridge compilation decisions.
+/// compile.py: ResumeGuardDescr.status field.
 pub(crate) struct GuardFailureInfo {
     /// Number of times this guard has failed.
     pub(crate) fail_count: u32,
     /// Whether a bridge has been compiled for this guard.
     pub(crate) bridge_compiled: bool,
+    /// compile.py:741-751, 786-795: ST_BUSY_FLAG — true while bridge
+    /// compilation is in progress for this guard. Prevents re-entrant
+    /// tracing from the same guard during recursive calls.
+    pub(crate) compiling: bool,
 }
 
 pub(crate) struct CompiledTrace {
@@ -2893,6 +2898,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
 
@@ -2944,6 +2950,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
 
@@ -2991,6 +2998,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
 
@@ -3113,6 +3121,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
             guard_fail_count = Some(info.fail_count);
@@ -3246,6 +3255,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
             guard_fail_count = Some(info.fail_count);
@@ -3316,6 +3326,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
             self.stats.guard_failures += 1;
@@ -3467,6 +3478,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert(GuardFailureInfo {
                     fail_count: 0,
                     bridge_compiled: false,
+                    compiling: false,
                 });
             info.fail_count += 1;
             let fail_count = info.fail_count;
@@ -3488,20 +3500,24 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, trace_id, fail_index, fail_count
                     );
                 }
-                // RPython compile.py:697 parity: mark bridge_compiled AFTER
-                // the bridge hook runs. If compilation fails, the flag stays
-                // true to prevent infinite retries (RPython sets ST_BUSY_FLAG
-                // before compile, clears on success or keeps on failure).
+                // compile.py:786-788: start_compiling — set ST_BUSY_FLAG
+                // before bridge compilation to prevent re-entrant tracing.
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
-                        info.bridge_compiled = true;
+                        info.compiling = true;
                     }
                 }
-                // RPython compile.py:714: invoke bridge compilation callback.
-                // pyre's call_jit.rs sets this hook to compile a bridge
-                // that handles the alternative path (e.g., fib base case).
+                // compile.py:714: invoke bridge compilation callback.
                 if let Some(ref hook) = self.hooks.on_bridge_threshold {
                     hook(green_key, trace_id, fail_index);
+                }
+                // compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+                // Also mark bridge_compiled to avoid re-triggering threshold.
+                if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                    if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
+                        info.compiling = false;
+                        info.bridge_compiled = true;
+                    }
                 }
             }
         }
@@ -3912,11 +3928,15 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type == Type::Int
     }
 
-    /// Check whether a guard in a specific compiled trace should get a bridge.
+    /// compile.py:701-717: handle_fail / must_compile — check whether a
+    /// guard should get a bridge compiled. RPython applies this to ALL
+    /// guards (root loop and bridge guards alike).
     ///
-    /// Only root-loop guards are eligible for bridge compilation.
-    /// Bridge guard failures (trace_id != root_trace_id) fall back to
-    /// the interpreter to avoid infinite bridge-of-bridge recompilation.
+    /// Currently restricted to root-loop guards: bridge-on-bridge
+    /// compilation causes SEGFAULT in nbody (fail_args layout issue in
+    /// the Cranelift backend's bridge chaining path). The ST_BUSY_FLAG
+    /// (compiling field) and counting infrastructure are in place for
+    /// when the backend issue is resolved.
     pub fn should_compile_bridge_in_trace(
         &self,
         green_key: u64,
@@ -3927,18 +3947,19 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        // Only compile bridges for root-loop guards, not bridge guards.
-        // RPython handle_fail applies to all guards, but our bridge
-        // compilation infrastructure doesn't yet handle bridge-on-bridge
-        // correctly (guard fail_args layout mismatch). Restricting to
-        // root-loop guards until the resume data is fully ported.
+        // TODO: remove this root-only restriction once the Cranelift
+        // bridge chaining backend handles bridge guard fail_args correctly.
         if trace_id != compiled.root_trace_id {
             return false;
         }
         compiled
             .guard_failures
             .get(&(trace_id, fail_index))
-            .is_some_and(|info| self.warm_state.should_compile_bridge(info.fail_count))
+            .is_some_and(|info| {
+                // compile.py:750-751: ST_BUSY_FLAG — if already compiling
+                // a bridge from this guard (e.g. recursive call), skip.
+                !info.compiling && self.warm_state.should_compile_bridge(info.fail_count)
+            })
     }
 
     /// Get the failure count for a guard in a specific compiled trace.
@@ -4214,6 +4235,7 @@ impl<M: Clone> MetaInterp<M> {
                         .or_insert(GuardFailureInfo {
                             fail_count: 0,
                             bridge_compiled: false,
+                            compiling: false,
                         })
                         .bridge_compiled = true;
                     let (resume_data, guard_op_indices, mut exit_layouts) =

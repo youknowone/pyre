@@ -2438,6 +2438,7 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
         needs_force_frame: compiled.needs_force_frame,
+        invalidated_arc: None, // call_assembler bridges don't need invalidation
     });
 
     // RPython redirect_call_assembler parity: store bridge code pointer
@@ -8962,13 +8963,15 @@ impl majit_codegen::Backend for CraneliftBackend {
         ops: &[Op],
         original_token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
-        // Compile the bridge trace as a standalone function using the same
-        // code generation path as compile_loop.
-        // Skip invalidation check for bridges: the parent loop's
-        // GuardNotInvalidated already checked the flag before reaching
-        // this guard. Baking the flag address into the bridge causes
-        // spurious failures when the parent's Arc is recycled.
-        let flag_ptr: usize = 0; // disabled for bridges
+        // compile.py:186: record_loop_or_bridge sets descr.rd_loop_token = clt
+        // on ALL guards. Bridges share the parent loop's invalidation flag.
+        // We clone the Arc to keep the flag alive as long as the bridge exists.
+        let invalidated_arc = original_token.invalidated.clone();
+        // TODO: Re-enable bridge invalidation once GuardNotInvalidated
+        // codegen handles flag_ptr lifetime correctly for all backends.
+        // For now, bridges don't check the invalidation flag.
+        let _flag_ptr =
+            Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
         let original_compiled = original_token
             .compiled
             .as_ref()
@@ -9003,7 +9006,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         let compiled = self.do_compile(
             inputargs,
             ops,
-            None, // no invalidation check for bridges
+            None, // bridge invalidation disabled pending flag_ptr lifetime fix
             Some((source_trace_id, fail_descr.fail_index())),
             caller_layout.as_ref(),
         )?;
@@ -9073,6 +9076,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                 num_ref_roots: compiled.num_ref_roots,
                 max_output_slots: compiled.max_output_slots,
                 needs_force_frame: compiled.needs_force_frame,
+                invalidated_arc: Some(invalidated_arc),
             });
         }
 
