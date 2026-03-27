@@ -1314,7 +1314,7 @@ impl OpcodeStepExecutor for PyFrame {
                         obj
                     }
                 }
-            } else if crate::typedef::space_type(obj).is_some() && !pyre_object::is_module(obj) {
+            } else if crate::typedef::r#type(obj).is_some() && !pyre_object::is_module(obj) {
                 // Builtin type method (list.append, etc.) found via TypeDef.
                 // PyPy: LOOKUP_METHOD binds self for builtin type methods.
                 obj

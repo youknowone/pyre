@@ -72,8 +72,7 @@ pub fn space_call_function_or_identity(
 ) -> pyre_object::PyObjectRef {
     unsafe {
         if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = baseobjspace::lookup_in_type(w_type, dunder) {
+            if let Some(method) = baseobjspace::lookup(obj, dunder) {
                 return space_call_function(method, &[obj]);
             }
         }

@@ -141,11 +141,11 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 2 {
         return Err(crate::PyError::type_error("dist requires 2 arguments"));
     }
-    let p: Vec<f64> = crate::builtins::collect_iterable_pub(args[0])?
+    let p: Vec<f64> = crate::builtins::collect_iterable(args[0])?
         .iter()
         .map(|&a| get_double(a))
         .collect();
-    let q: Vec<f64> = crate::builtins::collect_iterable_pub(args[1])?
+    let q: Vec<f64> = crate::builtins::collect_iterable(args[1])?
         .iter()
         .map(|&a| get_double(a))
         .collect();
@@ -301,7 +301,7 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
-    let items = crate::builtins::collect_iterable_pub(args[0])?;
+    let items = crate::builtins::collect_iterable(args[0])?;
     let floats: Vec<f64> = items.iter().map(|&a| get_double(a)).collect();
     match pymath::math::fsum(floats) {
         Ok(v) => Ok(floatobject::w_float_new(v)),
@@ -310,7 +310,7 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {
-    let items = crate::builtins::collect_iterable_pub(args[0])?;
+    let items = crate::builtins::collect_iterable(args[0])?;
     let floats: Vec<f64> = items.iter().map(|&a| get_double(a)).collect();
     let start = args.get(1).map(|&a| get_double(a));
     Ok(floatobject::w_float_new(pymath::math::prod(floats, start)))

@@ -13,7 +13,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("abs", || builtin_code_new("abs", builtin_abs));
     namespace.get_or_insert_with("min", || builtin_code_new("min", builtin_min));
     namespace.get_or_insert_with("max", || builtin_code_new("max", builtin_max));
-    namespace.get_or_insert_with("type", || crate::typedef::gettypetype());
+    namespace.get_or_insert_with("type", || crate::typedef::w_type());
     namespace.get_or_insert_with("isinstance", || {
         builtin_code_new("isinstance", builtin_isinstance)
     });
@@ -36,7 +36,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("object", || {
         // `object` is a W_TypeObject, not a builtin function.
         // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
-        crate::typedef::getobjecttype()
+        crate::typedef::w_object()
     });
     namespace.get_or_insert_with("super", || builtin_code_new("super", builtin_super));
     namespace.get_or_insert_with("id", || builtin_code_new("id", builtin_id));
@@ -76,7 +76,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             if args.is_empty() {
                 return builtin_set_from_items(&[]);
             }
-            let items = collect_iterable_pub(args[0])?;
+            let items = collect_iterable(args[0])?;
             builtin_set_from_items(&items)
         })
     });
@@ -123,32 +123,30 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             Err(crate::PyError::type_error("open() not implemented"))
         })
     });
-    namespace.get_or_insert_with("BaseException", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("Exception", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("StopIteration", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("GeneratorExit", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("StopAsyncIteration", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("Warning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("UserWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("DeprecationWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("PendingDeprecationWarning", || {
-        crate::typedef::getobjecttype()
-    });
-    namespace.get_or_insert_with("RuntimeWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("FutureWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("ImportWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("UnicodeWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("BytesWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("ResourceWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("SyntaxWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("EncodingWarning", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("LookupError", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("OSError", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("IOError", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("FileNotFoundError", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("SystemExit", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("KeyboardInterrupt", || crate::typedef::getobjecttype());
-    namespace.get_or_insert_with("RecursionError", || crate::typedef::getobjecttype());
+    namespace.get_or_insert_with("BaseException", || crate::typedef::w_object());
+    namespace.get_or_insert_with("Exception", || crate::typedef::w_object());
+    namespace.get_or_insert_with("StopIteration", || crate::typedef::w_object());
+    namespace.get_or_insert_with("GeneratorExit", || crate::typedef::w_object());
+    namespace.get_or_insert_with("StopAsyncIteration", || crate::typedef::w_object());
+    namespace.get_or_insert_with("Warning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("UserWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("DeprecationWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("PendingDeprecationWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("RuntimeWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("FutureWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("ImportWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("UnicodeWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("BytesWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("ResourceWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("SyntaxWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("EncodingWarning", || crate::typedef::w_object());
+    namespace.get_or_insert_with("LookupError", || crate::typedef::w_object());
+    namespace.get_or_insert_with("OSError", || crate::typedef::w_object());
+    namespace.get_or_insert_with("IOError", || crate::typedef::w_object());
+    namespace.get_or_insert_with("FileNotFoundError", || crate::typedef::w_object());
+    namespace.get_or_insert_with("SystemExit", || crate::typedef::w_object());
+    namespace.get_or_insert_with("KeyboardInterrupt", || crate::typedef::w_object());
+    namespace.get_or_insert_with("RecursionError", || crate::typedef::w_object());
     namespace.get_or_insert_with("any", || builtin_code_new("any", builtin_any));
     namespace.get_or_insert_with("all", || builtin_code_new("all", builtin_all));
     namespace.get_or_insert_with("sum", || builtin_code_new("sum", builtin_sum));
@@ -403,7 +401,7 @@ fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `type(obj)` — return the type of an object as a W_TypeObject.
 ///
 /// PyPy: `space.type(w_obj)` → W_TypeObject
-pub(crate) fn builtin_type_new_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // type.__new__(metatype, name, bases, dict)
     // May be called with extra self-binding from super():
     //   [self, metatype, name, bases, dict] — 5 args
@@ -411,36 +409,36 @@ pub(crate) fn builtin_type_new_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     //   [metatype, obj] — 2 args (type(obj))
     // Find the (name, bases, dict) triple by scanning for the first str arg.
     // Also extract the metatype (first type arg before the name str).
-    let mut metatype = pyre_object::PY_NULL;
+    let mut w_metaclass = pyre_object::PY_NULL;
     for i in 0..args.len() {
         if unsafe { pyre_object::is_str(args[i]) } && i + 2 < args.len() {
             // Extract metatype from preceding args
             for j in 0..i {
                 if unsafe { pyre_object::is_type(args[j]) } {
-                    metatype = args[j];
+                    w_metaclass = args[j];
                 }
             }
-            return builtin_type_with_meta(&args[i..], metatype);
+            return type_descr_new_with_metaclass(&args[i..], w_metaclass);
         }
     }
     if args.len() == 1 && unsafe { pyre_object::is_type(args[0]) } {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
     }
     if args.len() == 1 {
-        return builtin_type(args);
+        return type_descr_new_without_metaclass(args);
     }
     if args.len() == 2 {
-        return builtin_type(&args[1..]);
+        return type_descr_new_without_metaclass(&args[1..]);
     }
     Err(crate::PyError::type_error("type() takes 1 or 3 arguments"))
 }
-fn builtin_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_type_with_meta(args, pyre_object::PY_NULL)
+fn type_descr_new_without_metaclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    type_descr_new_with_metaclass(args, pyre_object::PY_NULL)
 }
 
-fn builtin_type_with_meta(
+fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
-    metatype: PyObjectRef,
+    w_metaclass: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 && args.len() != 3 {
         return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
@@ -450,30 +448,30 @@ fn builtin_type_with_meta(
     if args.len() == 3 {
         let name_obj = args[0];
         let bases = args[1];
-        let ns_dict = args[2];
+        let w_namespace_dict = args[2];
         let name = unsafe { pyre_object::w_str_get_value(name_obj) };
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
         // delegate to that metaclass instead of using type.__new__ directly.
-        if metatype.is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
+        if w_metaclass.is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
             let n = unsafe { w_tuple_len(bases) };
             for i in 0..n {
                 if let Some(base) = unsafe { pyre_object::w_tuple_getitem(bases, i as i64) } {
                     if unsafe { pyre_object::is_type(base) } {
-                        let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
+                        let w_metaclass = crate::baseobjspace::ATTR_TABLE.with(|table| {
                             table
                                 .borrow()
                                 .get(&(base as usize))
                                 .and_then(|d| d.get("__metaclass__").copied())
                         });
-                        if let Some(mc) = mc {
+                        if let Some(w_metaclass) = w_metaclass {
                             // Delegate: call metaclass(name, bases, dict, **kwds)
                             // Pass extra args from the original call
-                            let mut mc_args = vec![name_obj, bases, ns_dict];
+                            let mut metaclass_args = vec![name_obj, bases, w_namespace_dict];
                             if args.len() > 3 {
-                                mc_args.extend_from_slice(&args[3..]);
+                                metaclass_args.extend_from_slice(&args[3..]);
                             }
-                            return Ok(crate::space_call_function(mc, &mc_args));
+                            return Ok(crate::space_call_function(w_metaclass, &metaclass_args));
                         }
                     }
                 }
@@ -483,8 +481,8 @@ fn builtin_type_with_meta(
         // Convert dict to PyNamespace
         let mut class_ns = Box::new(crate::PyNamespace::new());
         class_ns.fix_ptr();
-        if unsafe { is_dict(ns_dict) } {
-            let d = unsafe { &*(ns_dict as *const pyre_object::dictobject::W_DictObject) };
+        if unsafe { is_dict(w_namespace_dict) } {
+            let d = unsafe { &*(w_namespace_dict as *const pyre_object::dictobject::W_DictObject) };
             for &(k, v) in unsafe { &*d.entries } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
@@ -495,12 +493,12 @@ fn builtin_type_with_meta(
         let ns_ptr = Box::into_raw(class_ns);
 
         // Default bases to (object,) if empty
-        let effective_bases =
+        let w_effective_bases =
             if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
             {
-                let obj_type = crate::typedef::getobjecttype();
-                if !obj_type.is_null() {
-                    pyre_object::w_tuple_new(vec![obj_type])
+                let w_object = crate::typedef::w_object();
+                if !w_object.is_null() {
+                    pyre_object::w_tuple_new(vec![w_object])
                 } else {
                     bases
                 }
@@ -509,50 +507,51 @@ fn builtin_type_with_meta(
             };
 
         // CPython: calculate_metaclass — delegate to winner if different
-        let default_meta = if metatype.is_null() {
-            crate::typedef::gettypetype()
+        let default_meta = if w_metaclass.is_null() {
+            crate::typedef::w_type()
         } else {
-            metatype
+            w_metaclass
         };
-        let winner =
-            crate::call::calculate_metaclass(default_meta, effective_bases).unwrap_or(default_meta);
-        if !std::ptr::eq(winner, default_meta) {
+        let w_winner = crate::call::calculate_metaclass(default_meta, w_effective_bases)
+            .unwrap_or(default_meta);
+        if !std::ptr::eq(w_winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
-            if let Some(mc_new) = unsafe { crate::baseobjspace::lookup_in_type(winner, "__new__") }
+            if let Some(w_metaclass_new) =
+                unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
             {
-                let mut new_args = vec![winner, name_obj, bases, ns_dict];
+                let mut new_args = vec![w_winner, name_obj, bases, w_namespace_dict];
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
                 }
                 drop(unsafe { Box::from_raw(ns_ptr) });
-                return Ok(crate::space_call_function(mc_new, &new_args));
+                return Ok(crate::space_call_function(w_metaclass_new, &new_args));
             }
         }
-        let metatype = winner;
+        let w_metaclass = w_winner;
 
-        let w_type = pyre_object::w_type_new(name, effective_bases, ns_ptr as *mut u8);
+        let w_type = pyre_object::w_type_new(name, w_effective_bases, ns_ptr as *mut u8);
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w_type) };
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
 
         // Store metaclass BEFORE __set_name__ so descriptors can access
         // metaclass methods (e.g. EnumType._add_member_ during _proto_member.__set_name__)
-        if !metatype.is_null() {
-            let type_type_obj = crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
-            if !std::ptr::eq(metatype, type_type_obj) {
+        if !w_metaclass.is_null() {
+            let w_type_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
+            if !std::ptr::eq(w_metaclass, w_type_type) {
                 crate::baseobjspace::ATTR_TABLE.with(|table| {
                     table
                         .borrow_mut()
                         .entry(w_type as usize)
                         .or_default()
-                        .insert("__metaclass__".to_string(), metatype);
+                        .insert("__metaclass__".to_string(), w_metaclass);
                 });
             }
         }
 
         // __set_name__ protocol — CPython: type_new_set_names
         // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor
-        if unsafe { is_dict(ns_dict) } {
-            let d = unsafe { &*(ns_dict as *const pyre_object::dictobject::W_DictObject) };
+        if unsafe { is_dict(w_namespace_dict) } {
+            let d = unsafe { &*(w_namespace_dict as *const pyre_object::dictobject::W_DictObject) };
             let entries: Vec<(PyObjectRef, PyObjectRef)> = unsafe { (*d.entries).clone() };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
@@ -574,7 +573,7 @@ fn builtin_type_with_meta(
             return Ok(w_instance_get_type(obj));
         }
     }
-    if let Some(tp) = crate::typedef::space_type(obj) {
+    if let Some(tp) = crate::typedef::r#type(obj) {
         return Ok(tp);
     }
     if obj.is_null() {
@@ -599,7 +598,7 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let len = unsafe { w_tuple_len(cls) };
         for i in 0..len {
             if let Some(c) = unsafe { w_tuple_getitem(cls, i as i64) } {
-                if isinstance_check(obj, c) {
+                if isinstance_w(obj, c) {
                     return Ok(w_bool_from(true));
                 }
             }
@@ -607,26 +606,26 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         return Ok(w_bool_from(false));
     }
 
-    Ok(w_bool_from(isinstance_check(obj, cls)))
+    Ok(w_bool_from(isinstance_w(obj, cls)))
 }
 
 /// Single-type isinstance check.
 ///
 /// PyPy: baseobjspace.py `isinstance_w` → `abstract_issubclass_w`
-fn isinstance_check(obj: PyObjectRef, cls: PyObjectRef) -> bool {
+fn isinstance_w(obj: PyObjectRef, cls: PyObjectRef) -> bool {
     unsafe {
         if !is_type(cls) {
             return false;
         }
-        let obj_type = if is_instance(obj) {
+        let w_obj_type = if is_instance(obj) {
             w_instance_get_type(obj)
         } else {
-            match crate::typedef::space_type(obj) {
+            match crate::typedef::r#type(obj) {
                 Some(t) => t,
                 None => return false,
             }
         };
-        is_subtype(obj_type, cls)
+        issubtype_w(w_obj_type, cls)
     }
 }
 
@@ -639,21 +638,21 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let len = unsafe { w_tuple_len(classinfo) };
         for i in 0..len {
             if let Some(c) = unsafe { w_tuple_getitem(classinfo, i as i64) } {
-                if unsafe { is_subtype(cls, c) } {
+                if unsafe { issubtype_w(cls, c) } {
                     return Ok(w_bool_from(true));
                 }
             }
         }
         return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(unsafe { is_subtype(cls, classinfo) }))
+    Ok(w_bool_from(unsafe { issubtype_w(cls, classinfo) }))
 }
 
 /// Check if w_type is cls or a subtype of cls by walking the C3 MRO.
 ///
 /// PyPy: baseobjspace.py `issubtype_w` → checks `cls in w_type.mro_w`.
 /// Uses the cached MRO (PyPy: w_type.mro_w) for O(n) lookup.
-unsafe fn is_subtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() || !is_type(w_type) {
         return false;
     }
@@ -776,10 +775,7 @@ fn builtin_classmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// `str(obj)` → convert to string
-pub(crate) fn builtin_str_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_str(args)
-}
-fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_str_new(""));
     }
@@ -800,11 +796,8 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_str_new(&s))
 }
 
-pub(crate) fn builtin_int_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_int(args)
-}
 /// `int(obj)` → convert to int
-fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_int_new(0));
     }
@@ -829,11 +822,8 @@ fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(0))
 }
 
-pub(crate) fn builtin_float_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_float(args)
-}
 /// `float(obj)` → convert to float
-fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(floatobject::w_float_new(0.0));
     }
@@ -855,11 +845,8 @@ fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(floatobject::w_float_new(0.0))
 }
 
-pub(crate) fn builtin_bool_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_bool(args)
-}
 /// `bool(obj)` — PyPy: operation.py bool → space.is_true
-fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_bool_from(false));
     }
@@ -909,10 +896,7 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(w_none())
 }
 
-pub(crate) fn builtin_tuple_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_tuple(args)
-}
-fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_tuple_new(vec![]));
     }
@@ -932,10 +916,7 @@ fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_tuple_new(collect_iterable(obj)?))
 }
 
-pub(crate) fn builtin_list_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_list_ctor(args)
-}
-fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
     }
@@ -961,10 +942,7 @@ fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_list_new(collect_iterable(obj)?))
 }
 
-pub(crate) fn collect_iterable_pub(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    collect_iterable(obj)
-}
-fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+pub(crate) fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let it = crate::baseobjspace::iter(obj)?;
     let mut items = Vec::new();
     loop {
@@ -980,7 +958,7 @@ fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// Create a set object from items.
 /// PyPy: setobject.py W_SetObject — backed by a dict for O(1) membership.
 pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = pyre_object::w_instance_new(crate::typedef::getobjecttype());
+    let obj = pyre_object::w_instance_new(crate::typedef::w_object());
     let data = pyre_object::w_dict_new();
     for &item in items {
         unsafe { pyre_object::w_dict_store(data, item, pyre_object::w_none()) };
@@ -1088,7 +1066,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
             let self_obj = args[0];
             let other = args[1];
             // Collect other items
-            let other_items = collect_iterable_pub(other)?;
+            let other_items = collect_iterable(other)?;
             // Build intersection
             let mut result_items = Vec::new();
             if let Ok(data) = crate::baseobjspace::getattr(self_obj, "__data__") {
@@ -1120,7 +1098,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
                     }
                 }
             }
-            let other_items = collect_iterable_pub(other)?;
+            let other_items = collect_iterable(other)?;
             for item in other_items {
                 result_items.push(item);
             }
@@ -1130,11 +1108,8 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(obj)
 }
 
-pub(crate) fn builtin_dict_ctor_pub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_dict_ctor(args)
-}
 /// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init
-fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_dict_new());
     }
@@ -1594,7 +1569,7 @@ fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `any(iterable)` — PyPy: baseobjspace.py any_w
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
-    let items = collect_iterable_pub(args[0])?;
+    let items = collect_iterable(args[0])?;
     for item in items {
         if crate::baseobjspace::is_true(item) {
             return Ok(w_bool_from(true));
@@ -1607,7 +1582,7 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `all(iterable)` — PyPy: baseobjspace.py all_w
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
-    let items = collect_iterable_pub(args[0])?;
+    let items = collect_iterable(args[0])?;
     for item in items {
         if !crate::baseobjspace::is_true(item) {
             return Ok(w_bool_from(false));
