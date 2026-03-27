@@ -15,6 +15,12 @@ const ASSOCIATIVITY: usize = 5;
 pub struct JitCounter {
     /// Counter table: pairs of (hash, count).
     table: Vec<(u64, u32)>,
+    /// counter.py:102-103: celltable — parallel array indicating whether
+    /// compiled code exists for each bucket. O(1) lookup via get_index.
+    /// RPython stores JitCell linked lists; pyre stores a bool hint.
+    /// True = compiled code MAY exist (verify via has_compiled_loop).
+    /// False = definitely no compiled code.
+    celltable: Vec<bool>,
     /// Threshold for triggering compilation.
     threshold: u32,
     /// counter.py: _nexthash — monotonically increasing hash generator.
@@ -27,10 +33,25 @@ impl JitCounter {
     pub fn new(threshold: u32) -> Self {
         JitCounter {
             table: vec![(0, 0); TABLE_SIZE],
+            celltable: vec![false; TABLE_SIZE],
             threshold,
             next_hash: 0,
             decay_mult: 1.0,
         }
+    }
+
+    /// counter.py:239 lookup_chain(hash) parity.
+    /// O(1) check: does this hash bucket have compiled code?
+    /// Returns true if compiled code MAY exist (must verify with full check).
+    #[inline(always)]
+    pub fn has_compiled_hint(&self, hash: u64) -> bool {
+        self.celltable[(hash as usize) & TABLE_MASK]
+    }
+
+    /// counter.py:246-256 install_new_cell(hash, newcell) parity.
+    /// Mark that compiled code exists for this hash bucket.
+    pub fn set_compiled_hint(&mut self, hash: u64, compiled: bool) {
+        self.celltable[(hash as usize) & TABLE_MASK] = compiled;
     }
 
     /// Check if counter would fire without modifying state.
