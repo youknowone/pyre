@@ -3,9 +3,8 @@ use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{PyObjectRef, w_bool_from};
 
 use crate::{
-    CompareOp, py_add, py_bitand, py_bitor, py_bitxor, py_compare, py_floordiv, py_getitem,
-    py_invert, py_is_true, py_lshift, py_mod, py_mul, py_negative, py_pow, py_rshift, py_sub,
-    py_truediv,
+    CompareOp, add, and_, compare, floordiv, getitem, invert, is_true, lshift, mod_, mul, neg, or_,
+    pow, rshift, sub, truediv, xor,
 };
 
 pub fn binary_value(
@@ -16,19 +15,19 @@ pub fn binary_value(
     let a = crate::baseobjspace::unwrap_cell(a);
     let b = crate::baseobjspace::unwrap_cell(b);
     match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => py_add(a, b),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => py_sub(a, b),
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => py_mul(a, b),
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => py_floordiv(a, b),
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => py_mod(a, b),
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => py_truediv(a, b),
-        BinaryOperator::Power | BinaryOperator::InplacePower => py_pow(a, b),
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => py_lshift(a, b),
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => py_rshift(a, b),
-        BinaryOperator::And | BinaryOperator::InplaceAnd => py_bitand(a, b),
-        BinaryOperator::Or | BinaryOperator::InplaceOr => py_bitor(a, b),
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => py_bitxor(a, b),
-        BinaryOperator::Subscr => py_getitem(a, b),
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => add(a, b),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => sub(a, b),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => mul(a, b),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => floordiv(a, b),
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => mod_(a, b),
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => truediv(a, b),
+        BinaryOperator::Power | BinaryOperator::InplacePower => pow(a, b),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => and_(a, b),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => or_(a, b),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => xor(a, b),
+        BinaryOperator::Subscr => getitem(a, b),
         _ => Err(PyError::type_error(format!(
             "binary operation {op:?} not yet implemented"
         ))),
@@ -41,19 +40,19 @@ pub fn binary_value_from_tag(
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
     match op_tag {
-        0 => py_add(a, b),
-        1 => py_sub(a, b),
-        2 => py_mul(a, b),
-        3 => py_floordiv(a, b),
-        4 => py_mod(a, b),
-        5 => py_truediv(a, b),
-        6 => py_getitem(a, b),
-        7 => py_pow(a, b),
-        8 => py_lshift(a, b),
-        9 => py_rshift(a, b),
-        10 => py_bitand(a, b),
-        11 => py_bitor(a, b),
-        12 => py_bitxor(a, b),
+        0 => add(a, b),
+        1 => sub(a, b),
+        2 => mul(a, b),
+        3 => floordiv(a, b),
+        4 => mod_(a, b),
+        5 => truediv(a, b),
+        6 => getitem(a, b),
+        7 => pow(a, b),
+        8 => lshift(a, b),
+        9 => rshift(a, b),
+        10 => and_(a, b),
+        11 => or_(a, b),
+        12 => xor(a, b),
         _ => Err(PyError::type_error(format!(
             "unsupported binary op tag: {op_tag}"
         ))),
@@ -75,7 +74,7 @@ pub fn compare_value(
         ComparisonOperator::Equal => CompareOp::Eq,
         ComparisonOperator::NotEqual => CompareOp::Ne,
     };
-    py_compare(a, b, cmp_op)
+    compare(a, b, cmp_op)
 }
 
 pub fn compare_value_from_tag(
@@ -96,22 +95,22 @@ pub fn compare_value_from_tag(
             )));
         }
     };
-    py_compare(a, b, op)
+    compare(a, b, op)
 }
 
 pub fn unary_negative_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
-    py_negative(value)
+    neg(value)
 }
 
 pub fn unary_invert_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let value = crate::baseobjspace::unwrap_cell(value);
-    py_invert(value)
+    invert(value)
 }
 
 pub fn truth_value(value: PyObjectRef) -> bool {
     let value = crate::baseobjspace::unwrap_cell(value);
-    py_is_true(value)
+    is_true(value)
 }
 
 pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
@@ -155,14 +154,14 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
 }
 
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
-    match py_getitem(obj as PyObjectRef, index as PyObjectRef) {
+    match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
         Err(err) => panic!("getitem failed in JIT: {err}"),
     }
 }
 
 pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
-    match crate::py_setitem(
+    match crate::setitem(
         obj as PyObjectRef,
         index as PyObjectRef,
         value as PyObjectRef,
@@ -175,7 +174,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) -> i64 {
 pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
-    match crate::py_getattr(obj as PyObjectRef, name) {
+    match crate::getattr(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
         Err(err) => panic!("getattr failed in JIT: {err}"),
     }
@@ -184,7 +183,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
 pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64) -> i64 {
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
-    match crate::py_setattr(obj as PyObjectRef, name, value as PyObjectRef) {
+    match crate::setattr(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
         Err(err) => panic!("setattr failed in JIT: {err}"),
     }

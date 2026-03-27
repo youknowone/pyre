@@ -55,13 +55,13 @@ pub fn init(ns: &mut PyNamespace) {
         ns,
         "_getframe",
         crate::builtin_code_new("_getframe", |_| {
-            let frame_type = crate::typedef::get_object_type();
+            let frame_type = crate::typedef::getobjecttype();
             let frame = pyre_object::w_instance_new(frame_type);
-            let _ = crate::baseobjspace::py_setattr(frame, "f_locals", w_dict_new());
-            let _ = crate::baseobjspace::py_setattr(frame, "f_globals", w_dict_new());
-            let _ = crate::baseobjspace::py_setattr(frame, "f_code", w_none());
-            let _ = crate::baseobjspace::py_setattr(frame, "f_back", w_none());
-            let _ = crate::baseobjspace::py_setattr(frame, "f_lineno", w_int_new(0));
+            let _ = crate::baseobjspace::setattr(frame, "f_locals", w_dict_new());
+            let _ = crate::baseobjspace::setattr(frame, "f_globals", w_dict_new());
+            let _ = crate::baseobjspace::setattr(frame, "f_code", w_none());
+            let _ = crate::baseobjspace::setattr(frame, "f_back", w_none());
+            let _ = crate::baseobjspace::setattr(frame, "f_lineno", w_int_new(0));
             Ok(frame)
         }),
     );
@@ -75,28 +75,27 @@ pub fn init(ns: &mut PyNamespace) {
     );
     // sys.flags — stub object with named attributes
     {
-        let flags_type = crate::typedef::get_object_type();
+        let flags_type = crate::typedef::getobjecttype();
         let flags = pyre_object::w_instance_new(flags_type);
-        let _ = crate::baseobjspace::py_setattr(flags, "debug", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "inspect", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "interactive", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "optimize", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "dont_write_bytecode", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "no_user_site", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "no_site", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "ignore_environment", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "verbose", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "bytes_warning", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "quiet", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "hash_randomization", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "isolated", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "dev_mode", w_bool_from(false));
-        let _ = crate::baseobjspace::py_setattr(flags, "utf8_mode", w_int_new(1));
-        let _ = crate::baseobjspace::py_setattr(flags, "warn_default_encoding", w_int_new(0));
-        let _ = crate::baseobjspace::py_setattr(flags, "safe_path", w_bool_from(false));
-        let _ = crate::baseobjspace::py_setattr(flags, "int_max_str_digits", w_int_new(4300));
-        let _ =
-            crate::baseobjspace::py_setattr(flags, "context_aware_warnings", w_bool_from(false));
+        let _ = crate::baseobjspace::setattr(flags, "debug", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "inspect", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "interactive", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "optimize", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "dont_write_bytecode", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "no_user_site", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "no_site", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "ignore_environment", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "verbose", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "bytes_warning", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "quiet", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "hash_randomization", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "isolated", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "dev_mode", w_bool_from(false));
+        let _ = crate::baseobjspace::setattr(flags, "utf8_mode", w_int_new(1));
+        let _ = crate::baseobjspace::setattr(flags, "warn_default_encoding", w_int_new(0));
+        let _ = crate::baseobjspace::setattr(flags, "safe_path", w_bool_from(false));
+        let _ = crate::baseobjspace::setattr(flags, "int_max_str_digits", w_int_new(4300));
+        let _ = crate::baseobjspace::setattr(flags, "context_aware_warnings", w_bool_from(false));
         namespace_store(ns, "flags", flags);
     }
     // sys.getdefaultencoding

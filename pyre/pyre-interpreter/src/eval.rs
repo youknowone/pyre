@@ -195,7 +195,7 @@ impl SharedOpcodeHandler for PyFrame {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        py_setitem(obj, key, value).map(|_| ())
+        setitem(obj, key, value).map(|_| ())
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
@@ -212,7 +212,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        py_getattr(obj, name)
+        getattr(obj, name)
     }
 
     fn store_attr(
@@ -221,7 +221,7 @@ impl SharedOpcodeHandler for PyFrame {
         name: &str,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        py_setattr(obj, name, value).map(|_| ())
+        setattr(obj, name, value).map(|_| ())
     }
 }
 
@@ -358,7 +358,7 @@ impl IterOpcodeHandler for PyFrame {
             // User-defined __iter__ — PyPy: space.iter → __iter__()
             // Check both type MRO and instance dict (ATTR_TABLE)
             if pyre_object::is_instance(iter) {
-                if let Ok(iter_method) = crate::baseobjspace::py_getattr(iter, "__iter__") {
+                if let Ok(iter_method) = crate::baseobjspace::getattr(iter, "__iter__") {
                     let result = crate::space_call_function(iter_method, &[iter]);
                     self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
                     return Ok(());
@@ -374,8 +374,7 @@ impl IterOpcodeHandler for PyFrame {
                         .and_then(|d| d.get("__metaclass__").copied())
                 });
                 if let Some(metaclass) = mc {
-                    if let Some(method) =
-                        crate::baseobjspace::lookup_in_type_mro_pub(metaclass, "__iter__")
+                    if let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
                     {
                         let result = crate::space_call_function(method, &[iter]);
                         self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
@@ -395,7 +394,7 @@ impl IterOpcodeHandler for PyFrame {
         unsafe {
             // Generator iterator
             if pyre_object::generatorobject::is_generator(iter) {
-                match crate::baseobjspace::py_next(iter) {
+                match crate::baseobjspace::next(iter) {
                     Ok(result) => {
                         USER_ITER_NEXT_CACHE.with(|c| c.set(result));
                         return Ok(true);
@@ -410,9 +409,7 @@ impl IterOpcodeHandler for PyFrame {
             // User-defined iterator with __next__
             if pyre_object::is_instance(iter) {
                 let w_type = pyre_object::w_instance_get_type(iter);
-                if let Some(next_method) =
-                    crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__next__")
-                {
+                if let Some(next_method) = crate::baseobjspace::lookup_in_type(w_type, "__next__") {
                     match crate::call::call_callable(self, next_method, &[iter]) {
                         Ok(result) => {
                             USER_ITER_NEXT_CACHE.with(|c| c.set(result));
@@ -760,7 +757,7 @@ impl OpcodeStepExecutor for PyFrame {
         // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
         let needle = self.pop();
-        let result = crate::baseobjspace::py_contains(haystack, needle)?;
+        let result = crate::baseobjspace::contains(haystack, needle)?;
         let inverted = match invert {
             pyre_bytecode::bytecode::Invert::No => result,
             pyre_bytecode::bytecode::Invert::Yes => !result,
@@ -789,7 +786,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn to_bool(&mut self) -> Result<(), Self::Error> {
         let val = self.pop();
-        let truth = crate::baseobjspace::py_is_true(val);
+        let truth = crate::baseobjspace::is_true(val);
         self.push(pyre_object::w_bool_from(truth));
         Ok(())
     }
@@ -817,7 +814,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn delete_subscript(&mut self) -> Result<(), Self::Error> {
         let index = self.pop();
         let obj = self.pop();
-        crate::baseobjspace::py_delitem(obj, index)?;
+        crate::baseobjspace::delitem(obj, index)?;
         Ok(())
     }
 
@@ -975,7 +972,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_globals(&mut self, name: &str) -> Result<(), Self::Error> {
         let dict = self.pop();
         // Try dict first (if it's a dict or has attrs)
-        if let Ok(val) = crate::baseobjspace::py_getattr(dict, name) {
+        if let Ok(val) = crate::baseobjspace::getattr(dict, name) {
             self.push(val);
             return Ok(());
         }
@@ -991,7 +988,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── GetLen ──
     fn get_len(&mut self, obj: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
-        let len = crate::baseobjspace::py_len(obj)?;
+        let len = crate::baseobjspace::len(obj)?;
         Ok(len)
     }
 
@@ -1157,7 +1154,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── yield from / send ──
     fn get_yield_from_iter(&mut self) -> Result<(), Self::Error> {
         let iterable = self.pop();
-        let iter = crate::baseobjspace::py_iter(iterable)?;
+        let iter = crate::baseobjspace::iter(iterable)?;
         self.push(iter);
         Ok(())
     }
@@ -1165,7 +1162,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn send_value(&mut self, target: usize) -> Result<(), Self::Error> {
         let _value = self.pop(); // sent value
         let iter = self.peek();
-        match crate::baseobjspace::py_next(iter) {
+        match crate::baseobjspace::next(iter) {
             Ok(result) => {
                 self.push(result);
                 Ok(())
@@ -1244,7 +1241,7 @@ impl OpcodeStepExecutor for PyFrame {
         let _global_super = self.pop();
 
         let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
-        let result = crate::baseobjspace::py_getattr(proxy, name)?;
+        let result = crate::baseobjspace::getattr(proxy, name)?;
 
         // CALL convention: stack = [callable, null_or_self, args...]
         // load_method pushes [attr, bound] where TOS=bound, TOS1=attr
@@ -1262,7 +1259,7 @@ impl OpcodeStepExecutor for PyFrame {
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = self.pop();
-        let attr = crate::baseobjspace::py_getattr(obj, name)?;
+        let attr = crate::baseobjspace::getattr(obj, name)?;
         if unsafe { pyre_object::is_method(attr) } {
             self.push(attr);
             self.push(PY_NULL);
@@ -1271,7 +1268,7 @@ impl OpcodeStepExecutor for PyFrame {
         self.push(attr);
         // Bind self only for regular instance method calls.
         // staticmethod/classmethod descriptors already unwrap to the raw
-        // function via py_getattr → call_descriptor_get; self must NOT
+        // function via getattr → get; self must NOT
         // be prepended for those.
         // PyPy: LOOKUP_METHOD checks whether the attr came from a
         // non-data descriptor that is a plain function (not staticmethod).
@@ -1284,7 +1281,7 @@ impl OpcodeStepExecutor for PyFrame {
         let bound = unsafe {
             if pyre_object::is_instance(obj) {
                 let w_type = pyre_object::w_instance_get_type(obj);
-                let raw = crate::baseobjspace::lookup_in_type_mro_pub(w_type, name);
+                let raw = crate::baseobjspace::lookup_in_type(w_type, name);
                 match raw {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
@@ -1306,7 +1303,7 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             } else if pyre_object::is_type(obj) {
                 // Type object: check for classmethod in type's MRO
-                let raw = crate::baseobjspace::lookup_in_type_mro_pub(obj, name);
+                let raw = crate::baseobjspace::lookup_in_type(obj, name);
                 match raw {
                     Some(d) if pyre_object::is_classmethod(d) => obj,
                     Some(_) => PY_NULL, // found in own MRO → no binding
@@ -1317,7 +1314,7 @@ impl OpcodeStepExecutor for PyFrame {
                         obj
                     }
                 }
-            } else if crate::typedef::type_of(obj).is_some() && !pyre_object::is_module(obj) {
+            } else if crate::typedef::space_type(obj).is_some() && !pyre_object::is_module(obj) {
                 // Builtin type method (list.append, etc.) found via TypeDef.
                 // PyPy: LOOKUP_METHOD binds self for builtin type methods.
                 obj
@@ -1537,7 +1534,7 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
     fn delete_attr(&mut self, name: &str) -> Result<(), Self::Error> {
         let obj = self.pop();
-        crate::baseobjspace::py_delattr(obj, name)?;
+        crate::baseobjspace::delattr(obj, name)?;
         Ok(())
     }
 
@@ -1950,10 +1947,10 @@ r = fannkuch(6)";
 
     #[test]
     fn test_float_truthiness() {
-        // Test via py_is_true directly since `not` uses ToBool instruction
-        assert!(!py_is_true(w_float_new(0.0)));
-        assert!(py_is_true(w_float_new(1.5)));
-        assert!(py_is_true(w_float_new(-0.1)));
+        // Test via is_true directly since `not` uses ToBool instruction
+        assert!(!is_true(w_float_new(0.0)));
+        assert!(is_true(w_float_new(1.5)));
+        assert!(is_true(w_float_new(-0.1)));
     }
 
     // ── str tests ────────────────────────────────────────────────────
@@ -3134,7 +3131,7 @@ result = fib(10)";
         res.expect("boolean and failed");
         unsafe {
             let r = *(*frame.namespace).get("result").unwrap();
-            assert!(!crate::baseobjspace::py_is_true(r));
+            assert!(!crate::baseobjspace::is_true(r));
         }
     }
 
@@ -3586,13 +3583,13 @@ code = f.__code__";
         unsafe {
             let x = pyre_object::w_dict_lookup(globals, pyre_object::w_str_new("x")).unwrap();
             assert_eq!(w_int_get_value(x), 7);
-            let argcount = crate::baseobjspace::py_getattr(code, "co_argcount").unwrap();
+            let argcount = crate::baseobjspace::getattr(code, "co_argcount").unwrap();
             assert_eq!(w_int_get_value(argcount), 1);
-            let kwonly = crate::baseobjspace::py_getattr(code, "co_kwonlyargcount").unwrap();
+            let kwonly = crate::baseobjspace::getattr(code, "co_kwonlyargcount").unwrap();
             assert_eq!(w_int_get_value(kwonly), 1);
-            let name = crate::baseobjspace::py_getattr(code, "co_name").unwrap();
+            let name = crate::baseobjspace::getattr(code, "co_name").unwrap();
             assert_eq!(w_str_get_value(name), "f");
-            let varnames = crate::baseobjspace::py_getattr(code, "co_varnames").unwrap();
+            let varnames = crate::baseobjspace::getattr(code, "co_varnames").unwrap();
             let first = w_tuple_getitem(varnames, 0).unwrap();
             assert_eq!(w_str_get_value(first), "a");
         }

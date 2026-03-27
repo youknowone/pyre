@@ -2265,6 +2265,6 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     if obj.is_null() || key.is_null() {
         return 0;
     }
-    let _ = pyre_interpreter::baseobjspace::py_setitem(obj, key, value);
+    let _ = pyre_interpreter::baseobjspace::setitem(obj, key, value);
     0
 }

@@ -2663,7 +2663,7 @@ impl MIFrame {
         }
         // MIFrame Box tracking: compute concrete subscr result
         let subscr_concrete = if let Ok(result) =
-            pyre_interpreter::baseobjspace::py_getitem(concrete_obj, concrete_key)
+            pyre_interpreter::baseobjspace::getitem(concrete_obj, concrete_key)
         {
             ConcreteValue::from_pyobj(result)
         } else {
@@ -5405,7 +5405,7 @@ impl SharedOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         let c_obj = obj.concrete.to_pyobj();
         if !c_obj.is_null() {
-            if let Ok(result) = pyre_interpreter::baseobjspace::py_getattr(c_obj, name) {
+            if let Ok(result) = pyre_interpreter::baseobjspace::getattr(c_obj, name) {
                 result_concrete = ConcreteValue::from_pyobj(result);
             }
         }
@@ -5833,13 +5833,13 @@ impl ArithmeticOpcodeHandler for MIFrame {
         if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
             let result = match op {
                 BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-                    pyre_interpreter::baseobjspace::py_add(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::add(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                    pyre_interpreter::baseobjspace::py_sub(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::sub(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                    pyre_interpreter::baseobjspace::py_mul(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::mul(lhs_obj, rhs_obj)
                 }
                 _ => Err(pyre_interpreter::PyError::type_error("unsupported")),
             };
@@ -5935,7 +5935,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
                 ComparisonOperator::Equal => pyre_interpreter::baseobjspace::CompareOp::Eq,
                 ComparisonOperator::NotEqual => pyre_interpreter::baseobjspace::CompareOp::Ne,
             };
-            if let Ok(r) = pyre_interpreter::baseobjspace::py_compare(lhs_obj, rhs_obj, cmp_op) {
+            if let Ok(r) = pyre_interpreter::baseobjspace::compare(lhs_obj, rhs_obj, cmp_op) {
                 result_concrete = ConcreteValue::from_pyobj(r);
             }
         }
@@ -6061,7 +6061,7 @@ impl OpcodeStepExecutor for MIFrame {
 
         // Non-instance path: trace as normal [attr, NULL]
         let mut attr_concrete = ConcreteValue::Null;
-        if let Ok(result) = pyre_interpreter::baseobjspace::py_getattr(concrete_obj, name) {
+        if let Ok(result) = pyre_interpreter::baseobjspace::getattr(concrete_obj, name) {
             attr_concrete = ConcreteValue::from_pyobj(result);
         }
         let attr_opref = self.trace_load_attr(obj.opref, name)?;

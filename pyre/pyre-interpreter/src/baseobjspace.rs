@@ -459,7 +459,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
             let b_type = w_instance_get_type(b);
             !std::ptr::eq(a_type, b_type)
                 && is_subtype_cached(b_type, a_type)
-                && lookup_in_type_mro(b_type, rdunder).is_some()
+                && lookup_in_type_where(b_type, rdunder).is_some()
         } else {
             false
         }
@@ -470,7 +470,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     if try_reverse_first {
         let rdunder = reverse_dunder(dunder).unwrap();
         let w_type = w_instance_get_type(b);
-        if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
+        if let Some(method) = lookup_in_type_where(w_type, rdunder) {
             let result = crate::space_call_function(method, &[b, a]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
@@ -481,14 +481,14 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     // Forward: a.__op__(b)
     if a_is_inst {
         let w_type = w_instance_get_type(a);
-        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
+        if let Some(method) = lookup_in_type_where(w_type, dunder) {
             let result = crate::space_call_function(method, &[a, b]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
         // Also check per-instance attributes (ATTR_TABLE)
-        if let Ok(method) = py_getattr(a, dunder) {
+        if let Ok(method) = getattr(a, dunder) {
             let result = crate::space_call_function(method, &[a, b]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
@@ -500,7 +500,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     if !try_reverse_first && b_is_inst {
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
-            if let Some(method) = lookup_in_type_mro(w_type, rdunder) {
+            if let Some(method) = lookup_in_type_where(w_type, rdunder) {
                 let result = crate::space_call_function(method, &[b, a]);
                 if !is_not_implemented(result) {
                     return Some(Ok(result));
@@ -555,7 +555,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
         let w_type = w_instance_get_type(a);
-        if let Some(method) = lookup_in_type_mro(w_type, dunder) {
+        if let Some(method) = lookup_in_type_where(w_type, dunder) {
             return Some(Ok(crate::space_call_function(method, &[a])));
         }
     }
@@ -567,7 +567,7 @@ unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult>
 /// Checks types and dispatches to the appropriate fast path.
 /// The JIT traces through this function, recording `GuardClass` on operand types.
 
-pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -601,7 +601,7 @@ pub fn py_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -625,7 +625,7 @@ pub fn py_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -662,7 +662,7 @@ pub fn py_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -686,7 +686,7 @@ pub fn py_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn py_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -833,7 +833,7 @@ unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
 
 /// True division (`/` operator) — always produces a float result.
 
-pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -855,7 +855,7 @@ pub fn py_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Power operation dispatch (`**` operator).
 
-pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -881,7 +881,7 @@ pub fn py_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Left shift dispatch (`<<` operator).
 
-pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -904,7 +904,7 @@ pub fn py_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Right shift dispatch (`>>` operator).
 
-pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -927,7 +927,7 @@ pub fn py_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Bitwise AND dispatch (`&` operator).
 
-pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -950,7 +950,7 @@ pub fn py_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Bitwise OR dispatch (`|` operator).
 
-pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -965,8 +965,8 @@ pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // type | type — Python 3.10+ union types
         if is_type(a) {
-            if let Some(metatype) = crate::typedef::get_type_object((*a).ob_type) {
-                if let Some(method) = lookup_in_type_mro(metatype, "__or__") {
+            if let Some(metatype) = crate::typedef::lookup_typeobject((*a).ob_type) {
+                if let Some(method) = lookup_in_type_where(metatype, "__or__") {
                     return Ok(crate::space_call_function(method, &[a, b]));
                 }
             }
@@ -981,7 +981,7 @@ pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Bitwise XOR dispatch (`^` operator).
 
-pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -1004,7 +1004,7 @@ pub fn py_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Comparison operation dispatch.
 
-pub fn py_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
     unsafe {
@@ -1097,7 +1097,7 @@ pub enum CompareOp {
 /// - bool → its value
 /// - int → nonzero
 
-pub fn py_is_true(obj: PyObjectRef) -> bool {
+pub fn is_true(obj: PyObjectRef) -> bool {
     let obj = unwrap_cell(obj);
     unsafe {
         if is_bool(obj) {
@@ -1131,21 +1131,21 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             // Try __bool__ first (type MRO)
-            if let Some(method) = lookup_in_type_mro(w_type, "__bool__") {
+            if let Some(method) = lookup_in_type_where(w_type, "__bool__") {
                 let result = crate::space_call_function(method, &[obj]);
                 if !result.is_null() && is_bool(result) {
                     return w_bool_get_value(result);
                 }
             }
             // Then __len__ (type MRO) — nonzero length = truthy
-            if let Some(method) = lookup_in_type_mro(w_type, "__len__") {
+            if let Some(method) = lookup_in_type_where(w_type, "__len__") {
                 let result = crate::space_call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
                 }
             }
             // Also check per-instance __len__ (ATTR_TABLE)
-            if let Ok(method) = py_getattr(obj, "__len__") {
+            if let Ok(method) = getattr(obj, "__len__") {
                 let result = crate::space_call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
@@ -1158,7 +1158,7 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
 
 /// Unary negation.
 
-pub fn py_negative(a: PyObjectRef) -> PyResult {
+pub fn neg(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
         if is_int(a) {
@@ -1192,7 +1192,7 @@ pub fn py_negative(a: PyObjectRef) -> PyResult {
 
 /// Unary bitwise inversion.
 
-pub fn py_invert(a: PyObjectRef) -> PyResult {
+pub fn invert(a: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     unsafe {
         if is_int(a) {
@@ -1217,7 +1217,7 @@ pub fn py_invert(a: PyObjectRef) -> PyResult {
 ///
 /// Dispatches based on the type of `obj`.
 
-pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let index = unwrap_cell(index);
     unsafe {
@@ -1387,14 +1387,14 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_type(obj) {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
-            if let Some(method) = lookup_in_type_mro(obj, "__class_getitem__") {
+            if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
                 return Ok(crate::space_call_function(method, &[obj, index]));
             }
             // Default: return the type itself (stub for GenericAlias)
             Ok(obj)
         } else if is_instance(obj) {
             // PyPy: descroperation.py __getitem__
-            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__getitem__") {
+            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
                 return Ok(crate::space_call_function(method, &[obj, index]));
             }
             Err(PyError::type_error(format!(
@@ -1412,7 +1412,7 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 /// Set item by index: `obj[index] = value`.
 
-pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let index = unwrap_cell(index);
     let value = unwrap_cell(value);
@@ -1435,7 +1435,7 @@ pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> P
             Ok(w_none())
         } else if is_instance(obj) {
             // PyPy: descroperation.py __setitem__
-            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__setitem__") {
+            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
                 crate::space_call_function(method, &[obj, index, value]);
                 return Ok(w_none());
             }
@@ -1453,7 +1453,7 @@ pub fn py_setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> P
 }
 
 /// Get the length of a container: `len(obj)`.
-pub fn py_len(obj: PyObjectRef) -> PyResult {
+pub fn len(obj: PyObjectRef) -> PyResult {
     unsafe {
         if is_list(obj) {
             Ok(w_int_new(w_list_len(obj) as i64))
@@ -1465,11 +1465,11 @@ pub fn py_len(obj: PyObjectRef) -> PyResult {
             Ok(w_int_new(w_str_len(obj) as i64))
         } else if is_instance(obj) {
             // Instance __len__ — PyPy: descroperation.py len
-            if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__len__") {
+            if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
             // Also check per-instance attributes (ATTR_TABLE)
-            if let Ok(method) = py_getattr(obj, "__len__") {
+            if let Ok(method) = getattr(obj, "__len__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
             Err(PyError::type_error(format!(
@@ -1517,7 +1517,7 @@ fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
-pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
+pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
 
     // super proxy — PyPy: superobject.py super_getattro
@@ -1548,7 +1548,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                         continue;
                     }
                     if is_type(t) {
-                        if let Some(method) = lookup_in_type_mro(t, name) {
+                        if let Some(method) = lookup_in_type_where(t, name) {
                             return Ok(method);
                         }
                     }
@@ -1607,12 +1607,12 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             let w_type = w_instance_get_type(obj);
 
             // Step 1: look up in type MRO
-            let w_descr = lookup_in_type_mro(w_type, name);
+            let w_descr = lookup_in_type_where(w_type, name);
 
             // Step 2: data descriptor takes priority over instance dict
             if let Some(descr) = w_descr {
-                if is_data_descriptor(descr) {
-                    if let Some(result) = call_descriptor_get(descr, obj, w_type) {
+                if is_data_descr(descr) {
+                    if let Some(result) = get(descr, obj, w_type) {
                         return Ok(result);
                     }
                 }
@@ -1634,7 +1634,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 if crate::is_builtin_code(descr) {
                     return Ok(descr);
                 }
-                if let Some(result) = call_descriptor_get(descr, obj, w_type) {
+                if let Some(result) = get(descr, obj, w_type) {
                     return Ok(result);
                 }
                 // Step 5: return descriptor as-is
@@ -1666,7 +1666,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
             if name == "__qualname__" {
                 // Check if __qualname__ was explicitly set in class body
-                if let Some(qn) = lookup_in_type_mro(obj, "__qualname__") {
+                if let Some(qn) = lookup_in_type_where(obj, "__qualname__") {
                     return Ok(qn);
                 }
                 return Ok(w_str_new(w_type_get_name(obj)));
@@ -1700,14 +1700,14 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 || name == "__kwdefaults__"
             {
                 // Check class dict first, then return None
-                if let Some(v) = lookup_in_type_mro(obj, name) {
+                if let Some(v) = lookup_in_type_where(obj, name) {
                     return Ok(v);
                 }
                 return Ok(w_none());
             }
 
-            if let Some(value) = lookup_in_type_mro(obj, name) {
-                if let Some(result) = call_descriptor_get(value, PY_NULL, obj) {
+            if let Some(value) = lookup_in_type_where(obj, name) {
+                if let Some(result) = get(value, PY_NULL, obj) {
                     return Ok(result);
                 }
                 return Ok(value);
@@ -1725,13 +1725,13 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Search metaclass MRO. Binding is handled by load_method.
             let metatypes: [Option<PyObjectRef>; 2] = [
                 metaclass_obj,
-                crate::typedef::get_type_object((*obj).ob_type),
+                crate::typedef::lookup_typeobject((*obj).ob_type),
             ];
             for mt in metatypes.iter().flatten() {
                 let mc = *mt;
                 if is_type(mc) {
-                    if let Some(value) = lookup_in_type_mro(mc, name) {
-                        if let Some(result) = call_descriptor_get(value, obj, mc) {
+                    if let Some(value) = lookup_in_type_where(mc, name) {
+                        if let Some(result) = get(value, obj, mc) {
                             return Ok(result);
                         }
                         return Ok(value);
@@ -1753,12 +1753,12 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // PyPy: space.type(w_obj) → W_TypeObject → MRO lookup in type dict.
     // Each builtin type (list, str, dict, etc.) has a W_TypeObject with
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
-    if let Some(type_obj) = crate::typedef::type_of(obj) {
-        if let Some(method) = unsafe { lookup_in_type_mro(type_obj, name) } {
+    if let Some(type_obj) = crate::typedef::space_type(obj) {
+        if let Some(method) = unsafe { lookup_in_type_where(type_obj, name) } {
             if unsafe { crate::is_builtin_code(method) } {
                 return Ok(pyre_object::w_method_new(method, obj, type_obj));
             }
-            if let Some(result) = unsafe { call_descriptor_get(method, obj, type_obj) } {
+            if let Some(result) = unsafe { get(method, obj, type_obj) } {
                 return Ok(result);
             }
             return Ok(method);
@@ -1892,8 +1892,8 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         match name {
             "__traceback__" => {
                 // Stub traceback object with tb_frame, tb_lineno, tb_next
-                let tb = pyre_object::w_instance_new(crate::typedef::get_object_type());
-                let frame_obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+                let tb = pyre_object::w_instance_new(crate::typedef::getobjecttype());
+                let frame_obj = pyre_object::w_instance_new(crate::typedef::getobjecttype());
                 ATTR_TABLE.with(|t| {
                     let mut t = t.borrow_mut();
                     let fd = t.entry(frame_obj as usize).or_default();
@@ -1930,7 +1930,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         return Ok(d);
     }
     if name == "__class__" {
-        if let Some(tp) = crate::typedef::type_of(obj) {
+        if let Some(tp) = crate::typedef::space_type(obj) {
             return Ok(tp);
         }
     }
@@ -1964,13 +1964,13 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
 /// Look up a name by walking the C3 MRO.
 ///
 /// Public wrapper for external callers (eval.rs load_method).
-pub unsafe fn lookup_in_type_mro_pub(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    lookup_in_type_mro(w_type, name)
+pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    lookup_in_type_where(w_type, name)
 }
 
 /// PyPy equivalent: typeobject.py `_lookup_where(self, key)` →
 /// linear search through `self.mro_w`.
-unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
@@ -2006,7 +2006,7 @@ unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObject
 /// algorithm (Python 2.3+). Handles diamond inheritance correctly.
 ///
 /// Public wrapper for use by isinstance and other external callers.
-pub unsafe fn compute_mro_pub(w_type: PyObjectRef) -> Vec<PyObjectRef> {
+pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
     compute_mro(w_type)
 }
 
@@ -2083,7 +2083,7 @@ unsafe fn compute_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// In Python, a data descriptor is any object whose type defines __set__
 /// or __delete__. For pyre's current object model, we check the ATTR_TABLE
 /// and type dict for these names.
-unsafe fn is_data_descriptor(descr: PyObjectRef) -> bool {
+unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -2096,8 +2096,8 @@ unsafe fn is_data_descriptor(descr: PyObjectRef) -> bool {
     if is_instance(descr) {
         let w_type = w_instance_get_type(descr);
         if !w_type.is_null() && is_type(w_type) {
-            return lookup_in_type_mro(w_type, "__set__").is_some()
-                || lookup_in_type_mro(w_type, "__delete__").is_some();
+            return lookup_in_type_where(w_type, "__set__").is_some()
+                || lookup_in_type_where(w_type, "__delete__").is_some();
         }
     }
     false
@@ -2113,11 +2113,7 @@ unsafe fn is_data_descriptor(descr: PyObjectRef) -> bool {
 ///
 /// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
 /// dispatch on descriptor type, then fallback to __get__ MRO lookup.
-unsafe fn call_descriptor_get(
-    descr: PyObjectRef,
-    obj: PyObjectRef,
-    w_type: PyObjectRef,
-) -> Option<PyObjectRef> {
+unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
     if descr.is_null() {
         return None;
     }
@@ -2146,14 +2142,14 @@ unsafe fn call_descriptor_get(
         if receiver.is_null() || is_none(receiver) {
             return Some(func);
         }
-        let owner = crate::typedef::type_of(receiver).unwrap_or(PY_NULL);
+        let owner = crate::typedef::space_type(receiver).unwrap_or(PY_NULL);
         return Some(pyre_object::w_method_new(func, receiver, owner));
     }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
     // PyPy: descroperation.py → space.get_and_call_function(w_get, descr, obj, type)
-    if let Some(descr_type) = crate::typedef::type_of(descr) {
-        if let Some(get_fn) = lookup_in_type_mro(descr_type, "__get__") {
+    if let Some(descr_type) = crate::typedef::space_type(descr) {
+        if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
                 // Call __get__(descr, obj, type) via space.call_function
                 return Some(crate::space_call_function(get_fn, &[descr, obj, w_type]));
@@ -2174,7 +2170,7 @@ unsafe fn call_func_1(func: PyObjectRef, arg: PyObjectRef) -> Option<PyObjectRef
 ///
 /// PyPy: descroperation.py `descr__setattr__` →
 /// `space.get_and_call_function(w_set, w_descr, w_obj, w_value)`
-unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool {
+unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -2192,7 +2188,7 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
     // General __set__: look up on descriptor's type MRO
     if is_instance(descr) {
         let descr_type = w_instance_get_type(descr);
-        if let Some(set_fn) = lookup_in_type_mro(descr_type, "__set__") {
+        if let Some(set_fn) = lookup_in_type_where(descr_type, "__set__") {
             if !set_fn.is_null() {
                 crate::space_call_function(set_fn, &[obj, value]);
                 return true;
@@ -2207,15 +2203,15 @@ unsafe fn call_descriptor_set(descr: PyObjectRef, obj: PyObjectRef, value: PyObj
 /// Stores the attribute in the per-object side table.
 /// PyPy: descroperation.py descr__setattr__
 
-pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let value = unwrap_cell(value);
     // Data descriptor __set__ takes priority (PyPy: descr__setattr__ step 1)
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            if let Some(descr) = lookup_in_type_mro(w_type, name) {
-                if call_descriptor_set(descr, obj, value) {
+            if let Some(descr) = lookup_in_type_where(w_type, name) {
+                if set(descr, obj, value) {
                     return Ok(w_none());
                 }
             }
@@ -2247,7 +2243,7 @@ pub fn py_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult 
 /// Delete an attribute: `del obj.name`.
 ///
 /// PyPy: descroperation.py descr__delattr__
-pub fn py_delattr(obj: PyObjectRef, name: &str) -> PyResult {
+pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = unwrap_cell(obj);
     // Type objects: set to PY_NULL in class dict
     // (PyNamespace doesn't support removal, null slot acts as deleted)
@@ -2281,7 +2277,7 @@ pub fn py_delattr(obj: PyObjectRef, name: &str) -> PyResult {
 
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
-pub fn py_iter(obj: PyObjectRef) -> PyResult {
+pub fn iter(obj: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     unsafe {
         // Builtin iterables
@@ -2311,7 +2307,7 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
         }
         // Instance __iter__ — check type MRO and ATTR_TABLE
         if is_instance(obj) {
-            if let Ok(method) = py_getattr(obj, "__iter__") {
+            if let Ok(method) = getattr(obj, "__iter__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
         }
@@ -2327,15 +2323,15 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
                     .and_then(|d| d.get("__metaclass__").copied())
             });
             if let Some(metaclass) = mc {
-                if let Some(method) = lookup_in_type_mro(metaclass, "__iter__") {
+                if let Some(method) = lookup_in_type_where(metaclass, "__iter__") {
                     return Ok(crate::space_call_function(method, &[obj]));
                 }
             }
             // Fallback: check type type's MRO
             if let Some(type_type) =
-                crate::typedef::get_type_object(&pyre_object::pyobject::TYPE_TYPE)
+                crate::typedef::lookup_typeobject(&pyre_object::pyobject::TYPE_TYPE)
             {
-                if let Some(method) = lookup_in_type_mro(type_type, "__iter__") {
+                if let Some(method) = lookup_in_type_where(type_type, "__iter__") {
                     return Ok(crate::space_call_function(method, &[obj]));
                 }
             }
@@ -2348,7 +2344,7 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
 }
 
 /// `next(iterator)` — PyPy: space.next(w_iter)
-pub fn py_next(obj: PyObjectRef) -> PyResult {
+pub fn next(obj: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     unsafe {
         // Seq iterator
@@ -2400,7 +2396,7 @@ pub fn py_next(obj: PyObjectRef) -> PyResult {
         // Instance __next__
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            if let Some(method) = lookup_in_type_mro(w_type, "__next__") {
+            if let Some(method) = lookup_in_type_where(w_type, "__next__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
         }
@@ -2494,7 +2490,7 @@ mod tests {
     fn test_int_add() {
         let a = w_int_new(3);
         let b = w_int_new(4);
-        let result = py_add(a, b).unwrap();
+        let result = add(a, b).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 7) };
     }
 
@@ -2502,7 +2498,7 @@ mod tests {
     fn test_int_compare() {
         let a = w_int_new(5);
         let b = w_int_new(10);
-        let result = py_compare(a, b, CompareOp::Lt).unwrap();
+        let result = compare(a, b, CompareOp::Lt).unwrap();
         unsafe { assert!(w_bool_get_value(result)) };
     }
 
@@ -2510,23 +2506,23 @@ mod tests {
     fn test_zero_division() {
         let a = w_int_new(5);
         let b = w_int_new(0);
-        assert!(py_floordiv(a, b).is_err());
+        assert!(floordiv(a, b).is_err());
     }
 
     #[test]
     fn test_truthiness() {
-        assert!(py_is_true(w_int_new(1)));
-        assert!(!py_is_true(w_int_new(0)));
-        assert!(!py_is_true(w_none()));
-        assert!(py_is_true(w_bool_from(true)));
-        assert!(!py_is_true(w_bool_from(false)));
+        assert!(is_true(w_int_new(1)));
+        assert!(!is_true(w_int_new(0)));
+        assert!(!is_true(w_none()));
+        assert!(is_true(w_bool_from(true)));
+        assert!(!is_true(w_bool_from(false)));
     }
 
     #[test]
     fn test_int_add_overflow() {
         let a = w_int_new(i64::MAX);
         let b = w_int_new(1);
-        let result = py_add(a, b).unwrap();
+        let result = add(a, b).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(
@@ -2540,7 +2536,7 @@ mod tests {
     fn test_int_sub_overflow() {
         let a = w_int_new(i64::MIN);
         let b = w_int_new(1);
-        let result = py_sub(a, b).unwrap();
+        let result = sub(a, b).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(
@@ -2554,7 +2550,7 @@ mod tests {
     fn test_int_mul_overflow() {
         let a = w_int_new(i64::MAX);
         let b = w_int_new(2);
-        let result = py_mul(a, b).unwrap();
+        let result = mul(a, b).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(
@@ -2568,7 +2564,7 @@ mod tests {
     fn test_long_add() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(100);
-        let result = py_add(a, b).unwrap();
+        let result = add(a, b).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(
@@ -2583,7 +2579,7 @@ mod tests {
         // long + long that fits back in i64 → W_IntObject
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(-1);
-        let result = py_add(a, b).unwrap();
+        let result = add(a, b).unwrap();
         unsafe {
             assert!(is_int(result));
             assert_eq!(w_int_get_value(result), i64::MAX);
@@ -2593,7 +2589,7 @@ mod tests {
     #[test]
     fn test_negate_min_int() {
         let a = w_int_new(i64::MIN);
-        let result = py_negative(a).unwrap();
+        let result = neg(a).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(*w_long_get_value(result), -BigInt::from(i64::MIN));
@@ -2602,7 +2598,7 @@ mod tests {
 
     #[test]
     fn test_invert_int() {
-        let result = py_invert(w_int_new(6)).unwrap();
+        let result = invert(w_int_new(6)).unwrap();
         unsafe {
             assert!(is_int(result));
             assert_eq!(w_int_get_value(result), !6);
@@ -2613,27 +2609,27 @@ mod tests {
     fn test_long_compare() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(i64::MAX);
-        let result = py_compare(a, b, CompareOp::Gt).unwrap();
+        let result = compare(a, b, CompareOp::Gt).unwrap();
         unsafe { assert!(w_bool_get_value(result)) };
     }
 
     #[test]
     fn test_long_truthiness() {
-        assert!(py_is_true(w_long_new(
+        assert!(is_true(w_long_new(
             BigInt::from(i64::MAX) + BigInt::from(1)
         )));
-        assert!(!py_is_true(w_long_new(BigInt::from(0))));
+        assert!(!is_true(w_long_new(BigInt::from(0))));
     }
 
     #[test]
     fn test_int_pow() {
-        let result = py_pow(w_int_new(2), w_int_new(10)).unwrap();
+        let result = pow(w_int_new(2), w_int_new(10)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1024) };
     }
 
     #[test]
     fn test_int_pow_overflow() {
-        let result = py_pow(w_int_new(2), w_int_new(63)).unwrap();
+        let result = pow(w_int_new(2), w_int_new(63)).unwrap();
         unsafe {
             // 2^63 overflows i64, should be long
             assert!(is_long(result));
@@ -2643,7 +2639,7 @@ mod tests {
 
     #[test]
     fn test_int_pow_negative_exponent() {
-        let result = py_pow(w_int_new(2), w_int_new(-1)).unwrap();
+        let result = pow(w_int_new(2), w_int_new(-1)).unwrap();
         unsafe {
             assert!(is_float(result));
             assert_eq!(w_float_get_value(result), 0.5);
@@ -2652,13 +2648,13 @@ mod tests {
 
     #[test]
     fn test_int_lshift() {
-        let result = py_lshift(w_int_new(1), w_int_new(10)).unwrap();
+        let result = lshift(w_int_new(1), w_int_new(10)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1024) };
     }
 
     #[test]
     fn test_int_lshift_overflow() {
-        let result = py_lshift(w_int_new(1), w_int_new(64)).unwrap();
+        let result = lshift(w_int_new(1), w_int_new(64)).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(*w_long_get_value(result), BigInt::from(1) << 64);
@@ -2667,31 +2663,31 @@ mod tests {
 
     #[test]
     fn test_int_rshift() {
-        let result = py_rshift(w_int_new(1024), w_int_new(3)).unwrap();
+        let result = rshift(w_int_new(1024), w_int_new(3)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 128) };
     }
 
     #[test]
     fn test_negative_shift_count() {
-        assert!(py_lshift(w_int_new(1), w_int_new(-1)).is_err());
-        assert!(py_rshift(w_int_new(1), w_int_new(-1)).is_err());
+        assert!(lshift(w_int_new(1), w_int_new(-1)).is_err());
+        assert!(rshift(w_int_new(1), w_int_new(-1)).is_err());
     }
 
     #[test]
     fn test_int_bitand() {
-        let result = py_bitand(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
+        let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
     }
 
     #[test]
     fn test_int_bitor() {
-        let result = py_bitor(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
+        let result = or_(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0xFF) };
     }
 
     #[test]
     fn test_int_bitxor() {
-        let result = py_bitxor(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
+        let result = xor(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0xF0) };
     }
 
@@ -2699,14 +2695,14 @@ mod tests {
     fn test_long_bitand() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(0xFF);
-        let result = py_bitand(a, b).unwrap();
+        let result = and_(a, b).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0) };
     }
 
     #[test]
     fn test_invert_long() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
-        let result = py_invert(a).unwrap();
+        let result = invert(a).unwrap();
         unsafe {
             assert!(is_long(result));
             assert_eq!(
@@ -2719,24 +2715,24 @@ mod tests {
     #[test]
     fn test_setattr_getattr() {
         let obj = w_int_new(42);
-        py_setattr(obj, "name", w_int_new(100)).unwrap();
-        let result = py_getattr(obj, "name").unwrap();
+        setattr(obj, "name", w_int_new(100)).unwrap();
+        let result = getattr(obj, "name").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 100) };
     }
 
     #[test]
     fn test_getattr_missing() {
         let obj = w_int_new(1);
-        let err = py_getattr(obj, "missing").unwrap_err();
+        let err = getattr(obj, "missing").unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
     }
 
     #[test]
     fn test_setattr_overwrite() {
         let obj = w_int_new(42);
-        py_setattr(obj, "x", w_int_new(1)).unwrap();
-        py_setattr(obj, "x", w_int_new(2)).unwrap();
-        let result = py_getattr(obj, "x").unwrap();
+        setattr(obj, "x", w_int_new(1)).unwrap();
+        setattr(obj, "x", w_int_new(2)).unwrap();
+        let result = getattr(obj, "x").unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 2) };
     }
 
@@ -2751,21 +2747,21 @@ mod tests {
                 (*(*list).ob_type).tp_name
             );
         }
-        let result = super::py_contains(list, needle).expect("py_contains failed");
+        let result = super::contains(list, needle).expect("contains failed");
         assert!(result, "1 should be in [1, 2, 3]");
     }
 }
 
 /// `in` operator: check if `needle` is in `haystack`.
 /// PyPy: space.contains_w(haystack, needle)
-pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
     use pyre_object::*;
     unsafe {
         if is_list(haystack) {
             let len = w_list_len(haystack);
             for i in 0..len {
                 if let Some(item) = w_list_getitem(haystack, i as i64) {
-                    if py_eq_bool(item, needle) {
+                    if eq_w(item, needle) {
                         return Ok(true);
                     }
                 }
@@ -2776,7 +2772,7 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
             let len = w_tuple_len(haystack);
             for i in 0..len {
                 if let Some(item) = w_tuple_getitem(haystack, i as i64) {
-                    if py_eq_bool(item, needle) {
+                    if eq_w(item, needle) {
                         return Ok(true);
                     }
                 }
@@ -2797,24 +2793,24 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
     unsafe {
         if is_instance(haystack) {
             let w_type = w_instance_get_type(haystack);
-            if let Some(method) = lookup_in_type_mro(w_type, "__contains__") {
+            if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
                 let result = crate::space_call_function(method, &[haystack, needle]);
-                return Ok(py_is_true(result));
+                return Ok(is_true(result));
             }
             // Also check per-instance attributes (ATTR_TABLE)
-            if let Ok(method) = py_getattr(haystack, "__contains__") {
+            if let Ok(method) = getattr(haystack, "__contains__") {
                 let result = crate::space_call_function(method, &[haystack, needle]);
-                return Ok(py_is_true(result));
+                return Ok(is_true(result));
             }
         }
     }
-    // Fallback: try iterating with py_getitem(obj, i) for i=0,1,...
+    // Fallback: try iterating with getitem(obj, i) for i=0,1,...
     unsafe {
         let mut i = 0i64;
         loop {
-            match py_getitem(haystack, pyre_object::w_int_new(i)) {
+            match getitem(haystack, pyre_object::w_int_new(i)) {
                 Ok(item) => {
-                    if py_eq_bool(item, needle) {
+                    if eq_w(item, needle) {
                         return Ok(true);
                     }
                     i += 1;
@@ -2826,7 +2822,7 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
-fn py_eq_bool(a: PyObjectRef, b: PyObjectRef) -> bool {
+fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
     if a == b {
         return true;
     }
@@ -2839,13 +2835,13 @@ fn py_eq_bool(a: PyObjectRef, b: PyObjectRef) -> bool {
             return w_str_get_value(a) == w_str_get_value(b);
         }
     }
-    py_compare(a, b, CompareOp::Eq)
-        .map(|r| py_is_true(r))
+    compare(a, b, CompareOp::Eq)
+        .map(|r| is_true(r))
         .unwrap_or(false)
 }
 
 /// Delete item: `del obj[index]`
-pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
+pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
         if is_list(obj) && is_int(index) {
@@ -2864,7 +2860,7 @@ pub fn py_delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_instance(obj) {
             if let Some(method) =
-                lookup_in_type_mro(pyre_object::w_instance_get_type(obj), "__delitem__")
+                lookup_in_type_where(pyre_object::w_instance_get_type(obj), "__delitem__")
             {
                 crate::space_call_function(method, &[obj, index]);
                 return Ok(());
