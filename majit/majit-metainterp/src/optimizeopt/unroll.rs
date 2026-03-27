@@ -295,8 +295,11 @@ impl UnrollOptimizer {
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Don't flush lazy sets — virtuals remain virtual until JUMP handling.
         opt_p2.skip_flush = true;
-        // Phase 2: don't virtualize New() — guard recovery_layout not populated.
-        opt_p2.set_phase2(true);
+        // RPython parity: Phase 2 DOES virtualize New(). Guard recovery uses
+        // rd_virtuals_info (generated in compile.rs from GuardVirtualEntry)
+        // for virtual materialization on guard failure.
+        // Previously disabled (set_phase2(true)) due to missing rd_virtuals_info;
+        // now enabled after compile.rs rd_virtuals→rd_virtuals_info generation.
         // RPython parity: Phase 2 imports heap cache via short preamble
         // (inline_short_preamble), not via direct cache import. The short
         // preamble replays HeapOps that populate Phase 2's cache.
