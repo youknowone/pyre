@@ -3535,9 +3535,15 @@ impl<M: Clone> MetaInterp<M> {
                     compiling: false,
                     per_value: None,
                 });
-            // compile.py:783-784: jitcounter.tick(hash, increment)
-            let guard_hash = info.guard_hash;
-            let must_compile = self.warm_state.tick_guard_failure(guard_hash) && !info.compiling;
+            // compile.py:741-784: must_compile — for GUARD_VALUE (per_value
+            // is Some), skip tick here. Per-value tick happens in
+            // handle_guard_failure_in_trace_with_savedata where fail_values
+            // are available. For normal guards, tick the guard_hash.
+            let must_compile = if info.per_value.is_none() {
+                self.warm_state.tick_guard_failure(info.guard_hash) && !info.compiling
+            } else {
+                false // GUARD_VALUE: ticked in handle_guard_failure_in_trace
+            };
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
