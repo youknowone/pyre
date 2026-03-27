@@ -507,14 +507,10 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
-        // Clear any stale forwarding for this pos. Phase 2 import may set
-        // forwarding for heap cache entries whose source OpRef coincides with
-        // a trace op's pos. When the trace op is re-emitted in Phase 2, the
-        // new result must NOT be aliased to the imported value.
-        let idx = pos_ref.0 as usize;
-        if idx < self.forwarding.len() && !self.forwarding[idx].is_none() {
-            self.forwarding[idx] = OpRef::NONE;
-        }
+        // RPython parity: emit() does NOT clear forwarding.
+        // In RPython, Box._forwarded is never cleared by emit — each Box
+        // has unique identity. The forwarding set by import_box must
+        // survive body op emission for consumer switchover to work.
         // Phase 2 body defines its own result at pos — supersede any cross-phase
         // short_preamble_mapping entry, so get_replacement returns the body's
         // value rather than the preamble import.
@@ -1312,7 +1308,9 @@ impl OptContext {
             self.ptr_info.resize(idx + 1, None);
         }
         self.ptr_info[idx] = Some(info);
-        // Clear forwarding: this position is now a terminal (has Info).
+        // RPython set_forwarded parity: _forwarded is a single field that
+        // holds EITHER an Op (forwarding) OR an Info (terminal).
+        // Setting Info replaces any existing forwarding.
         if idx < self.forwarding.len() {
             self.forwarding[idx] = OpRef::NONE;
         }
