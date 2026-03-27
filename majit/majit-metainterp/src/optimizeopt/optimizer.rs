@@ -3118,6 +3118,33 @@ impl<'a> majit_ir::BoxEnv for OptimizerBoxEnv<'a> {
     fn is_virtual_raw(&self, _opref: OpRef) -> bool {
         false // pyre has no raw virtuals
     }
+
+    fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
+        use crate::optimizeopt::info::PtrInfo;
+        let resolved = self.ctx.get_replacement(opref);
+        let info = self.ctx.get_ptr_info(resolved)?;
+        match info {
+            PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: vi.known_class,
+                field_oprefs: vi
+                    .fields
+                    .iter()
+                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .collect(),
+            }),
+            PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: None,
+                field_oprefs: vi
+                    .fields
+                    .iter()
+                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

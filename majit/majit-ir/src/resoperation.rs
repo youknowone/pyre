@@ -67,6 +67,19 @@ pub struct GuardPendingFieldEntry {
     pub field_type: Type,
 }
 
+/// resume.py:419-426 — virtual object field info discovered by
+/// `visitor_walk_recursive` inside `finish()`.
+#[derive(Debug, Clone)]
+pub struct VirtualFieldsInfo {
+    /// Type descriptor for the virtual object.
+    pub descr: Option<DescrRef>,
+    /// Known class pointer (for NewWithVtable).
+    pub known_class: Option<GcRef>,
+    /// Field OpRefs (after get_box_replacement). Order matches the
+    /// virtual's field descriptor list.
+    pub field_oprefs: Vec<OpRef>,
+}
+
 /// resume.py:192-226 parity: box environment for _number_boxes.
 ///
 /// Abstracts the operations RPython performs on boxes during snapshot
@@ -84,6 +97,15 @@ pub trait BoxEnv {
     fn is_virtual_ref(&self, opref: OpRef) -> bool;
     /// resume.py:215-216 — getrawptrinfo(box) is not None and info.is_virtual()
     fn is_virtual_raw(&self, opref: OpRef) -> bool;
+    /// resume.py:419-426 — getptrinfo(box).visitor_walk_recursive(box, self)
+    ///
+    /// Returns virtual field info for the given OpRef if it is a virtual
+    /// object. Called by `finish()` to discover virtual fields inline,
+    /// matching RPython's callback-based `visitor_walk_recursive` pattern.
+    /// Default returns None (no virtual info available).
+    fn get_virtual_fields(&self, _opref: OpRef) -> Option<VirtualFieldsInfo> {
+        None
+    }
 }
 
 /// A single IR operation.
