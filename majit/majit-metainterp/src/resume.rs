@@ -2295,24 +2295,11 @@ impl MaterializedVirtual {
 }
 
 /// Builder for constructing ResumeData during trace compilation.
-/// TODO(RPython parity): This is a legacy builder that creates `ResumeData`
-/// (the old format). RPython's `ResumeDataVirtualAdder` (resume.py:298-493)
-/// is fundamentally different:
 ///
-/// 1. Takes `(optimizer, descr, guard_op, trace, memo)` as __init__ args
-/// 2. `finish(pendingfields)`:
-///    - Calls `memo.number()` to create NumberingState
-///    - Walks virtual objects via `visitor_walk_recursive()`
-///    - Collects virtual fieldnums into `rd_virtuals` array
-///    - Patches slot 1 with `len(liveboxes)` (num_failargs)
-///    - Stores `rd_numb = numb_state.create_numbering()`
-///    - Stores `rd_consts = memo.consts`
-///    - Returns `newboxes` (the final fail_args list)
-///
-/// Porting `finish()` requires:
-/// - Access to optimizer's PtrInfo (for virtual walking)
-/// - VirtualVisitor implementation (for fieldnums collection)
-/// - Integration with `store_final_boxes_in_guard()` in optimizer.rs
+/// resume.py:298-493 ResumeDataVirtualAdder.finish() is implemented
+/// across two functions in majit:
+/// - `number_guard_inline` (mod.rs) — numbering + rd_numb/rd_consts
+/// - `store_final_boxes_in_guard` (optimizer.rs) — virtual expansion + rd_virtuals
 pub struct ResumeDataVirtualAdder {
     frames: Vec<FrameInfoBuilder>,
     virtuals: Vec<VirtualInfo>,
@@ -3541,12 +3528,9 @@ fn decode_tagged(
 /// decoder that returns RebuiltFrame structs. The caller materializes
 /// concrete interpreter state from the decoded values.
 ///
-/// TODO(ResumeDataVirtualAdder): TAGVIRTUAL values are returned as
-/// `RebuiltValue::Virtual(index)`. RPython's decode_ref/decode_int
-/// calls `getvirtual_ptr(num)` / `getvirtual_int(num)` which lazily
-/// allocates the virtual object from rd_virtuals[num]. Once
-/// ResumeDataVirtualAdder is ported and rd_virtuals is populated,
-/// add a `rd_virtuals` parameter and implement materialization.
+/// TAGVIRTUAL values are returned as `RebuiltValue::Virtual(index)`.
+/// Materialization is handled by materialize_from_recovery_layout
+/// in pyre-jit/eval.rs using the guard's rd_virtuals/ExitRecoveryLayout.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
