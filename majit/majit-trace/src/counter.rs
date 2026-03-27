@@ -48,10 +48,20 @@ impl JitCounter {
         self.celltable[(hash as usize) & TABLE_MASK]
     }
 
+    /// RPython-compatible alias for compiled checks.
+    pub fn has_compiled_loop(&self, hash: u64) -> bool {
+        self.has_compiled_hint(hash)
+    }
+
     /// counter.py:246-256 install_new_cell(hash, newcell) parity.
     /// Mark that compiled code exists for this hash bucket.
     pub fn set_compiled_hint(&mut self, hash: u64, compiled: bool) {
         self.celltable[(hash as usize) & TABLE_MASK] = compiled;
+    }
+
+    /// RPython-compatible alias for setting compiled state.
+    pub fn set_compiled_loop(&mut self, hash: u64, compiled: bool) {
+        self.set_compiled_hint(hash, compiled);
     }
 
     /// Check if counter would fire without modifying state.
@@ -295,14 +305,76 @@ impl JitCounter {
         // In majit, WarmEnterState.cells HashMap handles this directly.
     }
 
+    /// counter.py: _compute_threshold(threshold).
+    pub fn _compute_threshold(&self, threshold: u32) -> f64 {
+        if threshold <= 0 {
+            0.0
+        } else {
+            1.0 / (threshold as f64)
+        }
+    }
+
+    /// counter.py: _swap(p_entry, n)
+    ///
+    /// Compatibility shim: `p_entry` is interpreted as a slot index in the
+    /// current associative bucket.
+    pub fn _swap(&mut self, p_entry: usize, n: usize) -> usize {
+        let i = p_entry & TABLE_MASK;
+        let j = n & TABLE_MASK;
+        if self.table[i].1 >= self.table[j].1 {
+            i
+        } else {
+            self.table.swap(i, j);
+            j
+        }
+    }
+
+    /// counter.py: _tick_slowpath(p_entry, subhash)
+    ///
+    /// `p_entry` is interpreted as a bucket index; this keeps the same control
+    /// flow shape as the original without requiring the C struct layout.
+    pub fn _tick_slowpath(&mut self, p_entry: usize, subhash: u16) -> usize {
+        let base = p_entry & TABLE_MASK;
+        let hash = ((base as u64) << 16) | subhash as u64;
+        let mut n = 4;
+        while n > 0 && self.table[(base + n - 1) & TABLE_MASK].1 == 0 {
+            n -= 1;
+        }
+        for i in 0..ASSOCIATIVITY {
+            let idx = (base + i) & TABLE_MASK;
+            if self.table[idx].0 == hash {
+                return idx;
+            }
+        }
+        let target = (base + n) & TABLE_MASK;
+        self.table[target].0 = hash;
+        self.table[target].1 = 0;
+        target
+    }
+
+    /// counter.py: invoke_after_minor_collection() helper for GC hooks.
+    pub fn invoke_after_minor_collection(&mut self) {
+        self.decay_all_counters_by(0.96);
+    }
+
     /// counter.py: _get_index(hash) — hash to bucket index.
     fn get_index(&self, hash: u64) -> usize {
         (hash as usize) & TABLE_MASK
     }
 
+    /// RPython-compatible public alias.
+    pub fn _get_index(&self, hash: u64) -> usize {
+        self.get_index(hash)
+    }
+
     /// counter.py: _get_subhash(hash) — lower 16 bits for associative match.
     fn get_subhash(hash: u64) -> u16 {
         (hash & 0xFFFF) as u16
+    }
+
+    /// RPython-compatible public alias.
+    pub fn _get_subhash(hash: u64) -> u16 {
+        Self::get_subhash(hash)
     }
 }
 
@@ -399,6 +471,24 @@ impl DeterministicJitCounter {
     /// Threshold getter.
     pub fn threshold(&self) -> u32 {
         self.threshold
+    }
+
+    /// counter.py: _get_index(hash)
+    pub fn _get_index(&self, hash: u64) -> u64 {
+        hash
+    }
+
+    /// counter.py: _clear_all()
+    pub fn _clear_all(&mut self) {
+        self.counts.clear();
+    }
+
+    /// counter.py: make_null_entry()
+    pub fn make_null_entry() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+            threshold: 0,
+        }
     }
 }
 

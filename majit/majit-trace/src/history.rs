@@ -7,6 +7,13 @@
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
 use majit_ir::{InputArg, Op, OpCode, OpRef};
 
+/// RPython `History` parity alias for `TreeLoop`.
+///
+/// The Rust implementation keeps the historical `TreeLoop` name for naming
+/// consistency with `rpython/jit/metainterp/pyjitpl.py` internals, while
+/// `History` is retained for direct RPython call-site parity.
+pub type History = TreeLoop;
+
 /// A completed trace ready for optimization and compilation.
 #[derive(Clone, Debug)]
 pub struct TreeLoop {

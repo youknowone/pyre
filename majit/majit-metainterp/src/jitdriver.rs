@@ -393,6 +393,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_max_unroll_recursion(value);
     }
 
+    /// RPython-compatible alias used by warmstate/compile wiring.
+    pub fn set_param_max_unroll_recursion(&mut self, value: usize) {
+        self.set_max_unroll_recursion(value);
+    }
+
     /// Whether this driver was declared recursive.
     pub fn is_recursive(&self) -> bool {
         self.is_recursive
@@ -1248,6 +1253,27 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_threshold(threshold);
     }
 
+    /// RPython-compatible wrapper used by compile.py.
+    pub fn send_loop_to_backend(
+        &mut self,
+        jump_args: &[OpRef],
+        meta: S::Meta,
+    ) -> crate::pyjitpl::CompileOutcome {
+        self.meta.compile_loop(jump_args, meta)
+    }
+
+    /// RPython-compatible wrapper used by compile.py for bridges.
+    pub fn send_bridge_to_backend(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+    ) -> crate::pyjitpl::BridgeCompileResult {
+        self.meta
+            .close_bridge(green_key, trace_id, fail_index, finish_args)
+    }
+
     /// Set the bridge compilation threshold.
     pub fn set_bridge_threshold(&mut self, threshold: u32) {
         self.meta.set_bridge_threshold(threshold);
@@ -1283,6 +1309,7 @@ impl<S: JitState> JitDriver<S> {
             "trace_eagerness" => self.meta.set_trace_eagerness(value as u32),
             "bridge_threshold" => self.meta.set_bridge_threshold(value as u32),
             "function_threshold" => self.meta.set_function_threshold(value as u32),
+            "max_unroll_recursion" => self.set_param_max_unroll_recursion(value as usize),
             _ => self.meta.warm_state_mut().set_param(name, value),
         }
     }
