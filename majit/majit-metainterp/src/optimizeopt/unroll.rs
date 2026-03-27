@@ -2525,7 +2525,15 @@ fn assemble_peeled_trace_with_jump_args(
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
-    let mut max_pos = result_max.max(p1_all_max);
+    // Phase A parity: also account for Phase 2 op positions so assembly-
+    // allocated positions (aliases, labels) don't collide with Phase 2.
+    let p2_all_max = p2_ops
+        .iter()
+        .map(|op| op.pos.0)
+        .filter(|&p| p != u32::MAX)
+        .max()
+        .unwrap_or(0);
+    let mut max_pos = result_max.max(p1_all_max).max(p2_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
     let mut alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
     for alias in imported_short_aliases {
