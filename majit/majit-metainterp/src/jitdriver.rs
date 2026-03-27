@@ -595,26 +595,16 @@ impl<S: JitState> JitDriver<S> {
                         _ => provisional_meta,
                     };
                     // RPython pyjitpl.py:3000-3009 parity: if partial_trace
-                    // is set from a previous InvalidLoop, use compile_retrace
-                    // to reuse the preamble with new runtime values.
-                    let outcome = if self.meta.has_partial_trace() {
+                    // is set from a previous InvalidLoop, clear it and do a
+                    // fresh compile_loop. The new trace has different runtime
+                    // values (e.g. sign=1 vs sign=-1), so Phase 2 succeeds.
+                    if self.meta.has_partial_trace() {
                         if crate::majit_log_enabled() {
-                            eprintln!("[jit] CloseLoop → compile_retrace (partial_trace set)");
+                            eprintln!("[jit] clearing partial_trace for fresh compile_loop");
                         }
-                        let ok = self.meta.compile_retrace(&jump_args, meta.clone());
-                        if ok {
-                            crate::pyjitpl::CompileOutcome::Compiled {
-                                cut_header_pc: None,
-                                green_key: 0,
-                                from_retry: true,
-                            }
-                        } else {
-                            self.meta.clear_retrace_state();
-                            self.meta.compile_loop(&jump_args, meta)
-                        }
-                    } else {
-                        self.meta.compile_loop(&jump_args, meta)
-                    };
+                        self.meta.clear_retrace_state();
+                    }
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -689,26 +679,16 @@ impl<S: JitState> JitDriver<S> {
                         _ => provisional_meta,
                     };
                     // RPython pyjitpl.py:3000-3009 parity: if partial_trace
-                    // is set from a previous InvalidLoop, use compile_retrace
-                    // to reuse the preamble with new runtime values.
-                    let outcome = if self.meta.has_partial_trace() {
+                    // is set from a previous InvalidLoop, clear it and do a
+                    // fresh compile_loop. The new trace has different runtime
+                    // values (e.g. sign=1 vs sign=-1), so Phase 2 succeeds.
+                    if self.meta.has_partial_trace() {
                         if crate::majit_log_enabled() {
-                            eprintln!("[jit] CloseLoop → compile_retrace (partial_trace set)");
+                            eprintln!("[jit] clearing partial_trace for fresh compile_loop");
                         }
-                        let ok = self.meta.compile_retrace(&jump_args, meta.clone());
-                        if ok {
-                            crate::pyjitpl::CompileOutcome::Compiled {
-                                cut_header_pc: None,
-                                green_key: 0,
-                                from_retry: true,
-                            }
-                        } else {
-                            self.meta.clear_retrace_state();
-                            self.meta.compile_loop(&jump_args, meta)
-                        }
-                    } else {
-                        self.meta.compile_loop(&jump_args, meta)
-                    };
+                        self.meta.clear_retrace_state();
+                    }
+                    let outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(
