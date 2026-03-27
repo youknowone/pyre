@@ -3906,11 +3906,13 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 1);
         let label_args = import_state(&[OpRef(0)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(21)]);
+        // RPython parity: IntBound is NOT imported from preamble (unroll.py:73-75).
+        // Only int_lower_bound hints are imported for nonnegative array bounds.
         assert_eq!(
             ctx2.imported_int_bounds
                 .get(&OpRef(21))
                 .map(|b| (b.lower, b.upper)),
-            Some((10, 20))
+            None
         );
         assert_eq!(ctx2.int_lower_bounds.get(&OpRef(21)).copied(), Some(10));
     }

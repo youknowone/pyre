@@ -839,10 +839,12 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
-    // ── Integration: GuardStrengthenOpt in the default pipeline ───────────────────
+    // ── Integration: GuardStrengthenOpt as standalone pass ─────────────────────
+    // RPython: guard.py is NOT in the default pipeline (only used by vectorization).
+    // These tests exercise GuardStrengthenOpt independently.
 
     #[test]
-    fn test_guard_in_full_pipeline() {
+    fn test_guard_strengthen_pass_removes_duplicate() {
         let mut ops = vec![
             Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
             Op::new(OpCode::GuardTrue, &[OpRef(0)]),
@@ -851,12 +853,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 100);
 
-        let mut opt = Optimizer::default_pipeline();
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
+        let result = run_guard_pass(&ops);
 
         let guard_count = result
             .iter()
@@ -864,7 +861,7 @@ mod tests {
             .count();
         assert_eq!(
             guard_count, 1,
-            "duplicate guard should be removed in full pipeline"
+            "duplicate guard should be removed by GuardStrengthenOpt"
         );
     }
 
