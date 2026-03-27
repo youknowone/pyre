@@ -55,7 +55,7 @@ pub fn init(ns: &mut PyNamespace) {
         ns,
         "_getframe",
         crate::builtin_code_new("_getframe", |_| {
-            let frame_type = crate::typedef::getobjecttype();
+            let frame_type = crate::typedef::w_object();
             let frame = pyre_object::w_instance_new(frame_type);
             let _ = crate::baseobjspace::setattr(frame, "f_locals", w_dict_new());
             let _ = crate::baseobjspace::setattr(frame, "f_globals", w_dict_new());
@@ -75,7 +75,7 @@ pub fn init(ns: &mut PyNamespace) {
     );
     // sys.flags — stub object with named attributes
     {
-        let flags_type = crate::typedef::getobjecttype();
+        let flags_type = crate::typedef::w_object();
         let flags = pyre_object::w_instance_new(flags_type);
         let _ = crate::baseobjspace::setattr(flags, "debug", w_int_new(0));
         let _ = crate::baseobjspace::setattr(flags, "inspect", w_int_new(0));

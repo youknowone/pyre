@@ -145,32 +145,32 @@ fn init_collections_abc(ns: &mut PyNamespace) {
         }),
     );
     // Stub ABC classes
-    crate::namespace_store(ns, "Hashable", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Awaitable", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Coroutine", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Iterator", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Generator", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Iterable", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Callable", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Sized", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Container", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Collection", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Sequence", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "MutableSequence", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Mapping", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "MutableMapping", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Set", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "MutableSet", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "ByteString", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Buffer", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "Reversible", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "MappingView", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "KeysView", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "ItemsView", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "ValuesView", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "AsyncIterator", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::getobjecttype());
-    crate::namespace_store(ns, "AsyncIterable", crate::typedef::getobjecttype());
+    crate::namespace_store(ns, "Hashable", crate::typedef::w_object());
+    crate::namespace_store(ns, "Awaitable", crate::typedef::w_object());
+    crate::namespace_store(ns, "Coroutine", crate::typedef::w_object());
+    crate::namespace_store(ns, "Iterator", crate::typedef::w_object());
+    crate::namespace_store(ns, "Generator", crate::typedef::w_object());
+    crate::namespace_store(ns, "Iterable", crate::typedef::w_object());
+    crate::namespace_store(ns, "Callable", crate::typedef::w_object());
+    crate::namespace_store(ns, "Sized", crate::typedef::w_object());
+    crate::namespace_store(ns, "Container", crate::typedef::w_object());
+    crate::namespace_store(ns, "Collection", crate::typedef::w_object());
+    crate::namespace_store(ns, "Sequence", crate::typedef::w_object());
+    crate::namespace_store(ns, "MutableSequence", crate::typedef::w_object());
+    crate::namespace_store(ns, "Mapping", crate::typedef::w_object());
+    crate::namespace_store(ns, "MutableMapping", crate::typedef::w_object());
+    crate::namespace_store(ns, "Set", crate::typedef::w_object());
+    crate::namespace_store(ns, "MutableSet", crate::typedef::w_object());
+    crate::namespace_store(ns, "ByteString", crate::typedef::w_object());
+    crate::namespace_store(ns, "Buffer", crate::typedef::w_object());
+    crate::namespace_store(ns, "Reversible", crate::typedef::w_object());
+    crate::namespace_store(ns, "MappingView", crate::typedef::w_object());
+    crate::namespace_store(ns, "KeysView", crate::typedef::w_object());
+    crate::namespace_store(ns, "ItemsView", crate::typedef::w_object());
+    crate::namespace_store(ns, "ValuesView", crate::typedef::w_object());
+    crate::namespace_store(ns, "AsyncIterator", crate::typedef::w_object());
+    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::w_object());
+    crate::namespace_store(ns, "AsyncIterable", crate::typedef::w_object());
 }
 
 /// itertools stub
@@ -182,7 +182,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         crate::builtin_code_new("chain", |args| {
             let mut items = Vec::new();
             for &arg in args {
-                items.extend(crate::builtins::collect_iterable_pub(arg)?);
+                items.extend(crate::builtins::collect_iterable(arg)?);
             }
             let n = items.len();
             let list = pyre_object::w_list_new(items);
@@ -229,7 +229,7 @@ fn init_contextvars(ns: &mut PyNamespace) {
         "ContextVar",
         crate::builtin_code_new("ContextVar", |args| {
             // Return stub object with get/set methods
-            let obj = pyre_object::w_instance_new(crate::typedef::getobjecttype());
+            let obj = pyre_object::w_instance_new(crate::typedef::w_object());
             if !args.is_empty() {
                 let _ = crate::baseobjspace::setattr(obj, "name", args[0]);
             }

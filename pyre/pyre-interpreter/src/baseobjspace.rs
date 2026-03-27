@@ -554,8 +554,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 /// PyPy: `space.call_function(space.lookup(w_obj, dunder), w_obj)`
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
-        let w_type = w_instance_get_type(a);
-        if let Some(method) = lookup_in_type_where(w_type, dunder) {
+        if let Some(method) = lookup(a, dunder) {
             return Some(Ok(crate::space_call_function(method, &[a])));
         }
     }
@@ -965,8 +964,8 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // type | type — Python 3.10+ union types
         if is_type(a) {
-            if let Some(metatype) = crate::typedef::lookup_typeobject((*a).ob_type) {
-                if let Some(method) = lookup_in_type_where(metatype, "__or__") {
+            if let Some(w_metatype) = crate::typedef::gettypefor((*a).ob_type) {
+                if let Some(method) = lookup_in_type_where(w_metatype, "__or__") {
                     return Ok(crate::space_call_function(method, &[a, b]));
                 }
             }
@@ -1528,14 +1527,14 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             let bound_obj = pyre_object::superobject::w_super_get_obj(obj);
 
             // Walk obj's type MRO, skip until we pass super_type
-            let obj_type = if is_instance(bound_obj) {
+            let w_obj_type = if is_instance(bound_obj) {
                 w_instance_get_type(bound_obj)
             } else if is_type(bound_obj) {
                 bound_obj
             } else {
                 return Err(PyError::type_error("super: bad obj type"));
             };
-            let mro_ptr = w_type_get_mro(obj_type);
+            let mro_ptr = w_type_get_mro(w_obj_type);
             if !mro_ptr.is_null() {
                 let mro = &*mro_ptr;
                 let mut past_super = false;
@@ -1715,7 +1714,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Metaclass attribute lookup — PyPy: type.__getattribute__
             // Check if this type was created by a custom metaclass.
             // The metaclass is stored as __metaclass__ in ATTR_TABLE.
-            let metaclass_obj = ATTR_TABLE.with(|table| {
+            let w_metaclass = ATTR_TABLE.with(|table| {
                 let table = table.borrow();
                 table
                     .get(&(obj as usize))
@@ -1723,15 +1722,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             });
             // PyPy: type.__getattribute__ → metatype descriptor protocol.
             // Search metaclass MRO. Binding is handled by load_method.
-            let metatypes: [Option<PyObjectRef>; 2] = [
-                metaclass_obj,
-                crate::typedef::lookup_typeobject((*obj).ob_type),
-            ];
-            for mt in metatypes.iter().flatten() {
-                let mc = *mt;
-                if is_type(mc) {
-                    if let Some(value) = lookup_in_type_where(mc, name) {
-                        if let Some(result) = get(value, obj, mc) {
+            let w_metaclasses: [Option<PyObjectRef>; 2] =
+                [w_metaclass, crate::typedef::gettypefor((*obj).ob_type)];
+            for w_metaclass in w_metaclasses.iter().flatten() {
+                let w_metaclass = *w_metaclass;
+                if is_type(w_metaclass) {
+                    if let Some(value) = lookup_in_type_where(w_metaclass, name) {
+                        if let Some(result) = get(value, obj, w_metaclass) {
                             return Ok(result);
                         }
                         return Ok(value);
@@ -1753,12 +1750,12 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // PyPy: space.type(w_obj) → W_TypeObject → MRO lookup in type dict.
     // Each builtin type (list, str, dict, etc.) has a W_TypeObject with
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
-    if let Some(type_obj) = crate::typedef::space_type(obj) {
-        if let Some(method) = unsafe { lookup_in_type_where(type_obj, name) } {
+    if let Some(w_type) = crate::typedef::r#type(obj) {
+        if let Some(method) = unsafe { lookup_in_type_where(w_type, name) } {
             if unsafe { crate::is_builtin_code(method) } {
-                return Ok(pyre_object::w_method_new(method, obj, type_obj));
+                return Ok(pyre_object::w_method_new(method, obj, w_type));
             }
-            if let Some(result) = unsafe { get(method, obj, type_obj) } {
+            if let Some(result) = unsafe { get(method, obj, w_type) } {
                 return Ok(result);
             }
             return Ok(method);
@@ -1892,8 +1889,8 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         match name {
             "__traceback__" => {
                 // Stub traceback object with tb_frame, tb_lineno, tb_next
-                let tb = pyre_object::w_instance_new(crate::typedef::getobjecttype());
-                let frame_obj = pyre_object::w_instance_new(crate::typedef::getobjecttype());
+                let tb = pyre_object::w_instance_new(crate::typedef::w_object());
+                let frame_obj = pyre_object::w_instance_new(crate::typedef::w_object());
                 ATTR_TABLE.with(|t| {
                     let mut t = t.borrow_mut();
                     let fd = t.entry(frame_obj as usize).or_default();
@@ -1930,7 +1927,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         return Ok(d);
     }
     if name == "__class__" {
-        if let Some(tp) = crate::typedef::space_type(obj) {
+        if let Some(tp) = crate::typedef::r#type(obj) {
             return Ok(tp);
         }
     }
@@ -1961,15 +1958,23 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
 // Builtin type method implementations moved to type_methods.rs
 // (PyPy: listobject.py, unicodeobject.py, dictobject.py, tupleobject.py)
 
-/// Look up a name by walking the C3 MRO.
+/// Look up a descriptor on an object's type.
 ///
-/// Public wrapper for external callers (eval.rs load_method).
+/// PyPy equivalent: `space.lookup(w_obj, name)`.
+pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    let w_type = crate::typedef::r#type(obj)?;
+    lookup_in_type(w_type, name)
+}
+
+/// Look up a name on a type by walking the C3 MRO.
+///
+/// PyPy equivalent: `space.lookup_in_type(w_type, name)`.
 pub unsafe fn lookup_in_type(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where(w_type, name)
 }
 
-/// PyPy equivalent: typeobject.py `_lookup_where(self, key)` →
-/// linear search through `self.mro_w`.
+/// PyPy equivalent: `space.lookup_in_type_where(w_type, name)` /
+/// typeobject.py `_lookup_where(self, key)` → linear search through `self.mro_w`.
 unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
@@ -2127,7 +2132,7 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         if fget.is_null() || is_none(fget) {
             return None;
         }
-        return call_func_1(fget, obj);
+        return Some(crate::space_call_function(fget, &[obj]));
     }
 
     // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
@@ -2142,13 +2147,13 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         if receiver.is_null() || is_none(receiver) {
             return Some(func);
         }
-        let owner = crate::typedef::space_type(receiver).unwrap_or(PY_NULL);
+        let owner = crate::typedef::r#type(receiver).unwrap_or(PY_NULL);
         return Some(pyre_object::w_method_new(func, receiver, owner));
     }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
     // PyPy: descroperation.py → space.get_and_call_function(w_get, descr, obj, type)
-    if let Some(descr_type) = crate::typedef::space_type(descr) {
+    if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
                 // Call __get__(descr, obj, type) via space.call_function
@@ -2157,13 +2162,6 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         }
     }
     None
-}
-
-/// Call a Python callable with one arg via space_call_function.
-///
-/// PyPy: `space.call_function(w_func, w_arg)`
-unsafe fn call_func_1(func: PyObjectRef, arg: PyObjectRef) -> Option<PyObjectRef> {
-    Some(crate::space_call_function(func, &[arg]))
 }
 
 /// Call a descriptor's __set__ method.
@@ -2316,22 +2314,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // For type objects, type(X) is the metaclass.
         if is_type(obj) {
             // Look up __iter__ in the metaclass MRO
-            let mc = ATTR_TABLE.with(|table| {
+            let w_metaclass = ATTR_TABLE.with(|table| {
                 table
                     .borrow()
                     .get(&(obj as usize))
                     .and_then(|d| d.get("__metaclass__").copied())
             });
-            if let Some(metaclass) = mc {
-                if let Some(method) = lookup_in_type_where(metaclass, "__iter__") {
+            if let Some(w_metaclass) = w_metaclass {
+                if let Some(method) = lookup_in_type_where(w_metaclass, "__iter__") {
                     return Ok(crate::space_call_function(method, &[obj]));
                 }
             }
             // Fallback: check type type's MRO
-            if let Some(type_type) =
-                crate::typedef::lookup_typeobject(&pyre_object::pyobject::TYPE_TYPE)
+            if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
             {
-                if let Some(method) = lookup_in_type_where(type_type, "__iter__") {
+                if let Some(method) = lookup_in_type_where(w_type_type, "__iter__") {
                     return Ok(crate::space_call_function(method, &[obj]));
                 }
             }

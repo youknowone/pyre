@@ -107,7 +107,7 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let code_vec = extract_code(code_list)?;
     let code_box = Box::leak(Box::new(code_vec));
 
-    let pat = w_instance_new(crate::typedef::getobjecttype());
+    let pat = w_instance_new(crate::typedef::w_object());
     crate::baseobjspace::ATTR_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let d = t.entry(pat as usize).or_default();
@@ -213,7 +213,7 @@ fn do_match(
 }
 
 fn make_match(pat: PyObjectRef, string: PyObjectRef, state: &State<&str>, s: &str) -> PyObjectRef {
-    let m = w_instance_new(crate::typedef::getobjecttype());
+    let m = w_instance_new(crate::typedef::w_object());
     let start = state.start;
     let end = state.string_position;
 

@@ -70,7 +70,7 @@ pub fn init(ns: &mut PyNamespace) {
     namespace_store(ns, "BlockingIOError", w_str_new("BlockingIOError"));
 
     // Abstract base classes as W_TypeObject (required for io.py class inheritance)
-    let obj_type = crate::typedef::getobjecttype();
+    let obj_type = crate::typedef::w_object();
     for name in &["_IOBase", "_RawIOBase", "_BufferedIOBase", "_TextIOBase"] {
         let t = pyre_object::w_type_new(
             name,

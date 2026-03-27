@@ -18,17 +18,17 @@ use pyre_object::*;
 
 use crate::{PyNamespace, builtin_code_new, namespace_store};
 
-/// Global type registry: maps static PyType pointer → W_TypeObject (as usize).
+/// Global typeobject cache: maps static PyType pointer → W_TypeObject (as usize).
 ///
 /// PyPy equivalent: space.gettypeobject(cls.typedef) → cached W_TypeObject
 /// Stored as usize to satisfy Send+Sync requirements of OnceLock.
-static TYPE_REGISTRY: OnceLock<HashMap<usize, usize>> = OnceLock::new();
+static TYPEOBJECT_CACHE: OnceLock<HashMap<usize, usize>> = OnceLock::new();
 
-/// Look up the W_TypeObject for a builtin type.
+/// Get the cached W_TypeObject for a builtin runtime type.
 ///
-/// PyPy: `space.type(w_obj)` → W_TypeObject
-pub fn lookup_typeobject(tp: *const PyType) -> Option<PyObjectRef> {
-    TYPE_REGISTRY
+/// PyPy: `space.gettypefor(cls)` / `space.gettypeobject(typedef)`
+pub fn gettypefor(tp: *const PyType) -> Option<PyObjectRef> {
+    TYPEOBJECT_CACHE
         .get()
         .and_then(|reg| reg.get(&(tp as usize)).copied())
         .map(|v| v as PyObjectRef)
@@ -40,7 +40,7 @@ pub fn lookup_typeobject(tp: *const PyType) -> Option<PyObjectRef> {
 /// - Instance of user class → w_instance_get_type
 /// - Builtin object → type registry lookup
 /// - Type object → type of type (not implemented, returns None)
-pub fn space_type(obj: PyObjectRef) -> Option<PyObjectRef> {
+pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
     }
@@ -60,10 +60,10 @@ pub fn space_type(obj: PyObjectRef) -> Option<PyObjectRef> {
                 return Some(metaclass);
             }
             // Default: type of type is type
-            return lookup_typeobject(&pyre_object::pyobject::TYPE_TYPE);
+            return gettypefor(&pyre_object::pyobject::TYPE_TYPE);
         }
         let tp = (*obj).ob_type;
-        lookup_typeobject(tp)
+        gettypefor(tp)
     }
 }
 
@@ -74,7 +74,7 @@ pub fn space_type(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
-    if TYPE_REGISTRY.get().is_some() {
+    if TYPEOBJECT_CACHE.get().is_some() {
         return;
     }
 
@@ -82,70 +82,70 @@ pub fn init_typeobjects() {
 
     // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
     // MRO = [object]. All other types inherit from object.
-    let object_type = make_type_root("object", init_object_type);
+    let object_type = new_root_typeobject("object", init_object_type);
     reg.insert(
         &INSTANCE_TYPE as *const PyType as usize,
         object_type as usize,
     );
-    let _ = OBJECT_TYPE_OBJ.set(object_type as usize);
+    let _ = W_OBJECT_TYPEOBJECT.set(object_type as usize);
 
     // type — PyPy: typeobject.py, bases=(object,)
     // type.__new__(metatype, name, bases, dict) creates new types
-    let type_type = make_type_with_base("type", init_type_type, object_type);
+    let type_type = new_typeobject_with_base("type", init_type_type, object_type);
     reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
-    let _ = TYPE_TYPE_OBJ.set(type_type as usize);
+    let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
     // int — PyPy: intobject.py W_IntObject.typedef, bases=(object,)
-    let int_type = make_type_with_base("int", init_int_type, object_type);
+    let int_type = new_typeobject_with_base("int", init_int_type, object_type);
     reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
 
     // float — PyPy: floatobject.py, bases=(object,)
     reg.insert(
         &FLOAT_TYPE as *const PyType as usize,
-        make_type_with_base("float", init_float_type, object_type) as usize,
+        new_typeobject_with_base("float", init_float_type, object_type) as usize,
     );
 
     // bool — PyPy: boolobject.py, bases=(int,)
     reg.insert(
         &BOOL_TYPE as *const PyType as usize,
-        make_type_with_base("bool", init_bool_type, int_type) as usize,
+        new_typeobject_with_base("bool", init_bool_type, int_type) as usize,
     );
 
     // str — PyPy: unicodeobject.py, bases=(object,)
     reg.insert(
         &STR_TYPE as *const PyType as usize,
-        make_type_with_base("str", init_str_type, object_type) as usize,
+        new_typeobject_with_base("str", init_str_type, object_type) as usize,
     );
 
     // list — PyPy: listobject.py, bases=(object,)
     reg.insert(
         &LIST_TYPE as *const PyType as usize,
-        make_type_with_base("list", init_list_type, object_type) as usize,
+        new_typeobject_with_base("list", init_list_type, object_type) as usize,
     );
 
     // tuple — PyPy: tupleobject.py, bases=(object,)
     reg.insert(
         &TUPLE_TYPE as *const PyType as usize,
-        make_type_with_base("tuple", init_tuple_type, object_type) as usize,
+        new_typeobject_with_base("tuple", init_tuple_type, object_type) as usize,
     );
 
     // dict — PyPy: dictobject.py, bases=(object,)
     reg.insert(
         &DICT_TYPE as *const PyType as usize,
-        make_type_with_base("dict", init_dict_type, object_type) as usize,
+        new_typeobject_with_base("dict", init_dict_type, object_type) as usize,
     );
 
     // function — PyPy: funcobject.py
     // Functions are descriptors: function.__get__ returns a bound method.
     reg.insert(
         &crate::FUNCTION_TYPE as *const PyType as usize,
-        make_type_with_base("function", init_function_type, object_type) as usize,
+        new_typeobject_with_base("function", init_function_type, object_type) as usize,
     );
 
     // builtin_function_or_method
     reg.insert(
         &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
-        make_type_with_base(
+        new_typeobject_with_base(
             "builtin_function_or_method",
             init_builtin_function_type,
             object_type,
@@ -154,64 +154,62 @@ pub fn init_typeobjects() {
 
     reg.insert(
         &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
-        make_type_with_base("method", init_method_type, object_type) as usize,
+        new_typeobject_with_base("method", init_method_type, object_type) as usize,
     );
 
     reg.insert(
         &crate::pycode::CODE_TYPE as *const PyType as usize,
-        make_type_with_base("code", init_code_type, object_type) as usize,
+        new_typeobject_with_base("code", init_code_type, object_type) as usize,
     );
 
     // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
     reg.insert(
         &pyre_object::propertyobject::STATICMETHOD_TYPE as *const PyType as usize,
-        make_type_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
+        new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
     );
 
     // classmethod — PyPy: function.py ClassMethod, bases=(object,)
     reg.insert(
         &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const PyType as usize,
-        make_type_with_base("classmethod", init_classmethod_type, object_type) as usize,
+        new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
     );
 
     // NoneType — bases=(object,)
     reg.insert(
         &NONE_TYPE as *const PyType as usize,
-        make_type_with_base("NoneType", |_| {}, object_type) as usize,
+        new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
     );
 
-    let _ = TYPE_REGISTRY.set(reg);
+    let _ = TYPEOBJECT_CACHE.set(reg);
 }
 
 /// The global `object` type object, accessible from builtins.
-static OBJECT_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static W_OBJECT_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// The global `type` type object.
-static TYPE_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static W_TYPE_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Retrieve a W_TypeObject for a builtin type by its PyType pointer.
-/// Used to register `int`, `str`, etc. as types in builtins (not functions).
-/// Get the `type` W_TypeObject for use as a builtin.
-pub fn gettypetype() -> PyObjectRef {
-    TYPE_TYPE_OBJ
+/// Get the wrapped `type` typeobject.
+pub fn w_type() -> PyObjectRef {
+    W_TYPE_TYPEOBJECT
         .get()
         .map(|v| *v as PyObjectRef)
         .unwrap_or(PY_NULL)
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
-    lookup_typeobject(tp as *const PyType).unwrap_or(PY_NULL)
+    gettypefor(tp as *const PyType).unwrap_or(PY_NULL)
 }
 
-/// Get the `object` W_TypeObject for use as a builtin.
-pub fn getobjecttype() -> PyObjectRef {
-    OBJECT_TYPE_OBJ
+/// Get the wrapped `object` typeobject.
+pub fn w_object() -> PyObjectRef {
+    W_OBJECT_TYPEOBJECT
         .get()
         .map(|v| *v as PyObjectRef)
         .unwrap_or(PY_NULL)
 }
 
 /// Create the root `object` type. MRO = [object].
-fn make_type_root(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
+fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
     init(&mut ns);
@@ -223,7 +221,11 @@ fn make_type_root(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
 
 /// Create a builtin type with a single base. MRO = [self] + base.mro().
 /// PyPy: typeobject.py — compute_default_mro for single-inheritance
-fn make_type_with_base(name: &str, init: fn(&mut PyNamespace), base: PyObjectRef) -> PyObjectRef {
+fn new_typeobject_with_base(
+    name: &str,
+    init: fn(&mut PyNamespace),
+    base: PyObjectRef,
+) -> PyObjectRef {
     let mut ns = Box::new(PyNamespace::new());
     ns.fix_ptr();
     init(&mut ns);
@@ -254,9 +256,9 @@ macro_rules! descr_new_wrapper {
     };
 }
 
-descr_new_wrapper!(int_descr_new, crate::builtins::builtin_int_pub);
-descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float_pub);
-descr_new_wrapper!(str_descr_new, crate::builtins::builtin_str_pub);
+descr_new_wrapper!(int_descr_new, crate::builtins::builtin_int);
+descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float);
+descr_new_wrapper!(str_descr_new, crate::builtins::builtin_str);
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
 /// with a backing dict for storage. PyPy: dictobject.py descr__new__
@@ -270,7 +272,7 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     // If cls IS dict (not a subclass), use normal dict constructor
     if cls.is_null() || std::ptr::eq(cls, dict_type) {
-        return crate::builtins::builtin_dict_ctor_pub(&args[1..]);
+        return crate::builtins::builtin_dict_ctor(&args[1..]);
     }
 
     // cls is a dict subclass — create instance with backing dict
@@ -294,9 +296,9 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     Ok(instance)
 }
-descr_new_wrapper!(bool_descr_new, crate::builtins::builtin_bool_pub);
-descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor_pub);
-descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple_pub);
+descr_new_wrapper!(bool_descr_new, crate::builtins::builtin_bool);
+descr_new_wrapper!(list_descr_new, crate::builtins::builtin_list_ctor);
+descr_new_wrapper!(tuple_descr_new, crate::builtins::builtin_tuple);
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 // ── List TypeDef ─────────────────────────────────────────────────────
@@ -875,7 +877,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
                 return Ok(pyre_object::w_dict_new());
             };
             let d = pyre_object::w_dict_new();
-            let items = crate::builtins::collect_iterable_pub(iterable)?;
+            let items = crate::builtins::collect_iterable(iterable)?;
             for key in items {
                 unsafe { pyre_object::w_dict_store(d, key, value) };
             }
@@ -944,7 +946,7 @@ fn init_type_type(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        builtin_code_new("__new__", crate::builtins::builtin_type_new_pub),
+        builtin_code_new("__new__", crate::builtins::type_descr_new),
     );
     // type.__init__ — no-op for now
     namespace_store(
