@@ -979,19 +979,11 @@ impl OptContext {
 
         let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
 
-        // Build snapshot from tracing-time OpRefs → resolve through
-        // optimizer's replacement chain to current scope.
-        let boxes: Vec<OpRef> = snapshot_boxes
-            .iter()
-            .map(|&opref| {
-                if opref.is_none() {
-                    OpRef::NONE
-                } else {
-                    self.get_replacement(opref)
-                }
-            })
-            .collect();
-        let snapshot = Snapshot::single_frame(0, boxes);
+        // resume.py:201-202 get_box_replacement parity:
+        // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
+        // env.get_box_replacement per-box, which resolves through the
+        // replacement chain while preserving virtual identity.
+        let snapshot = Snapshot::single_frame(0, snapshot_boxes);
 
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {
@@ -999,7 +991,12 @@ impl OptContext {
         }
         impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
             fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-                opref // already resolved above
+                // resume.py:201-202 box.get_box_replacement()
+                let repl = self.ctx.get_replacement(opref);
+                if repl.is_none() && !opref.is_none() {
+                    return opref;
+                }
+                repl
             }
             fn is_const(&self, opref: OpRef) -> bool {
                 self.ctx.is_constant(opref)
@@ -1033,9 +1030,28 @@ impl OptContext {
                 majit_ir::Type::Ref
             }
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
-                self.ctx
-                    .get_ptr_info(opref)
-                    .is_some_and(|info| info.is_virtual())
+                // resume.py:210-216 is_virtual check.
+                // Walk the replacement chain to find virtual info.
+                // The virtual PtrInfo may be on an intermediate opref
+                // (e.g., Phase 2 replacement of a Phase 1 inputarg).
+                let mut check = opref;
+                for _ in 0..20 {
+                    if self
+                        .ctx
+                        .ptr_info
+                        .get(check.0 as usize)
+                        .and_then(|v| v.as_ref())
+                        .is_some_and(|info| info.is_virtual())
+                    {
+                        return true;
+                    }
+                    let next = self.ctx.get_replacement(check);
+                    if next == check || next.is_none() {
+                        break;
+                    }
+                    check = next;
+                }
+                false
             }
             fn is_virtual_raw(&self, _opref: OpRef) -> bool {
                 false
