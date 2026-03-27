@@ -140,6 +140,19 @@ pub trait JitState: Sized {
         0
     }
 
+    /// pyjitpl.py:2982 get_procedure_token(greenboxes): compute the
+    /// green key for a given loop header PC. Used by bridge trace close
+    /// to find compiled targets at the destination loop header.
+    fn green_key_for_pc(&self, _pc: usize) -> Option<u64> {
+        None
+    }
+
+    /// The code object pointer for green key computation.
+    /// RPython: jitdriver_sd.jitcodes[jitcode_pos]
+    fn code_ptr(&self) -> usize {
+        0
+    }
+
     /// compile.py:269-270 parity: update meta when the trace is cut at
     /// a cross-loop merge point. `header_pc` is the bytecode PC of the
     /// new loop header; `original_box_types` are the types of the live

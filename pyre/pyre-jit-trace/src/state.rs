@@ -6681,6 +6681,24 @@ impl JitState for PyreJitState {
         meta.merge_pc
     }
 
+    /// pyjitpl.py:2982 get_procedure_token: compute green key for a PC.
+    fn green_key_for_pc(&self, pc: usize) -> Option<u64> {
+        let frame_ptr = self.frame as *const pyre_interpreter::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            return None;
+        }
+        let code = unsafe { (*frame_ptr).code };
+        Some(crate::driver::make_green_key(code, pc))
+    }
+
+    fn code_ptr(&self) -> usize {
+        let frame_ptr = self.frame as *const pyre_interpreter::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            return 0;
+        }
+        unsafe { (*frame_ptr).code as usize }
+    }
+
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
         meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.

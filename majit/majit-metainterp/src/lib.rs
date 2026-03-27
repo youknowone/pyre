@@ -67,6 +67,12 @@ pub use symbolic_stack::SymbolicStack;
 pub use trace_ctx::{MergePoint, TraceCtx};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
+/// Compute green key from code pointer and PC.
+/// Must use the same hash as the front-end's make_green_key.
+pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
+    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
+}
+
 pub fn majit_log_enabled() -> bool {
     use std::sync::LazyLock;
     static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("MAJIT_LOG").is_ok());
