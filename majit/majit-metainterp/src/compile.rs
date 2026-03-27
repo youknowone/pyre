@@ -32,6 +32,10 @@ fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
 /// Static exit metadata for a compiled guard or finish point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledExitLayout {
+    /// compile.py:186 rd_loop_token: the green_key of the compiled loop
+    /// that owns this guard. Used by handle_fail to find the owning
+    /// compiled entry without scanning all entries.
+    pub rd_loop_token: u64,
     pub trace_id: u64,
     pub fail_index: u32,
     pub source_op_index: Option<usize>,
@@ -817,6 +821,7 @@ pub(crate) fn infer_terminal_exit_layout(
         })
         .collect();
     Some(CompiledExitLayout {
+        rd_loop_token: 0, // set by caller from token.green_key
         trace_id,
         fail_index,
         source_op_index: Some(op_index),

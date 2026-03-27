@@ -165,6 +165,7 @@ pub(crate) struct StoredExitLayout {
 impl StoredExitLayout {
     pub(crate) fn public(&self, trace_id: u64, fail_index: u32) -> CompiledExitLayout {
         CompiledExitLayout {
+            rd_loop_token: trace_id,
             trace_id,
             fail_index,
             source_op_index: self.source_op_index,
@@ -523,6 +524,7 @@ impl<M: Clone> MetaInterp<M> {
             .into_iter()
             .find(|layout| layout.fail_index == fail_index)
             .map(|layout| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: layout.source_op_index,
@@ -550,6 +552,7 @@ impl<M: Clone> MetaInterp<M> {
             .into_iter()
             .find(|layout| layout.op_index == op_index)
             .map(|layout| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: Some(layout.op_index),
@@ -595,6 +598,7 @@ impl<M: Clone> MetaInterp<M> {
                 merged.insert(
                     layout.fail_index,
                     CompiledExitLayout {
+                        rd_loop_token: trace_id, // from trace context
                         trace_id,
                         fail_index: layout.fail_index,
                         source_op_index: layout.source_op_index,
@@ -649,6 +653,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTerminalExitLayout {
                         op_index: layout.op_index,
                         exit_layout: CompiledExitLayout {
+                            rd_loop_token: trace_id, // from trace context
                             trace_id,
                             fail_index: layout.fail_index,
                             source_op_index: Some(layout.op_index),
@@ -3198,6 +3203,7 @@ impl<M: Clone> MetaInterp<M> {
                     &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
+                    rd_loop_token: trace_id, // from trace context
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout
@@ -3219,6 +3225,7 @@ impl<M: Clone> MetaInterp<M> {
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3327,6 +3334,7 @@ impl<M: Clone> MetaInterp<M> {
                     &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
+                    rd_loop_token: trace_id, // from trace context
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout
@@ -3348,6 +3356,7 @@ impl<M: Clone> MetaInterp<M> {
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3475,6 +3484,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3662,6 +3672,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -4812,6 +4823,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let exit_layout = Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: trace_id, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,

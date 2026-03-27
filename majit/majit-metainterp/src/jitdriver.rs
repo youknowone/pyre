@@ -1775,7 +1775,15 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py:701-717 handle_fail / must_compile: single tick+check.
-        let (should_bridge, owning_key) = self.meta.must_compile(green_key, trace_id, fail_index);
+        // Use rd_loop_token from exit_layout (= guard's owning loop key,
+        // RPython rd_loop_token parity) instead of dispatch green_key.
+        let guard_loop_key = if exit_layout.rd_loop_token != 0 {
+            exit_layout.rd_loop_token
+        } else {
+            green_key
+        };
+        let (should_bridge, owning_key) =
+            self.meta.must_compile(guard_loop_key, trace_id, fail_index);
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();
         if restored {
