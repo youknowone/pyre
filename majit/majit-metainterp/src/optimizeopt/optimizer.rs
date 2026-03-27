@@ -1777,39 +1777,7 @@ impl Optimizer {
         ctx.new_operations
             .retain(|op| !Self::is_constant_placeholder_op(op, &ctx.constants));
 
-        // Drop ops whose args reference undefined OpRefs (un-forced virtual
-        // remnants). RPython doesn't have this cleanup — skip in Phase 2
-        // (skip_flush) where forwarding-resolved virtual field refs may
-        // appear undefined but are valid at runtime.
-        if !self.skip_flush {
-            let defined: std::collections::HashSet<u32> = {
-                let mut s: std::collections::HashSet<u32> =
-                    (0..self.final_num_inputs as u32).collect();
-                for op in &ctx.new_operations {
-                    if !op.pos.is_none() && op.result_type() != Type::Void {
-                        s.insert(op.pos.0);
-                    }
-                }
-                for (k, val) in ctx.constants.iter().enumerate() {
-                    if val.is_some() {
-                        s.insert(k as u32);
-                    }
-                }
-                for (i, &fwd) in ctx.forwarding.iter().enumerate() {
-                    if !fwd.is_none() && fwd != OpRef(i as u32) {
-                        s.insert(fwd.0);
-                    }
-                }
-                s
-            };
-            ctx.new_operations.retain(|op| {
-                op.args
-                    .iter()
-                    .all(|arg| arg.is_none() || defined.contains(&arg.0))
-            });
-        }
-
-        // Drain remaining extra ops + re-check for undefined refs.
+        // Drain remaining extra ops.
         self.drain_extra_operations_from(0, &mut ctx);
         // Extra operations can introduce new forwarding (for example Heap/Pure
         // forwarding a recently-emitted boxed-field read to its raw payload).
