@@ -1964,10 +1964,20 @@ impl<M: Clone> MetaInterp<M> {
 
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
+                //
+                // Guard: if a valid compiled loop already exists with a
+                // DIFFERENT merge_pc (retrace produced a cross-loop cut),
+                // don't replace it — the existing entry's merge_pc matches
+                // the green_key and is_compatible will pass for back_edge
+                // callers. Replacing breaks nested-loop benchmarks (fannkuch).
+                // no skip guard needed — handled at call site
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
+                }
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
                 }
                 self.compiled_loops.insert(
                     green_key,
@@ -2476,6 +2486,15 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
+                }
+                // RPython parity: if a compiled loop already exists for
+                // this green_key with a WORKING merge_pc, don't replace it
+                // with a retrace that has a different merge_pc (from
+                // cut_trace_from). This prevents incompatible-state aborts
+                // in nested-loop benchmarks like fannkuch.
+                // skip-overwrite guard (see jitdriver.rs caller)
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
                 }
                 self.compiled_loops.insert(
                     green_key,
