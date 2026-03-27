@@ -1979,7 +1979,18 @@ impl OptUnroll {
                     })
                 }
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Heap => {
-                    let Some(object_slot) = short_boxes.lookup_label_arg(entry.op.arg(0)) else {
+                    // RPython shortpreamble.py: HeapOp.produce_op uses
+                    // preamble_op.getarglist() which references label_arg Boxes.
+                    // In majit, the struct arg may have been forwarded to a
+                    // constant (e.g., via GuardValue promotion). Fall back to
+                    // finding the label_arg whose forwarding resolves to the
+                    // constant struct.
+                    let object_slot = short_boxes.lookup_label_arg(entry.op.arg(0)).or_else(|| {
+                        short_args.iter().enumerate().find_map(|(i, &la)| {
+                            (ctx.get_replacement(la) == entry.op.arg(0)).then_some(i)
+                        })
+                    });
+                    let Some(object_slot) = object_slot else {
                         continue;
                     };
                     let Some(descr) = entry.op.descr.clone() else {
@@ -2153,9 +2164,16 @@ impl OptUnroll {
                     let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(value) = resolve_result(result) else {
-                        continue;
-                    };
+                    // RPython shortpreamble.py:11-49 (PreambleOp) parity:
+                    // Always allocate a fresh OpRef for heap field results.
+                    // In RPython, HeapOp.produce_op stores PreambleOp(res, ...)
+                    // where res is a Phase 1 Box with distinct identity from
+                    // Phase 2 inputarg Boxes. Using a fresh OpRef prevents
+                    // import_box forwarding chains from aliasing imported
+                    // field values with Phase 2 body operations through
+                    // convergent Phase 1 targets.
+                    let _slot_value = resolve_result(result);
+                    let value = ctx.alloc_op_position();
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_fields.insert((obj, descr_idx), value);
@@ -2197,9 +2215,10 @@ impl OptUnroll {
                     let Some(&obj) = short_args.get(object_slot) else {
                         continue;
                     };
-                    let Some(value) = resolve_result(result) else {
-                        continue;
-                    };
+                    // RPython PreambleOp parity: fresh OpRef for array item
+                    // results (same rationale as HeapField above).
+                    let _slot_value = resolve_result(result);
+                    let value = ctx.alloc_op_position();
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_arrayitems
@@ -3788,10 +3807,14 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        assert_eq!(
-            ctx2.imported_short_fields.get(&(OpRef(10), 0)).copied(),
-            Some(OpRef(11))
-        );
+        // RPython PreambleOp parity: imported heap field result is a fresh
+        // OpRef (not the label_arg) to prevent import_box forwarding aliasing.
+        let imported_val = ctx2.imported_short_fields.get(&(OpRef(10), 0)).copied();
+        assert!(imported_val.is_some());
+        let imported_val = imported_val.unwrap();
+        // Fresh OpRef must differ from both label_args
+        assert_ne!(imported_val, OpRef(10));
+        assert_ne!(imported_val, OpRef(11));
         assert_eq!(
             ctx2.imported_short_field_descrs
                 .get(&(OpRef(10), 0))
@@ -3843,10 +3866,11 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
-        assert_eq!(
-            ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied(),
-            Some(OpRef(11))
-        );
+        // RPython PreambleOp parity: fresh OpRef for heap field result
+        let imported_val = ctx2.imported_short_fields.get(&(OpRef(10), 56)).copied();
+        assert!(imported_val.is_some());
+        assert_ne!(imported_val.unwrap(), OpRef(10));
+        assert_ne!(imported_val.unwrap(), OpRef(11));
         assert_eq!(
             ctx2.imported_short_field_descrs
                 .get(&(OpRef(10), 56))
