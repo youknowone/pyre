@@ -1198,8 +1198,6 @@ pub fn register_materialize_virtuals(f: MaterializeVirtualsFn) {
     MATERIALIZE_VIRTUALS.with(|c| c.set(Some(f)));
 }
 
-
-
 /// Frame state to restore from guard failure fail_args.
 /// RPython resume_in_blackhole parity: the force_fn reads the frame state
 /// from the deadframe (outputs buffer) rather than using the corrupted frame.
