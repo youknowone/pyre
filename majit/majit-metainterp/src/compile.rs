@@ -385,7 +385,19 @@ pub(crate) fn merge_backend_exit_layouts(
                 rd_virtuals_info: None,
             });
         entry.source_op_index = layout.source_op_index;
-        entry.exit_types = layout.fail_arg_types.clone();
+        let backend_types_are_coarse_refs = !layout.fail_arg_types.is_empty()
+            && layout
+                .fail_arg_types
+                .iter()
+                .all(|tp| matches!(tp, majit_ir::Type::Ref));
+        let existing_has_precise_types = entry.exit_types.len() == layout.fail_arg_types.len()
+            && entry
+                .exit_types
+                .iter()
+                .any(|tp| !matches!(tp, majit_ir::Type::Ref));
+        if !(backend_types_are_coarse_refs && existing_has_precise_types) {
+            entry.exit_types = layout.fail_arg_types.clone();
+        }
         entry.is_finish = layout.is_finish;
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();

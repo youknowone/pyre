@@ -1231,6 +1231,26 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
+        let inputarg_slot_types = self.vable_array_base.map(|base| {
+            let inputarg_types = ctx.inputarg_types();
+            let locals: Vec<Type> = (0..nlocals)
+                .map(|i| {
+                    inputarg_types
+                        .get(base as usize + i)
+                        .copied()
+                        .unwrap_or(Type::Ref)
+                })
+                .collect();
+            let stack: Vec<Type> = (0..stack_only_depth)
+                .map(|i| {
+                    inputarg_types
+                        .get(base as usize + nlocals + i)
+                        .copied()
+                        .unwrap_or(Type::Ref)
+                })
+                .collect();
+            (locals, stack)
+        });
         if self.is_function_entry_trace {
             // RPython MIFrame parity: function-entry traces use concrete
             // value types (W_IntObject → Int). Always override.
@@ -1241,6 +1261,12 @@ impl PyreSym {
                         .unwrap_or(Type::Ref)
                 })
                 .collect();
+        } else if let Some((ref local_types, _)) = inputarg_slot_types {
+            // Bridge/root traces resume from the JIT inputarg contract.
+            // Re-deriving slot kinds from the concrete frame would turn boxed
+            // W_Int/W_Float locals back into raw Int/Float and break raw-array
+            // stores that expect an explicit unbox step.
+            self.symbolic_local_types = local_types.clone();
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
@@ -1252,7 +1278,9 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
-        if self.symbolic_stack_types.len() != stack_only_depth {
+        if let Some((_, ref stack_types)) = inputarg_slot_types {
+            self.symbolic_stack_types = stack_types.clone();
+        } else if self.symbolic_stack_types.len() != stack_only_depth {
             self.symbolic_stack_types =
                 concrete_slot_types(concrete_frame, nlocals, valuestackdepth)
                     .into_iter()

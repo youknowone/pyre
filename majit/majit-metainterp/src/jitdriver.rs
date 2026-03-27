@@ -2071,10 +2071,15 @@ impl<S: JitState> JitDriver<S> {
         let trace_meta = state.build_meta(resume_pc, env);
 
         let live_values = state.extract_live(&trace_meta);
+        let live_types = state.live_value_types(&trace_meta);
 
-        let (ok, is_exception_guard) =
-            self.meta
-                .start_retrace_from_guard(green_key, trace_id, fail_index, &live_values);
+        let (ok, is_exception_guard) = self.meta.start_retrace_from_guard(
+            green_key,
+            trace_id,
+            fail_index,
+            &live_values,
+            &live_types,
+        );
         if !ok {
             return false;
         }
