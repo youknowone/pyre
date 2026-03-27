@@ -1945,6 +1945,26 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
+                // resume.py:570-574 _add_optimizer_sections parity:
+                // serialize per-guard knowledge from unroll optimizer.
+                let optimizer_knowledge = {
+                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
+                        .iter()
+                        .filter_map(|(&fi, &op_idx)| {
+                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
+                        })
+                        .collect();
+                    let mut result: HashMap<
+                        u32,
+                        crate::optimizeopt::optimizer::OptimizerKnowledge,
+                    > = HashMap::new();
+                    for (guard_pos, knowledge) in &unroll_opt.per_guard_knowledge {
+                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
+                            result.insert(fi, knowledge.clone());
+                        }
+                    }
+                    result
+                };
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -1957,7 +1977,7 @@ impl<M: Clone> MetaInterp<M> {
                         exit_layouts,
                         terminal_exit_layouts,
                         snapshots: trace_snapshots,
-                        optimizer_knowledge: HashMap::new(), // TODO: serialize from optimizer
+                        optimizer_knowledge,
                         jitcode: None,
                     },
                 );

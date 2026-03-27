@@ -56,6 +56,13 @@ pub struct UnrollOptimizer {
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    /// resume.py:570-574 _add_optimizer_sections: per-guard optimizer
+    /// knowledge collected during optimization. Propagated to CompiledTrace
+    /// for bridge compilation.
+    pub per_guard_knowledge: Vec<(
+        majit_ir::OpRef,
+        crate::optimizeopt::optimizer::OptimizerKnowledge,
+    )>,
 }
 
 impl UnrollOptimizer {
@@ -69,6 +76,7 @@ impl UnrollOptimizer {
             max_retrace_guards: 15,
             imported_state: None,
             snapshot_boxes: std::collections::HashMap::new(),
+            per_guard_knowledge: Vec::new(),
         }
     }
 
@@ -223,6 +231,9 @@ impl UnrollOptimizer {
                     }
                     // Export Phase 1's heap cache for Phase 2.
                     state.preamble_heap_cache = opt_p1.export_all_cached_fields();
+                    // resume.py:570-574: collect Phase 1 per-guard knowledge.
+                    self.per_guard_knowledge
+                        .extend(opt_p1.per_guard_knowledge.drain(..));
                     (state, consts_p1, jv, p1_ops)
                 }
                 None => {
@@ -307,6 +318,9 @@ impl UnrollOptimizer {
         );
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
+        // resume.py:570-574: collect per-guard optimizer knowledge from both phases.
+        self.per_guard_knowledge
+            .extend(opt_p2.per_guard_knowledge.drain(..));
         let label_args = opt_p2
             .imported_label_args
             .clone()
