@@ -161,12 +161,6 @@ pub struct OptContext {
     /// RPython unroll.py: widened integer knowledge imported from the preamble.
     /// OptIntBounds intersects these with freshly discovered facts in phase 2.
     pub imported_int_bounds: HashMap<OpRef, IntBound>,
-    /// RPython shortpreamble.py / heap.py: imported cached field reads from the
-    /// preamble. Phase 2 uses these to seed Heap's read cache without
-    /// re-emitting preamble heap reads.
-    pub imported_short_fields: HashMap<(OpRef, u32), OpRef>,
-    /// Real descriptors for imported cached field reads.
-    pub imported_short_field_descrs: HashMap<(OpRef, u32), DescrRef>,
     /// RPython shortpreamble.py / heap.py: imported cached constant-index array
     /// reads from the preamble.
     pub imported_short_arrayitems: HashMap<(OpRef, u32, i64), OpRef>,
@@ -368,8 +362,6 @@ impl OptContext {
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
-            imported_short_fields: HashMap::new(),
-            imported_short_field_descrs: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
@@ -416,8 +408,6 @@ impl OptContext {
             ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
-            imported_short_fields: HashMap::new(),
-            imported_short_field_descrs: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
             imported_short_pure_ops: Vec::new(),
