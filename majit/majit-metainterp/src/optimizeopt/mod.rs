@@ -1053,11 +1053,20 @@ impl OptContext {
         }
 
         // resume.py:447,450-451: patch and store.
+        // resume.py:447: patch num_failargs
         numb_state.patch(1, liveboxes.len() as i32);
         op.fail_args = Some(liveboxes.into());
         if !virtual_entries.is_empty() {
             op.rd_virtuals = Some(virtual_entries);
         }
+
+        // resume.py:449 _add_optimizer_sections: serialize optimizer knowledge.
+        // RPython appends class/heap/loopinvariant data to numb_state inline.
+        // majit stores this in per_guard_knowledge (Optimizer struct) and
+        // deserializes via deserialize_optimizer_knowledge at bridge time.
+        // Functionally equivalent — same data used by bridge compilation.
+
+        // resume.py:450-451: storage.rd_numb, storage.rd_consts
         op.rd_numb = Some(numb_state.create_numbering());
         op.rd_consts = Some(memo.consts().to_vec());
     }

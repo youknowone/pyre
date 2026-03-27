@@ -2712,48 +2712,6 @@ impl Optimizer {
         Self::encode_guard_virtuals_impl(op, ctx)
     }
 
-    /// RPython store_final_boxes_in_guard parity: after all ops are processed,
-    /// re-scan emitted guards for fail_args that became virtual after initial
-    /// encoding. RPython's shared mutable forwarding graph makes this implicit;
-    /// majit needs an explicit re-scan.
-    fn rescan_guard_virtuals(ctx: &mut OptContext) {
-        let len = ctx.new_operations.len();
-        for i in 0..len {
-            let op = &ctx.new_operations[i];
-            if !op.opcode.is_guard() || op.fail_args.is_none() {
-                continue;
-            }
-            let fa_ref = op.fail_args.as_ref().unwrap();
-            let has_late_virtual = fa_ref.iter().any(|&fa| {
-                if fa.is_none() {
-                    return false;
-                }
-                let resolved = ctx.get_replacement(fa);
-                ctx.get_ptr_info(resolved)
-                    .is_some_and(|info| info.is_virtual())
-            });
-            // Check for NONE entries not covered by existing rd_virtuals.
-            // Phase 2 guards may have NONE at positions where Phase 1's
-            // store_final_boxes_in_guard forwarded a value to virtual, but
-            // the forwarding isn't recorded in exported_jump_virtuals.
-            let has_unresolved_none = fa_ref.iter().enumerate().any(|(idx, fa)| {
-                fa.is_none()
-                    && op
-                        .rd_virtuals
-                        .as_ref()
-                        .map_or(true, |rvs| !rvs.iter().any(|e| e.fail_arg_index == idx))
-            });
-            if !has_late_virtual && !has_unresolved_none {
-                continue;
-            }
-            // Take the op out, re-encode virtuals, put it back.
-            let placeholder = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[majit_ir::OpRef(0)]);
-            let op = std::mem::replace(&mut ctx.new_operations[i], placeholder);
-            let updated = Self::encode_guard_virtuals_impl(op, ctx);
-            ctx.new_operations[i] = updated;
-        }
-    }
-
     #[allow(dead_code)]
     fn encode_guard_virtuals_impl(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
