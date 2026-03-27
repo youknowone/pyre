@@ -296,8 +296,37 @@ fn call_user_function_with_eval(
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let callable = crate::space::unwrap_cell(callable);
+    if unsafe { pyre_object::is_method(callable) } {
+        let func = unsafe { pyre_object::w_method_get_func(callable) };
+        let receiver = unsafe {
+            let w_self = pyre_object::w_method_get_self(callable);
+            if !w_self.is_null() && !pyre_object::is_none(w_self) {
+                w_self
+            } else {
+                pyre_object::w_method_get_class(callable)
+            }
+        };
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
+            call_args.push(receiver);
+        }
+        call_args.extend_from_slice(args);
+        return call_callable(frame, func, &call_args);
+    }
     if unsafe { pyre_object::is_type(callable) } {
         return call_type_object(frame, callable, args);
+    }
+
+    // staticmethod → unwrap
+    // PyPy: function.py StaticMethod.descr_staticmethod__call__
+    if unsafe { pyre_object::is_staticmethod(callable) } {
+        let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
+        return call_callable(frame, func, args);
+    }
+    // classmethod → unwrap
+    if unsafe { pyre_object::is_classmethod(callable) } {
+        let func = unsafe { pyre_object::w_classmethod_get_func(callable) };
+        return call_callable(frame, func, args);
     }
 
     // Instance with __call__ — PyPy: descroperation.py descr_call
@@ -385,6 +414,23 @@ pub fn call_callable_inline_residual(
     args: &[PyObjectRef],
 ) -> PyResult {
     let _suspend_inline_result = suspend_inline_handled_result();
+    if unsafe { pyre_object::is_method(callable) } {
+        let func = unsafe { pyre_object::w_method_get_func(callable) };
+        let receiver = unsafe {
+            let w_self = pyre_object::w_method_get_self(callable);
+            if !w_self.is_null() && !pyre_object::is_none(w_self) {
+                w_self
+            } else {
+                pyre_object::w_method_get_class(callable)
+            }
+        };
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        if !receiver.is_null() && unsafe { !pyre_object::is_none(receiver) } {
+            call_args.push(receiver);
+        }
+        call_args.extend_from_slice(args);
+        return call_callable_inline_residual(frame, func, &call_args);
+    }
     dispatch_callable(
         callable,
         |callable| {
@@ -442,7 +488,14 @@ pub(crate) fn resolve_kwargs(
     let (target_func, skip_cls) = if unsafe { crate::is_func(callable) } {
         (callable, 0usize)
     } else if unsafe { pyre_object::is_type(callable) } {
-        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(callable, "__new__") } {
+        // For type objects, resolve kwargs against the winning metaclass's __new__
+        let bases_arg = if args.len() >= nkw + 2 {
+            args[1]
+        } else {
+            pyre_object::PY_NULL
+        };
+        let winner = calculate_metaclass(callable, bases_arg).unwrap_or(callable);
+        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(winner, "__new__") } {
             if unsafe { crate::is_func(new_fn) } {
                 (new_fn, 1usize) // __new__(cls, ...) → skip cls
             } else {
@@ -546,12 +599,32 @@ pub fn register_build_class() {
 /// Type call uses the same __new__ + __init__ protocol as call_type_object.
 pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     unsafe {
+        if pyre_object::is_method(callable) {
+            let func = pyre_object::w_method_get_func(callable);
+            let w_self = pyre_object::w_method_get_self(callable);
+            let receiver = if !w_self.is_null() && !pyre_object::is_none(w_self) {
+                w_self
+            } else {
+                pyre_object::w_method_get_class(callable)
+            };
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            if !receiver.is_null() && !pyre_object::is_none(receiver) {
+                call_args.push(receiver);
+            }
+            call_args.extend_from_slice(args);
+            return space_call_function_impl(func, &call_args);
+        }
         // Builtin function: direct Rust call
         if crate::is_builtin_func(callable) {
             let func = crate::w_builtin_func_get(callable);
             return match func(args) {
                 Ok(result) => result,
-                Err(_) => pyre_object::w_none(), // Error in space_call_function → None fallback
+                Err(e) => {
+                    if std::env::var("PYRE_DEBUG_CALL").is_ok() {
+                        eprintln!("[space_call_function_impl] builtin error: {}", e.message);
+                    }
+                    pyre_object::w_none()
+                }
             };
         }
         // User function: create frame + eval
@@ -563,15 +636,66 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
         if pyre_object::is_type(callable) {
             return space_call_type_impl(callable, args);
         }
+        // staticmethod → unwrap and call the wrapped function
+        // PyPy: function.py StaticMethod.descr_staticmethod__call__
+        if pyre_object::is_staticmethod(callable) {
+            let func = pyre_object::w_staticmethod_get_func(callable);
+            return space_call_function_impl(func, args);
+        }
+        // classmethod → unwrap and call the wrapped function
+        // PyPy: function.py ClassMethod.descr_classmethod__call__
+        if pyre_object::is_classmethod(callable) {
+            let func = pyre_object::w_classmethod_get_func(callable);
+            return space_call_function_impl(func, args);
+        }
+        // Instance with __call__ — PyPy: descroperation.py
+        if pyre_object::is_instance(callable) {
+            let w_type = pyre_object::w_instance_get_type(callable);
+            if let Some(call_fn) = crate::space::lookup_in_type_mro_pub(w_type, "__call__") {
+                let mut call_args = Vec::with_capacity(1 + args.len());
+                call_args.push(callable);
+                call_args.extend_from_slice(args);
+                return space_call_function_impl(call_fn, &call_args);
+            }
+        }
     }
     panic!("space_call_function: '{}' object is not callable", unsafe {
         (*(*callable).ob_type).tp_name
     });
 }
 
-/// Type call without a PyFrame (used by descriptor protocol and space_call_function).
-/// Mirrors call_type_object but without the frame parameter.
-///
+/// CPython: typeobject.c calculate_metaclass
+pub(crate) fn calculate_metaclass(
+    mut winner: PyObjectRef,
+    bases: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    if winner.is_null() {
+        winner = crate::typedef::get_type_type();
+    }
+    if bases.is_null() || unsafe { !pyre_object::is_tuple(bases) } {
+        return Ok(winner);
+    }
+    let n = unsafe { pyre_object::w_tuple_len(bases) };
+    for i in 0..n {
+        let Some(base) = (unsafe { pyre_object::w_tuple_getitem(bases, i as i64) }) else {
+            continue;
+        };
+        let Some(w_typ) = crate::typedef::type_of(base) else {
+            continue;
+        };
+        if std::ptr::eq(winner, w_typ) || is_subtype_ptr(winner, w_typ) {
+            continue;
+        }
+        if is_subtype_ptr(w_typ, winner) {
+            winner = w_typ;
+            continue;
+        }
+        return Err(PyError::type_error("metaclass conflict"));
+    }
+    Ok(winner)
+}
+
+/// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
 fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // Step 1: __new__
@@ -656,6 +780,28 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
         args.to_vec()
     };
 
+    // Fill keyword-only defaults (same logic as call_user_function_with_eval)
+    let nkwonly = code_ref.kwonlyarg_count as usize;
+    let mut filled_args = filled_args;
+    if nkwonly > 0 {
+        let kwdefaults = unsafe { crate::w_func_get_kwdefaults(func) };
+        while filled_args.len() < nparams + nkwonly {
+            filled_args.push(PY_NULL);
+        }
+        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            for ki in 0..nkwonly {
+                let slot = nparams + ki;
+                if filled_args[slot].is_null() {
+                    let param_name = &code_ref.varnames[slot];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                        filled_args[slot] = val;
+                    }
+                }
+            }
+        }
+    }
+
     let final_args = pack_varargs(code_ref, filled_args);
 
     // Generator function: wrap frame in generator object
@@ -673,7 +819,66 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let mut frame =
         PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
-    eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
+    match eval_frame_plain(&mut frame) {
+        Ok(v) => v,
+        Err(e) => {
+            if std::env::var("PYRE_DEBUG_CALL").is_ok() {
+                eprintln!("[call_user_func_with_args] error: {e}");
+            }
+            PY_NULL
+        }
+    }
+}
+
+/// Call a metaclass with extra keyword arguments.
+///
+/// PyPy: metaclass(name, bases, namespace, **kwds).
+/// Resolves kwargs to the metaclass __new__'s kwonly / **kwds parameters.
+fn call_metaclass_with_kwargs(
+    mc: PyObjectRef,
+    name: PyObjectRef,
+    bases: PyObjectRef,
+    ns_dict: PyObjectRef,
+    kwargs: PyObjectRef,
+) -> PyObjectRef {
+    // Find the metaclass __new__ method
+    let new_fn = if unsafe { pyre_object::is_type(mc) } {
+        unsafe { crate::space::lookup_in_type_mro_pub(mc, "__new__") }
+    } else {
+        None
+    };
+
+    if let Some(new_fn) = new_fn {
+        if unsafe { crate::is_func(new_fn) } {
+            // User function: resolve kwargs to kwonly params
+            let code_ptr = unsafe { w_func_get_code_ptr(new_fn) };
+            let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
+            let nparams = code.arg_count as usize; // positional params
+            let nkwonly = code.kwonlyarg_count as usize;
+
+            // Build positional args: [mcs, name, bases, ns_dict]
+            let mut args = vec![mc, name, bases, ns_dict];
+
+            // Fill kwonly params from kwargs dict
+            for ki in 0..nkwonly {
+                let param_idx = nparams + ki;
+                if param_idx < code.varnames.len() {
+                    let param_name = &code.varnames[param_idx];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwargs, key) } {
+                        args.push(val);
+                    } else {
+                        args.push(pyre_object::PY_NULL); // will be filled by defaults
+                    }
+                }
+            }
+
+            return call_user_func_with_args(new_fn, &args);
+        }
+    }
+
+    // Fallback: call without kwargs
+    crate::space_call_function(mc, &[name, bases, ns_dict])
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
@@ -728,22 +933,35 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let name_obj = args[1];
 
     // Check if last arg is a kwargs dict (from CALL_KW)
-    let (base_args, metaclass) = if args.len() > 2 {
+    // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
+    let (base_args, metaclass, extra_kwargs) = if args.len() > 2 {
         let last = args[args.len() - 1];
         if unsafe { pyre_object::is_dict(last) }
             && unsafe {
                 pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
             }
         {
-            // Extract metaclass from kwargs
             let mc =
                 unsafe { pyre_object::w_dict_lookup(last, pyre_object::w_str_new("metaclass")) };
-            (&args[2..args.len() - 1], mc)
+            // Collect extra kwargs (not metaclass, not __pyre_kw__)
+            let extra = pyre_object::w_dict_new();
+            unsafe {
+                let d = &*(last as *const pyre_object::dictobject::W_DictObject);
+                for &(k, v) in &*d.entries {
+                    if pyre_object::is_str(k) {
+                        let key = pyre_object::w_str_get_value(k);
+                        if key != "metaclass" && key != "__pyre_kw__" {
+                            pyre_object::w_dict_store(extra, k, v);
+                        }
+                    }
+                }
+            }
+            (&args[2..args.len() - 1], mc, Some(extra))
         } else {
-            (&args[2..], None)
+            (&args[2..], None, None)
         }
     } else {
-        (&args[2..], None)
+        (&args[2..], None, None)
     };
 
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
@@ -776,7 +994,13 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         None
     });
 
-    build_class_inner(body_fn, name, bases_tuple, effective_metaclass)
+    build_class_inner(
+        body_fn,
+        name,
+        bases_tuple,
+        effective_metaclass,
+        extra_kwargs,
+    )
 }
 
 fn build_class_inner(
@@ -784,16 +1008,59 @@ fn build_class_inner(
     name: &str,
     bases: PyObjectRef,
     metaclass: Option<PyObjectRef>,
+    extra_kwargs: Option<PyObjectRef>,
 ) -> PyResult {
     let code_ptr = unsafe { w_func_get_code_ptr(body_fn) };
     let globals = unsafe { w_func_get_globals(body_fn) };
     let closure = unsafe { w_func_get_closure(body_fn) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
-    // Create a fresh namespace for the class body (PyPy: w_locals for class scope)
+    // Call metaclass.__prepare__(name, bases, **kwds) if it exists.
+    // PyPy: build_class → metaclass.__prepare__(name, bases, **kwds)
+    // Returns the namespace dict to use for the class body.
+    let prepared_ns = if let Some(mc) = metaclass {
+        if unsafe { pyre_object::is_type(mc) } {
+            match crate::space::py_getattr(mc, "__prepare__") {
+                Ok(prepare) => {
+                    let ns_obj =
+                        crate::space_call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                    if !ns_obj.is_null() && unsafe { !pyre_object::is_none(ns_obj) } {
+                        Some(ns_obj)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Create class namespace — use __prepare__ result or fresh namespace
     let mut class_ns = Box::new(PyNamespace::new());
+    if let Some(pd) = prepared_ns {
+        if unsafe { pyre_object::is_dict(pd) } {
+            let dict = unsafe { &*(pd as *const pyre_object::dictobject::W_DictObject) };
+            for &(key, value) in unsafe { &*dict.entries } {
+                if !value.is_null() && unsafe { pyre_object::is_str(key) } {
+                    crate::namespace_store(
+                        &mut class_ns,
+                        unsafe { pyre_object::w_str_get_value(key) },
+                        value,
+                    );
+                }
+            }
+        }
+    }
     class_ns.fix_ptr();
     let class_ns_ptr = Box::into_raw(class_ns);
+
+    // prepared_ns: if __prepare__ returned a custom dict, we'll replay
+    // class body stores into it after execution. This lets EnumDict etc.
+    // track member definitions via __setitem__.
 
     let stored = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
     let exec_ctx = if stored.is_null() {
@@ -847,17 +1114,40 @@ fn build_class_inner(
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
     let w_type = if let Some(mc) = metaclass {
-        // Convert class namespace to a dict for metaclass call
-        let ns_dict = pyre_object::w_dict_new();
-        let ns = unsafe { &*class_ns_ptr };
-        for (k, &v) in ns.entries() {
-            if !v.is_null() {
-                unsafe { pyre_object::w_dict_store(ns_dict, pyre_object::w_str_new(k), v) };
+        // Convert class namespace to a dict for metaclass call.
+        // If __prepare__ returned a custom dict, replay stores into it
+        // so that __setitem__ side effects (e.g. EnumDict tracking) fire.
+        let ns_dict = if let Some(pd) = prepared_ns {
+            // Replay class body stores into prepared dict
+            let ns = unsafe { &*class_ns_ptr };
+            for (k, &v) in ns.entries() {
+                if !v.is_null() {
+                    let key = pyre_object::w_str_new(k);
+                    // Use py_setitem to trigger __setitem__ on EnumDict etc.
+                    let _ = crate::space::py_setitem(pd, key, v);
+                }
             }
-        }
-        // Call metaclass(name, bases, namespace)
+            pd
+        } else {
+            let d = pyre_object::w_dict_new();
+            let ns = unsafe { &*class_ns_ptr };
+            for (k, &v) in ns.entries() {
+                if !v.is_null() {
+                    unsafe { pyre_object::w_dict_store(d, pyre_object::w_str_new(k), v) };
+                }
+            }
+            d
+        };
+        // Call metaclass(name, bases, namespace, **kwds)
+        // Pass the ORIGINAL bases (not effective_bases) — the metaclass
+        // expects the user-declared bases. Default (object,) is added by
+        // type.__new__ internally if needed.
         let name_obj = pyre_object::w_str_new(name);
-        let result = crate::space_call_function(mc, &[name_obj, effective_bases, ns_dict]);
+        let result = if let Some(kw) = extra_kwargs {
+            call_metaclass_with_kwargs(mc, name_obj, bases, ns_dict, kw)
+        } else {
+            crate::space_call_function(mc, &[name_obj, bases, ns_dict])
+        };
         // If metaclass returned a W_TypeObject, set up MRO and store metaclass ref.
         if unsafe { pyre_object::is_type(result) } {
             let mro = unsafe { crate::space::compute_mro_pub(result) };
@@ -879,6 +1169,25 @@ fn build_class_inner(
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         w
     };
+
+    // __set_name__ protocol — CPython: type_new_set_names
+    // PyPy: typeobject.py type_new → call __set_name__(owner, name) on each descriptor
+    if unsafe { pyre_object::is_type(w_type) } {
+        let ns = unsafe { &*class_ns_ptr };
+        let entries: Vec<(String, PyObjectRef)> =
+            ns.entries().map(|(k, &v)| (k.to_string(), v)).collect();
+        for (attr_name, value) in entries {
+            if !value.is_null() {
+                if let Ok(set_name) = crate::space::py_getattr(value, "__set_name__") {
+                    // Call: descriptor.__set_name__(self, owner, name)
+                    let _ = crate::space_call_function(
+                        set_name,
+                        &[value, w_type, pyre_object::w_str_new(&attr_name)],
+                    );
+                }
+            }
+        }
+    }
 
     // CPython: if __classcell__ is in the namespace, set the cell's content
     // to the newly created class. This enables `__class__` references in methods.
@@ -934,7 +1243,7 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
             let mut new_args = Vec::with_capacity(1 + args.len());
             new_args.push(w_type);
             new_args.extend_from_slice(args);
-            crate::space_call_function(new_fn, &new_args)
+            call_callable(frame, new_fn, &new_args)?
         } else {
             // Default: allocate bare instance
             pyre_object::w_instance_new(w_type)

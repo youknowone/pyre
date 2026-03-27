@@ -487,6 +487,13 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
                 return Some(Ok(result));
             }
         }
+        // Also check per-instance attributes (ATTR_TABLE)
+        if let Ok(method) = py_getattr(a, dunder) {
+            let result = crate::space_call_function(method, &[a, b]);
+            if !is_not_implemented(result) {
+                return Some(Ok(result));
+            }
+        }
     }
 
     // Reverse: b.__rop__(a) — only if not already tried above
@@ -956,6 +963,14 @@ pub fn py_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_binop(a, b, "__or__") {
             return result;
         }
+        // type | type — Python 3.10+ union types
+        if is_type(a) {
+            if let Some(metatype) = crate::typedef::get_type_object((*a).ob_type) {
+                if let Some(method) = lookup_in_type_mro(metatype, "__or__") {
+                    return Ok(crate::space_call_function(method, &[a, b]));
+                }
+            }
+        }
         Err(PyError::type_error(format!(
             "unsupported operand type(s) for |: '{}' and '{}'",
             (*(*a).ob_type).tp_name,
@@ -1115,15 +1130,22 @@ pub fn py_is_true(obj: PyObjectRef) -> bool {
         // Instance __bool__ / __len__ — PyPy: descroperation.py is_true
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
-            // Try __bool__ first
+            // Try __bool__ first (type MRO)
             if let Some(method) = lookup_in_type_mro(w_type, "__bool__") {
                 let result = crate::space_call_function(method, &[obj]);
                 if !result.is_null() && is_bool(result) {
                     return w_bool_get_value(result);
                 }
             }
-            // Then __len__ (nonzero length = truthy)
+            // Then __len__ (type MRO) — nonzero length = truthy
             if let Some(method) = lookup_in_type_mro(w_type, "__len__") {
+                let result = crate::space_call_function(method, &[obj]);
+                if !result.is_null() && is_int(result) {
+                    return w_int_get_value(result) != 0;
+                }
+            }
+            // Also check per-instance __len__ (ATTR_TABLE)
+            if let Ok(method) = py_getattr(obj, "__len__") {
                 let result = crate::space_call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
@@ -1238,6 +1260,47 @@ pub fn py_getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 )),
             }
         } else if is_tuple(obj) {
+            if is_slice(index) {
+                // PyPy: tupleobject.py descr_getslice
+                let len = w_tuple_len(obj) as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let step = w_slice_get_step(index);
+                let s = if is_none(start) {
+                    0
+                } else {
+                    w_int_get_value(start)
+                };
+                let e = if is_none(stop) {
+                    len
+                } else {
+                    w_int_get_value(stop)
+                };
+                let step_val = if is_none(step) {
+                    1
+                } else {
+                    w_int_get_value(step)
+                };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let mut items = Vec::new();
+                if step_val == 1 {
+                    for i in s..e {
+                        if let Some(v) = w_tuple_getitem(obj, i as i64) {
+                            items.push(v);
+                        }
+                    }
+                } else if step_val > 0 {
+                    let mut i = s as i64;
+                    while (i as usize) < e {
+                        if let Some(v) = w_tuple_getitem(obj, i) {
+                            items.push(v);
+                        }
+                        i += step_val;
+                    }
+                }
+                return Ok(w_tuple_new(items));
+            }
             if !is_int(index) {
                 return Err(PyError::type_error("tuple indices must be integers"));
             }
@@ -1405,6 +1468,10 @@ pub fn py_len(obj: PyObjectRef) -> PyResult {
             if let Some(method) = lookup_in_type_mro(w_instance_get_type(obj), "__len__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
+            // Also check per-instance attributes (ATTR_TABLE)
+            if let Ok(method) = py_getattr(obj, "__len__") {
+                return Ok(crate::space_call_function(method, &[obj]));
+            }
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
                 w_type_get_name(w_instance_get_type(obj)),
@@ -1427,6 +1494,21 @@ thread_local! {
     /// the repr(C) layout of existing object types.
     pub static ATTR_TABLE: RefCell<HashMap<usize, HashMap<String, PyObjectRef>>> =
         RefCell::new(HashMap::new());
+}
+
+fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
+    let dict = pyre_object::w_dict_new();
+    if ns_ptr.is_null() {
+        return dict;
+    }
+    unsafe {
+        for (key, &value) in (*ns_ptr).entries() {
+            if !value.is_null() {
+                pyre_object::w_dict_store(dict, w_str_new(key), value);
+            }
+        }
+    }
+    dict
 }
 
 /// Get an attribute from an object: `obj.name`.
@@ -1495,6 +1577,10 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
     unsafe {
         if is_module(obj) {
+            if name == "__dict__" {
+                let ns_ptr = w_module_get_dict_ptr(obj) as *const crate::PyNamespace;
+                return Ok(namespace_to_dict(ns_ptr));
+            }
             let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
             if !ns_ptr.is_null() {
                 if let Some(&value) = (*ns_ptr).get(name) {
@@ -1545,6 +1631,9 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
 
             // Step 4: non-data descriptor
             if let Some(descr) = w_descr {
+                if crate::is_builtin_func(descr) {
+                    return Ok(descr);
+                }
                 if let Some(result) = call_descriptor_get(descr, obj, w_type) {
                     return Ok(result);
                 }
@@ -1591,15 +1680,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             if name == "__dict__" {
                 // Return the type's namespace as a dict
                 let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::PyNamespace;
-                let d = pyre_object::w_dict_new();
-                if !dict_ptr.is_null() {
-                    for (k, &v) in (*dict_ptr).entries() {
-                        if !v.is_null() {
-                            pyre_object::w_dict_store(d, w_str_new(k), v);
-                        }
-                    }
-                }
-                return Ok(d);
+                return Ok(namespace_to_dict(dict_ptr));
             }
             if name == "__bases__" {
                 return Ok(w_type_get_bases(obj));
@@ -1608,6 +1689,15 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 || name == "__module__"
                 || name == "__abstractmethods__"
                 || name == "__flags__"
+                || name == "__code__"
+                || name == "__func__"
+                || name == "__self__"
+                || name == "__wrapped__"
+                || name == "__annotations__"
+                || name == "__globals__"
+                || name == "__closure__"
+                || name == "__defaults__"
+                || name == "__kwdefaults__"
             {
                 // Check class dict first, then return None
                 if let Some(v) = lookup_in_type_mro(obj, name) {
@@ -1617,17 +1707,8 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
 
             if let Some(value) = lookup_in_type_mro(obj, name) {
-                // Unwrap staticmethod/classmethod/property descriptors
-                // PyPy: type.__getattribute__ calls space.get on descriptors
-                if is_staticmethod(value) {
-                    return Ok(w_staticmethod_get_func(value));
-                }
-                if is_classmethod(value) {
-                    return Ok(w_classmethod_get_func(value));
-                }
-                if is_property(value) {
-                    // property accessed on class → return property itself
-                    return Ok(value);
+                if let Some(result) = call_descriptor_get(value, PY_NULL, obj) {
+                    return Ok(result);
                 }
                 return Ok(value);
             }
@@ -1650,6 +1731,9 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 let mc = *mt;
                 if is_type(mc) {
                     if let Some(value) = lookup_in_type_mro(mc, name) {
+                        if let Some(result) = call_descriptor_get(value, obj, mc) {
+                            return Ok(result);
+                        }
                         return Ok(value);
                     }
                 }
@@ -1671,6 +1755,12 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // methods pre-installed, matching PyPy's TypeDef interpleveldefs.
     if let Some(type_obj) = crate::typedef::type_of(obj) {
         if let Some(method) = unsafe { lookup_in_type_mro(type_obj, name) } {
+            if unsafe { crate::is_builtin_func(method) } {
+                return Ok(pyre_object::w_method_new(method, obj, type_obj));
+            }
+            if let Some(result) = unsafe { call_descriptor_get(method, obj, type_obj) } {
+                return Ok(result);
+            }
             return Ok(method);
         }
     }
@@ -1692,44 +1782,92 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if crate::is_func(obj) {
             match name {
                 "__code__" => {
-                    // Return the code pointer as an opaque object (stub)
-                    let code_ptr = crate::w_func_get_code_ptr(obj);
-                    let code = &*(code_ptr as *const pyre_bytecode::CodeObject);
-                    let co = pyre_object::w_instance_new(crate::typedef::get_object_type());
-                    let _ = py_setattr(
-                        co,
-                        "co_varnames",
-                        w_tuple_new(
-                            code.varnames
-                                .iter()
-                                .map(|s| w_str_new(s) as PyObjectRef)
-                                .collect(),
-                        ),
-                    );
-                    let _ = py_setattr(co, "co_argcount", w_int_new(code.arg_count as i64));
-                    let _ = py_setattr(
-                        co,
-                        "co_kwonlyargcount",
-                        w_int_new(code.kwonlyarg_count as i64),
-                    );
-                    let _ = py_setattr(co, "co_name", w_str_new(&*code.obj_name));
-                    let _ = py_setattr(co, "co_filename", w_str_new(&*code.source_path));
-                    let _ = py_setattr(co, "co_flags", w_int_new(code.flags.bits() as i64));
-                    return Ok(co);
+                    let code_ptr =
+                        crate::w_func_get_code_ptr(obj) as *const pyre_bytecode::CodeObject;
+                    if code_ptr.is_null() {
+                        return Ok(w_none());
+                    }
+                    return Ok(crate::codeobject::box_code_constant(&*code_ptr));
                 }
                 "__name__" => {
                     return Ok(w_str_new(crate::w_func_get_name(obj)));
                 }
-                "__qualname__" | "__defaults__" | "__kwdefaults__" | "__globals__"
-                | "__closure__" => {
+                "__closure__" => {
+                    let closure = crate::w_func_get_closure(obj);
+                    return Ok(if closure.is_null() { w_none() } else { closure });
+                }
+                "__globals__" => {
+                    return Ok(namespace_to_dict(crate::w_func_get_globals(obj)));
+                }
+                "__defaults__" => {
+                    let defaults = crate::w_func_get_defaults(obj);
+                    return Ok(if defaults.is_null() {
+                        w_none()
+                    } else {
+                        defaults
+                    });
+                }
+                "__kwdefaults__" => {
+                    let kwdefaults = crate::w_func_get_kwdefaults(obj);
+                    return Ok(if kwdefaults.is_null() {
+                        w_none()
+                    } else {
+                        kwdefaults
+                    });
+                }
+                "__qualname__" => {
                     let found = ATTR_TABLE.with(|table| {
                         table
                             .borrow()
                             .get(&(obj as usize))
                             .and_then(|d| d.get(name).copied())
                     });
-                    return Ok(found.unwrap_or(w_none()));
+                    if let Some(value) = found {
+                        return Ok(value);
+                    }
+                    let code_ptr =
+                        crate::w_func_get_code_ptr(obj) as *const pyre_bytecode::CodeObject;
+                    if !code_ptr.is_null() {
+                        return Ok(w_str_new((*code_ptr).qualname.as_ref()));
+                    }
+                    return Ok(w_str_new(crate::w_func_get_name(obj)));
                 }
+                _ => {}
+            }
+        }
+        // staticmethod/classmethod descriptor attributes
+        // PyPy: function.py StaticMethod.__func__, ClassMethod.__func__
+        if pyre_object::is_staticmethod(obj) {
+            if name == "__func__" || name == "__wrapped__" {
+                return Ok(pyre_object::w_staticmethod_get_func(obj));
+            }
+        }
+        if pyre_object::is_classmethod(obj) {
+            if name == "__func__" || name == "__wrapped__" {
+                return Ok(pyre_object::w_classmethod_get_func(obj));
+            }
+        }
+        if crate::codeobject::is_code(obj) {
+            let code_ptr =
+                crate::codeobject::w_code_get_ptr(obj) as *const pyre_bytecode::CodeObject;
+            if code_ptr.is_null() {
+                return Ok(w_none());
+            }
+            let code = &*code_ptr;
+            match name {
+                "co_varnames" => {
+                    let items = code
+                        .varnames
+                        .iter()
+                        .map(|item| w_str_new(item.as_ref()))
+                        .collect();
+                    return Ok(w_tuple_new(items));
+                }
+                "co_argcount" => return Ok(w_int_new(code.arg_count as i64)),
+                "co_kwonlyargcount" => return Ok(w_int_new(code.kwonlyarg_count as i64)),
+                "co_name" => return Ok(w_str_new(code.obj_name.as_ref())),
+                "co_filename" => return Ok(w_str_new(code.source_path.as_ref())),
+                "co_flags" => return Ok(w_int_new(code.flags.bits() as i64)),
                 _ => {}
             }
         }
@@ -1749,6 +1887,36 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 .and_then(|d| d.get(name).copied())
         });
         return Ok(found.unwrap_or(w_none()));
+    }
+    // Exception attributes — PyPy: W_BaseException attributes
+    if unsafe { pyre_object::is_exception(obj) } {
+        match name {
+            "__traceback__" => {
+                // Stub traceback object with tb_frame, tb_lineno, tb_next
+                let tb = pyre_object::w_instance_new(crate::typedef::get_object_type());
+                let frame_obj = pyre_object::w_instance_new(crate::typedef::get_object_type());
+                ATTR_TABLE.with(|t| {
+                    let mut t = t.borrow_mut();
+                    let fd = t.entry(frame_obj as usize).or_default();
+                    fd.insert("f_locals".into(), w_dict_new());
+                    fd.insert("f_globals".into(), w_dict_new());
+                    fd.insert("f_code".into(), w_none());
+                    fd.insert("f_lineno".into(), w_int_new(0));
+                    let td = t.entry(tb as usize).or_default();
+                    td.insert("tb_frame".into(), frame_obj);
+                    td.insert("tb_lineno".into(), w_int_new(0));
+                    td.insert("tb_next".into(), w_none());
+                });
+                return Ok(tb);
+            }
+            "__cause__" | "__context__" | "__suppress_context__" => {
+                return Ok(w_none());
+            }
+            "args" => {
+                return Ok(w_tuple_new(vec![]));
+            }
+            _ => {}
+        }
     }
     if name == "__dict__" {
         let d = pyre_object::w_dict_new();
@@ -1778,12 +1946,14 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
         unsafe {
+            let tp_name = if obj.is_null() {
+                "NULL"
+            } else {
+                (*(*obj).ob_type).tp_name
+            };
             Err(PyError::new(
                 PyErrorKind::AttributeError,
-                format!(
-                    "'{}' object has no attribute '{name}'",
-                    (*(*obj).ob_type).tp_name,
-                ),
+                format!("'{tp_name}' object has no attribute '{name}'"),
             ))
         }
     })
@@ -1815,6 +1985,9 @@ unsafe fn lookup_in_type_mro(w_type: PyObjectRef, name: &str) -> Option<PyObject
         &mro_owned
     };
     for cls in mro {
+        if (*cls).is_null() || !is_type(*cls) {
+            continue;
+        }
         let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::PyNamespace;
         if !ns_ptr.is_null() {
             let ns = &*ns_ptr;
@@ -1952,6 +2125,9 @@ unsafe fn call_descriptor_get(
 
     // property: PyPy W_Property.get → call fget(obj)
     if is_property(descr) {
+        if obj.is_null() {
+            return Some(descr);
+        }
         let fget = w_property_get_fget(descr);
         if fget.is_null() || is_none(fget) {
             return None;
@@ -1965,16 +2141,19 @@ unsafe fn call_descriptor_get(
     }
 
     // classmethod: PyPy ClassMethod.descr_classmethod_get → func bound to class
-    // Simplified: return a closure-like call that prepends class.
-    // For now, return the inner function (class arg not yet prepended).
     if is_classmethod(descr) {
-        return Some(w_classmethod_get_func(descr));
+        let func = w_classmethod_get_func(descr);
+        let receiver = if !w_type.is_null() { w_type } else { obj };
+        if receiver.is_null() || is_none(receiver) {
+            return Some(func);
+        }
+        let owner = crate::typedef::type_of(receiver).unwrap_or(PY_NULL);
+        return Some(pyre_object::w_method_new(func, receiver, owner));
     }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
     // PyPy: descroperation.py → space.get_and_call_function(w_get, descr, obj, type)
-    if is_instance(descr) {
-        let descr_type = w_instance_get_type(descr);
+    if let Some(descr_type) = crate::typedef::type_of(descr) {
         if let Some(get_fn) = lookup_in_type_mro(descr_type, "__get__") {
             if !get_fn.is_null() {
                 // Call __get__(descr, obj, type) via space.call_function
@@ -2117,6 +2296,15 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
             let len = w_str_get_value(obj).len();
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
+        // dict → iterate over keys (dictobject.py __iter__)
+        if is_dict(obj) {
+            let d = &*(obj as *const pyre_object::dictobject::W_DictObject);
+            let entries = &*d.entries;
+            let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
+            let key_list = pyre_object::w_list_new(keys);
+            let len = entries.len();
+            return Ok(pyre_object::w_seq_iter_new(key_list, len));
+        }
         // Already an iterator
         if is_range_iter(obj) || is_seq_iter(obj) || pyre_object::generatorobject::is_generator(obj)
         {
@@ -2126,6 +2314,31 @@ pub fn py_iter(obj: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             if let Ok(method) = py_getattr(obj, "__iter__") {
                 return Ok(crate::space_call_function(method, &[obj]));
+            }
+        }
+        // Type object: check metaclass __iter__ (NOT the type's own MRO)
+        // PyPy/CPython: iter(X) calls type(X).__iter__(X), not X.__iter__
+        // For type objects, type(X) is the metaclass.
+        if is_type(obj) {
+            // Look up __iter__ in the metaclass MRO
+            let mc = ATTR_TABLE.with(|table| {
+                table
+                    .borrow()
+                    .get(&(obj as usize))
+                    .and_then(|d| d.get("__metaclass__").copied())
+            });
+            if let Some(metaclass) = mc {
+                if let Some(method) = lookup_in_type_mro(metaclass, "__iter__") {
+                    return Ok(crate::space_call_function(method, &[obj]));
+                }
+            }
+            // Fallback: check type type's MRO
+            if let Some(type_type) =
+                crate::typedef::get_type_object(&pyre_object::pyobject::TYPE_TYPE)
+            {
+                if let Some(method) = lookup_in_type_mro(type_type, "__iter__") {
+                    return Ok(crate::space_call_function(method, &[obj]));
+                }
             }
         }
     }
@@ -2243,22 +2456,28 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
         // Resume the frame from where it left off (frame.next_instr is preserved)
         match crate::eval::eval_loop_for_force(frame) {
             Ok(value) => {
-                // Check if this is a yield or a return.
-                // StepResult::Yield returns the yielded value via Ok.
-                // StepResult::Return also returns via Ok but means generator is done.
-                // We distinguish by checking if frame reached the end.
+                // Distinguish yield vs return: if the frame is at a YIELD_VALUE
+                // instruction (pc-1), it's a yield. Otherwise it's a return.
                 let code = &*frame.code;
-                if frame.next_instr >= code.instructions.len() {
-                    // Generator returned (finished) — raise StopIteration
+                let pc = frame.next_instr;
+                let is_yield = if pc > 0 && pc <= code.instructions.len() {
+                    matches!(
+                        code.instructions[pc - 1].op,
+                        pyre_bytecode::Instruction::YieldValue { .. }
+                    )
+                } else {
+                    false
+                };
+                if is_yield {
+                    Ok(value)
+                } else {
                     w_generator_set_exhausted(gen_obj);
-                    return Err(PyError {
+                    Err(PyError {
                         kind: PyErrorKind::StopIteration,
                         message: "".to_string(),
                         exc_object: std::ptr::null_mut(),
-                    });
+                    })
                 }
-                // Frame is suspended at YIELD_VALUE — return the yielded value
-                Ok(value)
             }
             Err(e) => {
                 w_generator_set_exhausted(gen_obj);
@@ -2570,12 +2789,21 @@ pub fn py_contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, P
             let n = w_str_get_value(needle);
             return Ok(h.contains(n));
         }
+        // dict: key containment (dictobject.py __contains__)
+        if is_dict(haystack) {
+            return Ok(w_dict_lookup(haystack, needle).is_some());
+        }
     }
     // Instance __contains__ — PyPy: descroperation.py contains_w
     unsafe {
         if is_instance(haystack) {
             let w_type = w_instance_get_type(haystack);
             if let Some(method) = lookup_in_type_mro(w_type, "__contains__") {
+                let result = crate::space_call_function(method, &[haystack, needle]);
+                return Ok(py_is_true(result));
+            }
+            // Also check per-instance attributes (ATTR_TABLE)
+            if let Ok(method) = py_getattr(haystack, "__contains__") {
                 let result = crate::space_call_function(method, &[haystack, needle]);
                 return Ok(py_is_true(result));
             }
