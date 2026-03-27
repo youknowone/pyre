@@ -974,11 +974,10 @@ impl VirtualState {
     ) -> Result<(), ()> {
         // virtualstate.py:523-524: force_boxes + Virtual incoming
         // → _generate_virtual_guards (check class compatibility only).
+        // virtualstate.py:523-524: force_boxes + incoming virtual, expected non-virtual
         if force_boxes && incoming.is_virtual() && !expected.is_virtual() {
             return match expected {
-                // virtualstate.py:566-568: constant vs virtual → always Err
                 VirtualStateInfo::Constant(_) => Err(()),
-                // virtualstate.py:570-572: knownclass vs virtual → check class
                 VirtualStateInfo::KnownClass { class_ptr } => {
                     if let VirtualStateInfo::Virtual { known_class, .. } = incoming {
                         if known_class.as_ref() == Some(class_ptr) {
@@ -987,14 +986,34 @@ impl VirtualState {
                             Err(())
                         }
                     } else {
-                        // Virtual array/struct — virtual is always nonnull,
-                        // so NonNull/Unknown targets accept it.
                         Ok(())
                     }
                 }
-                // NonNull/Unknown: virtual is always nonnull → Ok
                 _ => Ok(()),
             };
+        }
+        // virtualstate.py:520-530: _generate_virtual_guards —
+        // force_boxes + expected virtual, incoming non-virtual (forced box).
+        // The forced box's known class must match the virtual's class.
+        if force_boxes && expected.is_virtual() && !incoming.is_virtual() {
+            if let VirtualStateInfo::KnownClass { class_ptr } = incoming {
+                let expected_class = match expected {
+                    VirtualStateInfo::Virtual { known_class, .. } => known_class.as_ref(),
+                    _ => None,
+                };
+                return if expected_class == Some(class_ptr) || expected_class.is_none() {
+                    Ok(())
+                } else {
+                    Err(())
+                };
+            }
+            if matches!(
+                incoming,
+                VirtualStateInfo::NonNull | VirtualStateInfo::Unknown
+            ) {
+                return Ok(());
+            }
+            return Err(());
         }
 
         match (expected, incoming) {

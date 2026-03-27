@@ -1253,31 +1253,6 @@ impl OptUnroll {
         force_boxes: bool,
         runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        self.jump_to_existing_trace_with_vs(
-            jump_args,
-            current_label_args,
-            target_tokens,
-            optimizer,
-            ctx,
-            force_boxes,
-            runtime_boxes,
-            None,
-        )
-    }
-
-    /// RPython unroll.py:304-318 parity: jump_to_existing_trace with optional
-    /// pre-computed virtual state (from before force_box_for_end_of_preamble).
-    pub fn jump_to_existing_trace_with_vs(
-        &self,
-        jump_args: &[OpRef],
-        current_label_args: Option<&[OpRef]>,
-        target_tokens: &mut [TargetToken],
-        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
-        ctx: &mut OptContext,
-        force_boxes: bool,
-        runtime_boxes: Option<&[OpRef]>,
-        pre_virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
-    ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         optimizer.disable_guard_replacement();
         let result = self.jump_to_existing_trace_impl(
             jump_args,
@@ -1287,7 +1262,6 @@ impl OptUnroll {
             ctx,
             force_boxes,
             runtime_boxes,
-            pre_virtual_state,
         );
         optimizer.enable_guard_replacement();
         result
@@ -1302,12 +1276,9 @@ impl OptUnroll {
         ctx: &mut OptContext,
         force_boxes: bool,
         runtime_boxes: Option<&[OpRef]>,
-        pre_virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        // RPython unroll.py:323: virtual_state from BEFORE force_box_for_end_of_preamble
-        let mut virtual_state = pre_virtual_state.unwrap_or_else(|| {
-            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info)
-        });
+        let mut virtual_state =
+            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
         let mut args: Vec<OpRef> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
         let mut first_target_attempt = true;
 
