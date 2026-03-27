@@ -1542,10 +1542,15 @@ fn export_single_value(
     // iterations. RPython's setinfo_from_preamble_list calls
     // item.set_forwarded(None) — info is completely cleared for ALL types.
     if let Some(value) = ctx.get_constant(opref) {
-        if opref.0 >= 10000 {
+        // RPython resume.py:204: isinstance(box, Const) — export all true
+        // constants. Constant pool entries (>= 10000) are always constant.
+        // GcRef values (type pointers like ob_type) are invariant across
+        // iterations. Only skip trace-computed Int/Float constants that may
+        // differ across iterations (e.g., loop counter at entry).
+        let is_invariant = opref.0 >= 10000 || matches!(value, Value::Ref(_));
+        if is_invariant {
             return VirtualStateInfo::Constant(value.clone());
         }
-        // Trace-computed constant (OpRef < 10000): export as Unknown.
         return VirtualStateInfo::Unknown;
     }
 
