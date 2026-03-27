@@ -88,7 +88,7 @@ pub fn register_eval_override(f: EvalFn) {
 
 thread_local! {
     static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Last known valid execution context — for call_user_func_with_args.
+    /// Last known valid execution context — for call_user_function_with_args.
     static LAST_EXEC_CTX: std::cell::Cell<*const crate::PyExecutionContext> =
         const { std::cell::Cell::new(std::ptr::null()) };
 }
@@ -314,7 +314,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
         return call_callable(frame, func, &call_args);
     }
     if unsafe { pyre_object::is_type(callable) } {
-        return call_type_object(frame, callable, args);
+        return type_descr_call(frame, callable, args);
     }
 
     // staticmethod → unwrap
@@ -482,7 +482,7 @@ pub(crate) fn resolve_kwargs(
     // For user functions: direct code_ptr.
     // For type objects: look up __new__ in MRO (PyPy: Arguments used by descr_call).
     //
-    // When callable is a type, call_type_object will prepend `cls` as the first
+    // When callable is a type, type_descr_call will prepend `cls` as the first
     // arg to __new__, so the stack args correspond to __new__'s params[1:]
     // (skip_cls=1). For plain function calls skip_cls=0.
     let (target_func, skip_cls) = if unsafe { crate::is_function(callable) } {
@@ -596,8 +596,8 @@ pub fn register_build_class() {
 /// PyPy: baseobjspace.py `call_function`
 ///
 /// Dispatches to builtins, user functions, and type objects.
-/// Type call uses the same __new__ + __init__ protocol as call_type_object.
-pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+/// Type call uses the same __new__ + __init__ protocol as type_descr_call.
+pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(callable) {
             let func = pyre_object::w_method_get_func(callable);
@@ -612,7 +612,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
                 call_args.push(receiver);
             }
             call_args.extend_from_slice(args);
-            return space_call_function_impl(func, &call_args);
+            return call_function_impl(func, &call_args);
         }
         // Builtin function: direct Rust call
         if crate::is_builtin_code(callable) {
@@ -621,7 +621,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
                 Ok(result) => result,
                 Err(e) => {
                     if std::env::var("PYRE_DEBUG_CALL").is_ok() {
-                        eprintln!("[space_call_function_impl] builtin error: {}", e.message);
+                        eprintln!("[call_function_impl] builtin error: {}", e.message);
                     }
                     pyre_object::w_none()
                 }
@@ -629,24 +629,24 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
         }
         // User function: create frame + eval
         if crate::is_function(callable) {
-            return call_user_func_with_args(callable, args);
+            return call_user_function_with_args(callable, args);
         }
         // Type object → descr_call: __new__ + __init__
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
-            return space_call_type_impl(callable, args);
+            return type_descr_call_impl(callable, args);
         }
         // staticmethod → unwrap and call the wrapped function
         // PyPy: function.py StaticMethod.descr_staticmethod__call__
         if pyre_object::is_staticmethod(callable) {
             let func = pyre_object::w_staticmethod_get_func(callable);
-            return space_call_function_impl(func, args);
+            return call_function_impl(func, args);
         }
         // classmethod → unwrap and call the wrapped function
         // PyPy: function.py ClassMethod.descr_classmethod__call__
         if pyre_object::is_classmethod(callable) {
             let func = pyre_object::w_classmethod_get_func(callable);
-            return space_call_function_impl(func, args);
+            return call_function_impl(func, args);
         }
         // Instance with __call__ — PyPy: descroperation.py
         if pyre_object::is_instance(callable) {
@@ -655,7 +655,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
                 let mut call_args = Vec::with_capacity(1 + args.len());
                 call_args.push(callable);
                 call_args.extend_from_slice(args);
-                return space_call_function_impl(call_fn, &call_args);
+                return call_function_impl(call_fn, &call_args);
             }
         }
     }
@@ -683,10 +683,10 @@ pub(crate) fn calculate_metaclass(
         let Some(w_base_type) = crate::typedef::r#type(base) else {
             continue;
         };
-        if std::ptr::eq(w_winner, w_base_type) || is_subtype_ptr(w_winner, w_base_type) {
+        if std::ptr::eq(w_winner, w_base_type) || issubtype_ptr(w_winner, w_base_type) {
             continue;
         }
-        if is_subtype_ptr(w_base_type, w_winner) {
+        if issubtype_ptr(w_base_type, w_winner) {
             w_winner = w_base_type;
             continue;
         }
@@ -697,14 +697,14 @@ pub(crate) fn calculate_metaclass(
 
 /// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
-fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // Step 1: __new__
     let instance =
         if let Some(new_fn) = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") } {
             let mut new_args = Vec::with_capacity(1 + args.len());
             new_args.push(w_type);
             new_args.extend_from_slice(args);
-            space_call_function_impl(new_fn, &new_args)
+            call_function_impl(new_fn, &new_args)
         } else {
             pyre_object::w_instance_new(w_type)
         };
@@ -713,14 +713,14 @@ fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
     // PyPy: descr_call skips __init__ when __new__ returns a different type
     if !instance.is_null() && unsafe { pyre_object::is_instance(instance) } {
         let w_insttype = unsafe { pyre_object::w_instance_get_type(instance) };
-        if std::ptr::eq(w_insttype, w_type) || is_subtype_ptr(w_insttype, w_type) {
+        if std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type) {
             if let Some(init_fn) =
                 unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }
             {
                 let mut init_args = Vec::with_capacity(1 + args.len());
                 init_args.push(instance);
                 init_args.extend_from_slice(args);
-                let _ = space_call_function_impl(init_fn, &init_args);
+                let _ = call_function_impl(init_fn, &init_args);
             }
         }
     }
@@ -729,7 +729,7 @@ fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 }
 
 /// Pointer-based subtype check for descr_call __init__ guard.
-fn is_subtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_type) };
     if mro_ptr.is_null() {
         return false;
@@ -738,7 +738,7 @@ fn is_subtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 }
 
 /// Helper: call a user function with arbitrary args from descriptor context.
-fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let code_ptr = unsafe { function_get_code(func) };
     let globals = unsafe { function_get_globals(func) };
     let closure = unsafe { function_get_closure(func) };
@@ -823,7 +823,7 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
         Ok(v) => v,
         Err(e) => {
             if std::env::var("PYRE_DEBUG_CALL").is_ok() {
-                eprintln!("[call_user_func_with_args] error: {e}");
+                eprintln!("[call_user_function_with_args] error: {e}");
             }
             PY_NULL
         }
@@ -873,7 +873,7 @@ fn call_metaclass_with_kwargs(
                 }
             }
 
-            return call_user_func_with_args(new_fn, &args);
+            return call_user_function_with_args(new_fn, &args);
         }
     }
 
@@ -1229,7 +1229,7 @@ pub fn set_build_class_exec_ctx(ctx: *const crate::PyExecutionContext) {
 // ── Type calling (instance creation) ─────────────────────────────────
 // PyPy equivalent: typeobject.py descr_call → __new__ + __init__
 
-fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+fn type_descr_call(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // Step 1: Look up __new__ via type MRO → allocate instance
     // PyPy: typeobject.py descr_call → w_type.lookup_where('__new__'),
     // then bind/call the resulting descriptor with w_type as the first arg.
@@ -1249,7 +1249,7 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
     let call_init = if !instance.is_null() && unsafe { pyre_object::is_instance(instance) } {
         let w_insttype = unsafe { pyre_object::w_instance_get_type(instance) };
-        std::ptr::eq(w_insttype, w_type) || is_subtype_ptr(w_insttype, w_type)
+        std::ptr::eq(w_insttype, w_type) || issubtype_ptr(w_insttype, w_type)
     } else {
         false
     };

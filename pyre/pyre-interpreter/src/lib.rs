@@ -62,7 +62,7 @@ pub fn space_call_function(
     callable: pyre_object::PyObjectRef,
     args: &[pyre_object::PyObjectRef],
 ) -> pyre_object::PyObjectRef {
-    call::space_call_function_impl(callable, args)
+    call::call_function_impl(callable, args)
 }
 
 /// Try calling `obj.__dunder__()`, return obj itself if dunder not found.

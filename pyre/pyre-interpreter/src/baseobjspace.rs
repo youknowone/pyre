@@ -458,7 +458,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
             let a_type = w_instance_get_type(a);
             let b_type = w_instance_get_type(b);
             !std::ptr::eq(a_type, b_type)
-                && is_subtype_cached(b_type, a_type)
+                && issubtype_cached(b_type, a_type)
                 && lookup_in_type_where(b_type, rdunder).is_some()
         } else {
             false
@@ -513,7 +513,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
 }
 
 /// Check if w_type is a subtype of cls using cached MRO.
-unsafe fn is_subtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     let mro_ptr = w_type_get_mro(w_type);
     if !mro_ptr.is_null() {
         return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
