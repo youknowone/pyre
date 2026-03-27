@@ -231,7 +231,50 @@ pub(crate) fn build_guard_metadata(
                         .collect()
                 })
                 .unwrap_or_default();
-            let frame_slots = if let Some(ref fa) = op.fail_args {
+            // resume.py parity: build frame_slots from rd_numb when available.
+            // rd_numb encodes TAGBOX/TAGCONST/TAGVIRTUAL per frame slot.
+            // NULLREF slots (Const(0, Ref)) may represent virtuals when
+            // encode_guard_virtuals_impl replaced the virtual OpRef with
+            // NONE — overlay with virtual_map from rd_virtuals entries.
+            let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+                (&op.rd_numb, &op.rd_consts)
+            {
+                use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                // Build virtual_map from rd_virtuals for NULLREF → Virtual.
+                let virtual_map: std::collections::HashMap<usize, usize> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(vidx, entry)| (entry.fail_arg_index, vidx))
+                    .collect();
+                let mut slots = Vec::new();
+                let mut slot_idx = 0usize;
+                for frame in &frames {
+                    for val in &frame.values {
+                        slots.push(match val {
+                            RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
+                            RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
+                            RebuiltValue::Const(c, tp) => {
+                                // NULLREF (Const(0, Ref)) → check virtual_map.
+                                if *c == 0 && *tp == majit_ir::Type::Ref {
+                                    if let Some(&vidx) = virtual_map.get(&slot_idx) {
+                                        ExitValueSourceLayout::Virtual(vidx)
+                                    } else {
+                                        ExitValueSourceLayout::Constant(*c)
+                                    }
+                                } else {
+                                    ExitValueSourceLayout::Constant(*c)
+                                }
+                            }
+                            RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                            RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
+                        });
+                        slot_idx += 1;
+                    }
+                }
+                slots
+            } else if let Some(ref fa) = op.fail_args {
+                // Legacy fallback: fail_args + virtual_map overlay.
                 let mut virtual_map = std::collections::HashMap::new();
                 for (vidx, entry) in entries.iter().enumerate() {
                     virtual_map.insert(entry.fail_arg_index, vidx);

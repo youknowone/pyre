@@ -1095,7 +1095,7 @@ fn restore_guard_failure_for_loop(
             rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
         }
     };
-    materialize_recovery_virtuals(&mut typed, exit_layout);
+    materialize_recovery_virtuals(&mut typed, raw_values, exit_layout);
     // resume.py:993-1007 _prepare_pendingfields: replay deferred
     // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
     replay_pending_fields(&typed, exit_layout);
@@ -1379,11 +1379,15 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
 /// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
 /// Only apply when trailing fields are available (2 Int per null slot).
 /// Otherwise, replace remaining null Refs with w_none() for safety.
-fn materialize_recovery_virtuals(typed: &mut Vec<Value>, exit_layout: &CompiledExitLayout) {
-    // Try recovery layout first (Cranelift-generated from rd_virtuals).
+fn materialize_recovery_virtuals(
+    typed: &mut Vec<Value>,
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) {
+    // Try recovery layout first (rd_virtuals parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
-            if materialize_from_recovery_layout(typed, recovery) {
+            if materialize_from_recovery_layout(typed, raw_values, exit_layout, recovery) {
                 return;
             }
         }
@@ -1461,24 +1465,24 @@ fn materialize_recovery_virtuals(typed: &mut Vec<Value>, exit_layout: &CompiledE
     }
 }
 
-/// Materialize virtuals using Cranelift recovery layout (rd_virtuals parity).
+/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals).
+/// Field values are read from raw_values (deadframe) since rd_numb-decoded
+/// typed array only contains frame slots, not the appended virtual fields.
 fn materialize_from_recovery_layout(
     typed: &mut Vec<Value>,
+    raw_values: &[i64],
+    _exit_layout: &CompiledExitLayout,
     recovery: &majit_codegen::ExitRecoveryLayout,
 ) -> bool {
     let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
     let w_float_type = &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize;
 
+    // resume.py parity: resolve field values from deadframe (raw_values),
+    // not from rd_numb-decoded typed array. Virtual field values live at
+    // deadframe positions beyond the frame slots.
     let resolve_value = |src: &majit_codegen::ExitValueSourceLayout| -> Option<i64> {
         match src {
-            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
-                typed.get(*idx).map(|v| match v {
-                    Value::Int(i) => *i,
-                    Value::Float(f) => f.to_bits() as i64,
-                    Value::Ref(r) => r.0 as i64,
-                    _ => 0,
-                })
-            }
+            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => raw_values.get(*idx).copied(),
             majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
             _ => None,
         }
@@ -1501,7 +1505,6 @@ fn materialize_from_recovery_layout(
                 } else if ob_type == w_int_type {
                     pyre_object::intobject::w_int_new(val_raw) as usize
                 } else {
-                    // Unknown virtual type — cannot materialize safely.
                     return false;
                 };
                 materialized.push(obj);
