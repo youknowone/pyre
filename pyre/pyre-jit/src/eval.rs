@@ -429,9 +429,8 @@ fn jit_merge_point_hook(
 /// warmstate.py:446-511 maybe_compile_and_run.
 ///
 /// RPython: cell lookup (O(1)) → compiled → enter. No cell → counter.
-/// Cell-first requires guard failure recovery without null Ref — blocked
-/// by Phase 1 inputarg virtual materialization. Counter gating limits
-/// compiled entry frequency to avoid repeated guard failure overhead.
+/// Cell-first (O(1) celltable hint) blocked by guard failure frame
+/// corruption from incomplete virtual materialization.
 #[cold]
 #[inline(never)]
 fn maybe_compile_and_run(
@@ -701,11 +700,9 @@ fn bound_reached(
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
-    // RPython decays ALL counters (float ×0.96). Pyre's integer
-    // counters + no bridge compilation make full decay unsafe —
-    // it changes OTHER keys' compilation timing, causing wrong output.
-    // Per-key reset is the correct pyre equivalent until float
-    // counters are implemented.
+    // RPython decays ALL counters (×0.96). Pyre resets per-key because
+    // full decay changes other keys' compilation timing, causing wrong
+    // output (nbody). Root: integer counters + lossy hash collisions.
     driver
         .meta_interp_mut()
         .warm_state_mut()
