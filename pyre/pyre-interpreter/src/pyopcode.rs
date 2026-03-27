@@ -9,6 +9,107 @@ use crate::{
     opcode_store_attr, opcode_store_subscr, opcode_unpack_sequence,
 };
 
+use pyre_object::PyObjectRef;
+
+pub type PyUnaryOpHandler = fn(&mut crate::pyframe::PyFrame);
+pub type PyBinaryOpHandler = fn(&mut crate::pyframe::PyFrame);
+
+#[allow(non_camel_case_types)]
+pub struct __extend__;
+
+pub struct ExitFrame;
+
+pub struct Return;
+
+pub struct Yield;
+
+pub struct RaiseWithExplicitTraceback {
+    pub operr: crate::error::OperationError,
+}
+
+pub struct SuspendedUnroller {
+    pub kind: usize,
+}
+
+pub struct SReturnValue {
+    pub w_returnvalue: PyObjectRef,
+}
+
+pub struct SApplicationException {
+    pub operr: crate::error::OperationError,
+}
+
+pub struct SBreakLoop {
+    pub singleton: bool,
+}
+
+pub struct SContinueLoop {
+    pub jump_to: usize,
+}
+
+pub struct FrameBlock {
+    pub handlerposition: usize,
+    pub valuestackdepth: usize,
+    pub _opname: &'static str,
+}
+
+pub struct LoopBlock {
+    pub base: FrameBlock,
+}
+
+pub struct ExceptBlock {
+    pub base: FrameBlock,
+}
+
+pub struct FinallyBlock {
+    pub base: FrameBlock,
+}
+
+pub struct WithBlock {
+    pub base: FrameBlock,
+}
+
+impl FrameBlock {
+    pub fn new(
+        _frame: *mut crate::pyframe::PyFrame,
+        handlerposition: usize,
+        previous: *mut FrameBlock,
+    ) -> Self {
+        let _ = (_frame, previous);
+        Self {
+            handlerposition,
+            valuestackdepth: 0,
+            _opname: "",
+        }
+    }
+
+    pub fn cleanupstack(&self, frame: &mut crate::pyframe::PyFrame) {
+        while frame.valuestackdepth > self.valuestackdepth {
+            frame.popvalue_maybe_none();
+        }
+    }
+}
+
+#[inline]
+pub fn unaryoperation(_operationname: &str) -> PyUnaryOpHandler {
+    let _ = _operationname;
+    _stub_unaryoperation
+}
+
+#[inline]
+pub fn binaryoperation(_operationname: &str) -> PyBinaryOpHandler {
+    let _ = _operationname;
+    _stub_binaryoperation
+}
+
+fn _stub_unaryoperation(_frame: &mut crate::pyframe::PyFrame) {
+    let _ = _frame;
+}
+
+fn _stub_binaryoperation(_frame: &mut crate::pyframe::PyFrame) {
+    let _ = _frame;
+}
+
 pub enum StepResult<V> {
     Continue,
     Return(V),

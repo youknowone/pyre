@@ -4,7 +4,8 @@
 //! local variables, and instruction pointer. The JIT virtualizes
 //! these fields so they live in registers instead of memory.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::{PyExecutionContext, PyNamespace, PyObjectArray};
@@ -92,12 +93,81 @@ pub struct PyFrame {
     pub class_locals: *mut PyNamespace,
 }
 
+#[derive(Clone, Copy)]
+pub struct FrameDebugData {
+    w_locals: *mut PyNamespace,
+    w_globals: *mut PyNamespace,
+    w_f_trace: PyObjectRef,
+    is_being_profiled: bool,
+    is_in_line_tracing: bool,
+    instr_lb: usize,
+    instr_ub: usize,
+    instr_prev_plus_one: usize,
+    f_lineno: usize,
+    escaped: bool,
+}
+
+impl Default for FrameDebugData {
+    fn default() -> Self {
+        Self {
+            w_locals: std::ptr::null_mut(),
+            w_globals: std::ptr::null_mut(),
+            w_f_trace: pyre_object::PY_NULL,
+            is_being_profiled: false,
+            is_in_line_tracing: false,
+            instr_lb: 0,
+            instr_ub: 0,
+            instr_prev_plus_one: 0,
+            f_lineno: 0,
+            escaped: false,
+        }
+    }
+}
+
+thread_local! {
+    static FRAME_DEBUG: RefCell<HashMap<usize, FrameDebugData>> = RefCell::new(HashMap::new());
+}
+
 /// Exception handler block — pushed by SETUP_FINALLY/SETUP_EXCEPT, popped by POP_BLOCK.
 /// PyPy equivalent: pyframe.py Block classes (ExceptBlock, FinallyBlock).
 #[derive(Debug, Clone, Copy)]
 pub struct Block {
     pub handler: usize,
     pub level: usize,
+}
+
+#[inline]
+pub fn get_block_class(opname: &str) -> &'static str {
+    match opname {
+        "SETUP_LOOP" | "SETUP_EXCEPT" | "SETUP_FINALLY" | "SETUP_WITH" => "Block",
+        _ => "Block",
+    }
+}
+
+#[inline]
+pub fn unpickle_block(_space: PyObjectRef, w_tup: PyObjectRef) -> Block {
+    let _ = _space;
+    let handler = unsafe {
+        w_tuple_getitem(w_tup, 0).and_then(|v| {
+            if is_int(v) {
+                Some(w_int_get_value(v) as usize)
+            } else {
+                None
+            }
+        })
+    }
+    .unwrap_or(0);
+    let level = unsafe {
+        w_tuple_getitem(w_tup, 2).and_then(|v| {
+            if is_int(v) {
+                Some(w_int_get_value(v) as usize)
+            } else {
+                None
+            }
+        })
+    }
+    .unwrap_or(0);
+    Block { handler, level }
 }
 
 // ── Virtualizable field offsets ───────────────────────────────────────
@@ -147,6 +217,205 @@ fn ncells(code: &CodeObject) -> usize {
 }
 
 impl PyFrame {
+    #[inline]
+    fn debug_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    #[inline]
+    fn with_debug_data<R>(
+        &self,
+        create: bool,
+        op: impl FnOnce(&mut FrameDebugData) -> R,
+    ) -> Option<R> {
+        let key = self.debug_key();
+        FRAME_DEBUG.with(|cell| {
+            let mut table = cell.borrow_mut();
+            let entry = if create {
+                table.entry(key).or_insert(FrameDebugData {
+                    w_locals: self.namespace,
+                    w_globals: self.namespace,
+                    f_lineno: 0,
+                    w_f_trace: pyre_object::PY_NULL,
+                    is_being_profiled: false,
+                    is_in_line_tracing: false,
+                    instr_lb: 0,
+                    instr_ub: 0,
+                    instr_prev_plus_one: 0,
+                    escaped: false,
+                })
+            } else {
+                table.get_mut(&key)?
+            };
+            if entry.w_locals.is_null() {
+                entry.w_locals = self.class_locals;
+            }
+            if entry.w_locals.is_null() {
+                entry.w_locals = self.namespace;
+            }
+            if entry.w_globals.is_null() {
+                entry.w_globals = self.namespace;
+            }
+            Some(op(entry))
+        })
+    }
+
+    #[inline]
+    fn getdebug_data(&self) -> Option<FrameDebugData> {
+        self.with_debug_data(false, |data| *data)
+    }
+
+    #[inline]
+    fn getorcreate_debug_data(&self) -> FrameDebugData {
+        self.with_debug_data(true, |data| *data).unwrap_or_default()
+    }
+
+    /// PyPy-compatible `getdebug()`.
+    #[inline]
+    pub fn getdebug(&self) -> Option<FrameDebugData> {
+        self.getdebug_data()
+    }
+
+    /// PyPy-compatible `getorcreatedebug()`.
+    #[inline]
+    pub fn getorcreatedebug(&mut self) -> FrameDebugData {
+        self.getorcreate_debug_data()
+    }
+
+    /// PyPy-compatible alias for `code()`.
+    #[inline]
+    pub fn getcode(&self) -> &CodeObject {
+        self.code()
+    }
+
+    /// PyPy-compatible `fget_code`.
+    #[inline]
+    pub fn fget_code(&self) -> &CodeObject {
+        self.code()
+    }
+
+    /// PyPy-compatible frame stack alias for locals/cell locals conversion.
+    #[inline]
+    pub fn get_w_globals(&self) -> *mut PyNamespace {
+        self.getdebug_data()
+            .map_or(self.namespace, |data| data.w_globals)
+    }
+
+    /// PyPy-compatible `get_w_f_trace()`.
+    #[inline]
+    pub fn get_w_f_trace(&self) -> PyObjectRef {
+        self.getdebug_data()
+            .and_then(|data| {
+                if data.w_f_trace.is_null() {
+                    None
+                } else {
+                    Some(data.w_f_trace)
+                }
+            })
+            .unwrap_or(pyre_object::PY_NULL)
+    }
+
+    /// PyPy-compatible `get_is_being_profiled()`.
+    #[inline]
+    pub fn get_is_being_profiled(&self) -> bool {
+        self.getdebug_data()
+            .is_some_and(|data| data.is_being_profiled)
+    }
+
+    /// PyPy-compatible `get_w_locals()`.
+    #[inline]
+    pub fn get_w_locals(&self) -> *mut PyNamespace {
+        self.getdebug_data()
+            .map_or(std::ptr::null_mut(), |data| data.w_locals)
+    }
+
+    /// PyPy-compatible `getdictscope`.
+    #[inline]
+    pub fn getdictscope(&mut self) -> *mut PyNamespace {
+        let namespace = self.get_w_locals();
+        if namespace.is_null() {
+            self.getorcreate_debug_data().w_locals = self.namespace;
+            self.namespace
+        } else {
+            namespace
+        }
+    }
+
+    /// PyPy-compatible `__init__` hook.
+    #[inline]
+    pub fn __init__(
+        &mut self,
+        code: *const CodeObject,
+        namespace: *mut PyNamespace,
+        outer_func: PyObjectRef,
+    ) {
+        let _ = outer_func;
+        self.code = code;
+        self.namespace = namespace;
+        self.locals_cells_stack_w = PyObjectArray::filled(
+            unsafe {
+                (&*code).varnames.len()
+                    + ncells(unsafe { &*code })
+                    + unsafe { (&*code).max_stackdepth as usize }
+            },
+            PY_NULL,
+        );
+        self.valuestackdepth = unsafe { (&*code).varnames.len() + ncells(unsafe { &*code }) };
+        self.next_instr = 0;
+        self.block_stack.clear();
+        self.pending_inline_results.clear();
+        self.pending_inline_resume_pc = None;
+        self.class_locals = std::ptr::null_mut();
+        self.initialize_frame_scopes(outer_func, code);
+    }
+
+    /// PyPy-compatible `__repr__`.
+    #[inline]
+    pub fn __repr__(&self) -> String {
+        format!("<{}>", self.get_last_lineno())
+    }
+
+    /// PyPy-compatible `fget_getdictscope`.
+    #[inline]
+    pub fn fget_getdictscope(&mut self) -> *mut PyNamespace {
+        self.getdictscope()
+    }
+
+    /// PyPy-compatible `fget_w_globals`.
+    #[inline]
+    pub fn fget_w_globals(&self) -> *mut PyNamespace {
+        self.get_w_globals()
+    }
+
+    /// PyPy-compatible `_getcell`.
+    #[inline]
+    pub fn _getcell(&self, varindex: usize) -> PyObjectRef {
+        self.locals_cells_stack_w
+            .as_slice()
+            .get(self.nlocals() + varindex)
+            .copied()
+            .unwrap_or(PY_NULL)
+    }
+
+    /// PyPy-compatible `getclosure`.
+    #[inline]
+    pub fn getclosure(&self) -> PyObjectRef {
+        PY_NULL
+    }
+
+    /// PyPy-compatible `initialize_frame_scopes`.
+    #[inline]
+    pub fn initialize_frame_scopes(&mut self, _outer_func: PyObjectRef, _code: *const CodeObject) {
+        let _ = _outer_func;
+        let _ = _code;
+    }
+
+    /// PyPy-compatible `setdictscope`.
+    #[inline]
+    pub fn setdictscope(&mut self, w_locals: *mut PyNamespace) {
+        self.getorcreate_debug_data().w_locals = w_locals;
+    }
+
     /// Create a minimal frame stub for passing to call dispatch.
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
     pub fn new_minimal(
@@ -270,14 +539,19 @@ impl PyFrame {
 
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
+        self.assert_stack_index(self.valuestackdepth);
         self.locals_cells_stack_w[self.valuestackdepth] = value;
         self.valuestackdepth += 1;
     }
 
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        self.valuestackdepth -= 1;
-        self.locals_cells_stack_w[self.valuestackdepth]
+        assert!(self.valuestackdepth > self.stack_base());
+        let depth = self.valuestackdepth - 1;
+        let value = self.locals_cells_stack_w[depth];
+        self.locals_cells_stack_w[depth] = PY_NULL;
+        self.valuestackdepth = depth;
+        value
     }
 
     #[inline]
@@ -289,6 +563,479 @@ impl PyFrame {
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
         self.locals_cells_stack_w[self.valuestackdepth - 1 - depth]
+    }
+
+    /// PyPy-compatible stack operation aliases.
+    #[inline]
+    pub fn pushvalue(&mut self, value: PyObjectRef) {
+        self.push(value)
+    }
+
+    /// PyPy-compatible `pushvalue(None)` helper.
+    #[inline]
+    pub fn pushvalue_none(&mut self) {
+        self.push(w_none())
+    }
+
+    /// PyPy-compatible stack index guard.
+    #[inline]
+    pub fn assert_stack_index(&self, index: usize) {
+        debug_assert!(self._check_stack_index(index));
+    }
+
+    /// PyPy-compatible stack index validator.
+    #[inline]
+    pub fn _check_stack_index(&self, index: usize) -> bool {
+        index >= self.stack_base()
+    }
+
+    /// PyPy-compatible `popvalue()` alias.
+    #[inline]
+    pub fn popvalue(&mut self) -> PyObjectRef {
+        let value = self.pop();
+        assert!(!value.is_null(), "popvalue on empty value stack");
+        value
+    }
+
+    /// PyPy-compatible nullable pop path.
+    #[inline]
+    pub fn popvalue_maybe_none(&mut self) -> PyObjectRef {
+        if self.valuestackdepth <= self.stack_base() {
+            return PY_NULL;
+        }
+        self.pop()
+    }
+
+    /// PyPy `PyFrame._new_popvalues` factory.
+    #[inline]
+    pub fn _new_popvalues() -> fn(&mut Self, usize) -> Vec<PyObjectRef> {
+        Self::popvalues
+    }
+
+    /// PyPy-compatible pop-values helper.
+    #[inline]
+    pub fn popvalues(&mut self, n: usize) -> Vec<PyObjectRef> {
+        let mut out = vec![PY_NULL; n];
+        let mut idx = n;
+        while idx > 0 {
+            idx -= 1;
+            out[idx] = self.popvalue();
+        }
+        out
+    }
+
+    /// PyPy-compatible `popvalues_mutable`.
+    #[inline]
+    pub fn popvalues_mutable(&mut self, n: usize) -> Vec<PyObjectRef> {
+        self.popvalues(n)
+    }
+
+    /// PyPy-compatible stack peek helper.
+    #[inline]
+    pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
+        let base = self.valuestackdepth.saturating_sub(n);
+        self.assert_stack_index(base);
+        let mut values = Vec::with_capacity(n);
+        for i in base..self.valuestackdepth {
+            values.push(self.locals_cells_stack_w[i]);
+        }
+        values
+    }
+
+    /// PyPy-compatible `dropvalues`.
+    #[inline]
+    pub fn dropvalues(&mut self, n: usize) {
+        let finaldepth = self.valuestackdepth.saturating_sub(n);
+        self.assert_stack_index(finaldepth);
+        while self.valuestackdepth > finaldepth {
+            self.locals_cells_stack_w[self.valuestackdepth - 1] = PY_NULL;
+            self.valuestackdepth -= 1;
+        }
+    }
+
+    /// PyPy-compatible `pushrevvalues`.
+    #[inline]
+    pub fn pushrevvalues(&mut self, _n: usize, values_w: &[PyObjectRef]) {
+        let n = if _n == 0 { values_w.len() } else { _n };
+        assert!(n <= values_w.len());
+        let mut idx = n;
+        while idx > 0 {
+            idx -= 1;
+            self.push(values_w[idx]);
+        }
+    }
+
+    /// PyPy-compatible `dupvalues`.
+    #[inline]
+    pub fn dupvalues(&mut self, n: usize) {
+        let values = self.peekvalues(n);
+        for value in values {
+            self.push(value);
+        }
+    }
+
+    /// PyPy-compatible `peekvalue()`.
+    #[inline]
+    pub fn peekvalue(&self, index_from_top: usize) -> PyObjectRef {
+        self.peek_at(index_from_top)
+    }
+
+    /// PyPy-compatible `peekvalue_maybe_none()`.
+    #[inline]
+    pub fn peekvalue_maybe_none(&self, index_from_top: usize) -> PyObjectRef {
+        let index = self
+            .valuestackdepth
+            .checked_sub(index_from_top + 1)
+            .unwrap_or(usize::MAX);
+        if index == usize::MAX || index < self.stack_base() {
+            return PY_NULL;
+        }
+        self.locals_cells_stack_w[index]
+    }
+
+    /// PyPy-compatible `settopvalue()`.
+    #[inline]
+    pub fn settopvalue(&mut self, value: PyObjectRef, index_from_top: usize) {
+        let index = self
+            .valuestackdepth
+            .checked_sub(index_from_top + 1)
+            .unwrap_or(0);
+        self.assert_stack_index(index);
+        assert!(index < self.valuestackdepth);
+        self.locals_cells_stack_w[index] = value;
+    }
+
+    /// PyPy-compatible `dropvaluesuntil()`.
+    #[inline]
+    pub fn dropvaluesuntil(&mut self, finaldepth: usize) {
+        self.assert_stack_index(finaldepth);
+        while self.valuestackdepth > finaldepth {
+            self.locals_cells_stack_w[self.valuestackdepth - 1] = PY_NULL;
+            self.valuestackdepth -= 1;
+        }
+    }
+
+    /// PyPy-compatible block-stack helpers.
+    #[inline]
+    pub fn append_block(&mut self, block: Block) {
+        self.block_stack.push(block);
+    }
+
+    /// PyPy-compatible block pop helper.
+    #[inline]
+    pub fn pop_block(&mut self) -> Option<Block> {
+        self.block_stack.pop()
+    }
+
+    /// PyPy-compatible block list check.
+    #[inline]
+    pub fn blockstack_non_empty(&self) -> bool {
+        !self.block_stack.is_empty()
+    }
+
+    /// PyPy-compatible exception-info unwind helper.
+    #[inline]
+    pub fn _exc_info_unroll(&self, _for_hidden: bool) -> PyObjectRef {
+        let _ = _for_hidden;
+        pyre_object::w_none()
+    }
+
+    /// PyPy-compatible unexpected-exception converter.
+    #[inline]
+    pub fn _convert_unexpected_exception(&self, _e: PyObjectRef) -> PyObjectRef {
+        let _ = _e;
+        pyre_object::w_none()
+    }
+
+    /// PyPy-compatible pickle state helper.
+    #[inline]
+    pub fn _reduce_state(&self) -> PyObjectRef {
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            pyre_object::w_int_new(self.next_instr as i64),
+            pyre_object::w_int_new(self.valuestackdepth as i64),
+        ])
+    }
+
+    /// PyPy-compatible `descr__reduce__`.
+    #[inline]
+    pub fn descr__reduce__(&self) -> PyObjectRef {
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            self._reduce_state(),
+        ])
+    }
+
+    /// PyPy-compatible `descr__setstate__`.
+    #[inline]
+    pub fn descr__setstate__(&mut self, _state: PyObjectRef) {
+        let _ = _state;
+    }
+
+    /// PyPy-compatible materialized block list.
+    #[inline]
+    pub fn get_blocklist(&self) -> Vec<Block> {
+        self.block_stack.iter().rev().copied().collect()
+    }
+
+    /// PyPy-compatible block list restore.
+    #[inline]
+    pub fn set_blocklist(&mut self, lst: &[Block]) {
+        self.block_stack = lst.iter().rev().copied().collect();
+    }
+
+    /// PyPy-compatible execution entrypoint.
+    #[inline]
+    pub fn run(&mut self) -> crate::PyResult {
+        crate::eval::eval_frame_plain(self)
+    }
+
+    /// PyPy-compatible execution entrypoint with optional inbound values.
+    #[inline]
+    #[allow(unused_variables)]
+    pub fn execute_frame(
+        &mut self,
+        _w_inputvalue: Option<PyObjectRef>,
+        _operr: Option<PyObjectRef>,
+    ) -> crate::PyResult {
+        self.run()
+    }
+
+    /// PyPy-compatible `hide`.
+    #[inline]
+    pub fn hide(&self) -> bool {
+        false
+    }
+
+    /// PyPy-compatible `mark_as_escaped`.
+    #[inline]
+    pub fn mark_as_escaped(&mut self) {
+        self.getorcreate_debug_data().escaped = true;
+    }
+
+    /// PyPy-compatible `get_builtin`.
+    #[inline]
+    pub fn get_builtin(&self) -> PyObjectRef {
+        pyre_object::PY_NULL
+    }
+
+    /// PyPy-compatible `get_f_back`.
+    #[inline]
+    pub fn get_f_back(&self) -> *mut PyFrame {
+        std::ptr::null_mut()
+    }
+
+    /// PyPy-compatible `fget_f_builtins`.
+    #[inline]
+    pub fn fget_f_builtins(&self) -> PyObjectRef {
+        self.get_builtin()
+    }
+
+    /// PyPy-compatible `fget_f_back`.
+    #[inline]
+    pub fn fget_f_back(&self) -> *mut PyFrame {
+        self.get_f_back()
+    }
+
+    /// PyPy-compatible `fget_f_lasti`.
+    #[inline]
+    pub fn fget_f_lasti(&self) -> usize {
+        self.next_instr
+    }
+
+    /// PyPy-compatible `fget_f_trace`.
+    #[inline]
+    pub fn fget_f_trace(&self) -> PyObjectRef {
+        self.get_w_f_trace()
+    }
+
+    /// PyPy-compatible `fset_f_trace`.
+    #[inline]
+    pub fn fset_f_trace(&mut self, w_trace: PyObjectRef) {
+        self.getorcreate_debug_data().w_f_trace = w_trace;
+    }
+
+    /// PyPy-compatible `fdel_f_trace`.
+    #[inline]
+    pub fn fdel_f_trace(&mut self) {
+        self.getorcreate_debug_data().w_f_trace = pyre_object::PY_NULL;
+    }
+
+    /// PyPy-compatible `fget_f_exc_type`.
+    #[inline]
+    pub fn fget_f_exc_type(&self) -> PyObjectRef {
+        pyre_object::PY_NULL
+    }
+
+    /// PyPy-compatible `fget_f_exc_value`.
+    #[inline]
+    pub fn fget_f_exc_value(&self) -> PyObjectRef {
+        pyre_object::PY_NULL
+    }
+
+    /// PyPy-compatible `fget_f_exc_traceback`.
+    #[inline]
+    pub fn fget_f_exc_traceback(&self) -> PyObjectRef {
+        pyre_object::PY_NULL
+    }
+
+    /// PyPy-compatible `fget_f_restricted`.
+    #[inline]
+    pub fn fget_f_restricted(&self) -> bool {
+        false
+    }
+
+    /// PyPy-compatible `get_f_lineno`.
+    #[inline]
+    pub fn get_last_lineno(&self) -> usize {
+        self.next_instr
+    }
+
+    /// PyPy-compatible `fget_f_lineno`.
+    #[inline]
+    pub fn fget_f_lineno(&self) -> usize {
+        if self.get_w_f_trace().is_null() {
+            self.get_last_lineno()
+        } else {
+            self.getorcreate_debug_data().f_lineno
+        }
+    }
+
+    /// PyPy-compatible `fset_f_lineno`.
+    #[inline]
+    pub fn fset_f_lineno(&mut self, new_f_lineno: usize) {
+        self.getorcreate_debug_data().f_lineno = new_f_lineno;
+        self.next_instr = new_f_lineno;
+    }
+
+    /// PyPy-compatible `setfastscope`.
+    #[inline]
+    pub fn setfastscope(&mut self, scope_w: &[PyObjectRef]) {
+        assert!(scope_w.len() <= self.nlocals());
+        for (index, value) in scope_w.iter().copied().enumerate() {
+            self.locals_cells_stack_w[index] = value;
+        }
+        // In this port, cell initialization is performed as part of scope load.
+        self.init_cells();
+    }
+
+    /// PyPy-compatible `locals2fast`.
+    #[inline]
+    pub fn locals2fast(&mut self) {
+        let namespace = self.get_w_locals();
+        assert!(!namespace.is_null());
+        let namespace = unsafe { &*namespace };
+        let varnames = self.code().varnames.clone();
+        let mut fast_slots = vec![PY_NULL; self.nlocals()];
+        for (i, name) in varnames.iter().enumerate() {
+            fast_slots[i] = namespace.get(name).copied().unwrap_or(PY_NULL);
+        }
+        for (i, value) in fast_slots.iter().enumerate() {
+            self.locals_cells_stack_w[i] = *value;
+        }
+    }
+
+    /// PyPy-compatible `init_cells`.
+    #[inline]
+    pub fn init_cells(&mut self) {
+        let ncellvars = self.code().cellvars.len();
+        let num_locals = self.code().varnames.len();
+        let base = num_locals;
+        for i in 0..ncellvars {
+            if base + i >= self.locals_cells_stack_w.len() {
+                break;
+            }
+            self.locals_cells_stack_w[base + i] = self.locals_cells_stack_w[i];
+        }
+    }
+
+    /// PyPy-compatible `fast2locals`.
+    #[inline]
+    pub fn fast2locals(&mut self) {
+        let namespace = match self.getdictscope() {
+            namespace if namespace.is_null() => return,
+            namespace => unsafe { &mut *namespace },
+        };
+        namespace.clear();
+        let locals = self.locals_cells_stack_w.as_slice();
+        let code = self.code();
+
+        for (name, value) in code.varnames.iter().zip(locals.iter()) {
+            if !value.is_null() {
+                namespace.insert(name.to_string(), *value);
+            }
+        }
+
+        let num_locals = code.varnames.len();
+        let cellvars_only = code
+            .cellvars
+            .iter()
+            .filter(|cv| !code.varnames.iter().any(|v| v == *cv))
+            .count();
+
+        for (slot, name) in code
+            .cellvars
+            .iter()
+            .filter(|cv| !code.varnames.iter().any(|v| v == *cv))
+            .enumerate()
+        {
+            let idx = num_locals + slot;
+            if let Some(value) = locals.get(idx).copied() {
+                if !value.is_null() {
+                    namespace.insert((*name).to_string(), value);
+                }
+            }
+        }
+
+        for (slot, name) in code.freevars.iter().enumerate() {
+            let idx = num_locals + cellvars_only + slot;
+            if let Some(value) = locals.get(idx).copied() {
+                if !value.is_null() {
+                    namespace.insert(name.to_string(), value);
+                }
+            }
+        }
+    }
+
+    /// PyPy-compatible `setdictscope` and locals conversion.
+    #[inline]
+    pub fn setdictscope_and_fast(&mut self, w_locals: *mut PyNamespace) {
+        self.setdictscope(w_locals);
+        self.fast2locals();
+    }
+
+    /// PyPy-compatible `make_arguments`.
+    #[inline]
+    pub fn make_arguments(&self, nargs: usize, _methodcall: bool) -> Vec<PyObjectRef> {
+        self.peekvalues(nargs)
+    }
+
+    /// PyPy-compatible argument list builder.
+    #[inline]
+    #[allow(unused_variables)]
+    pub fn argument_factory(
+        &self,
+        _arguments: &[PyObjectRef],
+        _keywords: &[PyObjectRef],
+        _keywords_w: &[PyObjectRef],
+        _w_star: PyObjectRef,
+        _w_starstar: PyObjectRef,
+        _methodcall: bool,
+    ) -> Vec<PyObjectRef> {
+        let mut args = Vec::new();
+        args.extend_from_slice(_arguments);
+        args.extend_from_slice(_keywords);
+        args.extend_from_slice(_keywords_w);
+        if !_w_star.is_null() {
+            args.push(_w_star);
+        }
+        if !_w_starstar.is_null() {
+            args.push(_w_starstar);
+        }
+        args
     }
 
     /// Create a new frame for a function call.

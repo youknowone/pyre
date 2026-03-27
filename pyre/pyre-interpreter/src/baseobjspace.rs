@@ -21,6 +21,107 @@ pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
 
+/// Compatibility alias for PyPy's base-object type.
+/// PyPy frequently models interpreter values as subclasses of `W_Root`.
+pub type W_Root = PyObjectRef;
+
+/// Compatibility marker for a type mismatch in descriptor lookup.
+#[derive(Debug, Clone)]
+pub struct DescrMismatch;
+
+/// Compatibility marker for lock-sensitive APIs that are disabled under
+/// this no-GIL runtime.
+#[derive(Debug, Clone)]
+pub struct CannotHaveLock;
+
+/// Minimal compatibility placeholder for PyPy-style cache objects.
+#[derive(Debug, Default)]
+pub struct SpaceCache {
+    space: PyObjectRef,
+    _entries: RefCell<HashMap<usize, PyObjectRef>>,
+}
+
+impl SpaceCache {
+    pub fn new(space: PyObjectRef) -> Self {
+        Self {
+            space,
+            _entries: RefCell::new(HashMap::new()),
+        }
+    }
+
+    #[inline]
+    pub fn getorbuild(&self, _key: PyObjectRef) -> PyObjectRef {
+        std::ptr::null_mut()
+    }
+
+    #[inline]
+    pub fn ready(&self, _result: PyObjectRef) {}
+}
+
+/// Compatibility cache variant with `callable(self)` construction path.
+#[derive(Debug, Default)]
+pub struct InternalSpaceCache {
+    base: SpaceCache,
+}
+
+impl InternalSpaceCache {
+    pub fn new(space: PyObjectRef) -> Self {
+        Self {
+            base: SpaceCache::new(space),
+        }
+    }
+
+    #[inline]
+    pub fn getorbuild<F>(&self, f: F) -> PyObjectRef
+    where
+        F: FnOnce(PyObjectRef) -> PyObjectRef,
+    {
+        let _ = self.base.space;
+        f(std::ptr::null_mut())
+    }
+}
+
+/// Compatibility helper used by `ObjSpace` bootstrap in PyPy.
+#[derive(Debug, Default)]
+pub struct AppExecCache {
+    base: SpaceCache,
+}
+
+impl AppExecCache {
+    pub fn new(space: PyObjectRef) -> Self {
+        Self {
+            base: SpaceCache::new(space),
+        }
+    }
+
+    pub fn build(&self, _source: PyObjectRef) -> PyObjectRef {
+        let _ = self.base.space;
+        std::ptr::null_mut()
+    }
+}
+
+/// Very small compatibility object for PyPy's `ObjSpace` interface.
+/// The full object-space API is implemented as free functions in this module.
+#[derive(Debug, Default)]
+pub struct ObjSpace {
+    fromcache: Option<PyObjectRef>,
+}
+
+impl ObjSpace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn fromcache<T, F>(&self, mut build: F, cache: &SpaceCache) -> T
+    where
+        T: Default,
+        F: FnMut(&SpaceCache) -> T,
+    {
+        let _ = cache.getorbuild(std::ptr::null_mut());
+        build(cache)
+    }
+}
+
 // ── Cell unwrap ──────────────────────────────────────────────────────
 // CPython 3.13 unified locals+cells means LoadFast can return cell
 // objects. All operations must transparently unwrap cells.

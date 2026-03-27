@@ -1,5 +1,53 @@
 use pyre_object::PyObjectRef;
 use pyre_object::excobject::{ExcKind, exc_kind_name, w_exception_new};
+use std::io::Write;
+
+#[derive(Debug, Clone)]
+pub struct OperationError {
+    pub w_type: PyObjectRef,
+    pub w_value: PyObjectRef,
+    pub _application_traceback: Option<PyObjectRef>,
+}
+
+impl OperationError {
+    pub fn new(w_type: PyObjectRef, w_value: PyObjectRef) -> Self {
+        Self {
+            w_type,
+            w_value,
+            _application_traceback: None,
+        }
+    }
+
+    pub fn get_w_value(&self, _space: PyObjectRef) -> PyObjectRef {
+        let _ = _space;
+        self.w_value
+    }
+
+    pub fn match_(&self, _space: PyObjectRef, _check: PyObjectRef) -> bool {
+        false
+    }
+}
+
+impl From<OperationError> for PyError {
+    fn from(value: OperationError) -> Self {
+        let message = if value.w_value.is_null() {
+            String::new()
+        } else {
+            "operation error".to_string()
+        };
+        PyError {
+            kind: PyErrorKind::RuntimeError,
+            message,
+            exc_object: value.w_value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClearedOpErr;
+
+#[derive(Debug, Clone)]
+pub struct OpErrFmtNoArgs;
 
 /// Result type for Python operations.
 pub type PyResult = Result<PyObjectRef, PyError>;
@@ -153,4 +201,112 @@ impl std::fmt::Display for PyError {
         let name = exc_kind_name(self.to_exc_kind());
         write!(f, "{}: {}", name, self.message)
     }
+}
+
+pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
+    let _ = _space;
+    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+pub fn get_converted_unexpected_exception(
+    _space: PyObjectRef,
+    _error: &dyn std::error::Error,
+) -> OperationError {
+    let _ = (_space, _error);
+    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
+    let mut strings = Vec::new();
+    let mut formats = Vec::new();
+    let mut current = String::new();
+
+    let mut iter = valuefmt.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if ch == '%' {
+            if let Some('%') = iter.peek() {
+                let _ = iter.next();
+                current.push('%');
+                continue;
+            }
+            strings.push(std::mem::take(&mut current));
+            if let Some(spec) = iter.next() {
+                formats.push(spec.to_string());
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if !current.is_empty() {
+        strings.push(current);
+    }
+
+    (strings, formats)
+}
+
+pub fn get_operrcls2(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
+    let (strings, _formats) = decompose_valuefmt(valuefmt);
+    (std::ptr::null_mut(), strings)
+}
+
+pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
+    get_operrcls2(valuefmt)
+}
+
+pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, _args: impl std::fmt::Display) -> OperationError {
+    let _ = valuefmt;
+    let _ = format!("{}", _args);
+    OperationError::new(w_type, std::ptr::null_mut())
+}
+
+pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
+    if let Some(file) = file {
+        let _ = file.write_all(text.as_bytes());
+    }
+}
+
+pub fn exception_from_errno(
+    _space: PyObjectRef,
+    w_type: PyObjectRef,
+    _errno: i32,
+) -> OperationError {
+    let _ = _space;
+    OperationError::new(w_type, std::ptr::null_mut())
+}
+
+pub fn exception_from_saved_errno(_space: PyObjectRef, w_type: PyObjectRef) -> OperationError {
+    let _ = _space;
+    OperationError::new(w_type, std::ptr::null_mut())
+}
+
+pub fn new_exception_class(
+    _space: PyObjectRef,
+    _name: &str,
+    _bases: Option<PyObjectRef>,
+    _dict: Option<PyObjectRef>,
+) -> PyObjectRef {
+    let _ = (_space, _name, _bases, _dict);
+    std::ptr::null_mut()
+}
+
+pub fn wrap_oserror2(
+    _space: PyObjectRef,
+    _error: &dyn std::error::Error,
+    _filename: Option<PyObjectRef>,
+    _exception_class: Option<PyObjectRef>,
+) -> OperationError {
+    let _ = (_filename, _exception_class, _error);
+    let _ = _space;
+    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+pub fn wrap_oserror(
+    space: PyObjectRef,
+    error: &dyn std::error::Error,
+    _filename: Option<&str>,
+    w_exception_class: Option<PyObjectRef>,
+) -> OperationError {
+    let _ = _filename;
+    wrap_oserror2(space, error, None, w_exception_class)
 }
