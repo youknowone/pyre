@@ -137,9 +137,6 @@ pub struct OptContext {
     num_inputs: u32,
     /// Next unique op position for newly emitted or queued extra operations.
     pub(crate) next_pos: u32,
-    /// Phase 2 minimum position: reserve_pos() ensures next_pos >= this.
-    /// Used to prevent Phase 2 op positions from colliding with Phase 1.
-    phase2_min_pos: u32,
     /// Extra operations requested by the current pass. The optimizer drains
     /// these through the remaining downstream passes, matching RPython
     /// send_extra_operation()/emit_operation behavior.
@@ -360,7 +357,6 @@ impl OptContext {
             short_preamble_mapping: HashMap::new(),
             num_inputs: 0,
             next_pos: 0,
-            phase2_min_pos: 0,
             extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
             ptr_info: Vec::new(),
@@ -407,7 +403,6 @@ impl OptContext {
             short_preamble_mapping: HashMap::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
-            phase2_min_pos: 0,
             extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
             ptr_info: Vec::new(),
@@ -458,8 +453,7 @@ impl OptContext {
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
         self.next_pos = self
             .next_pos
-            .max(self.num_inputs + self.new_operations.len() as u32)
-            .max(self.phase2_min_pos);
+            .max(self.num_inputs + self.new_operations.len() as u32);
         while self
             .constants
             .get(self.next_pos as usize)
@@ -470,12 +464,6 @@ impl OptContext {
         let pos_ref = OpRef(self.next_pos);
         self.next_pos += 1;
         pos_ref
-    }
-
-    /// Set Phase 2 minimum position for new op allocation.
-    pub fn set_phase2_min_pos(&mut self, min_pos: u32) {
-        self.phase2_min_pos = min_pos;
-        self.next_pos = self.next_pos.max(min_pos);
     }
 
     /// Emit an operation to the output.
