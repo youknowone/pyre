@@ -1209,15 +1209,14 @@ fn restore_guard_failure_for_loop(
         }
     }
     // compile.py:783-784: jitcounter.tick(hash, increment).
-    // This is the counting point for guards reached via
-    // try_function_entry_jit → run_compiled_detailed path.
-    // The canonical tick is in handle_guard_failure_in_trace_with_savedata
-    // for guards reached via run_compiled_detailed_with_bridge_keyed.
+    // Use the same guard_hash as should_compile_bridge_in_trace
+    // (allocated via store_hash / fetch_next_hash). RPython uses
+    // one hash per guard across all paths.
     {
-        let guard_hash = (exit_layout.trace_id as u64)
-            .wrapping_mul(0x9E3779B97F4A7C15)
-            .wrapping_add(exit_layout.fail_index as u64);
         let (driver, _) = driver_pair();
+        let guard_hash = driver
+            .meta_interp_mut()
+            .guard_hash_for_trace(exit_layout.trace_id, exit_layout.fail_index);
         driver
             .meta_interp_mut()
             .warm_state_mut()

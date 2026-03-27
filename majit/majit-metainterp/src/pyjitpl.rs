@@ -3770,6 +3770,28 @@ impl<M: Clone> MetaInterp<M> {
         if would { self.trace_eagerness } else { 0 }
     }
 
+    /// compile.py:826-830: get the jitcounter hash for a guard.
+    /// Returns the hash allocated via store_hash (fetch_next_hash).
+    /// Looks up by trace_id across all compiled loops.
+    pub fn guard_hash_for_trace(&mut self, trace_id: u64, fail_index: u32) -> u64 {
+        // Find which compiled loop owns this trace_id.
+        for compiled in self.compiled_loops.values_mut() {
+            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+            if norm_tid == compiled.root_trace_id || compiled.traces.contains_key(&norm_tid) {
+                let info = compiled
+                    .guard_failures
+                    .entry((norm_tid, fail_index))
+                    .or_insert_with(|| GuardFailureInfo {
+                        guard_hash: self.warm_state.fetch_next_hash(),
+                        compiling: false,
+                    });
+                return info.guard_hash;
+            }
+        }
+        // Fallback: allocate a new hash.
+        self.warm_state.fetch_next_hash()
+    }
+
     // ── Call Assembler Support ──────────────────────────────────
 
     /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
