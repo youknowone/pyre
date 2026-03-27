@@ -682,6 +682,91 @@ impl WarmEnterState {
         self.function_threshold = threshold;
     }
 
+    /// RPython-compatible wrapper: set_param_threshold.
+    pub fn set_param_threshold(&mut self, threshold: u32) {
+        self.set_threshold(threshold);
+    }
+
+    /// RPython-compatible wrapper: set_param_trace_eagerness (alias bridge threshold).
+    pub fn set_param_trace_eagerness(&mut self, value: u32) {
+        self.set_bridge_threshold(value);
+    }
+
+    /// RPython-compatible wrapper: set_param_trace_limit.
+    pub fn set_param_trace_limit(&mut self, value: u32) {
+        self.set_trace_limit(value);
+    }
+
+    /// RPython-compatible wrapper: set_param_function_threshold.
+    pub fn set_param_function_threshold(&mut self, value: u32) {
+        self.set_function_threshold(value);
+    }
+
+    /// RPython-compatible wrapper: set_param_inlining.
+    pub fn set_param_inlining(&mut self, value: bool) {
+        self.inlining = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_disable_unrolling.
+    pub fn set_param_disable_unrolling(&mut self, value: u32) {
+        self.disable_unrolling_threshold = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_vec.
+    pub fn set_param_vec(&mut self, enabled: bool) {
+        self.vectorize = enabled;
+    }
+
+    /// Backward-compatible spelling: set_param_vec_all.
+    pub fn set_param_vec_all(&mut self, enabled: bool) {
+        self.vectorize = enabled;
+    }
+
+    /// RPython-compatible wrapper: set_param_vec_cost.
+    pub fn set_param_vec_cost(&mut self, value: u32) {
+        self.vec_cost = value;
+    }
+
+    /// RPython-compatible wrapper: set `max_unroll_recursion`.
+    pub fn set_param_max_unroll_recursion(&mut self, value: u32) {
+        self.max_unroll_recursion = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_max_inline_depth.
+    pub fn set_param_max_inline_depth(&mut self, value: u32) {
+        self.set_max_inline_depth(value);
+    }
+
+    /// RPython-compatible wrapper: set_param_retrace_limit.
+    pub fn set_param_retrace_limit(&mut self, value: u32) {
+        self.retrace_limit = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_max_retrace_guards.
+    pub fn set_param_max_retrace_guards(&mut self, value: u32) {
+        self.max_retrace_guards = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_max_unroll_loops.
+    pub fn set_param_max_unroll_loops(&mut self, value: u32) {
+        self.max_unroll_loops = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_loop_longevity.
+    pub fn set_param_loop_longevity(&mut self, value: u32) {
+        self.loop_longevity = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_pureop_historylength.
+    pub fn set_param_pureop_historylength(&mut self, value: u32) {
+        self.pureop_historylength = value;
+    }
+
+    /// RPython-compatible wrapper: set_param_decay.
+    pub fn set_param_decay(&mut self, value: u32) {
+        self.decay = value;
+    }
+
     /// Set the maximum inline depth.
     pub fn set_max_inline_depth(&mut self, depth: u32) {
         self.max_inline_depth = depth;

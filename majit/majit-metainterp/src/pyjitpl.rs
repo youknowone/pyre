@@ -1495,6 +1495,11 @@ impl<M: Clone> MetaInterp<M> {
         Some((trace, constants))
     }
 
+    /// RPython-compatible helper name from compile.py.
+    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        self.compile_loop(jump_args, meta)
+    }
+
     /// Close the current trace, optimize, and compile.
     ///
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
@@ -4072,6 +4077,17 @@ impl<M: Clone> MetaInterp<M> {
             }
             _ => BridgeCompileResult::Failed,
         }
+    }
+
+    /// RPython-compatible helper name from compile.py.
+    pub fn send_bridge_to_backend(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        finish_args: &[OpRef],
+    ) -> BridgeCompileResult {
+        self.close_bridge(green_key, trace_id, fail_index, finish_args)
     }
 
     /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
