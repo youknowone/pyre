@@ -1140,6 +1140,11 @@ impl<S: JitState> JitDriver<S> {
         values
     }
 
+    /// warmstate.py:482-511: extend live values with virtualizable fields
+    /// when the compiled loop expects more inputs than currently available.
+    /// RPython always has jitdriver_sd available; pyre may have descriptor=None
+    /// when re-entering from guard failure, so fall back to virtualizable_info
+    /// directly.
     fn extend_compiled_live_values(
         &self,
         green_key: u64,
@@ -1152,11 +1157,14 @@ impl<S: JitState> JitDriver<S> {
         if compiled_inputs <= live_values.len() {
             return Some(live_values);
         }
-        let descriptor = descriptor?;
-        let virtualizable = descriptor.virtualizable()?;
+        // Try descriptor path first (RPython jitdriver_sd.virtualizable).
+        let vable_name = descriptor
+            .and_then(|d| d.virtualizable())
+            .map(|v| v.name.clone());
+        // Fall back to virtualizable_info's default name if no descriptor.
         let info = self.meta.virtualizable_info()?;
-        let (static_boxes, array_boxes) =
-            state.export_virtualizable_boxes(meta, &virtualizable.name, info)?;
+        let name = vable_name.unwrap_or_else(|| "frame".to_string());
+        let (static_boxes, array_boxes) = state.export_virtualizable_boxes(meta, &name, info)?;
         let extra_values = Self::flatten_virtualizable_values(info, &static_boxes, &array_boxes);
         if live_values.len() + extra_values.len() != compiled_inputs {
             return None;
