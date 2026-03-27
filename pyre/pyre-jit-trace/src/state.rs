@@ -4985,6 +4985,11 @@ impl MIFrame {
 
             // pyjitpl.py:2506 finishframe_exception: unwind stack to handler,
             // push exception, continue tracing at handler_pc.
+            // Gated: bridge virtual handling needs optimizer force_virtual
+            // for virtual JUMP args in jump_to_preamble fallback path.
+            if !crate::exc_trace_enabled() {
+                return TraceAction::Abort;
+            }
             let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
             let nlocals = self.sym().nlocals;
             let target_stack_len = ncells + handler_depth;

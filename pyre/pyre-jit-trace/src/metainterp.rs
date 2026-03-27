@@ -485,6 +485,9 @@ impl PyreMetaInterp {
     ///
     /// Returns Some(LoopAction) if handled, None if all frames exhausted.
     fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
+        if !crate::exc_trace_enabled() {
+            return None;
+        }
         // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
             let code = unsafe { &*top.jitcode };
