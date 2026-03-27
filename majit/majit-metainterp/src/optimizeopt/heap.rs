@@ -2310,10 +2310,11 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // force_all_lazy_setfields at Jump drops lazy sets (RPython: emit_extra(emit=False)
-        // re-absorbs as lazy_set → lost). Only Jump remains.
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].opcode, OpCode::Jump);
+        // force_all_lazy_setfields emits the lazy SetfieldGc before Jump.
+        // GetfieldGcI is eliminated (replaced by cached i1). SetfieldGc + Jump.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     #[test]
@@ -2418,9 +2419,10 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // force_all_lazy at Jump drops lazy sets. Only Jump remains.
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].opcode, OpCode::Jump);
+        // First SetfieldGc is dead (overwritten). Second is emitted as lazy set before Jump.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::Jump);
     }
 
     // ── Test 4: SETFIELD then CALL then GETFIELD → cache invalidated ──
@@ -2439,12 +2441,13 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // force_all_lazy at call drops lazy sets + invalidates caches.
-        // CALL + GETFIELD (re-emitted, cache was invalidated) + Jump.
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].opcode, OpCode::CallN);
-        assert_eq!(result[1].opcode, OpCode::GetfieldGcI);
-        assert_eq!(result[2].opcode, OpCode::Jump);
+        // force_all_lazy at call emits SetfieldGc + invalidates caches.
+        // SetfieldGc + CALL + GETFIELD (re-emitted, cache was invalidated) + Jump.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::CallN);
+        assert_eq!(result[2].opcode, OpCode::GetfieldGcI);
+        assert_eq!(result[3].opcode, OpCode::Jump);
     }
 
     // ── Test 5: SETFIELD on different objects → both cached independently ──
@@ -2640,10 +2643,11 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // GETFIELD (emitted, different descriptor) + Jump (lazy set d0 dropped).
-        assert_eq!(result.len(), 2);
+        // SetfieldGc(d0) emitted as lazy set + GETFIELD(d1, different descriptor) + Jump.
+        assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
-        assert_eq!(result[1].opcode, OpCode::Jump);
+        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[2].opcode, OpCode::Jump);
     }
 
     // ── Test 10: SETFIELD_RAW does not affect GC caches ──
@@ -2832,10 +2836,11 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // force_all_lazy at Jump drops both lazy sets. Both GETFIELDs eliminated.
-        // Only Jump remains.
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].opcode, OpCode::Jump);
+        // Both GETFIELDs eliminated (cached). Both lazy SetfieldGc emitted before Jump.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[2].opcode, OpCode::Jump);
     }
 
     // ── Green field optimization tests ──
@@ -4297,10 +4302,11 @@ mod tests {
         ];
         let result = run_heap_opt(&mut ops);
 
-        // force_all_lazy_setfields at GcLoadI drops lazy sets. GcLoadI + Jump.
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].opcode, OpCode::GcLoadI);
-        assert_eq!(result[1].opcode, OpCode::Jump);
+        // force_all_lazy_setfields at GcLoadI emits lazy SetfieldGc. SetfieldGc + GcLoadI + Jump.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::GcLoadI);
+        assert_eq!(result[2].opcode, OpCode::Jump);
     }
 
     // ── Test 51: GC_LOAD marks base as nonnull ──

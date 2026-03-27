@@ -940,13 +940,12 @@ impl OptContext {
             if let Some(ref fa) = op.fail_args {
                 let fa_len = fa.len();
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
-                ns.append_int(0);
-                ns.append_int(fa_len as i32);
-                ns.append_int(0);
-                ns.append_int(0);
-                ns.append_int(0);
-                ns.append_int(0);
-                ns.append_int(fa_len as i32);
+                ns.append_int(0); // slot 0: size (patched)
+                ns.append_int(fa_len as i32); // slot 1: num_failargs
+                ns.append_int(0); // vable_array len
+                ns.append_int(0); // vref_array len
+                ns.append_int(0); // jitcode_index
+                ns.append_int(0); // pc
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         ns.append_short(resumedata::NULLREF);
