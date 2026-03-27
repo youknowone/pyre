@@ -500,15 +500,6 @@ fn execute_assembler(
         restore_guard_failure_for_loop,
     );
 
-    // warmstate.py:410-421: handle fail_descr outcomes
-    let bridge_request = match &outcome {
-        DetailedDriverRunOutcome::GuardFailure {
-            bridge_request: Some(req),
-            ..
-        } => Some(req.clone()),
-        _ => None,
-    };
-
     if majit_metainterp::majit_log_enabled() {
         let kind = match &outcome {
             DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -523,7 +514,27 @@ fn execute_assembler(
         );
     }
 
-    let result = match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+    // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
+    // If must_compile → _trace_and_compile_from_bridge, else resume_in_blackhole.
+    if let DetailedDriverRunOutcome::GuardFailure {
+        bridge_request: Some(req),
+        ..
+    } = &outcome
+    {
+        crate::call_jit::jit_bridge_compile_for_guard(
+            req.green_key,
+            req.trace_id,
+            req.fail_index,
+            frame,
+            req.resume_pc,
+        );
+        // RPython: handle_fail raises ContinueRunningNormally after bridge.
+        // eval_loop_jit restarts → compiled code re-entered with bridge active.
+        return Some(LoopResult::ContinueRunningNormally);
+    }
+
+    // warmstate.py:410-421: no bridge → handle fail_descr outcomes (blackhole)
+    match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
         JitAction::Return(result) => Some(LoopResult::Done(result)),
         JitAction::ContinueRunningNormally => {
             // compile.py:710 handle_fail → resume_in_blackhole
@@ -543,20 +554,7 @@ fn execute_assembler(
             }
         }
         JitAction::Continue => None,
-    };
-
-    // compile.py handle_fail → _trace_and_compile_from_bridge
-    if let Some(req) = bridge_request {
-        crate::call_jit::jit_bridge_compile_for_guard(
-            req.green_key,
-            req.trace_id,
-            req.fail_index,
-            frame,
-            req.resume_pc,
-        );
     }
-
-    result
 }
 
 /// RPython warmstate.py:425-444 bound_reached.
@@ -786,50 +784,28 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             || {},
             restore_guard_failure_for_loop,
         );
-        // RPython compile.py handle_fail parity: extract bridge request
-        // before consuming outcome. The jitdriver returns the request
-        // (instead of compiling inline) so we can compile AFTER the
-        // driver borrow is released — matching RPython where handle_fail
-        // creates a fresh MetaInterp separate from the execution loop.
-        let bridge_request = match &outcome {
-            DetailedDriverRunOutcome::GuardFailure {
-                bridge_request: Some(req),
-                ..
-            } => Some(req.clone()),
-            _ => None,
-        };
-
-        {
-            if majit_metainterp::majit_log_enabled() {
-                let kind = match &outcome {
-                    DetailedDriverRunOutcome::Finished { .. } => "finished",
-                    DetailedDriverRunOutcome::Jump { .. } => "jump",
-                    DetailedDriverRunOutcome::Abort { .. } => "abort",
-                    DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-                        "guard-restored"
-                    }
-                    DetailedDriverRunOutcome::GuardFailure {
-                        restored: false, ..
-                    } => "guard-unrestored",
-                };
-                eprintln!(
-                    "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
-                    green_key,
-                    debug_first_arg_int(frame),
-                    kind
-                );
-            }
-            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-                JitAction::Return(result) => return Some(result),
-                JitAction::ContinueRunningNormally | JitAction::Continue => {}
-            }
+        if majit_metainterp::majit_log_enabled() {
+            let kind = match &outcome {
+                DetailedDriverRunOutcome::Finished { .. } => "finished",
+                DetailedDriverRunOutcome::Jump { .. } => "jump",
+                DetailedDriverRunOutcome::Abort { .. } => "abort",
+                DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
+                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
+            };
+            eprintln!(
+                "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
+                green_key,
+                debug_first_arg_int(frame),
+                kind
+            );
         }
 
-        // RPython compile.py handle_fail → _trace_and_compile_from_bridge:
-        // Bridge compilation happens HERE — after the jitdriver returns and
-        // its &mut borrow is released. jit_bridge_compile_for_guard accesses
-        // the driver via TLS (safe: no concurrent borrow).
-        if let Some(req) = bridge_request {
+        // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
+        if let DetailedDriverRunOutcome::GuardFailure {
+            bridge_request: Some(req),
+            ..
+        } = &outcome
+        {
             crate::call_jit::jit_bridge_compile_for_guard(
                 req.green_key,
                 req.trace_id,
@@ -837,6 +813,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 frame,
                 req.resume_pc,
             );
+            frame.fix_array_ptrs();
+            return None; // caller re-enters eval_with_jit → compiled code with bridge
+        }
+
+        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            JitAction::Return(result) => return Some(result),
+            JitAction::ContinueRunningNormally | JitAction::Continue => {}
         }
 
         // After compiled code guard-restored fallback, re-establish the
@@ -1236,9 +1219,10 @@ fn restore_guard_failure_for_loop(
     }
 
     // RPython compile.py:701 handle_fail → _trace_and_compile_from_bridge.
-    // Bridge compilation is handled at the eval_loop_jit / try_function_entry_jit
-    // level (where frame is available). This callback only restores state;
-    // consume the pending request so it doesn't leak to the next guard failure.
+    // This callback only restores state; bridge compilation runs synchronously
+    // in execute_assembler/try_function_entry_jit BEFORE blackhole resumption
+    // (RPython handle_fail parity: bridge replaces blackhole).
+    // Consume the pending request so it doesn't leak to the next guard failure.
     crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
