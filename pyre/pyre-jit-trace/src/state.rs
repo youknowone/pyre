@@ -11,7 +11,7 @@ use majit_metainterp::{
 };
 
 use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
-use pyre_interpreter::frame::PendingInlineResult;
+use pyre_interpreter::pyframe::PendingInlineResult;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
@@ -1279,7 +1279,7 @@ impl PyreSym {
             .collect();
         // Extract frame metadata pointers for use without concrete_frame
         if concrete_frame != 0 {
-            let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::frame::PyFrame) };
+            let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.concrete_code = frame.code;
             self.concrete_namespace = frame.namespace;
             self.concrete_execution_context = frame.execution_context;
@@ -2634,12 +2634,13 @@ impl MIFrame {
             return Ok(FrontendOp::new(opref, ConcreteValue::Null));
         }
         // MIFrame Box tracking: compute concrete subscr result
-        let subscr_concrete =
-            if let Ok(result) = pyre_interpreter::space::py_getitem(concrete_obj, concrete_key) {
-                ConcreteValue::from_pyobj(result)
-            } else {
-                ConcreteValue::Null
-            };
+        let subscr_concrete = if let Ok(result) =
+            pyre_interpreter::baseobjspace::py_getitem(concrete_obj, concrete_key)
+        {
+            ConcreteValue::from_pyobj(result)
+        } else {
+            ConcreteValue::Null
+        };
 
         unsafe {
             if is_int(concrete_key) {
@@ -4203,7 +4204,7 @@ impl MIFrame {
         callee_key: u64,
         passed_concrete_args: &[PyObjectRef],
     ) -> Result<PendingInlineFrame, PyError> {
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         self.with_ctx(|this, ctx| {
             this.guard_value_ref(ctx, callable, concrete_callable as i64);
@@ -5376,7 +5377,7 @@ impl SharedOpcodeHandler for MIFrame {
         let mut result_concrete = ConcreteValue::Null;
         let c_obj = obj.concrete.to_pyobj();
         if !c_obj.is_null() {
-            if let Ok(result) = pyre_interpreter::space::py_getattr(c_obj, name) {
+            if let Ok(result) = pyre_interpreter::baseobjspace::py_getattr(c_obj, name) {
                 result_concrete = ConcreteValue::from_pyobj(result);
             }
         }
@@ -5804,13 +5805,13 @@ impl ArithmeticOpcodeHandler for MIFrame {
         if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
             let result = match op {
                 BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-                    pyre_interpreter::space::py_add(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::py_add(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                    pyre_interpreter::space::py_sub(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::py_sub(lhs_obj, rhs_obj)
                 }
                 BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                    pyre_interpreter::space::py_mul(lhs_obj, rhs_obj)
+                    pyre_interpreter::baseobjspace::py_mul(lhs_obj, rhs_obj)
                 }
                 _ => Err(pyre_interpreter::PyError::type_error("unsupported")),
             };
@@ -5899,14 +5900,14 @@ impl ArithmeticOpcodeHandler for MIFrame {
         }
         if result_concrete.is_null() && !lhs_obj.is_null() && !rhs_obj.is_null() {
             let cmp_op = match op {
-                ComparisonOperator::Less => pyre_interpreter::space::CompareOp::Lt,
-                ComparisonOperator::LessOrEqual => pyre_interpreter::space::CompareOp::Le,
-                ComparisonOperator::Greater => pyre_interpreter::space::CompareOp::Gt,
-                ComparisonOperator::GreaterOrEqual => pyre_interpreter::space::CompareOp::Ge,
-                ComparisonOperator::Equal => pyre_interpreter::space::CompareOp::Eq,
-                ComparisonOperator::NotEqual => pyre_interpreter::space::CompareOp::Ne,
+                ComparisonOperator::Less => pyre_interpreter::baseobjspace::CompareOp::Lt,
+                ComparisonOperator::LessOrEqual => pyre_interpreter::baseobjspace::CompareOp::Le,
+                ComparisonOperator::Greater => pyre_interpreter::baseobjspace::CompareOp::Gt,
+                ComparisonOperator::GreaterOrEqual => pyre_interpreter::baseobjspace::CompareOp::Ge,
+                ComparisonOperator::Equal => pyre_interpreter::baseobjspace::CompareOp::Eq,
+                ComparisonOperator::NotEqual => pyre_interpreter::baseobjspace::CompareOp::Ne,
             };
-            if let Ok(r) = pyre_interpreter::space::py_compare(lhs_obj, rhs_obj, cmp_op) {
+            if let Ok(r) = pyre_interpreter::baseobjspace::py_compare(lhs_obj, rhs_obj, cmp_op) {
                 result_concrete = ConcreteValue::from_pyobj(r);
             }
         }
@@ -6032,7 +6033,7 @@ impl OpcodeStepExecutor for MIFrame {
 
         // Non-instance path: trace as normal [attr, NULL]
         let mut attr_concrete = ConcreteValue::Null;
-        if let Ok(result) = pyre_interpreter::space::py_getattr(concrete_obj, name) {
+        if let Ok(result) = pyre_interpreter::baseobjspace::py_getattr(concrete_obj, name) {
             attr_concrete = ConcreteValue::from_pyobj(result);
         }
         let attr_opref = self.trace_load_attr(obj.opref, name)?;
@@ -6063,7 +6064,7 @@ impl OpcodeStepExecutor for MIFrame {
         )?;
         <Self as SharedOpcodeHandler>::push_value(self, exc)?;
         let frame =
-            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::pyframe::PyFrame) };
         let exc_val = frame.pop();
         frame.push(pyre_object::w_none());
         frame.push(exc_val);
@@ -6073,7 +6074,7 @@ impl OpcodeStepExecutor for MIFrame {
     fn pop_except(&mut self) -> Result<(), Self::Error> {
         let _ = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         let frame =
-            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+            unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::pyframe::PyFrame) };
         frame.pop();
         // RPython pyjitpl.py:2751 clear_exception: exception fully handled.
         let s = self.sym_mut();
@@ -7344,7 +7345,7 @@ mod tests {
     #[test]
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -7497,7 +7498,7 @@ mod tests {
     fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
         use majit_ir::GcRef;
         use pyre_bytecode::{ConstantData, compile_exec};
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
             .expect("test code should compile");
@@ -7623,7 +7624,7 @@ mod tests {
     #[test]
     fn test_store_local_value_preserves_traced_raw_int_type_for_ref_slot() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -7777,7 +7778,7 @@ mod tests {
     #[test]
     fn test_compare_value_direct_keeps_raw_truth_for_immediate_branch_consumer() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
         let code_ref = &code as *const _;
@@ -7877,7 +7878,7 @@ mod tests {
     #[test]
     fn test_compare_value_direct_boxes_bool_when_not_immediately_consumed_by_branch() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
         let code_ref = &code as *const _;
@@ -7940,7 +7941,7 @@ mod tests {
     #[test]
     fn test_next_instruction_consumes_comparison_truth_skips_extended_arg_trivia() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
         for i in 0..400 {
@@ -8010,7 +8011,7 @@ mod tests {
     #[test]
     fn test_trace_code_step_preserves_comparison_truth_across_extended_arg_trivia() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
         for i in 0..400 {
@@ -8088,7 +8089,7 @@ mod tests {
     #[test]
     fn test_concrete_branch_truth_uses_cached_comparison_truth_without_stack_value() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8126,7 +8127,7 @@ mod tests {
     #[test]
     fn test_truth_value_direct_caches_concrete_truth_for_raw_int_branch_consumer() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8170,7 +8171,7 @@ mod tests {
     #[test]
     fn test_record_branch_guard_uses_branch_pc_and_pre_pop_stack_shape() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8230,7 +8231,7 @@ mod tests {
     #[test]
     fn test_generic_guard_during_branch_truth_uses_pre_pop_stack_shape() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8291,7 +8292,7 @@ mod tests {
     #[test]
     fn test_branch_truth_uses_concrete_parameter() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8379,7 +8380,7 @@ mod tests {
     #[test]
     fn test_current_fail_args_materializes_symbolic_holes_from_concrete_frame() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8429,7 +8430,7 @@ mod tests {
     #[test]
     fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
@@ -8558,7 +8559,7 @@ mod tests {
     #[test]
     fn test_list_append_value_uses_raw_int_storage_fast_path() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let mut ctx = TraceCtx::for_test(2);
         let list = OpRef(0);
@@ -8647,7 +8648,7 @@ mod tests {
     #[test]
     fn test_list_append_value_uses_raw_float_storage_fast_path() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
 
         let mut ctx = TraceCtx::for_test(2);
         let list = OpRef(0);
@@ -8732,7 +8733,7 @@ mod tests {
     #[test]
     fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
         use pyre_bytecode::compile_exec;
-        use pyre_interpreter::frame::PyFrame;
+        use pyre_interpreter::pyframe::PyFrame;
         use pyre_object::w_range_iter_new;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -8839,7 +8840,7 @@ mod tests {
 
 pub struct PendingInlineFrame {
     pub sym: PyreSym,
-    pub concrete_frame: pyre_interpreter::frame::PyFrame,
+    pub concrete_frame: pyre_interpreter::pyframe::PyFrame,
     pub drop_frame_opref: Option<OpRef>,
     pub green_key: u64,
     pub parent_fail_args: Vec<OpRef>,
@@ -8854,7 +8855,7 @@ pub enum InlineTraceStepAction {
 }
 
 pub fn execute_inline_residual_call(
-    frame: &mut pyre_interpreter::frame::PyFrame,
+    frame: &mut pyre_interpreter::pyframe::PyFrame,
     nargs: usize,
 ) -> Result<(), pyre_interpreter::PyError> {
     let required = nargs + 2; // callable + null/self + args

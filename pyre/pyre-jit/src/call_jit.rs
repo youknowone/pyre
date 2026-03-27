@@ -17,7 +17,7 @@ use pyre_object::intobject::w_int_new;
 use pyre_object::pyobject::is_int;
 use pyre_object::{PY_NULL, PyObjectRef};
 
-use pyre_interpreter::frame::PyFrame;
+use pyre_interpreter::pyframe::PyFrame;
 
 // Force cache removed: CallAssemblerI + bridge handles recursion
 // natively without memoization.
@@ -328,10 +328,10 @@ pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
         initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
-        frame_size: std::mem::size_of::<pyre_interpreter::frame::PyFrame>(),
-        frame_code_offset: pyre_interpreter::frame::PYFRAME_CODE_OFFSET,
-        frame_next_instr_offset: pyre_interpreter::frame::PYFRAME_NEXT_INSTR_OFFSET,
-        frame_vable_token_offset: pyre_interpreter::frame::PYFRAME_VABLE_TOKEN_OFFSET,
+        frame_size: std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+        frame_code_offset: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
+        frame_next_instr_offset: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
+        frame_vable_token_offset: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         create_fn_addr: jit_create_self_recursive_callee_frame_1_raw_int as usize,
         drop_fn_addr: jit_drop_callee_frame as usize,
         arena_cap: ARENA_CAP,
@@ -350,14 +350,14 @@ pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
             jf_frame_baseitemofs: BASEITEMOFS,
             jf_frame_lengthofs: LENGTHOFS,
             sign_size: SIGN_SIZE,
-            pyframe_alloc_size: std::mem::size_of::<pyre_interpreter::frame::PyFrame>(),
-            pyframe_code_ofs: pyre_interpreter::frame::PYFRAME_CODE_OFFSET,
+            pyframe_alloc_size: std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+            pyframe_code_ofs: pyre_interpreter::pyframe::PYFRAME_CODE_OFFSET,
             pyframe_namespace_ofs: std::mem::offset_of!(
-                pyre_interpreter::frame::PyFrame,
+                pyre_interpreter::pyframe::PyFrame,
                 namespace
             ),
-            pyframe_next_instr_ofs: pyre_interpreter::frame::PYFRAME_NEXT_INSTR_OFFSET,
-            pyframe_vable_token_ofs: pyre_interpreter::frame::PYFRAME_VABLE_TOKEN_OFFSET,
+            pyframe_next_instr_ofs: pyre_interpreter::pyframe::PYFRAME_NEXT_INSTR_OFFSET,
+            pyframe_vable_token_ofs: pyre_interpreter::pyframe::PYFRAME_VABLE_TOKEN_OFFSET,
         }),
     }
 }
@@ -489,7 +489,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     // (deadframe) may be a nursery-allocated JitFrame-like block. We
     // reconstruct a proper interpreter frame from its raw fields.
     let (code, namespace, exec_ctx) = unsafe {
-        use pyre_interpreter::frame::*;
+        use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
         let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const pyre_bytecode::CodeObject);
         let ns = *(p.add(std::mem::offset_of!(PyFrame, namespace))
@@ -1451,7 +1451,7 @@ fn jit_blackhole_resume_from_guard(
     // The green_key from the target may be 0 for function-entry traces.
     // Recover the real green_key from the callee frame's code pointer.
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
-        let frame_ptr = fail_values[0] as *const pyre_interpreter::frame::PyFrame;
+        let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
         if !frame_ptr.is_null() {
             let code = unsafe { (*frame_ptr).code };
             crate::eval::make_green_key(code, 0)
@@ -2265,6 +2265,6 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     if obj.is_null() || key.is_null() {
         return 0;
     }
-    let _ = pyre_interpreter::space::py_setitem(obj, key, value);
+    let _ = pyre_interpreter::baseobjspace::py_setitem(obj, key, value);
     0
 }

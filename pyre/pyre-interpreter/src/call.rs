@@ -13,7 +13,7 @@ use crate::{
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use crate::eval::eval_frame_plain;
-use crate::frame::{PendingInlineResult, PyFrame};
+use crate::pyframe::{PendingInlineResult, PyFrame};
 
 /// Store an inline-handled concrete result on the owning caller frame.
 pub fn set_pending_inline_result(frame: &mut PyFrame, result: PendingInlineResult) {
@@ -209,7 +209,7 @@ fn call_user_function_with_eval(
     let nparams = code_ref.arg_count as usize;
     let nargs = args.len();
     let filled_args = if nargs < nparams && !defaults.is_null() {
-        let defaults = crate::space::unwrap_cell(defaults);
+        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         let mut full = Vec::with_capacity(nparams);
         full.extend_from_slice(args);
         // Defaults cover the LAST (nparams - first_default) parameters.
@@ -295,7 +295,7 @@ fn call_user_function_with_eval(
 }
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    let callable = crate::space::unwrap_cell(callable);
+    let callable = crate::baseobjspace::unwrap_cell(callable);
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {
@@ -332,7 +332,9 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     // Instance with __call__ — PyPy: descroperation.py descr_call
     if unsafe { pyre_object::is_instance(callable) } {
         let w_type = unsafe { pyre_object::w_instance_get_type(callable) };
-        if let Some(call_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__call__") } {
+        if let Some(call_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__call__") }
+        {
             let mut call_args = Vec::with_capacity(1 + args.len());
             call_args.push(callable);
             call_args.extend_from_slice(args);
@@ -495,7 +497,9 @@ pub(crate) fn resolve_kwargs(
             pyre_object::PY_NULL
         };
         let winner = calculate_metaclass(callable, bases_arg).unwrap_or(callable);
-        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(winner, "__new__") } {
+        if let Some(new_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type_mro_pub(winner, "__new__") }
+        {
             if unsafe { crate::is_func(new_fn) } {
                 (new_fn, 1usize) // __new__(cls, ...) → skip cls
             } else {
@@ -550,7 +554,7 @@ pub(crate) fn resolve_kwargs(
     let n_pos_params = code.arg_count as usize - skip_cls;
     let defaults = unsafe { crate::w_func_get_defaults(target_func) };
     if !defaults.is_null() {
-        let defaults = crate::space::unwrap_cell(defaults);
+        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         if unsafe { pyre_object::is_tuple(defaults) } {
             let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
             let first_default = n_pos_params.saturating_sub(ndefaults);
@@ -651,7 +655,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
         // Instance with __call__ — PyPy: descroperation.py
         if pyre_object::is_instance(callable) {
             let w_type = pyre_object::w_instance_get_type(callable);
-            if let Some(call_fn) = crate::space::lookup_in_type_mro_pub(w_type, "__call__") {
+            if let Some(call_fn) = crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__call__") {
                 let mut call_args = Vec::with_capacity(1 + args.len());
                 call_args.push(callable);
                 call_args.extend_from_slice(args);
@@ -699,15 +703,16 @@ pub(crate) fn calculate_metaclass(
 /// PyPy: typeobject.py descr_call
 fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // Step 1: __new__
-    let instance =
-        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__new__") } {
-            let mut new_args = Vec::with_capacity(1 + args.len());
-            new_args.push(w_type);
-            new_args.extend_from_slice(args);
-            space_call_function_impl(new_fn, &new_args)
-        } else {
-            pyre_object::w_instance_new(w_type)
-        };
+    let instance = if let Some(new_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__new__") }
+    {
+        let mut new_args = Vec::with_capacity(1 + args.len());
+        new_args.push(w_type);
+        new_args.extend_from_slice(args);
+        space_call_function_impl(new_fn, &new_args)
+    } else {
+        pyre_object::w_instance_new(w_type)
+    };
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type
     // PyPy: descr_call skips __init__ when __new__ returns a different type
@@ -715,7 +720,7 @@ fn space_call_type_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         let inst_type = unsafe { pyre_object::w_instance_get_type(instance) };
         if std::ptr::eq(inst_type, w_type) || is_subtype_ptr(inst_type, w_type) {
             if let Some(init_fn) =
-                unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__init__") }
+                unsafe { crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__init__") }
             {
                 let mut init_args = Vec::with_capacity(1 + args.len());
                 init_args.push(instance);
@@ -756,7 +761,7 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let nparams = code_ref.arg_count as usize;
     let nargs = args.len();
     let filled_args = if nargs < nparams && !defaults.is_null() {
-        let defaults = crate::space::unwrap_cell(defaults);
+        let defaults = crate::baseobjspace::unwrap_cell(defaults);
         let mut full = Vec::with_capacity(nparams);
         full.extend_from_slice(args);
         let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
@@ -843,7 +848,7 @@ fn call_metaclass_with_kwargs(
 ) -> PyObjectRef {
     // Find the metaclass __new__ method
     let new_fn = if unsafe { pyre_object::is_type(mc) } {
-        unsafe { crate::space::lookup_in_type_mro_pub(mc, "__new__") }
+        unsafe { crate::baseobjspace::lookup_in_type_mro_pub(mc, "__new__") }
     } else {
         None
     };
@@ -978,7 +983,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 if let Some(base) = pyre_object::w_tuple_getitem(bases_tuple, i as i64) {
                     if pyre_object::is_type(base) {
                         // Check if base has a custom metaclass
-                        let mc = crate::space::ATTR_TABLE.with(|table| {
+                        let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
                             table
                                 .borrow()
                                 .get(&(base as usize))
@@ -1020,7 +1025,7 @@ fn build_class_inner(
     // Returns the namespace dict to use for the class body.
     let prepared_ns = if let Some(mc) = metaclass {
         if unsafe { pyre_object::is_type(mc) } {
-            match crate::space::py_getattr(mc, "__prepare__") {
+            match crate::baseobjspace::py_getattr(mc, "__prepare__") {
                 Ok(prepare) => {
                     let ns_obj =
                         crate::space_call_function(prepare, &[pyre_object::w_str_new(name), bases]);
@@ -1124,7 +1129,7 @@ fn build_class_inner(
                 if !v.is_null() {
                     let key = pyre_object::w_str_new(k);
                     // Use py_setitem to trigger __setitem__ on EnumDict etc.
-                    let _ = crate::space::py_setitem(pd, key, v);
+                    let _ = crate::baseobjspace::py_setitem(pd, key, v);
                 }
             }
             pd
@@ -1150,11 +1155,11 @@ fn build_class_inner(
         };
         // If metaclass returned a W_TypeObject, set up MRO and store metaclass ref.
         if unsafe { pyre_object::is_type(result) } {
-            let mro = unsafe { crate::space::compute_mro_pub(result) };
+            let mro = unsafe { crate::baseobjspace::compute_mro_pub(result) };
             unsafe { pyre_object::w_type_set_mro(result, mro) };
             // Store metaclass reference in ATTR_TABLE (not class dict)
             // for metatype attribute lookup
-            crate::space::ATTR_TABLE.with(|table| {
+            crate::baseobjspace::ATTR_TABLE.with(|table| {
                 table
                     .borrow_mut()
                     .entry(result as usize)
@@ -1165,7 +1170,7 @@ fn build_class_inner(
         result
     } else {
         let w = pyre_object::w_type_new(name, effective_bases, class_ns_ptr as *mut u8);
-        let mro = unsafe { crate::space::compute_mro_pub(w) };
+        let mro = unsafe { crate::baseobjspace::compute_mro_pub(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         w
     };
@@ -1178,7 +1183,7 @@ fn build_class_inner(
             ns.entries().map(|(k, &v)| (k.to_string(), v)).collect();
         for (attr_name, value) in entries {
             if !value.is_null() {
-                if let Ok(set_name) = crate::space::py_getattr(value, "__set_name__") {
+                if let Ok(set_name) = crate::baseobjspace::py_getattr(value, "__set_name__") {
                     // Call: descriptor.__set_name__(self, owner, name)
                     let _ = crate::space_call_function(
                         set_name,
@@ -1205,9 +1210,9 @@ fn build_class_inner(
         for i in 0..n {
             if let Some(base) = unsafe { pyre_object::w_tuple_getitem(effective_bases, i as i64) } {
                 if unsafe { pyre_object::is_type(base) } {
-                    if let Some(init_sub) =
-                        unsafe { crate::space::lookup_in_type_mro_pub(base, "__init_subclass__") }
-                    {
+                    if let Some(init_sub) = unsafe {
+                        crate::baseobjspace::lookup_in_type_mro_pub(base, "__init_subclass__")
+                    } {
                         let _ = crate::space_call_function(init_sub, &[w_type]);
                     }
                 }
@@ -1237,17 +1242,18 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
     // Step 1: Look up __new__ via type MRO → allocate instance
     // PyPy: descr_call → w_newfunc = space.lookup(w_type, '__new__')
     //       w_newobject = space.call_obj_args(w_newfunc, w_type, __args__)
-    let instance =
-        if let Some(new_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__new__") } {
-            // Call __new__(cls, *args)
-            let mut new_args = Vec::with_capacity(1 + args.len());
-            new_args.push(w_type);
-            new_args.extend_from_slice(args);
-            call_callable(frame, new_fn, &new_args)?
-        } else {
-            // Default: allocate bare instance
-            pyre_object::w_instance_new(w_type)
-        };
+    let instance = if let Some(new_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__new__") }
+    {
+        // Call __new__(cls, *args)
+        let mut new_args = Vec::with_capacity(1 + args.len());
+        new_args.push(w_type);
+        new_args.extend_from_slice(args);
+        call_callable(frame, new_fn, &new_args)?
+    } else {
+        // Default: allocate bare instance
+        pyre_object::w_instance_new(w_type)
+    };
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
@@ -1259,7 +1265,9 @@ fn call_type_object(frame: &mut PyFrame, w_type: PyObjectRef, args: &[PyObjectRe
     };
 
     if call_init {
-        if let Some(init_fn) = unsafe { crate::space::lookup_in_type_mro_pub(w_type, "__init__") } {
+        if let Some(init_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__init__") }
+        {
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(instance);
             init_args.extend_from_slice(args);

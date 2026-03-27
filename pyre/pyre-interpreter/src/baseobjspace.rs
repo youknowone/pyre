@@ -1787,7 +1787,7 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     if code_ptr.is_null() {
                         return Ok(w_none());
                     }
-                    return Ok(crate::codeobject::box_code_constant(&*code_ptr));
+                    return Ok(crate::pycode::box_code_constant(&*code_ptr));
                 }
                 "__name__" => {
                     return Ok(w_str_new(crate::w_func_get_name(obj)));
@@ -1847,9 +1847,8 @@ pub fn py_getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(pyre_object::w_classmethod_get_func(obj));
             }
         }
-        if crate::codeobject::is_code(obj) {
-            let code_ptr =
-                crate::codeobject::w_code_get_ptr(obj) as *const pyre_bytecode::CodeObject;
+        if crate::pycode::is_code(obj) {
+            let code_ptr = crate::pycode::w_code_get_ptr(obj) as *const pyre_bytecode::CodeObject;
             if code_ptr.is_null() {
                 return Ok(w_none());
             }
@@ -2435,7 +2434,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                 exc_object: std::ptr::null_mut(),
             });
         }
-        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::frame::PyFrame;
+        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
             w_generator_set_exhausted(gen_obj);
             return Err(PyError {

@@ -22,32 +22,41 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn op_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_add(args[0], args[1]).unwrap_or(w_none()))
+    Ok(crate::baseobjspace::py_add(args[0], args[1]).unwrap_or(w_none()))
 }
 
 fn op_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_sub(args[0], args[1]).unwrap_or(w_none()))
+    Ok(crate::baseobjspace::py_sub(args[0], args[1]).unwrap_or(w_none()))
 }
 
 fn op_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_mul(args[0], args[1]).unwrap_or(w_none()))
+    Ok(crate::baseobjspace::py_mul(args[0], args[1]).unwrap_or(w_none()))
 }
 
 fn op_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Eq).unwrap_or(w_none()))
+    Ok(
+        crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
+            .unwrap_or(w_none()),
+    )
 }
 
 fn op_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Lt).unwrap_or(w_none()))
+    Ok(
+        crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Lt)
+            .unwrap_or(w_none()),
+    )
 }
 
 fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2);
-    Ok(crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Gt).unwrap_or(w_none()))
+    Ok(
+        crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Gt)
+            .unwrap_or(w_none()),
+    )
 }
 
 pub fn init(ns: &mut PyNamespace) {
@@ -62,21 +71,21 @@ pub fn init(ns: &mut PyNamespace) {
         ns,
         "le",
         w_builtin_func_new("le", |args| {
-            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Le)
+            crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
         }),
     );
     namespace_store(
         ns,
         "ge",
         w_builtin_func_new("ge", |args| {
-            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Ge)
+            crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
         }),
     );
     namespace_store(
         ns,
         "ne",
         w_builtin_func_new("ne", |args| {
-            crate::space::py_compare(args[0], args[1], crate::space::CompareOp::Ne)
+            crate::baseobjspace::py_compare(args[0], args[1], crate::baseobjspace::CompareOp::Ne)
         }),
     );
     // itemgetter/attrgetter stubs — return callable objects
@@ -109,7 +118,7 @@ pub fn init(ns: &mut PyNamespace) {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
-            crate::space::py_len(args[0]).or(Ok(w_int_new(0)))
+            crate::baseobjspace::py_len(args[0]).or(Ok(w_int_new(0)))
         }),
     );
 }

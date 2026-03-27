@@ -318,7 +318,7 @@ fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "len() takes exactly one argument");
-    crate::space::py_len(args[0])
+    crate::baseobjspace::py_len(args[0])
 }
 
 /// `abs(x)` — return the absolute value of a number.
@@ -346,7 +346,7 @@ fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__abs__") {
+            if let Some(method) = crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__abs__") {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
         }
@@ -466,7 +466,7 @@ fn builtin_type_with_meta(
             for i in 0..n {
                 if let Some(base) = unsafe { pyre_object::w_tuple_getitem(bases, i as i64) } {
                     if unsafe { pyre_object::is_type(base) } {
-                        let mc = crate::space::ATTR_TABLE.with(|table| {
+                        let mc = crate::baseobjspace::ATTR_TABLE.with(|table| {
                             table
                                 .borrow()
                                 .get(&(base as usize))
@@ -524,7 +524,8 @@ fn builtin_type_with_meta(
             crate::call::calculate_metaclass(default_meta, effective_bases).unwrap_or(default_meta);
         if !std::ptr::eq(winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
-            if let Some(mc_new) = unsafe { crate::space::lookup_in_type_mro_pub(winner, "__new__") }
+            if let Some(mc_new) =
+                unsafe { crate::baseobjspace::lookup_in_type_mro_pub(winner, "__new__") }
             {
                 let mut new_args = vec![winner, name_obj, bases, ns_dict];
                 if args.len() > 3 {
@@ -537,7 +538,7 @@ fn builtin_type_with_meta(
         let metatype = winner;
 
         let w_type = pyre_object::w_type_new(name, effective_bases, ns_ptr as *mut u8);
-        let mro = unsafe { crate::space::compute_mro_pub(w_type) };
+        let mro = unsafe { crate::baseobjspace::compute_mro_pub(w_type) };
         unsafe { pyre_object::w_type_set_mro(w_type, mro) };
 
         // Store metaclass BEFORE __set_name__ so descriptors can access
@@ -545,7 +546,7 @@ fn builtin_type_with_meta(
         if !metatype.is_null() {
             let type_type_obj = crate::typedef::get_builtin_type(&pyre_object::pyobject::TYPE_TYPE);
             if !std::ptr::eq(metatype, type_type_obj) {
-                crate::space::ATTR_TABLE.with(|table| {
+                crate::baseobjspace::ATTR_TABLE.with(|table| {
                     table
                         .borrow_mut()
                         .entry(w_type as usize)
@@ -562,7 +563,7 @@ fn builtin_type_with_meta(
             let entries: Vec<(PyObjectRef, PyObjectRef)> = unsafe { (*d.entries).clone() };
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
-                    if let Ok(set_name) = crate::space::py_getattr(v, "__set_name__") {
+                    if let Ok(set_name) = crate::baseobjspace::py_getattr(v, "__set_name__") {
                         // Call: descriptor.__set_name__(self, owner, name)
                         let _ = crate::space_call_function(set_name, &[v, w_type, k]);
                     }
@@ -669,7 +670,7 @@ unsafe fn is_subtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
         return (*mro_ptr).iter().any(|&t| std::ptr::eq(t, cls));
     }
     // Fallback: compute MRO
-    crate::space::compute_mro_pub(w_type)
+    crate::baseobjspace::compute_mro_pub(w_type)
         .iter()
         .any(|&t| std::ptr::eq(t, cls))
 }
@@ -869,7 +870,7 @@ fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(crate::space::py_is_true(args[0])))
+    Ok(w_bool_from(crate::baseobjspace::py_is_true(args[0])))
 }
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
@@ -877,7 +878,9 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     assert!(args.len() == 2, "hasattr() takes exactly two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    Ok(w_bool_from(crate::space::py_getattr(obj, name).is_ok()))
+    Ok(w_bool_from(
+        crate::baseobjspace::py_getattr(obj, name).is_ok(),
+    ))
 }
 
 /// `getattr(obj, name[, default])` → value — direct call
@@ -885,7 +888,7 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     assert!(args.len() >= 2, "getattr() takes at least two arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    match crate::space::py_getattr(obj, name) {
+    match crate::baseobjspace::py_getattr(obj, name) {
         Ok(val) => Ok(val),
         Err(e) => {
             if args.len() > 2 {
@@ -902,7 +905,7 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     assert!(args.len() == 3, "setattr() takes exactly three arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    let _ = crate::space::py_setattr(obj, name, args[2]);
+    let _ = crate::baseobjspace::py_setattr(obj, name, args[2]);
     Ok(w_none())
 }
 
@@ -911,7 +914,7 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     assert!(args.len() == 2, "delattr() takes exactly 2 arguments");
     let obj = args[0];
     let name = unsafe { w_str_get_value(args[1]) };
-    crate::space::py_delattr(obj, name)?;
+    crate::baseobjspace::py_delattr(obj, name)?;
     Ok(w_none())
 }
 
@@ -971,10 +974,10 @@ pub(crate) fn collect_iterable_pub(obj: PyObjectRef) -> Result<Vec<PyObjectRef>,
     collect_iterable(obj)
 }
 fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let it = crate::space::py_iter(obj)?;
+    let it = crate::baseobjspace::py_iter(obj)?;
     let mut items = Vec::new();
     loop {
-        match crate::space::py_next(it) {
+        match crate::baseobjspace::py_next(it) {
             Ok(v) => items.push(v),
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
@@ -991,14 +994,14 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     for &item in items {
         unsafe { pyre_object::w_dict_store(data, item, pyre_object::w_none()) };
     }
-    let _ = crate::space::py_setattr(obj, "__data__", data);
+    let _ = crate::baseobjspace::py_setattr(obj, "__data__", data);
     // add()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "add",
         crate::w_builtin_func_new("add", |args| {
             if args.len() >= 2 {
-                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     unsafe { pyre_object::w_dict_store(data, args[1], pyre_object::w_none()) };
                 }
             }
@@ -1006,24 +1009,24 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         }),
     );
     // discard()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "discard",
         crate::w_builtin_func_new("discard", |_args| Ok(pyre_object::w_none())),
     );
     // remove()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "remove",
         crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
     );
     // pop()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "pop",
         crate::w_builtin_func_new("pop", |args| {
             if !args.is_empty() {
-                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     unsafe {
                         let d = &*(data as *const pyre_object::dictobject::W_DictObject);
                         let entries = &*d.entries;
@@ -1040,13 +1043,13 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         }),
     );
     // __iter__()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "__iter__",
         crate::w_builtin_func_new("__iter__", |args| {
             if !args.is_empty() {
-                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
-                    return crate::space::py_iter(data);
+                if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
+                    return crate::baseobjspace::py_iter(data);
                 }
             }
             Ok(pyre_object::w_seq_iter_new(
@@ -1056,12 +1059,12 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         }),
     );
     // __contains__()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "__contains__",
         crate::w_builtin_func_new("__contains__", |args| {
             if args.len() >= 2 {
-                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
+                if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     let found = unsafe { pyre_object::w_dict_lookup(data, args[1]) };
                     return Ok(pyre_object::w_bool_from(found.is_some()));
                 }
@@ -1070,13 +1073,13 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         }),
     );
     // __len__()
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "__len__",
         crate::w_builtin_func_new("__len__", |args| {
             if !args.is_empty() {
-                if let Ok(data) = crate::space::py_getattr(args[0], "__data__") {
-                    return crate::space::py_len(data);
+                if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
+                    return crate::baseobjspace::py_len(data);
                 }
             }
             Ok(pyre_object::w_int_new(0))
@@ -1084,7 +1087,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     );
     // __and__() — set intersection
     // PyPy: setobject.py W_BaseSetObject.descr_and
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "__and__",
         crate::w_builtin_func_new("__and__", |args| {
@@ -1097,7 +1100,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
             let other_items = collect_iterable_pub(other)?;
             // Build intersection
             let mut result_items = Vec::new();
-            if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
+            if let Ok(data) = crate::baseobjspace::py_getattr(self_obj, "__data__") {
                 for item in &other_items {
                     if unsafe { pyre_object::w_dict_lookup(data, *item) }.is_some() {
                         result_items.push(*item);
@@ -1108,7 +1111,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
         }),
     );
     // __or__() — set union
-    let _ = crate::space::py_setattr(
+    let _ = crate::baseobjspace::py_setattr(
         obj,
         "__or__",
         crate::w_builtin_func_new("__or__", |args| {
@@ -1118,7 +1121,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
             let self_obj = args[0];
             let other = args[1];
             let mut result_items = Vec::new();
-            if let Ok(data) = crate::space::py_getattr(self_obj, "__data__") {
+            if let Ok(data) = crate::baseobjspace::py_getattr(self_obj, "__data__") {
                 unsafe {
                     let d = &*(data as *const pyre_object::dictobject::W_DictObject);
                     for &(k, _) in &*d.entries {
@@ -1204,7 +1207,7 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "iter() requires at least one argument",
         ));
     }
-    crate::space::py_iter(args[0])
+    crate::baseobjspace::py_iter(args[0])
 }
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
@@ -1214,7 +1217,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "next() requires at least one argument",
         ));
     }
-    match crate::space::py_next(args[0]) {
+    match crate::baseobjspace::py_next(args[0]) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::StopIteration && args.len() > 1 => {
             Ok(args[1]) // default value
@@ -1231,7 +1234,7 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             || crate::is_builtin_func(obj)
             || pyre_object::is_type(obj)
             || (pyre_object::is_instance(obj)
-                && crate::space::lookup_in_type_mro_pub(
+                && crate::baseobjspace::lookup_in_type_mro_pub(
                     pyre_object::w_instance_get_type(obj),
                     "__call__",
                 )
@@ -1316,14 +1319,14 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             || crate::is_func(obj)
             || crate::is_builtin_func(obj)
             || pyre_object::is_module(obj)
-    } || crate::space::ATTR_TABLE
+    } || crate::baseobjspace::ATTR_TABLE
         .with(|table| table.borrow().contains_key(&(obj as usize)));
     if !has_dict {
         return Err(crate::PyError::type_error(
             "vars() argument must have __dict__ attribute",
         ));
     }
-    let dict = crate::space::py_getattr(obj, "__dict__")
+    let dict = crate::baseobjspace::py_getattr(obj, "__dict__")
         .map_err(|_| crate::PyError::type_error("vars() argument must have __dict__ attribute"))?;
     if dict.is_null() || unsafe { pyre_object::is_none(dict) } {
         return Err(crate::PyError::type_error(
@@ -1360,7 +1363,7 @@ fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if pyre_object::is_instance(args[0]) {
             let w_type = pyre_object::w_instance_get_type(args[0]);
-            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__hash__") {
+            if let Some(method) = crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__hash__") {
                 return Ok(crate::space_call_function(method, &[args[0]]));
             }
         }
@@ -1433,9 +1436,9 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             } else {
                 // Use iter/next protocol
-                let it = crate::space::py_iter(arg)?;
+                let it = crate::baseobjspace::py_iter(arg)?;
                 loop {
-                    match crate::space::py_next(it) {
+                    match crate::baseobjspace::py_next(it) {
                         Ok(v) => items.push(v),
                         Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
                         Err(e) => return Err(e),
@@ -1488,10 +1491,10 @@ fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 }
             }
         } else {
-            let it = crate::space::py_iter(obj)?;
+            let it = crate::baseobjspace::py_iter(obj)?;
             let mut idx = start;
             loop {
-                match crate::space::py_next(it) {
+                match crate::baseobjspace::py_next(it) {
                     Ok(v) => {
                         items.push(pyre_object::w_tuple_new(vec![
                             pyre_object::w_int_new(idx),
@@ -1548,7 +1551,9 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         // Instance __reversed__
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::space::lookup_in_type_mro_pub(w_type, "__reversed__") {
+            if let Some(method) =
+                crate::baseobjspace::lookup_in_type_mro_pub(w_type, "__reversed__")
+            {
                 return Ok(crate::space_call_function(method, &[obj]));
             }
         }
@@ -1602,7 +1607,7 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
     let items = collect_iterable_pub(args[0])?;
     for item in items {
-        if crate::space::py_is_true(item) {
+        if crate::baseobjspace::py_is_true(item) {
             return Ok(w_bool_from(true));
         }
     }
@@ -1615,7 +1620,7 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
     let items = collect_iterable_pub(args[0])?;
     for item in items {
-        if !crate::space::py_is_true(item) {
+        if !crate::baseobjspace::py_is_true(item) {
             return Ok(w_bool_from(false));
         }
     }
@@ -1633,7 +1638,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let n = w_list_len(iterable);
             for i in 0..n {
                 if let Some(item) = w_list_getitem(iterable, i as i64) {
-                    acc = crate::space::py_add(acc, item).expect("sum: unsupported type");
+                    acc = crate::baseobjspace::py_add(acc, item).expect("sum: unsupported type");
                 }
             }
             return Ok(acc);
@@ -1642,7 +1647,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let n = w_tuple_len(iterable);
             for i in 0..n {
                 if let Some(item) = w_tuple_getitem(iterable, i as i64) {
-                    acc = crate::space::py_add(acc, item).expect("sum: unsupported type");
+                    acc = crate::baseobjspace::py_add(acc, item).expect("sum: unsupported type");
                 }
             }
             return Ok(acc);
@@ -1695,7 +1700,7 @@ fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `pow(base, exp)` — PyPy: baseobjspace.py pow
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "pow() takes at least two arguments");
-    crate::space::py_pow(args[0], args[1])
+    crate::baseobjspace::py_pow(args[0], args[1])
 }
 
 /// `hex(x)` — PyPy: operation.py hex
