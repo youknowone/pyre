@@ -67,6 +67,9 @@ pub trait JitCodeSym {
     fn header_selected(&self) -> usize {
         self.current_selected()
     }
+    /// RPython parity: jit.promote(storage).
+    /// Emit GuardValue on pool_ref to make it a known constant.
+    fn promote_pool_ref(&mut self, _ctx: &mut TraceCtx, _runtime_value: i64) {}
     /// Create a symbolic stack for a storage not in the initial layout.
     fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
     /// Full interpreter-visible state to materialize on guard failure.
@@ -329,12 +332,17 @@ pub trait JitCodeRuntime {
     fn stack_len(&self, selected: usize) -> usize;
     fn stack_peek(&self, selected: usize, pos: usize) -> i64;
     fn label_at(&self, pc: usize) -> usize;
+    /// RPython: jit.promote(storage) — runtime address of the storage pool.
+    fn pool_ptr(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub struct ClosureRuntime<FLen, FPeek, FLabel> {
     stack_len: FLen,
     stack_peek: FPeek,
     label_at: FLabel,
+    pool_ptr_val: Option<i64>,
 }
 
 impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
@@ -343,7 +351,13 @@ impl<FLen, FPeek, FLabel> ClosureRuntime<FLen, FPeek, FLabel> {
             stack_len,
             stack_peek,
             label_at,
+            pool_ptr_val: None,
         }
+    }
+
+    pub fn with_pool_ptr(mut self, pool_ptr: i64) -> Self {
+        self.pool_ptr_val = Some(pool_ptr);
+        self
     }
 }
 
@@ -363,6 +377,10 @@ where
 
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
+    }
+
+    fn pool_ptr(&self) -> Option<i64> {
+        self.pool_ptr_val
     }
 }
 
@@ -636,8 +654,11 @@ where
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
+        _runtime: &R,
         selected: usize,
     ) -> Result<(), TraceAction> {
+        // RPython parity: pool_ref already promoted at trace start (run_to_end).
+        // Each selected gives a distinct immutable GetfieldGcR result.
         let stack_ref = sym
             .ensure_linked_list_stack_ref(ctx, selected)
             .ok_or(TraceAction::Abort)?;
@@ -907,6 +928,12 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        // RPython parity: jit.promote(storage) at mainloop entry.
+        // Emit GuardValue on pool_ref before any storage access so
+        // subsequent immutable GetfieldGcR(pool, descr) constant-folds.
+        if let Some(pool_val) = runtime.pool_ptr() {
+            sym.promote_pool_ref(ctx, pool_val);
+        }
         let portal_pc = self.frames.current_mut().pc;
         sym.begin_portal_op(portal_pc);
         while !self.frames.is_empty() {
@@ -1857,7 +1884,7 @@ where
                     .is_some()
                 {
                     if self
-                        .linked_list_select_storage(ctx, sym, new_selected)
+                        .linked_list_select_storage(ctx, sym, runtime, new_selected)
                         .is_err()
                     {
                         return TraceAction::Abort;
@@ -2384,6 +2411,22 @@ where
     let root = MIFrame::new(jitcode, pc);
     let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
     machine.run_to_end(ctx, sym, &runtime)
+}
+
+pub fn trace_jitcode_with_runtime<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    let root = MIFrame::new(jitcode, pc);
+    let mut machine = JitCodeMachine::<S, _>::new(root, &jitcode.sub_jitcodes, &jitcode.fn_ptrs);
+    machine.run_to_end(ctx, sym, runtime)
 }
 
 pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {

@@ -123,14 +123,17 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     return TraceAction::AbortPermanent;
                 };
 
-                let __result = majit_metainterp::trace_jitcode(
+                let __runtime = majit_metainterp::ClosureRuntime::new(
+                    |__stack_index| __storage.get(__stack_index).len(),
+                    |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
+                    #label_closure,
+                ).with_pool_ptr(__storage as *const _ as i64);
+                let __result = majit_metainterp::trace_jitcode_with_runtime(
                     __ctx,
                     __sym,
                     &__jitcode,
                     pc,
-                    |__stack_index| __storage.get(__stack_index).len(),
-                    |__stack_index, __pos| __storage.get(__stack_index).peek_at(__pos),
-                    #label_closure,
+                    &__runtime,
                 );
                 if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
                     eprintln!(

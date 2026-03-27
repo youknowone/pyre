@@ -3575,14 +3575,29 @@ fn compute_per_call_gcmap(max_output_slots: usize, num_ref_roots: usize) -> i64 
     if num_ref_roots == 0 {
         return 0; // NULLGCMAP
     }
-    let mut bitmap: usize = 0;
+    let max_bit = max_output_slots + num_ref_roots;
+    if max_bit <= 64 {
+        // Fast path: single-word bitmap (most common case).
+        let mut bitmap: usize = 0;
+        for slot in 0..num_ref_roots {
+            bitmap |= 1usize << (max_output_slots + slot);
+        }
+        let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
+        return gcmap_arr.as_ptr() as i64;
+    }
+    // Multi-word bitmap for large traces.
+    let num_words = (max_bit + 63) / 64;
+    let mut gcmap: Vec<isize> = vec![0; 1 + num_words];
+    gcmap[0] = num_words as isize;
     for slot in 0..num_ref_roots {
         let bit_pos = max_output_slots + slot;
-        assert!(bit_pos < 64, "per-call gcmap exceeds single word");
-        bitmap |= 1usize << bit_pos;
+        let word_idx = bit_pos / 64;
+        let bit_idx = bit_pos % 64;
+        gcmap[1 + word_idx] |= (1usize << bit_idx) as isize;
     }
-    let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
-    gcmap_arr.as_ptr() as i64
+    let leaked = gcmap.into_boxed_slice();
+    let ptr = Box::leak(leaked).as_ptr();
+    ptr as i64
 }
 
 /// RPython _reload_frame_if_necessary (assembler.py:405-412):

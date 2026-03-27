@@ -37,10 +37,22 @@ type FieldKey = (OpRef, u32);
 /// RPython uses parallel lists (cached_structs, cached_infos). We use Vec
 /// of tuples for cache-friendly linear scan — the entry count per descr is
 /// typically 1–5, where Vec beats HashMap.
+/// heap.py:20-50 AbstractCachedEntry.
+///
+/// RPython stores `cached_infos: [PtrInfo]` and reads values from
+/// `info._fields[descr.get_index()]` at access time. majit stores an
+/// explicit `cached_values: Vec<OpRef>` parallel to `cached_structs`
+/// instead, because Rust's ownership model prevents storing mutable
+/// PtrInfo references. The two representations are always in sync —
+/// every `register()` + `set_field()` pair updates both, and
+/// `invalidate_with_ctx()` clears both. `produce_potential_short_preamble_ops`
+/// reads from PtrInfo (info.py:262 parity) to pick up late updates.
 struct CachedField {
-    /// (struct_opref, cached_value_opref) pairs.
-    /// RPython: cached_structs[i] + cached_infos[i]._fields[descr].
+    /// heap.py:23: cached_structs — struct OpRefs with cached field values.
     cached_structs: Vec<OpRef>,
+    /// Parallel to cached_structs. RPython reads this from
+    /// `cached_infos[i]._fields[descr]`; we cache the OpRef directly
+    /// for O(1) access in the hot path (optimize_getfield/setfield).
     cached_values: Vec<OpRef>,
     /// struct_opref → DescrRef (only stored when available).
     cached_descrs: Vec<(OpRef, DescrRef)>,
@@ -534,30 +546,24 @@ impl OptHeap {
             .filter_map(|(&field_idx, cf)| cf.lazy_set.take().map(|(obj, op)| (field_idx, obj, op)))
             .collect();
         for (field_idx, obj, mut op) in pending {
+            // RPython force_lazy_set: force virtual values, emit, restore cache.
             for arg in op.args.iter_mut() {
                 *arg = ctx.get_replacement(*arg);
             }
-            let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
-            if is_vable {
-                let value_ref = ctx.get_replacement(op.arg(1));
-                if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
-                    if info.is_virtual() {
-                        info.force_to_ops_direct(value_ref, ctx);
-                    }
+            let value_ref = ctx.get_replacement(op.arg(1));
+            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
+                if info.is_virtual() {
+                    info.force_to_ops_direct(value_ref, ctx);
                 }
-                for arg in op.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                let final_value = op.arg(1);
-                ctx.emit(op);
-                self.cache_field(obj, field_idx, final_value, None);
-            } else {
-                for arg in op.args.iter_mut() {
-                    *arg = ctx.get_replacement(*arg);
-                }
-                let value_ref = op.arg(1);
-                self.cache_field(obj, field_idx, value_ref, None);
             }
+            for arg in op.args.iter_mut() {
+                *arg = ctx.get_replacement(*arg);
+            }
+            let final_value = op.arg(1);
+            // heap.py:136: emit_extra(op) — always emit
+            ctx.emit(op);
+            // heap.py:142-143: put_field_back_to_info — restore cache
+            self.cache_field(obj, field_idx, final_value, None);
         }
     }
 
@@ -1212,13 +1218,13 @@ impl OptHeap {
                 return false;
             }
             let lazy_obj = cf.lazy_set.as_ref().unwrap().0;
-            // _cannot_alias_via_classes_or_lengths
+            // heap.py:198-204: _cannot_alias_via_classes_or_lengths
             let class1 = ctx.get_ptr_info(lazy_obj).and_then(|i| i.get_known_class());
             let class2 = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class());
             if matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2) {
                 return false;
             }
-            // _cannot_alias_via_content
+            // heap.py:206-226: _cannot_alias_via_content
             let lazy_resolved = ctx.get_replacement(lazy_obj);
             if Self::cannot_alias_via_content(lazy_resolved, obj, ctx) {
                 return false;
@@ -1276,27 +1282,14 @@ impl OptHeap {
         // possible_aliasing path above. Getfield handles read-after-write
         // aliasing via its own force path.
 
-        // Virtualizable fields (linked list head/size) must be emitted
-        // immediately so compiled code always writes to memory. Lazy
-        // deferral loses the write when force_lazy_sets_for_guard drains
-        // into rd_pendingfields but the normal loop path never emits.
-        let is_vable = op.descr.as_ref().map_or(false, |d| d.is_virtualizable());
-        if is_vable {
-            let cf = self.get_or_create_cached_field(field_idx);
-            cf.lazy_set = None;
-            return OptimizationResult::Emit(op.clone());
-        }
-
-        // Store as lazy set. heap.py:89-90: self._lazy_set = op
-        // obj is already resolved through get_replacement above.
+        // heap.py:89-101: store as lazy_set, update PtrInfo._fields.
+        // No cache_field here — RPython only updates _lazy_set and info._fields.
+        // getfield reads from lazy_set first (CachedField.get checks lazy_set).
         let cf = self.get_or_create_cached_field(field_idx);
         cf.lazy_set = Some((obj, op.clone()));
-
-        // heap.py: cf.do_setfield updates info as well
         if let Some(info) = ctx.get_ptr_info_mut(obj) {
             info.set_field(field_idx, new_value);
         }
-
         OptimizationResult::Remove
     }
 

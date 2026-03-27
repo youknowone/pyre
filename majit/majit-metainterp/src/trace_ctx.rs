@@ -560,7 +560,7 @@ impl TraceCtx {
 
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
     pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
-        let const_ref = self.const_int(runtime_value);
+        let const_ref = self.const_ref(runtime_value);
         self.record_guard(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }

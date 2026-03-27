@@ -286,9 +286,10 @@ impl UnrollOptimizer {
         opt_p2.skip_flush = true;
         // Phase 2: don't virtualize New() — guard recovery_layout not populated.
         opt_p2.set_phase2(true);
-        // Import heap cache from preamble so Phase 2 can reuse cached field values
-        // instead of re-reading from memory on every iteration.
-        opt_p2.import_all_cached_fields(&exported_state.preamble_heap_cache);
+        // RPython parity: Phase 2 imports heap cache via short preamble
+        // (inline_short_preamble), not via direct cache import. The short
+        // preamble replays HeapOps that populate Phase 2's cache.
+        // opt_p2.import_all_cached_fields — removed (majit-only workaround).
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(
@@ -1460,7 +1461,9 @@ impl OptUnroll {
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;
                 optimizer.send_extra_operation(&new_op, ctx);
-                mapping.insert(sp_op.pos, new_ref);
+                // RPython: mapping[sop] = op — follow forwarding
+                let forwarded = ctx.get_replacement(new_ref);
+                mapping.insert(sp_op.pos, forwarded);
                 replay_index += 1;
             }
 
@@ -1469,7 +1472,10 @@ impl OptUnroll {
                 let num_short_jump_args = short_jump_args.len();
                 let mapped_jump_args: Vec<OpRef> = short_jump_args
                     .iter()
-                    .map(|jump_arg| *mapping.get(jump_arg).unwrap_or(jump_arg))
+                    .map(|jump_arg| {
+                        let mapped = *mapping.get(jump_arg).unwrap_or(jump_arg);
+                        ctx.get_replacement(mapped)
+                    })
                     .collect();
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                     let _ = optimizer.force_box(arg, ctx);
@@ -1484,9 +1490,13 @@ impl OptUnroll {
             }
         }
 
+        // RPython: get_box_replacement follows forwarding after mapping
         current_short_jump_args(short_preamble, ctx)
             .iter()
-            .map(|&jump_arg| *mapping.get(&jump_arg).unwrap_or(&jump_arg))
+            .map(|&jump_arg| {
+                let mapped = *mapping.get(&jump_arg).unwrap_or(&jump_arg);
+                ctx.get_replacement(mapped)
+            })
             .collect()
     }
 

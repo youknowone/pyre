@@ -1095,6 +1095,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             #[allow(non_camel_case_types)]
             struct __JitSym {
                 pool_ref: majit_ir::OpRef,
+                pool_ref_promoted: bool,
                 current_stacksize_value: Option<majit_ir::OpRef>,
                 current_selected: usize,
                 current_selected_value: Option<majit_ir::OpRef>,
@@ -1119,6 +1120,21 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             impl majit_metainterp::JitCodeSym for __JitSym {
+                // RPython parity: jit.promote(storage)
+                fn promote_pool_ref(
+                    &mut self,
+                    ctx: &mut majit_metainterp::TraceCtx,
+                    runtime_value: i64,
+                ) {
+                    if !self.pool_ref_promoted {
+                        self.pool_ref_promoted = true;
+                        let promoted = ctx.promote_ref(self.pool_ref, runtime_value, 0);
+                        self.pool_ref = promoted;
+                        // Clear cached stack_refs to re-derive from promoted pool
+                        self.linked_list_stack_refs.clear();
+                    }
+                }
+
                 fn current_selected(&self) -> usize {
                     self.current_selected
                 }
@@ -1345,7 +1361,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                             8,
                             majit_ir::Type::Ref,
                             false,
-                        ).with_virtualizable(true),
+                        ),
                     ))
                 }
 
@@ -1357,7 +1373,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                             8,
                             majit_ir::Type::Int,
                             false,
-                        ).with_virtualizable(true),
+                        ),
                     ))
                 }
 
@@ -1430,6 +1446,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                     __JitSym {
                         pool_ref: majit_ir::OpRef(1),
+                        pool_ref_promoted: false,
                         current_stacksize_value: Some(majit_ir::OpRef(0)),
                         current_selected: meta.initial_selected,
                         current_selected_value: Some(majit_ir::OpRef(2)),
