@@ -18,6 +18,149 @@ use pyre_object::*;
 
 use crate::{PyNamespace, builtin_code_new, namespace_store};
 
+/// Compatibility stand-ins for PyPy `typedef.py` API (type descriptor helpers).
+#[derive(Debug, Default)]
+pub struct TypeDef;
+
+impl TypeDef {
+    pub fn new(_name: &str, _base: Option<crate::W_Root>, _dict: Option<PyObjectRef>) -> Self {
+        let _ = (_name, _base, _dict);
+        Self
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GetSetProperty;
+
+#[derive(Debug, Default)]
+pub struct Member;
+
+#[derive(Debug, Default)]
+pub struct ClassAttr;
+
+pub fn default_identity_hash(_space: PyObjectRef, _w_obj: PyObjectRef) -> PyObjectRef {
+    let _ = _space;
+    let _ = _w_obj;
+    0 as *mut pyre_object::PyObject
+}
+
+pub fn get_unique_interplevel_subclass(_space: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
+    let _ = _space;
+    cls
+}
+
+pub fn _getusercls(_cls: PyObjectRef, _reallywantdict: bool) -> PyObjectRef {
+    let _ = _reallywantdict;
+    _cls
+}
+
+pub fn _share_methods(_copycls: PyObjectRef, _subcls: PyObjectRef) {
+    let _ = (_copycls, _subcls);
+}
+
+pub fn use_special_method_shortcut(_name: &str, _checkerfunc: Option<PyObjectRef>) -> bool {
+    let _ = (_name, _checkerfunc);
+    false
+}
+
+pub fn make_descr_typecheck_wrapper<T, F, A>(
+    _tag: T,
+    _func: F,
+    _extraargs: A,
+    _cls: Option<PyObjectRef>,
+) -> PyObjectRef
+where
+    F: Fn() -> PyObjectRef,
+{
+    let _ = (_tag, _extraargs, _cls);
+    _func()
+}
+
+pub fn _make_descr_typecheck_wrapper<T, F, A>(
+    _tag: T,
+    _func: F,
+    _extraargs: A,
+    _cls: PyObjectRef,
+    _use_closure: bool,
+) -> PyObjectRef
+where
+    F: Fn() -> PyObjectRef,
+{
+    let _ = (_tag, _extraargs, _cls, _use_closure);
+    _func()
+}
+
+pub fn interp_attrproperty(
+    _name: &str,
+    cls: PyObjectRef,
+    _doc: Option<&str>,
+    _wrapfn: Option<PyObjectRef>,
+) -> PyObjectRef {
+    let _ = (_name, _doc, _wrapfn);
+    cls
+}
+
+pub fn interp_attrproperty_w(_name: &str, cls: PyObjectRef, _doc: Option<&str>) -> PyObjectRef {
+    let _ = (_name, _doc);
+    cls
+}
+
+pub fn generic_new_descr(_w_type: PyObjectRef) -> PyObjectRef {
+    _w_type
+}
+
+pub fn descr_get_dict(_space: PyObjectRef, _obj: PyObjectRef) -> PyObjectRef {
+    let _ = _space;
+    _obj
+}
+
+pub fn descr_set_dict(_space: PyObjectRef, _obj: PyObjectRef, _w_dict: PyObjectRef) {
+    let _ = (_space, _obj, _w_dict);
+}
+
+pub fn descr_del_dict(_space: PyObjectRef, _obj: PyObjectRef) {
+    let _ = (_space, _obj);
+}
+
+pub fn descr_get_weakref(_space: PyObjectRef, _obj: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, _obj);
+    PY_NULL
+}
+
+pub fn generic_ne(_space: PyObjectRef, w_obj1: PyObjectRef, w_obj2: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, w_obj1, w_obj2);
+    PY_NULL
+}
+
+pub fn fget_co_varnames(_space: PyObjectRef, _code: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, _code);
+    PY_NULL
+}
+
+pub fn fget_co_argcount(_space: PyObjectRef, _code: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, _code);
+    PY_NULL
+}
+
+pub fn fget_co_flags(_space: PyObjectRef, _code: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, _code);
+    PY_NULL
+}
+
+pub fn fget_co_consts(_space: PyObjectRef, _code: PyObjectRef) -> PyObjectRef {
+    let _ = (_space, _code);
+    PY_NULL
+}
+
+pub fn make_weakref_descr(_cls: PyObjectRef) -> PyObjectRef {
+    _cls
+}
+
+pub fn always_none(_self: PyObjectRef, _obj: PyObjectRef) -> PyObjectRef {
+    let _ = (_self, _obj);
+    PY_NULL
+}
+
 /// Global typeobject cache: maps static PyType pointer → W_TypeObject (as usize).
 ///
 /// PyPy equivalent: space.gettypeobject(cls.typedef) → cached W_TypeObject

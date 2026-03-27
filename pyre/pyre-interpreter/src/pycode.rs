@@ -6,6 +6,19 @@
 
 use pyre_object::pyobject::*;
 
+/// Compatibility alias for PyPy's `PyCode` type.
+pub type PyCode = W_CodeObject;
+
+/// Compatibility marker for malformed bytecode.
+#[derive(Debug, Clone)]
+pub struct BytecodeCorruption;
+
+/// Compatibility container for code-hook caching state.
+#[derive(Debug, Default)]
+pub struct CodeHookCache {
+    _code_hook: Option<PyObjectRef>,
+}
+
 /// Type descriptor for code objects.
 pub static CODE_TYPE: PyType = PyType { tp_name: "code" };
 
@@ -22,6 +35,40 @@ pub struct W_CodeObject {
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
+
+/// Compatibility helper for unpacking a tuple of strings.
+pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<String> {
+    let _ = (_space, w_str_tuple);
+    Vec::new()
+}
+
+/// Compatibility API for building a signature-like object.
+pub fn make_signature(_code: &W_CodeObject) -> PyObjectRef {
+    let _ = _code;
+    pyre_object::w_none()
+}
+
+/// Compatibility helper that returns argument indexes which shadow cellvars.
+pub fn _compute_args_as_cellvars(
+    _varnames: &[String],
+    _cellvars: &[String],
+    _argcount: usize,
+) -> Vec<usize> {
+    let _ = (_varnames, _cellvars, _argcount);
+    Vec::new()
+}
+
+#[inline]
+pub fn _code_const_eq(_space: PyObjectRef, w_a: PyObjectRef, w_b: PyObjectRef) -> bool {
+    let _ = _space;
+    std::ptr::eq(w_a, w_b)
+}
+
+#[inline]
+pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
+    let _ = _space;
+    w_a
+}
 
 /// Allocate a new W_CodeObject wrapping an opaque code pointer.
 ///

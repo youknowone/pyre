@@ -39,7 +39,10 @@ pub use error::*;
 pub use executioncontext::*;
 pub use frame_array::*;
 pub use function::*;
-pub use gateway::*;
+pub use gateway::{
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, builtin_code_get, builtin_code_name,
+    builtin_code_new, is_builtin_code,
+};
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use pycode::*;

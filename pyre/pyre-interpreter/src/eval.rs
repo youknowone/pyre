@@ -20,6 +20,25 @@ use pyre_object::*;
 use crate::call::call_callable;
 use std::cell::Cell;
 
+#[derive(Debug, Clone)]
+pub struct Code {
+    pub name: String,
+    pub code: Option<PyObjectRef>,
+}
+
+impl Code {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            code: None,
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("<code {}>", self.name)
+    }
+}
+
 // Thread-local current exception for bare `raise` (RAISE_VARARGS 0).
 // PyPy: executioncontext.py sys_exc_info — the current active exception.
 thread_local! {
