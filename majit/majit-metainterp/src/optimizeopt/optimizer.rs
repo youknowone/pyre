@@ -2613,7 +2613,6 @@ impl Optimizer {
                                     _ => None,
                                 };
                                 virtual_entries.push(GuardVirtualEntry {
-                                    original_opref: None,
                                     fail_arg_index: fa_idx,
                                     descr,
                                     known_class,
@@ -2632,14 +2631,7 @@ impl Optimizer {
                         .imported_label_args
                         .as_ref()
                         .and_then(|la| la.get(fa_idx).copied());
-                    let resolved = label_ref.map(|r| ctx.get_replacement(r)).or_else(|| {
-                        // original_opref fallback
-                        virtual_entries
-                            .iter()
-                            .find(|e| e.fail_arg_index == fa_idx)
-                            .and_then(|e| e.original_opref)
-                            .map(|r| ctx.get_replacement(r))
-                    });
+                    let resolved = label_ref.map(|r| ctx.get_replacement(r));
                     if let Some(resolved) = resolved {
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
                             if info.is_virtual() {
@@ -2665,7 +2657,6 @@ impl Optimizer {
                                     _ => None,
                                 };
                                 virtual_entries.push(GuardVirtualEntry {
-                                    original_opref: None,
                                     fail_arg_index: fa_idx,
                                     descr,
                                     known_class,
@@ -2716,7 +2707,6 @@ impl Optimizer {
                         fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
-                        original_opref: None,
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: vinfo.known_class,
@@ -2747,7 +2737,6 @@ impl Optimizer {
                         fields.push((descr_idx, fa_index));
                     }
                     virtual_entries.push(GuardVirtualEntry {
-                        original_opref: None,
                         fail_arg_index: fa_idx,
                         descr: vinfo.descr.clone(),
                         known_class: None,

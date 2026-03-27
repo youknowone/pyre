@@ -1190,7 +1190,6 @@ impl OptContext {
                 .copied()
                 .unwrap_or(*vidx as usize);
             virtual_entries.push(majit_ir::GuardVirtualEntry {
-                original_opref: Some(*vbox),
                 fail_arg_index: frame_pos,
                 descr,
                 known_class,
