@@ -17,6 +17,7 @@ pub mod intutils;
 pub mod optimize;
 pub mod optimizer;
 pub mod pure;
+pub mod renamer;
 pub mod rewrite;
 pub mod schedule;
 pub mod shortpreamble;
