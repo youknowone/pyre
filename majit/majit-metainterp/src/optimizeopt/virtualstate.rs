@@ -1543,18 +1543,27 @@ fn export_single_value(
     // item.set_forwarded(None) — info is completely cleared for ALL types.
     if let Some(value) = ctx.get_constant(opref) {
         // RPython setinfo_from_preamble parity (unroll.py:73-75):
-        // Only export LEVEL_CONSTANT for constant pool entries (>= 10000).
-        // These are truly invariant across iterations (e.g., type pointers
-        // loaded via LOAD_CONST bytecodes).
+        // Only export LEVEL_CONSTANT for constant pool entries (>= 10000)
+        // and type descriptor pointers marked via numbering_type_overrides.
         //
         // Trace-computed Ref constants (e.g., W_IntObject(-1) pointer for
         // sign) are NOT invariant — a different W_IntObject may be used on
-        // the next iteration. Exporting them as Constant causes Phase 2 to
-        // constant-fold GetfieldGcPureI(sign_obj), leading to InvalidLoop.
-        // RPython handles this by only setting PtrInfo (known_class) on
-        // such boxes, not making them compile-time constants.
-        if opref.0 >= 10000 {
-            return VirtualStateInfo::Constant(value.clone());
+        // the next iteration. Only truly invariant GcRef pointers (ob_type)
+        // registered via mark_const_type get the Ref override.
+        let has_ref_override = ctx
+            .constant_types_for_numbering
+            .get(&opref.0)
+            .is_some_and(|&t| t == majit_ir::Type::Ref);
+        if opref.0 >= 10000 || has_ref_override {
+            let export_val = if has_ref_override && matches!(value, Value::Int(v) if *v != 0) {
+                Value::Ref(majit_ir::GcRef(match value {
+                    Value::Int(v) => *v as usize,
+                    _ => 0,
+                }))
+            } else {
+                value.clone()
+            };
+            return VirtualStateInfo::Constant(export_val);
         }
         // Trace-computed constants: export as Unknown (RPython LEVEL_UNKNOWN).
         // Phase 2 will re-compute their values from runtime state.

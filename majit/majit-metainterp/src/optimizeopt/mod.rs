@@ -286,8 +286,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+        // RPython ConstPtr parity: check numbering type overrides first.
+        // ob_type constants are stored as Value::Int(ptr) in the constant map
+        // but their true type is Ref (from numbering_type_overrides).
+        let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
         match self.ctx.get_constant(opref) {
-            Some(Value::Int(v)) => (*v, majit_ir::Type::Int),
+            Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
             Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
             Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
             _ => {
