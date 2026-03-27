@@ -2934,14 +2934,20 @@ impl ResumeDataLoopMemo {
         // resume.py:413: self.vfieldboxes collected by virtual walk
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
         let mut new_liveboxes: HashMap<u32, i16> = HashMap::new();
+        // Insertion-order tracking for _number_virtuals (RPython dict is ordered).
+        let mut new_liveboxes_order: Vec<u32> = Vec::new();
 
-        // Iterate in deterministic order (sorted by opref_id) to ensure
-        // consistent virtual field numbering across runs.
-        // RPython uses dict iteration which is insertion-ordered in the
-        // implementation; Rust HashMap is not ordered.
+        // RPython iterates liveboxes_from_env in insertion order (snapshot order).
+        // Rust HashMap has no insertion order. Sort by tag value: TAGBOX entries
+        // by their index (0, 1, 2...), TAGVIRTUAL entries by their index.
+        // This matches the snapshot order because _number_boxes assigns indices
+        // sequentially as it encounters boxes in the snapshot.
         let mut sorted_liveboxes: Vec<(u32, i16)> =
             numb_state.liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
-        sorted_liveboxes.sort_by_key(|&(k, _)| k);
+        sorted_liveboxes.sort_by_key(|&(_, tagged)| {
+            let (val, tagbits) = untag(tagged);
+            (tagbits, val)
+        });
 
         for &(opref_id, tagged) in &sorted_liveboxes {
             let (i, tagbits) = untag(tagged);
@@ -2966,11 +2972,13 @@ impl ResumeDataLoopMemo {
                                 majit_ir::Type::Int => env.is_virtual_raw(field_opref),
                                 _ => false,
                             };
-                            if is_virtual {
-                                new_liveboxes.insert(field_opref.0, UNASSIGNEDVIRTUAL);
+                            let tag = if is_virtual {
+                                UNASSIGNEDVIRTUAL
                             } else {
-                                new_liveboxes.insert(field_opref.0, UNASSIGNED);
-                            }
+                                UNASSIGNED
+                            };
+                            new_liveboxes.insert(field_opref.0, tag);
+                            new_liveboxes_order.push(field_opref.0);
                         }
                     }
                 }
@@ -2980,9 +2988,11 @@ impl ResumeDataLoopMemo {
         // resume.py:454-509: _number_virtuals
         let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.cached_boxes.len()];
         let mut count = 0;
-        // Collect and sort keys for deterministic ordering.
-        let mut keys: Vec<(u32, i16)> = new_liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
-        keys.sort_by_key(|&(k, _)| k);
+        // Iterate in insertion order (RPython dict iteration = insertion order).
+        let keys: Vec<(u32, i16)> = new_liveboxes_order
+            .iter()
+            .filter_map(|&k| new_liveboxes.get(&k).map(|&v| (k, v)))
+            .collect();
         for (opref_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
