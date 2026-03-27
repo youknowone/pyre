@@ -959,8 +959,8 @@ impl Optimizer {
                     guard_op.rd_virtuals = Some(virtual_entries);
                 }
 
-                // compile.py:875: guard_op.setfailargs(newboxes)
-                guard_op.fail_args = Some(liveboxes.into());
+                // compile.py:875: descr.store_final_boxes(guard_op, newboxes)
+                guard_op.store_final_boxes(liveboxes);
             }
             return;
         }

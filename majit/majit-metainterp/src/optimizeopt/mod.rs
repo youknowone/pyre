@@ -1104,7 +1104,8 @@ impl OptContext {
         // resume.py:447,450-451: patch and store.
         // resume.py:447: patch num_failargs
         numb_state.patch(1, liveboxes.len() as i32);
-        op.fail_args = Some(liveboxes.into());
+        // compile.py:875: descr.store_final_boxes(guard_op, newboxes)
+        op.store_final_boxes(liveboxes);
         if !virtual_entries.is_empty() {
             op.rd_virtuals = Some(virtual_entries);
         }

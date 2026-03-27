@@ -192,6 +192,11 @@ impl Op {
     pub fn result_type(&self) -> Type {
         self.opcode.result_type()
     }
+    /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
+    ///   guard_op.setfailargs(boxes)
+    pub fn store_final_boxes(&mut self, boxes: Vec<OpRef>) {
+        self.fail_args = Some(boxes.into());
+    }
 }
 
 impl std::fmt::Display for Op {
