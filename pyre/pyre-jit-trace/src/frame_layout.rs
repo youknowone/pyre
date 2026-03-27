@@ -63,6 +63,8 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 ///   next_instr, valuestackdepth, locals_cells_stack_w[*]
 pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = VirtualizableInfo::new(PYFRAME_VABLE_TOKEN_OFFSET);
+    // interp_jit.py:25: virtualizable_name = 'frame'
+    info.name = "frame".to_string();
     // PyPy: last_instr
     info.add_field(
         PYFRAME_VABLE_FIELDS[0].0,

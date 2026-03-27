@@ -117,6 +117,8 @@ pub enum VableArrayStorage {
 /// from both heap and JIT representations.
 #[derive(Debug, Clone)]
 pub struct VirtualizableInfo {
+    /// jitdriver_sd.virtualizable name (interp_jit.py:25).
+    pub name: String,
     /// Static (scalar) fields on the virtualizable.
     pub static_fields: Vec<VableFieldInfo>,
     /// Array fields on the virtualizable (e.g., `locals_w`).
@@ -136,6 +138,7 @@ impl VirtualizableInfo {
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {
         VirtualizableInfo {
+            name: String::new(),
             static_fields: Vec::new(),
             array_fields: Vec::new(),
             token_offset,

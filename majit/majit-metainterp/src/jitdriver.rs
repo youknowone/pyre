@@ -1170,20 +1170,15 @@ impl<S: JitState> JitDriver<S> {
             .map(|v| v.name.clone());
         // Fall back to virtualizable_info's default name if no descriptor.
         let info = self.meta.virtualizable_info()?;
-        let name = vable_name.unwrap_or_else(|| "frame".to_string());
+        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25)
+        let name = vable_name.unwrap_or_else(|| info.name.clone());
         let (static_boxes, array_boxes) = state.export_virtualizable_boxes(meta, &name, info)?;
         let extra_values = Self::flatten_virtualizable_values(info, &static_boxes, &array_boxes);
-        // warmstate.py:502-507: extend with exactly the needed amount.
-        // The compiled loop may need fewer virtualizable fields than the
-        // full export provides (e.g. when vsd differs between trace-time
-        // and re-entry-time). Truncate to match compiled_inputs.
-        let needed = compiled_inputs - live_values.len();
-        if needed <= extra_values.len() {
-            live_values.extend(extra_values.into_iter().take(needed));
-            Some(live_values)
-        } else {
-            None
+        if live_values.len() + extra_values.len() != compiled_inputs {
+            return None;
         }
+        live_values.extend(extra_values);
+        Some(live_values)
     }
 
     fn sync_before(
