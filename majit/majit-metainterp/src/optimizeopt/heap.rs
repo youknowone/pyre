@@ -371,6 +371,8 @@ pub struct OptHeap {
     /// When GETARRAYITEM_GC with constant index N is seen, the array
     /// must have length >= N+1. Tracked per array OpRef.
     array_min_lengths: HashMap<OpRef, i64>,
+    /// Reverse map for immutable field loads: loaded OpRef → (parent, field_idx).
+    immutable_load_origins: HashMap<OpRef, (OpRef, u32)>,
 }
 
 impl OptHeap {
@@ -392,6 +394,7 @@ impl OptHeap {
             cached_arraylens: HashMap::new(),
             cached_arrayitems_var: HashMap::new(),
             array_min_lengths: HashMap::new(),
+            immutable_load_origins: HashMap::new(),
         }
     }
 
@@ -769,6 +772,16 @@ impl OptHeap {
         false
     }
 
+    fn known_distinct_via_immutable_loads(&self, opref1: OpRef, opref2: OpRef) -> bool {
+        if let (Some(&(p1, f1)), Some(&(p2, f2))) = (
+            self.immutable_load_origins.get(&opref1),
+            self.immutable_load_origins.get(&opref2),
+        ) {
+            return p1 == p2 && f1 != f2;
+        }
+        false
+    }
+
     /// Invalidate only array cache entries affected by an ARRAYCOPY/ARRAYMOVE.
     ///
     /// Instead of clearing all array caches, only remove entries for the
@@ -1028,10 +1041,12 @@ impl OptHeap {
                 );
                 // heap.py:198-226: possible_aliasing_two_infos
                 // RPython checks: class/length, then content. No seen_allocation.
-                let cannot_alias = cannot_alias_via_class || {
-                    let lazy_obj_resolved = ctx.get_replacement(*lazy_obj);
-                    Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx)
-                };
+                let cannot_alias = cannot_alias_via_class
+                    || {
+                        let lazy_obj_resolved = ctx.get_replacement(*lazy_obj);
+                        Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx)
+                    }
+                    || self.known_distinct_via_immutable_loads(*lazy_obj, obj);
                 if !cannot_alias {
                     // UNKNOWN_ALIAS → force_lazy_set, return None (cache miss)
                     force_lazy = true;
@@ -1087,6 +1102,9 @@ impl OptHeap {
         // Consume the imported short field: remove it so that if a later
         // setfield/call invalidates cache, the stale preamble value
         // cannot re-populate the cache on a subsequent getfield.
+        // Register in cache so that push's virtual SetfieldGc and
+        // subsequent pop's GetfieldGcR can cancel out correctly.
+        // RPython shortpreamble.py: HeapOp.produce_op → opinfo.setfield.
         if !is_vable_field {
             if let Some(cached) = ctx.imported_short_fields.remove(&key) {
                 ctx.force_op_from_preamble(cached);
@@ -1152,6 +1170,11 @@ impl OptHeap {
         if self.immutable_field_descrs.contains(&key.1) {
             self.immutable_cached_fields.insert(key, op.pos);
         }
+        if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
+            if op.descr.as_ref().map_or(false, |d| d.is_always_pure()) {
+                self.immutable_load_origins.insert(op.pos, (obj, field_idx));
+            }
+        }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         // Record the field value in ptr_info so other passes can see it.
         if !is_vable_field {
@@ -1213,6 +1236,13 @@ impl OptHeap {
         //   1. same_info → MUST_ALIAS (handled by OpRef equality above)
         //   2. _cannot_alias_via_classes_or_lengths (198-204)
         //   3. _cannot_alias_via_content (206-226)
+        let skip_invalidate = self.field_cache.get(&field_idx).map_or(false, |cf| {
+            if let Some((lazy_obj, _)) = &cf.lazy_set {
+                self.known_distinct_via_immutable_loads(*lazy_obj, obj)
+            } else {
+                false
+            }
+        });
         let needs_force = self.field_cache.get(&field_idx).map_or(false, |cf| {
             if !cf.possible_aliasing(obj) {
                 return false;
@@ -1229,6 +1259,9 @@ impl OptHeap {
             if Self::cannot_alias_via_content(lazy_resolved, obj, ctx) {
                 return false;
             }
+            if self.known_distinct_via_immutable_loads(lazy_obj, obj) {
+                return false;
+            }
             true // UNKNOWN_ALIAS → needs force
         });
         if needs_force {
@@ -1238,8 +1271,8 @@ impl OptHeap {
                 .and_then(|cf| cf.lazy_set.take());
             if let Some((lazy_obj, mut lazy_op)) = lazy_data {
                 // heap.py:122-143: force_lazy_set
-                // 1. invalidate (skip pure)
-                if !self.immutable_field_descrs.contains(&field_idx) {
+                // 1. invalidate (skip pure, skip when known-distinct)
+                if !self.immutable_field_descrs.contains(&field_idx) && !skip_invalidate {
                     self.get_or_create_cached_field(field_idx)
                         .invalidate_with_ctx(field_idx, ctx);
                 }
@@ -1524,10 +1557,16 @@ impl OptHeap {
             // GuardNonnull on a value already known non-null is redundant.
             if opcode == OpCode::GuardNonnull {
                 let arg = op.arg(0);
-                if self.known_nonnull.contains(&arg) || self.seen_allocation.contains(&arg) {
+                let resolved = ctx.get_replacement(arg);
+                if self.known_nonnull.contains(&arg)
+                    || self.known_nonnull.contains(&resolved)
+                    || self.seen_allocation.contains(&arg)
+                    || self.seen_allocation.contains(&resolved)
+                {
                     return OptimizationResult::Remove;
                 }
                 self.known_nonnull.insert(arg);
+                self.known_nonnull.insert(resolved);
             }
 
             // GuardClass / GuardNonnullClass / GuardValue imply non-null.
@@ -1996,6 +2035,7 @@ impl Optimization for OptHeap {
         self.cached_arraylens.clear();
         self.cached_arrayitems_var.clear();
         self.array_min_lengths.clear();
+        self.immutable_load_origins.clear();
     }
 
     fn flush(&mut self, ctx: &mut OptContext) {
@@ -2085,41 +2125,20 @@ impl Optimization for OptHeap {
     /// Add cached field/array reads to the short preamble so bridges
     /// can re-populate the optimizer's cache.
     /// heap.py:360-377: export ALL cached fields to short preamble.
-    /// heap.py:360-377: produce_potential_short_preamble_ops(sb).
-    /// RPython iterates cached_fields keyed by descr, then per-CachedField
-    /// cached_infos. No is_reachable filter. get_box_replacement on struct
-    /// and field value (heap.py:55, info.py:262).
+    /// heap.py:360-377: No is_reachable filter — export ALL cached fields.
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        ctx: &OptContext,
+        _ctx: &OptContext,
     ) {
-        // heap.py:370-372: for descr in cached_fields: d.produce_...(optimizer, sb, descr)
-        // heap.py:54: for i, info in enumerate(self.cached_infos):
-        // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
-        for (&field_idx, cf) in &self.field_cache {
-            debug_assert!(cf.lazy_set.is_none()); // heap.py:53
+        for cf in self.field_cache.values() {
             for i in 0..cf.cached_structs.len() {
-                // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
-                let obj = ctx.get_replacement(cf.cached_structs[i]);
-                if obj.is_none() {
+                let obj = cf.cached_structs[i];
+                let cached_val = cf.cached_values[i];
+                if cached_val.is_none() || obj.is_none() {
                     continue;
                 }
-                // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
-                // Read from PtrInfo._fields — RPython reads info._fields[descr] at export time,
-                // not a stored snapshot. This picks up any updates between registration and export.
-                let cached_val = ctx
-                    .get_ptr_info(obj)
-                    .and_then(|info| info.get_field(field_idx))
-                    .map(|v| ctx.get_replacement(v))
-                    .unwrap_or_else(|| ctx.get_replacement(cf.cached_values[i]));
-                if cached_val.is_none() {
-                    continue;
-                }
-                let Some(descr) = cf
-                    .get_descr(cf.cached_structs[i])
-                    .or_else(|| cf.get_descr(obj))
-                else {
+                let Some(descr) = cf.get_descr(obj) else {
                     continue;
                 };
                 let opcode = descr

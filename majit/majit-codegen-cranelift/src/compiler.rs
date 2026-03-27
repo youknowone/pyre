@@ -436,6 +436,7 @@ fn deadframe_recovery_layout_for_call_assembler(
             identity_recovery_layout(
                 layout.trace_id,
                 trace_info.header_pc,
+                None, // no per-guard resume_pc available here
                 trace_info.source_guard,
                 &layout.fail_arg_types,
                 None,
@@ -4058,6 +4059,11 @@ struct CompiledLoop {
     /// Whether any guard in this loop uses FORCE_TOKEN slots.
     /// When false, force frame registration can be skipped entirely.
     needs_force_frame: bool,
+    /// Number of body label args for body-direct entry.
+    /// When > 0, the compiled function supports dual entry: the last
+    /// input slot (at index max(num_inputs, body_num_inputs)) selects
+    /// the entry mode: 0 = preamble, nonzero = body-direct.
+    body_num_inputs: usize,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -4273,6 +4279,7 @@ struct GuardInfo {
 fn identity_recovery_layout(
     trace_id: u64,
     header_pc: u64,
+    guard_resume_pc: Option<u64>,
     source_guard: Option<(u64, u32)>,
     slot_types: &[Type],
     caller_layout: Option<&ExitRecoveryLayout>,
@@ -4284,7 +4291,7 @@ fn identity_recovery_layout(
         trace_id: Some(trace_id),
         header_pc: Some(header_pc),
         source_guard,
-        pc: header_pc,
+        pc: guard_resume_pc.unwrap_or(header_pc),
         slots: (0..slot_types.len())
             .map(ExitValueSourceLayout::ExitValue)
             .collect(),
@@ -4607,7 +4614,17 @@ impl CraneliftBackend {
         // RPython parity: bridge JUMP → loop re-entry uses a loop instead
         // of recursive calls, matching RPython's inline jmp within the same
         // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
-        let mut current_inputs = inputs.to_vec();
+        let max_entry = compiled.num_inputs.max(compiled.body_num_inputs);
+        let mut current_inputs = if compiled.body_num_inputs > 0 {
+            // Pad inputs for body-direct capable loops.
+            // Last slot = entry_mode: 0 = preamble (initial entry).
+            let mut padded = vec![0i64; max_entry + 1];
+            let copy_len = inputs.len().min(compiled.num_inputs);
+            padded[..copy_len].copy_from_slice(&inputs[..copy_len]);
+            padded
+        } else {
+            inputs.to_vec()
+        };
         loop {
             let (fail_index, outputs, handle, force_frame) = run_compiled_code(
                 compiled.code_ptr,
@@ -4618,7 +4635,6 @@ impl CraneliftBackend {
                 &current_inputs,
                 compiled.needs_force_frame,
             );
-
             if let Some(frame) = maybe_take_call_assembler_deadframe(
                 fail_index,
                 &outputs,
@@ -4637,7 +4653,6 @@ impl CraneliftBackend {
             }
 
             let fail_descr = &compiled.fail_descrs[fail_index as usize];
-
             // Finish exits return directly — no bridge dispatch.
             if fail_descr.is_finish {
                 let saved_data = if let Some(ref ff) = force_frame {
@@ -4663,9 +4678,16 @@ impl CraneliftBackend {
 
             // Increment guard failure count.
             fail_descr.increment_fail_count();
+            let fail_count = fail_descr.get_fail_count();
 
             // If a bridge is attached to this guard, execute it.
             let bridge_guard = fail_descr.bridge.lock().unwrap();
+            if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
+                eprintln!(
+                    "[exec-with-inputs] guard={fail_index} has_bridge={}",
+                    bridge_guard.is_some()
+                );
+            }
             if let Some(ref bridge) = *bridge_guard {
                 release_force_token(handle);
                 // RPython rebuild_state_after_failure parity: materialize
@@ -4688,9 +4710,21 @@ impl CraneliftBackend {
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
                         let num_outputs = bridge_descr.fail_arg_types().len();
-                        current_inputs = (0..num_outputs)
-                            .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                            .collect();
+                        if compiled.body_num_inputs > 0 {
+                            // Body-direct re-entry: bridge outputs are
+                            // body-compatible values. Set entry_mode = 1
+                            // to skip preamble guards on re-entry.
+                            current_inputs = vec![0i64; max_entry + 1];
+                            for i in 0..num_outputs.min(compiled.body_num_inputs) {
+                                current_inputs[i] =
+                                    get_int_from_deadframe(&bridge_frame, i).unwrap_or(0);
+                            }
+                            current_inputs[max_entry] = 1; // body-direct
+                        } else {
+                            current_inputs = (0..num_outputs)
+                                .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                                .collect();
+                        }
                         continue; // re-enter loop
                     }
                     return bridge_frame;
@@ -4700,7 +4734,6 @@ impl CraneliftBackend {
             drop(bridge_guard);
 
             // RPython compile.py:696 handle_fail: trigger bridge compilation.
-            let fail_count = fail_descr.get_fail_count();
             if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
                 let gk = fail_descr.green_key;
                 let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
@@ -4769,13 +4802,22 @@ impl CraneliftBackend {
         let fail_descr = &bridge.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
-        // Check for chained bridges.
+        // Check for chained bridges (RPython: bridge-on-bridge).
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref next_bridge) = *bridge_guard {
             release_force_token(handle);
             return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
         }
         drop(bridge_guard);
+
+        // RPython parity: trigger bridge compilation for bridge guards
+        // just like for loop guards (handle_fail / must_compile).
+        let fail_count = fail_descr.get_fail_count();
+        if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
+            let gk = bridge.header_pc; // green_key = original loop's key
+            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
+            notify_bridge_threshold(gk, bridge.trace_id, fail_index, resume_pc);
+        }
 
         let saved_data = if let Some(ref ff) = force_frame {
             take_force_frame_saved_data(ff)
@@ -4857,6 +4899,7 @@ impl CraneliftBackend {
             header_pc,
             source_guard,
             caller_layout,
+            &self.constants,
         )?;
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
@@ -4919,6 +4962,9 @@ impl CraneliftBackend {
             .collect();
         let has_entry_label = label_indices.first().copied() == Some(0);
 
+        // Body-direct entry disabled — requires bridge to provide full body args.
+        let body_direct_num_inputs = 0;
+
         // Collect all variable declarations into a map (index -> type)
         // before declaring them sequentially. Cranelift 0.130 declare_var
         // returns auto-assigned indices, so we must declare in order 0..max.
@@ -4959,22 +5005,21 @@ impl CraneliftBackend {
                 }
                 var_types.insert(vi as u32, cl_type);
             }
-            // Ensure all fail_arg OpRefs are declared as variables.
-            // Virtual resume data may add extra fail_args whose OpRefs
-            // reference ops that don't produce a result_type (constants
-            // handled separately by resolve_opref).
-            if let Some(ref fa) = op.fail_args {
-                for &arg in fa.iter() {
-                    if !arg.is_none()
-                        && !declared_vars.contains(&arg.0)
-                        && !constants.contains_key(&arg.0)
-                    {
-                        declared_vars.insert(arg.0);
-                        if debug_declares {
-                            eprintln!("[jit][declare] fail-arg var{} owner={:?}", arg.0, op.opcode);
-                        }
-                        var_types.insert(arg.0, cl_types::I64);
+            // Declare ALL referenced OpRefs: fail_args, op args, etc.
+            for &arg in op
+                .args
+                .iter()
+                .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
+            {
+                if !arg.is_none()
+                    && !declared_vars.contains(&arg.0)
+                    && !constants.contains_key(&arg.0)
+                {
+                    declared_vars.insert(arg.0);
+                    if debug_declares {
+                        eprintln!("[jit][declare] ref-arg var{} owner={:?}", arg.0, op.opcode);
                     }
+                    var_types.insert(arg.0, cl_types::I64);
                 }
             }
         }
@@ -5050,7 +5095,13 @@ impl CraneliftBackend {
             *cell.borrow_mut() = Some(op_result_positions);
         });
 
-        let entry_input_vals: Vec<CValue> = (0..num_inputs)
+        let max_entry_inputs = num_inputs.max(body_direct_num_inputs);
+        let load_count = if body_direct_num_inputs > 0 {
+            max_entry_inputs + 1 // extra slot for entry_mode flag
+        } else {
+            num_inputs
+        };
+        let entry_input_vals: Vec<CValue> = (0..load_count)
             .map(|i| {
                 let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                 builder
@@ -5110,21 +5161,48 @@ impl CraneliftBackend {
         let mut last_ovf_flag: Option<CValue> = None;
 
         if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
-            let vals: Vec<CValue> = if has_entry_label {
-                entry_input_vals.clone()
+            if body_direct_num_inputs > 0 && label_blocks.len() >= 2 {
+                // Dual entry: branch on entry_mode (last input slot).
+                // entry_mode == 0 → preamble, entry_mode != 0 → body-direct.
+                // brif directly targets label blocks with their params.
+                let entry_mode = entry_input_vals[max_entry_inputs];
+                let body_block = label_blocks.last().unwrap().1;
+
+                let body_args = block_args(&entry_input_vals[..body_direct_num_inputs]);
+                let preamble_args = block_args(&entry_input_vals[..num_inputs]);
+                builder.ins().brif(
+                    entry_mode,
+                    body_block,
+                    &body_args,
+                    entry_label_block,
+                    &preamble_args,
+                );
+
+                // Continue with preamble label block for var binding
+                builder.switch_to_block(entry_label_block);
+                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                    let param = builder.block_params(entry_label_block)[i];
+                    if !arg_ref.is_none() {
+                        builder.def_var(var(arg_ref.0), param);
+                    }
+                }
             } else {
-                ops[entry_label_idx]
-                    .args
-                    .iter()
-                    .map(|&r| resolve_opref(&mut builder, &constants, r))
-                    .collect()
-            };
-            builder.ins().jump(entry_label_block, &block_args(&vals));
-            builder.switch_to_block(entry_label_block);
-            for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
-                let param = builder.block_params(entry_label_block)[i];
-                if !arg_ref.is_none() {
-                    builder.def_var(var(arg_ref.0), param);
+                let vals: Vec<CValue> = if has_entry_label {
+                    entry_input_vals.clone()
+                } else {
+                    ops[entry_label_idx]
+                        .args
+                        .iter()
+                        .map(|&r| resolve_opref(&mut builder, &constants, r))
+                        .collect()
+                };
+                builder.ins().jump(entry_label_block, &block_args(&vals));
+                builder.switch_to_block(entry_label_block);
+                for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
+                    let param = builder.block_params(entry_label_block)[i];
+                    if !arg_ref.is_none() {
+                        builder.def_var(var(arg_ref.0), param);
+                    }
                 }
             }
         } else if has_jump {
@@ -8565,6 +8643,11 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
             needs_force_frame,
+            body_num_inputs: if label_indices.len() >= 2 {
+                ops[*label_indices.last().unwrap()].args.len()
+            } else {
+                0
+            },
         })
     }
 }
@@ -8596,6 +8679,7 @@ fn collect_guards(
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
+    constants: &HashMap<u32, i64>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
@@ -8682,9 +8766,28 @@ fn collect_guards(
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.0).then_some(slot))
             .collect();
 
+        // Extract per-guard bytecode resume PC from the last fail_arg constant.
+        // RPython rd_resume_position: the interpreter PC where execution resumes.
+        // The jit_interp macro records resume_pc as the last fail_arg constant.
+        let guard_resume_pc: Option<u64> = if !is_finish && !is_external_jump {
+            fail_arg_refs
+                .last()
+                .and_then(|&last_ref| constants.get(&last_ref.0).map(|&v| v as u64))
+        } else {
+            None
+        };
+        if std::env::var_os("MAJIT_LOG").is_some() && guard_resume_pc.is_some() {
+            eprintln!(
+                "[guard-resume] fail_index={} last_ref={:?} resume_pc={:?}",
+                fail_index,
+                fail_arg_refs.last(),
+                guard_resume_pc
+            );
+        }
         let mut recovery_layout = identity_recovery_layout(
             trace_id,
             header_pc,
+            guard_resume_pc,
             source_guard,
             &fail_arg_types,
             caller_layout,
@@ -8810,6 +8913,7 @@ fn collect_terminal_exit_layouts(
                 identity_recovery_layout(
                     trace_id,
                     header_pc,
+                    None, // terminal exits don't need per-guard resume_pc
                     source_guard,
                     &exit_types,
                     caller_layout,
@@ -8892,8 +8996,11 @@ impl majit_codegen::Backend for CraneliftBackend {
     ) -> Result<AsmInfo, BackendError> {
         // Compile the bridge trace as a standalone function using the same
         // code generation path as compile_loop.
-        // Bridges share the parent loop's invalidation flag.
-        let flag_ptr = Arc::as_ptr(&original_token.invalidated) as *const AtomicBool as usize;
+        // Skip invalidation check for bridges: the parent loop's
+        // GuardNotInvalidated already checked the flag before reaching
+        // this guard. Baking the flag address into the bridge causes
+        // spurious failures when the parent's Arc is recycled.
+        let flag_ptr: usize = 0; // disabled for bridges
         let original_compiled = original_token
             .compiled
             .as_ref()
@@ -8928,7 +9035,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         let compiled = self.do_compile(
             inputargs,
             ops,
-            Some(flag_ptr),
+            None, // no invalidation check for bridges
             Some((source_trace_id, fail_descr.fail_index())),
             caller_layout.as_ref(),
         )?;
@@ -9058,9 +9165,18 @@ impl majit_codegen::Backend for CraneliftBackend {
             compiled.needs_force_frame,
         );
 
+        if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
+            eprintln!(
+                "[exec-raw] fail_index={fail_index} outputs_len={}",
+                outputs.len()
+            );
+        }
         if let Some(frame) =
             maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
         {
+            if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
+                eprintln!("[exec-raw] fail_index=0 → call_assembler path");
+            }
             let frame = wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 compiled.trace_id,
@@ -9117,7 +9233,11 @@ impl majit_codegen::Backend for CraneliftBackend {
         let fail_descr = &compiled.fail_descrs[fail_index as usize];
         fail_descr.increment_fail_count();
 
-        // If a bridge is attached, fall back to the full DeadFrame path.
+        // If a bridge is attached, dispatch to it.
+        if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
+            let has_bridge = fail_descr.bridge.lock().unwrap().is_some();
+            eprintln!("[exec-guard0] fail_index={fail_index} has_bridge={has_bridge}");
+        }
         let bridge_guard = fail_descr.bridge.lock().unwrap();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
@@ -9126,6 +9246,15 @@ impl majit_codegen::Backend for CraneliftBackend {
                 .data
                 .downcast_ref::<FrameData>()
                 .expect("bridge returned unexpected frame type");
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[bridge-dispatch] guard={} bridge_trace={} bridge_exit_fail={} is_finish={}",
+                    fail_index,
+                    bridge.trace_id,
+                    descr.fail_descr.fail_index(),
+                    descr.fail_descr.is_finish()
+                );
+            }
             let arity = descr.fail_descr.fail_arg_types().len();
             let mut result = Vec::with_capacity(arity);
             let mut typed_result = Vec::with_capacity(arity);

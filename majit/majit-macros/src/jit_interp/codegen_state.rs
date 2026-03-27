@@ -1354,6 +1354,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 }
 
                 fn linked_list_stack_head_descr(&self) -> Option<majit_ir::DescrRef> {
+                    // Mark as virtualizable to exclude from Phase 2 heap cache
+                    // import. These fields change every iteration — the imported
+                    // preamble value would be stale. The correct fix is to carry
+                    // them as extra JUMP/LABEL args (RPython inline_short_preamble).
                     Some(std::sync::Arc::new(
                         majit_ir::descr::SimpleFieldDescr::new(
                             0x8000_0003,

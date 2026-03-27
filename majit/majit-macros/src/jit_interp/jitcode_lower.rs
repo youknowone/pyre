@@ -2712,7 +2712,9 @@ fn push_call_arg(expr: &Expr) -> Option<&Expr> {
     let Expr::MethodCall(ExprMethodCall { method, args, .. }) = expr else {
         return None;
     };
-    if (method == "push" || method == "push_ref" || method == "push_float") && args.len() == 1 {
+    if (method == "push" || method == "push_ref" || method == "push_float" || method == "push_raw")
+        && args.len() == 1
+    {
         Some(&args[0])
     } else {
         None
@@ -2763,7 +2765,7 @@ fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
 fn is_pop_call(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::MethodCall(ExprMethodCall { method, args, .. }) if method == "pop" && args.is_empty()
+        Expr::MethodCall(ExprMethodCall { method, args, .. }) if (method == "pop" || method == "pop_raw") && args.is_empty()
     )
 }
 
@@ -2820,7 +2822,16 @@ fn is_pop_discard(expr: &Expr) -> bool {
 
 fn is_supported_int_cast(ty: &Type) -> bool {
     match ty {
-        Type::Path(type_path) => type_path.path.is_ident("i64") || type_path.path.is_ident("isize"),
+        Type::Path(type_path) => {
+            type_path.path.is_ident("i64")
+                || type_path.path.is_ident("isize")
+                || type_path.path.is_ident("i32")
+                || type_path.path.is_ident("u32")
+                || type_path.path.is_ident("i16")
+                || type_path.path.is_ident("u16")
+                || type_path.path.is_ident("i8")
+                || type_path.path.is_ident("u8")
+        }
         _ => false,
     }
 }
