@@ -3944,23 +3944,6 @@ impl<M: Clone> MetaInterp<M> {
             })
     }
 
-    /// compile.py:783-784: check if guard counter would fire (without ticking).
-    pub fn would_compile_bridge_in_trace(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> bool {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return false;
-        };
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        compiled
-            .guard_failures
-            .get(&(trace_id, fail_index))
-            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash))
-    }
-
     fn bridge_fail_descr_proxy(
         compiled: &CompiledEntry<M>,
         trace_id: u64,
@@ -4524,10 +4507,11 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
 
         // Decide what to do next
+        // compile.py:701-709: handle_fail — two branches only:
+        // 1. must_compile → CompileBridge
+        // 2. else → resume_in_blackhole (ResumeInterpreter)
         let action = if self.should_compile_bridge_in_trace(green_key, trace_id, fail_index) {
             GuardRecoveryAction::CompileBridge
-        } else if self.would_compile_bridge_in_trace(green_key, trace_id, fail_index) {
-            GuardRecoveryAction::RetraceFromGuard
         } else {
             GuardRecoveryAction::ResumeInterpreter
         };
@@ -5334,12 +5318,10 @@ pub struct GuardRecovery {
 /// What should be done after a guard failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardRecoveryAction {
-    /// Resume the interpreter from the recovered state.
+    /// compile.py:711-716: resume_in_blackhole — resume interpreter.
     ResumeInterpreter,
-    /// The guard has failed enough times to warrant bridge compilation.
+    /// compile.py:704-709: _trace_and_compile_from_bridge.
     CompileBridge,
-    /// Start retracing from this guard failure point.
-    RetraceFromGuard,
 }
 
 /// Result of running compiled code with automatic recovery.
