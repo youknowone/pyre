@@ -4059,11 +4059,6 @@ struct CompiledLoop {
     /// Whether any guard in this loop uses FORCE_TOKEN slots.
     /// When false, force frame registration can be skipped entirely.
     needs_force_frame: bool,
-    /// Number of body label args for body-direct entry.
-    /// When > 0, the compiled function supports dual entry: the last
-    /// input slot (at index max(num_inputs, body_num_inputs)) selects
-    /// the entry mode: 0 = preamble, nonzero = body-direct.
-    body_num_inputs: usize,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -4614,17 +4609,7 @@ impl CraneliftBackend {
         // RPython parity: bridge JUMP → loop re-entry uses a loop instead
         // of recursive calls, matching RPython's inline jmp within the same
         // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
-        let max_entry = compiled.num_inputs.max(compiled.body_num_inputs);
-        let mut current_inputs = if compiled.body_num_inputs > 0 {
-            // Pad inputs for body-direct capable loops.
-            // Last slot = entry_mode: 0 = preamble (initial entry).
-            let mut padded = vec![0i64; max_entry + 1];
-            let copy_len = inputs.len().min(compiled.num_inputs);
-            padded[..copy_len].copy_from_slice(&inputs[..copy_len]);
-            padded
-        } else {
-            inputs.to_vec()
-        };
+        let mut current_inputs = inputs.to_vec();
         loop {
             let (fail_index, outputs, handle, force_frame) = run_compiled_code(
                 compiled.code_ptr,
@@ -4710,21 +4695,9 @@ impl CraneliftBackend {
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
                         let num_outputs = bridge_descr.fail_arg_types().len();
-                        if compiled.body_num_inputs > 0 {
-                            // Body-direct re-entry: bridge outputs are
-                            // body-compatible values. Set entry_mode = 1
-                            // to skip preamble guards on re-entry.
-                            current_inputs = vec![0i64; max_entry + 1];
-                            for i in 0..num_outputs.min(compiled.body_num_inputs) {
-                                current_inputs[i] =
-                                    get_int_from_deadframe(&bridge_frame, i).unwrap_or(0);
-                            }
-                            current_inputs[max_entry] = 1; // body-direct
-                        } else {
-                            current_inputs = (0..num_outputs)
-                                .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                                .collect();
-                        }
+                        current_inputs = (0..num_outputs)
+                            .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
+                            .collect();
                         continue; // re-enter loop
                     }
                     return bridge_frame;
@@ -8643,7 +8616,6 @@ impl CraneliftBackend {
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
             needs_force_frame,
-            body_num_inputs: 0, // body-direct entry disabled
         })
     }
 }
