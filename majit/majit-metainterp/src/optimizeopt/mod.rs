@@ -232,10 +232,6 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
-    /// Bridge trace flag: RPython registers_r/registers_i separation parity.
-    pub is_bridge_trace: bool,
-    /// Actual number of bridge inputargs (before effective_inputs inflation).
-    pub bridge_num_inputargs: u32,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -415,8 +411,6 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
-            is_bridge_trace: false,
-            bridge_num_inputargs: 0,
             current_pass_idx: 0,
 
             in_final_emission: false,
@@ -463,8 +457,6 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
-            is_bridge_trace: false,
-            bridge_num_inputargs: 0,
             current_pass_idx: 0,
 
             in_final_emission: false,
@@ -1020,6 +1012,7 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
+        let snapshot_boxes_ref = snapshot_boxes.clone();
         let snapshot = Snapshot::single_frame(0, snapshot_boxes);
 
         // BoxEnv bridging current optimizer state.
@@ -1036,7 +1029,18 @@ impl OptContext {
                 repl
             }
             fn is_const(&self, opref: OpRef) -> bool {
-                self.ctx.is_constant(opref)
+                if self.ctx.is_constant(opref) {
+                    // RPython parity: null Ref (GcRef(0)) is not a valid
+                    // constant for resume data — would produce null Ref
+                    // at runtime via TAGCONST(0, Ref).
+                    if let Some(Value::Ref(r)) = self.ctx.get_constant(opref) {
+                        if r.0 == 0 {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                false
             }
             fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
                 if let Some(val) = self.ctx.get_constant(opref) {
@@ -1114,6 +1118,24 @@ impl OptContext {
             }
         }
 
+        // Map vidx → snapshot frame position. TAGVIRTUAL(vidx) was emitted
+        // at a specific position in the snapshot — that's the frame slot index.
+        let mut vidx_to_frame_pos: std::collections::HashMap<i32, usize> =
+            std::collections::HashMap::new();
+        for (snap_pos, &snap_opref) in snapshot_boxes_ref.iter().enumerate() {
+            if !snap_opref.is_none() {
+                // Resolve through replacement chain (same as _number_boxes does
+                // via env.get_box_replacement) to match numb_state.liveboxes keys.
+                let resolved = self.get_replacement(snap_opref);
+                if let Some(&tagged) = numb_state.liveboxes.get(&resolved.0) {
+                    let (v, tagbits) = resumedata::untag(tagged);
+                    if tagbits == resumedata::TAGVIRTUAL {
+                        vidx_to_frame_pos.entry(v).or_insert(snap_pos);
+                    }
+                }
+            }
+        }
+
         // resume.py:419-426 + 444 _number_virtuals: append virtual field boxes.
         let mut virtual_entries: Vec<majit_ir::GuardVirtualEntry> = Vec::new();
         for (vbox, vidx) in &virtual_boxes {
@@ -1134,9 +1156,14 @@ impl OptContext {
                 liveboxes.push(resolved_val);
                 fields.push((*field_idx, base_idx + fi));
             }
+            // fail_arg_index = snapshot frame position (not vidx)
+            let frame_pos = vidx_to_frame_pos
+                .get(vidx)
+                .copied()
+                .unwrap_or(*vidx as usize);
             virtual_entries.push(majit_ir::GuardVirtualEntry {
                 original_opref: Some(*vbox),
-                fail_arg_index: *vidx as usize,
+                fail_arg_index: frame_pos,
                 descr,
                 known_class,
                 fields,
