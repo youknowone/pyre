@@ -231,3 +231,165 @@ pub fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 
     schedule
 }
+
+// ── dependency.py:981-1138: IndexVar ──────────────────────────
+
+/// dependency.py:981-1093: Linear combination of an index variable.
+/// Represents `var * (coefficient_mul / coefficient_div) + constant`.
+#[derive(Clone, Debug)]
+pub struct IndexVar {
+    /// The base SSA variable.
+    pub var: OpRef,
+    /// Multiplicative coefficient (numerator).
+    pub coefficient_mul: i64,
+    /// Divisive coefficient (denominator).
+    pub coefficient_div: i64,
+    /// Additive constant.
+    pub constant: i64,
+}
+
+impl IndexVar {
+    pub fn new(var: OpRef) -> Self {
+        IndexVar {
+            var,
+            coefficient_mul: 1,
+            coefficient_div: 1,
+            constant: 0,
+        }
+    }
+
+    /// dependency.py:1042-1044
+    pub fn same_variable(&self, other: &IndexVar) -> bool {
+        self.var == other.var
+    }
+
+    /// dependency.py:1046-1058
+    pub fn same_mulfactor(&self, other: &IndexVar) -> bool {
+        if self.coefficient_mul == other.coefficient_mul
+            && self.coefficient_div == other.coefficient_div
+        {
+            return true;
+        }
+        let selfmod = self.coefficient_mul % self.coefficient_div;
+        let othermod = other.coefficient_mul % other.coefficient_div;
+        if selfmod == 0 && othermod == 0 {
+            let selfdiv = self.coefficient_mul / self.coefficient_div;
+            let otherdiv = other.coefficient_mul / other.coefficient_div;
+            return selfdiv == otherdiv;
+        }
+        false
+    }
+
+    /// dependency.py:1060-1063
+    pub fn constant_diff(&self, other: &IndexVar) -> i64 {
+        self.constant - other.constant
+    }
+
+    /// dependency.py:1030-1033
+    pub fn is_identity(&self) -> bool {
+        self.coefficient_mul == 1 && self.coefficient_div == 1 && self.constant == 0
+    }
+
+    /// dependency.py:1035-1040
+    pub fn clone_var(&self) -> Self {
+        IndexVar {
+            var: self.var,
+            coefficient_mul: self.coefficient_mul,
+            coefficient_div: self.coefficient_div,
+            constant: self.constant,
+        }
+    }
+}
+
+// ── dependency.py:1140-1220: MemoryRef ────────────────────────
+
+/// dependency.py:1140-1220: A memory reference to an array object.
+/// Tracks the array pointer, descriptor, and index variable (linear
+/// combination) for adjacent-memory analysis.
+#[derive(Clone, Debug)]
+pub struct MemoryRef {
+    /// The array pointer (op.getarg(0))
+    pub array: OpRef,
+    /// The array descriptor
+    pub descr: majit_ir::DescrRef,
+    /// The index as a linear combination
+    pub index_var: IndexVar,
+    /// Whether this is a raw (byte-level) access
+    pub raw_access: bool,
+}
+
+impl MemoryRef {
+    pub fn new(array: OpRef, descr: majit_ir::DescrRef, index_var: IndexVar) -> Self {
+        MemoryRef {
+            array,
+            descr,
+            index_var,
+            raw_access: false,
+        }
+    }
+
+    /// dependency.py:1158-1167: symmetric adjacency check
+    pub fn is_adjacent_to(&self, other: &MemoryRef) -> bool {
+        if !self.same_array(other) {
+            return false;
+        }
+        if !self.index_var.same_variable(&other.index_var) {
+            return false;
+        }
+        if !self.index_var.same_mulfactor(&other.index_var) {
+            return false;
+        }
+        let stride = self.stride();
+        self.index_var
+            .constant_diff(&other.index_var)
+            .abs()
+            .saturating_sub(stride)
+            == 0
+    }
+
+    /// dependency.py:1169-1178: asymmetric adjacency (self is after other)
+    pub fn is_adjacent_after(&self, other: &MemoryRef) -> bool {
+        if !self.same_array(other) {
+            return false;
+        }
+        if !self.index_var.same_variable(&other.index_var) {
+            return false;
+        }
+        if !self.index_var.same_mulfactor(&other.index_var) {
+            return false;
+        }
+        let stride = self.stride();
+        other.index_var.constant_diff(&self.index_var) == stride
+    }
+
+    /// dependency.py:1180-1194: alias check
+    pub fn alias(&self, other: &MemoryRef) -> bool {
+        if !self.same_array(other) {
+            return false;
+        }
+        if !self.index_var.same_variable(&other.index_var) {
+            return true;
+        }
+        if !self.index_var.same_mulfactor(&other.index_var) {
+            return true;
+        }
+        self.index_var.constant_diff(&other.index_var).abs() < self.stride()
+    }
+
+    /// dependency.py:1196-1197
+    pub fn same_array(&self, other: &MemoryRef) -> bool {
+        self.array == other.array && std::sync::Arc::ptr_eq(&self.descr, &other.descr)
+    }
+
+    /// dependency.py:1213-1217: stride in elements (1) or bytes (for raw)
+    pub fn stride(&self) -> i64 {
+        if !self.raw_access {
+            1
+        } else {
+            self.descr
+                .as_array_descr()
+                .map(|ad| ad.item_size() as i64)
+                .unwrap_or(8)
+        }
+    }
+}
