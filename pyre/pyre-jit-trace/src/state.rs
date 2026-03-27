@@ -5642,21 +5642,24 @@ impl ControlFlowOpcodeHandler for MIFrame {
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
-            // pyjitpl.py:2979-2983: compile_trace — attempt to connect to
-            // the ROOT loop's existing compiled targets.
+            // pyjitpl.py:2979-2983 / 2999-3007: compile_trace or compile_retrace
+            // — attempt to connect to the ROOT loop's existing compiled targets.
+            // For bridge traces, pass bridge_origin so compile_trace routes to
+            // compile_bridge (RPython compile_retrace parity).
             {
                 let root_key = ctx.root_green_key();
                 let (driver, _) = crate::driver::driver_pair();
+                let bridge_origin = driver.bridge_origin();
                 if driver.meta_interp().has_compiled_targets(root_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
-                        .compile_trace(root_key, &jump_args, None);
+                        .compile_trace(root_key, &jump_args, bridge_origin);
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
-                                "[jit][reached_loop_header] compile_trace success: root={} pc={}",
-                                root_key, target
+                                "[jit][reached_loop_header] compile_trace success: root={} pc={} bridge={:?}",
+                                root_key, target, bridge_origin
                             );
                         }
                         MIFrame::set_next_instr(this, ctx, target);
