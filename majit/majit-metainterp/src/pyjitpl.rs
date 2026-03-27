@@ -2434,8 +2434,14 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
 
-        // compile.py:379-382: concatenate partial_trace ops with new body.
-        let mut combined_ops = partial.ops;
+        // compile.py:379-382: preamble (without terminal Jump) + body.
+        // body_ops already contains Label (from assemble_peeled_trace_with_jump_args).
+        // Remove preamble's terminal JUMP — the body Label follows directly.
+        let mut combined_ops: Vec<Op> = partial
+            .ops
+            .into_iter()
+            .take_while(|op| op.opcode != majit_ir::OpCode::Jump)
+            .collect();
         combined_ops.extend(body_ops);
         // Merge constants from partial trace with new constants.
         for (k, v) in partial.constants {
