@@ -1045,6 +1045,10 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         mut recorder: majit_trace::recorder::Trace,
     ) -> BackEdgeAction {
+        // RPython parity: each tracing pass starts with cancel_count=0.
+        // In RPython, MetaInterp is re-created per _compile_and_run_once.
+        // In pyre, MetaInterp is reused, so reset per-trace state here.
+        self.cancel_count = 0;
         for value in live_values {
             recorder.record_input_arg(value.get_type());
         }
@@ -1734,6 +1738,10 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
 
+        // RPython pyjitpl.py:3014 parity: save Phase 1 exported_state
+        // before catch_unwind for retrace_needed if Phase 2 InvalidLoop.
+        let phase1_es = unroll_opt.phase1_exported_state.clone();
+
         // RPython virtualizable.py: if interpreter has a virtualizable,
         // pass its config to OptVirtualize so it can carry frame fields and
         // array slots through the loop as virtual state instead of heap traffic.
@@ -1794,7 +1802,36 @@ impl<M: Clone> MetaInterp<M> {
                             }
                         }
                     } else {
-                        self.warm_state.abort_tracing(green_key, false);
+                        // RPython pyjitpl.py:3014-3017 parity: InvalidLoop
+                        // but cancel_count < limit — set up retrace with
+                        // Phase 1 preamble so the next compile_loop call
+                        // uses compile_retrace with new runtime values.
+                        if let Ok(guard) = phase1_es.lock() {
+                            if let Some(es) = guard.clone() {
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] retrace_needed after InvalidLoop at key={}",
+                                        green_key,
+                                    );
+                                }
+                                self.potential_retrace_position =
+                                    Some(majit_trace::recorder::TracePosition {
+                                        op_count: 0,
+                                        ops_len: 0,
+                                    });
+                                self.retrace_needed(
+                                    green_key,
+                                    trace_ops_snapshot.clone(),
+                                    trace.inputargs.clone(),
+                                    constants_snapshot.clone(),
+                                    es,
+                                );
+                            } else {
+                                self.warm_state.abort_tracing(green_key, false);
+                            }
+                        } else {
+                            self.warm_state.abort_tracing(green_key, false);
+                        }
                         self.warm_state.reset_function_counts();
                         return CompileOutcome::Cancelled;
                     }
@@ -2083,8 +2120,13 @@ impl<M: Clone> MetaInterp<M> {
         self.cancel_count > limit
     }
 
+    /// RPython pyjitpl.py: check if partial_trace is set for compile_retrace.
+    pub fn has_partial_trace(&self) -> bool {
+        self.partial_trace.is_some()
+    }
+
     /// Clear retrace state (partial_trace, retracing_from, exported_state).
-    fn clear_retrace_state(&mut self) {
+    pub fn clear_retrace_state(&mut self) {
         self.partial_trace = None;
         self.retracing_from = None;
         self.exported_state = None;

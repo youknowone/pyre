@@ -52,6 +52,10 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
+    /// RPython pyjitpl.py:3014 parity: Phase 1 exported_state saved for
+    /// retrace_needed when Phase 2 raises InvalidLoop.
+    /// Arc<Mutex<>> to allow access outside catch_unwind.
+    pub phase1_exported_state: std::sync::Arc<std::sync::Mutex<Option<ExportedState>>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
@@ -75,6 +79,7 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
+            phase1_exported_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             snapshot_boxes: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
         }
@@ -285,6 +290,10 @@ impl UnrollOptimizer {
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
+        // Save for retrace_needed if Phase 2 raises InvalidLoop.
+        if let Ok(mut guard) = self.phase1_exported_state.lock() {
+            *guard = Some(exported_state.clone());
+        }
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
         let imported = build_imported_virtuals(&jump_virtuals);

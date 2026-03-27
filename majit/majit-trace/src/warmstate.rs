@@ -352,7 +352,9 @@ impl WarmEnterState {
             function_entry_counts: HashMap::new(),
             retrace_limit: DEFAULT_RETRACE_LIMIT,
             max_retrace_guards: 15,
-            max_unroll_loops: 0,
+            // RPython parity: default 4 (PyPy sets via set_param_max_unroll_loops).
+            // 0 causes cancelled_too_many_times on first InvalidLoop.
+            max_unroll_loops: 4,
             max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
@@ -383,7 +385,9 @@ impl WarmEnterState {
             function_entry_counts: HashMap::new(),
             retrace_limit: DEFAULT_RETRACE_LIMIT,
             max_retrace_guards: 15,
-            max_unroll_loops: 0,
+            // RPython parity: default 4 (PyPy sets via set_param_max_unroll_loops).
+            // 0 causes cancelled_too_many_times on first InvalidLoop.
+            max_unroll_loops: 4,
             max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
