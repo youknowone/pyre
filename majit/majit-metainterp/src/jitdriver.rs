@@ -1746,9 +1746,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        let should_bridge = self
-            .meta
-            .should_compile_bridge_in_trace(green_key, trace_id, fail_index);
+        let should_bridge = self.meta.must_compile(green_key, trace_id, fail_index);
         let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
         let restored = resume_pc.is_some();
         if restored {
@@ -2271,9 +2269,7 @@ impl<S: JitState> JitDriver<S> {
             materialize_pending_fields(&exit_layout, &raw_values);
             self.sync_after(state, &result_meta, descriptor.as_ref());
 
-            let should_bridge = self
-                .meta
-                .should_compile_bridge_in_trace(key_hash, trace_id, fail_index);
+            let should_bridge = self.meta.must_compile(key_hash, trace_id, fail_index);
             if should_bridge {
                 let bridge_ok = self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
