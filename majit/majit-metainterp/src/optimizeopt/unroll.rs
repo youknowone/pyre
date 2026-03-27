@@ -1461,9 +1461,13 @@ impl OptUnroll {
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;
                 optimizer.send_extra_operation(&new_op, ctx);
-                // RPython: mapping[sop] = op — follow forwarding
-                let forwarded = ctx.get_replacement(new_ref);
-                mapping.insert(sp_op.pos, forwarded);
+                // RPython: mapping[sop] = op
+                // Do NOT follow forwarding here. The mapping must use
+                // the new_ref allocated for this short preamble op,
+                // not the forwarded value from Phase 2's cache.
+                // RPython uses distinct Box objects that don't alias,
+                // so mapping[sop] = op is always unique.
+                mapping.insert(sp_op.pos, new_ref);
                 replay_index += 1;
             }
 
