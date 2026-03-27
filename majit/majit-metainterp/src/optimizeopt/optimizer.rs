@@ -5,12 +5,10 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// Chains multiple optimization passes and drives operations through them.
 use crate::optimizeopt::{
     earlyforce::OptEarlyForce,
-    guard::GuardStrengthenOpt,
     heap::OptHeap,
     intbounds::OptIntBounds,
     pure::OptPure,
     rewrite::OptRewrite,
-    simplify::OptSimplify,
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
@@ -2730,9 +2728,9 @@ impl Optimizer {
 
 impl Optimizer {
     /// Create an optimizer with the standard pass pipeline.
-    /// RPython __init__.py:15-22 ALL_OPTS:
-    ///   IntBounds → Rewrite → Virtualize → String → Pure → EarlyForce → Heap
-    /// Guard + Simplify are conditional (__init__.py:40-42).
+    /// RPython __init__.py:15-22 ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
+    ///   intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll
+    /// (unroll is handled separately by UnrollOptimizer)
     pub fn default_pipeline() -> Self {
         let mut opt = Self::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
@@ -2741,8 +2739,6 @@ impl Optimizer {
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
-        opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
         opt
     }
@@ -2756,8 +2752,6 @@ impl Optimizer {
         opt.add_pass(Box::new(OptString::new()));
         opt.add_pass(Box::new(OptPure::new()));
         opt.add_pass(Box::new(OptEarlyForce::new()));
-        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
-        opt.add_pass(Box::new(OptSimplify::new()));
         opt.add_pass(Box::new(OptHeap::new()));
         opt
     }
@@ -3125,10 +3119,11 @@ mod tests {
     }
 
     #[test]
-    fn test_default_pipeline_has_9_passes() {
-        // RPython __init__.py:15-22 ALL_OPTS: 9 passes including OptEarlyForce
+    fn test_default_pipeline_has_7_passes() {
+        // RPython __init__.py:15-22 ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
+        // intbounds:rewrite:virtualize:string:pure:earlyforce:heap (unroll separate)
         let opt = Optimizer::default_pipeline();
-        assert_eq!(opt.num_passes(), 9);
+        assert_eq!(opt.num_passes(), 7);
     }
 
     #[test]

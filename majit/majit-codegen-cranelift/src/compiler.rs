@@ -8834,10 +8834,11 @@ fn collect_guards(
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
-                    // RPython regalloc.py:1092-1108 parity: only GC-track
-                    // frame slots holding heap object VARIABLES, not constant
-                    // pool entries. Static type descriptor pointers (ConstPtr)
-                    // are not GC-managed and must not be scanned.
+                    // TEMPORARY WORKAROUND: RPython never puts constants in
+                    // fail_args (regalloc.py:1206 asserts this). Once the
+                    // consumer switchover (number()+finish() producing
+                    // rd_numb+liveboxes) is active, constants will be in
+                    // rd_consts instead, and this check becomes unnecessary.
                     let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
                     if constants.contains_key(&opref_id) {
                         continue; // constant — not a GC root
