@@ -2091,6 +2091,8 @@ impl Optimization for OptHeap {
         // heap.py:54: for i, info in enumerate(self.cached_infos):
         // info.py:262: op = get_box_replacement(self._fields[fielddescr.get_index()])
         for (&field_idx, cf) in &self.field_cache {
+            // heap.py:53: assert self._lazy_set is None
+            debug_assert!(cf.lazy_set.is_none());
             for i in 0..cf.cached_structs.len() {
                 // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
                 let obj = ctx.get_replacement(cf.cached_structs[i]);
