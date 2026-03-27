@@ -1196,13 +1196,18 @@ fn rebuild_typed_from_rd_numb(
     // RPython calls _prepare_virtuals then _prepare_next_section per frame.
     let mut typed = Vec::new();
 
-    // resume.py:983-991 _prepare_virtuals: virtual objects are materialized
-    // later by materialize_recovery_virtuals using ExitRecoveryLayout.
-    // TAGVIRTUAL slots become placeholder null Refs.
+    // Decode dead frame raw values to typed values first.
+    let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
 
     // resume.py:1017-1026 _prepare_next_section: decode each frame's slots.
     for frame in &frames {
-        _prepare_next_section(frame, raw_values, exit_layout, &mut typed);
+        _prepare_next_section(
+            frame,
+            raw_values,
+            &dead_frame_typed,
+            exit_layout,
+            &mut typed,
+        );
     }
 
     if majit_metainterp::majit_log_enabled() {
@@ -1220,26 +1225,14 @@ fn rebuild_typed_from_rd_numb(
 fn _prepare_next_section(
     frame: &majit_ir::resumedata::RebuiltFrame,
     raw_values: &[i64],
+    dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
     typed: &mut Vec<Value>,
 ) {
     use majit_ir::resumedata::RebuiltValue;
     for val in &frame.values {
         typed.push(match val {
-            RebuiltValue::Box(idx) => {
-                let raw = raw_values.get(*idx).copied().unwrap_or(0);
-                let tp = exit_layout
-                    .exit_types
-                    .get(*idx)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                match tp {
-                    majit_ir::Type::Int => Value::Int(raw),
-                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    majit_ir::Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    majit_ir::Type::Void => Value::Void,
-                }
-            }
+            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
                 majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
@@ -1247,8 +1240,14 @@ fn _prepare_next_section(
                 majit_ir::Type::Void => Value::Void,
             },
             RebuiltValue::Int(i) => Value::Int(*i as i64),
-            // resume.py:983-991: TAGVIRTUAL → placeholder for materialization.
-            RebuiltValue::Virtual(_) => Value::Ref(majit_ir::GcRef(0)),
+            // resume.py:983-991: TAGVIRTUAL → materialize from rd_virtuals_info.
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                exit_layout.exit_types.len() as i32,
+                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
+                exit_layout.rd_virtuals_info.as_deref(),
+            ),
             RebuiltValue::Unassigned => Value::Int(0),
         });
     }
