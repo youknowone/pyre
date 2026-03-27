@@ -2126,11 +2126,15 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Clear retrace state (partial_trace, retracing_from, exported_state).
+    ///
+    /// RPython parity: does NOT reset cancel_count. cancel_count is
+    /// per-tracing-pass (reset in setup_tracing, which corresponds to
+    /// RPython creating a new MetaInterp per _compile_and_run_once).
+    /// clear_retrace_state only clears the retrace-specific fields.
     pub fn clear_retrace_state(&mut self) {
         self.partial_trace = None;
         self.retracing_from = None;
         self.exported_state = None;
-        self.cancel_count = 0;
     }
 
     /// compile.py: has_compiled_targets — check if a green key has
@@ -2434,14 +2438,26 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
 
-        // compile.py:379-382: preamble (without terminal Jump) + body.
-        // body_ops already contains Label (from assemble_peeled_trace_with_jump_args).
-        // Remove preamble's terminal JUMP — the body Label follows directly.
-        let mut combined_ops: Vec<Op> = partial
-            .ops
-            .into_iter()
-            .take_while(|op| op.opcode != majit_ir::OpCode::Jump)
-            .collect();
+        // compile.py:379-382: partial_trace.operations + [label_op] + loop_ops.
+        //
+        // RPython invariant: partial_trace.operations does NOT contain a
+        // terminal JUMP — the optimizer's propagate_all_forward separates
+        // JUMP into last_op (not in _newoperations). body_ops (from
+        // assemble_peeled_trace_with_jump_args) contains Label + body + JUMP.
+        //
+        // pyre deviation: partial.ops are raw trace ops (not optimized
+        // preamble), which DO contain a terminal JUMP from close_loop.
+        // Strip the JUMP only if present at the end, preserving all other
+        // ops. This is a temporary measure until partial.ops stores the
+        // optimized preamble result (RPython's partial_trace.operations).
+        let mut partial_ops = partial.ops;
+        if partial_ops
+            .last()
+            .map_or(false, |op| op.opcode == majit_ir::OpCode::Jump)
+        {
+            partial_ops.pop();
+        }
+        let mut combined_ops = partial_ops;
         combined_ops.extend(body_ops);
         // Merge constants from partial trace with new constants.
         for (k, v) in partial.constants {
