@@ -2122,6 +2122,18 @@ impl Optimizer {
         });
         self.flush(&mut ctx);
 
+        // RPython unroll.py:204: get_virtual_state BEFORE force_box_for_end_of_preamble.
+        // The virtual state must reflect the pre-force state (Virtual/VirtualStruct)
+        // so generate_guards can match against target tokens that expect virtuals.
+        let pre_force_virtual_state = crate::optimizeopt::virtualstate::export_state(
+            &jump_args
+                .iter()
+                .map(|&a| ctx.get_replacement(a))
+                .collect::<Vec<_>>(),
+            &ctx,
+            &ctx.ptr_info,
+        );
+
         // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
         for &arg in &jump_args {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
@@ -2134,14 +2146,15 @@ impl Optimizer {
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
         // JUMP args (live_arg_boxes from compile_trace / deadframe values).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
-        let vs = opt_unroll.jump_to_existing_trace(
+        let vs = opt_unroll.jump_to_existing_trace_with_vs(
             &jump_args,
             None,
             front_target_tokens,
             self,
             &mut ctx,
             false,
-            Some(&pre_opt_jump_args), // runtime_boxes: pre-opt JUMP args (RPython parity)
+            Some(&pre_opt_jump_args),
+            Some(pre_force_virtual_state.clone()),
         );
 
         if vs.is_none() {
@@ -2164,14 +2177,15 @@ impl Optimizer {
 
         // unroll.py:220-230: retrace limit reached, try force_boxes=true
         ctx.clear_newoperations();
-        let vs2 = opt_unroll.jump_to_existing_trace(
+        let vs2 = opt_unroll.jump_to_existing_trace_with_vs(
             &jump_args,
             None,
             front_target_tokens,
             self,
             &mut ctx,
-            true,                     // force_boxes
-            Some(&pre_opt_jump_args), // runtime_boxes: pre-opt JUMP args (RPython parity)
+            true, // force_boxes
+            Some(&pre_opt_jump_args),
+            Some(pre_force_virtual_state),
         );
 
         if vs2.is_none() {
