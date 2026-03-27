@@ -339,7 +339,7 @@ fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__abs__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
         }
     }
@@ -471,7 +471,7 @@ fn type_descr_new_with_metaclass(
                             if args.len() > 3 {
                                 metaclass_args.extend_from_slice(&args[3..]);
                             }
-                            return Ok(crate::space_call_function(w_metaclass, &metaclass_args));
+                            return Ok(crate::call_function(w_metaclass, &metaclass_args));
                         }
                     }
                 }
@@ -524,7 +524,7 @@ fn type_descr_new_with_metaclass(
                     new_args.extend_from_slice(&args[3..]);
                 }
                 drop(unsafe { Box::from_raw(ns_ptr) });
-                return Ok(crate::space_call_function(w_metaclass_new, &new_args));
+                return Ok(crate::call_function(w_metaclass_new, &new_args));
             }
         }
         let w_metaclass = w_winner;
@@ -557,7 +557,7 @@ fn type_descr_new_with_metaclass(
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
                         // Call: descriptor.__set_name__(self, owner, name)
-                        let _ = crate::space_call_function(set_name, &[v, w_type, k]);
+                        let _ = crate::call_function(set_name, &[v, w_type, k]);
                     }
                 }
             }
@@ -1330,7 +1330,7 @@ fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if pyre_object::is_instance(args[0]) {
             let w_type = pyre_object::w_instance_get_type(args[0]);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
-                return Ok(crate::space_call_function(method, &[args[0]]));
+                return Ok(crate::call_function(method, &[args[0]]));
             }
         }
     }
@@ -1365,7 +1365,7 @@ fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let items = collect_iterable(iterable)?;
     let mut results = Vec::with_capacity(items.len());
     for item in items {
-        let result = crate::space_call_function(func, &[item]);
+        let result = crate::call_function(func, &[item]);
         results.push(result);
     }
     let n = results.len();
@@ -1518,7 +1518,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__reversed__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
         }
     }

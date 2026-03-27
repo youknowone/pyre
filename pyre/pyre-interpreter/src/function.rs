@@ -86,6 +86,12 @@ pub fn function_new_with_closure(
     Box::into_raw(obj) as PyObjectRef
 }
 
+/// PyPy `function._get_immutable_code`.
+#[inline]
+pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
+    unsafe { function_get_code(func) }
+}
+
 /// Check if an object is a user-defined function.
 ///
 /// # Safety

@@ -16,6 +16,7 @@ use num_traits::ToPrimitive;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::function::is_function;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::strobject::is_str;
 use pyre_object::*;
@@ -471,7 +472,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         let rdunder = reverse_dunder(dunder).unwrap();
         let w_type = w_instance_get_type(b);
         if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-            let result = crate::space_call_function(method, &[b, a]);
+            let result = crate::call_function(method, &[b, a]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
@@ -482,14 +483,14 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
     if a_is_inst {
         let w_type = w_instance_get_type(a);
         if let Some(method) = lookup_in_type_where(w_type, dunder) {
-            let result = crate::space_call_function(method, &[a, b]);
+            let result = crate::call_function(method, &[a, b]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
         }
         // Also check per-instance attributes (ATTR_TABLE)
         if let Ok(method) = getattr(a, dunder) {
-            let result = crate::space_call_function(method, &[a, b]);
+            let result = crate::call_function(method, &[a, b]);
             if !is_not_implemented(result) {
                 return Some(Ok(result));
             }
@@ -501,7 +502,7 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
         if let Some(rdunder) = reverse_dunder(dunder) {
             let w_type = w_instance_get_type(b);
             if let Some(method) = lookup_in_type_where(w_type, rdunder) {
-                let result = crate::space_call_function(method, &[b, a]);
+                let result = crate::call_function(method, &[b, a]);
                 if !is_not_implemented(result) {
                     return Some(Ok(result));
                 }
@@ -555,7 +556,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
         if let Some(method) = lookup(a, dunder) {
-            return Some(Ok(crate::space_call_function(method, &[a])));
+            return Some(Ok(crate::call_function(method, &[a])));
         }
     }
     None
@@ -966,7 +967,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_type(a) {
             if let Some(w_metatype) = crate::typedef::gettypefor((*a).ob_type) {
                 if let Some(method) = lookup_in_type_where(w_metatype, "__or__") {
-                    return Ok(crate::space_call_function(method, &[a, b]));
+                    return Ok(crate::call_function(method, &[a, b]));
                 }
             }
         }
@@ -1131,21 +1132,21 @@ pub fn is_true(obj: PyObjectRef) -> bool {
             let w_type = w_instance_get_type(obj);
             // Try __bool__ first (type MRO)
             if let Some(method) = lookup_in_type_where(w_type, "__bool__") {
-                let result = crate::space_call_function(method, &[obj]);
+                let result = crate::call_function(method, &[obj]);
                 if !result.is_null() && is_bool(result) {
                     return w_bool_get_value(result);
                 }
             }
             // Then __len__ (type MRO) — nonzero length = truthy
             if let Some(method) = lookup_in_type_where(w_type, "__len__") {
-                let result = crate::space_call_function(method, &[obj]);
+                let result = crate::call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
                 }
             }
             // Also check per-instance __len__ (ATTR_TABLE)
             if let Ok(method) = getattr(obj, "__len__") {
-                let result = crate::space_call_function(method, &[obj]);
+                let result = crate::call_function(method, &[obj]);
                 if !result.is_null() && is_int(result) {
                     return w_int_get_value(result) != 0;
                 }
@@ -1387,14 +1388,14 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             // Python 3.9+ generic subscript: type[X] → __class_getitem__(X)
             // PyPy: typeobject.py type.__class_getitem__
             if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-                return Ok(crate::space_call_function(method, &[obj, index]));
+                return Ok(crate::call_function(method, &[obj, index]));
             }
             // Default: return the type itself (stub for GenericAlias)
             Ok(obj)
         } else if is_instance(obj) {
             // PyPy: descroperation.py __getitem__
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__getitem__") {
-                return Ok(crate::space_call_function(method, &[obj, index]));
+                return Ok(crate::call_function(method, &[obj, index]));
             }
             Err(PyError::type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1435,7 +1436,7 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
         } else if is_instance(obj) {
             // PyPy: descroperation.py __setitem__
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
-                crate::space_call_function(method, &[obj, index, value]);
+                crate::call_function(method, &[obj, index, value]);
                 return Ok(w_none());
             }
             Err(PyError::type_error(format!(
@@ -1465,11 +1466,11 @@ pub fn len(obj: PyObjectRef) -> PyResult {
         } else if is_instance(obj) {
             // Instance __len__ — PyPy: descroperation.py len
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
             // Also check per-instance attributes (ATTR_TABLE)
             if let Ok(method) = getattr(obj, "__len__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
@@ -2132,7 +2133,7 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         if fget.is_null() || is_none(fget) {
             return None;
         }
-        return Some(crate::space_call_function(fget, &[obj]));
+        return Some(crate::call_function(fget, &[obj]));
     }
 
     // staticmethod: PyPy StaticMethod.descr_staticmethod_get → return w_function
@@ -2157,7 +2158,7 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
                 // Call __get__(descr, obj, type) via space.call_function
-                return Some(crate::space_call_function(get_fn, &[descr, obj, w_type]));
+                return Some(crate::call_function(get_fn, &[descr, obj, w_type]));
             }
         }
     }
@@ -2179,7 +2180,7 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
         if fset.is_null() || is_none(fset) {
             return false;
         }
-        crate::space_call_function(fset, &[obj, value]);
+        crate::call_function(fset, &[obj, value]);
         return true;
     }
 
@@ -2188,7 +2189,7 @@ unsafe fn set(descr: PyObjectRef, obj: PyObjectRef, value: PyObjectRef) -> bool 
         let descr_type = w_instance_get_type(descr);
         if let Some(set_fn) = lookup_in_type_where(descr_type, "__set__") {
             if !set_fn.is_null() {
-                crate::space_call_function(set_fn, &[obj, value]);
+                crate::call_function(set_fn, &[obj, value]);
                 return true;
             }
         }
@@ -2273,6 +2274,178 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 }
 
+/// PyPy: baseobjspace.py `call`.
+///
+/// Call a Python callable with packed positional arguments and optional kwargs.
+pub fn call(
+    callable: PyObjectRef,
+    w_args: PyObjectRef,
+    w_kwds: Option<PyObjectRef>,
+) -> PyObjectRef {
+    if let Some(w_kwargs) = w_kwds {
+        if !w_kwargs.is_null() && !unsafe { is_none(w_kwargs) } {
+            panic!("call with kwargs is not yet implemented in pyre");
+        }
+    }
+
+    let mut args = Vec::new();
+    unsafe {
+        if is_tuple(w_args) {
+            let len = w_tuple_len(w_args);
+            args.reserve(len);
+            for i in 0..len {
+                if let Some(arg) = w_tuple_getitem(w_args, i as i64) {
+                    args.push(arg);
+                }
+            }
+        } else if is_list(w_args) {
+            let len = w_list_len(w_args);
+            args.reserve(len);
+            for i in 0..len {
+                if let Some(arg) = w_list_getitem(w_args, i as i64) {
+                    args.push(arg);
+                }
+            }
+        } else if !w_args.is_null() {
+            panic!("call() expects tuple or list positional arguments");
+        }
+    }
+    call_function(callable, &args)
+}
+
+/// PyPy: baseobjspace.py `call_obj_args` — add a leading object before args.
+pub fn call_obj_args(callable: PyObjectRef, obj: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    if obj.is_null() {
+        return call_function(callable, args);
+    }
+    let mut call_args = Vec::with_capacity(1 + args.len());
+    call_args.push(obj);
+    call_args.extend_from_slice(args);
+    call_function(callable, &call_args)
+}
+
+/// PyPy: baseobjspace.py `call_valuestack`.
+pub fn call_valuestack(
+    callable: PyObjectRef,
+    nargs: usize,
+    frame: &mut crate::pyframe::PyFrame,
+    dropvalues: usize,
+    methodcall: bool,
+) -> PyObjectRef {
+    let mut args = Vec::with_capacity(nargs);
+    for _ in 0..nargs {
+        args.push(frame.pop());
+    }
+    args.reverse();
+
+    let mut remaining_to_drop = dropvalues.saturating_sub(nargs);
+
+    let null_or_self = if methodcall {
+        let value = if remaining_to_drop > 0 {
+            remaining_to_drop -= 1;
+            Some(frame.pop())
+        } else {
+            None
+        };
+        if remaining_to_drop > 0 {
+            frame.pop();
+            remaining_to_drop -= 1;
+        }
+        value
+    } else {
+        if remaining_to_drop > 0 {
+            frame.pop();
+            remaining_to_drop -= 1;
+        }
+        None
+    };
+
+    for _ in 0..remaining_to_drop {
+        frame.pop();
+    }
+
+    if let Some(null_or_self) = null_or_self {
+        if !null_or_self.is_null() && !unsafe { is_none(null_or_self) } {
+            args.insert(0, null_or_self);
+        }
+    }
+    call_function(callable, &args)
+}
+
+/// PyPy: baseobjspace.py `call_args_and_c_profile`.
+pub fn call_args_and_c_profile(
+    _frame: &mut crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyObjectRef {
+    call_function(callable, args)
+}
+
+/// PyPy: baseobjspace.py `call_method`.
+pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
+    let method =
+        getattr(obj, methname).unwrap_or_else(|e| panic!("call_method({methname}) failed: {e}"));
+    call_function(method, args)
+}
+
+/// PyPy: baseobjspace.py `call_function`.
+///
+/// Dispatches to builtins, user functions, and type objects.
+pub fn call_function(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    crate::call::call_function_impl(callable, args)
+}
+
+/// PyPy: baseobjspace.py `callable_w`.
+pub fn callable_w(obj: PyObjectRef) -> bool {
+    unsafe {
+        is_function(obj)
+            || crate::is_builtin_code(obj)
+            || is_type(obj)
+            || (is_instance(obj) && lookup_in_type(w_instance_get_type(obj), "__call__").is_some())
+    }
+}
+
+/// PyPy: baseobjspace.py `callable`.
+pub fn callable(obj: PyObjectRef) -> PyObjectRef {
+    if callable_w(obj) {
+        w_bool_from(true)
+    } else {
+        w_bool_from(false)
+    }
+}
+
+/// PyPy `ObjSpace.call_function_or_identity`.
+pub fn call_function_or_identity(obj: PyObjectRef, dunder: &str) -> PyObjectRef {
+    unsafe {
+        if is_instance(obj) {
+            if let Some(method) = lookup(obj, dunder) {
+                return call_function(method, &[obj]);
+            }
+        }
+    }
+    obj
+}
+
+/// PyPy baseobjspace.py equivalent.
+pub fn get_printable_location(greenkey: PyObjectRef) -> String {
+    format!("unpackiterable [{:?}]", greenkey)
+}
+
+/// PyPy baseobjspace.py equivalent.
+pub fn wrappable_class_name(class: PyObjectRef) -> String {
+    if class.is_null() {
+        return "internal subclass".to_string();
+    }
+    unsafe {
+        let type_name = (*(*class).ob_type).tp_name;
+        if is_type(class) {
+            type_name.to_string()
+        } else {
+            format!("internal subclass of {type_name}")
+        }
+    }
+}
+
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
@@ -2306,7 +2479,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // Instance __iter__ — check type MRO and ATTR_TABLE
         if is_instance(obj) {
             if let Ok(method) = getattr(obj, "__iter__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
         }
         // Type object: check metaclass __iter__ (NOT the type's own MRO)
@@ -2322,14 +2495,14 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             });
             if let Some(w_metaclass) = w_metaclass {
                 if let Some(method) = lookup_in_type_where(w_metaclass, "__iter__") {
-                    return Ok(crate::space_call_function(method, &[obj]));
+                    return Ok(crate::call_function(method, &[obj]));
                 }
             }
             // Fallback: check type type's MRO
             if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
             {
                 if let Some(method) = lookup_in_type_where(w_type_type, "__iter__") {
-                    return Ok(crate::space_call_function(method, &[obj]));
+                    return Ok(crate::call_function(method, &[obj]));
                 }
             }
         }
@@ -2394,7 +2567,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__next__") {
-                return Ok(crate::space_call_function(method, &[obj]));
+                return Ok(crate::call_function(method, &[obj]));
             }
         }
     }
@@ -2791,12 +2964,12 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         if is_instance(haystack) {
             let w_type = w_instance_get_type(haystack);
             if let Some(method) = lookup_in_type_where(w_type, "__contains__") {
-                let result = crate::space_call_function(method, &[haystack, needle]);
+                let result = crate::call_function(method, &[haystack, needle]);
                 return Ok(is_true(result));
             }
             // Also check per-instance attributes (ATTR_TABLE)
             if let Ok(method) = getattr(haystack, "__contains__") {
-                let result = crate::space_call_function(method, &[haystack, needle]);
+                let result = crate::call_function(method, &[haystack, needle]);
                 return Ok(is_true(result));
             }
         }
@@ -2859,7 +3032,7 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
             if let Some(method) =
                 lookup_in_type_where(pyre_object::w_instance_get_type(obj), "__delitem__")
             {
-                crate::space_call_function(method, &[obj, index]);
+                crate::call_function(method, &[obj, index]);
                 return Ok(());
             }
         }

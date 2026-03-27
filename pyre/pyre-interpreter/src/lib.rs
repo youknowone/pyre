@@ -48,34 +48,4 @@ pub use pyopcode::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
 
-// ── baseobjspace.call_function ───────────────────────────────────────
-//
-// PyPy: baseobjspace.py call_function — unified callable dispatch.
-// Now a direct function (no callback needed — interpreter is in the same crate).
-
-/// Call a Python callable with the given arguments.
-///
-/// PyPy: `space.call_function(w_callable, *args_w)`
-///
-/// Dispatches to builtins, user functions, and type objects.
-pub fn space_call_function(
-    callable: pyre_object::PyObjectRef,
-    args: &[pyre_object::PyObjectRef],
-) -> pyre_object::PyObjectRef {
-    call::call_function_impl(callable, args)
-}
-
-/// Try calling `obj.__dunder__()`, return obj itself if dunder not found.
-pub fn space_call_function_or_identity(
-    obj: pyre_object::PyObjectRef,
-    dunder: &str,
-) -> pyre_object::PyObjectRef {
-    unsafe {
-        if pyre_object::is_instance(obj) {
-            if let Some(method) = baseobjspace::lookup(obj, dunder) {
-                return space_call_function(method, &[obj]);
-            }
-        }
-    }
-    obj
-}
+// baseobjspace call helpers are re-exported from `baseobjspace`.

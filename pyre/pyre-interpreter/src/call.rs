@@ -659,7 +659,7 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
             }
         }
     }
-    panic!("space_call_function: '{}' object is not callable", unsafe {
+    panic!("call_function: '{}' object is not callable", unsafe {
         (*(*callable).ob_type).tp_name
     });
 }
@@ -878,7 +878,7 @@ fn call_metaclass_with_kwargs(
     }
 
     // Fallback: call without kwargs
-    crate::space_call_function(w_metaclass, &[name, bases, w_namespace_dict])
+    crate::call_function(w_metaclass, &[name, bases, w_namespace_dict])
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
@@ -1017,7 +1017,7 @@ fn build_class_inner(
             match crate::baseobjspace::getattr(w_metaclass, "__prepare__") {
                 Ok(prepare) => {
                     let ns_obj =
-                        crate::space_call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                        crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
                     if !ns_obj.is_null() && unsafe { !pyre_object::is_none(ns_obj) } {
                         Some(ns_obj)
                     } else {
@@ -1141,7 +1141,7 @@ fn build_class_inner(
         let result = if let Some(kw) = extra_kwargs {
             call_metaclass_with_kwargs(w_metaclass, name_obj, bases, w_namespace_dict, kw)
         } else {
-            crate::space_call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
+            crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
         };
         // If metaclass returned a W_TypeObject, set up MRO and store metaclass ref.
         if unsafe { pyre_object::is_type(result) } {
@@ -1175,7 +1175,7 @@ fn build_class_inner(
             if !value.is_null() {
                 if let Ok(set_name) = crate::baseobjspace::getattr(value, "__set_name__") {
                     // Call: descriptor.__set_name__(self, owner, name)
-                    let _ = crate::space_call_function(
+                    let _ = crate::call_function(
                         set_name,
                         &[value, w_type, pyre_object::w_str_new(&attr_name)],
                     );
@@ -1204,7 +1204,7 @@ fn build_class_inner(
                     if let Some(init_sub) =
                         unsafe { crate::baseobjspace::lookup_in_type(base, "__init_subclass__") }
                     {
-                        let _ = crate::space_call_function(init_sub, &[w_type]);
+                        let _ = crate::call_function(init_sub, &[w_type]);
                     }
                 }
             }

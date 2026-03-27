@@ -359,7 +359,7 @@ impl IterOpcodeHandler for PyFrame {
             // Check both type MRO and instance dict (ATTR_TABLE)
             if pyre_object::is_instance(iter) {
                 if let Ok(iter_method) = crate::baseobjspace::getattr(iter, "__iter__") {
-                    let result = crate::space_call_function(iter_method, &[iter]);
+                    let result = crate::call_function(iter_method, &[iter]);
                     self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
                     return Ok(());
                 }
@@ -376,7 +376,7 @@ impl IterOpcodeHandler for PyFrame {
                 if let Some(metaclass) = mc {
                     if let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
                     {
-                        let result = crate::space_call_function(method, &[iter]);
+                        let result = crate::call_function(method, &[iter]);
                         self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
                         return Ok(());
                     }
@@ -691,7 +691,7 @@ impl OpcodeStepExecutor for PyFrame {
                         }
                     } else if pyre_object::is_type(exc) {
                         // raise SomeType → call type() to create instance
-                        let result = crate::space_call_function(exc, &[]);
+                        let result = crate::call_function(exc, &[]);
                         if pyre_object::is_exception(result) {
                             Err(PyError::from_exc_object(result))
                         } else {
