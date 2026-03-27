@@ -667,6 +667,12 @@ impl WarmEnterState {
             .tick_with_threshold(guard_hash, self.bridge_threshold)
     }
 
+    /// compile.py:826-830: store_hash — allocate a jitcounter hash for
+    /// a new guard. Called at compile time (or lazily on first failure).
+    pub fn fetch_next_hash(&mut self) -> u64 {
+        self.counter.fetch_next_hash()
+    }
+
     /// Get the function inlining threshold.
     pub fn function_threshold(&self) -> u32 {
         self.function_threshold
