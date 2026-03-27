@@ -54,14 +54,14 @@ pub struct UnrollOptimizer {
     pub imported_state: Option<ExportedState>,
     /// RPython compile.py:278-284 parity: Phase 1 results saved for
     /// retrace_needed when Phase 2 raises InvalidLoop.
-    /// Arc<Mutex<>> because catch_unwind moves self into the closure;
-    /// the Arc is cloned before move, allowing access after Phase 2 panic.
-    /// RPython doesn't need this indirection because Phase 1 and Phase 2
-    /// are separate calls in compile_loop (compile.py:278, 294).
-    pub phase1_exported_state: std::sync::Arc<std::sync::Mutex<Option<ExportedState>>>,
+    /// RPython: Phase 1 and Phase 2 are separate calls, so Phase 1
+    /// results are naturally accessible. pyre: Phase 1 runs inside
+    /// optimize_phase1() before catch_unwind, so results are directly
+    /// available on the caller's stack.
+    pub phase1_exported_state: Option<ExportedState>,
     /// Phase 1 preamble ops (terminal JUMP excluded by optimizer).
     /// RPython compile.py:279: partial_trace.operations.
-    pub phase1_preamble_ops: std::sync::Arc<std::sync::Mutex<Option<Vec<Op>>>>,
+    pub phase1_preamble_ops: Option<Vec<Op>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
@@ -85,8 +85,8 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
-            phase1_exported_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            phase1_preamble_ops: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            phase1_exported_state: None,
+            phase1_preamble_ops: None,
             snapshot_boxes: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
         }
@@ -196,6 +196,28 @@ impl UnrollOptimizer {
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
     ) -> (Vec<Op>, usize) {
+        self.optimize_trace_with_constants_and_inputs_vable_out(
+            ops,
+            constants,
+            num_inputs,
+            vable_config,
+            None,
+        )
+    }
+
+    /// Same as optimize_trace_with_constants_and_inputs_vable but with an
+    /// output parameter for Phase 1 results. RPython compile.py:278-294
+    /// parity: Phase 1 results (preamble_ops + exported_state) are written
+    /// to `phase1_out` before Phase 2 starts. If Phase 2 panics, the caller
+    /// still has the Phase 1 results for retrace_needed.
+    pub fn optimize_trace_with_constants_and_inputs_vable_out(
+        &mut self,
+        ops: &[Op],
+        constants: &mut std::collections::HashMap<u32, i64>,
+        num_inputs: usize,
+        vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
+        phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
+    ) -> (Vec<Op>, usize) {
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
         let (mut exported_state, consts_p1, jump_virtuals, p1_ops) = if let Some(pre_imported) =
@@ -300,11 +322,13 @@ impl UnrollOptimizer {
         // RPython compile.py:278-284 parity: save Phase 1 results.
         // If Phase 2 raises InvalidLoop, compile_loop uses these for
         // retrace_needed (RPython partial_trace.operations + exported_state).
-        if let Ok(mut guard) = self.phase1_exported_state.lock() {
-            *guard = Some(exported_state.clone());
-        }
-        if let Ok(mut guard) = self.phase1_preamble_ops.lock() {
-            *guard = Some(p1_ops.clone());
+        self.phase1_exported_state = Some(exported_state.clone());
+        self.phase1_preamble_ops = Some(p1_ops.clone());
+        // Output parameter: write Phase 1 results to caller's stack frame
+        // BEFORE Phase 2 starts. This survives Phase 2 panic because it's
+        // on the caller's stack, not inside the UnrollOptimizer.
+        if let Some(out) = phase1_out {
+            *out = Some((p1_ops.clone(), exported_state.clone()));
         }
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.

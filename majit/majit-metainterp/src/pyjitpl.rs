@@ -1743,26 +1743,25 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
 
-        // RPython compile.py:278-284 parity: clone Arc references to
-        // Phase 1 results before catch_unwind moves unroll_opt. If Phase 2
-        // raises InvalidLoop, these are used for retrace_needed.
-        let phase1_es = unroll_opt.phase1_exported_state.clone();
-        let phase1_ops = unroll_opt.phase1_preamble_ops.clone();
-
-        // RPython virtualizable.py: if interpreter has a virtualizable,
-        // pass its config to OptVirtualize so it can carry frame fields and
-        // array slots through the loop as virtual state instead of heap traffic.
+        // RPython compile.py:278-294 parity: Phase 1 results must survive
+        // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
+        // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
+        // holds the Phase 1 results.
+        let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
+            unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
                 &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
                 vable_config.clone(),
+                Some(&mut phase1_out),
             )
         }));
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
+                // Phase 2 panicked — unroll_opt dropped. Phase 1 results
+                // survive in phase1_out (written before Phase 2 started).
                 if payload
                     .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
                     .is_some()
@@ -1814,11 +1813,11 @@ impl<M: Clone> MetaInterp<M> {
                         // Phase 1 preamble so the next compile_loop call
                         // uses compile_retrace with new runtime values.
                         // RPython compile.py:278-284 parity: use Phase 1
-                        // preamble ops (JUMP excluded by optimizer) instead of
-                        // raw trace ops. This matches RPython's partial_trace.operations.
-                        let p1_ops = phase1_ops.lock().ok().and_then(|g| g.clone());
-                        let es = phase1_es.lock().ok().and_then(|g| g.clone());
-                        if let (Some(preamble_ops), Some(es)) = (p1_ops, es) {
+                        // preamble ops (JUMP excluded by optimizer) for
+                        // retrace_needed partial_trace. phase1_out was
+                        // written before Phase 2 started, so it survives
+                        // the Phase 2 panic.
+                        if let Some((preamble_ops, es)) = phase1_out.take() {
                             if crate::majit_log_enabled() {
                                 eprintln!(
                                     "[jit] retrace_needed after InvalidLoop at key={} preamble_ops={}",
