@@ -1990,8 +1990,11 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                // Backend compilation failure — permanent abort.
-                self.warm_state.abort_tracing(green_key, true);
+                // RPython: backend failure propagates to warmspot, handled
+                // non-permanently (allows retry). compile.py has no explicit
+                // catch for backend errors — they fall through to the outer
+                // try/except in maybe_compile_and_run.
+                self.warm_state.abort_tracing(green_key, false);
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
