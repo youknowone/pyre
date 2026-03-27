@@ -802,6 +802,15 @@ pub fn resume_in_blackhole_from_fail_args(
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
         }
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][blackhole-section] idx={} frame_ptr={:#x} py_pc={:?} vsd={:?}",
+                sec_idx,
+                frame_ptr as usize,
+                section.get(1),
+                section.get(2),
+            );
+        }
         let frame = unsafe { &*frame_ptr };
         let code = unsafe { &*frame.code };
         let nlocals = code.varnames.len();
@@ -997,44 +1006,28 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 
 fn parse_fail_arg_sections(typed_values: &[majit_ir::Value]) -> Vec<&[majit_ir::Value]> {
     use majit_ir::Value;
-    if typed_values.len() < 3 {
-        return vec![];
+    let mut sections = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 3 <= typed_values.len() {
+        let section = &typed_values[cursor..];
+        let has_header = matches!(section[0], Value::Ref(_) | Value::Int(_))
+            && matches!(section[1], Value::Int(_))
+            && matches!(section[2], Value::Int(_));
+        if !has_header {
+            break;
+        }
+        let vsd = match section[2] {
+            Value::Int(v) if v >= 0 => v as usize,
+            _ => break,
+        };
+        let section_len = 3 + vsd;
+        if cursor + section_len > typed_values.len() {
+            break;
+        }
+        sections.push(&typed_values[cursor..cursor + section_len]);
+        cursor += section_len;
     }
-    // Extract first section's frame pointer to get nlocals.
-    let frame_ptr = match typed_values.get(0) {
-        Some(Value::Ref(r)) => r.as_usize() as *const PyFrame,
-        Some(Value::Int(v)) => *v as *const PyFrame,
-        _ => return vec![],
-    };
-    if frame_ptr.is_null() {
-        return vec![];
-    }
-    let code = unsafe { &*(*frame_ptr).code };
-    let nlocals = code.varnames.len();
-    let vsd = match typed_values.get(2) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => return vec![],
-    };
-    // RPython: vsd = nlocals + stack_depth (already includes nlocals).
-    // Section length = 3 header fields + vsd slots.
-    let first_section_len = 3 + vsd;
-
-    if first_section_len >= typed_values.len() {
-        // Single section (entire typed_values).
-        return vec![typed_values];
-    }
-
-    // Check if remainder starts with a valid section header [Ref, Int, Int].
-    let rest = &typed_values[first_section_len..];
-    if rest.len() >= 3
-        && matches!(rest[0], Value::Ref(_) | Value::Int(_))
-        && matches!(rest[1], Value::Int(_))
-        && matches!(rest[2], Value::Int(_))
-    {
-        vec![&typed_values[..first_section_len], rest]
-    } else {
-        vec![typed_values]
-    }
+    sections
 }
 
 /// bhimpl_jit_merge_point parity: run the blackhole from `guard_py_pc`
