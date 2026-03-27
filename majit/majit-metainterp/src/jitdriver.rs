@@ -195,7 +195,10 @@ pub struct JitDriver<S: JitState> {
     trace_meta: Option<S::Meta>,
     descriptor: Option<JitDriverStaticData>,
     /// Bridge tracing state: (green_key, trace_id, fail_index).
-    bridge_info: Option<(u64, u64, u32)>,
+    /// (green_key, trace_id, fail_index, code_ptr_for_green_key)
+    /// code_ptr enables computing green_key for any PC via
+    /// the same hash function used by make_green_key.
+    bridge_info: Option<(u64, u64, u32, usize)>,
     /// RPython pyjitpl.py:3101 parity: true when the current bridge
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
@@ -433,7 +436,7 @@ impl<S: JitState> JitDriver<S> {
     /// Bridge origin (trace_id, fail_index) for compile_trace bridge_origin arg.
     #[inline]
     pub fn bridge_origin(&self) -> Option<(u64, u32)> {
-        self.bridge_info.map(|(_, tid, fi)| (tid, fi))
+        self.bridge_info.map(|(_, tid, fi, _)| (tid, fi))
     }
 
     /// The green key of the active trace, if any.
@@ -515,7 +518,7 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::CloseLoop => {
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
-                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
+                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
                     self.bridge_info.as_ref()
                 {
                     let has_targets = self.meta.has_compiled_targets(bridge_key);
@@ -603,17 +606,22 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
-                loop_header_pc: _,
+                loop_header_pc,
             } => {
-                // Same has_compiled_targets + bridge logic as CloseLoop.
-                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index)) =
+                // pyjitpl.py:2979-2990 reached_loop_header parity.
+                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index, bridge_code_ptr)) =
                     self.bridge_info.as_ref()
                 {
-                    let has_targets = self.meta.has_compiled_targets(bridge_key);
+                    // pyjitpl.py:2982: ptoken = self.get_procedure_token(greenboxes)
+                    // Use the TARGET loop header's green key, not the bridge origin.
+                    let target_key = loop_header_pc
+                        .map(|pc| crate::green_key_from_code_ptr(bridge_code_ptr, pc))
+                        .unwrap_or(bridge_key);
+                    let has_targets = self.meta.has_compiled_targets(target_key);
                     if has_targets {
                         self.bridge_info.take();
                         let result = self.meta.close_bridge(
-                            bridge_key,
+                            target_key,
                             bridge_trace_id,
                             bridge_fail_index,
                             &jump_args,
@@ -679,7 +687,7 @@ impl<S: JitState> JitDriver<S> {
             } => {
                 // compile.py:714: bridge tracing that exits via return
                 // closes as a bridge with Finish, not a standalone loop.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index)) =
+                if let Some((bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
                     self.bridge_info.take()
                 {
                     self.sym = None;
@@ -2119,7 +2127,8 @@ impl<S: JitState> JitDriver<S> {
 
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));
         self.trace_meta = Some(trace_meta);
-        self.bridge_info = Some((green_key, trace_id, fail_index));
+        let code_ptr = state.code_ptr();
+        self.bridge_info = Some((green_key, trace_id, fail_index, code_ptr));
         // RPython pyjitpl.py:2908 — bridge traces start with empty
         // current_merge_points (no loop header to match against).
         if let Some(ref mut ctx) = self.meta.tracing {
