@@ -2570,61 +2570,9 @@ impl Optimizer {
 
         for fa_idx in 0..original_len {
             if fail_args[fa_idx].is_none() {
-                // RPython parity: Phase 2 fail_args inherit NONE from Phase 1.
-                // Look up exported_jump_virtuals to find the virtual for this
-                // frame slot, then imported_virtuals for its Phase 2 head OpRef.
-                let ejv = ctx
-                    .exported_jump_virtuals
-                    .iter()
-                    .find(|v| v.jump_arg_index == fa_idx);
-                if let Some(virt) = ejv {
-                    let head = ctx.imported_virtuals.iter().find_map(|iv| {
-                        if iv.size_descr.index() == virt.size_descr.index() {
-                            ctx.imported_label_args
-                                .as_ref()
-                                .and_then(|la| la.get(iv.inputarg_index).copied())
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(head_ref) = head {
-                        let resolved = ctx.get_replacement(head_ref);
-                        if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
-                            if info.is_virtual() {
-                                let base_idx = original_len + extra_fail_args.len();
-                                let fields_vec = match &info {
-                                    PtrInfo::VirtualStruct(v) => &v.fields,
-                                    PtrInfo::Virtual(v) => &v.fields,
-                                    _ => continue,
-                                };
-                                let mut fields = Vec::new();
-                                for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
-                                    let rv = ctx.get_replacement(*vref);
-                                    extra_fail_args.push(rv);
-                                    fields.push((*fidx, base_idx + i));
-                                }
-                                let descr = match &info {
-                                    PtrInfo::VirtualStruct(v) => v.descr.clone(),
-                                    PtrInfo::Virtual(v) => v.descr.clone(),
-                                    _ => continue,
-                                };
-                                let known_class = match &info {
-                                    PtrInfo::Virtual(v) => v.known_class,
-                                    _ => None,
-                                };
-                                virtual_entries.push(GuardVirtualEntry {
-                                    fail_arg_index: fa_idx,
-                                    descr,
-                                    known_class,
-                                    fields,
-                                });
-                            }
-                        }
-                    }
-                }
                 // RPython parity: Box forwarding resolves NONE slots
-                // automatically. In pyre, use body label args to find
-                // the current Phase 2 OpRef for this frame slot.
+                // automatically via set_forwarded. In pyre, use body
+                // label args to find the current Phase 2 OpRef.
                 if !virtual_entries.iter().any(|e| e.fail_arg_index == fa_idx) {
                     // Body label args map frame slots to Phase 2 OpRefs.
                     let label_ref = ctx
