@@ -589,7 +589,7 @@ pub fn register_build_class() {
     crate::typedef::init_typeobjects();
 }
 
-/// `space.call_function(callable, *args)` — direct implementation.
+/// `ObjSpace.call_function(callable, *args)` — direct implementation.
 ///
 /// PyPy: baseobjspace.py `call_function`. Now a direct function call
 /// (no callback — interpreter and runtime are in the same crate).

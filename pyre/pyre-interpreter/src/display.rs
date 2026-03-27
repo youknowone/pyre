@@ -10,7 +10,7 @@ use crate::{BUILTIN_CODE_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_na
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
 ///
-/// PyPy: `space.call_function(space.lookup(w_obj, name), w_obj)`
+/// PyPy: `ObjSpace.call_function(space.lookup(w_obj, name), w_obj)`
 /// Uses the unified `call_function` instead of a dedicated callback.
 fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
     unsafe {

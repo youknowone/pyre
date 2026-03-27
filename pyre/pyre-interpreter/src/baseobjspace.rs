@@ -552,7 +552,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 
 /// Try to call a unary dunder on an instance.
 ///
-/// PyPy: `space.call_function(space.lookup(w_obj, dunder), w_obj)`
+/// PyPy: `ObjSpace.call_function(space.lookup(w_obj, dunder), w_obj)`
 unsafe fn try_instance_unaryop(a: PyObjectRef, dunder: &str) -> Option<PyResult> {
     if is_instance(a) {
         if let Some(method) = lookup(a, dunder) {
@@ -2157,7 +2157,7 @@ unsafe fn get(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> Opti
     if let Some(descr_type) = crate::typedef::r#type(descr) {
         if let Some(get_fn) = lookup_in_type_where(descr_type, "__get__") {
             if !get_fn.is_null() {
-                // Call __get__(descr, obj, type) via space.call_function
+                // Call __get__(descr, obj, type) via ObjSpace.call_function
                 return Some(crate::call_function(get_fn, &[descr, obj, w_type]));
             }
         }
