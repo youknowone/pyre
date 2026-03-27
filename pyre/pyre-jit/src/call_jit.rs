@@ -680,11 +680,18 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
     // RPython: resumereader.consume_one_section(curbh) — load register values
-    // For pyre: fast locals → int registers, value stack → runtime stack
+    // For pyre: fast locals → registers, value stack → runtime stack.
+    // Locals go to BOTH i and r register files: the codewriter uses ref
+    // registers for object values (pop_r/push_r) and int registers for
+    // some opcodes (LOAD_FAST in binary_op context, truth checks).
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
-            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
+            let val = frame.locals_cells_stack_w[i] as i64;
+            bh.setarg_i(i, val);
+            if i < bh.registers_r.len() {
+                bh.setarg_r(i, val);
+            }
         }
     }
 
@@ -697,9 +704,10 @@ fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
         }
     }
 
-    // Set frame pointer in frame_reg (nlocals+3) for LOAD_GLOBAL and CALL
-    if nlocals + 3 < bh.registers_i.len() {
-        bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
+    // frame_reg = 3 (fixed in codewriter, independent of nlocals)
+    const FRAME_REG: usize = 3;
+    if FRAME_REG < bh.registers_i.len() {
+        bh.setarg_i(FRAME_REG, frame as *mut PyFrame as i64);
     }
 
     if majit_metainterp::majit_log_enabled() {
@@ -2112,22 +2120,18 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 /// RPython: bhimpl_recursive_call_i — call a Python function in blackhole mode.
 ///
 /// The blackhole pops callable and args into registers before calling this.
-/// For CALL 1: args = [callable, arg0, frame_ptr]
-/// For CALL 0: args = [callable, frame_ptr]
+/// Convention: args = [callable, arg0, ..., argN, frame_ptr]
+/// frame_ptr is always the LAST argument.
 ///
-/// This function creates a callee frame and recursively runs the blackhole
-/// on the callee's JitCode, ensuring no JIT re-entry.
+/// Since the C ABI signature is fixed at 3 args, we use call_user_function_plain
+/// for calls with >1 Python arg, falling back to the interpreter instead of
+/// trying to shoehorn variable args into a fixed signature.
 pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
     let callable = callable as PyObjectRef;
     if callable.is_null() {
         return 0;
     }
 
-    // RPython: bhimpl_recursive_call_i calls portal_runner directly.
-    // pyre: we call call_user_function_plain which uses eval_frame_plain
-    // (no JIT hooks). For full RPython parity, this should recursively
-    // use the blackhole, but call_user_function_plain is sufficient
-    // when combined with the IN_BLACKHOLE guard in try_function_entry_jit.
     let parent_frame = unsafe { &*(frame_ptr as *const PyFrame) };
 
     if !unsafe { is_func(callable) } {
@@ -2142,20 +2146,13 @@ pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
     let closure = unsafe { w_func_get_closure(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
+    // Use the plain interpreter for the callee — handles any arg count
+    // correctly by reading from the code object's parameter list.
     let args = [arg0 as PyObjectRef];
-    let mut callee_frame = PyFrame::new_for_call_with_closure(
-        func_code,
-        &args,
-        globals,
-        parent_frame.execution_context,
-        closure,
-    );
-    callee_frame.fix_array_ptrs();
-
-    // RPython: bhimpl_recursive_call_i calls portal_runner directly,
-    // which runs the blackhole interpreter recursively.
-    // We recursively call resume_in_blackhole on the callee frame.
-    resume_in_blackhole(&mut callee_frame) as i64
+    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, &args) {
+        Ok(result) => result as i64,
+        Err(_) => 0,
+    }
 }
 
 /// RPython: bhimpl_residual_call — LOAD_GLOBAL helper.
