@@ -448,10 +448,12 @@ impl CodeWriter {
                     assembler.push_r(obj_tmp0);
                 }
 
-                // RPython: same as JumpBackward (no interrupt check in JIT)
+                // Match the interpreter's direct PC arithmetic for
+                // JumpBackwardNoInterrupt. Unlike JumpBackward, the
+                // bytecode target is encoded from the post-dispatch PC
+                // without an extra cache skip.
                 Instruction::JumpBackwardNoInterrupt { delta } => {
-                    let target_py_pc =
-                        skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
+                    let target_py_pc = (py_pc + 1).saturating_sub(delta.get(op_arg).as_usize());
                     if target_py_pc < num_instrs {
                         assembler.jump(labels[target_py_pc]);
                     }

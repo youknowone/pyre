@@ -1276,6 +1276,7 @@ mod tests {
             finalized: true,
             aborted: true,
             trace_limit: DEFAULT_TRACE_LIMIT,
+            snapshots: vec![],
         };
         rec3.get_trace(); // should panic
     }

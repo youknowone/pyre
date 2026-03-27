@@ -286,6 +286,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
 
 /// Create a fresh namespace seeded with the default builtins.
 pub fn new_builtin_namespace() -> PyNamespace {
+    crate::typedef::install_builtin_typedefs();
     let mut namespace = PyNamespace::new();
     install_default_builtins(&mut namespace);
     namespace

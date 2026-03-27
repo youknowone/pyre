@@ -2206,7 +2206,7 @@ x = 42
 i = 0
 acc = 0
 while i < 3000:
-    if isinstance(x, \"int\"):
+    if isinstance(x, int):
         acc = acc + 1
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
@@ -2227,7 +2227,7 @@ x = []
 i = 0
 acc = 0
 while i < 3000:
-    if isinstance(x, \"int\"):
+    if isinstance(x, int):
         acc = acc + 1
     else:
         acc = acc + 2
@@ -2250,7 +2250,7 @@ x = []
 i = 0
 acc = 0
 while i < 3000:
-    if type(x) == \"list\":
+    if type(x) == list:
         acc = acc + 1
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");

@@ -315,13 +315,22 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
+                    let rd_numb_len = op.rd_numb.as_ref().map(|v| v.len()).unwrap_or(0);
                     if let Some(ref fa) = op.fail_args {
                         let fa_raw: Vec<String> =
                             fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
                         eprintln!(
-                            "[jit] p2 guard {:?} fail_args_raw=[{}]",
+                            "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=[{}]",
                             op.opcode,
+                            op.pos,
+                            op.rd_resume_position,
+                            rd_numb_len,
                             fa_raw.join(", ")
+                        );
+                    } else {
+                        eprintln!(
+                            "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
+                            op.opcode, op.pos, op.rd_resume_position, rd_numb_len,
                         );
                     }
                 }

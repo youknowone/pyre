@@ -82,6 +82,11 @@ impl ConstantPool {
     pub fn snapshot(&self) -> HashMap<u32, i64> {
         self.constants.clone()
     }
+
+    /// Clone the constant type map without consuming the pool.
+    pub fn constant_types_snapshot(&self) -> HashMap<u32, Type> {
+        self.constant_types.clone()
+    }
 }
 
 impl Default for ConstantPool {

@@ -2012,6 +2012,17 @@ static OPNAME: [&str; OPCODE_COUNT] = {
 mod tests {
     use super::*;
 
+    macro_rules! op {
+        ($($field:tt)*) => {
+            Op {
+                $($field)*
+                rd_numb: None,
+                rd_consts: None,
+                rd_virtuals_info: None,
+            }
+        };
+    }
+
     /// Iterate over all defined OpCode variants.
     fn all_opcodes() -> impl Iterator<Item = OpCode> {
         (0..OPCODE_COUNT as u16).map(|i| unsafe { std::mem::transmute::<u16, OpCode>(i) })
@@ -3043,7 +3054,7 @@ mod tests {
     #[test]
     fn test_format_trace_readable_output() {
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(1), OpRef(2)],
                 descr: None,
@@ -3054,7 +3065,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
                 descr: None,
@@ -3065,7 +3076,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
                 descr: None,
@@ -3088,7 +3099,7 @@ mod tests {
 
     #[test]
     fn test_op_display_int_result() {
-        let op = Op {
+        let op = op! {
             opcode: OpCode::IntAdd,
             args: smallvec::smallvec![OpRef(1), OpRef(2)],
             descr: None,
@@ -3105,7 +3116,7 @@ mod tests {
 
     #[test]
     fn test_op_display_void() {
-        let op = Op {
+        let op = op! {
             opcode: OpCode::SetfieldGc,
             args: smallvec::smallvec![OpRef(0), OpRef(1)],
             descr: None,
@@ -3122,7 +3133,7 @@ mod tests {
 
     #[test]
     fn test_op_display_guard_with_fail_args() {
-        let op = Op {
+        let op = op! {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef(0)],
             descr: None,
@@ -3140,7 +3151,7 @@ mod tests {
 
     #[test]
     fn test_op_display_guard_without_fail_args() {
-        let op = Op {
+        let op = op! {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef(0)],
             descr: None,
@@ -3157,7 +3168,7 @@ mod tests {
 
     #[test]
     fn test_format_trace_constants_rendered_with_values() {
-        let ops = vec![Op {
+        let ops = vec![op! {
             opcode: OpCode::IntAdd,
             args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
             descr: None,
@@ -3178,7 +3189,7 @@ mod tests {
     #[test]
     fn test_format_trace_guards_show_fail_args() {
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
                 descr: None,
@@ -3189,7 +3200,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef(0)],
                 descr: None,
@@ -3200,7 +3211,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::Finish,
                 args: smallvec::smallvec![OpRef(1)],
                 descr: None,
@@ -3221,7 +3232,7 @@ mod tests {
 
     #[test]
     fn test_format_trace_constants_in_fail_args() {
-        let ops = vec![Op {
+        let ops = vec![op! {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef(0)],
             descr: None,
@@ -3254,7 +3265,7 @@ mod tests {
         // Parity with test_simple: a full loop trace from Label to Jump
         // should format each op on its own line with readable names and args.
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::Label,
                 args: smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)],
                 descr: None,
@@ -3265,7 +3276,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(1), OpRef(2)],
                 descr: None,
@@ -3276,7 +3287,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
                 descr: None,
@@ -3287,7 +3298,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
                 descr: None,
@@ -3321,7 +3332,7 @@ mod tests {
     fn test_format_trace_bridge_guard_to_finish() {
         // Parity with test_guard: a bridge trace starts with ops and ends with Finish.
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::IntSub,
                 args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
                 descr: None,
@@ -3332,7 +3343,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntGt,
                 args: smallvec::smallvec![OpRef(1), OpRef(10_001)],
                 descr: None,
@@ -3343,7 +3354,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef(2)],
                 descr: None,
@@ -3354,7 +3365,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::Finish,
                 args: smallvec::smallvec![OpRef(1)],
                 descr: None,
@@ -3385,7 +3396,7 @@ mod tests {
         let descr: crate::DescrRef = std::sync::Arc::new(DebugMergePointDescr::new(
             DebugMergePointInfo::new("testdriver", "bytecode ADD at 5", 5, 0),
         ));
-        let ops = vec![Op {
+        let ops = vec![op! {
             opcode: OpCode::DebugMergePoint,
             args: smallvec::smallvec![],
             descr: Some(descr),
@@ -3417,7 +3428,7 @@ mod tests {
         // Parity with test_guard: complex trace with mixed ops, guards, constants,
         // and fail_args all render correctly and can be round-tripped.
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::Label,
                 args: smallvec::smallvec![OpRef(0), OpRef(1)],
                 descr: None,
@@ -3428,7 +3439,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef(0), OpRef(1)],
                 descr: None,
@@ -3439,7 +3450,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntLt,
                 args: smallvec::smallvec![OpRef(2), OpRef(10_000)],
                 descr: None,
@@ -3450,7 +3461,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef(3)],
                 descr: None,
@@ -3461,7 +3472,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::IntSub,
                 args: smallvec::smallvec![OpRef(0), OpRef(10_001)],
                 descr: None,
@@ -3472,7 +3483,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef(4), OpRef(2)],
                 descr: None,
@@ -3506,7 +3517,7 @@ mod tests {
     fn test_format_trace_multiple_guards_with_different_fail_args() {
         // Multiple guards in a single trace, each with distinct fail_args.
         let ops = vec![
-            Op {
+            op! {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef(0)],
                 descr: None,
@@ -3517,7 +3528,7 @@ mod tests {
                 rd_pendingfields: None,
                 rd_resume_position: -1,
             },
-            Op {
+            op! {
                 opcode: OpCode::GuardFalse,
                 args: smallvec::smallvec![OpRef(1)],
                 descr: None,
