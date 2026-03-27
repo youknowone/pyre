@@ -3847,14 +3847,61 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py:703: skip bridge compilation when stack space is low.
     #[inline]
     pub fn stack_almost_full() -> bool {
-        // rstack.py: checks if remaining stack < 1/16 of total.
-        // Rust approximation: a local variable's address gives the
-        // approximate stack pointer. Thread stacks are typically 8MB.
-        // 1/16 of 8MB = 512KB. Conservative threshold: 256KB.
-        const MIN_REMAINING: usize = 256 * 1024;
-        let local_var: usize = 0;
-        let sp = &local_var as *const usize as usize;
-        sp < MIN_REMAINING
+        // rstack.py: remaining < length * 15/16 means almost full.
+        // Use platform API to get accurate stack bounds.
+        let local_var: u8 = 0;
+        let sp = &local_var as *const u8 as usize;
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_self() -> usize;
+                fn pthread_get_stackaddr_np(thread: usize) -> *const u8;
+                fn pthread_get_stacksize_np(thread: usize) -> usize;
+            }
+            let thread = unsafe { pthread_self() };
+            let stack_top = unsafe { pthread_get_stackaddr_np(thread) } as usize;
+            let stack_size = unsafe { pthread_get_stacksize_np(thread) };
+            // Stack grows downward: remaining = sp - stack_bottom
+            let stack_bottom = stack_top.saturating_sub(stack_size);
+            let remaining = sp.saturating_sub(stack_bottom);
+            let threshold = stack_size / 16; // 1/16 of total
+            return remaining < threshold;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::mem::MaybeUninit;
+            extern "C" {
+                fn pthread_self() -> usize;
+                fn pthread_getattr_np(thread: usize, attr: *mut [u8; 64]) -> i32;
+                fn pthread_attr_getstack(
+                    attr: *const [u8; 64],
+                    stackaddr: *mut *mut u8,
+                    stacksize: *mut usize,
+                ) -> i32;
+                fn pthread_attr_destroy(attr: *mut [u8; 64]) -> i32;
+            }
+            let mut attr = MaybeUninit::<[u8; 64]>::zeroed();
+            let thread = unsafe { pthread_self() };
+            if unsafe { pthread_getattr_np(thread, attr.as_mut_ptr()) } == 0 {
+                let attr = unsafe { attr.assume_init_mut() };
+                let mut stack_addr: *mut u8 = std::ptr::null_mut();
+                let mut stack_size: usize = 0;
+                if unsafe { pthread_attr_getstack(attr, &mut stack_addr, &mut stack_size) } == 0 {
+                    unsafe { pthread_attr_destroy(attr) };
+                    let stack_bottom = stack_addr as usize;
+                    let remaining = sp.saturating_sub(stack_bottom);
+                    let threshold = stack_size / 16;
+                    return remaining < threshold;
+                }
+                unsafe { pthread_attr_destroy(attr) };
+            }
+            false // fallback: assume not full
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = sp;
+            false // unsupported platform: assume not full
+        }
     }
 
     /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
@@ -4518,11 +4565,6 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// RPython flow: force_now() → cpu.force(token) → handle_async_forcing()
     /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
-    ///
-    /// In majit, virtual objects are already materialized by the optimizer's
-    /// force pass. This function handles any remaining cleanup: storing
-    /// materialized virtuals so the subsequent GUARD_NOT_FORCED blackhole
-    /// resume can access them.
     pub fn handle_async_forcing(
         &mut self,
         green_key: u64,
@@ -4530,9 +4572,6 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_values: &[i64],
     ) {
-        // compile.py:994: force_from_resumedata
-        // In majit, virtuals are already forced by the optimizer.
-        // Log for debugging.
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
@@ -4542,11 +4581,37 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values.len()
             );
         }
-        // compile.py:999: set_savedata_ref — store all_virtuals on deadframe.
-        // In majit, the materialized virtuals are carried in the fail_values
-        // directly (Ref slots contain live GcRefs to forced objects).
-        // No additional work needed — the blackhole resume path already
-        // reads from fail_values.
+        // compile.py:994: force_from_resumedata — reconstruct virtuals
+        // from resume data and materialize them.
+        let compiled = match self.compiled_loops.get(&green_key) {
+            Some(c) => c,
+            None => return,
+        };
+        let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+        if let Some((_, trace)) = Self::trace_for_exit(compiled, norm_tid) {
+            if let Some(exit_layout) =
+                Self::compiled_exit_layout_from_trace(trace, norm_tid, fail_index)
+            {
+                // resume.py:1347: ResumeDataDirectReader + force_all_virtuals
+                // Use reconstruct_state to materialize virtuals from rd_numb.
+                if let Some(ref resume_layout) = exit_layout.resume_layout {
+                    let state = resume_layout.reconstruct_state(fail_values);
+                    // compile.py:999: store materialized virtuals.
+                    // In majit, materialized Ref values are already in fail_values.
+                    // The reconstruct_state result captures pending fields that
+                    // need to be written back to heap objects.
+                    for pf in &state.pending_fields {
+                        // compile.py:999: log forced virtual field writes.
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][force] pending field: descr={} item={:?}",
+                                pf.descr_index, pf.item_index,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
@@ -4739,13 +4804,55 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // compile.py:701-709: handle_fail — must_compile → bridge, else → blackhole.
-        // The guard counter was already ticked in the caller's guard failure
-        // handler. Use should_compile_bridge_in_trace (would_fire + !compiling).
-        let action = if self.should_compile_bridge_in_trace(green_key, trace_id, fail_index) {
-            GuardRecoveryAction::CompileBridge
-        } else {
-            GuardRecoveryAction::ResumeInterpreter
+        // compile.py:783-784: tick with per-value hash for GUARD_VALUE.
+        // This is the canonical tick point for this path. For GUARD_VALUE,
+        // compile.py:780-781 computes hash from guard_addr + intval.
+        {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+            if let Some(info) = compiled.guard_failures.get(&(norm_tid, fail_index)) {
+                if let Some((idx, _tp)) = info.per_value {
+                    let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
+                    let per_value_hash = info
+                        .guard_hash
+                        .wrapping_mul(777767777)
+                        .wrapping_add((intval as u64).wrapping_mul(1442968193));
+                    self.warm_state.tick_guard_failure(per_value_hash);
+                }
+            }
+        }
+
+        // compile.py:701-709, 753-784: handle_fail / must_compile.
+        // For GUARD_VALUE, use per-value hash (compile.py:780-781):
+        //   hash = guard_addr * 777767777 + intval * 1442968193
+        // For other guards, use the normal guard_hash via would_fire.
+        let action = {
+            let compiled = self.compiled_loops.get(&green_key).unwrap();
+            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+            let must_compile = compiled
+                .guard_failures
+                .get(&(norm_tid, fail_index))
+                .is_some_and(|info| {
+                    if info.compiling || Self::stack_almost_full() {
+                        return false;
+                    }
+                    if let Some((idx, _tp)) = info.per_value {
+                        // compile.py:780-781: per-value hash for GUARD_VALUE
+                        let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
+                        let per_value_hash = info
+                            .guard_hash
+                            .wrapping_mul(777767777)
+                            .wrapping_add((intval as u64).wrapping_mul(1442968193));
+                        self.warm_state.counter.would_fire(per_value_hash)
+                    } else {
+                        self.warm_state.counter.would_fire(info.guard_hash)
+                    }
+                });
+            if must_compile {
+                GuardRecoveryAction::CompileBridge
+            } else {
+                GuardRecoveryAction::ResumeInterpreter
+            }
         };
 
         Some(GuardRecovery {
