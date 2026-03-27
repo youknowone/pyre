@@ -606,6 +606,21 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         return Ok(w_bool_from(false));
     }
 
+    // isinstance(obj, int | str) — UnionType
+    // PyPy: UnionType.__instancecheck__
+    if unsafe { pyre_object::is_union(cls) } {
+        let args = unsafe { pyre_object::w_union_get_args(cls) };
+        let len = unsafe { w_tuple_len(args) };
+        for i in 0..len {
+            if let Some(c) = unsafe { w_tuple_getitem(args, i as i64) } {
+                if isinstance_w(obj, c) {
+                    return Ok(w_bool_from(true));
+                }
+            }
+        }
+        return Ok(w_bool_from(false));
+    }
+
     Ok(w_bool_from(isinstance_w(obj, cls)))
 }
 
@@ -638,6 +653,20 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let len = unsafe { w_tuple_len(classinfo) };
         for i in 0..len {
             if let Some(c) = unsafe { w_tuple_getitem(classinfo, i as i64) } {
+                if unsafe { issubtype_w(cls, c) } {
+                    return Ok(w_bool_from(true));
+                }
+            }
+        }
+        return Ok(w_bool_from(false));
+    }
+    // issubclass(cls, int | str) — UnionType
+    // PyPy: UnionType.__subclasscheck__
+    if unsafe { pyre_object::is_union(classinfo) } {
+        let args = unsafe { pyre_object::w_union_get_args(classinfo) };
+        let len = unsafe { w_tuple_len(args) };
+        for i in 0..len {
+            if let Some(c) = unsafe { w_tuple_getitem(args, i as i64) } {
                 if unsafe { issubtype_w(cls, c) } {
                     return Ok(w_bool_from(true));
                 }

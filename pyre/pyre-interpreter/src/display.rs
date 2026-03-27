@@ -116,6 +116,23 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {
             let name = pyre_object::w_type_get_name(obj);
             format!("<class '{name}'>")
+        } else if std::ptr::eq(tp, &pyre_object::UNION_TYPE as *const PyType) {
+            // PyPy: UnionType.__repr__ → " | ".join([_repr_item(x) for x in self.__args__])
+            let args = pyre_object::w_union_get_args(obj);
+            let n = pyre_object::w_tuple_len(args);
+            let mut parts = Vec::with_capacity(n);
+            for i in 0..n {
+                if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
+                    if pyre_object::is_none(item) {
+                        parts.push("None".to_string());
+                    } else if pyre_object::is_type(item) {
+                        parts.push(pyre_object::w_type_get_name(item).to_string());
+                    } else {
+                        parts.push(py_repr(item));
+                    }
+                }
+            }
+            parts.join(" | ")
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
             let name = pyre_object::w_module_get_name(obj);
             format!("<module '{name}'>")

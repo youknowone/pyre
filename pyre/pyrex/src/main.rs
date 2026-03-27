@@ -182,6 +182,12 @@ fn run_repl(quiet: bool) {
     // Shared namespace across all REPL statements
     let mut namespace = Box::new(execution_context.fresh_namespace());
     namespace.fix_ptr();
+    // PyPy: Module.__init__ sets __name__ in w_dict
+    pyre_interpreter::namespace_store(
+        &mut namespace,
+        "__name__",
+        pyre_object::w_str_new("__main__"),
+    );
     let namespace = Box::into_raw(namespace);
 
     if !quiet {
