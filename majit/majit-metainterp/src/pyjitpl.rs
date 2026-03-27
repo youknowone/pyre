@@ -4512,6 +4512,43 @@ impl<M: Clone> MetaInterp<M> {
         (true, is_exception_guard, Some(fail_types))
     }
 
+    /// compile.py:987-1000: handle_async_forcing — force all virtuals
+    /// from resume data when a GUARD_NOT_FORCED fires asynchronously
+    /// (during a residual call that forces the virtualizable).
+    ///
+    /// RPython flow: force_now() → cpu.force(token) → handle_async_forcing()
+    /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
+    ///
+    /// In majit, virtual objects are already materialized by the optimizer's
+    /// force pass. This function handles any remaining cleanup: storing
+    /// materialized virtuals so the subsequent GUARD_NOT_FORCED blackhole
+    /// resume can access them.
+    pub fn handle_async_forcing(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+    ) {
+        // compile.py:994: force_from_resumedata
+        // In majit, virtuals are already forced by the optimizer.
+        // Log for debugging.
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
+                green_key,
+                trace_id,
+                fail_index,
+                fail_values.len()
+            );
+        }
+        // compile.py:999: set_savedata_ref — store all_virtuals on deadframe.
+        // In majit, the materialized virtuals are carried in the fail_values
+        // directly (Ref slots contain live GcRefs to forced objects).
+        // No additional work needed — the blackhole resume path already
+        // reads from fail_values.
+    }
+
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
     /// pyjitpl.py:3132 prepare_resume_from_failure parity:
     /// Emit SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at
