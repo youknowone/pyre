@@ -40,9 +40,9 @@ pyre-object = { path = "pyre/pyre-object" }
 pyre-bytecode = { path = "pyre/pyre-bytecode" }
 pyre-interpreter = { path = "pyre/pyre-interpreter" }
 
-# RustPython compiler toolchain (0.5.0, pinned to main @ 2026-03-24)
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython", rev = "82432be96239db7225e836961678f3af26bf9a62" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", rev = "82432be96239db7225e836961678f3af26bf9a62" }
+# RustPython compiler toolchain (0.5.0, pinned to main @ 2026-03-27)
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython", rev = "e3ac1bf8dcdb35900e9ee09543b1bffb8d70af61" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython", rev = "e3ac1bf8dcdb35900e9ee09543b1bffb8d70af61" }
 
 # majit JIT framework
 majit-metainterp = { path = "majit/majit-metainterp" }
