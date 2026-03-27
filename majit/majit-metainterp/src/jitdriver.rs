@@ -833,7 +833,14 @@ impl<S: JitState> JitDriver<S> {
             // current trace (loop or bridge) as a JUMP to that code.
             // RPython does NOT skip bridge traces — bridge → existing loop
             // JUMP is the primary bridge closure mechanism.
-            if self.meta.has_compiled_targets(green_key) {
+            // Only check when the trace has recorded ops (not on the first
+            // merge_point call before any bytecodes are traced).
+            let has_trace_ops = self
+                .meta
+                .tracing
+                .as_ref()
+                .map_or(false, |ctx| ctx.recorder.ops().len() > 0);
+            if has_trace_ops && self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
                     if matches!(
