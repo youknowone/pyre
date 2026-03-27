@@ -652,12 +652,6 @@ impl WarmEnterState {
         self.bridge_threshold = threshold;
     }
 
-    /// Check whether a guard failure count has reached the bridge threshold.
-    /// Returns true if bridge compilation should be triggered.
-    pub fn should_compile_bridge(&self, guard_fail_count: u32) -> bool {
-        guard_fail_count >= self.bridge_threshold
-    }
-
     /// compile.py must_compile / counter.py tick(hash, increment_trace_eagerness):
     /// Increment the guard failure counter using the shared timetable.
     /// Returns true when bridge_threshold (trace_eagerness=200) is reached.
@@ -1407,15 +1401,6 @@ mod tests {
         let mut ws = WarmEnterState::new(3);
         ws.set_bridge_threshold(10);
         assert_eq!(ws.bridge_threshold(), 10);
-    }
-
-    #[test]
-    fn test_should_compile_bridge() {
-        let ws = WarmEnterState::new(3);
-        assert!(!ws.should_compile_bridge(0));
-        assert!(!ws.should_compile_bridge(199));
-        assert!(ws.should_compile_bridge(200));
-        assert!(ws.should_compile_bridge(300));
     }
 
     #[test]

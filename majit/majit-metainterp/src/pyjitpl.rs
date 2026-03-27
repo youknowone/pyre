@@ -3746,18 +3746,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_trace_layout_for_trace(compiled, trace_id)
     }
 
-    /// Check whether a guard has failed enough times to warrant bridge compilation.
-    pub fn should_compile_bridge(&self, green_key: u64, fail_index: u32) -> bool {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return false;
-        };
-        let key = (compiled.root_trace_id, fail_index);
-        compiled
-            .guard_failures
-            .get(&key)
-            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash))
-    }
-
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
     ///
     /// Marks the loop token as invalidated. Subsequent executions of the
