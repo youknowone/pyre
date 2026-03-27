@@ -111,6 +111,7 @@ pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
+    is_bridge: bool,
 ) -> (
     HashMap<u32, StoredResumeData>,
     HashMap<u32, usize>,
@@ -124,9 +125,18 @@ pub(crate) fn build_guard_metadata(
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
 
+    // RPython registers_r/registers_i separation parity: protect inputarg types.
+    let inputarg_positions: std::collections::HashSet<u32> = if is_bridge {
+        inputargs.iter().map(|arg| arg.index).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for (op_idx, op) in ops.iter().enumerate() {
         if !op.pos.is_none() && op.result_type() != Type::Void {
-            value_types.insert(op.pos.0, op.result_type());
+            if !is_bridge || !inputarg_positions.contains(&op.pos.0) {
+                value_types.insert(op.pos.0, op.result_type());
+            }
         }
 
         let is_guard = op.opcode.is_guard();

@@ -3189,10 +3189,19 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
 fn build_value_type_map(
     inputargs: &[InputArg],
     ops: &[Op],
+    is_bridge: bool,
 ) -> (HashMap<u32, Type>, HashMap<u32, Type>, HashMap<u32, usize>) {
     let mut value_types = HashMap::new();
     let mut inputarg_types = HashMap::new();
     let mut op_def_positions = HashMap::new();
+
+    // RPython registers_r/registers_i separation parity: for bridge traces,
+    // protect inputarg types from being overridden by operation result types.
+    let inputarg_positions: HashSet<u32> = if is_bridge {
+        inputargs.iter().map(|arg| arg.index).collect()
+    } else {
+        HashSet::new()
+    };
 
     for input in inputargs {
         value_types.insert(input.index, input.tp);
@@ -3203,14 +3212,14 @@ fn build_value_type_map(
         let result_type = op.result_type();
         if result_type != Type::Void {
             let var_idx = op_var_index(op, op_idx, inputargs.len()) as u32;
-            // Track type conflicts: inputarg type ≠ operation result type.
-            // Guards before this operation should use inputarg_types.
             if let Some(&ia_type) = inputarg_types.get(&var_idx) {
                 if ia_type != result_type {
                     op_def_positions.insert(var_idx, op_idx);
                 }
             }
-            value_types.insert(var_idx, result_type);
+            if !is_bridge || !inputarg_positions.contains(&var_idx) {
+                value_types.insert(var_idx, result_type);
+            }
         }
         // Propagate optimizer-provided fail_arg_types to value_types.
         // This ensures constant OpRefs typed as Ref by the optimizer
@@ -3277,7 +3286,7 @@ fn build_value_type_map(
 
 /// Lightweight variant for call sites that only need merged value_types.
 fn build_value_type_map_simple(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type> {
-    build_value_type_map(inputargs, ops).0
+    build_value_type_map(inputargs, ops, false).0
 }
 
 fn build_ref_root_slots(
@@ -8647,7 +8656,9 @@ fn collect_guards(
     constants: &HashMap<u32, i64>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
-    let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
+    let is_bridge = source_guard.is_some();
+    let (value_types, inputarg_types, op_def_positions) =
+        build_value_type_map(inputargs, ops, is_bridge);
 
     // Collect Label descr indices to distinguish internal vs external JUMPs.
     let label_descr_indices: HashSet<u32> = ops
@@ -8691,17 +8702,27 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            // box.type parity: merge descriptor types with positional
-            // inference. For OpRefs with JUMP→LABEL or inputarg-vs-op
-            // type conflicts, the positional type is authoritative.
-            let types = merge_descriptor_with_positional(
-                &refs,
-                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                &value_types,
-                &inputarg_types,
-                &op_def_positions,
-                op_idx,
-            )?;
+            // RPython registers_r/registers_i parity: for bridge traces,
+            // don't trust descriptor types — they may have Int at positions
+            // that should be Ref. Use value_types directly.
+            let types = if is_bridge {
+                infer_fail_arg_types_positional(
+                    &refs,
+                    &value_types,
+                    &inputarg_types,
+                    &op_def_positions,
+                    op_idx,
+                )?
+            } else {
+                merge_descriptor_with_positional(
+                    &refs,
+                    op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                    &value_types,
+                    &inputarg_types,
+                    &op_def_positions,
+                    op_idx,
+                )?
+            };
             (refs, types)
         } else {
             let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {

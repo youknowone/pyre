@@ -1912,7 +1912,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
+                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key, false);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -2422,7 +2422,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key);
+                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key, false);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -2709,7 +2709,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             Ok(_) => {
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
+                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key, false);
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -4224,7 +4224,12 @@ impl<M: Clone> MetaInterp<M> {
                             compiling: false,
                         });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
-                        compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
+                        compile::build_guard_metadata(
+                            bridge_inputargs,
+                            &optimized_ops,
+                            green_key,
+                            true,
+                        );
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
@@ -5642,7 +5647,7 @@ mod tests {
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
         let (mut resume_data, guard_op_indices, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key);
+            compile::build_guard_metadata(inputargs, &ops, green_key, false);
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);

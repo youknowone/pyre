@@ -232,6 +232,10 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
+    /// Bridge trace flag: RPython registers_r/registers_i separation parity.
+    pub is_bridge_trace: bool,
+    /// Actual number of bridge inputargs (before effective_inputs inflation).
+    pub bridge_num_inputargs: u32,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -411,6 +415,8 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            is_bridge_trace: false,
+            bridge_num_inputargs: 0,
             current_pass_idx: 0,
 
             in_final_emission: false,
@@ -457,6 +463,8 @@ impl OptContext {
             pre_force_jump_args: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            is_bridge_trace: false,
+            bridge_num_inputargs: 0,
             current_pass_idx: 0,
 
             in_final_emission: false,
