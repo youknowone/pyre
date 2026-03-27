@@ -178,10 +178,6 @@ pub struct Optimizer {
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Propagated to OptContext for number_guard_inline.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
-    /// Bridge trace flag: RPython registers_r/registers_i separation parity.
-    pub is_bridge_trace: bool,
-    /// Actual number of bridge inputargs (before effective_inputs inflation).
-    pub bridge_num_inputargs: usize,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -766,8 +762,6 @@ impl Optimizer {
             constant_fold_alloc: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
-            is_bridge_trace: false,
-            bridge_num_inputargs: 0,
         }
     }
 
@@ -1306,8 +1300,6 @@ impl Optimizer {
         let effective_inputs = num_inputs.max((max_pos + 1) as usize);
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
         ctx.skip_flush_mode = self.skip_flush;
-        ctx.is_bridge_trace = self.is_bridge_trace;
-        ctx.bridge_num_inputargs = self.bridge_num_inputargs as u32;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         // RPython resume.py parity: Phase 2 optimizer needs exported_jump_virtuals
         // and imported_virtuals to create GuardVirtualEntry for NONE positions
@@ -2095,11 +2087,6 @@ impl Optimizer {
             .map(|op| op.args.to_vec())
             .unwrap_or_default();
 
-        // RPython registers_r/registers_i separation parity: mark this as a
-        // bridge trace so guard fail_args preserve inputarg types.
-        self.is_bridge_trace = true;
-        self.bridge_num_inputargs = num_inputs;
-
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
         let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
 
@@ -2114,10 +2101,11 @@ impl Optimizer {
 
         let jump_args = optimized_ops.last().unwrap().args.to_vec();
 
-        // unroll.py:198-200: not inline_short_preamble or no body targets → jump_to_preamble.
-        // RPython target_tokens includes the START token; majit front_target_tokens
-        // contains only BODY tokens. RPython `len <= 1` = no body tokens = `is_empty()`.
-        if !inline_short_preamble || front_target_tokens.is_empty() {
+        // unroll.py:198: not inline_short_preamble or len(target_tokens) <= 1
+        // front_target_tokens[0] = preamble (from ensure_preamble_token),
+        // followed by body specializations from finalize_short_preamble.
+        // len <= 1 = only preamble, no body specializations to inline.
+        if !inline_short_preamble || front_target_tokens.len() <= 1 {
             if let Some(preamble_token) = front_target_tokens.first() {
                 return (
                     crate::optimizeopt::unroll::UnrollOptimizer::jump_to_preamble(

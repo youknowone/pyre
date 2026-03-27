@@ -111,7 +111,6 @@ pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-    is_bridge: bool,
 ) -> (
     HashMap<u32, StoredResumeData>,
     HashMap<u32, usize>,
@@ -125,18 +124,9 @@ pub(crate) fn build_guard_metadata(
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
 
-    // RPython registers_r/registers_i separation parity: protect inputarg types.
-    let inputarg_positions: std::collections::HashSet<u32> = if is_bridge {
-        inputargs.iter().map(|arg| arg.index).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-
     for (op_idx, op) in ops.iter().enumerate() {
         if !op.pos.is_none() && op.result_type() != Type::Void {
-            if !is_bridge || !inputarg_positions.contains(&op.pos.0) {
-                value_types.insert(op.pos.0, op.result_type());
-            }
+            value_types.insert(op.pos.0, op.result_type());
         }
 
         let is_guard = op.opcode.is_guard();
@@ -149,6 +139,11 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
+        // RPython Box.type parity: each Box carries its own type.
+        // Use optimizer-provided fail_arg_types when available (set by
+        // emit_guard_operation / number_guard_inline). This eliminates
+        // type inference via value_types — the type comes from the Box
+        // (OpRef) itself, not from operation result type inference.
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
