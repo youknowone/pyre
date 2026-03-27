@@ -62,6 +62,11 @@ impl JitCounter {
     /// a single JitCounter with variable float increments; this integer
     /// equivalent accepts different thresholds per call site (loop entry
     /// vs guard failure vs function entry).
+    /// counter.py:185-201 tick(hash, increment) parity.
+    ///
+    /// RPython: when counter reaches 1.0, `self.reset(hash)` is called
+    /// before returning True. This ensures subsequent tick() calls
+    /// return False until the counter re-accumulates to threshold.
     #[inline(always)]
     pub fn tick_with_threshold(&mut self, hash: u64, threshold: u32) -> bool {
         let base = (hash as usize) & TABLE_MASK;
@@ -70,7 +75,12 @@ impl JitCounter {
         // 5-way associative lookup with MRU swap to slot 0.
         if self.table[base].0 == hash {
             self.table[base].1 += 1;
-            return self.table[base].1 >= threshold;
+            if self.table[base].1 >= threshold {
+                // counter.py:199-200: "self.reset(hash); return True"
+                self.table[base].1 = 0;
+                return true;
+            }
+            return false;
         }
         for i in 1..ASSOCIATIVITY {
             let idx = (base + i) & TABLE_MASK;
@@ -81,6 +91,15 @@ impl JitCounter {
                 let prev_idx = (base + i - 1) & TABLE_MASK;
                 if self.table[prev_idx].1 <= self.table[idx].1 {
                     self.table.swap(idx, prev_idx);
+                }
+                if fired {
+                    // counter.py:199-200
+                    let swapped_idx = if self.table[prev_idx].0 == hash {
+                        prev_idx
+                    } else {
+                        idx
+                    };
+                    self.table[swapped_idx].1 = 0;
                 }
                 return fired;
             }
