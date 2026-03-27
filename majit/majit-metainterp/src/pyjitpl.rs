@@ -457,7 +457,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id
     }
 
-    fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
+    pub fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
         if trace_id == 0 {
             compiled.root_trace_id
         } else {
@@ -3847,6 +3847,17 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.fetch_next_hash()
     }
 
+    /// Get the number of fail_arg_types for a guard.
+    /// Returns 0 if not found. Used to adjust bridge tracing state.
+    pub fn fail_arg_count_for(&self, green_key: u64, trace_id: u64, fail_index: u32) -> usize {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return 0;
+        };
+        Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index)
+            .map(|p| p.fail_arg_types.len())
+            .unwrap_or(0)
+    }
+
     // ── Call Assembler Support ──────────────────────────────────
 
     /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
@@ -3992,14 +4003,6 @@ impl<M: Clone> MetaInterp<M> {
         };
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         // compile.py:701-717: handle_fail applies to ALL guards.
-        // Bridge-on-bridge needs the concrete frame to match fail_arg_types.
-        // RPython rebuild_from_resumedata constructs a synthetic MIFrame
-        // from deadframe values — pyre uses the interpreter frame directly,
-        // which has more slots than fail_arg_types for bridge guards.
-        // TODO: construct synthetic frame from fail_args for bridge guards.
-        if trace_id != compiled.root_trace_id {
-            return false;
-        }
         compiled
             .guard_failures
             .get(&(trace_id, fail_index))
@@ -4010,7 +4013,7 @@ impl<M: Clone> MetaInterp<M> {
             })
     }
 
-    fn bridge_fail_descr_proxy(
+    pub fn bridge_fail_descr_proxy(
         compiled: &CompiledEntry<M>,
         trace_id: u64,
         fail_index: u32,
