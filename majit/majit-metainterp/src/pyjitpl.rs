@@ -67,16 +67,22 @@ pub enum CompileOutcome {
 }
 
 /// Per-guard failure tracking for bridge compilation decisions.
-/// compile.py:685-688: ResumeGuardDescr.status field packs ST_BUSY_FLAG
+/// compile.py:685-696: ResumeGuardDescr.status field packs ST_BUSY_FLAG
 /// + ST_TYPE_MASK + jitcounter hash into a single integer.
 pub(crate) struct GuardFailureInfo {
     /// compile.py:746: hash for jitcounter.tick(). Assigned at compile
     /// time via store_hash() (compile.py:826-830).
+    /// For GUARD_VALUE, this is overridden per-failure with a value-based
+    /// hash (compile.py:780-781).
     pub(crate) guard_hash: u64,
     /// compile.py:741-751, 786-795: ST_BUSY_FLAG — true while bridge
     /// compilation is in progress for this guard. Prevents re-entrant
     /// tracing from the same guard during recursive calls.
     pub(crate) compiling: bool,
+    /// compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
+    /// the fail_arg index + type tag used to compute per-value hash.
+    /// None for non-GUARD_VALUE guards (TY_NONE).
+    pub(crate) per_value: Option<(u32, Type)>,
 }
 
 pub(crate) struct CompiledTrace {
@@ -2958,6 +2964,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3009,6 +3016,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3056,6 +3064,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
 
@@ -3177,6 +3186,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
@@ -3304,6 +3314,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
@@ -3369,6 +3380,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             // compile.py:783-784: jitcounter.tick(hash, increment)
             self.warm_state.tick_guard_failure(info.guard_hash);
@@ -3521,6 +3533,7 @@ impl<M: Clone> MetaInterp<M> {
                 .or_insert_with(|| GuardFailureInfo {
                     guard_hash: self.warm_state.fetch_next_hash(),
                     compiling: false,
+                    per_value: None,
                 });
             // compile.py:783-784: jitcounter.tick(hash, increment)
             let guard_hash = info.guard_hash;
@@ -3857,6 +3870,7 @@ impl<M: Clone> MetaInterp<M> {
                     .or_insert_with(|| GuardFailureInfo {
                         guard_hash: self.warm_state.fetch_next_hash(),
                         compiling: false,
+                        per_value: None,
                     });
                 return info.guard_hash;
             }
@@ -4313,6 +4327,7 @@ impl<M: Clone> MetaInterp<M> {
                             guard_hash: source_trace_id
                                 ^ (fail_index as u64).wrapping_mul(777767777),
                             compiling: false,
+                            per_value: None,
                         });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
