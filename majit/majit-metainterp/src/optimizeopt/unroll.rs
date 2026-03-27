@@ -273,6 +273,15 @@ impl UnrollOptimizer {
         };
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
+        // RPython compile.py parity: Phase 2 ops must not collide with Phase 1
+        // positions. Set phase2_min_pos so all new Phase 2 ops get pos > p1_max.
+        let p1_max_pos = p1_ops
+            .iter()
+            .map(|op| op.pos.0)
+            .filter(|&p| p != u32::MAX)
+            .max()
+            .unwrap_or(num_inputs as u32);
+        opt_p2.phase2_min_pos = Some(p1_max_pos + 1);
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
