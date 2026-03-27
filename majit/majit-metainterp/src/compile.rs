@@ -144,6 +144,10 @@ pub(crate) fn build_guard_metadata(
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
+        } else if let Some(ref types) = op.fail_arg_types {
+            // RPython parity: use optimizer-provided fail_arg_types (from
+            // store_final_boxes_in_guard / consumer switchover).
+            types.clone()
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
