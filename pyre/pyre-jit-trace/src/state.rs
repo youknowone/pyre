@@ -4983,12 +4983,43 @@ impl MIFrame {
                 );
             }
 
-            // pyjitpl.py:2506 finishframe_exception: found handler.
-            // RPython continues tracing at handler_pc (raise ChangeFrame).
-            // Blocked: optimizer short-preamble bug drops SetfieldGc for
-            // the second virtual in bridge JUMP args, causing infinite loop.
-            // TODO: activate when inline_short_preamble is fixed.
-            TraceAction::Abort
+            // pyjitpl.py:2506 finishframe_exception: unwind stack to handler,
+            // push exception, continue tracing at handler_pc.
+            let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+            let nlocals = self.sym().nlocals;
+            let target_stack_len = ncells + handler_depth;
+            {
+                let s = self.sym_mut();
+                s.symbolic_stack.truncate(target_stack_len);
+                s.symbolic_stack_types.truncate(target_stack_len);
+                s.concrete_stack.truncate(target_stack_len);
+                s.valuestackdepth = nlocals + target_stack_len;
+                if entry.push_lasti {
+                    s.symbolic_stack.push(OpRef::NONE);
+                    s.symbolic_stack_types.push(Type::Ref);
+                    s.concrete_stack
+                        .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
+                    s.valuestackdepth += 1;
+                }
+                s.symbolic_stack.push(exc_opref);
+                s.symbolic_stack_types.push(Type::Ref);
+                s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
+                s.valuestackdepth += 1;
+            }
+            // Sync concrete frame.
+            let frame =
+                unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::frame::PyFrame) };
+            let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
+            while frame.valuestackdepth > target_depth {
+                frame.pop();
+            }
+            if entry.push_lasti {
+                frame.push(pyre_object::w_int_new(pc as i64));
+            }
+            frame.push(exc_obj);
+            // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame
+            self.sym_mut().pending_next_instr = Some(handler_pc);
+            TraceAction::Continue
         } else {
             // TODO(exception-exit): pyjitpl.py:2532-2538
             // compile_exit_frame_with_exception(last_exc_box) → FINISH op.

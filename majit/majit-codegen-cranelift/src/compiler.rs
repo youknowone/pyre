@@ -1198,6 +1198,8 @@ pub fn register_materialize_virtuals(f: MaterializeVirtualsFn) {
     MATERIALIZE_VIRTUALS.with(|c| c.set(Some(f)));
 }
 
+
+
 /// Frame state to restore from guard failure fail_args.
 /// RPython resume_in_blackhole parity: the force_fn reads the frame state
 /// from the deadframe (outputs buffer) rather than using the corrupted frame.
@@ -2564,16 +2566,14 @@ fn call_assembler_fast_path(
         // RPython rebuild_state_after_failure parity: materialize virtual
         // objects before bridge dispatch. Virtual Ref slots are null (0)
         // with their fields in trailing Int slots.
-        let mut bridge_outputs = outputs;
-        MATERIALIZE_VIRTUALS.with(|c| {
-            if let Some(f) = c.get() {
-                f(
-                    &mut bridge_outputs[..actual_outputs],
-                    &fail_descr.fail_arg_types,
-                );
-            }
-        });
-        let outputs_slice = &bridge_outputs[..actual_outputs];
+        let mut bridge_outputs = outputs.to_vec();
+        materialize_for_bridge(
+            &mut bridge_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout.lock().unwrap().as_ref(),
+            bridge.num_inputs,
+        );
+        let outputs_slice = &bridge_outputs[..bridge_outputs.len().min(actual_outputs)];
         let mut frame =
             CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
@@ -4685,9 +4685,6 @@ impl CraneliftBackend {
                     fail_descr.recovery_layout.lock().unwrap().as_ref(),
                     bridge.num_inputs,
                 );
-                // Truncate to bridge.num_inputs: heuristic materializer replaces
-                // null Ref slots in-place but trailing virtual fields remain.
-                mat_outputs.truncate(bridge.num_inputs);
                 if bridge.loop_reentry {
                     let bridge_frame =
                         Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
