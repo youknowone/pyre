@@ -1580,8 +1580,12 @@ impl OptUnroll {
                 ctx.set_import_box(source, *target);
             }
             if let Some(info) = exported_state.exported_infos.get(target) {
+                // RPython unroll.py:53-54: setinfo_from_preamble does
+                //   op = get_box_replacement(op)
+                // Follow forwarding so info is set on TARGET, not source.
+                let resolved = ctx.get_replacement(source);
                 self.apply_exported_info_recursive(
-                    source,
+                    resolved,
                     info,
                     &exported_state.exported_infos,
                     ctx,
