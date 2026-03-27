@@ -6,7 +6,7 @@ use pyre_object::pyobject::{
     PyType, STR_TYPE, TYPE_TYPE,
 };
 
-use crate::{BUILTIN_FUNC_TYPE, FUNCTION_TYPE, w_builtin_func_name, w_func_get_name};
+use crate::{BUILTIN_CODE_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name};
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
 ///
@@ -105,11 +105,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
         ) {
             "NotImplemented".to_string()
-        } else if std::ptr::eq(tp, &BUILTIN_FUNC_TYPE as *const PyType) {
-            let name = w_builtin_func_name(obj);
+        } else if std::ptr::eq(tp, &BUILTIN_CODE_TYPE as *const PyType) {
+            let name = builtin_code_name(obj);
             format!("<built-in function {name}>")
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            let name = w_func_get_name(obj);
+            let name = function_get_name(obj);
             format!("<function {name}>")
         } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
             let msg = pyre_object::excobject::w_exception_get_message(obj);

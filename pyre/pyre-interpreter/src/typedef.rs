@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use pyre_object::pyobject::*;
 use pyre_object::*;
 
-use crate::{PyNamespace, namespace_store, w_builtin_func_new};
+use crate::{PyNamespace, builtin_code_new, namespace_store};
 
 /// Global type registry: maps static PyType pointer → W_TypeObject (as usize).
 ///
@@ -144,7 +144,7 @@ pub fn install_builtin_typedefs() {
 
     // builtin_function_or_method
     reg.insert(
-        &crate::BUILTIN_FUNC_TYPE as *const PyType as usize,
+        &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
         make_type_with_base(
             "builtin_function_or_method",
             init_builtin_function_typedef,
@@ -303,61 +303,61 @@ type_new_wrapper!(tuple_new, crate::builtins::builtin_tuple_pub);
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
 fn init_list_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", list_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", list_new));
     namespace_store(
         ns,
         "append",
-        w_builtin_func_new("append", crate::type_methods::list_method_append),
+        builtin_code_new("append", crate::type_methods::list_method_append),
     );
     namespace_store(
         ns,
         "extend",
-        w_builtin_func_new("extend", crate::type_methods::list_method_extend),
+        builtin_code_new("extend", crate::type_methods::list_method_extend),
     );
     namespace_store(
         ns,
         "copy",
-        w_builtin_func_new("copy", crate::type_methods::list_method_copy),
+        builtin_code_new("copy", crate::type_methods::list_method_copy),
     );
     namespace_store(
         ns,
         "insert",
-        w_builtin_func_new("insert", crate::type_methods::list_method_insert),
+        builtin_code_new("insert", crate::type_methods::list_method_insert),
     );
     namespace_store(
         ns,
         "pop",
-        w_builtin_func_new("pop", crate::type_methods::list_method_pop),
+        builtin_code_new("pop", crate::type_methods::list_method_pop),
     );
     namespace_store(
         ns,
         "clear",
-        w_builtin_func_new("clear", crate::type_methods::list_method_clear),
+        builtin_code_new("clear", crate::type_methods::list_method_clear),
     );
     namespace_store(
         ns,
         "reverse",
-        w_builtin_func_new("reverse", crate::type_methods::list_method_reverse),
+        builtin_code_new("reverse", crate::type_methods::list_method_reverse),
     );
     namespace_store(
         ns,
         "sort",
-        w_builtin_func_new("sort", crate::type_methods::list_method_sort),
+        builtin_code_new("sort", crate::type_methods::list_method_sort),
     );
     namespace_store(
         ns,
         "index",
-        w_builtin_func_new("index", crate::type_methods::list_method_index),
+        builtin_code_new("index", crate::type_methods::list_method_index),
     );
     namespace_store(
         ns,
         "count",
-        w_builtin_func_new("count", crate::type_methods::list_method_count),
+        builtin_code_new("count", crate::type_methods::list_method_count),
     );
     namespace_store(
         ns,
         "remove",
-        w_builtin_func_new("remove", crate::type_methods::list_method_remove),
+        builtin_code_new("remove", crate::type_methods::list_method_remove),
     );
 }
 
@@ -365,192 +365,192 @@ fn init_list_typedef(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
 fn init_str_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", str_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", str_new));
     namespace_store(
         ns,
         "join",
-        w_builtin_func_new("join", crate::type_methods::str_method_join),
+        builtin_code_new("join", crate::type_methods::str_method_join),
     );
     namespace_store(
         ns,
         "split",
-        w_builtin_func_new("split", crate::type_methods::str_method_split),
+        builtin_code_new("split", crate::type_methods::str_method_split),
     );
     namespace_store(
         ns,
         "strip",
-        w_builtin_func_new("strip", crate::type_methods::str_method_strip),
+        builtin_code_new("strip", crate::type_methods::str_method_strip),
     );
     namespace_store(
         ns,
         "lstrip",
-        w_builtin_func_new("lstrip", crate::type_methods::str_method_lstrip),
+        builtin_code_new("lstrip", crate::type_methods::str_method_lstrip),
     );
     namespace_store(
         ns,
         "rstrip",
-        w_builtin_func_new("rstrip", crate::type_methods::str_method_rstrip),
+        builtin_code_new("rstrip", crate::type_methods::str_method_rstrip),
     );
     namespace_store(
         ns,
         "startswith",
-        w_builtin_func_new("startswith", crate::type_methods::str_method_startswith),
+        builtin_code_new("startswith", crate::type_methods::str_method_startswith),
     );
     namespace_store(
         ns,
         "endswith",
-        w_builtin_func_new("endswith", crate::type_methods::str_method_endswith),
+        builtin_code_new("endswith", crate::type_methods::str_method_endswith),
     );
     namespace_store(
         ns,
         "replace",
-        w_builtin_func_new("replace", crate::type_methods::str_method_replace),
+        builtin_code_new("replace", crate::type_methods::str_method_replace),
     );
     namespace_store(
         ns,
         "find",
-        w_builtin_func_new("find", crate::type_methods::str_method_find),
+        builtin_code_new("find", crate::type_methods::str_method_find),
     );
     namespace_store(
         ns,
         "rfind",
-        w_builtin_func_new("rfind", crate::type_methods::str_method_rfind),
+        builtin_code_new("rfind", crate::type_methods::str_method_rfind),
     );
     namespace_store(
         ns,
         "upper",
-        w_builtin_func_new("upper", crate::type_methods::str_method_upper),
+        builtin_code_new("upper", crate::type_methods::str_method_upper),
     );
     namespace_store(
         ns,
         "lower",
-        w_builtin_func_new("lower", crate::type_methods::str_method_lower),
+        builtin_code_new("lower", crate::type_methods::str_method_lower),
     );
     namespace_store(
         ns,
         "format",
-        w_builtin_func_new("format", crate::type_methods::str_method_format),
+        builtin_code_new("format", crate::type_methods::str_method_format),
     );
     namespace_store(
         ns,
         "encode",
-        w_builtin_func_new("encode", crate::type_methods::str_method_encode),
+        builtin_code_new("encode", crate::type_methods::str_method_encode),
     );
     namespace_store(
         ns,
         "isdigit",
-        w_builtin_func_new("isdigit", crate::type_methods::str_method_isdigit),
+        builtin_code_new("isdigit", crate::type_methods::str_method_isdigit),
     );
     namespace_store(
         ns,
         "isalpha",
-        w_builtin_func_new("isalpha", crate::type_methods::str_method_isalpha),
+        builtin_code_new("isalpha", crate::type_methods::str_method_isalpha),
     );
     namespace_store(
         ns,
         "zfill",
-        w_builtin_func_new("zfill", crate::type_methods::str_method_zfill),
+        builtin_code_new("zfill", crate::type_methods::str_method_zfill),
     );
     namespace_store(
         ns,
         "count",
-        w_builtin_func_new("count", crate::type_methods::str_method_count),
+        builtin_code_new("count", crate::type_methods::str_method_count),
     );
     namespace_store(
         ns,
         "index",
-        w_builtin_func_new("index", crate::type_methods::str_method_index),
+        builtin_code_new("index", crate::type_methods::str_method_index),
     );
     namespace_store(
         ns,
         "title",
-        w_builtin_func_new("title", crate::type_methods::str_method_title),
+        builtin_code_new("title", crate::type_methods::str_method_title),
     );
     namespace_store(
         ns,
         "capitalize",
-        w_builtin_func_new("capitalize", crate::type_methods::str_method_capitalize),
+        builtin_code_new("capitalize", crate::type_methods::str_method_capitalize),
     );
     namespace_store(
         ns,
         "swapcase",
-        w_builtin_func_new("swapcase", crate::type_methods::str_method_swapcase),
+        builtin_code_new("swapcase", crate::type_methods::str_method_swapcase),
     );
     namespace_store(
         ns,
         "center",
-        w_builtin_func_new("center", crate::type_methods::str_method_center),
+        builtin_code_new("center", crate::type_methods::str_method_center),
     );
     namespace_store(
         ns,
         "ljust",
-        w_builtin_func_new("ljust", crate::type_methods::str_method_ljust),
+        builtin_code_new("ljust", crate::type_methods::str_method_ljust),
     );
     namespace_store(
         ns,
         "rjust",
-        w_builtin_func_new("rjust", crate::type_methods::str_method_rjust),
+        builtin_code_new("rjust", crate::type_methods::str_method_rjust),
     );
     namespace_store(
         ns,
         "isspace",
-        w_builtin_func_new("isspace", crate::type_methods::str_method_isspace),
+        builtin_code_new("isspace", crate::type_methods::str_method_isspace),
     );
     namespace_store(
         ns,
         "isupper",
-        w_builtin_func_new("isupper", crate::type_methods::str_method_isupper),
+        builtin_code_new("isupper", crate::type_methods::str_method_isupper),
     );
     namespace_store(
         ns,
         "islower",
-        w_builtin_func_new("islower", crate::type_methods::str_method_islower),
+        builtin_code_new("islower", crate::type_methods::str_method_islower),
     );
     namespace_store(
         ns,
         "isalnum",
-        w_builtin_func_new("isalnum", crate::type_methods::str_method_isalnum),
+        builtin_code_new("isalnum", crate::type_methods::str_method_isalnum),
     );
     namespace_store(
         ns,
         "isascii",
-        w_builtin_func_new("isascii", crate::type_methods::str_method_isascii),
+        builtin_code_new("isascii", crate::type_methods::str_method_isascii),
     );
     namespace_store(
         ns,
         "partition",
-        w_builtin_func_new("partition", crate::type_methods::str_method_partition),
+        builtin_code_new("partition", crate::type_methods::str_method_partition),
     );
     namespace_store(
         ns,
         "rpartition",
-        w_builtin_func_new("rpartition", crate::type_methods::str_method_rpartition),
+        builtin_code_new("rpartition", crate::type_methods::str_method_rpartition),
     );
     namespace_store(
         ns,
         "splitlines",
-        w_builtin_func_new("splitlines", crate::type_methods::str_method_splitlines),
+        builtin_code_new("splitlines", crate::type_methods::str_method_splitlines),
     );
     namespace_store(
         ns,
         "removeprefix",
-        w_builtin_func_new("removeprefix", crate::type_methods::str_method_removeprefix),
+        builtin_code_new("removeprefix", crate::type_methods::str_method_removeprefix),
     );
     namespace_store(
         ns,
         "removesuffix",
-        w_builtin_func_new("removesuffix", crate::type_methods::str_method_removesuffix),
+        builtin_code_new("removesuffix", crate::type_methods::str_method_removesuffix),
     );
     namespace_store(
         ns,
         "expandtabs",
-        w_builtin_func_new("expandtabs", crate::type_methods::str_method_expandtabs),
+        builtin_code_new("expandtabs", crate::type_methods::str_method_expandtabs),
     );
     // str dunder methods
     namespace_store(
         ns,
         "__contains__",
-        w_builtin_func_new("__contains__", |args| {
+        builtin_code_new("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -562,7 +562,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__len__",
-        w_builtin_func_new("__len__", |args| {
+        builtin_code_new("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
@@ -572,7 +572,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__getitem__",
-        w_builtin_func_new("__getitem__", |args| {
+        builtin_code_new("__getitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__"));
             }
@@ -582,7 +582,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__iter__",
-        w_builtin_func_new("__iter__", |args| {
+        builtin_code_new("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
@@ -592,7 +592,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__add__",
-        w_builtin_func_new("__add__", |args| {
+        builtin_code_new("__add__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__add__"));
             }
@@ -602,7 +602,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__mul__",
-        w_builtin_func_new("__mul__", |args| {
+        builtin_code_new("__mul__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mul__"));
             }
@@ -612,7 +612,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__mod__",
-        w_builtin_func_new("__mod__", |args| {
+        builtin_code_new("__mod__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mod__"));
             }
@@ -623,7 +623,7 @@ fn init_str_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "maketrans",
-        w_builtin_func_new("maketrans", |args| {
+        builtin_code_new("maketrans", |args| {
             // maketrans(x[, y[, z]]) → translation dict
             let d = pyre_object::w_dict_new();
             if args.len() >= 3 {
@@ -674,47 +674,47 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        w_builtin_func_new("__new__", dict_new_subclass),
+        builtin_code_new("__new__", dict_new_subclass),
     );
     namespace_store(
         ns,
         "get",
-        w_builtin_func_new("get", crate::type_methods::dict_method_get),
+        builtin_code_new("get", crate::type_methods::dict_method_get),
     );
     namespace_store(
         ns,
         "keys",
-        w_builtin_func_new("keys", crate::type_methods::dict_method_keys),
+        builtin_code_new("keys", crate::type_methods::dict_method_keys),
     );
     namespace_store(
         ns,
         "values",
-        w_builtin_func_new("values", crate::type_methods::dict_method_values),
+        builtin_code_new("values", crate::type_methods::dict_method_values),
     );
     namespace_store(
         ns,
         "items",
-        w_builtin_func_new("items", crate::type_methods::dict_method_items),
+        builtin_code_new("items", crate::type_methods::dict_method_items),
     );
     namespace_store(
         ns,
         "update",
-        w_builtin_func_new("update", crate::type_methods::dict_method_update),
+        builtin_code_new("update", crate::type_methods::dict_method_update),
     );
     namespace_store(
         ns,
         "pop",
-        w_builtin_func_new("pop", crate::type_methods::dict_method_pop),
+        builtin_code_new("pop", crate::type_methods::dict_method_pop),
     );
     namespace_store(
         ns,
         "setdefault",
-        w_builtin_func_new("setdefault", crate::type_methods::dict_method_setdefault),
+        builtin_code_new("setdefault", crate::type_methods::dict_method_setdefault),
     );
     namespace_store(
         ns,
         "__setitem__",
-        w_builtin_func_new("__setitem__", |args| {
+        builtin_code_new("__setitem__", |args| {
             if args.len() < 3 {
                 return Err(crate::PyError::type_error("__setitem__ requires 3 args"));
             }
@@ -737,7 +737,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__getitem__",
-        w_builtin_func_new("__getitem__", |args| {
+        builtin_code_new("__getitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
             }
@@ -759,7 +759,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__contains__",
-        w_builtin_func_new("__contains__", |args| {
+        builtin_code_new("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -778,7 +778,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__len__",
-        w_builtin_func_new("__len__", |args| {
+        builtin_code_new("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
@@ -794,7 +794,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__iter__",
-        w_builtin_func_new("__iter__", |args| {
+        builtin_code_new("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
@@ -809,7 +809,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__delitem__",
-        w_builtin_func_new("__delitem__", |args| {
+        builtin_code_new("__delitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
             }
@@ -820,7 +820,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__eq__",
-        w_builtin_func_new("__eq__", |args| {
+        builtin_code_new("__eq__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -830,7 +830,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__or__",
-        w_builtin_func_new("__or__", |args| {
+        builtin_code_new("__or__", |args| {
             // dict | dict → merge
             if args.len() < 2 {
                 return Ok(args[0]);
@@ -841,7 +841,7 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "copy",
-        w_builtin_func_new("copy", |args| {
+        builtin_code_new("copy", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_dict_new());
             }
@@ -863,13 +863,13 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "clear",
-        w_builtin_func_new("clear", |_args| Ok(pyre_object::w_none())),
+        builtin_code_new("clear", |_args| Ok(pyre_object::w_none())),
     );
     // dict.fromkeys(iterable, value=None) — classmethod
     namespace_store(
         ns,
         "fromkeys",
-        w_builtin_func_new("fromkeys", |args| {
+        builtin_code_new("fromkeys", |args| {
             // Called as dict.fromkeys(iter, val): args = [iter, val] (no cls binding)
             let (iterable, value) = if args.len() >= 2 {
                 (args[0], args[1])
@@ -891,21 +891,21 @@ fn init_dict_typedef(ns: &mut PyNamespace) {
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
 fn init_tuple_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", tuple_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", tuple_new));
     namespace_store(
         ns,
         "index",
-        w_builtin_func_new("index", crate::type_methods::tuple_method_index),
+        builtin_code_new("index", crate::type_methods::tuple_method_index),
     );
     namespace_store(
         ns,
         "count",
-        w_builtin_func_new("count", crate::type_methods::tuple_method_count),
+        builtin_code_new("count", crate::type_methods::tuple_method_count),
     );
     namespace_store(
         ns,
         "__contains__",
-        w_builtin_func_new("__contains__", |args| {
+        builtin_code_new("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -917,7 +917,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__len__",
-        w_builtin_func_new("__len__", |args| {
+        builtin_code_new("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
@@ -929,7 +929,7 @@ fn init_tuple_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__iter__",
-        w_builtin_func_new("__iter__", |args| {
+        builtin_code_new("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
@@ -948,13 +948,13 @@ fn init_type_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        w_builtin_func_new("__new__", crate::builtins::builtin_type_new_pub),
+        builtin_code_new("__new__", crate::builtins::builtin_type_new_pub),
     );
     // type.__init__ — no-op for now
     namespace_store(
         ns,
         "__init__",
-        w_builtin_func_new("__init__", |_| Ok(pyre_object::w_none())),
+        builtin_code_new("__init__", |_| Ok(pyre_object::w_none())),
     );
 }
 
@@ -965,7 +965,7 @@ fn init_function_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__get__",
-        w_builtin_func_new("__get__", |args| {
+        builtin_code_new("__get__", |args| {
             let func = args.first().copied().unwrap_or(pyre_object::w_none());
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
             let objtype = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
@@ -982,7 +982,7 @@ fn init_builtin_function_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__get__",
-        w_builtin_func_new("__get__", |args| {
+        builtin_code_new("__get__", |args| {
             Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
         }),
     );
@@ -992,7 +992,7 @@ fn init_method_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__func__",
-        w_builtin_func_new("__func__", |args| {
+        builtin_code_new("__func__", |args| {
             Ok(args
                 .first()
                 .map(|&method| unsafe { pyre_object::w_method_get_func(method) })
@@ -1002,7 +1002,7 @@ fn init_method_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__self__",
-        w_builtin_func_new("__self__", |args| {
+        builtin_code_new("__self__", |args| {
             Ok(args
                 .first()
                 .map(|&method| unsafe { pyre_object::w_method_get_self(method) })
@@ -1018,7 +1018,7 @@ fn init_staticmethod_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        w_builtin_func_new("__new__", |args| {
+        builtin_code_new("__new__", |args| {
             // staticmethod(func) — args[0] is cls (staticmethod type), args[1] is func
             let func = if args.len() > 1 {
                 args[1]
@@ -1035,7 +1035,7 @@ fn init_classmethod_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__new__",
-        w_builtin_func_new("__new__", |args| {
+        builtin_code_new("__new__", |args| {
             let func = if args.len() > 1 {
                 args[1]
             } else {
@@ -1047,13 +1047,13 @@ fn init_classmethod_typedef(ns: &mut PyNamespace) {
 }
 
 fn init_int_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", int_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", int_new));
 }
 fn init_float_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", float_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", float_new));
 }
 fn init_bool_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", bool_new));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", bool_new));
 }
 
 // ── Object TypeDef ───────────────────────────────────────────────────
@@ -1082,13 +1082,13 @@ fn object_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn init_object_typedef(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", w_builtin_func_new("__new__", object_new));
-    namespace_store(ns, "__init__", w_builtin_func_new("__init__", object_init));
+    namespace_store(ns, "__new__", builtin_code_new("__new__", object_new));
+    namespace_store(ns, "__init__", builtin_code_new("__init__", object_init));
     // PyPy: objectobject.py — default comparison/hash/repr for all objects
     namespace_store(
         ns,
         "__eq__",
-        w_builtin_func_new("__eq__", |args| {
+        builtin_code_new("__eq__", |args| {
             Ok(pyre_object::w_bool_from(
                 args.len() >= 2 && std::ptr::eq(args[0], args[1]),
             ))
@@ -1097,7 +1097,7 @@ fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__ne__",
-        w_builtin_func_new("__ne__", |args| {
+        builtin_code_new("__ne__", |args| {
             Ok(pyre_object::w_bool_from(
                 args.len() >= 2 && !std::ptr::eq(args[0], args[1]),
             ))
@@ -1106,7 +1106,7 @@ fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__hash__",
-        w_builtin_func_new("__hash__", |args| {
+        builtin_code_new("__hash__", |args| {
             Ok(pyre_object::w_int_new(if args.is_empty() {
                 0
             } else {
@@ -1118,7 +1118,7 @@ fn init_object_typedef(ns: &mut PyNamespace) {
         ns,
         "__repr__",
         // PyPy: objectobject.py descr___repr__ — base __repr__ for all objects
-        w_builtin_func_new("__repr__", |args| {
+        builtin_code_new("__repr__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new("<object>"));
             }
@@ -1139,7 +1139,7 @@ fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__str__",
-        w_builtin_func_new("__str__", |args| {
+        builtin_code_new("__str__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new("<object>"));
             }
@@ -1152,7 +1152,7 @@ fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__format__",
-        w_builtin_func_new("__format__", |args| {
+        builtin_code_new("__format__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new(""));
             }
@@ -1163,16 +1163,16 @@ fn init_object_typedef(ns: &mut PyNamespace) {
     namespace_store(
         ns,
         "__reduce_ex__",
-        w_builtin_func_new("__reduce_ex__", |_| Ok(pyre_object::w_none())),
+        builtin_code_new("__reduce_ex__", |_| Ok(pyre_object::w_none())),
     );
     namespace_store(
         ns,
         "__init_subclass__",
-        w_builtin_func_new("__init_subclass__", |_| Ok(pyre_object::w_none())),
+        builtin_code_new("__init_subclass__", |_| Ok(pyre_object::w_none())),
     );
     namespace_store(
         ns,
         "__subclasshook__",
-        w_builtin_func_new("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
+        builtin_code_new("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
     );
 }

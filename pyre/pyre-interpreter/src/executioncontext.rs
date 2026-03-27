@@ -207,7 +207,7 @@ impl PyExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::is_builtin_func;
+    use crate::is_builtin_code;
 
     #[test]
     fn test_fresh_namespace_starts_with_builtins() {
@@ -218,8 +218,8 @@ mod tests {
         let range = *namespace.get("range").unwrap();
 
         unsafe {
-            assert!(is_builtin_func(print));
-            assert!(is_builtin_func(range));
+            assert!(is_builtin_code(print));
+            assert!(is_builtin_code(range));
         }
     }
 

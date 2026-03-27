@@ -7,8 +7,8 @@ use std::cell::Cell;
 use std::sync::OnceLock;
 
 use crate::{
-    PyError, PyErrorKind, PyNamespace, PyResult, dispatch_callable, w_builtin_func_get,
-    w_func_get_closure, w_func_get_code_ptr, w_func_get_globals,
+    PyError, PyErrorKind, PyNamespace, PyResult, builtin_code_get, dispatch_callable,
+    function_get_closure, function_get_code, function_get_globals,
 };
 use pyre_object::{PY_NULL, PyObjectRef};
 
@@ -197,10 +197,10 @@ fn call_user_function_with_eval(
     args: &[PyObjectRef],
     eval_fn: EvalFn,
 ) -> PyResult {
-    let code_ptr = unsafe { w_func_get_code_ptr(callable) };
-    let globals = unsafe { w_func_get_globals(callable) };
-    let closure = unsafe { w_func_get_closure(callable) };
-    let defaults = unsafe { crate::w_func_get_defaults(callable) };
+    let code_ptr = unsafe { function_get_code(callable) };
+    let globals = unsafe { function_get_globals(callable) };
+    let closure = unsafe { function_get_closure(callable) };
+    let defaults = unsafe { crate::function_get_defaults(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
     // PyPy: pyframe.py handle_operation_error / init_cells
@@ -243,7 +243,7 @@ fn call_user_function_with_eval(
     let nkwonly = code_ref.kwonlyarg_count as usize;
     let mut filled_args = filled_args;
     if nkwonly > 0 {
-        let kwdefaults = unsafe { crate::w_func_get_kwdefaults(callable) };
+        let kwdefaults = unsafe { crate::function_get_kwdefaults(callable) };
         // Ensure filled_args covers all positional + kwonly slots
         while filled_args.len() < nparams + nkwonly {
             filled_args.push(pyre_object::PY_NULL);
@@ -345,7 +345,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     dispatch_callable(
         callable,
         |callable| {
-            let func = unsafe { w_builtin_func_get(callable) };
+            let func = unsafe { builtin_code_get(callable) };
             func(args)
         },
         |callable| call_user_function(frame, callable, args),
@@ -393,9 +393,9 @@ pub fn call_user_function_plain_with_ctx(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    let code_ptr = unsafe { w_func_get_code_ptr(callable) };
-    let globals = unsafe { w_func_get_globals(callable) };
-    let closure = unsafe { w_func_get_closure(callable) };
+    let code_ptr = unsafe { function_get_code(callable) };
+    let globals = unsafe { function_get_globals(callable) };
+    let closure = unsafe { function_get_closure(callable) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
     let mut func_frame =
         PyFrame::new_for_call_with_closure(func_code, args, globals, execution_context, closure);
@@ -436,7 +436,7 @@ pub fn call_callable_inline_residual(
     dispatch_callable(
         callable,
         |callable| {
-            let func = unsafe { w_builtin_func_get(callable) };
+            let func = unsafe { builtin_code_get(callable) };
             func(args)
         },
         |callable| call_user_function_plain(frame, callable, args),
@@ -487,7 +487,7 @@ pub(crate) fn resolve_kwargs(
     // When callable is a type, call_type_object will prepend `cls` as the first
     // arg to __new__, so the stack args correspond to __new__'s params[1:]
     // (skip_cls=1). For plain function calls skip_cls=0.
-    let (target_func, skip_cls) = if unsafe { crate::is_func(callable) } {
+    let (target_func, skip_cls) = if unsafe { crate::is_function(callable) } {
         (callable, 0usize)
     } else if unsafe { pyre_object::is_type(callable) } {
         // For type objects, resolve kwargs against the winning metaclass's __new__
@@ -500,7 +500,7 @@ pub(crate) fn resolve_kwargs(
         if let Some(new_fn) =
             unsafe { crate::baseobjspace::lookup_in_type_mro_pub(winner, "__new__") }
         {
-            if unsafe { crate::is_func(new_fn) } {
+            if unsafe { crate::is_function(new_fn) } {
                 (new_fn, 1usize) // __new__(cls, ...) → skip cls
             } else {
                 return args.to_vec();
@@ -512,7 +512,7 @@ pub(crate) fn resolve_kwargs(
         return args.to_vec();
     };
 
-    let code_ptr = unsafe { w_func_get_code_ptr(target_func) };
+    let code_ptr = unsafe { function_get_code(target_func) };
     let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
     // Total named params = positional + keyword-only
     let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
@@ -552,7 +552,7 @@ pub(crate) fn resolve_kwargs(
     // Fill positional defaults (PyPy: _match_signature defs_w)
     // Defaults cover the LAST N of the positional params (arg_count).
     let n_pos_params = code.arg_count as usize - skip_cls;
-    let defaults = unsafe { crate::w_func_get_defaults(target_func) };
+    let defaults = unsafe { crate::function_get_defaults(target_func) };
     if !defaults.is_null() {
         let defaults = crate::baseobjspace::unwrap_cell(defaults);
         if unsafe { pyre_object::is_tuple(defaults) } {
@@ -571,7 +571,7 @@ pub(crate) fn resolve_kwargs(
 
     // Fill keyword-only defaults from kwdefaults dict
     // PyPy: _match_signature fills from w_kw_defs
-    let kwdefaults = unsafe { crate::w_func_get_kwdefaults(target_func) };
+    let kwdefaults = unsafe { crate::function_get_kwdefaults(target_func) };
     if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
         let nkwonly = code.kwonlyarg_count as usize;
         for ki in 0..nkwonly {
@@ -619,8 +619,8 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
             return space_call_function_impl(func, &call_args);
         }
         // Builtin function: direct Rust call
-        if crate::is_builtin_func(callable) {
-            let func = crate::w_builtin_func_get(callable);
+        if crate::is_builtin_code(callable) {
+            let func = crate::builtin_code_get(callable);
             return match func(args) {
                 Ok(result) => result,
                 Err(e) => {
@@ -632,7 +632,7 @@ pub(crate) fn space_call_function_impl(callable: PyObjectRef, args: &[PyObjectRe
             };
         }
         // User function: create frame + eval
-        if crate::is_func(callable) {
+        if crate::is_function(callable) {
             return call_user_func_with_args(callable, args);
         }
         // Type object → descr_call: __new__ + __init__
@@ -744,10 +744,10 @@ fn is_subtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 
 /// Helper: call a user function with arbitrary args from descriptor context.
 fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    let code_ptr = unsafe { w_func_get_code_ptr(func) };
-    let globals = unsafe { w_func_get_globals(func) };
-    let closure = unsafe { w_func_get_closure(func) };
-    let defaults = unsafe { crate::w_func_get_defaults(func) };
+    let code_ptr = unsafe { function_get_code(func) };
+    let globals = unsafe { function_get_globals(func) };
+    let closure = unsafe { function_get_closure(func) };
+    let defaults = unsafe { crate::function_get_defaults(func) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
     let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
     let exec_ctx = if exec_ctx.is_null() {
@@ -789,7 +789,7 @@ fn call_user_func_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObject
     let nkwonly = code_ref.kwonlyarg_count as usize;
     let mut filled_args = filled_args;
     if nkwonly > 0 {
-        let kwdefaults = unsafe { crate::w_func_get_kwdefaults(func) };
+        let kwdefaults = unsafe { crate::function_get_kwdefaults(func) };
         while filled_args.len() < nparams + nkwonly {
             filled_args.push(PY_NULL);
         }
@@ -854,9 +854,9 @@ fn call_metaclass_with_kwargs(
     };
 
     if let Some(new_fn) = new_fn {
-        if unsafe { crate::is_func(new_fn) } {
+        if unsafe { crate::is_function(new_fn) } {
             // User function: resolve kwargs to kwonly params
-            let code_ptr = unsafe { w_func_get_code_ptr(new_fn) };
+            let code_ptr = unsafe { function_get_code(new_fn) };
             let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
             let nparams = code.arg_count as usize; // positional params
             let nkwonly = code.kwonlyarg_count as usize;
@@ -1015,9 +1015,9 @@ fn build_class_inner(
     metaclass: Option<PyObjectRef>,
     extra_kwargs: Option<PyObjectRef>,
 ) -> PyResult {
-    let code_ptr = unsafe { w_func_get_code_ptr(body_fn) };
-    let globals = unsafe { w_func_get_globals(body_fn) };
-    let closure = unsafe { w_func_get_closure(body_fn) };
+    let code_ptr = unsafe { function_get_code(body_fn) };
+    let globals = unsafe { function_get_globals(body_fn) };
+    let closure = unsafe { function_get_closure(body_fn) };
     let func_code = code_ptr as *const pyre_bytecode::CodeObject;
 
     // Call metaclass.__prepare__(name, bases, **kwds) if it exists.

@@ -8,9 +8,9 @@ use crate::virtualizable_spec::{PYFRAME_VABLE_ARRAYS, PYFRAME_VABLE_FIELDS};
 
 /// Shared PyFrame layout contract used by the interpreter and tracer.
 ///
-/// This mirrors `pyre-interp::frame::PyFrame` exactly so both crates can
+/// This mirrors `pyre-interpreter::pyframe::PyFrame` exactly so both crates can
 /// compute the same virtualizable offsets without introducing a reverse
-/// dependency from `pyre-jit` to `pyre-interp`.
+/// dependency from `pyre-jit` to `pyre-interpreter`.
 #[repr(C)]
 struct PyFrameLayout {
     #[allow(dead_code)]

@@ -421,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_opcode_step() {
-        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
+    fn test_analyze_pyopcode() {
+        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
         let result = analyze_multiple_pipeline_with_config(
             &[&source],
             &crate::test_support::pyre_analyze_config(),
@@ -653,7 +653,7 @@ mod tests {
     fn test_graph_pipeline_on_pyre_source() {
         // Run the full graph pipeline on actual pyre interpreter source.
         // This validates that the pipeline handles real-world Rust code.
-        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
+        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
         let parsed = parse::parse_source(&source);
         let program = front::build_semantic_program(&parsed);
 
@@ -668,7 +668,7 @@ mod tests {
         // Should analyze many functions from the real source
         assert!(
             result.functions.len() >= 5,
-            "expected >=5 functions from opcode_step.rs, got {}",
+            "expected >=5 functions from pyopcode.rs, got {}",
             result.functions.len()
         );
 
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_analyze_pipeline_runs_canonical_graph_path() {
-        let source = read_pyre_file("pyre-interpreter/src/opcode_step.rs");
+        let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
         let graph_result = analyze_pipeline(&source);
 
         // Graph pipeline should analyze functions

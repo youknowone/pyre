@@ -1,7 +1,7 @@
 //! JIT-enabled evaluation — the sole entry point for JIT execution.
 //!
 //! This module owns the JitDriver, tracing hooks, and compiled-code
-//! execution. pyre-interp provides the pure interpreter (eval_frame_plain)
+//! execution. pyre-interpreter provides the pure interpreter (eval_frame_plain)
 //! and the opcode trait implementations on PyFrame.
 //!
 //! Equivalent to PyPy's `pypyjit/interp_jit.py` — the JIT is injected
@@ -134,7 +134,7 @@ fn init_callbacks() {
 // JIT_TRACING_DEPTH removed — now MetaInterp.tracing_call_depth field.
 // RPython portal_call_depth parity: state colocated with tracing context.
 
-/// Read the call depth from pyre-interp's CALL_DEPTH TLS.
+/// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
 #[inline(always)]
 fn call_depth() -> u32 {
@@ -148,7 +148,7 @@ pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> 
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
-// JIT_CALL_DEPTH removed — pyre-interp::call::CALL_DEPTH is the single
+// JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
 /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
@@ -1607,7 +1607,7 @@ fn sync_jit_state_to_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::{is_func, w_func_get_code_ptr};
+    use pyre_interpreter::{function_get_code, is_function};
 
     #[test]
     fn test_eval_simple_addition() {

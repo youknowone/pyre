@@ -2,23 +2,23 @@ use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::executioncontext::PyNamespace;
-use crate::{PyDisplay, w_builtin_func_new};
+use crate::{PyDisplay, builtin_code_new};
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
 pub fn install_default_builtins(namespace: &mut PyNamespace) {
-    namespace.get_or_insert_with("print", || w_builtin_func_new("print", builtin_print));
-    namespace.get_or_insert_with("range", || w_builtin_func_new("range", builtin_range));
-    namespace.get_or_insert_with("len", || w_builtin_func_new("len", builtin_len));
-    namespace.get_or_insert_with("abs", || w_builtin_func_new("abs", builtin_abs));
-    namespace.get_or_insert_with("min", || w_builtin_func_new("min", builtin_min));
-    namespace.get_or_insert_with("max", || w_builtin_func_new("max", builtin_max));
+    namespace.get_or_insert_with("print", || builtin_code_new("print", builtin_print));
+    namespace.get_or_insert_with("range", || builtin_code_new("range", builtin_range));
+    namespace.get_or_insert_with("len", || builtin_code_new("len", builtin_len));
+    namespace.get_or_insert_with("abs", || builtin_code_new("abs", builtin_abs));
+    namespace.get_or_insert_with("min", || builtin_code_new("min", builtin_min));
+    namespace.get_or_insert_with("max", || builtin_code_new("max", builtin_max));
     namespace.get_or_insert_with("type", || crate::typedef::get_type_type());
     namespace.get_or_insert_with("isinstance", || {
-        w_builtin_func_new("isinstance", builtin_isinstance)
+        builtin_code_new("isinstance", builtin_isinstance)
     });
     namespace.get_or_insert_with("str", || crate::typedef::get_builtin_type(&STR_TYPE));
-    namespace.get_or_insert_with("repr", || w_builtin_func_new("repr", builtin_repr));
+    namespace.get_or_insert_with("repr", || builtin_code_new("repr", builtin_repr));
     namespace.get_or_insert_with("int", || crate::typedef::get_builtin_type(&INT_TYPE));
     namespace.get_or_insert_with("float", || crate::typedef::get_builtin_type(&FLOAT_TYPE));
     namespace.get_or_insert_with("bool", || crate::typedef::get_builtin_type(&BOOL_TYPE));
@@ -26,10 +26,10 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("False", || w_bool_from(false));
     namespace.get_or_insert_with("None", || w_none());
     namespace.get_or_insert_with("NotImplemented", || w_not_implemented());
-    namespace.get_or_insert_with("hasattr", || w_builtin_func_new("hasattr", builtin_hasattr));
-    namespace.get_or_insert_with("getattr", || w_builtin_func_new("getattr", builtin_getattr));
-    namespace.get_or_insert_with("setattr", || w_builtin_func_new("setattr", builtin_setattr));
-    namespace.get_or_insert_with("delattr", || w_builtin_func_new("delattr", builtin_delattr));
+    namespace.get_or_insert_with("hasattr", || builtin_code_new("hasattr", builtin_hasattr));
+    namespace.get_or_insert_with("getattr", || builtin_code_new("getattr", builtin_getattr));
+    namespace.get_or_insert_with("setattr", || builtin_code_new("setattr", builtin_setattr));
+    namespace.get_or_insert_with("delattr", || builtin_code_new("delattr", builtin_delattr));
     namespace.get_or_insert_with("tuple", || crate::typedef::get_builtin_type(&TUPLE_TYPE));
     namespace.get_or_insert_with("list", || crate::typedef::get_builtin_type(&LIST_TYPE));
     namespace.get_or_insert_with("dict", || crate::typedef::get_builtin_type(&DICT_TYPE));
@@ -38,43 +38,41 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         // PyPy: baseobjspace.py w_object = W_TypeObject("object", ...)
         crate::typedef::get_object_type()
     });
-    namespace.get_or_insert_with("super", || w_builtin_func_new("super", builtin_super));
-    namespace.get_or_insert_with("id", || w_builtin_func_new("id", builtin_id));
-    namespace.get_or_insert_with("hash", || w_builtin_func_new("hash", builtin_hash));
-    namespace.get_or_insert_with("ord", || w_builtin_func_new("ord", builtin_ord));
-    namespace.get_or_insert_with("chr", || w_builtin_func_new("chr", builtin_chr));
-    namespace.get_or_insert_with("map", || w_builtin_func_new("map", builtin_map));
-    namespace.get_or_insert_with("zip", || w_builtin_func_new("zip", builtin_zip));
+    namespace.get_or_insert_with("super", || builtin_code_new("super", builtin_super));
+    namespace.get_or_insert_with("id", || builtin_code_new("id", builtin_id));
+    namespace.get_or_insert_with("hash", || builtin_code_new("hash", builtin_hash));
+    namespace.get_or_insert_with("ord", || builtin_code_new("ord", builtin_ord));
+    namespace.get_or_insert_with("chr", || builtin_code_new("chr", builtin_chr));
+    namespace.get_or_insert_with("map", || builtin_code_new("map", builtin_map));
+    namespace.get_or_insert_with("zip", || builtin_code_new("zip", builtin_zip));
     namespace.get_or_insert_with("enumerate", || {
-        w_builtin_func_new("enumerate", builtin_enumerate)
+        builtin_code_new("enumerate", builtin_enumerate)
     });
     namespace.get_or_insert_with("reversed", || {
-        w_builtin_func_new("reversed", builtin_reversed)
+        builtin_code_new("reversed", builtin_reversed)
     });
-    namespace.get_or_insert_with("sorted", || w_builtin_func_new("sorted", builtin_sorted));
-    namespace.get_or_insert_with("iter", || w_builtin_func_new("iter", builtin_iter));
-    namespace.get_or_insert_with("next", || w_builtin_func_new("next", builtin_next));
+    namespace.get_or_insert_with("sorted", || builtin_code_new("sorted", builtin_sorted));
+    namespace.get_or_insert_with("iter", || builtin_code_new("iter", builtin_iter));
+    namespace.get_or_insert_with("next", || builtin_code_new("next", builtin_next));
     namespace.get_or_insert_with("callable", || {
-        w_builtin_func_new("callable", builtin_callable)
+        builtin_code_new("callable", builtin_callable)
     });
-    namespace.get_or_insert_with("vars", || w_builtin_func_new("vars", builtin_vars));
+    namespace.get_or_insert_with("vars", || builtin_code_new("vars", builtin_vars));
     namespace.get_or_insert_with("__build_class__", || {
-        w_builtin_func_new("__build_class__", |args| {
+        builtin_code_new("__build_class__", |args| {
             crate::call::real_build_class(args)
         })
     });
     // Type stubs for missing builtin types
     namespace.get_or_insert_with("bytearray", || {
-        w_builtin_func_new("bytearray", |_| Ok(w_str_new("")))
+        builtin_code_new("bytearray", |_| Ok(w_str_new("")))
     });
-    namespace.get_or_insert_with("bytes", || {
-        w_builtin_func_new("bytes", |_| Ok(w_str_new("")))
-    });
+    namespace.get_or_insert_with("bytes", || builtin_code_new("bytes", |_| Ok(w_str_new(""))));
     namespace.get_or_insert_with("frozenset", || {
-        w_builtin_func_new("frozenset", |_| Ok(w_tuple_new(vec![])))
+        builtin_code_new("frozenset", |_| Ok(w_tuple_new(vec![])))
     });
     namespace.get_or_insert_with("set", || {
-        w_builtin_func_new("set", |args| {
+        builtin_code_new("set", |args| {
             if args.is_empty() {
                 return builtin_set_from_items(&[]);
             }
@@ -83,7 +81,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         })
     });
     namespace.get_or_insert_with("property", || {
-        w_builtin_func_new("property", |args| {
+        builtin_code_new("property", |args| {
             if args.is_empty() {
                 return Ok(w_none());
             }
@@ -110,20 +108,18 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("Ellipsis", || w_none());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
     namespace.get_or_insert_with("memoryview", || {
-        w_builtin_func_new("memoryview", |_| Ok(w_none()))
+        builtin_code_new("memoryview", |_| Ok(w_none()))
     });
-    namespace.get_or_insert_with("globals", || w_builtin_func_new("globals", builtin_globals));
-    namespace.get_or_insert_with("locals", || w_builtin_func_new("locals", builtin_locals));
-    namespace.get_or_insert_with("exec", || w_builtin_func_new("exec", |_| Ok(w_none())));
-    namespace.get_or_insert_with("eval", || w_builtin_func_new("eval", |_| Ok(w_none())));
-    namespace.get_or_insert_with("compile", || {
-        w_builtin_func_new("compile", |_| Ok(w_none()))
-    });
+    namespace.get_or_insert_with("globals", || builtin_code_new("globals", builtin_globals));
+    namespace.get_or_insert_with("locals", || builtin_code_new("locals", builtin_locals));
+    namespace.get_or_insert_with("exec", || builtin_code_new("exec", |_| Ok(w_none())));
+    namespace.get_or_insert_with("eval", || builtin_code_new("eval", |_| Ok(w_none())));
+    namespace.get_or_insert_with("compile", || builtin_code_new("compile", |_| Ok(w_none())));
     namespace.get_or_insert_with("input", || {
-        w_builtin_func_new("input", |_| Ok(pyre_object::w_str_new("")))
+        builtin_code_new("input", |_| Ok(pyre_object::w_str_new("")))
     });
     namespace.get_or_insert_with("open", || {
-        w_builtin_func_new("open", |_| {
+        builtin_code_new("open", |_| {
             Err(crate::PyError::type_error("open() not implemented"))
         })
     });
@@ -153,75 +149,73 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     namespace.get_or_insert_with("SystemExit", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("KeyboardInterrupt", || crate::typedef::get_object_type());
     namespace.get_or_insert_with("RecursionError", || crate::typedef::get_object_type());
-    namespace.get_or_insert_with("any", || w_builtin_func_new("any", builtin_any));
-    namespace.get_or_insert_with("all", || w_builtin_func_new("all", builtin_all));
-    namespace.get_or_insert_with("sum", || w_builtin_func_new("sum", builtin_sum));
-    namespace.get_or_insert_with("round", || w_builtin_func_new("round", builtin_round));
-    namespace.get_or_insert_with("divmod", || w_builtin_func_new("divmod", builtin_divmod));
-    namespace.get_or_insert_with("pow", || w_builtin_func_new("pow", builtin_pow));
-    namespace.get_or_insert_with("hex", || w_builtin_func_new("hex", builtin_hex));
-    namespace.get_or_insert_with("oct", || w_builtin_func_new("oct", builtin_oct));
-    namespace.get_or_insert_with("bin", || w_builtin_func_new("bin", builtin_bin));
-    namespace.get_or_insert_with("format", || w_builtin_func_new("format", builtin_format));
+    namespace.get_or_insert_with("any", || builtin_code_new("any", builtin_any));
+    namespace.get_or_insert_with("all", || builtin_code_new("all", builtin_all));
+    namespace.get_or_insert_with("sum", || builtin_code_new("sum", builtin_sum));
+    namespace.get_or_insert_with("round", || builtin_code_new("round", builtin_round));
+    namespace.get_or_insert_with("divmod", || builtin_code_new("divmod", builtin_divmod));
+    namespace.get_or_insert_with("pow", || builtin_code_new("pow", builtin_pow));
+    namespace.get_or_insert_with("hex", || builtin_code_new("hex", builtin_hex));
+    namespace.get_or_insert_with("oct", || builtin_code_new("oct", builtin_oct));
+    namespace.get_or_insert_with("bin", || builtin_code_new("bin", builtin_bin));
+    namespace.get_or_insert_with("format", || builtin_code_new("format", builtin_format));
     namespace.get_or_insert_with("issubclass", || {
-        w_builtin_func_new("issubclass", builtin_issubclass)
+        builtin_code_new("issubclass", builtin_issubclass)
     });
     namespace.get_or_insert_with("__import__", || {
-        w_builtin_func_new("__import__", builtin_import_stub)
+        builtin_code_new("__import__", builtin_import_stub)
     });
 
     // Exception type constructors — callable for `raise ValueError("msg")`
     // and identifiable by name for CHECK_EXC_MATCH.
     namespace.get_or_insert_with("BaseException", || {
-        w_builtin_func_new("BaseException", exc_base_exception)
+        builtin_code_new("BaseException", exc_base_exception)
     });
-    namespace.get_or_insert_with("Exception", || {
-        w_builtin_func_new("Exception", exc_exception)
-    });
+    namespace.get_or_insert_with("Exception", || builtin_code_new("Exception", exc_exception));
     namespace.get_or_insert_with("ArithmeticError", || {
-        w_builtin_func_new("ArithmeticError", exc_arithmetic_error)
+        builtin_code_new("ArithmeticError", exc_arithmetic_error)
     });
     namespace.get_or_insert_with("ZeroDivisionError", || {
-        w_builtin_func_new("ZeroDivisionError", exc_zero_division)
+        builtin_code_new("ZeroDivisionError", exc_zero_division)
     });
     namespace.get_or_insert_with("TypeError", || {
-        w_builtin_func_new("TypeError", exc_type_error)
+        builtin_code_new("TypeError", exc_type_error)
     });
     namespace.get_or_insert_with("ValueError", || {
-        w_builtin_func_new("ValueError", exc_value_error)
+        builtin_code_new("ValueError", exc_value_error)
     });
-    namespace.get_or_insert_with("KeyError", || w_builtin_func_new("KeyError", exc_key_error));
+    namespace.get_or_insert_with("KeyError", || builtin_code_new("KeyError", exc_key_error));
     namespace.get_or_insert_with("IndexError", || {
-        w_builtin_func_new("IndexError", exc_index_error)
+        builtin_code_new("IndexError", exc_index_error)
     });
     namespace.get_or_insert_with("AttributeError", || {
-        w_builtin_func_new("AttributeError", exc_attribute_error)
+        builtin_code_new("AttributeError", exc_attribute_error)
     });
     namespace.get_or_insert_with("NameError", || {
-        w_builtin_func_new("NameError", exc_name_error)
+        builtin_code_new("NameError", exc_name_error)
     });
     namespace.get_or_insert_with("RuntimeError", || {
-        w_builtin_func_new("RuntimeError", exc_runtime_error)
+        builtin_code_new("RuntimeError", exc_runtime_error)
     });
     namespace.get_or_insert_with("StopIteration", || {
-        w_builtin_func_new("StopIteration", exc_stop_iteration)
+        builtin_code_new("StopIteration", exc_stop_iteration)
     });
     namespace.get_or_insert_with("OverflowError", || {
-        w_builtin_func_new("OverflowError", exc_overflow_error)
+        builtin_code_new("OverflowError", exc_overflow_error)
     });
     namespace.get_or_insert_with("ImportError", || {
-        w_builtin_func_new("ImportError", exc_import_error)
+        builtin_code_new("ImportError", exc_import_error)
     });
     namespace.get_or_insert_with("NotImplementedError", || {
-        w_builtin_func_new("NotImplementedError", exc_not_implemented_error)
+        builtin_code_new("NotImplementedError", exc_not_implemented_error)
     });
     namespace.get_or_insert_with("AssertionError", || {
-        w_builtin_func_new("AssertionError", exc_assertion_error)
+        builtin_code_new("AssertionError", exc_assertion_error)
     });
 
     // Descriptor types
     namespace.get_or_insert_with("property", || {
-        w_builtin_func_new("property", builtin_property)
+        builtin_code_new("property", builtin_property)
     });
     // staticmethod/classmethod registered as types for isinstance() support.
     // The type's __new__ creates the descriptor wrapper.
@@ -750,7 +744,7 @@ fn builtin_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// Get a reference to the `__build_class__` builtin function.
 pub fn get_build_class_func() -> PyObjectRef {
-    w_builtin_func_new("__build_class__", builtin_build_class)
+    builtin_code_new("__build_class__", builtin_build_class)
 }
 
 /// `property(fget=None, fset=None, fdel=None, doc=None)` → W_PropertyObject
@@ -999,7 +993,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "add",
-        crate::w_builtin_func_new("add", |args| {
+        crate::builtin_code_new("add", |args| {
             if args.len() >= 2 {
                 if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     unsafe { pyre_object::w_dict_store(data, args[1], pyre_object::w_none()) };
@@ -1012,19 +1006,19 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "discard",
-        crate::w_builtin_func_new("discard", |_args| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("discard", |_args| Ok(pyre_object::w_none())),
     );
     // remove()
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "remove",
-        crate::w_builtin_func_new("remove", |_args| Ok(pyre_object::w_none())),
+        crate::builtin_code_new("remove", |_args| Ok(pyre_object::w_none())),
     );
     // pop()
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "pop",
-        crate::w_builtin_func_new("pop", |args| {
+        crate::builtin_code_new("pop", |args| {
             if !args.is_empty() {
                 if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     unsafe {
@@ -1046,7 +1040,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "__iter__",
-        crate::w_builtin_func_new("__iter__", |args| {
+        crate::builtin_code_new("__iter__", |args| {
             if !args.is_empty() {
                 if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     return crate::baseobjspace::py_iter(data);
@@ -1062,7 +1056,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "__contains__",
-        crate::w_builtin_func_new("__contains__", |args| {
+        crate::builtin_code_new("__contains__", |args| {
             if args.len() >= 2 {
                 if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     let found = unsafe { pyre_object::w_dict_lookup(data, args[1]) };
@@ -1076,7 +1070,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "__len__",
-        crate::w_builtin_func_new("__len__", |args| {
+        crate::builtin_code_new("__len__", |args| {
             if !args.is_empty() {
                 if let Ok(data) = crate::baseobjspace::py_getattr(args[0], "__data__") {
                     return crate::baseobjspace::py_len(data);
@@ -1090,7 +1084,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "__and__",
-        crate::w_builtin_func_new("__and__", |args| {
+        crate::builtin_code_new("__and__", |args| {
             if args.len() < 2 {
                 return Ok(args[0]);
             }
@@ -1114,7 +1108,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let _ = crate::baseobjspace::py_setattr(
         obj,
         "__or__",
-        crate::w_builtin_func_new("__or__", |args| {
+        crate::builtin_code_new("__or__", |args| {
             if args.len() < 2 {
                 return Ok(args[0]);
             }
@@ -1230,8 +1224,8 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
     let is_callable = unsafe {
-        crate::is_func(obj)
-            || crate::is_builtin_func(obj)
+        crate::is_function(obj)
+            || crate::is_builtin_code(obj)
             || pyre_object::is_type(obj)
             || (pyre_object::is_instance(obj)
                 && crate::baseobjspace::lookup_in_type_mro_pub(
@@ -1316,8 +1310,8 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
     let has_dict = unsafe {
         pyre_object::is_instance(obj)
-            || crate::is_func(obj)
-            || crate::is_builtin_func(obj)
+            || crate::is_function(obj)
+            || crate::is_builtin_code(obj)
             || pyre_object::is_module(obj)
     } || crate::baseobjspace::ATTR_TABLE
         .with(|table| table.borrow().contains_key(&(obj as usize)));

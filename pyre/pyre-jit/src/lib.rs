@@ -4,13 +4,13 @@
 //! it contains automatically generated tracing code produced by
 //! `majit-analyze` during build time.
 //!
-//! The interpreter (`pyre-interp`) has zero JIT dependencies.
+//! The interpreter (`pyre-interpreter`) has zero JIT dependencies.
 //! All JIT logic lives here, generated from static analysis of
 //! the interpreter's source code.
 //!
 //! Architecture:
 //! ```text
-//! pyre-interp (pure interpreter)
+//! pyre-interpreter (pure interpreter)
 //!       ↓ (source analysis at build time)
 //! majit-analyze (RPython translator)
 //!       ↓ (code generation)

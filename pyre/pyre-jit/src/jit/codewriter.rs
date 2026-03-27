@@ -601,7 +601,7 @@ impl CodeWriter {
 // ---------------------------------------------------------------------------
 
 /// Forward jump target: skip_caches(next_instr) + delta.
-/// Must match pyre-interpreter/opcode_step.rs:jump_target_forward.
+/// Must match pyre-interpreter/pyopcode.rs:jump_target_forward.
 fn jump_target_forward(
     code: &CodeObject,
     num_instrs: usize,
@@ -617,7 +617,7 @@ fn jump_target_backward(next_instr: usize, delta: usize) -> usize {
     next_instr.saturating_sub(delta)
 }
 
-/// Match pyre-interpreter/opcode_step.rs:skip_caches.
+/// Match pyre-interpreter/pyopcode.rs:skip_caches.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
     let mut state = OpArgState::default();
     while pos < code.instructions.len() {

@@ -1,10 +1,10 @@
 //! JIT driver for pyre — manages trace compilation and execution.
 //!
 //! This module is the Rust equivalent of RPython's jit/metainterp
-//! integration layer. It connects the interpreter (pyre-interp) with
+//! integration layer. It connects the interpreter (pyre-interpreter) with
 //! the JIT compiler (majit) through auto-generated tracing code.
 //!
-//! Key principle: pyre-interp has zero JIT dependencies.
+//! Key principle: pyre-interpreter has zero JIT dependencies.
 //! All JIT logic lives here in pyre-jit.
 
 // Re-export the auto-generated tracing functions
