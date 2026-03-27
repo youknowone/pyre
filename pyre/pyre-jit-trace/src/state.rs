@@ -6677,6 +6677,10 @@ impl JitState for PyreJitState {
         }
     }
 
+    fn meta_merge_pc(meta: &Self::Meta) -> usize {
+        meta.merge_pc
+    }
+
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
         meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.

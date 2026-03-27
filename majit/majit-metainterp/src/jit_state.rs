@@ -135,6 +135,11 @@ pub trait JitState: Sized {
     /// must use the back-edge target PC, not the tracing entry PC.
     fn update_meta_merge_pc(_meta: &mut Self::Meta, _new_pc: usize) {}
 
+    /// Read the merge_pc from a compiled meta.
+    fn meta_merge_pc(meta: &Self::Meta) -> usize {
+        0
+    }
+
     /// compile.py:269-270 parity: update meta when the trace is cut at
     /// a cross-loop merge point. `header_pc` is the bytecode PC of the
     /// new loop header; `original_box_types` are the types of the live

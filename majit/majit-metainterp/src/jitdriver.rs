@@ -587,20 +587,6 @@ impl<S: JitState> JitDriver<S> {
                         _ => provisional_meta,
                     };
                     let outcome = self.meta.compile_loop(&jump_args, meta);
-                    if hpc != Some(0) {
-                        if let crate::pyjitpl::CompileOutcome::Compiled {
-                            cut_header_pc: Some(cp),
-                            green_key: gk,
-                            from_retry: false,
-                        } = outcome
-                        {
-                            if cp != 0 && gk != 0 {
-                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                                    S::update_meta_merge_pc(&mut entry.meta, cp);
-                                }
-                            }
-                        }
-                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -670,20 +656,6 @@ impl<S: JitState> JitDriver<S> {
                         _ => provisional_meta,
                     };
                     let outcome = self.meta.compile_loop(&jump_args, meta);
-                    if hpc != Some(0) {
-                        if let crate::pyjitpl::CompileOutcome::Compiled {
-                            cut_header_pc: Some(cp),
-                            green_key: gk,
-                            from_retry: false,
-                        } = outcome
-                        {
-                            if cp != 0 && gk != 0 {
-                                if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                                    S::update_meta_merge_pc(&mut entry.meta, cp);
-                                }
-                            }
-                        }
-                    }
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(
