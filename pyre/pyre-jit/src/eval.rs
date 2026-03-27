@@ -513,19 +513,22 @@ fn execute_assembler(
     }
 
     // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
-    // If must_compile → _trace_and_compile_from_bridge, else resume_in_blackhole.
+    // compile.py:701-710: must_compile → _trace_and_compile_from_bridge.
+    // compile.py:703: not rstack.stack_almost_full() check before bridge.
     if let DetailedDriverRunOutcome::GuardFailure {
         bridge_request: Some(req),
         ..
     } = &outcome
     {
-        crate::call_jit::jit_bridge_compile_for_guard(
-            req.green_key,
-            req.trace_id,
-            req.fail_index,
-            frame,
-            req.resume_pc,
-        );
+        if !stack_almost_full() {
+            crate::call_jit::jit_bridge_compile_for_guard(
+                req.green_key,
+                req.trace_id,
+                req.fail_index,
+                frame,
+                req.resume_pc,
+            );
+        }
         // RPython: handle_fail raises ContinueRunningNormally after bridge.
         // eval_loop_jit restarts → compiled code re-entered with bridge active.
         return Some(LoopResult::ContinueRunningNormally);
@@ -685,14 +688,17 @@ fn bound_reached(
             }
             JitAction::Continue => {}
         }
+        // compile.py:703: not rstack.stack_almost_full()
         if let Some(req) = bridge_request {
-            crate::call_jit::jit_bridge_compile_for_guard(
-                req.green_key,
-                req.trace_id,
-                req.fail_index,
-                frame,
-                req.resume_pc,
-            );
+            if !stack_almost_full() {
+                crate::call_jit::jit_bridge_compile_for_guard(
+                    req.green_key,
+                    req.trace_id,
+                    req.fail_index,
+                    frame,
+                    req.resume_pc,
+                );
+            }
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
@@ -793,20 +799,23 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
 
         // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
+        // compile.py:703: not rstack.stack_almost_full()
         if let DetailedDriverRunOutcome::GuardFailure {
             bridge_request: Some(req),
             ..
         } = &outcome
         {
-            crate::call_jit::jit_bridge_compile_for_guard(
-                req.green_key,
-                req.trace_id,
-                req.fail_index,
-                frame,
-                req.resume_pc,
-            );
-            frame.fix_array_ptrs();
-            return None; // caller re-enters eval_with_jit → compiled code with bridge
+            if !stack_almost_full() {
+                crate::call_jit::jit_bridge_compile_for_guard(
+                    req.green_key,
+                    req.trace_id,
+                    req.fail_index,
+                    frame,
+                    req.resume_pc,
+                );
+                frame.fix_array_ptrs();
+                return None; // caller re-enters eval_with_jit → compiled code with bridge
+            }
         }
 
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
