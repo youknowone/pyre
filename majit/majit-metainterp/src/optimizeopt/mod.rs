@@ -505,7 +505,7 @@ impl OptContext {
 
         // RPython optimizer.py:_emit_operation → store_final_boxes_in_guard:
         // produce rd_numb inline at guard emission time, not post-assembly.
-        if op.opcode.is_guard() && !self.snapshot_boxes.is_empty() {
+        if op.opcode.is_guard() {
             self.number_guard_inline(&mut op);
         }
 

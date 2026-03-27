@@ -1032,40 +1032,43 @@ fn materialize_virtual_from_rd(
     let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
     let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
     if ob_type == int_type_addr {
-        // W_IntObject: payload is field after ob_type (typically field[1]).
-        // If the dead frame stored a Ref (W_IntObject pointer) due to
-        // Phase 2 reverse mapping, dereference to get intval.
         let payload = field_values
             .get(1)
-            .map(|v| match v {
-                Value::Int(n) => *n,
-                Value::Ref(gc) if !gc.is_null() => unsafe {
-                    pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
-                },
-                _ => 0,
-            })
+            .map(decode_virtual_int_payload)
             .unwrap_or(0);
         let ptr = pyre_object::intobject::w_int_new(payload);
         Value::Ref(majit_ir::GcRef(ptr as usize))
     } else if ob_type == float_type_addr {
         let payload = field_values
             .get(1)
-            .map(|v| match v {
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Int(n) => *n,
-                Value::Ref(gc) if !gc.is_null() => unsafe {
-                    let f = pyre_object::floatobject::w_float_get_value(
-                        gc.0 as pyre_object::PyObjectRef,
-                    );
-                    f.to_bits() as i64
-                },
-                _ => 0,
-            })
+            .map(decode_virtual_float_payload_bits)
             .unwrap_or(0);
         let ptr = pyre_object::floatobject::w_float_new(f64::from_bits(payload as u64));
         Value::Ref(majit_ir::GcRef(ptr as usize))
     } else {
         Value::Ref(majit_ir::GcRef::NULL)
+    }
+}
+
+fn decode_virtual_int_payload(value: &Value) -> i64 {
+    match value {
+        Value::Int(n) => *n,
+        Value::Ref(gc) if !gc.is_null() => unsafe {
+            pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
+        },
+        _ => 0,
+    }
+}
+
+fn decode_virtual_float_payload_bits(value: &Value) -> i64 {
+    match value {
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Int(n) => *n,
+        Value::Ref(gc) if !gc.is_null() => unsafe {
+            pyre_object::floatobject::w_float_get_value(gc.0 as pyre_object::PyObjectRef).to_bits()
+                as i64
+        },
+        _ => 0,
     }
 }
 
@@ -1428,7 +1431,7 @@ fn materialize_recovery_virtuals(
     // Try recovery layout first (rd_virtuals parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
-            if materialize_from_recovery_layout(typed, raw_values, recovery) {
+            if materialize_from_recovery_layout(typed, raw_values, exit_layout, recovery) {
                 return;
             }
         }
@@ -1484,12 +1487,19 @@ fn materialize_recovery_virtuals(
                 break;
             }
             if let Value::Int(v) = typed[intval_pos] {
-                let obj = pyre_object::intobject::w_int_new(v);
+                let intval = decode_recovery_int_payload(
+                    v,
+                    typed,
+                    raw_values.get(intval_pos).copied(),
+                    raw_values,
+                    &exit_layout.exit_types,
+                );
+                let obj = pyre_object::intobject::w_int_new(intval);
                 typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit] materialized virtual W_IntObject(intval={}) at slot {}",
-                        v, slot_idx
+                        intval, slot_idx
                     );
                 }
             }
@@ -1512,6 +1522,7 @@ fn materialize_recovery_virtuals(
 fn materialize_from_recovery_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
     recovery: &majit_codegen::ExitRecoveryLayout,
 ) -> bool {
     let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
@@ -1539,11 +1550,26 @@ fn materialize_from_recovery_layout(
                     .map(|(_, src)| resolve_value(src).unwrap_or(0))
                     .collect();
                 let ob_type = field_vals.first().copied().unwrap_or(0) as usize;
+                let payload_src = fields.get(1).map(|(_, src)| src);
                 let val_raw = field_vals.get(1).copied().unwrap_or(0);
                 let obj = if ob_type == w_float_type {
-                    pyre_object::floatobject::w_float_new(f64::from_bits(val_raw as u64)) as usize
+                    pyre_object::floatobject::w_float_new(f64::from_bits(
+                        decode_recovery_float_payload_bits(
+                            val_raw,
+                            payload_src,
+                            typed,
+                            raw_values,
+                            exit_layout,
+                        ) as u64,
+                    )) as usize
                 } else if ob_type == w_int_type {
-                    pyre_object::intobject::w_int_new(val_raw) as usize
+                    pyre_object::intobject::w_int_new(decode_recovery_payload_from_source(
+                        val_raw,
+                        payload_src,
+                        typed,
+                        raw_values,
+                        exit_layout,
+                    )) as usize
                 } else {
                     return false;
                 };
@@ -1573,6 +1599,98 @@ fn materialize_from_recovery_layout(
         all_ok = false;
     }
     all_ok
+}
+
+fn decode_recovery_payload_from_source(
+    raw: i64,
+    src: Option<&majit_codegen::ExitValueSourceLayout>,
+    typed: &[Value],
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) -> i64 {
+    match src {
+        Some(majit_codegen::ExitValueSourceLayout::ExitValue(_)) => {
+            maybe_unbox_known_int_ref(raw, typed, raw_values, &exit_layout.exit_types)
+        }
+        _ => raw,
+    }
+}
+
+fn decode_recovery_float_payload_bits(
+    raw: i64,
+    src: Option<&majit_codegen::ExitValueSourceLayout>,
+    typed: &[Value],
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) -> i64 {
+    match src {
+        Some(majit_codegen::ExitValueSourceLayout::ExitValue(_)) => {
+            maybe_unbox_known_float_ref_bits(raw, typed, raw_values, &exit_layout.exit_types)
+        }
+        _ => raw,
+    }
+}
+
+fn decode_recovery_int_payload(
+    typed_raw: i64,
+    typed: &[Value],
+    raw_slot: Option<i64>,
+    raw_values: &[i64],
+    exit_types: &[majit_ir::Type],
+) -> i64 {
+    raw_slot
+        .map(|raw| maybe_unbox_known_int_ref(raw, typed, raw_values, exit_types))
+        .unwrap_or(typed_raw)
+}
+
+fn maybe_unbox_known_int_ref(
+    raw: i64,
+    typed: &[Value],
+    raw_values: &[i64],
+    exit_types: &[majit_ir::Type],
+) -> i64 {
+    let obj = raw as usize as pyre_object::PyObjectRef;
+    if obj.is_null() || !raw_matches_known_ref(raw, typed, raw_values, exit_types) {
+        return raw;
+    }
+    if unsafe { pyre_object::pyobject::is_int(obj) } {
+        unsafe { pyre_object::intobject::w_int_get_value(obj) }
+    } else {
+        raw
+    }
+}
+
+fn maybe_unbox_known_float_ref_bits(
+    raw: i64,
+    typed: &[Value],
+    raw_values: &[i64],
+    exit_types: &[majit_ir::Type],
+) -> i64 {
+    let obj = raw as usize as pyre_object::PyObjectRef;
+    if obj.is_null() || !raw_matches_known_ref(raw, typed, raw_values, exit_types) {
+        return raw;
+    }
+    if unsafe { pyre_object::pyobject::is_float(obj) } {
+        unsafe { pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64 }
+    } else {
+        raw
+    }
+}
+
+fn raw_matches_known_ref(
+    raw: i64,
+    typed: &[Value],
+    raw_values: &[i64],
+    exit_types: &[majit_ir::Type],
+) -> bool {
+    typed.iter().skip(3).any(|value| match value {
+        Value::Ref(gc) => gc.0 as i64 == raw,
+        _ => false,
+    }) || raw_values
+        .iter()
+        .zip(exit_types.iter())
+        .skip(3)
+        .any(|(value, tp)| matches!(tp, majit_ir::Type::Ref) && *value == raw)
 }
 
 pub(crate) fn build_jit_state(

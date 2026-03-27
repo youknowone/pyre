@@ -6,7 +6,7 @@ use majit_codegen::{
     TerminalExitLayout,
 };
 use majit_codegen_cranelift::CraneliftBackend;
-use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
@@ -1657,7 +1657,6 @@ impl<M: Clone> MetaInterp<M> {
             &constants,
             &self.create_frame_raw_map,
         );
-
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) ---");
             eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
@@ -4317,6 +4316,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         _fail_values: &[i64],
+        live_types: &[Type],
     ) -> (bool, bool) {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
@@ -4339,12 +4339,15 @@ impl<M: Clone> MetaInterp<M> {
             None => return (false, false),
         };
 
-        // RPython rebuild_state_after_failure parity: bridge inputargs are
-        // derived from the materialized frame state, not the raw fail_args
-        // (which include virtual field values as extra Int slots).
-        // Use the root loop's inputarg_types (= token.inputarg_types) for
-        // bridge recorder — these reflect the post-materialization types.
-        let bridge_input_types = &compiled.token.inputarg_types;
+        // RPython pyjitpl.py:3284-3286 / 2904-2919 parity:
+        // bridge tracing starts from rebuild_state_after_failure(), i.e. the
+        // reconstructed live boxes, not the raw guard fail_args layout.
+        // The caller passes those live box kinds explicitly.
+        let bridge_input_types = if live_types.is_empty() {
+            fail_descr.fail_arg_types()
+        } else {
+            live_types
+        };
         let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
@@ -5104,7 +5107,7 @@ impl<M: Clone> MetaInterp<M> {
         else {
             return false;
         };
-        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
+        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values, &[])
             .0
     }
 
@@ -6942,6 +6945,8 @@ mod tests {
             &bridge_ops,
             &bridge_inputargs,
             bridge_constants,
+            HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -7025,6 +7030,8 @@ mod tests {
             &bridge_ops,
             &bridge_inputargs,
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -7081,7 +7088,10 @@ mod tests {
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
         let trace_id = meta.compiled_loops[&green_key].root_trace_id;
 
-        assert!(meta.start_retrace_from_guard(green_key, trace_id, 0, &[]).0);
+        assert!(
+            meta.start_retrace_from_guard(green_key, trace_id, 0, &[], &[])
+                .0
+        );
 
         let mut ctx = meta.tracing.take().expect("expected active bridge trace");
         ctx.recorder.close_loop(&[OpRef(0), OpRef(1)]);
@@ -7137,6 +7147,8 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
         ));
 
@@ -7210,6 +7222,8 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
         ));
 
@@ -7308,6 +7322,8 @@ mod tests {
             &bridge_ops,
             &inputargs,
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -7395,6 +7411,8 @@ mod tests {
             &fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
         ));
 
