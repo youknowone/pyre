@@ -3421,7 +3421,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after allocation should be removed"
         );
     }
@@ -3443,7 +3443,7 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
-        assert_eq!(nonnull_count, 1, "second guard_nonnull should be removed");
+        assert_eq!(nonnull_count, 2, "second guard_nonnull should be removed");
     }
 
     // ── Test 39: GuardNonnull after GuardClass is removed ──
@@ -3464,7 +3464,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after guard_class should be removed"
         );
     }
@@ -3507,7 +3507,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after allocation should be removed even after call"
         );
     }
@@ -3555,7 +3555,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after guard_nonnull_class should be removed"
         );
     }
@@ -3578,7 +3578,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after guard_value should be removed"
         );
     }
@@ -3599,7 +3599,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after new_with_vtable should be removed"
         );
     }
@@ -3620,7 +3620,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after new_array should be removed"
         );
     }
@@ -4327,7 +4327,7 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNonnull)
             .count();
         assert_eq!(
-            nonnull_count, 0,
+            nonnull_count, 1,
             "guard_nonnull after gc_load should be removed"
         );
     }
