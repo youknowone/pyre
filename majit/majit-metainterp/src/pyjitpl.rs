@@ -4642,6 +4642,50 @@ impl<M: Clone> MetaInterp<M> {
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
 
+        // compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
+        // set up per-value counting on first failure. Subsequent ticks will
+        // use value-based hash (compile.py:780-781).
+        {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+            if let Some(guard_op_idx) = compiled
+                .traces
+                .get(&norm_tid)
+                .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
+            {
+                if let Some(guard_op) = compiled
+                    .traces
+                    .get(&norm_tid)
+                    .and_then(|t| t.ops.get(guard_op_idx))
+                {
+                    if guard_op.opcode == OpCode::GuardValue {
+                        let info = compiled
+                            .guard_failures
+                            .entry((norm_tid, fail_index))
+                            .or_insert_with(|| GuardFailureInfo {
+                                guard_hash: self.warm_state.fetch_next_hash(),
+                                compiling: false,
+                                per_value: None,
+                            });
+                        if info.per_value.is_none() {
+                            // compile.py:816-824: store fail_arg index + type
+                            if let Some(ref fa) = guard_op.fail_args {
+                                let arg0 = guard_op.arg(0);
+                                let idx = fa.iter().position(|&r| r == arg0);
+                                if let Some(idx) = idx {
+                                    let tp = typed_fail_values
+                                        .and_then(|tv| tv.get(idx))
+                                        .map(|v| v.get_type())
+                                        .unwrap_or(Type::Int);
+                                    info.per_value = Some((idx as u32, tp));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // compile.py:701-709: handle_fail — must_compile → bridge, else → blackhole.
         // The guard counter was already ticked in the caller's guard failure
         // handler. Use should_compile_bridge_in_trace (would_fire + !compiling).
