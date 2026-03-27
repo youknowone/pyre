@@ -417,8 +417,9 @@ impl PyreMetaInterp {
             return;
         }
 
-        let code_unit = code.instructions[ni];
-        let (instruction, op_arg) = top.arg_state.get(code_unit);
+        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
+            return;
+        };
         cf.next_instr = ni + 1;
         let next = cf.next_instr;
 
@@ -446,8 +447,9 @@ impl PyreMetaInterp {
             return pyre_object::PY_NULL;
         }
 
-        let code_unit = code.instructions[ni];
-        let (instruction, op_arg) = top.arg_state.get(code_unit);
+        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
+            return pyre_object::PY_NULL;
+        };
         cf.next_instr = ni + 1;
         let next = cf.next_instr;
 

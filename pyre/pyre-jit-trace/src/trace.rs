@@ -90,13 +90,14 @@ pub fn trace_bytecode(
     }
 
     // On abort, root frame may still be on the stack.
-    let root_frame = if executed_frame.is_some() {
-        executed_frame.unwrap()
-    } else if let Some(root) = metainterp.framestack.pop() {
-        root.owned_concrete_frame
-            .unwrap_or_else(|| Box::new(unsafe { std::mem::zeroed() }))
+    let root_frame = if let Some(frame) = executed_frame {
+        frame
     } else {
-        Box::new(unsafe { std::mem::zeroed() })
+        metainterp
+            .framestack
+            .pop()
+            .and_then(|frame| frame.owned_concrete_frame)
+            .expect("trace_bytecode must return the root concrete frame")
     };
     (action, root_frame)
 }

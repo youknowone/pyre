@@ -619,7 +619,7 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
-    let result = resume_in_blackhole(frame);
+    let result = blackhole_from_jit_frame(frame);
 
     match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
@@ -634,7 +634,7 @@ extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
 ///
 /// Public wrapper for guard failure recovery.
 pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    resume_in_blackhole(frame)
+    blackhole_from_jit_frame(frame)
 }
 
 /// RPython: blackhole.py resume_in_blackhole()
@@ -642,7 +642,7 @@ pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef 
 /// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
 /// a BlackholeInterpreter, loads frame state, and runs it.
 /// The blackhole has NO JIT entry points — structural isolation.
-fn resume_in_blackhole(frame: &mut PyFrame) -> PyObjectRef {
+fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython parity: blackhole has no jit_merge_point, but
     // bhimpl_recursive_call calls portal_runner which CAN enter JIT.
     // eval_frame_plain handles THIS frame without JIT hooks;
@@ -750,7 +750,8 @@ pub enum BlackholeResult {
 ///
 /// Builds a blackhole chain (innermost first), then runs _run_forever:
 /// callee blackhole → RETURN_VALUE → caller blackhole → merge point.
-pub fn resume_in_blackhole_from_fail_args(
+/// blackhole.py:1782 resume_in_blackhole parity.
+pub fn resume_in_blackhole(
     _caller_frame: &mut PyFrame,
     typed_values: &[majit_ir::Value],
     merge_py_pc: usize,
@@ -1317,7 +1318,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     // RPython parity: nested calls CAN enter JIT (blackhole.py:1095)
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = resume_in_blackhole(frame);
+        let bh_result = blackhole_from_jit_frame(frame);
         match protocol {
             FinishProtocol::RawInt if !bh_result.is_null() && unsafe { is_int(bh_result) } => unsafe {
                 w_int_get_value(bh_result)

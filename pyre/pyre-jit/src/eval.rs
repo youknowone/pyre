@@ -538,7 +538,7 @@ fn execute_assembler(
             // compile.py:710 handle_fail → resume_in_blackhole
             let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
             if let Some(ref vals) = typed {
-                match crate::call_jit::resume_in_blackhole_from_fail_args(frame, vals, entry_pc) {
+                match crate::call_jit::resume_in_blackhole(frame, vals, entry_pc) {
                     crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                         Some(LoopResult::ContinueRunningNormally)
                     }
@@ -672,11 +672,7 @@ fn bound_reached(
             JitAction::ContinueRunningNormally => {
                 let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
                 if let Some(ref vals) = typed {
-                    match crate::call_jit::resume_in_blackhole_from_fail_args(
-                        frame,
-                        vals,
-                        loop_header_pc,
-                    ) {
+                    match crate::call_jit::resume_in_blackhole(frame, vals, loop_header_pc) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                             return Some(LoopResult::ContinueRunningNormally);
                         }
@@ -1213,13 +1209,6 @@ fn restore_guard_failure_for_loop(
             jit_state.next_instr, jit_state.valuestackdepth
         );
     }
-
-    // RPython compile.py:701 handle_fail → _trace_and_compile_from_bridge.
-    // This callback only restores state; bridge compilation runs synchronously
-    // in execute_assembler/try_function_entry_jit BEFORE blackhole resumption
-    // (RPython handle_fail parity: bridge replaces blackhole).
-    // Consume the pending request so it doesn't leak to the next guard failure.
-    crate::call_jit::PENDING_BRIDGE_REQUEST.with(|c| c.take());
 
     restored.then_some(jit_state.next_instr)
 }
