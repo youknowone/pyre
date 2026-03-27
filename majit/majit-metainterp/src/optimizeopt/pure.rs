@@ -8,7 +8,17 @@ use std::collections::HashMap;
 
 use majit_ir::{GcRef, Op, OpCode, OpRef, Type, Value};
 
+use crate::optimizeopt::info::PreambleOp;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+
+/// pure.py:104,204-210: extra_call_pure entry.
+/// RPython stores AbstractResOp (or PreambleOp) directly in the list.
+/// isinstance(old_op, PreambleOp) check → force_op_from_preamble → replace.
+#[derive(Clone, Debug)]
+enum ExtraCallPureEntry {
+    Direct { key: PureOpKey, result: OpRef },
+    Preamble { key: PureOpKey, pop: PreambleOp },
+}
 
 /// Key for looking up a previously computed pure operation.
 ///
@@ -162,10 +172,27 @@ pub struct OptPure {
     /// Pre-recorded CALL_PURE results from RECORD_KNOWN_RESULT.
     /// pure.py: known_result_call_pure
     known_result_call_pure: Vec<(PureOpKey, OpRef)>,
-    /// pure.py: extra_call_pure — CALL_PURE results from the previous
-    /// loop iteration (fed from Optimizer.call_pure_results).
-    /// These are checked before the regular cache for cross-iteration CSE.
-    extra_call_pure: Vec<(PureOpKey, OpRef)>,
+    /// pure.py:104: extra_call_pure — CALL_PURE results from the previous
+    /// loop iteration and preamble import. May contain PreambleOp entries
+    /// (RPython isinstance check → force_op_from_preamble → replace in-place).
+    extra_call_pure: Vec<ExtraCallPureEntry>,
+    /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
+    /// optpure's cache. In majit, PreambleOp entries stored here are
+    /// searched with forwarding-aware matching (force_preamble_op pattern).
+    /// Body CSE uses the HashMap (unchanged).
+    preamble_pure_ops: Vec<PreamblePureEntry>,
+}
+
+/// shortpreamble.py:124-126: PreambleOp stored in OptPure for always-pure ops.
+/// Searched with forwarding-aware matching during Phase 2 body optimization.
+#[derive(Clone, Debug)]
+struct PreamblePureEntry {
+    opcode: OpCode,
+    args: Vec<OpRef>,
+    descr_index: Option<u32>,
+    pop: PreambleOp,
+    /// Forced flag: after first match, replaced with Direct result.
+    forced_result: Option<OpRef>,
 }
 
 impl OptPure {
@@ -180,6 +207,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
+            preamble_pure_ops: Vec::new(),
         }
     }
 
@@ -194,7 +222,7 @@ impl OptPure {
                     args,
                     descr_index: None,
                 };
-                (key, result)
+                ExtraCallPureEntry::Direct { key, result }
             })
             .collect();
     }
@@ -310,9 +338,13 @@ impl OptPure {
             }
         }
         // pure.py: also check extra_call_pure (from previous loop iteration)
-        for (k, result) in &self.extra_call_pure {
+        for entry in &self.extra_call_pure {
+            let (k, result) = match entry {
+                ExtraCallPureEntry::Direct { key, result } => (key, *result),
+                ExtraCallPureEntry::Preamble { key, pop } => (key, pop.resolved),
+            };
             if k.args == key.args {
-                return Some(*result);
+                return Some(result);
             }
         }
         None
@@ -360,12 +392,44 @@ impl OptPure {
             .unwrap_or(true)
     }
 
-    fn lookup_imported_short_pure(&self, op: &Op, ctx: &OptContext) -> Option<OpRef> {
+    /// pure.py:50-55,57-79: force_preamble_op + lookup pattern.
+    /// Searches preamble entries with forwarding-aware arg matching.
+    /// On match, forces PreambleOp (in-place replacement) and returns result.
+    fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
+        let descr_index = op.descr.as_ref().map(|d| d.index());
+        // Search preamble_pure_ops (shortpreamble.py:124-126 entries)
+        for entry in &mut self.preamble_pure_ops {
+            if entry.opcode != op.opcode {
+                continue;
+            }
+            if entry.descr_index != descr_index {
+                continue;
+            }
+            if entry.args.len() != op.args.len() {
+                continue;
+            }
+            // pure.py:62: get_box_replacement matching
+            if entry
+                .args
+                .iter()
+                .zip(op.args.iter())
+                .all(|(&stored, &query)| ctx.get_replacement(stored) == ctx.get_replacement(query))
+            {
+                // pure.py:50-55: force_preamble_op
+                if let Some(result) = entry.forced_result {
+                    return Some(result);
+                }
+                let forced = ctx.force_op_from_preamble(entry.pop.resolved);
+                entry.forced_result = Some(forced);
+                return Some(forced);
+            }
+        }
+        // Fallback: also check ctx.imported_short_pure_ops (legacy path)
         ctx.imported_short_pure_ops.iter().find_map(|entry| {
             if entry.opcode != op.opcode {
                 return None;
             }
-            if entry.descr.as_ref().map(|d| d.index()) != op.descr.as_ref().map(|d| d.index()) {
+            if entry.descr.as_ref().map(|d| d.index()) != descr_index {
                 return None;
             }
             if entry.args.len() != op.args.len() {
@@ -387,6 +451,41 @@ impl OptPure {
             }
             Some(entry.result)
         })
+    }
+
+    /// Store PreambleOp in OptPure for always-pure ops.
+    /// RPython shortpreamble.py:124-126: opt.pure(op.getopnum(), PreambleOp(...))
+    pub fn pure_preamble(
+        &mut self,
+        opcode: OpCode,
+        args: Vec<OpRef>,
+        descr_index: Option<u32>,
+        pop: PreambleOp,
+    ) {
+        self.preamble_pure_ops.push(PreamblePureEntry {
+            opcode,
+            args,
+            descr_index,
+            pop,
+            forced_result: None,
+        });
+    }
+
+    /// Store PreambleOp in extra_call_pure for CALL_PURE preamble imports.
+    /// RPython shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
+    pub fn extra_call_pure_preamble(
+        &mut self,
+        args: Vec<OpRef>,
+        descr_index: Option<u32>,
+        pop: PreambleOp,
+    ) {
+        let key = PureOpKey {
+            opcode: OpCode::CallPureI,
+            args,
+            descr_index,
+        };
+        self.extra_call_pure
+            .push(ExtraCallPureEntry::Preamble { key, pop });
     }
 }
 
@@ -532,8 +631,7 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                if let Some(cached_ref) = self.lookup_imported_short_pure(&postponed, ctx) {
-                    let cached_ref = ctx.force_op_from_preamble(cached_ref);
+                if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -612,8 +710,7 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
-                let cached_ref = ctx.force_op_from_preamble(cached_ref);
+            if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -636,8 +733,7 @@ impl Optimization for OptPure {
 
         // CALL_PURE_* -> CSE or known_result lookup, then demote to CALL_*.
         if op.opcode.is_call_pure() {
-            if let Some(cached_ref) = self.lookup_imported_short_pure(op, ctx) {
-                let cached_ref = ctx.force_op_from_preamble(cached_ref);
+            if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -742,6 +838,7 @@ impl Optimization for OptPure {
         self.known_result_call_pure.clear();
         // Note: extra_call_pure is NOT cleared on setup — it persists
         // across optimization runs (set by set_extra_call_pure before opt).
+        // preamble_pure_ops also NOT cleared — populated during import.
     }
 
     fn name(&self) -> &'static str {
