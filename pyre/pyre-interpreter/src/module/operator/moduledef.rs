@@ -17,7 +17,7 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     }
     // Try __index__ dunder
-    Ok(crate::space_call_function_or_identity(obj, "__index__"))
+    Ok(crate::call_function_or_identity(obj, "__index__"))
 }
 
 fn op_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

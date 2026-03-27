@@ -11,7 +11,7 @@ use crate::{BUILTIN_CODE_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_na
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
 ///
 /// PyPy: `space.call_function(space.lookup(w_obj, name), w_obj)`
-/// Uses the unified `space_call_function` instead of a dedicated callback.
+/// Uses the unified `call_function` instead of a dedicated callback.
 fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
     unsafe {
         if !pyre_object::is_instance(obj) {
@@ -21,7 +21,7 @@ fn try_call_dunder(obj: PyObjectRef, name: &str) -> Option<String> {
         if method.is_null() {
             return None;
         }
-        let result = crate::space_call_function(method, &[obj]);
+        let result = crate::call_function(method, &[obj]);
         if result.is_null() {
             return None;
         }
