@@ -2122,18 +2122,6 @@ impl Optimizer {
         });
         self.flush(&mut ctx);
 
-        // RPython unroll.py:204: get_virtual_state BEFORE force_box_for_end_of_preamble.
-        // The virtual state must reflect the pre-force state (Virtual/VirtualStruct)
-        // so generate_guards can match against target tokens that expect virtuals.
-        let pre_force_virtual_state = crate::optimizeopt::virtualstate::export_state(
-            &jump_args
-                .iter()
-                .map(|&a| ctx.get_replacement(a))
-                .collect::<Vec<_>>(),
-            &ctx,
-            &ctx.ptr_info,
-        );
-
         // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
         for &arg in &jump_args {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
@@ -2146,7 +2134,7 @@ impl Optimizer {
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
         // JUMP args (live_arg_boxes from compile_trace / deadframe values).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
-        let vs = opt_unroll.jump_to_existing_trace_with_vs(
+        let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
             front_target_tokens,
@@ -2154,7 +2142,6 @@ impl Optimizer {
             &mut ctx,
             false,
             Some(&pre_opt_jump_args),
-            Some(pre_force_virtual_state.clone()),
         );
 
         if vs.is_none() {
@@ -2177,7 +2164,7 @@ impl Optimizer {
 
         // unroll.py:220-230: retrace limit reached, try force_boxes=true
         ctx.clear_newoperations();
-        let vs2 = opt_unroll.jump_to_existing_trace_with_vs(
+        let vs2 = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
             front_target_tokens,
@@ -2185,7 +2172,6 @@ impl Optimizer {
             &mut ctx,
             true, // force_boxes
             Some(&pre_opt_jump_args),
-            Some(pre_force_virtual_state),
         );
 
         if vs2.is_none() {
@@ -2603,18 +2589,13 @@ impl Optimizer {
                     if let Some(head_ref) = head {
                         let resolved = ctx.get_replacement(head_ref);
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
-                            // RPython resume.py parity: encode virtual fields for
-                            // NONE slots. Also handle Instance (forced virtual) —
-                            // the fields are still tracked after force.
-                            let fields_vec = match &info {
-                                PtrInfo::VirtualStruct(v) if info.is_virtual() => Some(&v.fields),
-                                PtrInfo::Virtual(v) if info.is_virtual() => Some(&v.fields),
-                                // Forced virtual: Instance retains fields from force_virtual_instance
-                                PtrInfo::Instance(v) if !v.fields.is_empty() => Some(&v.fields),
-                                _ => None,
-                            };
-                            if let Some(fields_vec) = fields_vec {
+                            if info.is_virtual() {
                                 let base_idx = original_len + extra_fail_args.len();
+                                let fields_vec = match &info {
+                                    PtrInfo::VirtualStruct(v) => &v.fields,
+                                    PtrInfo::Virtual(v) => &v.fields,
+                                    _ => continue,
+                                };
                                 let mut fields = Vec::new();
                                 for (i, (fidx, vref)) in fields_vec.iter().enumerate() {
                                     let rv = ctx.get_replacement(*vref);
@@ -2624,14 +2605,10 @@ impl Optimizer {
                                 let descr = match &info {
                                     PtrInfo::VirtualStruct(v) => v.descr.clone(),
                                     PtrInfo::Virtual(v) => v.descr.clone(),
-                                    PtrInfo::Instance(v) => {
-                                        v.descr.clone().unwrap_or_else(|| virt.size_descr.clone())
-                                    }
                                     _ => continue,
                                 };
                                 let known_class = match &info {
                                     PtrInfo::Virtual(v) => v.known_class,
-                                    PtrInfo::Instance(v) => v.known_class,
                                     _ => None,
                                 };
                                 virtual_entries.push(GuardVirtualEntry {
