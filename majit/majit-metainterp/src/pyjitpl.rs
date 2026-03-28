@@ -51,11 +51,6 @@ pub enum CompileOutcome {
     Compiled {
         cut_header_pc: Option<usize>,
         green_key: u64,
-        /// RPython: no equivalent — blackhole handles guard failures from
-        /// retry-compiled code. In pyre, the blackhole Finished path is not
-        /// yet correct, so retry-compiled code with always-failing guards
-        /// must not have merge_pc updated (would cause tight guard-fail loops).
-        /// Remove once blackhole DoneWithThisFrame is fully implemented.
         from_retry: bool,
     },
     /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).
@@ -1647,6 +1642,11 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
         // the new header PC so meta.merge_pc can be updated after insert.
+        // RPython parity: only cut the trace if no compiled entry already
+        // exists at the inner loop's green_key. If the inner loop was already
+        // compiled independently, its entry has correct code+meta. Cutting
+        // and replacing would install cross-loop-cut code with mismatched
+        // inputarg layout. Instead, keep the original (uncut) trace and
         let cut_header_pc = if cross_loop_cut.is_some() {
             Some(ctx.header_pc)
         } else {
@@ -2082,20 +2082,13 @@ impl<M: Clone> MetaInterp<M> {
 
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
-                //
-                // Guard: if a valid compiled loop already exists with a
-                // DIFFERENT merge_pc (retrace produced a cross-loop cut),
-                // don't replace it — the existing entry's merge_pc matches
-                // the green_key and is_compatible will pass for back_edge
-                // callers. Replacing breaks nested-loop benchmarks (fannkuch).
-                // no skip guard needed — handled at call site
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                 }
                 if crate::majit_log_enabled() {
-                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
+                    eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
                 }
                 self.compiled_loops.insert(
                     green_key,
@@ -2129,6 +2122,12 @@ impl<M: Clone> MetaInterp<M> {
                 self.exported_state = None;
                 self.warm_state.reset_function_counts();
                 let from_retry = self.cancel_count > 0;
+                // When replacing an existing inner-loop entry with a
+                // cross-loop cut, suppress meta rebuild — the existing
+                // meta is authoritative (built from the inner loop's own
+                // trace). The new compiled code may have different inputarg
+                // layout, but is_compatible uses meta to extract live_values
+                // so the meta must stay consistent with the entry point.
                 return CompileOutcome::Compiled {
                     cut_header_pc,
                     green_key,
@@ -4315,6 +4314,33 @@ impl<M: Clone> MetaInterp<M> {
             gc_ref_slots: exit_layout.gc_ref_slots.clone(),
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
+        })
+    }
+
+    /// Check whether a bridge was actually compiled and attached for a guard.
+    /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
+    /// compilation from trace abort (RPython pyjitpl.py:2906-2907 parity).
+    ///
+    /// Searches the current token AND previous_tokens, since bridge
+    /// compilation may have attached to an earlier token that was replaced
+    /// by a retrace/recompile.
+    pub fn bridge_was_compiled(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return false;
+        };
+        if self
+            .backend
+            .compiled_bridge_fail_descr_layouts(&compiled.token, trace_id, fail_index)
+            .is_some()
+        {
+            return true;
+        }
+        // Search previous tokens (old compilations kept alive for
+        // target_token JUMPs and bridge attachments).
+        compiled.previous_tokens.iter().any(|prev_token| {
+            self.backend
+                .compiled_bridge_fail_descr_layouts(prev_token, trace_id, fail_index)
+                .is_some()
         })
     }
 

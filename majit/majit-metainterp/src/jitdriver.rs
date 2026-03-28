@@ -627,13 +627,12 @@ impl<S: JitState> JitDriver<S> {
                         cut_header_pc: Some(cut_pc),
                         green_key: gk,
                         from_retry: false,
+                        ..
                     } = outcome
                     {
                         // pyjitpl.py:3160-3175 parity: cut_trace_from redirected
                         // to an inner loop header. Update meta.merge_pc so
                         // is_compatible matches at entry.
-                        // Safety: only update when meta_merge_pc != cut_pc to avoid
-                        // double-patching on retrace.
                         if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
                             let existing_pc = S::meta_merge_pc(&entry.meta);
                             if existing_pc != cut_pc && entry.retraced_count == 0 {
@@ -743,13 +742,12 @@ impl<S: JitState> JitDriver<S> {
                         cut_header_pc: Some(cut_pc),
                         green_key: gk,
                         from_retry: false,
+                        ..
                     } = outcome
                     {
                         // pyjitpl.py:3160-3175 parity: cut_trace_from redirected
                         // to an inner loop header. Update meta.merge_pc so
                         // is_compatible matches at entry.
-                        // Safety: only update when meta_merge_pc != cut_pc to avoid
-                        // double-patching on retrace.
                         if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
                             let existing_pc = S::meta_merge_pc(&entry.meta);
                             if existing_pc != cut_pc && entry.retraced_count == 0 {

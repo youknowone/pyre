@@ -1088,18 +1088,22 @@ fn execute_assembler(
         ..
     } = &outcome
     {
-        if !stack_almost_full() {
+        let compiled = if !stack_almost_full() {
             crate::call_jit::jit_bridge_compile_for_guard(
                 req.green_key,
                 req.trace_id,
                 req.fail_index,
                 frame,
                 req.resume_pc,
-            );
+            )
+        } else {
+            false
+        };
+        if compiled {
+            // RPython: ContinueRunningNormally after successful bridge.
+            return Some(LoopResult::ContinueRunningNormally);
         }
-        // RPython: handle_fail raises ContinueRunningNormally after bridge.
-        // eval_loop_jit restarts → compiled code re-entered with bridge active.
-        return Some(LoopResult::ContinueRunningNormally);
+        // Bridge failed → fall through to handle_jit_outcome (blackhole).
     }
 
     // warmstate.py:410-421: no bridge → handle fail_descr outcomes (blackhole)
@@ -1309,7 +1313,10 @@ fn bound_reached(
             } => Some(req.clone()),
             _ => None,
         };
-        // compile.py:701-703: must_compile → _trace_and_compile_from_bridge.
+        // compile.py:701-710 handle_fail parity: attempt bridge compilation.
+        // jit_bridge_compile_for_guard returns true only on success.
+        // On failure → fall through to blackhole (pyjitpl.py:2906-2907
+        // SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
         let bridge_compiled = if let Some(ref req) = bridge_request {
             if !stack_almost_full() {
                 crate::call_jit::jit_bridge_compile_for_guard(
@@ -1318,8 +1325,7 @@ fn bound_reached(
                     req.fail_index,
                     frame,
                     req.resume_pc,
-                );
-                true
+                )
             } else {
                 false
             }
@@ -1448,21 +1454,24 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             );
         }
 
-        // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
-        // compile.py:703: not rstack.stack_almost_full()
+        // compile.py:701-710 handle_fail parity.
         if let DetailedDriverRunOutcome::GuardFailure {
             bridge_request: Some(req),
             ..
         } = &outcome
         {
-            if !stack_almost_full() {
+            let compiled = if !stack_almost_full() {
                 crate::call_jit::jit_bridge_compile_for_guard(
                     req.green_key,
                     req.trace_id,
                     req.fail_index,
                     frame,
                     req.resume_pc,
-                );
+                )
+            } else {
+                false
+            };
+            if compiled {
                 frame.fix_array_ptrs();
                 return None; // caller re-enters eval_with_jit → compiled code with bridge
             }

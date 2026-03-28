@@ -1498,13 +1498,19 @@ fn jit_blackhole_resume_from_guard(
 /// The tracing loop mirrors pyjitpl.py interpret(): execute bytecodes
 /// from the guard failure PC until a Finish (return) or CloseLoop
 /// (back-edge to loop header) is reached.
+/// compile.py:714 _trace_and_compile_from_bridge parity.
+///
+/// Returns true if the bridge was successfully compiled and attached.
+/// On failure (trace abort, start failure), returns false so the caller
+/// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
+/// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
 pub fn jit_bridge_compile_for_guard(
     green_key: u64,
     trace_id: u64,
     fail_index: u32,
     frame: &mut PyFrame,
     resume_pc_hint: usize,
-) {
+) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
     use crate::jit::trace::trace_bytecode;
@@ -1547,7 +1553,7 @@ pub fn jit_bridge_compile_for_guard(
         frame.next_instr
     };
     if resume_pc == 0 {
-        return;
+        return false;
     }
     frame.next_instr = resume_pc;
     let code = unsafe { &*frame.code };
@@ -1599,7 +1605,7 @@ pub fn jit_bridge_compile_for_guard(
                 green_key, trace_id, fail_index
             );
         }
-        return;
+        return false;
     }
 
     // RPython pyjitpl.py:3101 _prepare_exception_resumption +
@@ -1668,19 +1674,23 @@ pub fn jit_bridge_compile_for_guard(
                     step, pc, green_key
                 );
             }
-            return;
+            return true;
         }
 
         // If the driver is no longer tracing, the bridge was compiled
-        // (or aborted) inside merge_point.
+        // (or aborted) inside merge_point. Check whether a bridge was
+        // actually attached to distinguish success from abort.
         if !driver.is_tracing() {
+            let compiled = driver
+                .meta_interp()
+                .bridge_was_compiled(green_key, trace_id, fail_index);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-trace] trace ended at step={} pc={} key={}",
-                    step, pc, green_key
+                    "[jit][bridge-trace] trace ended at step={} pc={} key={} compiled={}",
+                    step, pc, green_key, compiled
                 );
             }
-            return;
+            return compiled;
         }
 
         // Advance the trace frame's PC for the next instruction.
@@ -1699,6 +1709,7 @@ pub fn jit_bridge_compile_for_guard(
         }
         driver.meta_interp_mut().abort_trace(false);
     }
+    false
 }
 
 extern "C" fn jit_bridge_compile_callee(
