@@ -879,10 +879,18 @@ impl PtrInfo {
 
     /// heap.py:194: opinfo._fields[descr.get_index()] = None
     /// Clear a cached field value. Used by CachedField.invalidate().
+    /// RPython stores PreambleOp in _fields[] too, so clearing a field
+    /// index removes both regular and preamble entries.
     pub fn clear_field(&mut self, field_idx: u32) {
         match self {
-            PtrInfo::Instance(v) => v.fields.retain(|(k, _)| *k != field_idx),
-            PtrInfo::Struct(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::Instance(v) => {
+                v.fields.retain(|(k, _)| *k != field_idx);
+                v.preamble_fields.retain(|(k, _)| *k != field_idx);
+            }
+            PtrInfo::Struct(v) => {
+                v.fields.retain(|(k, _)| *k != field_idx);
+                v.preamble_fields.retain(|(k, _)| *k != field_idx);
+            }
             PtrInfo::Virtual(v) => v.fields.retain(|(k, _)| *k != field_idx),
             PtrInfo::VirtualStruct(v) => v.fields.retain(|(k, _)| *k != field_idx),
             _ => {}

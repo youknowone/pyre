@@ -874,7 +874,13 @@ mod tests {
 
     #[test]
     fn test_schedule_empty_graph() {
-        let graph = DependencyGraph { nodes: Vec::new() };
+        let graph = DependencyGraph {
+            nodes: Vec::new(),
+            memory_refs: Default::default(),
+            index_vars: Default::default(),
+            guards: Vec::new(),
+            invariant_vars: Default::default(),
+        };
         let sched = schedule_operations(&graph);
         assert!(sched.is_empty());
     }

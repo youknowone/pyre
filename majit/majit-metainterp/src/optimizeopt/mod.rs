@@ -73,7 +73,9 @@ pub enum OptimizationResult {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImportedShortPureArg {
     OpRef(OpRef),
-    Const(Value),
+    /// Const arg with source OpRef for matching in force_preamble_op.
+    /// RPython: Const Box has identity; get_box_replacement returns itself.
+    Const(Value, OpRef),
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +202,10 @@ pub struct OptContext {
     /// slots the trace depends on. After compilation, per-slot watchers
     /// are registered.
     pub quasi_immutable_deps: HashSet<(u64, u32)>,
+    /// info.py:716-721: ConstPtrInfo._get_info — const_infos stores
+    /// StructPtrInfo for constant GC objects, keyed by pointer address.
+    /// RPython: optheap.const_infos[ref] = StructPtrInfo(descr)
+    pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
@@ -402,6 +408,7 @@ impl OptContext {
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
+            const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
 
             potential_extra_ops: HashMap::new(),
@@ -448,6 +455,7 @@ impl OptContext {
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
+            const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
 
             potential_extra_ops: HashMap::new(),
@@ -1336,6 +1344,7 @@ impl OptContext {
         self.extra_operations.clear();
         self.next_pos = self.num_inputs;
         self.imported_int_bounds.clear();
+        self.const_infos.clear();
     }
 
     /// Get a mutable reference to the last emitted operation.
@@ -1380,6 +1389,26 @@ impl OptContext {
         }
         if self.ptr_info[idx].is_none() {
             self.ptr_info[idx] = Some(PtrInfo::instance(None, None));
+        }
+    }
+
+    /// info.py:716-721: ConstPtrInfo._get_info(descr, optheap)
+    /// For constant GC objects, get or create a StructPtrInfo in const_infos.
+    /// Returns None if opref is not a Ref constant.
+    pub fn get_const_info_mut(
+        &mut self,
+        opref: OpRef,
+    ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
+        let addr = match self.get_constant(opref) {
+            Some(majit_ir::Value::Ref(r)) if !r.is_null() => r.0,
+            _ => return None,
+        };
+        use std::collections::hash_map::Entry;
+        match self.const_infos.entry(addr) {
+            Entry::Occupied(e) => Some(e.into_mut()),
+            Entry::Vacant(e) => {
+                Some(e.insert(crate::optimizeopt::info::PtrInfo::instance(None, None)))
+            }
         }
     }
 
@@ -1478,6 +1507,12 @@ pub trait Optimization {
 
     /// bridgeopt.py:173-185: deserialize_optrewrite — import loopinvariant results.
     fn import_loopinvariant_results(&mut self, _entries: &[(i64, OpRef)]) {}
+
+    /// shortpreamble.py:112-126: PureOp.produce_op / LoopInvariantOp.produce_op
+    /// Transfer imported PreambleOp entries from OptContext to this pass.
+    /// RPython calls `opt.optimizer.optpure` directly during produce_op.
+    /// In majit, the Optimization trait mediates this transfer.
+    fn install_preamble_pure_ops(&mut self, _ctx: &OptContext) {}
 
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(

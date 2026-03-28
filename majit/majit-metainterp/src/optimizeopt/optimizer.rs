@@ -1340,6 +1340,8 @@ impl Optimizer {
         }
 
         // Pre-populate known constants so passes can see them.
+        // Use constant_types to distinguish Ref from Int (GC pointers
+        // are stored as i64 in the constants map).
         for (&idx, &val) in constants.iter() {
             ctx.make_constant(
                 OpRef(idx),
@@ -1501,6 +1503,17 @@ impl Optimizer {
                 }
             }
         }
+
+        // RPython shortpreamble.py: PureOp.produce_op stores PreambleOp
+        // directly in opt.optimizer.optpure. In majit, imported short pure ops
+        // are first collected in ctx.imported_short_pure_ops, then transferred
+        // to the OptPure pass here (matching RPython's produce_op timing).
+        // NOTE: currently disabled — see next commit for activation.
+        // if !ctx.imported_short_pure_ops.is_empty() {
+        //     for pass in &mut self.passes {
+        //         pass.install_preamble_pure_ops(&ctx);
+        //     }
+        // }
 
         // RPython optimizer.py:536-556: JUMP/FINISH is separated from
         // the main loop. With flush=False (Phase 2), JUMP is NOT processed
