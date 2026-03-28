@@ -2023,21 +2023,42 @@ fn materialize_virtual_from_rd(
         _ => {} // Instance/Struct: fall through
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
-    let (known_class, fieldnums, field_offsets): (Option<i64>, &[i16], &[usize]) = match entry {
+    let (known_class, fieldnums, field_offsets, field_types, object_size): (
+        Option<i64>,
+        &[i16],
+        &[usize],
+        &[majit_ir::Type],
+        usize,
+    ) = match entry {
         majit_ir::RdVirtualInfo::Instance {
             known_class,
             fieldnums,
             field_offsets,
+            field_types,
             ..
-        } => (*known_class, fieldnums.as_slice(), field_offsets.as_slice()),
+        } => (
+            *known_class,
+            fieldnums.as_slice(),
+            field_offsets.as_slice(),
+            field_types.as_slice(),
+            0,
+        ),
         majit_ir::RdVirtualInfo::Struct {
+            known_class: struct_kc,
+            object_size,
             fieldnums,
             field_offsets,
+            field_types: struct_ft,
             ..
-        } => (None, fieldnums.as_slice(), field_offsets.as_slice()),
+        } => (
+            *struct_kc,
+            fieldnums.as_slice(),
+            field_offsets.as_slice(),
+            struct_ft.as_slice(),
+            *object_size,
+        ),
         _ => unreachable!(),
     };
-    let _field_offsets = field_offsets;
 
     // resume.py:617-621 VirtualInfo.allocate parity:
     //   Phase 1: struct = allocate_with_vtable(descr)
@@ -2065,12 +2086,16 @@ fn materialize_virtual_from_rd(
         });
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
-        // General struct: allocate based on max field offset + 8.
         let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
         let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         unsafe { *ptr = ob_type };
+        ptr as usize
+    } else if object_size > 0 {
+        // resume.py:634 VStructInfo.allocate → allocate_struct(typedescr)
+        let layout = std::alloc::Layout::from_size_align(object_size.max(8), 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         ptr as usize
     } else {
         return Value::Ref(majit_ir::GcRef::NULL);
@@ -2145,15 +2170,37 @@ fn materialize_virtual_from_rd(
                 rd_virtuals_info,
                 virtuals_cache,
             );
+            // resume.py:1509-1518 setfield: type-dispatched write.
             let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8);
-            let raw = match val {
-                Value::Int(n) => n,
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Ref(gc) => gc.0 as i64,
-                _ => 0,
-            };
+            let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
             unsafe {
-                *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
+                match ftype {
+                    majit_ir::Type::Ref => {
+                        let p = match val {
+                            Value::Ref(gc) => gc.0 as i64,
+                            Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = p;
+                    }
+                    majit_ir::Type::Float => {
+                        let bits = match val {
+                            Value::Float(f) => f.to_bits(),
+                            Value::Int(n) => n as u64,
+                            _ => 0,
+                        };
+                        *((obj_ptr as *mut u8).add(byte_offset) as *mut u64) = bits;
+                    }
+                    _ => {
+                        let raw = match val {
+                            Value::Int(n) => n,
+                            Value::Float(f) => f.to_bits() as i64,
+                            Value::Ref(gc) => gc.0 as i64,
+                            _ => 0,
+                        };
+                        *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
+                    }
+                }
             }
         }
     }

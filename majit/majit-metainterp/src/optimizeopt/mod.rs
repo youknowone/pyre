@@ -1654,11 +1654,23 @@ impl OptContext {
                         .collect();
                     let fieldnums: Vec<i16> =
                         vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    let field_types: Vec<majit_ir::Type> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
+                                .unwrap_or(majit_ir::Type::Int)
+                        })
+                        .collect();
                     majit_ir::RdVirtualInfo::Instance {
                         descr_index: vi.descr.index(),
                         known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
                         fielddescr_indices,
                         field_offsets,
+                        field_types,
                         fieldnums,
                     }
                 }
@@ -1678,10 +1690,26 @@ impl OptContext {
                         .collect();
                     let fieldnums: Vec<i16> =
                         vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    let known_class_val: Option<i64> = None;
+                    let object_size_val = vi.descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
+                    let field_types: Vec<majit_ir::Type> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
+                                .unwrap_or(majit_ir::Type::Int)
+                        })
+                        .collect();
                     majit_ir::RdVirtualInfo::Struct {
                         descr_index: vi.descr.index(),
+                        known_class: known_class_val,
+                        object_size: object_size_val,
                         fielddescr_indices,
                         field_offsets,
+                        field_types,
                         fieldnums,
                     }
                 }

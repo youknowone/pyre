@@ -289,13 +289,17 @@ pub(crate) fn build_guard_metadata(
                             known_class,
                             fielddescr_indices,
                             field_offsets: vec![],
+                            field_types: vec![],
                             fieldnums,
                         }
                     } else {
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index: descr_idx,
+                            known_class: None,
+                            object_size: 0,
                             fielddescr_indices,
                             field_offsets: vec![],
+                            field_types: vec![],
                             fieldnums,
                         }
                     }
