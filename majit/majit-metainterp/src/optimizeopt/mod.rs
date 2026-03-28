@@ -1159,21 +1159,27 @@ impl OptContext {
         // All TAGVIRTUAL entries have PtrInfo (is_virtual_ref uses
         // PtrInfo.is_virtual() only — no virtual_oprefs fallback).
         let num_virtuals = numb_state.num_virtuals as usize;
-        let mut rd_virt_info: Vec<(u32, Option<i64>, Vec<i16>)> =
-            vec![(0, None, vec![]); num_virtuals];
+        let mut rd_virt_info: Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)> =
+            vec![(0, None, vec![], vec![]); num_virtuals];
         for (vbox, vidx) in &virtual_boxes {
             let idx = *vidx as usize;
             if idx >= num_virtuals {
                 continue;
             }
             let vinfo_opt = self.get_ptr_info(*vbox).cloned();
-            let (descr, known_class, fields_data) = match vinfo_opt {
-                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
-                    (vi.descr.clone(), vi.known_class, vi.fields.clone())
-                }
-                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
-                    (vi.descr.clone(), None, vi.fields.clone())
-                }
+            let (descr, known_class, fields_data, field_descrs) = match vinfo_opt {
+                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => (
+                    vi.descr.clone(),
+                    vi.known_class,
+                    vi.fields.clone(),
+                    vi.field_descrs.clone(),
+                ),
+                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => (
+                    vi.descr.clone(),
+                    None,
+                    vi.fields.clone(),
+                    vi.field_descrs.clone(),
+                ),
                 _ => {
                     // resume.py:498: assert info.is_virtual()
                     // Phase 2 PtrInfo detachment → placeholder stays.
@@ -1221,10 +1227,23 @@ impl OptContext {
                     );
                 }
             }
+            // resume.py:593 AbstractVirtualStructInfo.fielddescrs parity:
+            // extract byte offset from each field descriptor for setfield.
+            let field_offsets: Vec<usize> = fields_data
+                .iter()
+                .map(|(field_idx, _)| {
+                    field_descrs
+                        .iter()
+                        .find(|(di, _)| *di == *field_idx)
+                        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+                        .unwrap_or((*field_idx as usize + 1) * 8)
+                })
+                .collect();
             rd_virt_info[idx] = (
                 descr.index(),
                 known_class.map(|gc| gc.as_usize() as i64),
                 fieldnums,
+                field_offsets,
             );
         }
 

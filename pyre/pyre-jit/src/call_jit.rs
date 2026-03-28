@@ -1428,7 +1428,7 @@ pub fn install_jit_call_bridge() {
         // Bridge compilation for guards hit via try_function_entry_jit is
         // handled at the eval.rs level: run_compiled_detailed_with_bridge_keyed
         // returns BridgeCompilationRequest, and try_function_entry_jit calls
-        // jit_bridge_compile_for_guard after releasing the driver borrow.
+        // trace_and_compile_from_bridge after releasing the driver borrow.
     });
 }
 
@@ -1533,7 +1533,7 @@ fn jit_blackhole_resume_from_guard(
 /// On failure (trace abort, start failure), returns false so the caller
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-pub fn jit_bridge_compile_for_guard(
+pub fn trace_and_compile_from_bridge(
     green_key: u64,
     trace_id: u64,
     fail_index: u32,
@@ -1546,32 +1546,9 @@ pub fn jit_bridge_compile_for_guard(
 
     let (driver, info) = crate::eval::driver_pair();
 
-    // compile.py:702-709: try/finally start_compiling/done_compiling.
-    // Use Drop guard to ensure ST_BUSY_FLAG is always cleared.
-    driver
-        .meta_interp_mut()
-        .set_guard_compiling(green_key, trace_id, fail_index, true);
-    struct DoneCompilingGuard {
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    }
-    impl Drop for DoneCompilingGuard {
-        fn drop(&mut self) {
-            let (driver, _) = crate::eval::driver_pair();
-            driver.meta_interp_mut().set_guard_compiling(
-                self.green_key,
-                self.trace_id,
-                self.fail_index,
-                false,
-            );
-        }
-    }
-    let _done_compiling = DoneCompilingGuard {
-        green_key,
-        trace_id,
-        fail_index,
-    };
+    // compile.py:786-795: start_compiling / done_compiling are handled by
+    // the caller (handle_fail in eval.rs), matching RPython where
+    // handle_fail wraps _trace_and_compile_from_bridge in try/finally.
 
     // RPython resume_in_blackhole parity: use resume_pc from guard's
     // resume data (via LAST_GUARD_RESUME_PC or recovery_layout), not

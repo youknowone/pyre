@@ -154,7 +154,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
-    pub(crate) rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
+    pub(crate) rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
 }
 
 impl StoredExitLayout {
@@ -5997,37 +5997,25 @@ pub enum DetailedDriverRunOutcome {
     Jump {
         via_blackhole: bool,
     },
+    /// compile.py:701 handle_fail: guard failure data for the caller to
+    /// process via handle_fail(). No state restoration is done here —
+    /// the caller decides whether to bridge or blackhole.
     GuardFailure {
-        restored: bool,
-        via_blackhole: bool,
-        /// RPython compile.py handle_fail parity: fail_index and trace_id
-        /// for bridge compilation after guard failure.
-        fail_index: Option<u32>,
-        trace_id: Option<u64>,
-        /// RPython handle_fail → _trace_and_compile_from_bridge parity:
-        /// When a guard failure reaches the bridge threshold, the caller
-        /// should compile a bridge from this resume_pc. The jitdriver
-        /// returns this request (instead of compiling inline) so the
-        /// caller can compile with the driver borrow released.
-        bridge_request: Option<BridgeCompilationRequest>,
+        fail_index: u32,
+        trace_id: u64,
+        /// compile.py:702: must_compile() result.
+        should_bridge: bool,
+        /// compile.py: rd_loop_token — owning compiled loop key.
+        owning_key: u64,
+        /// Raw register values from compiled code exit.
+        raw_values: Vec<i64>,
+        /// Guard exit layout (rd_numb, fail_arg_types, etc.).
+        exit_layout: CompiledExitLayout,
     },
     Abort {
         restored: bool,
         via_blackhole: bool,
     },
-}
-
-/// RPython compile.py handle_fail parity: bridge compilation request
-/// returned by jitdriver when a guard fails enough times.
-/// The caller compiles the bridge with the driver borrow released,
-/// matching RPython's pattern where handle_fail creates a fresh
-/// MetaInterp separate from the execution loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeCompilationRequest {
-    pub green_key: u64,
-    pub trace_id: u64,
-    pub fail_index: u32,
-    pub resume_pc: usize,
 }
 
 /// Decision about how to handle a function call during tracing.
