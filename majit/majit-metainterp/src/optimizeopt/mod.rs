@@ -2110,13 +2110,19 @@ impl OptContext {
     }
 
     /// executor.py:555: execute_nonspec_const — execute a pure op with
-    /// constant args via CPU dispatch. RPython uses the CPU backend to
-    /// safely execute the op. Direct memory dereference is unsafe because
-    /// GcRef pointers may be stale after GC. Returns None until a safe
-    /// CPU execution path is implemented.
+    /// constant args via CPU dispatch. RPython calls bh_getfield_gc_i/r/f.
+    /// Only safe for GcRef from the constant pool (OpRef >= CONST_BASE) —
+    /// these are program-lifetime stable pointers. Trace-computed GcRefs
+    /// may be stale after GC.
+    /// executor.py:555: execute_nonspec_const — execute a pure op with
+    /// constant args via CPU dispatch. RPython calls bh_getfield_gc_i/r/f.
+    ///
+    /// Disabled: direct memory dereference is unsafe even for constant pool
+    /// GcRefs — the optimizer may propagate Ref constants from heap cache
+    /// or PtrInfo that are not in the constant pool. RPython's CPU backend
+    /// has a safe execution path; majit needs an equivalent (e.g., registered
+    /// safe-to-read addresses or GC cooperation).
     fn execute_nonspec_const(&self, _op: &Op) -> Option<Value> {
-        // TODO: implement safe CPU execution (executor.py execute_nonspec_const)
-        // with protect_speculative_operation validation.
         None
     }
 
@@ -2231,6 +2237,21 @@ impl OptContext {
     /// RPython set_forwarded parity: setting Info on a box REPLACES
     /// any forwarding. In pyre, ptr_info and forwarding must be
     /// mutually exclusive — the last writer wins.
+    /// optimizer.py:437-448: make_nonnull — record that a Ref box is nonnull.
+    /// Only sets NonNull if no existing PtrInfo is present.
+    pub fn make_nonnull(&mut self, opref: OpRef) {
+        let resolved = self.get_box_replacement(opref);
+        if resolved.is_constant() {
+            return;
+        }
+        // optimizer.py:446: if opinfo is not None: assert opinfo.is_nonnull(); return
+        if self.get_ptr_info(resolved).is_some() {
+            return;
+        }
+        // optimizer.py:448: op.set_forwarded(info.NonNullPtrInfo())
+        self.set_ptr_info(resolved, PtrInfo::NonNull { last_guard_pos: -1 });
+    }
+
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;

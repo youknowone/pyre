@@ -931,15 +931,12 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
+        // warmstate.py:482-501: compiled procedure_token → assembler entry.
         if self.meta.has_compiled_loop(green_key) {
             let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             let live_values = {
                 if !state.is_compatible(&compiled_meta) {
-                    // RPython parity: incompatible state means this entry
-                    // was overwritten by a retrace with different merge_pc.
-                    // Invalidate so the next back_edge starts a fresh trace
-                    // at the correct PC instead of failing 14000+ times.
                     self.meta.invalidate_loop(green_key);
                     return false;
                 }
@@ -2223,12 +2220,14 @@ impl<S: JitState> JitDriver<S> {
         let key_hash = crate::green_key_hash(green_values);
 
         if !self.has_compiled_loop(key_hash) {
-            // RPython parity: the single authoritative tick point is
-            // maybe_compile (warmstate.py:309). Don't tick here — just
-            // forward to back_edge_structured unconditionally. The
-            // GreenKey allocation on each back edge is the cost of
-            // correctness; RPython's equivalent path also allocates
-            // a green key per back_edge (it's a Python tuple).
+            // warmstate.py:446,465: cold fast path — check would_fire without
+            // ticking (tick happens inside maybe_compile via back_edge_structured).
+            // This avoids GreenKey allocation and build_meta for cold keys.
+            if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
+                // Advance counter toward threshold without firing.
+                self.meta.warm_state_mut().counter_tick(key_hash);
+                return None;
+            }
             let green_key = GreenKey::new(green_values.to_vec());
             let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
             return ran.then_some(target_pc);
@@ -2278,6 +2277,7 @@ impl<S: JitState> JitDriver<S> {
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
 
+            if crate::majit_log_enabled() {}
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
