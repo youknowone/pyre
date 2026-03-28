@@ -28,7 +28,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr, flags as gc_flags};
 use majit_ir::{
-    CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
+    AccumVectorInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode,
+    OpRef, Type, Value,
 };
 
 use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
@@ -3952,12 +3953,59 @@ fn emit_guard_exit(
 ) {
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
+    //
+    // vector_ext.py:119-156 _update_at_exit parity:
+    // If accumulation is done in this loop, at the guard exit some vector
+    // values must be reduced to scalars before storing to jf_frame.
+    let accum_positions: HashMap<usize, &AccumVectorInfo> = info
+        .accum_info
+        .iter()
+        .map(|ai| (ai.failargs_pos, ai))
+        .collect();
+
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-        let val = resolve_opref(builder, constants, arg_ref);
         let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-        builder
-            .ins()
-            .store(MemFlags::trusted(), val, jf_ptr, offset);
+
+        if let Some(accum) = accum_positions.get(&slot) {
+            // _update_at_exit: reduce vector accumulator to scalar.
+            // vector_ext.py:130: vector_loc = accum_info.location (vector SSA)
+            // vector_ext.py:132: scalar_arg = accum_info.getoriginal() (type info only)
+            let vec_val = resolve_opref(builder, constants, accum.vector_loc);
+            let val_type = builder.func.dfg.value_type(vec_val);
+
+            let reduced = if val_type == cl_types::F64X2 {
+                // _accum_reduce_sum (vector_ext.py:164-173): HADDPD
+                // _accum_reduce_mul (vector_ext.py:158-162): SHUFPD + MULSD
+                let lane0 = builder.ins().extractlane(vec_val, 0);
+                let lane1 = builder.ins().extractlane(vec_val, 1);
+                let scalar_f = match accum.operator {
+                    '+' => builder.ins().fadd(lane0, lane1),
+                    '*' => builder.ins().fmul(lane0, lane1),
+                    op => panic!("unsupported accum operator '{op}'"),
+                };
+                builder
+                    .ins()
+                    .bitcast(cl_types::I64, MemFlags::new(), scalar_f)
+            } else {
+                // _accum_reduce_sum INT (vector_ext.py:174-179):
+                // PEXTRQ lane0, PEXTRQ lane1, ADD
+                let lane0 = builder.ins().extractlane(vec_val, 0);
+                let lane1 = builder.ins().extractlane(vec_val, 1);
+                match accum.operator {
+                    '+' => builder.ins().iadd(lane0, lane1),
+                    '*' => builder.ins().imul(lane0, lane1),
+                    op => panic!("unsupported accum operator '{op}'"),
+                }
+            };
+            builder
+                .ins()
+                .store(MemFlags::trusted(), reduced, jf_ptr, offset);
+        } else {
+            let val = resolve_opref(builder, constants, arg_ref);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), val, jf_ptr, offset);
+        }
     }
     // _build_failure_recovery (assembler.py:2102-2105) parity:
     //   POP [ebp + jf_gcmap]   — #2104
@@ -4232,6 +4280,10 @@ struct GuardInfo {
     /// stores Arc::as_ptr(CraneliftFailDescr) as i64.
     /// The FailDescr GCREF pointer is written to jf_descr on guard exit.
     fail_descr_ptr: i64,
+    /// vector_ext.py:119 _update_at_exit: accumulation metadata for vector
+    /// reduction at guard exit. Each entry maps a fail_arg slot to its
+    /// vector accumulator variable and reduction operator.
+    accum_info: Vec<AccumVectorInfo>,
 }
 
 fn identity_recovery_layout(
@@ -8804,9 +8856,13 @@ fn collect_guards(
             force_token_slots,
             recovery_layout,
         );
-        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            descr.vector_info = fd.vector_info();
-        }
+        let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            let vi = fd.vector_info();
+            descr.vector_info = vi.clone();
+            vi
+        } else {
+            Vec::new()
+        };
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
         let descr = Arc::new(descr);
@@ -8819,6 +8875,7 @@ fn collect_guards(
             fail_arg_refs,
             gcmap,
             fail_descr_ptr,
+            accum_info,
         });
     }
 

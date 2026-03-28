@@ -146,10 +146,20 @@ pub trait FailDescr: Descr {
 
 /// resume.py:65-80: AccumInfo — metadata attached to guard descriptors
 /// so deoptimization can reconstruct vector accumulators.
+///
+/// Two distinct OpRefs following RPython's separation:
+///   - `variable`: original scalar accumulator (resume.py:29 getoriginal(),
+///     used for type inference)
+///   - `vector_loc`: vector SSA result holding the accumulated vector
+///     (regalloc.py:350 accuminfo.location, used by backend for lane reduction)
 #[derive(Debug, Clone)]
 pub struct AccumVectorInfo {
     pub failargs_pos: usize,
+    /// resume.py:29: the original scalar variable (getoriginal()).
     pub variable: OpRef,
+    /// regalloc.py:350: vector register/SSA where the accumulated vector lives.
+    /// Backend reads this for extractlane + reduction at guard exit.
+    pub vector_loc: OpRef,
     pub operator: char,
 }
 
