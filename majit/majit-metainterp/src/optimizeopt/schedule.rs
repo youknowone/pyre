@@ -475,6 +475,25 @@ pub fn check_if_pack_supported(pack: &Pack, ops: &[Op]) -> Result<(), NotAProfit
     Ok(())
 }
 
+/// schedule.py:476-486: unpack_from_vector — extract a scalar from a vector box.
+/// Creates a VecUnpack op and appends it to state's oplist.
+pub fn unpack_from_vector(
+    state: &mut VecScheduleState,
+    vec_ref: OpRef,
+    index: usize,
+    count: usize,
+) -> OpRef {
+    assert!(count > 0);
+    let index_const = OpRef(OpRef::CONST_BASE + index as u32);
+    let count_const = OpRef(OpRef::CONST_BASE + count as u32);
+    // schedule.py:482-483: create_vec_unpack
+    let mut unpack_op = Op::new(OpCode::VecUnpackI, &[vec_ref, index_const, count_const]);
+    unpack_op.pos = state.alloc_op_pos();
+    let result = unpack_op.pos;
+    state.append_to_oplist(unpack_op);
+    result
+}
+
 /// schedule.py:388-400: prepare_fail_arguments — process guard failargs
 /// for vectorized guard ops, unpacking vector boxes to scalar.
 pub fn prepare_fail_arguments(
@@ -489,11 +508,13 @@ pub fn prepare_fail_arguments(
     }
     if let Some(ref fail_args) = first_op.fail_args {
         let mut new_fail_args = fail_args.clone();
-        for (i, arg) in new_fail_args.iter_mut().enumerate() {
-            if let Some((pos, newarg)) = state.getvector_of_box(*arg) {
-                // schedule.py:396-397: if vector box, unpack at position 0
-                // For now, use the renamed scalar ref
-                *arg = state.renamer.rename_box(*arg);
+        for arg in new_fail_args.iter_mut() {
+            // schedule.py:393-394: look up if arg is in a vector box
+            let (pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));
+            if newarg != *arg {
+                // schedule.py:396-397: vector box → unpack at position 0
+                let unpacked = unpack_from_vector(state, newarg, 0, 1);
+                *arg = unpacked;
             }
         }
         vecop.fail_args = Some(new_fail_args);
