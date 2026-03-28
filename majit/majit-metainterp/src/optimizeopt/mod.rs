@@ -1082,12 +1082,10 @@ impl OptContext {
             }
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
                 // resume.py:210-216 is_virtual check.
-                // First: check if this opref was identified as virtual
-                // from the fail_args NONE pattern.
-                if self.virtual_oprefs.contains(&opref.0) {
-                    return true;
-                }
-                // Second: walk replacement chain for PtrInfo::Virtual.
+                // RPython: getptrinfo(box).is_virtual() — checks Box's PtrInfo.
+                // majit: walk replacement chain checking PtrInfo at each node.
+                // The virtual_oprefs set (from legacy NONE pattern) is a fallback
+                // that is NOT needed when PtrInfo is correctly propagated.
                 let mut check = opref;
                 for _ in 0..20 {
                     if self
@@ -1105,7 +1103,8 @@ impl OptContext {
                     }
                     check = next;
                 }
-                false
+                // Fallback: check legacy NONE pattern (dual-write parity).
+                self.virtual_oprefs.contains(&opref.0)
             }
             fn is_virtual_raw(&self, _opref: OpRef) -> bool {
                 false
@@ -1214,12 +1213,6 @@ impl OptContext {
         if !virtual_entries.is_empty() {
             op.rd_virtuals = Some(virtual_entries);
         }
-
-        // resume.py:449 _add_optimizer_sections: serialize optimizer knowledge.
-        // RPython appends class/heap/loopinvariant data to numb_state inline.
-        // majit stores this in per_guard_knowledge (Optimizer struct) and
-        // deserializes via deserialize_optimizer_knowledge at bridge time.
-        // Functionally equivalent — same data used by bridge compilation.
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         op.rd_numb = Some(numb_state.create_numbering());
