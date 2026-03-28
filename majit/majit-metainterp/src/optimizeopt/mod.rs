@@ -1208,22 +1208,8 @@ impl OptContext {
         // rd_numb.is_some() means already processed.
         //
         // GUARD_NOT_FORCED never uses copied descr (compile.py:926 assert).
-        // optimizer.py:672 — fail_args.is_none() is kept because majit's
-        // number_guard_inline doesn't yet normalize fail_args to liveboxes
-        // (store_final_boxes parity). This requires coordinated changes to
-        // compile.rs resume_layout construction + backend jitframe sizing.
-        // optimizer.py:672: self._last_guard_op and guard_op.getdescr() is None.
-        // fail_args.is_none() required: pyre's tracer does not populate
-        // snapshot_boxes (rd_resume_position = -1 for all guards), so
-        // number_guard_inline uses the no-snapshot path which cannot
-        // normalize fail_args to liveboxes. Sharing fail_args from another
-        // guard would corrupt the resume mapping. Full RPython parity
-        // requires porting capture_resumedata (opencoder.py:819) to
-        // populate snapshot_boxes, enabling store_final_boxes normalization.
-        // GUARD_NOT_FORCED never uses copied descr (compile.py:926 assert).
         let can_share = self.last_guard_idx.is_some()
             && op.rd_numb.is_none()
-            && op.fail_args.is_none()
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -1312,12 +1298,11 @@ impl OptContext {
         if op.fail_args.is_none() {
             return;
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[jit] WARNING: guard {:?} at {:?} missing rd_numb",
-                op.opcode, op.pos,
-            );
-        }
+        debug_assert!(
+            false,
+            "[jit] guard {:?} at {:?} missing rd_numb after store_final_boxes_in_guard",
+            op.opcode, op.pos,
+        );
     }
 
     fn number_guard_inline_impl(&self, op: &mut Op) {
@@ -1411,6 +1396,11 @@ impl OptContext {
             }
             return;
         }
+
+        // RPython parity: snapshot path handles ALL guards with snapshots,
+        // including guards with rd_virtuals. The snapshot uses original boxes
+        // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
+        // _number_virtuals then builds rd_virtuals_info from PtrInfo.
         let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
         let vable_oprefs = self
             .snapshot_vable_boxes
