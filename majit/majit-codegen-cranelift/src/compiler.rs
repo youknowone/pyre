@@ -961,12 +961,15 @@ fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
 }
 
 /// RPython rebuild_state_after_failure parity: materialize virtual objects
-/// in raw fail_args before bridge dispatch, using recovery_layout if available.
+/// in raw fail_args before bridge/blackhole dispatch, using recovery_layout.
 ///
-/// The optimizer may inline virtual field values directly into fail_args
-/// (e.g., [frame, ni, vsd, ob_type_s, intval_s, ob_type_i, intval_i])
-/// instead of using null-Ref placeholders. This function reconstructs
-/// boxed objects and produces a compacted output matching bridge inputargs.
+/// resume.py:1042-1057 rebuild_from_resumedata processes ALL frames in the
+/// recovery layout (outermost first). call_assembler prefixes caller frames
+/// via prefixed_by() at compiler.rs:512, so frames is [caller..., callee].
+/// The blackhole consumer at call_jit.rs:806 expects a full section chain.
+///
+/// After frame reconstruction, pending_field_layouts are replayed
+/// (resume.py:1003-1007 setfield/setarrayitem parity).
 fn rebuild_state_after_failure(
     outputs: &mut Vec<i64>,
     types: &[majit_ir::Type],
@@ -974,34 +977,92 @@ fn rebuild_state_after_failure(
     bridge_num_inputs: usize,
 ) {
     // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
+    // Process ALL frames, not just frames[0].
     if let Some(recovery) = recovery {
-        if !recovery.virtual_layouts.is_empty() && !recovery.frames.is_empty() {
-            let frame_layout = &recovery.frames[0];
-            let mut rebuilt = Vec::with_capacity(frame_layout.slots.len());
-            for slot in &frame_layout.slots {
-                match slot {
-                    majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
-                        rebuilt.push(outputs.get(*idx).copied().unwrap_or(0));
+        if !recovery.frames.is_empty()
+            && (!recovery.virtual_layouts.is_empty()
+                || recovery.frames.len() > 1
+                || !recovery.pending_field_layouts.is_empty())
+        {
+            // Step 1: materialize all virtuals referenced by any frame.
+            // Keep materialized pointers indexed by vidx for pending fields.
+            let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
+            let materialize = |vidx: usize, materialized: &mut Vec<Option<i64>>| -> i64 {
+                if let Some(ptr) = materialized[vidx] {
+                    return ptr;
+                }
+                if let Some(vl) = recovery.virtual_layouts.get(vidx) {
+                    if let Some(obj) = rebuild_state_after_failure_single_virtual(vl, outputs) {
+                        materialized[vidx] = Some(obj);
+                        return obj;
                     }
-                    majit_codegen::ExitValueSourceLayout::Constant(c) => {
-                        rebuilt.push(*c);
-                    }
-                    majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
-                        if let Some(vl) = recovery.virtual_layouts.get(*vidx) {
-                            if let Some(obj) =
-                                rebuild_state_after_failure_single_virtual(vl, outputs)
-                            {
-                                rebuilt.push(obj);
-                            } else {
-                                rebuilt.push(0);
-                            }
-                        } else {
-                            rebuilt.push(0);
+                }
+                0
+            };
+
+            // Step 2: rebuild ALL frames' slots, concatenated in
+            // callee-first order. ExitRecoveryLayout stores frames
+            // outermost-first (caller, callee), but the blackhole
+            // consumer parse_fail_arg_sections at call_jit.rs:1075
+            // expects [[callee], [caller]] and iterates .rev() to
+            // build the chain innermost-first.
+            let mut rebuilt = Vec::new();
+            for frame_layout in recovery.frames.iter().rev() {
+                for slot in &frame_layout.slots {
+                    match slot {
+                        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                            rebuilt.push(outputs.get(*idx).copied().unwrap_or(0));
                         }
+                        majit_codegen::ExitValueSourceLayout::Constant(c) => {
+                            rebuilt.push(*c);
+                        }
+                        majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                            rebuilt.push(materialize(*vidx, &mut materialized));
+                        }
+                        _ => rebuilt.push(0),
                     }
-                    _ => rebuilt.push(0),
                 }
             }
+
+            // Step 3: replay pending field writes (resume.py:1003-1007).
+            // Must happen AFTER materialization so target/value virtuals
+            // resolve to concrete pointers.
+            let resolve_pending = |src: &majit_codegen::ExitValueSourceLayout,
+                                   materialized: &[Option<i64>]|
+             -> Option<i64> {
+                match src {
+                    majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                        outputs.get(*idx).copied()
+                    }
+                    majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+                    majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                        materialized.get(*vidx).copied().flatten()
+                    }
+                    _ => None,
+                }
+            };
+            for pf in &recovery.pending_field_layouts {
+                let Some(target_ptr) = resolve_pending(&pf.target, &materialized) else {
+                    continue;
+                };
+                let Some(value_raw) = resolve_pending(&pf.value, &materialized) else {
+                    continue;
+                };
+                if target_ptr == 0 {
+                    continue;
+                }
+                let addr = target_ptr as usize + pf.field_offset;
+                unsafe {
+                    match pf.field_size {
+                        8 => std::ptr::write(addr as *mut i64, value_raw),
+                        4 => std::ptr::write(addr as *mut i32, value_raw as i32),
+                        2 => std::ptr::write(addr as *mut i16, value_raw as i16),
+                        1 => std::ptr::write(addr as *mut u8, value_raw as u8),
+                        _ => {}
+                    }
+                }
+            }
+
             *outputs = rebuilt;
             return;
         }
@@ -1009,8 +1070,6 @@ fn rebuild_state_after_failure(
     // Phase 2: compact virtual field pairs when outputs has more slots
     // than bridge expects. Pattern: [frame, ni, vsd, ob_type_0, intval_0,
     // ob_type_1, intval_1, ...] → [frame, ni, vsd, boxed_0, boxed_1, ...].
-    // RPython rebuild_state_after_failure materializes virtuals from
-    // rd_virtuals before bridge dispatch.
     if bridge_num_inputs > 0 && outputs.len() > bridge_num_inputs {
         let prefix = 3; // frame, ni, vsd
         let object_slots = bridge_num_inputs - prefix;
@@ -1020,7 +1079,6 @@ fn rebuild_state_after_failure(
             for i in 0..object_slots {
                 let ob_type = outputs[prefix + i * 2];
                 let intval = outputs[prefix + i * 2 + 1];
-                // Materialize via callback
                 let mut temp = vec![0i64, ob_type, intval];
                 let temp_types = vec![
                     majit_ir::Type::Ref,

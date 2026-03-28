@@ -4535,6 +4535,39 @@ impl<M: Clone> MetaInterp<M> {
         )?))
     }
 
+    /// Return the full recovery slot types for a guard exit, concatenated
+    /// from all frames in callee-first order (matching the blackhole
+    /// consumer's section convention). Falls back to exit_types when
+    /// recovery_layout is absent.
+    pub fn get_recovery_slot_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        if let Some(ref recovery) = exit_layout.recovery_layout {
+            if recovery.frames.len() > 1 {
+                // Multi-frame: concatenate slot_types in callee-first order
+                // (matching rebuild_state_after_failure's .rev() iteration).
+                let mut types = Vec::new();
+                for frame in recovery.frames.iter().rev() {
+                    if let Some(ref st) = frame.slot_types {
+                        types.extend_from_slice(st);
+                    } else {
+                        // No slot_types — use Ref for all slots as default.
+                        types.extend(frame.slots.iter().map(|_| Type::Ref));
+                    }
+                }
+                return Some(types);
+            }
+        }
+        Some(exit_layout.exit_types.clone())
+    }
+
     /// Compile a bridge from a guard failure point.
     ///
     /// In RPython, when a guard fails frequently, the JIT compiles a
