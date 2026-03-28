@@ -178,10 +178,10 @@ pub struct Optimizer {
     pub resumedata_memo: crate::resume::ResumeDataLoopMemo,
     /// resume.py parity: per-guard snapshots from tracing time.
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
-    /// Propagated to OptContext for number_guard_inline.
+    /// Propagated to OptContext for store_final_boxes_in_guard.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-frame box counts for multi-frame snapshots.
-    /// Propagated to OptContext for number_guard_inline multi-frame encoding.
+    /// Propagated to OptContext for store_final_boxes_in_guard multi-frame encoding.
     pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
@@ -890,7 +890,7 @@ impl Optimizer {
     // RPython optimizer.py:722-752 store_final_boxes_in_guard and
     // optimizer.py:649-670 emit_guard_operation are implemented inside
     // emit_with_guard_check: _copy_resume_data_from, store_final_boxes_in_guard,
-    // force_box on fail_args, and number_guard_inline in ctx.emit().
+    // force_box on fail_args, and store_final_boxes_in_guard in ctx.emit().
 
     /// optimizer.py: add_pending_field(op)
     /// Queue a SETFIELD_GC to be emitted before the next guard.
@@ -1582,7 +1582,7 @@ impl Optimizer {
         // in guard fail_args. Phase 2 guards may inherit NONE from Phase 1
         // virtualization — rescan resolves these using imported_virtuals.
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
-        // RPython parity: number_guard_inline in ctx.emit() handles
+        // RPython parity: store_final_boxes_in_guard in ctx.emit() handles
         // virtual tagging inline at each guard emit. No post-pass rescan.
 
         // Transfer exported virtual state from context to optimizer
@@ -1752,7 +1752,7 @@ impl Optimizer {
         self.final_num_inputs = num_inputs + num_virtual_inputs;
 
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
-        // RPython parity: number_guard_inline handles virtual tagging
+        // RPython parity: store_final_boxes_in_guard handles virtual tagging
         // and rd_numb production inline. No post-pass rescan needed.
 
         // Force any remaining virtual refs in output ops before forwarding resolve.
@@ -2388,7 +2388,7 @@ impl Optimizer {
                 op.descr = last.descr.clone();
                 op.fail_args = last.fail_args.clone();
                 op.rd_resume_position = last.rd_resume_position;
-                // Copy complete resume data so number_guard_inline is a no-op.
+                // Copy complete resume data so store_final_boxes_in_guard is a no-op.
                 op.rd_numb = last.rd_numb.clone();
                 op.rd_consts = last.rd_consts.clone();
                 op.rd_virtuals = last.rd_virtuals.clone();
@@ -2855,7 +2855,7 @@ impl Default for Optimizer {
 }
 
 // OptimizerBoxEnv removed: was only used by store_final_boxes_in_guard.
-// number_guard_inline in mod.rs defines InlineBoxEnv for the same purpose.
+// store_final_boxes_in_guard in mod.rs defines InlineBoxEnv for the same purpose.
 
 #[cfg(test)]
 mod tests {

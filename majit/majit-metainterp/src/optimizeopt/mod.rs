@@ -1106,7 +1106,7 @@ impl OptContext {
     /// Matches OptBoxEnv::get_const: checks constant_types_for_numbering
     /// override, PtrInfo::Constant, and constant pool.
     /// Returns None if opref is not a constant.
-    pub fn getconst_for_numbering(&self, opref: OpRef) -> Option<(i64, majit_ir::Type)> {
+    pub fn getconst(&self, opref: OpRef) -> Option<(i64, majit_ir::Type)> {
         let type_override = self.constant_types_for_numbering.get(&opref.0).copied();
         // Check constant pool (through replacement chain).
         if let Some(val) = self.get_constant(opref) {
@@ -1178,7 +1178,7 @@ impl OptContext {
 
     /// optimizer.py:652-686 emit_guard_operation — decide whether to share
     /// resume data from the previous guard (_copy_resume_data_from) or build
-    /// new resume data (store_final_boxes_in_guard / number_guard_inline).
+    /// new resume data (store_final_boxes_in_guard / number_guard_inline_fallback).
     fn emit_guard_operation(&mut self, op: &mut Op) {
         let opnum = op.opcode;
 
@@ -1203,7 +1203,7 @@ impl OptContext {
         // RPython condition: self._last_guard_op and guard_op.getdescr() is None.
         // In RPython, getdescr() is None before store_final_boxes_in_guard
         // processes the guard (which sets the descr + replaces fail_args with
-        // normalized liveboxes). In majit, number_guard_inline produces rd_numb
+        // normalized liveboxes). In majit, number_guard_inline_fallback produces rd_numb
         // and normalizes fail_args to liveboxes (store_final_boxes parity).
         // rd_numb.is_some() means already processed.
         //
@@ -1225,7 +1225,7 @@ impl OptContext {
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
             // store_final_boxes_in_guard: build new resume data.
-            self.number_guard_inline(op);
+            self.number_guard_inline_fallback(op);
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
@@ -1286,10 +1286,10 @@ impl OptContext {
     /// Called from store_final_boxes_in_guard in optimizer.rs.
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
     pub fn finalize_guard_resume_data(&self, op: &mut Op) {
-        self.number_guard_inline_impl(op);
+        self.store_final_boxes_in_guard(op);
     }
 
-    fn number_guard_inline(&self, op: &mut Op) {
+    fn number_guard_inline_fallback(&self, op: &mut Op) {
         // RPython parity: store_final_boxes_in_guard already produced
         // rd_numb via finalize_guard_resume_data. Assert completeness.
         if op.rd_numb.is_some() {
@@ -1305,7 +1305,7 @@ impl OptContext {
         );
     }
 
-    fn number_guard_inline_impl(&self, op: &mut Op) {
+    fn store_final_boxes_in_guard(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
         // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
@@ -1361,7 +1361,7 @@ impl OptContext {
                         } else {
                             ns.append_short(resumedata::NULLREF);
                         }
-                    } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
+                    } else if let Some((raw, tp)) = self.getconst(opref) {
                         if tp == majit_ir::Type::Int {
                             if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
                                 ns.append_short(tagged);
@@ -1435,12 +1435,10 @@ impl OptContext {
             Snapshot::single_frame(pc, snapshot_boxes.clone())
         };
         // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
-        // Currently kept empty for numbering because pyre's recovery
-        // path reads frame/ni/vsd from fail_args[0..3], not from
-        // vable_array. Populating vable_array would shift TAGBOX
-        // indices and break the fail_args ↔ deadframe correspondence.
-        // TODO: populate once recovery reads frame from vable_array.
-        let _ = vable_oprefs;
+        // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect
+        // TAGBOX numbering. The same OpRefs also appear in fail_args —
+        // _number_boxes deduplicates via liveboxes HashMap.
+        snapshot.vable_array = vable_oprefs;
 
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {
@@ -1632,7 +1630,7 @@ impl OptContext {
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
                                 .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or((*fi as usize + 1) * 8)
+                                .unwrap_or(0)
                         })
                         .collect();
                     let fieldnums: Vec<i16> =
@@ -1662,7 +1660,12 @@ impl OptContext {
                     let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Instance {
                         descr_index: vi.descr.index(),
-                        known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
+                        // virtualize.py:208: known_class = descr.get_vtable()
+                        known_class: vi
+                            .known_class
+                            .map(|gc| gc.as_usize() as i64)
+                            .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
+                            .filter(|&v| v != 0),
                         fielddescr_indices,
                         field_offsets,
                         field_types,
@@ -1682,7 +1685,7 @@ impl OptContext {
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
                                 .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or((*fi as usize + 1) * 8)
+                                .unwrap_or(0)
                         })
                         .collect();
                     let fieldnums: Vec<i16> =

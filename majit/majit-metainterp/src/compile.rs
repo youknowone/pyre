@@ -192,18 +192,20 @@ pub(crate) fn build_guard_metadata(
         let resume_layout;
         if is_guard {
             let mut builder = ResumeDataVirtualAdder::new();
-            builder.push_frame(pc);
 
             // store_final_boxes parity: when rd_numb is present, fail_args
             // are normalized to liveboxes only (no constants/virtuals).
             // Build resume_layout from rd_numb so that TAGCONST/TAGINT
             // slots produce Constant entries in the reconstructed state.
+            // Multi-frame: push_frame per frame with correct pc.
             if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
-                let mut slot_idx = 0usize;
-                for frame in &frames {
-                    for val in &frame.values {
+                let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                // rd_numb encodes [callee(top), caller(parent)] order.
+                // resume_layout expects [outer, ..., innermost] order.
+                for frame in frames.iter().rev() {
+                    builder.push_frame(frame.pc as u64);
+                    for (slot_idx, val) in frame.values.iter().enumerate() {
                         match val {
                             RebuiltValue::Box(idx) => {
                                 builder.map_slot(slot_idx, *idx);
@@ -221,11 +223,11 @@ pub(crate) fn build_guard_metadata(
                                 builder.set_slot_uninitialized(slot_idx);
                             }
                         }
-                        slot_idx += 1;
                     }
                 }
             } else {
-                // No rd_numb: 1:1 mapping (fail_args[i] → state[i]).
+                // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
+                builder.push_frame(pc);
                 let num_slots = op
                     .fail_args
                     .as_ref()
@@ -246,7 +248,7 @@ pub(crate) fn build_guard_metadata(
         // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
-        // resume.py parity: rd_virtuals_info produced by number_guard_inline_impl.
+        // resume.py parity: rd_virtuals_info produced by store_final_boxes_in_guard_impl.
         let rd_virtuals_info = op.rd_virtuals_info.clone();
 
         let recovery_layout = if op.rd_numb.is_some() {
@@ -257,7 +259,7 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 let mut slots = Vec::new();
                 for frame in &frames {
                     for val in &frame.values {

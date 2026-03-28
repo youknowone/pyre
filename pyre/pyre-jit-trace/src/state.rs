@@ -2120,9 +2120,16 @@ impl MIFrame {
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
         // pyjitpl.py:2575-2578: determine after_residual_call from guard opcode.
+        // When true, opencoder.py:767 activates all live boxes in the top
+        // frame snapshot (liveness filter disabled). In pyre, all boxes are
+        // already included (no liveness filtering), so this flag currently
+        // has no behavioral effect — kept for source parity.
         let _after_residual_call = matches!(
             opcode,
-            OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
+            OpCode::GuardException
+                | OpCode::GuardNoException
+                | OpCode::GuardNotForced
+                | OpCode::GuardAlwaysFails
         );
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top), caller (parent)] into
@@ -2145,6 +2152,7 @@ impl MIFrame {
             // opencoder.py:819-832: snapshot = [top_frame, parent_frame]
             let callee_boxes = Self::fail_args_to_snapshot_boxes(&callee_fail_args);
             let caller_boxes = Self::fail_args_to_snapshot_boxes(&caller_fail_args);
+            let vable_boxes = Self::build_virtualizable_boxes(self.sym());
             let snapshot = majit_trace::recorder::Snapshot {
                 frames: vec![
                     majit_trace::recorder::SnapshotFrame {
@@ -2159,7 +2167,7 @@ impl MIFrame {
                         boxes: caller_boxes,
                     },
                 ],
-                vable_boxes: Vec::new(),
+                vable_boxes,
                 vref_boxes: Vec::new(),
             };
             let snapshot_id = ctx.capture_resumedata(snapshot);
@@ -2190,16 +2198,15 @@ impl MIFrame {
         let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&fail_args);
         // opencoder.py:776-778: top snapshot uses frame.jitcode.index
         // and frame.pc (= resumepc set by capture_resumedata).
+        // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
+        let vable_boxes = Self::build_virtualizable_boxes(self.sym());
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: self.orgpc as u32,
                 boxes: snapshot_boxes,
             }],
-            // pyjitpl.py:2588: virtualizable_boxes stored in snapshot
-            // for data model parity but not yet consumed by numbering
-            // (requires recovery refactoring to read from vable_array).
-            vable_boxes: Vec::new(),
+            vable_boxes,
             vref_boxes: Vec::new(),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
@@ -2208,14 +2215,38 @@ impl MIFrame {
         ctx.set_last_guard_resume_position(snapshot_id);
     }
 
-    /// Snapshot boxes from fail_args. In RPython, snapshot stores only
-    /// active boxes (get_list_of_active_boxes). In pyre, fail_args
-    /// include [frame, ni, vsd, locals, stack] and the snapshot
-    /// currently stores all of them for compatibility with the
-    /// recovery path that reads frame/ni/vsd from typed[0..3].
-    /// Full RPython active-box parity requires recovery path
-    /// refactoring to read frame from vable_array and ni from
-    /// RebuiltFrame.pc instead of typed values.
+    /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
+    /// [static_fields..., array_items..., virtualizable_ptr].
+    /// pyjitpl.py:2586: self.virtualizable_boxes → vable_array.
+    fn build_virtualizable_boxes(sym: &PyreSym) -> Vec<majit_trace::recorder::SnapshotTagged> {
+        let stack_only = sym.stack_only_depth();
+        let opref_to_tag = |opref: OpRef| -> majit_trace::recorder::SnapshotTagged {
+            if opref.is_none() {
+                majit_trace::recorder::SnapshotTagged::Const(0)
+            } else {
+                majit_trace::recorder::SnapshotTagged::Box(opref.0)
+            }
+        };
+        let mut boxes = Vec::new();
+        // Static fields: next_instr, valuestackdepth
+        boxes.push(opref_to_tag(sym.vable_next_instr));
+        boxes.push(opref_to_tag(sym.vable_valuestackdepth));
+        // Array field: locals_cells_stack_w items
+        for &local in &sym.symbolic_locals {
+            boxes.push(opref_to_tag(local));
+        }
+        for &stack_val in &sym.symbolic_stack[..stack_only.min(sym.symbolic_stack.len())] {
+            boxes.push(opref_to_tag(stack_val));
+        }
+        // virtualizable.py:139: last element = virtualizable itself
+        boxes.push(opref_to_tag(sym.frame));
+        boxes
+    }
+
+    /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
+    /// snapshot boxes from fail_args = [frame, ni, vsd, locals, stack].
+    /// ni/vsd are also in Snapshot.vable_array; _number_boxes
+    /// deduplicates via liveboxes HashMap (same OpRef → same tag).
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
