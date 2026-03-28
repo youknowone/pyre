@@ -1170,9 +1170,24 @@ fn execute_assembler(
                     }
                 }
             } else {
-                // No typed values — frame was restored directly.
-                // RPython ContinueRunningNormally: restart eval_loop_jit.
-                Some(LoopResult::ContinueRunningNormally)
+                // RPython compile.py:701 handle_fail: blackhole resume
+                // always has payload. Missing typed values = recovery
+                // failure. Restore pre-entry frame and invalidate.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] no typed values for key={}, recovery failure",
+                        green_key
+                    );
+                }
+                driver.invalidate_loop(green_key);
+                frame.next_instr = saved_ni;
+                frame.valuestackdepth = saved_vsd;
+                let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
+                for i in 0..restore_len {
+                    frame.locals_cells_stack_w[i] = saved_locals[i];
+                }
+                frame.fix_array_ptrs();
+                None
             }
         }
         JitAction::Continue => None,

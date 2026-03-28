@@ -892,11 +892,11 @@ pub fn resume_in_blackhole(
             if let Some(val) = section.get(slot) {
                 bh.setarg_r(i, materialize_virtual(val));
             } else {
-                // RPython parity: rd_numb always encodes all locals.
-                // If missing from typed_values, read from the actual frame.
-                if i < frame.locals_cells_stack_w.len() {
-                    bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
-                }
+                // RPython resume.py:1381 parity: rd_numb always encodes
+                // all locals. Missing slot = incomplete resume data.
+                // Abort blackhole rather than inject stale frame values.
+                builder.release_interp(bh);
+                return BlackholeResult::Failed;
             }
         }
         for i in 0..stack_only {
