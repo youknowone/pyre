@@ -1139,11 +1139,20 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     } else {
         return false;
     };
-    let merge_jitcode_pc = if merge_py_pc < pyjitcode.pc_map.len() {
-        pyjitcode.pc_map[merge_py_pc]
-    } else {
+    // Use jitcode_pc_for_loop_header: the interpreter's merge_py_pc may
+    // include Cache-skip offset that doesn't match the codewriter's label.
+    let merge_jitcode_pc =
+        crate::jit::codewriter::jitcode_pc_for_loop_header(&pyjitcode.pc_map, merge_py_pc)
+            .unwrap_or_else(|| {
+                if merge_py_pc < pyjitcode.pc_map.len() {
+                    pyjitcode.pc_map[merge_py_pc]
+                } else {
+                    0
+                }
+            });
+    if merge_jitcode_pc == 0 && merge_py_pc > 0 {
         return false;
-    };
+    }
 
     thread_local! {
         static BH_BUILDER2: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
@@ -1154,10 +1163,14 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
     bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
 
+    // RPython blackhole.py _prepare_next_section parity:
+    // pyre locals are PyObjectRef → ref register bank (setarg_r).
+    // resume_in_blackhole (line 892) uses setarg_r — this must match.
+    // The writeback (line 950) reads from registers_r.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
-            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
+            bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
         }
     }
     let stack_base = nlocals;
@@ -1167,8 +1180,9 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
             bh.runtime_stack_push(0, frame.locals_cells_stack_w[i] as i64);
         }
     }
-    if nlocals + 3 < bh.registers_i.len() {
-        bh.setarg_i(nlocals + 3, frame as *mut PyFrame as i64);
+    // Frame pointer in int register 3 (same as resume_in_blackhole line 913).
+    if 3 < bh.registers_i.len() {
+        bh.setarg_i(3, frame as *mut PyFrame as i64);
     }
 
     if majit_metainterp::majit_log_enabled() {
