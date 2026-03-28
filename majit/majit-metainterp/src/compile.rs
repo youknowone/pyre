@@ -380,7 +380,8 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, _vable_vals, _vref_vals, frames) =
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 // Build virtual_map from rd_virtuals for NULLREF → Virtual.
                 let virtual_map: std::collections::HashMap<usize, usize> = entries
                     .iter()
@@ -454,7 +455,8 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, _vable_vals, _vref_vals, frames) =
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 let mut slots = Vec::new();
                 for frame in &frames {
                     for val in &frame.values {
@@ -541,6 +543,7 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::Array {
                                     descr_index,
                                     clear,
+                                    kind,
                                     fieldnums,
                                 } => {
                                     let items = fieldnums
@@ -574,6 +577,7 @@ pub(crate) fn build_guard_metadata(
                                     majit_codegen::ExitVirtualLayout::Array {
                                         descr_index: *descr_index,
                                         clear: *clear,
+                                        kind: *kind,
                                         items,
                                     }
                                 }
