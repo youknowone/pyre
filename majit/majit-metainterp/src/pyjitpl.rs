@@ -1580,20 +1580,21 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // pyjitpl.py:3162: has_compiled_targets(ptoken) — cancel if the
-        // greenkey already has VALID compiled targets (not merely a stale
-        // entry in the map). Invalidated entries must not block recompilation.
+        // pyjitpl.py:3162: has_compiled_targets(ptoken) →
+        // raise SwitchToBlackhole(ABORT_BAD_LOOP).
+        // RPython switches to blackhole execution (not silent cancel).
+        // Return Aborted so the caller knows to resume via blackhole.
         if let Some(ctx) = self.tracing.as_ref() {
             let gk = ctx.green_key;
             if self.has_compiled_targets(gk) {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compile_loop cancelled: has_compiled_targets key={}",
+                        "[jit] compile_loop → SwitchToBlackhole: has_compiled_targets key={}",
                         gk
                     );
                 }
                 self.abort_trace(false);
-                return CompileOutcome::Cancelled;
+                return CompileOutcome::Aborted;
             }
         }
 

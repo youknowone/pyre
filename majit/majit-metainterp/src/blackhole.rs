@@ -1294,8 +1294,6 @@ impl BlackholeInterpreter {
                     );
                 }
                 if cond == 0 {
-                    // blackhole.py:1066 bhimpl_jit_merge_point parity:
-                    // branch target may be the merge point (loop header).
                     if self.merge_point_jitcode_pc == Some(target) {
                         self.position = target;
                         self.reached_merge_point = true;
@@ -1454,10 +1452,26 @@ impl BlackholeInterpreter {
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
                 // Clear stale exception before call to prevent false positives.
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[bh] call_ref fn={} dst={} nargs={} args={:?} pos={}",
+                        fn_ptr_idx,
+                        dst,
+                        num_args,
+                        &args[..args.len().min(4)],
+                        self.last_opcode_position,
+                    );
+                }
                 let result = call_int_function(target.concrete_ptr, &args);
                 // Check if call raised an exception (TLS set by helper).
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
                 if exc_val != 0 {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bh] call_ref EXCEPTION fn={} pos={} exc={:#x}",
+                            fn_ptr_idx, self.last_opcode_position, exc_val,
+                        );
+                    }
                     // Actual exception: try handler dispatch.
                     if self.handle_exception_in_frame(exc_val) {
                         return Ok(());
