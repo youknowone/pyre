@@ -403,6 +403,9 @@ pub(crate) fn build_guard_metadata(
                                     size,
                                     fielddescr_indices,
                                     field_types,
+                                    item_size,
+                                    field_offsets,
+                                    field_sizes,
                                     fieldnums,
                                 } => {
                                     let fpe = if *size > 0 {
@@ -420,6 +423,9 @@ pub(crate) fn build_guard_metadata(
                                     majit_codegen::ExitVirtualLayout::ArrayStruct {
                                         descr_index: *descr_index,
                                         field_types: field_types.clone(),
+                                        item_size: *item_size,
+                                        field_offsets: field_offsets.clone(),
+                                        field_sizes: field_sizes.clone(),
                                         element_fields,
                                     }
                                 }

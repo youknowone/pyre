@@ -709,6 +709,9 @@ impl ResumeVirtualLayoutSummary {
             } => ExitVirtualLayout::ArrayStruct {
                 descr_index: *descr_index,
                 field_types: field_types.clone(),
+                item_size: 0,
+                field_offsets: vec![],
+                field_sizes: vec![],
                 element_fields: element_fields
                     .iter()
                     .map(|fields| {
