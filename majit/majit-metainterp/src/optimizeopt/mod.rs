@@ -259,6 +259,10 @@ pub struct OptContext {
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
     pub snapshot_boxes: HashMap<i32, Vec<OpRef>>,
+    /// Per-frame box counts for multi-frame snapshots.
+    /// opencoder.py:819 capture_resumedata encodes multiple frames;
+    /// this tracks the boundary between callee and caller sections.
+    pub snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
 }
@@ -427,6 +431,7 @@ impl OptContext {
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
+            snapshot_frame_sizes: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
         }
     }
@@ -473,6 +478,7 @@ impl OptContext {
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
+            snapshot_frame_sizes: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
         }
     }
@@ -1036,6 +1042,7 @@ impl OptContext {
                 ns.append_int(0); // vref_array len
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
+                ns.append_int(fa_len as i32); // slot_count
                 // resume.py _number_boxes + _number_virtuals + getconst parity.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
@@ -1162,7 +1169,21 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let snapshot = Snapshot::single_frame(0, snapshot_boxes.clone());
+        let frame_sizes = self.snapshot_frame_sizes.get(&op.rd_resume_position);
+        let snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
+            // Multi-frame: split snapshot_boxes into per-frame chunks.
+            let mut frames = Vec::new();
+            let mut offset = 0;
+            for &size in sizes {
+                let end = (offset + size).min(snapshot_boxes.len());
+                let frame_boxes: Vec<OpRef> = snapshot_boxes[offset..end].to_vec();
+                frames.push((0i32, 0i32, frame_boxes));
+                offset = end;
+            }
+            Snapshot::multi_frame(frames)
+        } else {
+            Snapshot::single_frame(0, snapshot_boxes.clone())
+        };
 
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {

@@ -66,6 +66,8 @@ pub struct UnrollOptimizer {
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    /// Per-frame box counts for multi-frame snapshots.
+    pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
     /// resume.py:570-574 _add_optimizer_sections: per-guard optimizer
     /// knowledge collected during optimization. Propagated to CompiledTrace
     /// for bridge compilation.
@@ -91,6 +93,7 @@ impl UnrollOptimizer {
             phase1_exported_state: None,
             phase1_preamble_ops: None,
             snapshot_boxes: std::collections::HashMap::new(),
+            snapshot_frame_sizes: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
         }
     }
@@ -244,6 +247,7 @@ impl UnrollOptimizer {
             opt_p1.constant_types = self.constant_types.clone();
             opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
+            opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -323,6 +327,7 @@ impl UnrollOptimizer {
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
+        opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // RPython compile.py:278-284 parity: save Phase 1 results.
         // If Phase 2 raises InvalidLoop, compile_loop uses these for
@@ -3072,18 +3077,47 @@ fn assemble_peeled_trace_with_jump_args(
             }
             new_op.args = jump_args.into();
         }
+        // RPython resume.py parity: fail_args are rebuilt from the
+        // snapshot by store_final_boxes_in_guard. Snapshot-derived
+        // values that reference label args must NOT be remapped to
+        // body results, because the snapshot captures the state at
+        // the guard point (or parent capture point), not the body's
+        // final state.  Use body_result_remap only for values that
+        // are body-defined AND not visible before the label.
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                *a = remap_body_arg(
-                    *a,
-                    &label_scope_remap,
-                    &input_remap,
-                    &alias_remap,
-                    &short_source_map,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                );
+                let mut current = *a;
+                for _ in 0..8 {
+                    if let Some(&mapped) = label_scope_remap.get(&current) {
+                        if mapped != current {
+                            current = mapped;
+                            continue;
+                        }
+                    }
+                    if let Some(&mapped) = input_remap.get(&current) {
+                        if mapped != current {
+                            current = mapped;
+                            continue;
+                        }
+                    }
+                    if let Some(&mapped) = alias_remap.get(&current) {
+                        if mapped != current {
+                            current = mapped;
+                            continue;
+                        }
+                    }
+                    if let Some(&mapped) = body_result_remap.get(&current) {
+                        if seen_body_defs.contains(&current)
+                            && !visible_before_label.contains(&current)
+                            && mapped != current
+                        {
+                            current = mapped;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                *a = current;
             }
         }
         if let Some(label_idx) = current_inner_label_index {

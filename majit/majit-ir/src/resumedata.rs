@@ -65,7 +65,7 @@ impl Snapshot {
         n += self.vable_array.len();
         n += self.vref_array.len();
         for f in &self.framestack {
-            n += 2 + f.boxes.len(); // jitcode_index + pc + boxes
+            n += 3 + f.boxes.len(); // jitcode_index + pc + slot_count + boxes
         }
         n
     }
@@ -80,6 +80,24 @@ impl Snapshot {
                 pc,
                 boxes,
             }],
+        }
+    }
+
+    /// Create a multi-frame snapshot from per-frame (jitcode_index, pc, boxes) tuples.
+    /// Used when a guard fires inside an inlined callee and the snapshot
+    /// contains [callee_section..., caller_section...].
+    pub fn multi_frame(frames: Vec<(i32, i32, Vec<OpRef>)>) -> Self {
+        Snapshot {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            framestack: frames
+                .into_iter()
+                .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
+                    jitcode_index,
+                    pc,
+                    boxes,
+                })
+                .collect(),
         }
     }
 }
@@ -271,14 +289,14 @@ impl ResumeDataLoopMemo {
         numb_state.append_int((vref_len >> 1) as i32);
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
-        // resume.py:249-253: frame chain
-        // RPython does NOT encode slot_count per frame — it reads tagged
-        // values until the frame ends (using jitcode.position_info at
-        // rebuild time). For single-frame snapshots the reader simply
-        // consumes all remaining tagged values after jitcode_index + pc.
+        // resume.py:249-253: frame chain.
+        // Each frame encodes: jitcode_index, pc, slot_count, [tagged_values...].
+        // The slot_count field allows the decoder to know where one frame ends
+        // and the next begins, enabling multi-frame guard recovery.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -365,16 +383,19 @@ pub fn rebuild_from_numbering(
     }
 
     // Frames.
-    // RPython does NOT encode slot_count — it uses jitcode.position_info
-    // to know how many registers each frame has. For single-frame (all we
-    // support), after reading jitcode_index and pc, consume ALL remaining
-    // tagged values.
+    // Each frame encodes: jitcode_index, pc, slot_count, [tagged_values...].
+    // The decoder reads exactly slot_count tagged values per frame, allowing
+    // multi-frame guard recovery when a guard fires inside an inlined callee.
     let mut frames = Vec::new();
-    if reader.has_more() {
+    while reader.has_more() {
         let jitcode_index = reader.next_item();
         let pc = reader.next_item();
+        let slot_count = reader.next_item();
         let mut values = Vec::new();
-        while reader.has_more() {
+        for _ in 0..slot_count {
+            if !reader.has_more() {
+                break;
+            }
             let tagged = reader.next_item() as i16;
             values.push(decode_tagged(tagged, num_failargs, rd_consts));
         }
