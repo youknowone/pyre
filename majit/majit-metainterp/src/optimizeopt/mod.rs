@@ -1027,23 +1027,13 @@ impl OptContext {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
+        // resoperation.py:240: self._forwarded = forwarded_to
+        // Simple overwrite — old info is lost.
         let idx = old.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        let old_info = match std::mem::replace(&mut self.forwarded[idx], Forwarded::Op(new)) {
-            Forwarded::Info(info) => Some(info),
-            _ => None,
-        };
-        if let Some(info) = old_info {
-            let new_idx = new.0 as usize;
-            if new_idx >= self.forwarded.len() {
-                self.forwarded.resize(new_idx + 1, Forwarded::None);
-            }
-            if matches!(self.forwarded[new_idx], Forwarded::None) {
-                self.forwarded[new_idx] = Forwarded::Info(info);
-            }
-        }
+        self.forwarded[idx] = Forwarded::Op(new);
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
