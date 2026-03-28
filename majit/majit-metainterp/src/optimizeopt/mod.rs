@@ -1466,24 +1466,43 @@ impl OptContext {
                                             .unwrap_or(resumedata::NULLREF)
                                     })
                                     .collect();
+                                let fdinfo: Vec<majit_ir::FieldDescrInfo> = if !entry
+                                    .field_offsets
+                                    .is_empty()
+                                {
+                                    fdi.iter()
+                                        .zip(entry.field_offsets.iter())
+                                        .zip(entry.field_types.iter())
+                                        .zip(entry.field_sizes.iter())
+                                        .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
+                                            index: *idx,
+                                            offset: *off,
+                                            field_type: *tp,
+                                            field_size: *sz,
+                                        })
+                                        .collect()
+                                } else {
+                                    fdi.iter()
+                                        .map(|idx| majit_ir::FieldDescrInfo {
+                                            index: *idx,
+                                            offset: 0,
+                                            field_type: majit_ir::Type::Int,
+                                            field_size: 8,
+                                        })
+                                        .collect()
+                                };
                                 if kc.is_some() {
                                     majit_ir::RdVirtualInfo::Instance {
                                         descr_index: di,
                                         known_class: kc,
-                                        fielddescr_indices: fdi,
-                                        field_offsets: entry.field_offsets.clone(),
-                                        field_types: entry.field_types.clone(),
-                                        field_sizes: entry.field_sizes.clone(),
+                                        fielddescrs: fdinfo,
                                         fieldnums: fns,
                                         descr_size: ds,
                                     }
                                 } else {
                                     majit_ir::RdVirtualInfo::Struct {
                                         descr_index: di,
-                                        fielddescr_indices: fdi,
-                                        field_offsets: entry.field_offsets.clone(),
-                                        field_types: entry.field_types.clone(),
-                                        field_sizes: entry.field_sizes.clone(),
+                                        fielddescrs: fdinfo,
                                         fieldnums: fns,
                                         descr_size: ds,
                                     }
@@ -1769,10 +1788,18 @@ impl OptContext {
                             .map(|gc| gc.as_usize() as i64)
                             .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
                             .filter(|&v| v != 0),
-                        fielddescr_indices,
-                        field_offsets,
-                        field_types,
-                        field_sizes,
+                        fielddescrs: fielddescr_indices
+                            .iter()
+                            .zip(field_offsets.iter())
+                            .zip(field_types.iter())
+                            .zip(field_sizes.iter())
+                            .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
+                                index: *idx,
+                                offset: *off,
+                                field_type: *tp,
+                                field_size: *sz,
+                            })
+                            .collect(),
                         fieldnums,
                         descr_size,
                     }
@@ -1818,10 +1845,18 @@ impl OptContext {
                     let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Struct {
                         descr_index: vi.descr.index(),
-                        fielddescr_indices,
-                        field_offsets,
-                        field_types,
-                        field_sizes,
+                        fielddescrs: fielddescr_indices
+                            .iter()
+                            .zip(field_offsets.iter())
+                            .zip(field_types.iter())
+                            .zip(field_sizes.iter())
+                            .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
+                                index: *idx,
+                                offset: *off,
+                                field_type: *tp,
+                                field_size: *sz,
+                            })
+                            .collect(),
                         fieldnums,
                         descr_size,
                     }

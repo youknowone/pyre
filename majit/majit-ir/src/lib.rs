@@ -11,7 +11,7 @@ pub use descr::{
     SimpleFailDescr, SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
 };
 pub use resoperation::{
-    BoxEnv, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode, OpRef, RdVirtualInfo,
+    BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode, OpRef, RdVirtualInfo,
     VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{

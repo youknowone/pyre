@@ -325,26 +325,34 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::Instance {
                                     descr_index,
                                     known_class,
-                                    fielddescr_indices,
+                                    fielddescrs,
                                     fieldnums,
                                     ..
-                                } => majit_codegen::ExitVirtualLayout::Object {
-                                    type_id: known_class.map_or(0, |kc| kc as u32),
-                                    descr_index: *descr_index,
-                                    fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                                    target_slot,
-                                },
+                                } => {
+                                    let idx: Vec<u32> =
+                                        fielddescrs.iter().map(|fd| fd.index).collect();
+                                    majit_codegen::ExitVirtualLayout::Object {
+                                        type_id: known_class.map_or(0, |kc| kc as u32),
+                                        descr_index: *descr_index,
+                                        fields: resolve_fieldnums(fieldnums, &idx),
+                                        target_slot,
+                                    }
+                                }
                                 majit_ir::RdVirtualInfo::Struct {
                                     descr_index,
-                                    fielddescr_indices,
+                                    fielddescrs,
                                     fieldnums,
                                     ..
-                                } => majit_codegen::ExitVirtualLayout::Struct {
-                                    type_id: 0,
-                                    descr_index: *descr_index,
-                                    fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                                    target_slot,
-                                },
+                                } => {
+                                    let idx: Vec<u32> =
+                                        fielddescrs.iter().map(|fd| fd.index).collect();
+                                    majit_codegen::ExitVirtualLayout::Struct {
+                                        type_id: 0,
+                                        descr_index: *descr_index,
+                                        fields: resolve_fieldnums(fieldnums, &idx),
+                                        target_slot,
+                                    }
+                                }
                                 majit_ir::RdVirtualInfo::Array {
                                     descr_index,
                                     clear,
