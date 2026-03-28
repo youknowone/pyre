@@ -345,6 +345,70 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:83: make_guards(op, short, optimizer)
+    /// Append guard operations to `short` that check this PtrInfo's
+    /// properties hold for `op`. Used by use_box (shortpreamble.py:382).
+    pub fn make_guards(
+        &self,
+        op: OpRef,
+        short: &mut Vec<Op>,
+        const_pool: &mut Vec<(OpRef, Value)>,
+    ) {
+        match self {
+            // info.py:83-84: PtrInfo base — no-op
+            PtrInfo::NonNull { .. } => {
+                // info.py:120-122: NonNullPtrInfo.make_guards
+                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+            }
+            PtrInfo::KnownClass { class_ptr, .. } => {
+                // info.py:336-345: InstancePtrInfo.make_guards with known_class
+                let class_ref = Self::alloc_guard_const(const_pool, Value::Ref(*class_ptr));
+                short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+            }
+            PtrInfo::Instance(info) => {
+                // info.py:336-353: InstancePtrInfo.make_guards
+                if let Some(cls) = &info.known_class {
+                    let class_ref = Self::alloc_guard_const(const_pool, Value::Ref(*cls));
+                    short.push(Op::new(OpCode::GuardNonnullClass, &[op, class_ref]));
+                } else {
+                    // info.py:353: fallback to AbstractStructPtrInfo (NonNull)
+                    short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                }
+            }
+            PtrInfo::Struct(_) => {
+                // info.py:360-366: StructPtrInfo.make_guards
+                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+            }
+            PtrInfo::Constant(gcref) => {
+                // info.py:715-716: ConstPtrInfo.make_guards
+                let c = Self::alloc_guard_const(const_pool, Value::Ref(*gcref));
+                short.push(Op::new(OpCode::GuardValue, &[op, c]));
+            }
+            PtrInfo::Array(_) => {
+                // info.py:632-633: ArrayPtrInfo.make_guards
+                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+            }
+            // Virtuals/Virtualizable: no guards needed in short preamble
+            _ => {}
+        }
+    }
+
+    /// Record a constant needed by a short preamble guard.
+    /// The caller (collect_use_box_guards) allocates proper OpRefs
+    /// via alloc_op_position and registers them in the constant map.
+    fn alloc_guard_const(const_pool: &mut Vec<(OpRef, Value)>, value: Value) -> OpRef {
+        // Check if we already have this value in the pool
+        for &(ref_existing, ref val_existing) in const_pool.iter() {
+            if *val_existing == value {
+                return ref_existing;
+            }
+        }
+        // Placeholder — caller replaces with alloc_op_position result
+        let placeholder = OpRef(u32::MAX - const_pool.len() as u32);
+        const_pool.push((placeholder, value));
+        placeholder
+    }
+
     /// Get the string length from a constant string pointer.
     /// info.py: getstrlen() on ConstPtrInfo
     pub fn getstrlen(&self) -> Option<usize> {
@@ -660,9 +724,9 @@ impl PtrInfo {
     }
 
     /// info.py: make_guards(op, short_boxes, optimizer)
-    /// Generate guard operations to verify this pointer info.
-    /// Returns a list of opcodes and expected values for guards.
-    pub fn make_guards(&self) -> Vec<majit_ir::OpCode> {
+    /// Generate guard opcodes (without args) to verify this pointer info.
+    /// Legacy helper for tests — use make_guards() for full guard emission.
+    pub fn guard_opcodes(&self) -> Vec<majit_ir::OpCode> {
         match self {
             PtrInfo::NonNull { .. } => vec![majit_ir::OpCode::GuardNonnull],
             PtrInfo::KnownClass { .. } => vec![majit_ir::OpCode::GuardNonnullClass],
@@ -1650,17 +1714,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ptr_info_make_guards() {
+    fn test_ptr_info_guard_opcodes() {
         let nonnull = PtrInfo::nonnull();
-        let guards = nonnull.make_guards();
+        let guards = nonnull.guard_opcodes();
         assert!(guards.contains(&OpCode::GuardNonnull));
 
         let constant = PtrInfo::constant(GcRef(0x1000));
-        let guards = constant.make_guards();
+        let guards = constant.guard_opcodes();
         assert!(guards.contains(&OpCode::GuardValue));
 
         let kc = PtrInfo::known_class(GcRef(0x2000), true);
-        let guards = kc.make_guards();
+        let guards = kc.guard_opcodes();
         assert!(guards.contains(&OpCode::GuardNonnullClass));
     }
 
