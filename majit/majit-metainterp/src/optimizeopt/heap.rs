@@ -962,16 +962,21 @@ impl OptHeap {
         }
 
         // heap.py:640-643: constant_fold — pure getfield on constant object.
-        // RPython: protect_speculative_operation(op) validates the GcRef via
-        // cpu.protect_speculative_field(ref, fielddescr) which checks GC type
-        // ownership. Then execute_nonspec_const reads the field via CPU dispatch.
-        //
-        // majit has no GC type registry to validate object ownership, so
-        // protect_speculative_operation cannot be implemented safely.
-        // Without it, raw pointer dereference is UB (object may be stale).
-        // This is equivalent to protect_speculative_operation always raising
-        // SpeculativeError — the fold is skipped, falling through to the
-        // heap cache path below.
+        //   if descr.is_always_pure() and self.get_constant_box(arg0):
+        //       resbox = self.optimizer.constant_fold(op)
+        //       self.optimizer.make_constant(op, resbox)
+        if let Some(descr) = &op.descr {
+            if descr.is_always_pure() {
+                if ctx.get_constant_box(op.arg(0)).is_some() {
+                    if let Some(value) = ctx.constant_fold(&op) {
+                        let const_pos = ctx.alloc_op_position();
+                        ctx.make_constant(const_pos, value);
+                        ctx.replace_op(op.pos, const_pos);
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;

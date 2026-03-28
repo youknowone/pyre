@@ -1294,16 +1294,16 @@ impl OptContext {
     }
 
     fn number_guard_inline_fallback(&self, op: &mut Op) {
-        // RPython parity: store_final_boxes_in_guard already produced
-        // rd_numb via finalize_guard_resume_data. Assert completeness.
-        if op.rd_numb.is_some() {
+        // resume.py parity: after store_final_boxes_in_guard (via
+        // finalize_guard_resume_data), every guard has rd_numb.
+        // Guards without fail_args (FINISH) or with shared descr
+        // skip numbering entirely. This is a hard invariant — RPython's
+        // modifier.finish() (optimizer.py:735) is the single entry point
+        // for guard resume data generation.
+        if op.rd_numb.is_some() || op.fail_args.is_none() {
             return;
         }
-        if op.fail_args.is_none() {
-            return;
-        }
-        debug_assert!(
-            false,
+        panic!(
             "[jit] guard {:?} at {:?} missing rd_numb after store_final_boxes_in_guard",
             op.opcode, op.pos,
         );
@@ -1325,6 +1325,9 @@ impl OptContext {
         }
 
         // RPython parity: every guard has a snapshot from capture_resumedata.
+        // TODO: Phase 2 guards with rd_resume_position < 0 should not exist —
+        // they indicate missing snapshot propagation in unroll. Once fixed,
+        // this no-snapshot path should become a hard panic.
         // Guards without snapshot (optimizer-created, rd_resume_position < 0)
         // share resume data from _copy_resume_data_from. If they reach here
         // without a snapshot, build a minimal rd_numb directly from fail_args
@@ -1965,6 +1968,65 @@ impl OptContext {
     /// Get a constant Value for an OpRef, or None if not constant.
     pub fn get_constant_box(&self, opref: OpRef) -> Option<Value> {
         self.get_constant(opref).cloned()
+    }
+
+    /// optimizer.py:783-790: constant_fold(op).
+    /// Calls protect_speculative_operation, then execute_nonspec_const.
+    /// Returns None on SpeculativeError (fold skipped).
+    pub fn constant_fold(&self, op: &Op) -> Option<Value> {
+        self.protect_speculative_operation(op)?;
+        self.execute_nonspec_const(op)
+    }
+
+    /// optimizer.py:791-840: protect_speculative_operation(op).
+    /// Validates that constant GcRef args are safe to dereference.
+    /// Returns None (SpeculativeError) if validation fails.
+    fn protect_speculative_operation(&self, op: &Op) -> Option<()> {
+        // llmodel.py:555-567: protect_speculative_field.
+        // When supports_guard_gc_type is false (majit has no GC type registry),
+        // only null check is performed (llmodel.py:556-557).
+        if op.opcode.is_getfield() {
+            let gcref = match self.get_constant_box(op.arg(0))? {
+                Value::Ref(r) => r,
+                _ => return None,
+            };
+            if gcref.is_null() {
+                return None; // SpeculativeError
+            }
+        }
+        Some(())
+    }
+
+    /// executor.py:555: execute_nonspec_const — execute a pure op with
+    /// constant args via CPU dispatch. For GETFIELD_GC_*, reads the field
+    /// at (gcref + offset) with the correct type from FieldDescr.
+    fn execute_nonspec_const(&self, op: &Op) -> Option<Value> {
+        if !op.opcode.is_getfield() {
+            return None;
+        }
+        let gcref = match self.get_constant_box(op.arg(0))? {
+            Value::Ref(r) => r,
+            _ => return None,
+        };
+        let descr = op.descr.as_ref()?;
+        let (offset, field_size, field_type) = majit_ir::unpack_fielddescr(descr)?;
+        let addr = gcref.0 + offset;
+        // bh_getfield_gc_i/r/f dispatch by field_type + field_size.
+        match (field_type, field_size) {
+            (majit_ir::Type::Int, 8) => Some(Value::Int(unsafe { *(addr as *const i64) })),
+            (majit_ir::Type::Int, 4) => Some(Value::Int(unsafe { *(addr as *const i32) as i64 })),
+            (majit_ir::Type::Int, 2) => Some(Value::Int(unsafe { *(addr as *const i16) as i64 })),
+            (majit_ir::Type::Int, 1) => Some(Value::Int(unsafe { *(addr as *const u8) as i64 })),
+            (majit_ir::Type::Float, 8) => {
+                let bits = unsafe { *(addr as *const u64) };
+                Some(Value::Float(f64::from_bits(bits)))
+            }
+            (majit_ir::Type::Ref, _) => {
+                let ptr = unsafe { *(addr as *const usize) };
+                Some(Value::Ref(majit_ir::GcRef(ptr)))
+            }
+            _ => None,
+        }
     }
 
     /// RPython box.type parity: find the result type of the operation
