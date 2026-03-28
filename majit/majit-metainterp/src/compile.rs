@@ -217,10 +217,14 @@ pub(crate) fn build_guard_metadata(
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
         // resume.py _number_virtuals + _gettagged + getconst parity:
-        // build rd_virtuals_info from GuardVirtualEntry. Each field is tagged
-        // via _gettagged: Const → getconst (TAGINT/TAGCONST), Box → TAGBOX.
+        // Prefer op.rd_virtuals_info (set by optimizer's full snapshot path,
+        // line 1492) which has correct TAGVIRTUAL encoding. Only fall back
+        // to rebuilding from GuardVirtualEntry when rd_virtuals_info is absent.
         let fail_args_ref = op.fail_args.as_deref().unwrap_or(&[]);
-        let (rd_virtuals_info, rd_consts) = if let Some(ref entries) = op.rd_virtuals {
+        let (rd_virtuals_info, rd_consts) = if op.rd_virtuals_info.is_some() {
+            // Optimizer already produced authoritative rd_virtuals_info.
+            (op.rd_virtuals_info.clone(), rd_consts)
+        } else if let Some(ref entries) = op.rd_virtuals {
             let mut rd_consts_vec = rd_consts.clone().unwrap_or_default();
             let initial_consts_len = rd_consts_vec.len();
             let info: Vec<majit_ir::RdVirtualInfo> = entries
@@ -237,6 +241,22 @@ pub(crate) fn build_guard_metadata(
                                 .get(*fail_arg_idx)
                                 .copied()
                                 .unwrap_or(OpRef::NONE);
+                            // resume.py _number_virtuals parity: OpRef::NONE in
+                            // fail_args means this slot is a virtual. Find which
+                            // virtual entry it belongs to and encode as TAGVIRTUAL.
+                            if opref.is_none() {
+                                let vidx = entries
+                                    .iter()
+                                    .position(|e| e.fail_arg_index == *fail_arg_idx);
+                                if let Some(vidx) = vidx {
+                                    return majit_ir::resumedata::tag(
+                                        vidx as i32,
+                                        majit_ir::resumedata::TAGVIRTUAL,
+                                    )
+                                    .unwrap_or(majit_ir::resumedata::NULLREF);
+                                }
+                                return majit_ir::resumedata::NULLREF;
+                            }
                             if let Some(&raw_val) = constants.get(&opref.0) {
                                 let tp = constant_types.get(&opref.0).copied().unwrap_or(Type::Int);
                                 // resume.py getconst: INT → try TAGINT first.
@@ -253,7 +273,6 @@ pub(crate) fn build_guard_metadata(
                                     return majit_ir::resumedata::NULLREF;
                                 }
                                 // Large int / Ref / Float → TAGCONST via pool.
-                                // resume.py getconst: dedup (large_ints / refs).
                                 let existing = rd_consts_vec
                                     .iter()
                                     .position(|(v, t)| *v == raw_val && *t == tp);
@@ -268,7 +287,7 @@ pub(crate) fn build_guard_metadata(
                                 )
                                 .unwrap_or(majit_ir::resumedata::NULLREF)
                             } else {
-                                // Non-constant: TAGBOX(fail_arg_idx).
+                                // Non-constant, non-virtual: TAGBOX(fail_arg_idx).
                                 majit_ir::resumedata::tag(
                                     *fail_arg_idx as i32,
                                     majit_ir::resumedata::TAGBOX,

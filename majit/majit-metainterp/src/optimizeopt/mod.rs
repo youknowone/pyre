@@ -1193,8 +1193,23 @@ impl OptContext {
     fn number_guard_inline_impl(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
+        // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
+        // already produced rd_numb + liveboxes. Don't overwrite — UNLESS the
+        // guard has virtual placeholders (OpRef::NONE) in fail_args that need
+        // fresh TAGVIRTUAL encoding. Phase 2 guards inherit Phase 1 rd_numb
+        // which has wrong slot indices for Phase 2 fail_args.
         if op.rd_numb.is_some() {
-            return;
+            let has_virtual_slots = op
+                .fail_args
+                .as_ref()
+                .map_or(false, |fa| fa.iter().any(|r| r.is_none()));
+            if !has_virtual_slots {
+                return;
+            }
+            // Clear stale rd_numb/rd_virtuals_info to regenerate from
+            // current fail_args with correct TAGVIRTUAL encoding.
+            op.rd_numb = None;
+            op.rd_virtuals_info = None;
         }
 
         // RPython parity: every guard has a snapshot from capture_resumedata.
