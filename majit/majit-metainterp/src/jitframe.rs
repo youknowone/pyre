@@ -323,7 +323,16 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
                 // jitframe.py:128-130 — sanity check
                 let frame_lgt =
                     *((obj_addr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize);
-                debug_assert!((index as isize) < frame_lgt, "bogus frame field get");
+                if (index as isize) >= frame_lgt {
+                    eprintln!(
+                        "[GC] bogus frame field: index={} frame_lgt={} no={} bitindex={} gcmap_lgt={} obj_addr={:#x}",
+                        index, frame_lgt, no, bitindex, gcmap_lgt, obj_addr as usize
+                    );
+                    panic!(
+                        "bogus frame field get: index={} >= frame_lgt={}",
+                        index, frame_lgt
+                    );
+                }
                 // jitframe.py:131-133 — trace the slot
                 let slot_addr = (obj_addr as *mut u8)
                     .add(JF_FRAME_OFS + BASEITEMOFS + SIGN_SIZE * index)
