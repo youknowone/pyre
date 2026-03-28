@@ -9,91 +9,391 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};
 
-/// A node in the dependency graph.
+/// dependency.py:131-300: A node in the dependency graph.
+/// Each node wraps one operation and maintains forward/backward dependency edges.
 #[derive(Clone, Debug)]
 pub struct Node {
-    /// Index in the ops list.
+    /// Index in the ops list (dependency.py:134: opidx).
     pub idx: usize,
-    /// The operation.
+    /// The operation (dependency.py:133: op).
     pub op: Op,
-    /// Indices of operations this one depends on (must execute before).
+    /// dependency.py:135: adjacent_list — forward dependency edges (this → target).
+    pub adjacent_list: Vec<Dependency>,
+    /// dependency.py:136: adjacent_list_back — backward dependency edges (source → this).
+    pub adjacent_list_back: Vec<Dependency>,
+    /// dependency.py:137: memory_ref — MemoryRef for array access ops.
+    pub memory_ref: Option<MemoryRef>,
+    /// dependency.py:138: pack — which Pack this node belongs to.
+    pub pack: Option<usize>,
+    /// dependency.py:139: pack_position
+    pub pack_position: i32,
+    /// dependency.py:140: emitted — whether this node has been scheduled.
+    pub emitted: bool,
+    /// dependency.py:141: schedule_position
+    pub schedule_position: i32,
+    /// dependency.py:142: priority — scheduling priority.
+    pub priority: i32,
+    /// Compat: indices of operations this one depends on.
     pub deps: Vec<usize>,
-    /// Indices of operations that depend on this one (must execute after).
+    /// Compat: indices of operations that depend on this one.
     pub users: Vec<usize>,
 }
 
-/// Dependency graph for a loop body.
+impl Node {
+    pub fn new(op: Op, opidx: usize) -> Self {
+        Node {
+            idx: opidx,
+            op,
+            adjacent_list: Vec::new(),
+            adjacent_list_back: Vec::new(),
+            memory_ref: None,
+            pack: None,
+            pack_position: -1,
+            emitted: false,
+            schedule_position: -1,
+            priority: 0,
+            deps: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    /// dependency.py:161: setpriority
+    pub fn setpriority(&mut self, value: i32) {
+        self.priority = value;
+    }
+
+    /// dependency.py:243: provides_count
+    pub fn provides_count(&self) -> usize {
+        self.adjacent_list.len()
+    }
+
+    /// dependency.py:249: depends_count
+    pub fn depends_count(&self) -> usize {
+        self.adjacent_list_back.len()
+    }
+
+    /// dependency.py:268: is_after
+    pub fn is_after(&self, other_idx: usize) -> bool {
+        self.idx > other_idx
+    }
+
+    /// dependency.py:271: is_before
+    pub fn is_before(&self, other_idx: usize) -> bool {
+        self.idx < other_idx
+    }
+
+    /// dependency.py:167: is_pure
+    pub fn is_pure(&self) -> bool {
+        self.op.opcode.is_always_pure()
+    }
+
+    /// dependency.py:201-205: exits_early
+    pub fn exits_early(&self) -> bool {
+        if self.op.opcode.is_guard() {
+            // In RPython, descr.exits_early(). We check for GUARD_FUTURE_CONDITION etc.
+            matches!(self.op.opcode, OpCode::GuardFutureCondition)
+        } else {
+            false
+        }
+    }
+
+    /// dependency.py:207-208: loads_from_complex_object
+    pub fn loads_from_complex_object(&self) -> bool {
+        self.op.opcode.is_complex_load()
+    }
+
+    /// dependency.py:210-211: modifies_complex_object
+    pub fn modifies_complex_object(&self) -> bool {
+        self.op.opcode.is_complex_modify()
+    }
+}
+
+/// dependency.py:537: DependencyGraph — dependency graph for a loop body.
 #[derive(Clone, Debug)]
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
+    /// dependency.py:567: memory_refs — node index → MemoryRef
+    pub memory_refs: HashMap<usize, MemoryRef>,
+    /// dependency.py:569: index_vars — OpRef → IndexVar
+    pub index_vars: HashMap<OpRef, IndexVar>,
+    /// dependency.py:571: guards — guard node indices
+    pub guards: Vec<usize>,
+    /// dependency.py:565: invariant_vars — loop-invariant variables
+    pub invariant_vars: HashMap<OpRef, ()>,
 }
 
 impl DependencyGraph {
-    /// Build a dependency graph from a list of operations.
-    ///
-    /// Two operations have a dependency if:
-    /// - One uses the result of the other (data dependency)
-    /// - Both access memory and at least one is a write (memory dependency)
-    /// - One is a guard (control dependency)
-    pub fn build(ops: &[Op]) -> Self {
+    /// dependency.py:556-572: Build a dependency graph from loop operations.
+    /// Uses DefTracker and IntegralForwardModification for precise analysis.
+    pub fn build(ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) -> Self {
         let mut nodes: Vec<Node> = ops
             .iter()
             .enumerate()
-            .map(|(idx, op)| Node {
-                idx,
-                op: op.clone(),
-                deps: Vec::new(),
-                users: Vec::new(),
-            })
+            .map(|(idx, op)| Node::new(op.clone(), idx))
             .collect();
 
-        // Map from OpRef (producer position) to node index
-        let mut def_map: HashMap<OpRef, usize> = HashMap::new();
-        for (i, op) in ops.iter().enumerate() {
-            def_map.insert(op.pos, i);
+        let mut graph = DependencyGraph {
+            nodes,
+            memory_refs: HashMap::new(),
+            index_vars: HashMap::new(),
+            guards: Vec::new(),
+            invariant_vars: HashMap::new(),
+        };
+
+        graph.build_dependencies(ops, constant_of);
+        graph
+    }
+
+    /// dependency.py:596-644: build_dependencies — construct def-use chains
+    /// with DefTracker and IntegralForwardModification.
+    fn build_dependencies(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
+        let mut tracker = DefTracker::new(self);
+        let mut intformod = IntegralForwardModification::new(constant_of);
+
+        for i in 0..self.nodes.len() {
+            let op = &self.nodes[i].op.clone();
+
+            // dependency.py:613-616: set priority for pure/guard ops
+            if op.opcode.is_always_pure() {
+                self.nodes[i].setpriority(1);
+            }
+            if op.opcode.is_guard() {
+                self.nodes[i].setpriority(2);
+            }
+
+            // dependency.py:620: inspect for index variables and memory refs
+            intformod.inspect_operation(op, i);
+            if let Some(mref) = intformod.memory_refs.get(&i) {
+                self.nodes[i].memory_ref = Some(mref.clone());
+                self.memory_refs.insert(i, mref.clone());
+            }
+
+            // dependency.py:622-624: define result variable
+            if op.opcode.result_type() != majit_ir::Type::Void {
+                tracker.define(op.pos, i);
+            }
+
+            // dependency.py:626-644: build edges based on op type
+            if op.opcode.is_always_pure() || op.opcode.is_final() {
+                // dependency.py:628-629: pure/final — depend on all args
+                let args: Vec<OpRef> = op.args.to_vec();
+                for arg in &args {
+                    Self::depends_on_arg_static(&tracker, *arg, i, &mut self.nodes);
+                }
+            } else if op.opcode.is_guard() {
+                // dependency.py:630-642: guard dependencies
+                if !self.nodes[i].exits_early() {
+                    // dependency.py:635-640: guard ordering + non-pure deps
+                    if !self.guards.is_empty() {
+                        let last_guard = *self.guards.last().unwrap();
+                        Self::add_edge(&mut self.nodes, last_guard, i, None, true);
+                    }
+                    for &np_idx in &tracker.non_pure.clone() {
+                        Self::add_edge(&mut self.nodes, np_idx, i, None, true);
+                    }
+                    tracker.non_pure.clear();
+                }
+                self.guards.push(i);
+                // dependency.py:642: build_guard_dependencies
+                self.build_guard_dependencies(i, &mut tracker, ops);
+            } else {
+                // dependency.py:644: non-pure (memory side effects)
+                self.build_non_pure_dependencies(i, &mut tracker, ops);
+            }
         }
 
-        // Build data dependencies
-        for i in 0..ops.len() {
-            let op = &ops[i];
-            for arg in &op.args {
-                if let Some(&dep_idx) = def_map.get(arg) {
-                    if dep_idx != i {
-                        nodes[i].deps.push(dep_idx);
-                        nodes[dep_idx].users.push(i);
+        // Copy index_vars from intformod
+        self.index_vars = intformod.index_vars;
+    }
+
+    /// dependency.py:708-735: build_guard_dependencies
+    fn build_guard_dependencies(&mut self, guard_idx: usize, tracker: &mut DefTracker, ops: &[Op]) {
+        let op = self.nodes[guard_idx].op.clone();
+        // dependency.py:714-715: true dependencies on args
+        for arg in &op.args.to_vec() {
+            Self::depends_on_arg_static(tracker, *arg, guard_idx, &mut self.nodes);
+        }
+        // dependency.py:717: guard_argument_protection
+        self.guard_argument_protection(guard_idx, tracker);
+        // dependency.py:723-735: fail_args dependencies
+        if let Some(ref fail_args) = op.fail_args {
+            let fa = fail_args.to_vec();
+            for arg in &fa {
+                if arg.is_none() {
+                    continue;
+                }
+                if !tracker.is_defined(*arg) {
+                    continue;
+                }
+                if let Some(at_idx) = tracker.definition(*arg) {
+                    if self.nodes[at_idx].is_before(guard_idx) {
+                        Self::add_edge(&mut self.nodes, at_idx, guard_idx, Some(*arg), true);
                     }
                 }
             }
+        }
+    }
 
-            // fail_args also create dependencies
-            if let Some(ref fa) = op.fail_args {
-                for arg in fa.iter() {
-                    if let Some(&dep_idx) = def_map.get(arg) {
-                        if dep_idx != i && !nodes[i].deps.contains(&dep_idx) {
-                            nodes[i].deps.push(dep_idx);
-                            nodes[dep_idx].users.push(i);
-                        }
+    /// dependency.py:646-698: guard_argument_protection
+    fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
+        let op = self.nodes[guard_idx].op.clone();
+        // dependency.py:657-664: redefine non-int/float pointer args at guard
+        for arg in &op.args.to_vec() {
+            if !arg.is_constant() {
+                // In RPython, this checks arg.type not in ('i','f').
+                // For majit, we check if it's a reference type.
+                let tp = op.opcode.result_type();
+                // Conservatively redefine: guards on pointers
+                if matches!(
+                    self.nodes[guard_idx].op.opcode,
+                    OpCode::GuardNonnull | OpCode::GuardClass | OpCode::GuardSubclass
+                ) {
+                    tracker.define(*arg, guard_idx);
+                }
+            }
+        }
+        // dependency.py:665-698: special guard priorities
+        match op.opcode {
+            OpCode::GuardNotForced2 => {
+                self.nodes[guard_idx].setpriority(-10);
+            }
+            OpCode::GuardOverflow | OpCode::GuardNoOverflow => {
+                self.nodes[guard_idx].setpriority(100);
+                // Find preceding overflow operation
+                let mut j = guard_idx;
+                while j > 0 {
+                    j -= 1;
+                    if self.nodes[j].op.opcode.is_ovf() {
+                        Self::add_edge(&mut self.nodes, j, guard_idx, None, false);
+                        break;
                     }
+                }
+            }
+            OpCode::GuardNoException | OpCode::GuardException | OpCode::GuardNotForced => {
+                self.nodes[guard_idx].setpriority(100);
+                // Find preceding can-raise operation
+                let mut j = guard_idx;
+                while j > 0 {
+                    j -= 1;
+                    if self.nodes[j].op.opcode.can_raise() || self.nodes[j].op.opcode.is_guard() {
+                        Self::add_edge(&mut self.nodes, j, guard_idx, None, false);
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// dependency.py:737-784: build_non_pure_dependencies
+    fn build_non_pure_dependencies(
+        &mut self,
+        node_idx: usize,
+        tracker: &mut DefTracker,
+        ops: &[Op],
+    ) {
+        let op = self.nodes[node_idx].op.clone();
+
+        if self.nodes[node_idx].loads_from_complex_object() {
+            // dependency.py:742-751: complex object load
+            let cobj = op.args[0];
+            Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
+            if op.args.len() > 1 {
+                let index_var = op.args[1];
+                Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
+            }
+        } else {
+            // dependency.py:752-777: side effect arguments
+            for arg in &op.args.to_vec() {
+                Self::depends_on_arg_static(tracker, *arg, node_idx, &mut self.nodes);
+            }
+            if self.nodes[node_idx].modifies_complex_object() {
+                // dependency.py:776-777: redefine modified args
+                if !op.args.is_empty() {
+                    tracker.define(op.args[0], node_idx);
                 }
             }
         }
 
-        // Memory dependencies: sequential ordering for loads/stores
-        // to the same descriptor (conservative: treat all memory ops as aliasing)
-        let mut last_memory_op: Option<usize> = None;
-        for i in 0..ops.len() {
-            if ops[i].opcode.is_memory_access() {
-                if let Some(prev) = last_memory_op {
-                    if !nodes[i].deps.contains(&prev) {
-                        nodes[i].deps.push(prev);
-                        nodes[prev].users.push(i);
-                    }
+        // dependency.py:780-782: non-pure must follow last guard
+        if !self.guards.is_empty() {
+            let last_guard = *self.guards.last().unwrap();
+            Self::add_edge(&mut self.nodes, last_guard, node_idx, None, false);
+        }
+        // dependency.py:784: track as non-pure
+        tracker.add_non_pure(node_idx);
+    }
+
+    /// Helper: add a dependency edge between two nodes (dependency.py:170-195 Node.edge_to).
+    fn add_edge(
+        nodes: &mut Vec<Node>,
+        from_idx: usize,
+        to_idx: usize,
+        arg: Option<OpRef>,
+        failarg: bool,
+    ) {
+        if from_idx == to_idx {
+            return;
+        }
+        // Check if edge already exists
+        let existing = nodes[from_idx]
+            .adjacent_list
+            .iter()
+            .position(|d| d.to_idx == to_idx);
+        if let Some(pos) = existing {
+            // dependency.py:186-194: update existing edge
+            if let Some(a) = arg {
+                if !nodes[from_idx].adjacent_list[pos].because_of(a) {
+                    nodes[from_idx].adjacent_list[pos].args.push((from_idx, a));
                 }
-                last_memory_op = Some(i);
+            }
+            if !(nodes[from_idx].adjacent_list[pos].failarg && failarg) {
+                nodes[from_idx].adjacent_list[pos].failarg = false;
+            }
+        } else {
+            // dependency.py:176-180: create new edge + backward edge
+            let dep = Dependency::new(from_idx, to_idx, arg);
+            nodes[from_idx].adjacent_list.push(dep);
+            let dep_back = Dependency::new(to_idx, from_idx, arg);
+            nodes[to_idx].adjacent_list_back.push(dep_back);
+            // Compat: update deps/users
+            if !nodes[to_idx].deps.contains(&from_idx) {
+                nodes[to_idx].deps.push(from_idx);
+                nodes[from_idx].users.push(to_idx);
             }
         }
+    }
 
-        DependencyGraph { nodes }
+    /// Helper: depends_on_arg using DefTracker (works with &mut nodes borrow).
+    fn depends_on_arg_static(
+        tracker: &DefTracker,
+        arg: OpRef,
+        to_idx: usize,
+        nodes: &mut Vec<Node>,
+    ) {
+        if let Some(at_idx) = tracker.definition(arg) {
+            if at_idx != to_idx {
+                // Inline add_edge logic to avoid double borrow issues
+                let existing = nodes[at_idx]
+                    .adjacent_list
+                    .iter()
+                    .position(|d| d.to_idx == to_idx);
+                if let Some(pos) = existing {
+                    if !nodes[at_idx].adjacent_list[pos].because_of(arg) {
+                        nodes[at_idx].adjacent_list[pos].args.push((at_idx, arg));
+                    }
+                } else {
+                    let dep = Dependency::new(at_idx, to_idx, Some(arg));
+                    nodes[at_idx].adjacent_list.push(dep);
+                    let dep_back = Dependency::new(to_idx, at_idx, Some(arg));
+                    nodes[to_idx].adjacent_list_back.push(dep_back);
+                    if !nodes[to_idx].deps.contains(&at_idx) {
+                        nodes[to_idx].deps.push(at_idx);
+                        nodes[at_idx].users.push(to_idx);
+                    }
+                }
+            }
+        }
     }
 
     /// Find groups of independent, isomorphic operations that can be packed.
@@ -448,18 +748,16 @@ impl Dependency {
 /// dependency.py:473-535: Tracks definitions of OpRefs during
 /// dependency graph construction. Maps each OpRef to the node(s)
 /// that define it, enabling def-use chain queries.
-pub struct DefTracker<'a> {
-    pub graph: &'a DependencyGraph,
+pub struct DefTracker {
     /// OpRef → list of (defining node index, optional memory ref cell)
     pub defs: HashMap<OpRef, Vec<(usize, Option<usize>)>>,
     /// Nodes with side effects (non-pure).
     pub non_pure: Vec<usize>,
 }
 
-impl<'a> DefTracker<'a> {
-    pub fn new(graph: &'a DependencyGraph) -> Self {
+impl DefTracker {
+    pub fn new(_graph: &DependencyGraph) -> Self {
         DefTracker {
-            graph,
             defs: HashMap::new(),
             non_pure: Vec::new(),
         }
