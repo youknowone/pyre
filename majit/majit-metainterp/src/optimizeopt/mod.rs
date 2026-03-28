@@ -995,13 +995,20 @@ impl OptContext {
                 ns.append_int(0); // vref_array len
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
+                // resume.py _number_virtuals: TAGVIRTUAL for virtual slots.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
-                        // TODO(TAGVIRTUAL): resume.py _number_virtuals encodes
-                        // virtual slots as TAGVIRTUAL(vidx). Currently NULLREF;
-                        // requires investigation of spectral_norm/fannkuch
-                        // regression before enabling.
-                        ns.append_short(resumedata::NULLREF);
+                        let vidx = op
+                            .rd_virtuals
+                            .as_ref()
+                            .and_then(|entries| entries.iter().position(|e| e.fail_arg_index == i));
+                        if let Some(vidx) = vidx {
+                            let t = resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
+                                .unwrap_or(resumedata::NULLREF);
+                            ns.append_short(t);
+                        } else {
+                            ns.append_short(resumedata::NULLREF);
+                        }
                     } else {
                         let t = resumedata::tag(i as i32, resumedata::TAGBOX)
                             .unwrap_or(resumedata::NULLREF);

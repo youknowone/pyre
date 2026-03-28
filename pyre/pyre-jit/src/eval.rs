@@ -1864,9 +1864,10 @@ fn restore_guard_failure_for_loop(
     // Fallback: restore frame state for interpreter continuation.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
+        // Verify frame slots after restore.
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
-            jit_state.next_instr, jit_state.valuestackdepth
+            jit_state.next_instr, jit_state.valuestackdepth,
         );
     }
 
