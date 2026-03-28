@@ -1916,26 +1916,28 @@ impl<S: JitState> JitDriver<S> {
 
     /// interp_jit.py:259 releaseall → memmgr.py:85 release_all_loops.
     ///
-    /// RPython: alive_loops.clear() drops the memory manager's strong
-    /// references to LoopTokens. JitCells hold weakrefs, so tokens
-    /// that are still on a thread stack survive; the rest become GC
-    /// garbage. Crucially, tokens are NOT invalidated — compiled code
-    /// that is currently running or reachable via a JitCell weakref
-    /// remains valid.
+    /// memmgr.py:85 release_all_loops → alive_loops.clear().
     ///
-    /// majit has no GC or weakrefs. The closest equivalent is a no-op:
-    /// compiled code stays valid and warm-state is untouched. Future
-    /// work can add generation-based eviction (memmgr.py:16-20).
+    /// RPython: alive_loops holds the only strong references to
+    /// LoopTokens. Clearing it makes tokens eligible for GC collection.
+    /// JitCells hold weakrefs, so tokens referenced by an active thread
+    /// stack survive until the stack unwinds. Tokens are NOT invalidated.
+    ///
+    /// majit has no GC or weakrefs. We clear compiled_loops (the
+    /// equivalent of alive_loops) which drops majit's strong ownership.
+    /// Warm-state cells are untouched — they can re-trigger compilation.
+    /// Machine code is not invalidated: if a guard failure path still
+    /// references a removed entry it will simply miss the lookup and
+    /// fall back to the interpreter, matching the RPython "dangling
+    /// weakref → re-compile" path.
     pub fn mark_all_loops_for_release(&mut self) {
-        // No-op: without GC, there is no "drop strong ref" to perform.
-        // Calling invalidate() here would be stronger than RPython and
-        // would break currently-running compiled code.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][releaseall] {} compiled loops (no-op, no GC)",
+                "[jit][releaseall] releasing {} compiled loops",
                 self.meta.compiled_loops.len()
             );
         }
+        self.meta.compiled_loops.clear();
     }
 
     /// Invalidate compiled code for a specific trace_id, removing the

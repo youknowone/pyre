@@ -496,27 +496,26 @@ pub fn residual_call(
 pub fn set_param(
     _space: pyre_object::PyObjectRef,
     __args__: &[pyre_object::PyObjectRef],
-) -> pyre_object::PyObjectRef {
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let _ = _space;
     let (driver, _) = driver_pair();
 
     // Separate positional args from kwargs dict (last arg with __pyre_kw__ marker).
     let (pos_args, kwds) = split_kwargs(__args__);
 
-    // interp_jit.py:147-148 — at most 1 non-keyword argument
+    // interp_jit.py:147-148
     if pos_args.len() > 1 {
-        eprintln!(
-            "TypeError: set_param() takes at most 1 non-keyword argument, {} given",
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "set_param() takes at most 1 non-keyword argument, {} given",
             pos_args.len()
-        );
-        return w_none();
+        )));
     }
 
     // interp_jit.py:151-156 — positional string → jit.set_user_param(None, text)
     if pos_args.len() == 1 {
         let w_text = pos_args[0];
         if !unsafe { pyre_object::is_str(w_text) } {
-            return w_none();
+            return Ok(w_none());
         }
         let text = unsafe { pyre_object::w_str_get_value(w_text) };
         // rlib/jit.py:842-845
@@ -537,10 +536,12 @@ pub fn set_param(
                 if s.is_empty() {
                     continue;
                 }
+                // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
                 let Some((name, value)) = s.split_once('=') else {
-                    // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
-                    eprintln!("ValueError: error in JIT parameters string");
-                    return w_none();
+                    return Err(pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::ValueError,
+                        "error in JIT parameters string".to_string(),
+                    ));
                 };
                 let value = value.trim();
                 if name == "enable_opts" {
@@ -548,8 +549,10 @@ pub fn set_param(
                 } else if let Ok(parsed) = value.parse::<i64>() {
                     ws.set_param(name, parsed);
                 } else {
-                    eprintln!("ValueError: error in JIT parameters string");
-                    return w_none();
+                    return Err(pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::ValueError,
+                        "error in JIT parameters string".to_string(),
+                    ));
                 }
             }
         }
@@ -576,8 +579,9 @@ pub fn set_param(
             }
             // interp_jit.py:160-167 — validate parameter name
             if !is_known_jit_param(key) {
-                eprintln!("TypeError: no JIT parameter '{key}'");
-                return w_none();
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "no JIT parameter '{key}'"
+                )));
             }
             if unsafe { pyre_object::is_int(v) } {
                 ws.set_param(key, unsafe { pyre_object::w_int_get_value(v) });
@@ -585,7 +589,7 @@ pub fn set_param(
         }
     }
 
-    w_none()
+    Ok(w_none())
 }
 
 /// rlib/jit.py:588-605 PARAMETERS — valid parameter names.
