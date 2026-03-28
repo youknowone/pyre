@@ -182,7 +182,7 @@ const DEFAULT_THRESHOLD: u32 = 1039;
 const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
 
 /// rlib/jit.py:590 trace_eagerness = 200
-const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
+const DEFAULT_TRACE_EAGERNESS: u32 = 200;
 
 /// rlib/jit.py:601 max_unroll_recursion = 7
 const DEFAULT_MAX_UNROLL_RECURSION: u32 = 7;
@@ -225,8 +225,11 @@ pub struct WarmEnterState {
     cells: HashMap<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
-    /// Guard failure threshold for triggering bridge compilation.
-    bridge_threshold: u32,
+    /// warmstate.py: trace_eagerness parameter (integer, default 200).
+    trace_eagerness: u32,
+    /// warmstate.py: increment_trace_eagerness = compute_threshold(trace_eagerness).
+    /// Pre-computed f64 increment for guard failure counter ticking.
+    increment_trace_eagerness: f64,
     /// Function call threshold for inlining during tracing.
     ///
     /// A function must be called at least this many times before
@@ -351,7 +354,10 @@ impl WarmEnterState {
             counter: JitCounter::new(threshold),
             cells: HashMap::new(),
             threshold,
-            bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
+            trace_eagerness: DEFAULT_TRACE_EAGERNESS,
+            increment_trace_eagerness: JitCounter::compute_threshold_static(
+                DEFAULT_TRACE_EAGERNESS,
+            ),
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -385,7 +391,10 @@ impl WarmEnterState {
             counter: JitCounter::new(threshold),
             cells: HashMap::new(),
             threshold,
-            bridge_threshold: DEFAULT_BRIDGE_THRESHOLD,
+            trace_eagerness: DEFAULT_TRACE_EAGERNESS,
+            increment_trace_eagerness: JitCounter::compute_threshold_static(
+                DEFAULT_TRACE_EAGERNESS,
+            ),
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -663,23 +672,39 @@ impl WarmEnterState {
         self.jitlog.as_ref()
     }
 
-    /// Get the bridge compilation threshold.
-    pub fn bridge_threshold(&self) -> u32 {
-        self.bridge_threshold
+    /// warmstate.py: trace_eagerness parameter (integer).
+    pub fn trace_eagerness(&self) -> u32 {
+        self.trace_eagerness
     }
 
-    /// Set the bridge compilation threshold.
-    pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.bridge_threshold = threshold;
+    /// warmstate.py:259: set_param_trace_eagerness.
+    pub fn set_param_trace_eagerness(&mut self, value: u32) {
+        self.trace_eagerness = value;
+        self.increment_trace_eagerness = JitCounter::compute_threshold_static(value);
     }
 
-    /// compile.py must_compile / counter.py tick(hash, increment_trace_eagerness):
+    /// warmstate.py: increment_trace_eagerness (pre-computed f64).
+    pub fn increment_trace_eagerness(&self) -> f64 {
+        self.increment_trace_eagerness
+    }
+
+    /// compile.py:783-784: jitcounter.tick(hash, increment_trace_eagerness).
     /// Increment the guard failure counter using the shared timetable.
-    /// Returns true when bridge_threshold (trace_eagerness=200) is reached.
+    /// Returns true when counter reaches 1.0 (trace_eagerness ticks).
     #[inline]
     pub fn tick_guard_failure(&mut self, guard_hash: u64) -> bool {
         self.counter
-            .tick_with_threshold(guard_hash, self.bridge_threshold)
+            .tick_with_increment(guard_hash, self.increment_trace_eagerness)
+    }
+
+    /// Compat alias: bridge_threshold() returns trace_eagerness.
+    pub fn bridge_threshold(&self) -> u32 {
+        self.trace_eagerness
+    }
+
+    /// Compat alias: set_bridge_threshold delegates to set_param_trace_eagerness.
+    pub fn set_bridge_threshold(&mut self, threshold: u32) {
+        self.set_param_trace_eagerness(threshold);
     }
 
     /// compile.py:826-830: store_hash — allocate a jitcounter hash for
@@ -701,11 +726,6 @@ impl WarmEnterState {
     /// RPython-compatible wrapper: set_param_threshold.
     pub fn set_param_threshold(&mut self, threshold: u32) {
         self.set_threshold(threshold);
-    }
-
-    /// RPython-compatible wrapper: set_param_trace_eagerness (alias bridge threshold).
-    pub fn set_param_trace_eagerness(&mut self, value: u32) {
-        self.set_bridge_threshold(value);
     }
 
     /// RPython-compatible wrapper: set_param_trace_limit.
@@ -852,7 +872,7 @@ impl WarmEnterState {
     /// Restore warm-state parameters to rlib/jit.py:588-605 PARAMETERS defaults.
     pub fn set_default_params(&mut self) {
         self.set_threshold(DEFAULT_THRESHOLD); // 1039
-        self.set_bridge_threshold(DEFAULT_BRIDGE_THRESHOLD); // 200
+        self.set_bridge_threshold(DEFAULT_TRACE_EAGERNESS); // 200
         self.set_trace_limit(DEFAULT_TRACE_LIMIT); // 6000
         self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD); // 1619
         self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH); // 7
@@ -1123,7 +1143,7 @@ impl WarmEnterState {
         match name {
             "threshold" => self.set_threshold(as_u32),
             "trace_limit" => self.trace_limit = as_u32,
-            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = as_u32,
+            "trace_eagerness" | "bridge_threshold" => self.set_param_trace_eagerness(as_u32),
             "function_threshold" => self.function_threshold = as_u32,
             "max_inline_depth" => self.max_inline_depth = as_u32,
             "retrace_limit" => self.retrace_limit = as_u32,
@@ -1201,7 +1221,7 @@ impl WarmEnterState {
         match name {
             "threshold" => Some(self.counter.threshold() as i64),
             "trace_limit" => Some(self.trace_limit as i64),
-            "trace_eagerness" | "bridge_threshold" => Some(self.bridge_threshold as i64),
+            "trace_eagerness" | "bridge_threshold" => Some(self.trace_eagerness as i64),
             "function_threshold" => Some(self.function_threshold as i64),
             "max_inline_depth" => Some(self.max_inline_depth as i64),
             "retrace_limit" => Some(self.retrace_limit as i64),
@@ -1225,7 +1245,9 @@ impl WarmEnterState {
         match name {
             "threshold" => self.set_threshold(1039), // RPython default
             "trace_limit" => self.trace_limit = DEFAULT_TRACE_LIMIT,
-            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = 200,
+            "trace_eagerness" | "bridge_threshold" => {
+                self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS)
+            }
             "function_threshold" => self.function_threshold = DEFAULT_FUNCTION_THRESHOLD,
             "max_inline_depth" => self.max_inline_depth = 10,
             "retrace_limit" => self.retrace_limit = DEFAULT_RETRACE_LIMIT,

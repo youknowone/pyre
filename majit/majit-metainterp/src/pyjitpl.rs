@@ -327,9 +327,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) compiled_loops: HashMap<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
-    /// Trace eagerness: start tracing from a guard failure point
-    /// after this many failures (0 = never trace from guards).
-    pub(crate) trace_eagerness: u32,
     /// Virtualizable info for interpreter frame virtualization.
     ///
     /// When set, the JIT will:
@@ -698,7 +695,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: HashMap::new(),
             tracing: None,
             next_trace_id: 1,
-            trace_eagerness: 200,
             virtualizable_info: None,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -757,13 +753,9 @@ impl<M: Clone> MetaInterp<M> {
         Vec::new()
     }
 
-    /// Set the trace eagerness (guard failure threshold for bridge tracing).
-    /// RPython warmstate.py set_param_trace_eagerness: updates both the
-    /// MetaInterp field and warmstate.bridge_threshold so that must_compile /
-    /// would_fire_with_threshold see the same value.
+    /// warmstate.py:259: set_param_trace_eagerness — delegates to warmstate.
     pub fn set_trace_eagerness(&mut self, eagerness: u32) {
-        self.trace_eagerness = eagerness;
-        self.warm_state.set_bridge_threshold(eagerness);
+        self.warm_state.set_param_trace_eagerness(eagerness);
     }
 
     /// Update the green_key associated with the current trace.
@@ -785,10 +777,9 @@ impl<M: Clone> MetaInterp<M> {
             .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
     }
 
-    /// Set the bridge compilation threshold.
+    /// Compat alias: delegates to set_trace_eagerness.
     pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.trace_eagerness = threshold;
-        self.warm_state.set_bridge_threshold(threshold);
+        self.set_trace_eagerness(threshold);
     }
 
     /// Set the main compilation threshold.
@@ -3991,12 +3982,13 @@ impl<M: Clone> MetaInterp<M> {
             .get(&green_key)
             .and_then(|c| c.guard_failures.get(&(c.root_trace_id, fail_index)))
             .is_some_and(|info| {
-                self.warm_state
-                    .counter
-                    .would_fire_with_threshold(info.guard_hash, self.warm_state.bridge_threshold())
+                self.warm_state.counter.would_fire_with_increment(
+                    info.guard_hash,
+                    self.warm_state.increment_trace_eagerness(),
+                )
             });
         if would {
-            self.warm_state.bridge_threshold()
+            self.warm_state.trace_eagerness()
         } else {
             0
         }
@@ -5086,14 +5078,14 @@ impl<M: Clone> MetaInterp<M> {
                             .guard_hash
                             .wrapping_mul(777767777)
                             .wrapping_add((intval as u64).wrapping_mul(1442968193));
-                        self.warm_state.counter.would_fire_with_threshold(
+                        self.warm_state.counter.would_fire_with_increment(
                             per_value_hash,
-                            self.warm_state.bridge_threshold(),
+                            self.warm_state.increment_trace_eagerness(),
                         )
                     } else {
-                        self.warm_state.counter.would_fire_with_threshold(
+                        self.warm_state.counter.would_fire_with_increment(
                             info.guard_hash,
-                            self.warm_state.bridge_threshold(),
+                            self.warm_state.increment_trace_eagerness(),
                         )
                     }
                 });

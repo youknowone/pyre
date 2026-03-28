@@ -71,7 +71,7 @@ impl JitCounter {
 
     /// counter.py:122-126 compute_threshold
     /// Returns f64 (Python float) — same as RPython.
-    fn compute_threshold_static(threshold: u32) -> f64 {
+    pub fn compute_threshold_static(threshold: u32) -> f64 {
         if threshold <= 0 {
             return 0.0;
         }
@@ -149,7 +149,7 @@ impl JitCounter {
         self.would_fire_with_increment(hash, Self::compute_threshold_static(threshold))
     }
 
-    fn would_fire_with_increment(&self, hash: u64, increment: f64) -> bool {
+    pub fn would_fire_with_increment(&self, hash: u64, increment: f64) -> bool {
         let index = Self::get_index(hash);
         let subhash = Self::get_subhash(hash);
         let entry = &self.timetable[index];
