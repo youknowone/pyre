@@ -1313,8 +1313,6 @@ fn bound_reached(
             _ => None,
         };
         // compile.py:701-703: must_compile → _trace_and_compile_from_bridge.
-        // Bridge is compiled BEFORE blackhole, with the frame in its
-        // guard-failure-restored state (ni, vsd from fail_args).
         let bridge_compiled = if let Some(ref req) = bridge_request {
             if !stack_almost_full() {
                 crate::call_jit::jit_bridge_compile_for_guard(
