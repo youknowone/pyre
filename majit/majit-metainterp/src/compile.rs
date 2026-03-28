@@ -111,10 +111,15 @@ pub struct DeadFrameArtifacts {
 /// The backend numbers every guard and finish in a single exit table, so this
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
+/// resume.py ResumeDataLoopMemo parity: `constants` maps OpRef.0 → raw i64,
+/// `constant_types` maps OpRef.0 → Type. Used by `getconst` to encode
+/// virtual field constants as TAGINT/TAGCONST instead of TAGBOX.
 pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
+    constants: &std::collections::HashMap<u32, i64>,
+    constant_types: &std::collections::HashMap<u32, Type>,
 ) -> (
     HashMap<u32, StoredResumeData>,
     HashMap<u32, usize>,
@@ -185,10 +190,13 @@ pub(crate) fn build_guard_metadata(
         // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
-        // resume.py _number_virtuals parity: build rd_virtuals_info from
-        // GuardVirtualEntry. Each entry is (descr_index, known_class, fieldnums)
-        // where fieldnums are TAGBOX references into fail_args.
-        let rd_virtuals_info = if let Some(ref entries) = op.rd_virtuals {
+        // resume.py _number_virtuals + _gettagged + getconst parity:
+        // build rd_virtuals_info from GuardVirtualEntry. Each field is tagged
+        // via _gettagged: Const → getconst (TAGINT/TAGCONST), Box → TAGBOX.
+        let fail_args_ref = op.fail_args.as_deref().unwrap_or(&[]);
+        let (rd_virtuals_info, rd_consts) = if let Some(ref entries) = op.rd_virtuals {
+            let mut rd_consts_vec = rd_consts.clone().unwrap_or_default();
+            let initial_consts_len = rd_consts_vec.len();
             let info: Vec<(u32, Option<i64>, Vec<i16>)> = entries
                 .iter()
                 .map(|entry| {
@@ -198,19 +206,63 @@ pub(crate) fn build_guard_metadata(
                         .fields
                         .iter()
                         .map(|(_field_descr, fail_arg_idx)| {
-                            majit_ir::resumedata::tag(
-                                *fail_arg_idx as i32,
-                                majit_ir::resumedata::TAGBOX,
-                            )
-                            .unwrap_or(majit_ir::resumedata::NULLREF)
+                            // resume.py _gettagged: isinstance(box, Const) → getconst(box).
+                            let opref = fail_args_ref
+                                .get(*fail_arg_idx)
+                                .copied()
+                                .unwrap_or(OpRef::NONE);
+                            if let Some(&raw_val) = constants.get(&opref.0) {
+                                let tp = constant_types.get(&opref.0).copied().unwrap_or(Type::Int);
+                                // resume.py getconst: INT → try TAGINT first.
+                                if tp == Type::Int {
+                                    if let Ok(tagged) = majit_ir::resumedata::tag(
+                                        raw_val as i32,
+                                        majit_ir::resumedata::TAGINT,
+                                    ) {
+                                        return tagged;
+                                    }
+                                }
+                                // resume.py getconst: REF null → NULLREF.
+                                if tp == Type::Ref && raw_val == 0 {
+                                    return majit_ir::resumedata::NULLREF;
+                                }
+                                // Large int / Ref / Float → TAGCONST via pool.
+                                // resume.py getconst: dedup (large_ints / refs).
+                                let existing = rd_consts_vec
+                                    .iter()
+                                    .position(|(v, t)| *v == raw_val && *t == tp);
+                                let idx = existing.unwrap_or_else(|| {
+                                    let i = rd_consts_vec.len();
+                                    rd_consts_vec.push((raw_val, tp));
+                                    i
+                                });
+                                majit_ir::resumedata::tag(
+                                    (idx + majit_ir::resumedata::TAG_CONST_OFFSET as usize) as i32,
+                                    majit_ir::resumedata::TAGCONST,
+                                )
+                                .unwrap_or(majit_ir::resumedata::NULLREF)
+                            } else {
+                                // Non-constant: TAGBOX(fail_arg_idx).
+                                majit_ir::resumedata::tag(
+                                    *fail_arg_idx as i32,
+                                    majit_ir::resumedata::TAGBOX,
+                                )
+                                .unwrap_or(majit_ir::resumedata::NULLREF)
+                            }
                         })
                         .collect();
                     (descr_idx, known_class, fieldnums)
                 })
                 .collect();
-            Some(info)
+            // Only update rd_consts if new entries were added.
+            let updated_consts = if rd_consts_vec.len() > initial_consts_len {
+                Some(rd_consts_vec)
+            } else {
+                rd_consts
+            };
+            (Some(info), updated_consts)
         } else {
-            op.rd_virtuals_info.clone()
+            (op.rd_virtuals_info.clone(), rd_consts)
         };
 
         // Build recovery_layout from rd_virtuals (GuardVirtualEntry).
