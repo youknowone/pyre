@@ -39,6 +39,7 @@ pub fn trace_bytecode(
         owned_concrete_frame: Some(concrete_frame),
         parent_fail_args: Vec::new(),
         parent_fail_arg_types: Vec::new(),
+        parent_resumepc: 0,
         drop_frame_opref: None,
         caller_result_stack_idx: None,
         arg_state: pyre_bytecode::bytecode::OpArgState::default(),
