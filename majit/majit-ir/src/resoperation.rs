@@ -58,12 +58,16 @@ pub enum RdVirtualInfo {
         known_class: Option<i64>,
         fielddescr_indices: Vec<u32>,
         field_offsets: Vec<usize>,
+        field_types: Vec<Type>,
         fieldnums: Vec<i16>,
     },
     Struct {
         descr_index: u32,
+        known_class: Option<i64>,
+        object_size: usize,
         fielddescr_indices: Vec<u32>,
         field_offsets: Vec<usize>,
+        field_types: Vec<Type>,
         fieldnums: Vec<i16>,
     },
     Array {
