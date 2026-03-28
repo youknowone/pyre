@@ -4244,28 +4244,53 @@ impl<M: Clone> MetaInterp<M> {
             return (false, green_key);
         };
         let tid = Self::normalize_trace_id(compiled, trace_id);
+        // compile.py:826-830 store_hash + backend make_a_counter_per_value:
+        // RPython sets up the guard descriptor at compile time. In majit,
+        // we set up GuardFailureInfo lazily at first failure but immediately
+        // detect GUARD_VALUE and configure per_value (compile.py:813-824).
         let info = compiled
             .guard_failures
             .entry((tid, fail_index))
-            .or_insert_with(|| GuardFailureInfo {
-                guard_hash: self.warm_state.fetch_next_hash(),
-                compiling: false,
-                per_value: None,
-                copied_from: None,
+            .or_insert_with(|| {
+                let guard_hash = self.warm_state.fetch_next_hash();
+                // compile.py:813-824 make_a_counter_per_value parity:
+                // if this guard is GUARD_VALUE, set up per-value counting
+                // immediately (RPython does this at backend regalloc time).
+                let per_value = compiled
+                    .traces
+                    .get(&tid)
+                    .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
+                    .and_then(|op_idx| compiled.traces.get(&tid).and_then(|t| t.ops.get(op_idx)))
+                    .filter(|op| op.opcode == OpCode::GuardValue)
+                    .and_then(|guard_op| {
+                        let fa = guard_op.fail_args.as_ref()?;
+                        let arg0 = guard_op.arg(0);
+                        let idx = fa.iter().position(|&r| r == arg0)?;
+                        // compile.py:816-823: box.type → TY_INT/TY_REF/TY_FLOAT
+                        let tp = guard_op
+                            .fail_arg_types
+                            .as_ref()
+                            .and_then(|ts| ts.get(idx).copied())
+                            .unwrap_or(Type::Int);
+                        Some((idx as u32, tp))
+                    });
+                GuardFailureInfo {
+                    guard_hash,
+                    compiling: false,
+                    per_value,
+                    copied_from: None,
+                }
             });
         // compile.py:750-751: ST_BUSY_FLAG + stack_almost_full
         if info.compiling || Self::stack_almost_full() {
             return (false, owning_key);
         }
-        // compile.py:753-781: GUARD_VALUE per-value hash
-        let hash = if let Some((idx, tp)) = info.per_value {
-            let raw = fail_values.get(idx as usize).copied().unwrap_or(0);
-            let intval = match tp {
-                Type::Int => raw,
-                Type::Ref => raw,
-                Type::Float => raw,
-                _ => raw,
-            };
+        // compile.py:753-781: GUARD_VALUE per-value hash.
+        // RPython: hash = current_object_addr_as_int(self) * 777767777 + intval * 1442968193
+        // guard_hash (unique per guard from fetch_next_hash) serves as
+        // the stable guard identity, matching RPython's descriptor address.
+        let hash = if let Some((idx, _tp)) = info.per_value {
+            let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
             info.guard_hash
                 .wrapping_mul(777767777)
                 .wrapping_add((intval as u64).wrapping_mul(1442968193))
