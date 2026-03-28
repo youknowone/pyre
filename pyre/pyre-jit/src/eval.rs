@@ -742,6 +742,11 @@ fn stack_almost_full() -> bool {
 ///
 /// This is the main entry point for pyre-jit.
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
+    // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
+    static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
+        return pyre_interpreter::eval::eval_frame_plain(frame);
+    }
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_inline_call_override(
         crate::call_jit::maybe_handle_inline_concrete_call,
@@ -1776,7 +1781,7 @@ fn materialize_virtual_from_rd(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>, Vec<usize>)]>,
+    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     // resume.py:951: v = self.virtuals_cache.get_ptr(index)
@@ -1786,9 +1791,198 @@ fn materialize_virtual_from_rd(
     let Some(virtuals) = rd_virtuals_info else {
         return Value::Ref(majit_ir::GcRef::NULL);
     };
-    let Some((_descr_idx, known_class, fieldnums, field_offsets)) = virtuals.get(vidx) else {
+    let Some(entry) = virtuals.get(vidx) else {
         return Value::Ref(majit_ir::GcRef::NULL);
     };
+    // resume.py:1552-1588 decode_* parity.
+    fn decode_tagged_fieldnum(
+        tagged: i16,
+        dead_frame: &[Value],
+        num_failargs: i32,
+        rd_consts: &[(i64, majit_ir::Type)],
+        rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
+        virtuals_cache: &mut HashMap<usize, Value>,
+    ) -> Option<Value> {
+        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
+            return None;
+        }
+        let (val, tagbits) = majit_metainterp::resume::untag(tagged);
+        Some(match tagbits {
+            majit_ir::resumedata::TAGBOX => {
+                // resume.py:1556-1564: negative index → num + count
+                let idx = if val < 0 {
+                    (val + num_failargs) as usize
+                } else {
+                    val as usize
+                };
+                dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
+            }
+            majit_ir::resumedata::TAGINT => Value::Int(val as i64),
+            majit_ir::resumedata::TAGCONST => {
+                // resume.py:1552-1564: type-aware constant decode
+                if tagged == majit_ir::resumedata::NULLREF {
+                    return Some(Value::Ref(majit_ir::GcRef::NULL));
+                }
+                let ci = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+                let (c, tp) = rd_consts
+                    .get(ci)
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int));
+                match tp {
+                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
+                    majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
+                    _ => Value::Int(c),
+                }
+            }
+            majit_ir::resumedata::TAGVIRTUAL => {
+                return Some(materialize_virtual_from_rd(
+                    val as usize,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                ));
+            }
+            _ => Value::Int(0),
+        })
+    }
+    fn box_opt_value(v: &Option<Value>) -> pyre_object::PyObjectRef {
+        match v {
+            Some(Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
+            Some(Value::Int(n)) => pyre_object::intobject::w_int_new(*n),
+            Some(Value::Float(f)) => pyre_object::floatobject::w_float_new(*f),
+            _ => std::ptr::null_mut(),
+        }
+    }
+    // resume.py:643-760: dispatch by virtual kind.
+    match entry {
+        majit_ir::RdVirtualInfo::Array {
+            clear, fieldnums, ..
+        } => {
+            // resume.py:650-670: allocate_array(len, arraydescr, clear)
+            // then setarrayitem_ref/float/int per element.
+            // resume.py:659: skip UNINITIALIZED when clear=true (already zeroed).
+            let mut items = Vec::with_capacity(fieldnums.len());
+            for &fnum in fieldnums {
+                let v = decode_tagged_fieldnum(
+                    fnum,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                );
+                match &v {
+                    None if *clear => items.push(w_none()), // clear array: zero-init
+                    None => items.push(std::ptr::null_mut()), // not clear: skip
+                    _ => items.push(box_opt_value(&v)),
+                }
+            }
+            return Value::Ref(majit_ir::GcRef(
+                pyre_object::listobject::w_list_new(items) as usize
+            ));
+        }
+        majit_ir::RdVirtualInfo::ArrayStruct {
+            size, fieldnums, ..
+        } => {
+            // resume.py:748-760: allocate_array + setinteriorfield
+            let mut items = Vec::with_capacity(fieldnums.len());
+            for &fnum in fieldnums {
+                let v = decode_tagged_fieldnum(
+                    fnum,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                );
+                items.push(box_opt_value(&v));
+            }
+            return Value::Ref(majit_ir::GcRef(
+                pyre_object::listobject::w_list_new(items) as usize
+            ));
+        }
+        majit_ir::RdVirtualInfo::RawBuffer {
+            size,
+            offsets,
+            entry_sizes,
+            fieldnums,
+        } => {
+            // resume.py:701-708: allocate_raw_buffer + setrawbuffer_item
+            let buffer = unsafe {
+                std::alloc::alloc_zeroed(
+                    std::alloc::Layout::from_size_align(*size, 8)
+                        .unwrap_or(std::alloc::Layout::new::<u8>()),
+                )
+            };
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if let Some(val) = decode_tagged_fieldnum(
+                    fnum,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                ) {
+                    let offset = offsets.get(i).copied().unwrap_or(i * 8);
+                    let esz = entry_sizes.get(i).copied().unwrap_or(8);
+                    if offset + esz <= *size {
+                        let raw = match val {
+                            Value::Int(n) => n,
+                            Value::Float(f) => f.to_bits() as i64,
+                            _ => 0,
+                        };
+                        unsafe {
+                            match esz {
+                                1 => *(buffer.add(offset) as *mut u8) = raw as u8,
+                                2 => *(buffer.add(offset) as *mut u16) = raw as u16,
+                                4 => *(buffer.add(offset) as *mut u32) = raw as u32,
+                                _ => *(buffer.add(offset) as *mut i64) = raw,
+                            }
+                        }
+                    }
+                }
+            }
+            return Value::Int(buffer as i64);
+        }
+        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+            // resume.py:723-727: base_buffer + offset
+            if let Some(fnum) = fieldnums.first() {
+                if let Some(Value::Int(base)) = decode_tagged_fieldnum(
+                    *fnum,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                ) {
+                    return Value::Int(base + *offset as i64);
+                }
+            }
+            return Value::Int(0);
+        }
+        majit_ir::RdVirtualInfo::Empty => {
+            panic!("[jit] materialize_virtual: rd_virtuals[{vidx}] is Empty");
+        }
+        _ => {} // Instance/Struct: fall through
+    }
+    // Instance/Struct: extract fields for ob_type-based materialization.
+    let (known_class, fieldnums, field_offsets): (Option<i64>, &[i16], &[usize]) = match entry {
+        majit_ir::RdVirtualInfo::Instance {
+            known_class,
+            fieldnums,
+            field_offsets,
+            ..
+        } => (*known_class, fieldnums.as_slice(), field_offsets.as_slice()),
+        majit_ir::RdVirtualInfo::Struct {
+            fieldnums,
+            field_offsets,
+            ..
+        } => (None, fieldnums.as_slice(), field_offsets.as_slice()),
+        _ => unreachable!(),
+    };
+    let _field_offsets = field_offsets;
 
     // resume.py:617-621 VirtualInfo.allocate parity:
     //   Phase 1: struct = allocate_with_vtable(descr)
@@ -1925,7 +2119,7 @@ fn decode_tagged_value(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>, Vec<usize>)]>,
+    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     let (val, tagbits) = majit_metainterp::resume::untag(tagged);
@@ -2461,10 +2655,16 @@ fn rebuild_state_after_failure_from_recovery_layout(
     // resume.py parity: resolve field values from deadframe (raw_values),
     // not from rd_numb-decoded typed array. Virtual field values live at
     // deadframe positions beyond the frame slots.
-    let resolve_value = |src: &majit_codegen::ExitValueSourceLayout| -> Option<i64> {
+    // resume.py:1252 parity: resolve field values, including nested virtuals.
+    let resolve_value = |src: &majit_codegen::ExitValueSourceLayout,
+                         materialized: &[usize]|
+     -> Option<i64> {
         match src {
             majit_codegen::ExitValueSourceLayout::ExitValue(idx) => raw_values.get(*idx).copied(),
             majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+            majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                materialized.get(*vidx).map(|&ptr| ptr as i64)
+            }
             _ => None,
         }
     };
@@ -2477,7 +2677,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
             | majit_codegen::ExitVirtualLayout::Struct { fields, .. } => {
                 let field_vals: Vec<i64> = fields
                     .iter()
-                    .map(|(_, src)| resolve_value(src).unwrap_or(0))
+                    .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
                     .collect();
                 let ob_type = field_vals.first().copied().unwrap_or(0) as usize;
                 let payload_src = fields.get(1).map(|(_, src)| src);
@@ -2505,7 +2705,58 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 };
                 materialized.push(obj);
             }
-            _ => return false,
+            majit_codegen::ExitVirtualLayout::Array { clear, items, .. } => {
+                // resume.py:650-670: allocate_array + setarrayitem_*
+                let item_ptrs: Vec<pyre_object::PyObjectRef> = items
+                    .iter()
+                    .map(|src| match resolve_value(src, &materialized) {
+                        Some(v) => v as pyre_object::PyObjectRef,
+                        None if *clear => w_none(),
+                        None => std::ptr::null_mut(),
+                    })
+                    .collect();
+                materialized.push(pyre_object::listobject::w_list_new(item_ptrs) as usize);
+            }
+            majit_codegen::ExitVirtualLayout::ArrayStruct { element_fields, .. } => {
+                let item_ptrs: Vec<pyre_object::PyObjectRef> = element_fields
+                    .iter()
+                    .flat_map(|ef| {
+                        ef.iter().map(|(_, src)| {
+                            resolve_value(src, &materialized).unwrap_or(0)
+                                as pyre_object::PyObjectRef
+                        })
+                    })
+                    .collect();
+                materialized.push(pyre_object::listobject::w_list_new(item_ptrs) as usize);
+            }
+            majit_codegen::ExitVirtualLayout::RawBuffer { size, entries } => {
+                let buffer = unsafe {
+                    std::alloc::alloc_zeroed(
+                        std::alloc::Layout::from_size_align(*size, 8)
+                            .unwrap_or(std::alloc::Layout::new::<u8>()),
+                    )
+                };
+                for &(offset, esz, ref src) in entries {
+                    if let Some(val) = resolve_value(src, &materialized) {
+                        if offset + esz <= *size {
+                            unsafe {
+                                match esz {
+                                    1 => *(buffer.add(offset) as *mut u8) = val as u8,
+                                    2 => *(buffer.add(offset) as *mut u16) = val as u16,
+                                    4 => *(buffer.add(offset) as *mut u32) = val as u32,
+                                    _ => *(buffer.add(offset) as *mut i64) = val,
+                                }
+                            }
+                        }
+                    }
+                }
+                materialized.push(buffer as usize);
+            }
+            majit_codegen::ExitVirtualLayout::RawSlice { offset, base } => {
+                // resume.py:723-727: base_buffer + offset
+                let base_val = resolve_value(base, &materialized).unwrap_or(0);
+                materialized.push((base_val + *offset as i64) as usize);
+            }
         }
     }
 

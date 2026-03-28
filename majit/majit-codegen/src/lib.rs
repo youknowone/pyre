@@ -102,11 +102,18 @@ pub enum ExitVirtualLayout {
     },
     Array {
         descr_index: u32,
+        /// resume.py:653: allocate_array(length, arraydescr, self.clear)
+        clear: bool,
         items: Vec<ExitValueSourceLayout>,
     },
     ArrayStruct {
         descr_index: u32,
         element_fields: Vec<Vec<(u32, ExitValueSourceLayout)>>,
+    },
+    /// resume.py:717 VRawSliceInfo — base_buffer + offset.
+    RawSlice {
+        offset: usize,
+        base: ExitValueSourceLayout,
     },
     RawBuffer {
         size: usize,
@@ -149,12 +156,21 @@ impl ExitVirtualLayout {
                     .collect(),
                 target_slot: *target_slot,
             },
-            Self::Array { descr_index, items } => Self::Array {
+            Self::Array {
+                descr_index,
+                clear,
+                items,
+            } => Self::Array {
                 descr_index: *descr_index,
+                clear: *clear,
                 items: items
                     .iter()
                     .map(|source| source.shifted_virtuals(virtual_offset))
                     .collect(),
+            },
+            Self::RawSlice { offset, base } => Self::RawSlice {
+                offset: *offset,
+                base: base.shifted_virtuals(virtual_offset),
             },
             Self::ArrayStruct {
                 descr_index,

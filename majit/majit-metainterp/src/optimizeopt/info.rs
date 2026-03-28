@@ -267,9 +267,10 @@ impl PtrInfo {
     }
 
     /// Create a VirtualArray PtrInfo.
-    pub fn virtual_array(descr: DescrRef, length: usize) -> Self {
+    pub fn virtual_array(descr: DescrRef, length: usize, clear: bool) -> Self {
         PtrInfo::VirtualArray(VirtualArrayInfo {
             descr,
+            clear,
             items: vec![OpRef::NONE; length],
             last_guard_pos: -1,
         })
@@ -316,7 +317,6 @@ impl PtrInfo {
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_)
-                | PtrInfo::Virtualizable(_)
         )
     }
 
@@ -1186,6 +1186,8 @@ pub struct VirtualInfo {
 pub struct VirtualArrayInfo {
     /// The array descriptor.
     pub descr: DescrRef,
+    /// Whether this was created by NewArrayClear (zero-initialized).
+    pub clear: bool,
     /// Element values.
     pub items: Vec<OpRef>,
     /// info.py:91-92
@@ -1612,7 +1614,7 @@ mod tests {
         assert!(virtual_obj.is_nonnull());
         assert!(virtual_obj.get_descr().is_some());
 
-        let virtual_arr = PtrInfo::virtual_array(descr.clone(), 5);
+        let virtual_arr = PtrInfo::virtual_array(descr.clone(), 5, false);
         assert!(virtual_arr.is_virtual());
         assert_eq!(virtual_arr.num_fields(), 5);
 
@@ -1637,7 +1639,7 @@ mod tests {
     #[test]
     fn test_ptr_info_set_get_item() {
         let descr: DescrRef = Arc::new(TestDescr);
-        let mut info = PtrInfo::virtual_array(descr, 3);
+        let mut info = PtrInfo::virtual_array(descr, 3, false);
 
         assert_eq!(info.get_item(0), Some(OpRef::NONE)); // initialized to NONE
         info.set_item(0, OpRef(10));

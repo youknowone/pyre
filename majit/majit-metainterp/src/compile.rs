@@ -49,8 +49,8 @@ pub struct CompiledExitLayout {
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool.
     pub rd_consts: Option<Vec<(i64, Type)>>,
-    /// resume.py:488 — virtual object blueprints (descr_index, known_class, fieldnums).
-    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
+    /// resume.py:488 — virtual object blueprints.
+    pub rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
 }
 
 /// Typed result from running compiled code.
@@ -197,7 +197,7 @@ pub(crate) fn build_guard_metadata(
         let (rd_virtuals_info, rd_consts) = if let Some(ref entries) = op.rd_virtuals {
             let mut rd_consts_vec = rd_consts.clone().unwrap_or_default();
             let initial_consts_len = rd_consts_vec.len();
-            let info: Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)> = entries
+            let info: Vec<majit_ir::RdVirtualInfo> = entries
                 .iter()
                 .map(|entry| {
                     let descr_idx = entry.descr.index();
@@ -251,9 +251,28 @@ pub(crate) fn build_guard_metadata(
                             }
                         })
                         .collect();
-                    // Legacy GuardVirtualEntry doesn't carry field offsets.
-                    let field_offsets = vec![];
-                    (descr_idx, known_class, fieldnums, field_offsets)
+                    // Legacy GuardVirtualEntry: Instance (known_class) or Struct.
+                    // Array/ArrayStruct/RawBuffer are force-allocated in
+                    // encode_virtual_for_guard (optimizer.rs) and don't
+                    // produce GuardVirtualEntry — only Instance/Struct reach here.
+                    let fielddescr_indices: Vec<u32> =
+                        entry.fields.iter().map(|(fd, _)| *fd).collect();
+                    if known_class.is_some() {
+                        majit_ir::RdVirtualInfo::Instance {
+                            descr_index: descr_idx,
+                            known_class,
+                            fielddescr_indices,
+                            field_offsets: vec![],
+                            fieldnums,
+                        }
+                    } else {
+                        majit_ir::RdVirtualInfo::Struct {
+                            descr_index: descr_idx,
+                            fielddescr_indices,
+                            field_offsets: vec![],
+                            fieldnums,
+                        }
+                    }
                 })
                 .collect();
             // Only update rd_consts if new entries were added.
@@ -423,30 +442,203 @@ pub(crate) fn build_guard_metadata(
             } else {
                 vec![]
             };
+            // resume.py:576-860 parity: resolve fieldnums tags for recovery.
+            let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
+            let resolve_fieldnums = |fieldnums: &[i16],
+                                     fielddescr_indices: &[u32]|
+             -> Vec<(u32, ExitValueSourceLayout)> {
+                fieldnums
+                    .iter()
+                    .enumerate()
+                    .map(|(fi, &fnum)| {
+                        let fdi = fielddescr_indices.get(fi).copied().unwrap_or(fi as u32);
+                        let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                        let source = match tagbits {
+                            majit_ir::resumedata::TAGBOX => {
+                                ExitValueSourceLayout::ExitValue(val as usize)
+                            }
+                            majit_ir::resumedata::TAGVIRTUAL => {
+                                ExitValueSourceLayout::Virtual(val as usize)
+                            }
+                            majit_ir::resumedata::TAGINT => {
+                                ExitValueSourceLayout::Constant(val as i64)
+                            }
+                            majit_ir::resumedata::TAGCONST => {
+                                let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+                                let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
+                                ExitValueSourceLayout::Constant(c)
+                            }
+                            _ => ExitValueSourceLayout::Constant(0),
+                        };
+                        (fdi, source)
+                    })
+                    .collect()
+            };
             let virtual_layouts: Vec<majit_codegen::ExitVirtualLayout> = op
                 .rd_virtuals_info
                 .as_ref()
                 .map(|entries| {
                     entries
                         .iter()
-                        .map(|(descr_idx, known_class, fieldnums, _field_offsets)| {
-                            majit_codegen::ExitVirtualLayout::Struct {
-                                type_id: known_class.map_or(0, |kc| kc as u32),
-                                descr_index: *descr_idx,
-                                fields: fieldnums
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(fi, &fnum)| {
-                                        let (val, tagbits) = majit_ir::resumedata::untag(fnum);
-                                        let source = if tagbits == majit_ir::resumedata::TAGBOX {
-                                            ExitValueSourceLayout::ExitValue(val as usize)
-                                        } else {
-                                            ExitValueSourceLayout::Constant(val as i64)
-                                        };
-                                        (fi as u32, source)
-                                    })
-                                    .collect(),
-                                target_slot: None,
+                        .enumerate()
+                        .map(|(vidx, entry)| {
+                            let target_slot = frame_slots.iter().position(
+                                |s| matches!(s, ExitValueSourceLayout::Virtual(v) if *v == vidx),
+                            );
+                            match entry {
+                                majit_ir::RdVirtualInfo::Instance {
+                                    descr_index,
+                                    known_class,
+                                    fielddescr_indices,
+                                    fieldnums,
+                                    ..
+                                } => majit_codegen::ExitVirtualLayout::Object {
+                                    type_id: known_class.map_or(0, |kc| kc as u32),
+                                    descr_index: *descr_index,
+                                    fields: resolve_fieldnums(fieldnums, fielddescr_indices),
+                                    target_slot,
+                                },
+                                majit_ir::RdVirtualInfo::Struct {
+                                    descr_index,
+                                    fielddescr_indices,
+                                    fieldnums,
+                                    ..
+                                } => majit_codegen::ExitVirtualLayout::Struct {
+                                    type_id: 0,
+                                    descr_index: *descr_index,
+                                    fields: resolve_fieldnums(fieldnums, fielddescr_indices),
+                                    target_slot,
+                                },
+                                majit_ir::RdVirtualInfo::Array {
+                                    descr_index,
+                                    clear,
+                                    fieldnums,
+                                } => {
+                                    let items = fieldnums
+                                        .iter()
+                                        .map(|&fnum| {
+                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                                            match tagbits {
+                                                majit_ir::resumedata::TAGBOX => {
+                                                    ExitValueSourceLayout::ExitValue(val as usize)
+                                                }
+                                                majit_ir::resumedata::TAGVIRTUAL => {
+                                                    ExitValueSourceLayout::Virtual(val as usize)
+                                                }
+                                                majit_ir::resumedata::TAGINT => {
+                                                    ExitValueSourceLayout::Constant(val as i64)
+                                                }
+                                                majit_ir::resumedata::TAGCONST => {
+                                                    let idx = (val
+                                                        - majit_ir::resumedata::TAG_CONST_OFFSET)
+                                                        as usize;
+                                                    let c = rd_consts_ref
+                                                        .get(idx)
+                                                        .map(|(v, _)| *v)
+                                                        .unwrap_or(0);
+                                                    ExitValueSourceLayout::Constant(c)
+                                                }
+                                                _ => ExitValueSourceLayout::Constant(0),
+                                            }
+                                        })
+                                        .collect();
+                                    majit_codegen::ExitVirtualLayout::Array {
+                                        descr_index: *descr_index,
+                                        clear: *clear,
+                                        items,
+                                    }
+                                }
+                                majit_ir::RdVirtualInfo::ArrayStruct {
+                                    descr_index,
+                                    size,
+                                    fielddescr_indices,
+                                    fieldnums,
+                                } => {
+                                    let fpe = if *size > 0 {
+                                        fieldnums.len() / *size
+                                    } else {
+                                        0
+                                    };
+                                    let element_fields = (0..*size)
+                                        .map(|ei| {
+                                            let s = ei * fpe;
+                                            let e = (s + fpe).min(fieldnums.len());
+                                            resolve_fieldnums(&fieldnums[s..e], fielddescr_indices)
+                                        })
+                                        .collect();
+                                    majit_codegen::ExitVirtualLayout::ArrayStruct {
+                                        descr_index: *descr_index,
+                                        element_fields,
+                                    }
+                                }
+                                majit_ir::RdVirtualInfo::RawBuffer {
+                                    size,
+                                    offsets,
+                                    entry_sizes,
+                                    fieldnums,
+                                } => {
+                                    let entries = fieldnums
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &fnum)| {
+                                            let offset = offsets.get(i).copied().unwrap_or(i * 8);
+                                            let esz = entry_sizes.get(i).copied().unwrap_or(8);
+                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                                            let source = match tagbits {
+                                                majit_ir::resumedata::TAGBOX => {
+                                                    ExitValueSourceLayout::ExitValue(val as usize)
+                                                }
+                                                majit_ir::resumedata::TAGVIRTUAL => {
+                                                    ExitValueSourceLayout::Virtual(val as usize)
+                                                }
+                                                majit_ir::resumedata::TAGINT => {
+                                                    ExitValueSourceLayout::Constant(val as i64)
+                                                }
+                                                majit_ir::resumedata::TAGCONST => {
+                                                    let idx = (val
+                                                        - majit_ir::resumedata::TAG_CONST_OFFSET)
+                                                        as usize;
+                                                    let c = rd_consts_ref
+                                                        .get(idx)
+                                                        .map(|(v, _)| *v)
+                                                        .unwrap_or(0);
+                                                    ExitValueSourceLayout::Constant(c)
+                                                }
+                                                _ => ExitValueSourceLayout::Constant(0),
+                                            };
+                                            (offset, esz, source)
+                                        })
+                                        .collect();
+                                    majit_codegen::ExitVirtualLayout::RawBuffer {
+                                        size: *size,
+                                        entries,
+                                    }
+                                }
+                                majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+                                    // resume.py:717: VRawSliceInfo — base_buffer + offset.
+                                    let base = fieldnums
+                                        .first()
+                                        .map(|&fnum| {
+                                            let (val, tagbits) = majit_ir::resumedata::untag(fnum);
+                                            match tagbits {
+                                                majit_ir::resumedata::TAGBOX => {
+                                                    ExitValueSourceLayout::ExitValue(val as usize)
+                                                }
+                                                majit_ir::resumedata::TAGVIRTUAL => {
+                                                    ExitValueSourceLayout::Virtual(val as usize)
+                                                }
+                                                _ => ExitValueSourceLayout::Constant(val as i64),
+                                            }
+                                        })
+                                        .unwrap_or(ExitValueSourceLayout::Constant(0));
+                                    majit_codegen::ExitVirtualLayout::RawSlice {
+                                        offset: *offset,
+                                        base,
+                                    }
+                                }
+                                majit_ir::RdVirtualInfo::Empty => {
+                                    panic!("[jit] rd_virtuals_info[{vidx}] is Empty");
+                                }
                             }
                         })
                         .collect()

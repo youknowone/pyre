@@ -361,6 +361,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArray(
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
+                            clear: false,
                             items: imported_items,
                             last_guard_pos: -1,
                         },
@@ -616,6 +617,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArray(
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
+                            clear: false,
                             items: imported_items,
                             last_guard_pos: -1,
                         },
@@ -2685,6 +2687,9 @@ impl Optimizer {
         let (fields_vec, field_descrs, descr, known_class) = match info {
             PtrInfo::Virtual(v) => (&v.fields, &v.field_descrs, v.descr.clone(), v.known_class),
             PtrInfo::VirtualStruct(v) => (&v.fields, &v.field_descrs, v.descr.clone(), None),
+            // VirtualArray/VirtualArrayStruct/VirtualRawBuffer: force to concrete
+            // in the caller (resolve_guard_none_slots) via force_to_ops_direct.
+            // GuardVirtualEntry only supports Instance/Struct fields.
             _ => return None,
         };
         let base_idx = original_len + extra_fail_args.len();

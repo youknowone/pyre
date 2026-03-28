@@ -158,6 +158,7 @@ mod tests {
                 OpRef(1),
                 PtrInfo::VirtualArray(VirtualArrayInfo {
                     descr: descr_ref(),
+                    clear: false,
                     items: vec![OpRef(20), OpRef(21)],
                     last_guard_pos: -1,
                 }),
@@ -237,6 +238,7 @@ mod tests {
                 OpRef(1),
                 PtrInfo::VirtualArray(VirtualArrayInfo {
                     descr: descr_ref(),
+                    clear: false,
                     items: vec![OpRef(20)],
                     last_guard_pos: -1,
                 }),
