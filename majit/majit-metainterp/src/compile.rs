@@ -194,13 +194,46 @@ pub(crate) fn build_guard_metadata(
             let mut builder = ResumeDataVirtualAdder::new();
             builder.push_frame(pc);
 
-            let num_slots = op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.len())
-                .unwrap_or(exit_types.len());
-            for slot_idx in 0..num_slots {
-                builder.map_slot(slot_idx, slot_idx);
+            // store_final_boxes parity: when rd_numb is present, fail_args
+            // are normalized to liveboxes only (no constants/virtuals).
+            // Build resume_layout from rd_numb so that TAGCONST/TAGINT
+            // slots produce Constant entries in the reconstructed state.
+            if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+                use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let mut slot_idx = 0usize;
+                for frame in &frames {
+                    for val in &frame.values {
+                        match val {
+                            RebuiltValue::Box(idx) => {
+                                builder.map_slot(slot_idx, *idx);
+                            }
+                            RebuiltValue::Const(c, _tp) => {
+                                builder.set_slot_constant(slot_idx, *c);
+                            }
+                            RebuiltValue::Int(i) => {
+                                builder.set_slot_constant(slot_idx, *i as i64);
+                            }
+                            RebuiltValue::Virtual(vidx) => {
+                                builder.set_slot_virtual(slot_idx, *vidx);
+                            }
+                            RebuiltValue::Unassigned => {
+                                builder.set_slot_uninitialized(slot_idx);
+                            }
+                        }
+                        slot_idx += 1;
+                    }
+                }
+            } else {
+                // No rd_numb: 1:1 mapping (fail_args[i] → state[i]).
+                let num_slots = op
+                    .fail_args
+                    .as_ref()
+                    .map(|fa| fa.len())
+                    .unwrap_or(exit_types.len());
+                for slot_idx in 0..num_slots {
+                    builder.map_slot(slot_idx, slot_idx);
+                }
             }
 
             let stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
