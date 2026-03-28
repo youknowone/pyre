@@ -358,9 +358,14 @@ impl CostModel {
         }
     }
 
+    /// schedule.py:325 (costmodel.py): record savings from vectorizing a pack.
+    pub fn record_pack_savings(&mut self, _pack: &Pack, _numops: usize) {
+        // costmodel.py: GenericCostModel.record_pack_savings()
+        // Accumulates savings for profitability decision.
+        // In majit, is_profitable() does the calculation directly.
+    }
+
     /// Estimate whether vectorizing a group is profitable.
-    ///
-    /// Returns true if the estimated savings outweigh the pack/unpack costs.
     pub fn is_profitable(&self, group: &Pack) -> bool {
         let n = group.members.len() as i32;
         if n < self.min_pack_size as i32 {
@@ -449,22 +454,76 @@ impl VecScheduleState {
     }
 }
 
-// ── schedule.py:322-350: turn_into_vector ─────────────────────
+// ── schedule.py:317-400: turn_into_vector and helpers ─────────────────────
+
+/// schedule.py:317-320: failnbail_transformation
+pub struct NotAVectorizeableLoop;
+pub struct NotAProfitableLoop;
+
+/// schedule.py:462-474: check_if_pack_supported — validate pack constraints.
+pub fn check_if_pack_supported(pack: &Pack, ops: &[Op]) -> Result<(), NotAProfitableLoop> {
+    let first_op = &ops[pack.members[0]];
+    // schedule.py:471-474: INT_MUL with bytesize 8 or 1 is not profitable
+    if first_op.opcode == OpCode::IntMul {
+        if let Some(ref vi) = first_op.vecinfo {
+            let insize = vi.getbytesize();
+            if insize == 8 || insize == 1 {
+                return Err(NotAProfitableLoop);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// schedule.py:388-400: prepare_fail_arguments — process guard failargs
+/// for vectorized guard ops, unpacking vector boxes to scalar.
+pub fn prepare_fail_arguments(
+    state: &mut VecScheduleState,
+    pack: &Pack,
+    ops: &[Op],
+    vecop: &mut Op,
+) {
+    let first_op = &ops[pack.members[0]];
+    if !first_op.opcode.is_guard() {
+        return;
+    }
+    if let Some(ref fail_args) = first_op.fail_args {
+        let mut new_fail_args = fail_args.clone();
+        for (i, arg) in new_fail_args.iter_mut().enumerate() {
+            if let Some((pos, newarg)) = state.getvector_of_box(*arg) {
+                // schedule.py:396-397: if vector box, unpack at position 0
+                // For now, use the renamed scalar ref
+                *arg = state.renamer.rename_box(*arg);
+            }
+        }
+        vecop.fail_args = Some(new_fail_args);
+    }
+}
 
 /// schedule.py:322-350: Turn a pack of scalar ops into a single vector op.
-/// Creates VecOperation with the appropriate vector opcode and lane count.
 pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     if pack.members.is_empty() {
         return;
     }
+    // schedule.py:324: check_if_pack_supported
+    if check_if_pack_supported(pack, ops).is_err() {
+        return;
+    }
     let count = pack.members.len();
     let first_op = &ops[pack.members[0]];
+
+    // schedule.py:325: costmodel.record_pack_savings
+    state.costmodel.record_pack_savings(pack, count);
+
     let Some(vec_opcode) = first_op.opcode.to_vector() else {
         return; // not vectorizable
     };
 
+    // schedule.py:335-336: build args list
+    let args = first_op.args.to_vec();
+
     // schedule.py:337-338: create VecOperation
-    let mut vecop = Op::new(vec_opcode, &first_op.args);
+    let mut vecop = Op::new(vec_opcode, &args);
     vecop.pos = state.alloc_op_pos();
     vecop.descr = first_op.descr.clone();
     let datatype = if first_op.opcode.result_type() == majit_ir::Type::Float {
@@ -480,16 +539,25 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     let vecop_pos = vecop.pos;
     // schedule.py:340-346: map scalar ops to vector positions
     for (i, &member_idx) in pack.members.iter().enumerate() {
-        let scalar_pos = ops[member_idx].pos;
+        let op = &ops[member_idx];
+        if op.opcode.result_type() == majit_ir::Type::Void {
+            continue; // schedule.py:342-343: skip void ops
+        }
+        let scalar_pos = op.pos;
         if !scalar_pos.is_none() {
             state.setvector_of_box(scalar_pos, i, vecop_pos);
             // schedule.py:345-346: only rename for accumulating packs
-            if pack.is_accumulating {
+            if pack.is_accumulating && !op.opcode.is_guard() {
                 state.renamer.start_renaming(scalar_pos, vecop_pos);
             }
         }
     }
 
+    // schedule.py:347-348: handle guard failargs
+    if first_op.opcode.is_guard() {
+        prepare_fail_arguments(state, pack, ops, &mut vecop);
+    }
+
     state.append_to_oplist(vecop);
-    assert!(count >= 1);
+    assert!(count >= 1); // schedule.py:350
 }

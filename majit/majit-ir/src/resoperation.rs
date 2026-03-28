@@ -1205,6 +1205,51 @@ impl OpCode {
                 | OpCode::GcStoreIndexed
         )
     }
+
+    /// dependency.py:207-208: loads_from_complex_object
+    /// (ALWAYS_PURE_LAST <= opnum < MALLOC_FIRST in RPython)
+    pub fn is_complex_load(self) -> bool {
+        matches!(
+            self,
+            OpCode::GetarrayitemGcI
+                | OpCode::GetarrayitemGcR
+                | OpCode::GetarrayitemGcF
+                | OpCode::GetarrayitemGcPureI
+                | OpCode::GetarrayitemGcPureR
+                | OpCode::GetarrayitemGcPureF
+                | OpCode::GetarrayitemRawI
+                | OpCode::GetarrayitemRawF
+                | OpCode::RawLoadI
+                | OpCode::RawLoadF
+                | OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldRawI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldRawF
+                | OpCode::GetinteriorfieldGcI
+                | OpCode::GetinteriorfieldGcF
+                | OpCode::GetinteriorfieldGcR
+        )
+    }
+
+    /// dependency.py:210-211: modifies_complex_object
+    /// (SETARRAYITEM_GC <= opnum <= UNICODESETITEM)
+    pub fn is_complex_modify(self) -> bool {
+        matches!(
+            self,
+            OpCode::SetarrayitemGc
+                | OpCode::SetarrayitemRaw
+                | OpCode::RawStore
+                | OpCode::SetinteriorfieldGc
+                | OpCode::SetinteriorfieldRaw
+                | OpCode::SetfieldGc
+                | OpCode::SetfieldRaw
+                | OpCode::ZeroArray
+                | OpCode::Strsetitem
+                | OpCode::Unicodesetitem
+        )
+    }
 }
 
 // ── Metadata tables ──

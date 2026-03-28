@@ -343,8 +343,11 @@ impl VectorizingOptimizer {
             return None; // Too small to benefit
         }
 
+        // Constant resolver — looks up OpRef in the optimizer's constant map.
+        let constant_of = |opref: OpRef| -> Option<i64> { ctx.get_constant_int(opref) };
+
         // Phase 1: Schedule operations for ILP before packing.
-        let dep_graph = DependencyGraph::build(&self.body_ops);
+        let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
         let schedule = schedule_operations(&dep_graph);
         if schedule.len() == self.body_ops.len() {
             let scheduled: Vec<Op> = schedule.iter().map(|&i| self.body_ops[i].clone()).collect();
@@ -352,7 +355,7 @@ impl VectorizingOptimizer {
         }
 
         // Phase 2: Rebuild dependency graph on reordered ops and find packs.
-        let dep_graph = DependencyGraph::build(&self.body_ops);
+        let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
         let groups = dep_graph.find_packable_groups();
 
         if groups.is_empty() {
