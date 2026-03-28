@@ -1541,6 +1541,11 @@ pub fn jit_bridge_compile_for_guard(
 
     let (driver, info) = crate::eval::driver_pair();
 
+    // compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    driver
+        .meta_interp_mut()
+        .set_guard_compiling(green_key, trace_id, fail_index, true);
+
     // RPython resume_in_blackhole parity: use resume_pc from guard's
     // resume data (via LAST_GUARD_RESUME_PC or recovery_layout), not
     // frame.next_instr which may have been reset by force_fn.
@@ -1772,6 +1777,14 @@ extern "C" fn jit_bridge_compile_callee(
             HashMap::new(),
             HashMap::new(),
         );
+    }
+
+    // compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .set_guard_compiling(green_key, trace_id, fail_index, false);
     }
 
     result
