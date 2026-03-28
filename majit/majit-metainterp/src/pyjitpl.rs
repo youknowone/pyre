@@ -1982,6 +1982,16 @@ impl<M: Clone> MetaInterp<M> {
                     };
                     eprintln!("[jit] compile_loop {kind}, aborting trace at key={green_key}");
                 }
+                // compile.py:288 parity: preserve preamble target_tokens
+                // even on InvalidLoop/panic. The unroller's Phase 1 created
+                // target_tokens that the next retrace needs.
+                if is_invalid_loop && !unroll_opt.target_tokens.is_empty() {
+                    if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                        if compiled.front_target_tokens.is_empty() {
+                            compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                        }
+                    }
+                }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
                 self.warm_state.reset_function_counts();
