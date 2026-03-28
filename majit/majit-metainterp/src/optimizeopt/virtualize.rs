@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 /// Virtualize optimization pass: remove heap allocations for non-escaping objects.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/virtualize.py.
@@ -8,7 +9,6 @@
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
 
 use majit_ir::{
     Descr, DescrRef, FieldDescr, GuardVirtualEntry, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
@@ -2237,10 +2237,7 @@ fn set_field(fields: &mut Vec<(u32, OpRef)>, field_idx: u32, value_ref: OpRef) {
 }
 
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
-    field_descr_registry()
-        .lock()
-        .expect("field descr registry lock poisoned")
-        .insert(field_idx, descr.clone());
+    FIELD_DESCR_REGISTRY.with(|r| r.borrow_mut().insert(field_idx, descr.clone()));
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
             entry.1 = descr;
@@ -2257,9 +2254,8 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .map(|(_, descr)| descr.clone())
 }
 
-fn field_descr_registry() -> &'static Mutex<HashMap<u32, DescrRef>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u32, DescrRef>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    static FIELD_DESCR_REGISTRY: RefCell<HashMap<u32, DescrRef>> = RefCell::new(HashMap::new());
 }
 
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {
@@ -2318,12 +2314,7 @@ impl FieldDescr for FieldIndexDescr {
 }
 
 pub(crate) fn make_field_index_descr(idx: u32) -> DescrRef {
-    if let Some(descr) = field_descr_registry()
-        .lock()
-        .expect("field descr registry lock poisoned")
-        .get(&idx)
-        .cloned()
-    {
+    if let Some(descr) = FIELD_DESCR_REGISTRY.with(|r| r.borrow().get(&idx).cloned()) {
         return descr;
     }
     Arc::new(FieldIndexDescr(idx))
