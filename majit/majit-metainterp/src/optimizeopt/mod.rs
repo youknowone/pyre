@@ -1091,6 +1091,15 @@ impl OptContext {
         // number_guard_inline doesn't yet normalize fail_args to liveboxes
         // (store_final_boxes parity). This requires coordinated changes to
         // compile.rs resume_layout construction + backend jitframe sizing.
+        // optimizer.py:672: self._last_guard_op and guard_op.getdescr() is None.
+        // fail_args.is_none() required: pyre's tracer does not populate
+        // snapshot_boxes (rd_resume_position = -1 for all guards), so
+        // number_guard_inline uses the no-snapshot path which cannot
+        // normalize fail_args to liveboxes. Sharing fail_args from another
+        // guard would corrupt the resume mapping. Full RPython parity
+        // requires porting capture_resumedata (opencoder.py:819) to
+        // populate snapshot_boxes, enabling store_final_boxes normalization.
+        // GUARD_NOT_FORCED never uses copied descr (compile.py:926 assert).
         let can_share = self.last_guard_idx.is_some()
             && op.rd_numb.is_none()
             && op.fail_args.is_none()
@@ -1224,6 +1233,8 @@ impl OptContext {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
+                let mut rd_consts: Vec<(i64, majit_ir::Type)> =
+                    op.rd_consts.take().unwrap_or_default();
                 ns.append_int(0); // size (patched)
                 ns.append_int(fa_len as i32); // num_failargs
                 ns.append_int(0); // vable_array len
@@ -1233,7 +1244,6 @@ impl OptContext {
                 ns.append_int(fa_len as i32); // slot_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
-                        // TAGVIRTUAL if rd_virtuals has entry for this slot.
                         let vidx = op
                             .rd_virtuals
                             .as_ref()
@@ -1246,7 +1256,6 @@ impl OptContext {
                             ns.append_short(resumedata::NULLREF);
                         }
                     } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
-                        // resume.py getconst: TAGINT for small ints, TAGCONST for rest.
                         if tp == majit_ir::Type::Int {
                             if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
                                 ns.append_short(tagged);
@@ -1257,17 +1266,12 @@ impl OptContext {
                             ns.append_short(resumedata::NULLREF);
                             continue;
                         }
-                        let mut rd_consts_local: Vec<(i64, majit_ir::Type)> =
-                            op.rd_consts.take().unwrap_or_default();
-                        let existing = rd_consts_local
-                            .iter()
-                            .position(|(v, t)| *v == raw && *t == tp);
+                        let existing = rd_consts.iter().position(|(v, t)| *v == raw && *t == tp);
                         let idx = existing.unwrap_or_else(|| {
-                            let j = rd_consts_local.len();
-                            rd_consts_local.push((raw, tp));
+                            let j = rd_consts.len();
+                            rd_consts.push((raw, tp));
                             j
                         });
-                        op.rd_consts = Some(rd_consts_local);
                         let t = resumedata::tag(
                             (idx + resumedata::TAG_CONST_OFFSET as usize) as i32,
                             resumedata::TAGCONST,
@@ -1282,9 +1286,7 @@ impl OptContext {
                 }
                 ns.patch_current_size(0);
                 op.rd_numb = Some(ns.create_numbering());
-                if op.rd_consts.is_none() {
-                    op.rd_consts = Some(Vec::new());
-                }
+                op.rd_consts = Some(rd_consts);
             }
             return;
         }

@@ -3627,7 +3627,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: trace_id,
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3774,7 +3774,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: trace_id,
                 trace_id,
                 fail_index,
                 source_op_index: None,

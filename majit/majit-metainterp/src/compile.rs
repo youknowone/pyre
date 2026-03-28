@@ -169,19 +169,16 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
-        // RPython Box.type parity: each Box carries its own type.
-        // Use optimizer-provided fail_arg_types when available (set by
-        // emit_guard_operation / number_guard_inline). This eliminates
-        // type inference via value_types — the type comes from the Box
-        // (OpRef) itself, not from operation result type inference.
+        // RPython Box.type parity: exit_types from fail_args (liveboxes).
+        // After store_final_boxes normalization, fail_args contain only
+        // live boxes. exit_types determines dead frame slot types for
+        // the backend — one per live box.
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref types) = op.fail_arg_types {
-            // RPython parity: use optimizer-provided fail_arg_types (from
-            // store_final_boxes_in_guard / consumer switchover).
             types.clone()
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
