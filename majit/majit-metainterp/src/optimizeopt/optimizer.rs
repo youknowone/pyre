@@ -17,18 +17,11 @@ use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
 use crate::optimizeopt::info::PtrInfo;
 
 /// Transient metadata for a virtual in guard fail_args.
-/// Used only within store_final_boxes_in_guard → finalize_guard_resume_data;
-/// never stored on Op. Converted to RdVirtualInfo by the fallback numbering path.
-#[derive(Clone, Debug)]
-pub(crate) struct GuardVirtualEntry {
-    pub fail_arg_index: usize,
-    pub descr: DescrRef,
-    pub known_class: Option<GcRef>,
-    pub fields: Vec<(u32, usize)>,
-    pub field_offsets: Vec<usize>,
-    pub field_types: Vec<Type>,
-    pub field_sizes: Vec<usize>,
-}
+/// Transient record of a virtual fail_arg slot. Used only within
+/// store_final_boxes_in_guard → finalize_guard_resume_data; never stored on Op.
+/// The fallback numbering path looks up PtrInfo(virtual_opref) to build
+/// RdVirtualInfo — no pre-computed field metadata needed.
+pub(crate) type VirtualFailArgSlot = (usize, OpRef); // (fail_arg_index, virtual_opref)
 
 /// bridgeopt.py: serialized optimizer knowledge for guard resume data.
 ///
@@ -434,6 +427,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
+                            fielddescrs: Vec::new(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
                         },
@@ -708,6 +702,7 @@ impl Optimizer {
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::VirtualArrayStructInfo {
                             descr: descr.clone(),
+                            fielddescrs: Vec::new(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
                         },
@@ -2610,7 +2605,7 @@ impl Optimizer {
         };
 
         let original_len = fail_args.len();
-        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
+        let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
         let mut extra_fail_args: Vec<OpRef> = Vec::new();
 
         for fa_idx in 0..original_len {
@@ -2618,23 +2613,26 @@ impl Optimizer {
                 // RPython parity: Box forwarding resolves NONE slots
                 // automatically via set_forwarded. In pyre, use body
                 // label args to find the current Phase 2 OpRef.
-                if !virtual_entries.iter().any(|e| e.fail_arg_index == fa_idx) {
+                if !virtual_slots.iter().any(|(idx, _)| *idx == fa_idx) {
                     let label_ref = ctx
                         .imported_label_args
                         .as_ref()
                         .and_then(|la| la.get(fa_idx).copied());
                     let resolved = label_ref.map(|r| ctx.get_box_replacement(r));
                     if let Some(resolved) = resolved {
-                        if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
+                        if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
                             if info.is_virtual() {
-                                if let Some(entry) = Self::encode_virtual_for_guard(
+                                if Self::collect_virtual_field_values(
                                     &info,
-                                    fa_idx,
                                     original_len,
                                     &mut extra_fail_args,
                                     ctx,
                                 ) {
-                                    virtual_entries.push(entry);
+                                    virtual_slots.push((fa_idx, resolved));
+                                } else {
+                                    // Unsupported virtual kind (Array etc.) → force.
+                                    let forced = info.force_to_ops_direct(resolved, ctx);
+                                    fail_args[fa_idx] = ctx.get_box_replacement(forced);
                                 }
                             } else {
                                 fail_args[fa_idx] = resolved;
@@ -2655,18 +2653,15 @@ impl Optimizer {
                 continue;
             }
 
-            // resume.py ResumeDataVirtualAdder: encode virtual metadata
-            if let Some(entry) = Self::encode_virtual_for_guard(
-                &info,
-                fa_idx,
-                original_len,
-                &mut extra_fail_args,
-                ctx,
-            ) {
-                virtual_entries.push(entry);
+            // Virtual fail_arg → NONE + collect field values as extra fail_args.
+            if Self::collect_virtual_field_values(&info, original_len, &mut extra_fail_args, ctx) {
+                virtual_slots.push((fa_idx, resolved));
                 fail_args[fa_idx] = OpRef::NONE;
             } else {
-                fail_args[fa_idx] = resolved;
+                // Unsupported virtual kind (Array etc.) → force to concrete.
+                let mut info_mut = info;
+                let forced = info_mut.force_to_ops_direct(resolved, ctx);
+                fail_args[fa_idx] = ctx.get_box_replacement(forced);
             }
         }
 
@@ -2708,36 +2703,28 @@ impl Optimizer {
         // resume.py ResumeDataVirtualAdder.finish() parity:
         // Generate rd_numb + rd_consts + rd_virtuals_info in the SAME call as
         // fail_args finalization. RPython does not defer to a later phase.
-        ctx.finalize_guard_resume_data(&mut op, &virtual_entries);
+        ctx.finalize_guard_resume_data(&mut op, &virtual_slots);
 
         op
     }
 
-    /// RPython box.type parity: infer the type of a fail_arg OpRef from
-    /// the optimizer context. Checks PtrInfo (Virtual/Instance → Ref),
-    /// constant type, and falls back to the original descriptor type.
-    /// resume.py ResumeDataVirtualAdder parity: encode a virtual's fields
-    /// as extra fail_args + GuardVirtualEntry. Shared by NONE-slot resolution
-    /// and non-NONE virtual encoding paths.
-    fn encode_virtual_for_guard(
+    /// Collect a virtual's field values as extra fail_args, forcing nested
+    /// virtuals to concrete. Returns true if field values were collected
+    /// (Instance/Struct). Returns false for unsupported virtual kinds
+    /// (Array, ArrayStruct, RawBuffer) — caller should force these.
+    fn collect_virtual_field_values(
         info: &crate::optimizeopt::info::PtrInfo,
-        fa_idx: usize,
-        original_len: usize,
+        _original_len: usize,
         extra_fail_args: &mut Vec<OpRef>,
         ctx: &mut OptContext,
-    ) -> Option<GuardVirtualEntry> {
+    ) -> bool {
         use crate::optimizeopt::info::PtrInfo;
-        let (fields_vec, field_descrs, descr, known_class) = match info {
-            PtrInfo::Virtual(v) => (&v.fields, &v.field_descrs, v.descr.clone(), v.known_class),
-            PtrInfo::VirtualStruct(v) => (&v.fields, &v.field_descrs, v.descr.clone(), None),
-            // VirtualArray/VirtualArrayStruct/VirtualRawBuffer: force to concrete
-            // in the caller (resolve_guard_none_slots) via force_to_ops_direct.
-            // GuardVirtualEntry only supports Instance/Struct fields.
-            _ => return None,
+        let fields_vec = match info {
+            PtrInfo::Virtual(v) => &v.fields,
+            PtrInfo::VirtualStruct(v) => &v.fields,
+            _ => return false,
         };
-        let base_idx = original_len + extra_fail_args.len();
-        let mut fields = Vec::with_capacity(fields_vec.len());
-        for &(field_idx, value_ref) in fields_vec {
+        for &(_field_idx, value_ref) in fields_vec {
             let mut final_ref = ctx.get_box_replacement(value_ref);
             if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
                 if nested.is_virtual() {
@@ -2747,56 +2734,8 @@ impl Optimizer {
                 }
             }
             extra_fail_args.push(final_ref);
-            let descr_idx = field_descrs
-                .iter()
-                .find(|(idx, _)| *idx == field_idx)
-                .map(|(_, d)| d.index())
-                .unwrap_or(field_idx);
-            fields.push((descr_idx, base_idx + fields.len()));
         }
-        let fo: Vec<usize> = fields
-            .iter()
-            .enumerate()
-            .map(|(_i, (fidx, _))| {
-                field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.offset())
-                    .unwrap_or(0)
-            })
-            .collect();
-        let ft: Vec<majit_ir::Type> = fields
-            .iter()
-            .map(|(fidx, _)| {
-                field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.field_type())
-                    .unwrap_or(majit_ir::Type::Int)
-            })
-            .collect();
-        let fs: Vec<usize> = fields
-            .iter()
-            .map(|(fidx, _)| {
-                field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.field_size())
-                    .unwrap_or(8)
-            })
-            .collect();
-        Some(GuardVirtualEntry {
-            fail_arg_index: fa_idx,
-            descr,
-            known_class,
-            fields,
-            field_offsets: fo,
-            field_types: ft,
-            field_sizes: fs,
-        })
+        true
     }
 
     fn infer_fail_arg_type(

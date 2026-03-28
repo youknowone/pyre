@@ -1288,9 +1288,9 @@ impl OptContext {
     pub fn finalize_guard_resume_data(
         &self,
         op: &mut Op,
-        guard_virtuals: &[crate::optimizeopt::optimizer::GuardVirtualEntry],
+        virtual_slots: &[crate::optimizeopt::optimizer::VirtualFailArgSlot],
     ) {
-        self.store_final_boxes_in_guard(op, guard_virtuals);
+        self.store_final_boxes_in_guard(op, virtual_slots);
     }
 
     fn number_guard_inline_fallback(&self, op: &mut Op) {
@@ -1312,7 +1312,7 @@ impl OptContext {
     fn store_final_boxes_in_guard(
         &self,
         op: &mut Op,
-        guard_virtuals: &[crate::optimizeopt::optimizer::GuardVirtualEntry],
+        virtual_slots: &[crate::optimizeopt::optimizer::VirtualFailArgSlot],
     ) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
@@ -1355,7 +1355,7 @@ impl OptContext {
                 // resume.py:253: _number_boxes — tagged values, no slot_count.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
-                        let vidx = guard_virtuals.iter().position(|e| e.fail_arg_index == i);
+                        let vidx = virtual_slots.iter().position(|(idx, _)| *idx == i);
                         if let Some(vidx) = vidx {
                             let t = resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
                                 .unwrap_or(resumedata::NULLREF);
@@ -1399,45 +1399,51 @@ impl OptContext {
                 op.rd_numb = Some(ns.create_numbering());
                 op.rd_consts = Some(rd_consts);
 
-                // Build rd_virtuals_info from GuardVirtualEntry for no-snapshot guards.
+                // Build rd_virtuals_info from PtrInfo for no-snapshot guards.
                 // resume.py _gettagged parity: tag each field value as
-                // TAGBOX/TAGCONST/TAGINT/TAGVIRTUAL based on its nature.
-                if op.rd_virtuals_info.is_none() && !guard_virtuals.is_empty() {
-                    let entries = guard_virtuals;
-                    {
-                        let mut rd_cv = op.rd_consts.take().unwrap_or_default();
-                        let info: Vec<majit_ir::RdVirtualInfo> = entries
-                            .iter()
-                            .map(|entry| {
-                                let di = entry.descr.index();
-                                let kc = entry
-                                    .known_class
-                                    .map(|gc| gc.as_usize() as i64)
-                                    .or_else(|| {
-                                        entry.descr.as_size_descr().map(|sd| sd.vtable() as i64)
-                                    })
-                                    .filter(|&v| v != 0);
-                                let fdi: Vec<u32> =
-                                    entry.fields.iter().map(|(fd, _)| *fd).collect();
-                                let ds = entry.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                                let fns: Vec<i16> = entry
-                                    .fields
+                // TAGBOX/TAGCONST/TAGINT based on its nature.
+                if op.rd_virtuals_info.is_none() && !virtual_slots.is_empty() {
+                    use crate::optimizeopt::info::PtrInfo;
+                    let mut rd_cv = op.rd_consts.take().unwrap_or_default();
+                    let info: Vec<majit_ir::RdVirtualInfo> = virtual_slots
+                        .iter()
+                        .map(|&(_slot_idx, vbox)| {
+                            let vinfo = self.get_ptr_info(vbox).cloned();
+                            let mut build_fieldnums = |fields: &[(u32, OpRef)],
+                                                       field_descrs: &[(u32, DescrRef)]|
+                             -> (
+                                Vec<majit_ir::FieldDescrInfo>,
+                                Vec<i16>,
+                            ) {
+                                let fdinfo: Vec<majit_ir::FieldDescrInfo> = fields
                                     .iter()
-                                    .map(|&(_fd, fap)| {
-                                        let opref = fa.get(fap).copied().unwrap_or(OpRef::NONE);
-                                        if opref.is_none() {
-                                            if let Some(vi) =
-                                                entries.iter().position(|e| e.fail_arg_index == fap)
-                                            {
-                                                return resumedata::tag(
-                                                    vi as i32,
-                                                    resumedata::TAGVIRTUAL,
-                                                )
-                                                .unwrap_or(resumedata::NULLREF);
-                                            }
-                                            return resumedata::NULLREF;
+                                    .map(|(fi, _)| {
+                                        let fd = field_descrs
+                                            .iter()
+                                            .find(|(di, _)| *di == *fi)
+                                            .and_then(|(_, d)| d.as_field_descr());
+                                        majit_ir::FieldDescrInfo {
+                                            index: field_descrs
+                                                .iter()
+                                                .find(|(di, _)| *di == *fi)
+                                                .map(|(_, d)| d.index())
+                                                .unwrap_or(*fi),
+                                            offset: fd.map(|f| f.offset()).unwrap_or(0),
+                                            field_type: fd
+                                                .map(|f| f.field_type())
+                                                .unwrap_or(majit_ir::Type::Int),
+                                            field_size: fd.map(|f| f.field_size()).unwrap_or(8),
                                         }
-                                        if let Some((raw, tp)) = self.getconst(opref) {
+                                    })
+                                    .collect();
+                                let fns: Vec<i16> = fields
+                                    .iter()
+                                    .map(|&(_, vr)| {
+                                        let resolved = self.get_box_replacement(vr);
+                                        if resolved.is_none() {
+                                            return resumedata::UNINITIALIZED_TAG;
+                                        }
+                                        if let Some((raw, tp)) = self.getconst(resolved) {
                                             if tp == majit_ir::Type::Int {
                                                 if let Ok(t) =
                                                     resumedata::tag(raw as i32, resumedata::TAGINT)
@@ -1462,57 +1468,102 @@ impl OptContext {
                                             )
                                             .unwrap_or(resumedata::NULLREF);
                                         }
-                                        resumedata::tag(fap as i32, resumedata::TAGBOX)
-                                            .unwrap_or(resumedata::NULLREF)
+                                        // Field value in extra fail_args → TAGBOX(position).
+                                        let fap = fa.iter().position(|&a| a == resolved);
+                                        if let Some(fap) = fap {
+                                            resumedata::tag(fap as i32, resumedata::TAGBOX)
+                                                .unwrap_or(resumedata::NULLREF)
+                                        } else {
+                                            resumedata::NULLREF
+                                        }
                                     })
                                     .collect();
-                                let fdinfo: Vec<majit_ir::FieldDescrInfo> = if !entry
-                                    .field_offsets
-                                    .is_empty()
-                                {
-                                    fdi.iter()
-                                        .zip(entry.field_offsets.iter())
-                                        .zip(entry.field_types.iter())
-                                        .zip(entry.field_sizes.iter())
-                                        .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
-                                            index: *idx,
-                                            offset: *off,
-                                            field_type: *tp,
-                                            field_size: *sz,
+                                (fdinfo, fns)
+                            };
+                            match vinfo {
+                                Some(PtrInfo::Virtual(ref vi)) => {
+                                    let (fdinfo, fns) =
+                                        build_fieldnums(&vi.fields, &vi.field_descrs);
+                                    let ds =
+                                        vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                                    let kc = vi
+                                        .known_class
+                                        .map(|gc| gc.as_usize() as i64)
+                                        .or_else(|| {
+                                            vi.descr.as_size_descr().map(|sd| sd.vtable() as i64)
                                         })
-                                        .collect()
-                                } else {
-                                    fdi.iter()
-                                        .map(|idx| majit_ir::FieldDescrInfo {
-                                            index: *idx,
-                                            offset: 0,
-                                            field_type: majit_ir::Type::Int,
-                                            field_size: 8,
-                                        })
-                                        .collect()
-                                };
-                                if kc.is_some() {
+                                        .filter(|&v| v != 0);
                                     majit_ir::RdVirtualInfo::Instance {
-                                        descr_index: di,
+                                        descr_index: vi.descr.index(),
                                         known_class: kc,
                                         fielddescrs: fdinfo,
                                         fieldnums: fns,
                                         descr_size: ds,
                                     }
-                                } else {
+                                }
+                                Some(PtrInfo::VirtualStruct(ref vi)) => {
+                                    let (fdinfo, fns) =
+                                        build_fieldnums(&vi.fields, &vi.field_descrs);
+                                    let ds =
+                                        vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                                     majit_ir::RdVirtualInfo::Struct {
-                                        descr_index: di,
+                                        descr_index: vi.descr.index(),
                                         fielddescrs: fdinfo,
                                         fieldnums: fns,
                                         descr_size: ds,
                                     }
                                 }
-                            })
-                            .collect();
-                        op.rd_consts = Some(rd_cv);
-                        if !info.is_empty() {
-                            op.rd_virtuals_info = Some(info);
-                        }
+                                // Forced virtual: PtrInfo changed from Virtual→Struct
+                                // (nested forcing in collect_virtual_field_values).
+                                // Use Struct/Instance PtrInfo fields for rd_virtuals_info.
+                                Some(PtrInfo::Struct(ref si)) => {
+                                    let (fdinfo, fns) =
+                                        build_fieldnums(&si.fields, &si.field_descrs);
+                                    let ds =
+                                        si.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                                    majit_ir::RdVirtualInfo::Struct {
+                                        descr_index: si.descr.index(),
+                                        fielddescrs: fdinfo,
+                                        fieldnums: fns,
+                                        descr_size: ds,
+                                    }
+                                }
+                                Some(PtrInfo::Instance(ref ii)) => {
+                                    let (fdinfo, fns) =
+                                        build_fieldnums(&ii.fields, &ii.field_descrs);
+                                    let ds = ii
+                                        .descr
+                                        .as_ref()
+                                        .and_then(|d| d.as_size_descr().map(|s| s.size()))
+                                        .unwrap_or(0);
+                                    let kc = ii
+                                        .known_class
+                                        .map(|gc| gc.as_usize() as i64)
+                                        .or_else(|| {
+                                            ii.descr.as_ref().and_then(|d| {
+                                                d.as_size_descr().map(|sd| sd.vtable() as i64)
+                                            })
+                                        })
+                                        .filter(|&v| v != 0);
+                                    majit_ir::RdVirtualInfo::Instance {
+                                        descr_index: ii
+                                            .descr
+                                            .as_ref()
+                                            .map(|d| d.index())
+                                            .unwrap_or(0),
+                                        known_class: kc,
+                                        fielddescrs: fdinfo,
+                                        fieldnums: fns,
+                                        descr_size: ds,
+                                    }
+                                }
+                                _ => majit_ir::RdVirtualInfo::Empty,
+                            }
+                        })
+                        .collect();
+                    op.rd_consts = Some(rd_cv);
+                    if !info.is_empty() {
+                        op.rd_virtuals_info = Some(info);
                     }
                 }
             }
@@ -1892,14 +1943,45 @@ impl OptContext {
                             fieldnums.push(gettagged(*vr));
                         }
                     }
+                    // resume.py VArrayStructInfo parity: extract layout from
+                    // arraydescr (item_size) and fielddescrs (offset/size/type).
+                    let is = vi
+                        .descr
+                        .as_array_descr()
+                        .map(|ad| ad.item_size())
+                        .unwrap_or(0);
+                    let mut fo = Vec::new();
+                    let mut fs = Vec::new();
+                    let mut ft = Vec::new();
+                    for fd in &vi.fielddescrs {
+                        if let Some(ifd) = fd.as_interior_field_descr() {
+                            let fld = ifd.field_descr();
+                            fo.push(fld.offset());
+                            fs.push(fld.field_size());
+                            ft.push(match fld.field_type() {
+                                majit_ir::Type::Float => 2u8,
+                                majit_ir::Type::Int => 1u8,
+                                _ => 0u8,
+                            });
+                        } else {
+                            // Fallback: no InteriorFieldDescr available.
+                            fo.push(fo.len() * 8);
+                            fs.push(8);
+                            ft.push(0);
+                        }
+                    }
+                    // If fielddescrs empty, fill from fielddescr_indices count.
+                    if ft.is_empty() {
+                        ft = vec![0u8; fielddescr_indices.len()];
+                    }
                     majit_ir::RdVirtualInfo::ArrayStruct {
                         descr_index: vi.descr.index(),
                         size: vi.element_fields.len(),
                         fielddescr_indices: fielddescr_indices.clone(),
-                        field_types: vec![0u8; fielddescr_indices.len()],
-                        item_size: 0,
-                        field_offsets: Vec::new(),
-                        field_sizes: Vec::new(),
+                        field_types: ft,
+                        item_size: is,
+                        field_offsets: fo,
+                        field_sizes: fs,
                         fieldnums,
                     }
                 }
