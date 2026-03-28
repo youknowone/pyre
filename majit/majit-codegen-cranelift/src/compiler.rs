@@ -6825,7 +6825,8 @@ impl CraneliftBackend {
                     let fast_block = builder.create_block();
                     let slow_block = builder.create_block();
                     let merge_block = builder.create_block();
-                    builder.append_block_param(merge_block, ptr_type);
+                    builder.append_block_param(merge_block, ptr_type); // alloc result
+                    builder.append_block_param(merge_block, ptr_type); // jf_ptr
 
                     builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
 
@@ -6836,7 +6837,10 @@ impl CraneliftBackend {
                     // Return pointer past GC header
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
-                    builder.ins().jump(merge_block, &[BlockArg::from(obj_ptr)]);
+                    builder.ins().jump(
+                        merge_block,
+                        &[BlockArg::from(obj_ptr), BlockArg::from(jf_ptr)],
+                    );
 
                     // slow: call shim (triggers minor collection)
                     builder.switch_to_block(slow_block);
@@ -6859,15 +6863,18 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
-                    builder
-                        .ins()
-                        .jump(merge_block, &[BlockArg::from(slow_result)]);
+                    let reloaded_jf =
+                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    builder.ins().jump(
+                        merge_block,
+                        &[BlockArg::from(slow_result), BlockArg::from(reloaded_jf)],
+                    );
 
                     builder.switch_to_block(merge_block);
                     builder.seal_block(merge_block);
                     let result = builder.block_params(merge_block)[0];
+                    jf_ptr = builder.block_params(merge_block)[1];
+                    outputs_ptr = jf_ptr;
                     builder.def_var(var(vi), result);
                 }
 
@@ -8566,9 +8573,13 @@ impl CraneliftBackend {
 
         // Compile
         let mut ctx = Context::for_function(func);
-        self.module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
+        if let Err(e) = self.module.define_function(func_id, &mut ctx) {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[jit][clif-error] {e}\nCLIF IR:\n{}", ctx.func.display());
+            }
+            self.module.clear_context(&mut ctx);
+            return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));
+        }
         self.module.clear_context(&mut ctx);
         self.module.finalize_definitions().unwrap();
 
