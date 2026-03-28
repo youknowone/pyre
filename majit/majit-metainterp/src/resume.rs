@@ -2378,7 +2378,7 @@ impl MaterializedVirtual {
 ///
 /// resume.py:298-493 ResumeDataVirtualAdder.finish() is implemented
 /// across two functions in majit:
-/// - `number_guard_inline` (mod.rs) — numbering + rd_numb/rd_consts
+/// - `store_final_boxes_in_guard` (mod.rs) — numbering + rd_numb/rd_consts
 /// - `store_final_boxes_in_guard` (optimizer.rs) — virtual expansion + rd_virtuals
 pub struct ResumeDataVirtualAdder {
     frames: Vec<FrameInfoBuilder>,
@@ -4924,7 +4924,8 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
-        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, memo.consts());
+        let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
+            rebuild_from_numbering(&rd_numb, memo.consts());
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
@@ -4948,7 +4949,8 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
-        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, memo.consts());
+        let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
+            rebuild_from_numbering(&rd_numb, memo.consts());
         assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
@@ -5044,7 +5046,8 @@ mod tests {
         assert_eq!(liveboxes[1], OpRef(3)); // box #1
 
         // rd_numb should be valid
-        let (num_failargs, rebuilt_frames) = rebuild_from_numbering(&rd_numb, &rd_consts);
+        let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
+            rebuild_from_numbering(&rd_numb, &rd_consts);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));

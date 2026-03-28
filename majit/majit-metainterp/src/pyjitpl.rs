@@ -1977,7 +1977,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // resume.py parity: rd_numb is now produced inline during optimization
-        // (ctx.emit → number_guard_inline) rather than post-assembly.
+        // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
 
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -2956,7 +2956,7 @@ impl<M: Clone> MetaInterp<M> {
         // directly (frame + ni + sd + locals). A guard before GETFIELD ops
         // ensures tagged pointers (force_cache hits) don't get dereferenced.
 
-        // rd_numb produced inline during optimization (number_guard_inline).
+        // rd_numb produced inline during optimization (store_final_boxes_in_guard).
 
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();

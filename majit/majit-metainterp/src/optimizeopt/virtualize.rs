@@ -785,9 +785,14 @@ impl OptVirtualize {
 
     fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.descr.clone().expect("NEW_WITH_VTABLE needs descr");
+        // virtualize.py:208: known_class = ConstInt(op.getdescr().get_vtable())
+        let known_class = descr
+            .as_size_descr()
+            .map(|sd| majit_ir::GcRef(sd.vtable()))
+            .filter(|gc| !gc.is_null());
         let vinfo = VirtualInfo {
             descr,
-            known_class: None,
+            known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
@@ -1316,6 +1321,30 @@ impl OptVirtualize {
             *arg = ctx.get_box_replacement(*arg);
         }
         OptimizationResult::Replace(guard_op)
+    }
+
+    /// RPython info.py:228 _force_at_the_end_of_preamble parity:
+    /// Force field VALUES of a virtual to concrete (non-virtual), but keep
+    /// the virtual structure itself alive (no New + SetfieldGc emission).
+    /// This ensures compiled code doesn't modify heap objects for this virtual,
+    /// so guard failure can safely blackhole-resume without heap rollback.
+    fn force_virtual_fields_at_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) {
+        let Some(info) = ctx.get_ptr_info(opref).cloned() else {
+            return;
+        };
+        let fields = match &info {
+            PtrInfo::Virtual(vi) => vi.fields.clone(),
+            PtrInfo::VirtualStruct(vi) => vi.fields.clone(),
+            _ => return,
+        };
+        for &(_field_idx, value_ref) in &fields {
+            let resolved = ctx.get_box_replacement(value_ref);
+            if Self::is_virtual(resolved, ctx) {
+                // Recursive: force nested virtual's fields too
+                self.force_virtual_fields_at_end_of_preamble(resolved, ctx);
+            }
+        }
+        // Virtual itself is NOT forced — no New/SetfieldGc emitted.
     }
 
     fn prepare_guard_fail_arg(&mut self, resolved: OpRef, ctx: &mut OptContext) -> OpRef {

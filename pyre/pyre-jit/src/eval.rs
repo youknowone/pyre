@@ -1286,15 +1286,10 @@ fn execute_assembler(
                             frame.fix_array_ptrs();
                             return None;
                         }
-                        // Blackhole reached merge point successfully.
-                        // RPython: ContinueRunningNormally → interpreter dispatch
-                        // → re-enter compiled code. This works in RPython because
-                        // bridge compilation breaks the guard failure cycle.
-                        // In pyre, bridge execution doesn't reliably break the
-                        // cycle yet (GuardNotInvalidated fires on re-entry).
-                        // Invalidate to prevent infinite guard→blackhole→reentry.
-                        // The interpreter continues normally; the counter will
-                        // recompile if needed.
+                        // RPython compile.py:710: blackhole resume succeeds.
+                        // Pyre limitation: compiled code partially modifies heap
+                        // before guard failure (forced virtuals in JUMP args).
+                        // Invalidate to prevent double-update on re-entry.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
@@ -2084,26 +2079,17 @@ fn materialize_virtual_from_rd(
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
         // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
-        let size = if descr_size > 0 {
-            descr_size
-        } else {
-            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-            (max_offset + 8).max(16)
-        };
+        debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
+        let size = if descr_size > 0 { descr_size } else { 16 };
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         unsafe { *ptr = ob_type }; // ob_type at offset 0
         ptr as usize
-    } else if descr_size > 0 || !field_offsets.is_empty() {
+    } else if descr_size > 0 {
         // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
-        let size = if descr_size > 0 {
-            descr_size
-        } else {
-            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-            (max_offset + 8).max(16)
-        };
-        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-        unsafe { std::alloc::alloc_zeroed(layout) as usize }
+        // VStruct allocation crashes when used as Python object (ob_type dispatch).
+        // Keep NULL until trace emission distinguishes NEW vs NEW_WITH_VTABLE.
+        return Value::Ref(majit_ir::GcRef::NULL);
     } else {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -2188,11 +2174,42 @@ fn materialize_virtual_from_rd(
                 Value::Ref(gc) => gc.0 as i64,
                 _ => 0,
             };
-            // resume.py:598-602: decoder.setfield(struct, num, descr)
-            // descr.offset() provides byte offset within the struct.
-            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8); // fallback: contiguous after ob_type
+            // resume.py:598-602,1509-1518: decoder.setfield(struct, num, descr)
+            let Some(&byte_offset) = field_offsets.get(i) else {
+                debug_assert!(false, "field_offsets missing for field {}", i);
+                continue;
+            };
+            if byte_offset == 0 {
+                continue;
+            }
+            let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+            let fsz = field_sizes.get(i).copied().unwrap_or(8);
             unsafe {
-                *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
+                let addr = (obj_ptr as *mut u8).add(byte_offset);
+                match ftype {
+                    majit_ir::Type::Ref => {
+                        let p = match val {
+                            Value::Ref(gc) => gc.0 as i64,
+                            Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        std::ptr::write(addr as *mut i64, p);
+                    }
+                    majit_ir::Type::Float => {
+                        let bits = match val {
+                            Value::Float(f) => f.to_bits(),
+                            Value::Int(n) => n as u64,
+                            _ => 0,
+                        };
+                        std::ptr::write(addr as *mut u64, bits);
+                    }
+                    _ => match fsz {
+                        1 => std::ptr::write(addr, raw as u8),
+                        2 => std::ptr::write(addr as *mut u16, raw as u16),
+                        4 => std::ptr::write(addr as *mut u32, raw as u32),
+                        _ => std::ptr::write(addr as *mut i64, raw),
+                    },
+                }
             }
         }
     }
@@ -2434,7 +2451,18 @@ fn rebuild_typed_from_rd_numb(
 ) -> Vec<Value> {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
-    let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
+    let (_num_failargs, vable_values, _vref_values, frames) =
+        rebuild_from_numbering(rd_numb, rd_consts);
+
+    // resume.py:1045 consume_vref_and_vable_boxes parity:
+    // vable_values contains virtualizable field values [ni, vsd].
+    if majit_metainterp::majit_log_enabled() && !vable_values.is_empty() {
+        eprintln!(
+            "[jit] guard-fail: vable_values={} items: {:?}",
+            vable_values.len(),
+            vable_values.iter().take(4).collect::<Vec<_>>()
+        );
+    }
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
