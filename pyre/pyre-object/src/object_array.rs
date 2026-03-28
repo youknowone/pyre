@@ -269,35 +269,23 @@ pub enum ArrayKind {
     Struct,
 }
 
-/// resume.py:1444-1447, llmodel.py:788 parity.
-/// `clear=true` → bh_new_array_clear (explicit zero-init).
-/// `clear=false` → bh_new_array (GC nursery zero-filled in RPython).
-/// In pyre both produce zero-filled storage (Rust Vec/vec! default).
-/// RPython distinction: bh_new_array_clear emits memset; bh_new_array
-/// relies on GC nursery zeroing. pyre has no GC nursery — always zeroed.
-pub fn allocate_array(length: usize, kind: ArrayKind, clear: bool) -> *mut GcTypedArray {
-    let arr = if clear {
-        match kind {
-            ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
-            ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
-            ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
-            ArrayKind::Struct => GcTypedArray::Struct {
-                item_size: 0,
-                num_elems: length,
-                data: Vec::new(),
-            },
-        }
-    } else {
-        match kind {
-            ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
-            ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
-            ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
-            ArrayKind::Struct => GcTypedArray::Struct {
-                item_size: 0,
-                num_elems: length,
-                data: Vec::new(),
-            },
-        }
+/// resume.py:1444-1447, llmodel.py:788-790 parity.
+/// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py:790).
+/// Both call `gc_malloc_array` which allocates from the GC nursery
+/// (always zero-filled). The `clear` parameter preserves the API
+/// distinction from resume.py:1444 but has no behavioral difference.
+pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
+    // llmodel.py:790: bh_new_array_clear = bh_new_array.
+    // Both allocate from gc_malloc_array (always zero-filled).
+    let arr = match kind {
+        ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
+        ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
+        ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
+        ArrayKind::Struct => GcTypedArray::Struct {
+            item_size: 0,
+            num_elems: length,
+            data: Vec::new(),
+        },
     };
     Box::into_raw(Box::new(arr))
 }
