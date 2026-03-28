@@ -2391,10 +2391,14 @@ impl OptUnroll {
                     }
                     ctx.replace_op(source, value);
                     let descr_idx = descr.index();
+                    // shortpreamble.py:72,84 parity: canonicalize obj through
+                    // get_box_replacement so the key matches heap.py lookup
+                    // which also canonicalizes array via get_box_replacement.
+                    let obj_resolved = ctx.get_box_replacement(obj);
                     ctx.imported_short_arrayitems
-                        .insert((obj, descr_idx, index), value);
+                        .insert((obj_resolved, descr_idx, index), value);
                     ctx.imported_short_arrayitem_descrs
-                        .insert((obj, descr_idx, index), descr.clone());
+                        .insert((obj_resolved, descr_idx, index), descr.clone());
                     ctx.imported_short_sources
                         .push(crate::optimizeopt::ImportedShortSource {
                             result: value,
