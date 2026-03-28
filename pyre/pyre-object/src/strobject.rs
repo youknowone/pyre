@@ -4,8 +4,8 @@
 //! carries a stable length slot so truth/len paths can follow the same layout
 //! from both the interpreter and the tracer.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use crate::pyobject::*;
 
@@ -41,20 +41,24 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     Box::into_raw(obj) as PyObjectRef
 }
 
-fn string_constant_cache() -> &'static Mutex<HashMap<String, usize>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    /// String constant interning cache — single-threaded, no lock needed.
+    /// RPython has no equivalent lock; string interning is handled by the
+    /// translator at compile time, not at runtime.
+    static STRING_CONSTANT_CACHE: RefCell<HashMap<String, usize>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Box a string constant into a heap Python str object.
 pub fn box_str_constant(value: &str) -> PyObjectRef {
-    let mut cache = string_constant_cache().lock().unwrap();
-    if let Some(&cached) = cache.get(value) {
-        return cached as PyObjectRef;
-    }
-    let obj = w_str_new(value);
-    cache.insert(value.to_owned(), obj as usize);
-    obj
+    STRING_CONSTANT_CACHE.with(|cache| {
+        if let Some(&cached) = cache.borrow().get(value) {
+            return cached as PyObjectRef;
+        }
+        let obj = w_str_new(value);
+        cache.borrow_mut().insert(value.to_owned(), obj as usize);
+        obj
+    })
 }
 
 /// Extract the &str value from a known W_StrObject pointer.
