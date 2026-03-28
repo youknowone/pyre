@@ -964,39 +964,30 @@ impl OptHeap {
             }
         }
 
-        // RPython optimizer.py:783: constant_fold — read immutable field
-        // from a constant object at optimization time.
-        // Safety: only fold when the object's class is known (via GuardClass
-        // or GuardValue). This prevents folding field reads on function
-        // pointers or other objects whose memory layout doesn't match
-        // the field descriptor.
+        // heap.py:640-643: constant_fold — read immutable field from a
+        // constant object at optimization time.
+        //   if descr.is_always_pure() and self.get_constant_box(arg0):
+        //       resbox = self.optimizer.constant_fold(op)
         if let Some(descr) = &op.descr {
             if descr.is_always_pure() {
                 let obj_ref = op.arg(0);
-                let class_known = ctx
-                    .get_ptr_info(obj_ref)
-                    .and_then(|info| info.get_known_class())
-                    .is_some();
-                if class_known {
-                    if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned()
-                    {
-                        if !ptr_val.is_null() {
-                            if let Some((offset, field_size, _field_type)) =
-                                majit_ir::unpack_fielddescr(descr)
-                            {
-                                let addr = ptr_val.0 + offset;
-                                let folded = match field_size {
-                                    8 => Some(unsafe { *(addr as *const i64) }),
-                                    4 => Some(unsafe { *(addr as *const i32) as i64 }),
-                                    2 => Some(unsafe { *(addr as *const i16) as i64 }),
-                                    1 => Some(unsafe { *(addr as *const u8) as i64 }),
-                                    _ => None,
-                                };
-                                if let Some(value) = folded {
-                                    let const_ref = ctx.make_constant_int(value);
-                                    ctx.replace_op(op.pos, const_ref);
-                                    return OptimizationResult::Remove;
-                                }
+                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
+                    if !ptr_val.is_null() {
+                        if let Some((offset, field_size, _field_type)) =
+                            majit_ir::unpack_fielddescr(descr)
+                        {
+                            let addr = ptr_val.0 + offset;
+                            let folded = match field_size {
+                                8 => Some(unsafe { *(addr as *const i64) }),
+                                4 => Some(unsafe { *(addr as *const i32) as i64 }),
+                                2 => Some(unsafe { *(addr as *const i16) as i64 }),
+                                1 => Some(unsafe { *(addr as *const u8) as i64 }),
+                                _ => None,
+                            };
+                            if let Some(value) = folded {
+                                let const_ref = ctx.make_constant_int(value);
+                                ctx.replace_op(op.pos, const_ref);
+                                return OptimizationResult::Remove;
                             }
                         }
                     }
@@ -1085,18 +1076,26 @@ impl OptHeap {
         //       opinfo.setfield(descr, None, res, optheap=optheap)
         //   return res
         if !is_vable_field {
-            if let Some(pop) = ctx
+            // heap.py:177-187: CachedField._getfield — PreambleOp detection.
+            // info.py:716: ConstPtrInfo._get_info delegates to const_infos.
+            let pop = ctx
                 .get_ptr_info_mut(obj)
                 .and_then(|info| info.take_preamble_field(field_idx))
-            {
+                .or_else(|| {
+                    ctx.get_const_info_mut(obj)
+                        .and_then(|info| info.take_preamble_field(field_idx))
+                });
+            if let Some(pop) = pop {
                 let cached = pop.resolved;
+                // RPython heap.py:185-186: always force PreambleOp.
+                // force_op_from_preamble registers with short preamble
+                // builder (use_box + potential_extra_ops).
                 ctx.force_op_from_preamble(cached);
                 let d = op.descr.clone();
-                if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) {
-                    if d.as_ref().map_or(false, |dd| dd.is_always_pure()) {
-                        self.immutable_field_descrs.insert(key.1);
-                        self.immutable_cached_fields.insert(key, cached);
-                    }
+                let is_immutable = d.as_ref().map_or(false, |dd| dd.is_always_pure());
+                if is_immutable {
+                    self.immutable_field_descrs.insert(key.1);
+                    self.immutable_cached_fields.insert(key, cached);
                 }
                 let cf = self.get_or_create_cached_field(field_idx);
                 if cf.get_entry(obj).is_none() {

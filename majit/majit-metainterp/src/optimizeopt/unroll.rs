@@ -525,7 +525,10 @@ impl UnrollOptimizer {
                 )
                 .is_none(); // None = jumped successfully
             if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!("[jit] jump_to_existing_trace result: jumped={}", jumped);
+                eprintln!(
+                    "[jit] jump_to_existing_trace(force_boxes=false) result: jumped={}",
+                    jumped
+                );
             }
 
             if !jumped {
@@ -2231,7 +2234,9 @@ impl OptUnroll {
                                 .map(crate::optimizeopt::ImportedShortPureArg::OpRef),
                             ExportedShortArg::Const { source, value } => {
                                 ctx.make_constant(*source, value.clone());
-                                Some(crate::optimizeopt::ImportedShortPureArg::Const(*value))
+                                Some(crate::optimizeopt::ImportedShortPureArg::Const(
+                                    *value, *source,
+                                ))
                             }
                             ExportedShortArg::Produced(index) => produced_results
                                 .get(*index)
@@ -2310,18 +2315,21 @@ impl OptUnroll {
                     ctx.short_preamble_mapping.insert(source, value);
                     let descr_idx = descr.index();
                     let obj_resolved = ctx.get_replacement(obj);
-                    // RPython shortpreamble.py: opinfo = getptrinfo(obj)
-                    // Ensure PtrInfo exists so set_preamble_field can store.
-                    ctx.ensure_ptr_info(obj_resolved);
-                    if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
-                        info.set_preamble_field(
-                            descr_idx,
-                            crate::optimizeopt::info::PreambleOp {
-                                op: source,
-                                resolved: value,
-                                invented_name,
-                            },
-                        );
+                    let pop = crate::optimizeopt::info::PreambleOp {
+                        op: source,
+                        resolved: value,
+                        invented_name,
+                    };
+                    // info.py:716-721: ConstPtrInfo._get_info(descr, optheap)
+                    // For constant objects, delegate to const_infos StructPtrInfo.
+                    // For non-constants, ensure_ptr_info + set_preamble_field.
+                    if let Some(info) = ctx.get_const_info_mut(obj_resolved) {
+                        info.set_preamble_field(descr_idx, pop);
+                    } else {
+                        ctx.ensure_ptr_info(obj_resolved);
+                        if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
+                            info.set_preamble_field(descr_idx, pop);
+                        }
                     }
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
@@ -4116,7 +4124,7 @@ mod tests {
                 descr: None,
                 args: vec![
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
-                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7)),
+                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                 ],
                 result: OpRef(11),
             }]
@@ -4178,7 +4186,7 @@ mod tests {
                 opcode: OpCode::CallPureI,
                 descr: Some(call_descr.clone()),
                 args: vec![
-                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(0x1234)),
+                    crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(0x1234), OpRef(10)),
                     crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
                 ],
                 result: OpRef(11),
@@ -4264,7 +4272,7 @@ mod tests {
                     descr: None,
                     args: vec![
                         crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef(12)),
-                        crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7)),
+                        crate::optimizeopt::ImportedShortPureArg::Const(Value::Int(7), OpRef(10)),
                     ],
                     result: temp_result,
                 },
@@ -4330,9 +4338,10 @@ mod tests {
             vec![crate::optimizeopt::ImportedShortPureOp {
                 opcode: OpCode::GetfieldGcPureI,
                 descr: Some(field_descr.clone()),
-                args: vec![crate::optimizeopt::ImportedShortPureArg::Const(Value::Ref(
-                    ptr
-                ))],
+                args: vec![crate::optimizeopt::ImportedShortPureArg::Const(
+                    Value::Ref(ptr),
+                    OpRef(10023)
+                )],
                 result: OpRef(11),
             }]
         );
