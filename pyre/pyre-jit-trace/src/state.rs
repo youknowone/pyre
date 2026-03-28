@@ -1043,8 +1043,8 @@ fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -> OpRef {
     match value {
         Value::Int(v) => ctx.const_int(v),
         Value::Float(v) => ctx.const_int(v.to_bits() as i64),
-        Value::Ref(r) => ctx.const_int(r.as_usize() as i64),
-        Value::Void => ctx.const_int(PY_NULL as i64),
+        Value::Ref(r) => ctx.const_ref(r.as_usize() as i64),
+        Value::Void => ctx.const_ref(PY_NULL as i64),
     }
 }
 
