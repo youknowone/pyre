@@ -1789,6 +1789,7 @@ fn import_single_value(
             }
             ptr_info[idx] = Some(PtrInfo::VirtualArrayStruct(VirtualArrayStructInfo {
                 descr: descr.clone(),
+                fielddescrs: Vec::new(),
                 element_fields: imported_elements,
                 last_guard_pos: -1,
             }));

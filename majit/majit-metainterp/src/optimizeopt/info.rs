@@ -1331,10 +1331,13 @@ pub struct VirtualStructInfo {
 /// with complex item types (e.g., hash table entries with key+value fields).
 #[derive(Clone, Debug)]
 pub struct VirtualArrayStructInfo {
-    /// The array descriptor.
+    /// The array descriptor (arraydescr).
     pub descr: DescrRef,
     /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
     pub element_fields: Vec<Vec<(u32, OpRef)>>,
+    /// resume.py VArrayStructInfo.fielddescrs — InteriorFieldDescr per field.
+    /// Used by _number_virtuals to extract item_size/field_offset/field_size.
+    pub fielddescrs: Vec<DescrRef>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }

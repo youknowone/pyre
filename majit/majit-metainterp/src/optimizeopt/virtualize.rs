@@ -1154,6 +1154,13 @@ impl OptVirtualize {
                     let elem_idx = index as usize;
                     if elem_idx < vinfo.element_fields.len() {
                         set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
+                        // RPython VArrayStructInfo.fielddescrs parity:
+                        // collect InteriorFieldDescr for _number_virtuals.
+                        if let Some(ref descr) = op.descr {
+                            if !vinfo.fielddescrs.iter().any(|d| d.index() == descr.index()) {
+                                vinfo.fielddescrs.push(descr.clone());
+                            }
+                        }
                         return OptimizationResult::Remove;
                     }
                 }
