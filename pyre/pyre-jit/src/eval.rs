@@ -83,6 +83,10 @@ thread_local! {
         );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
+        // warmstate.py:259 trace_eagerness: guard failure threshold for
+        // bridge compilation. RPython default 200, pyre uses 20 because
+        // interpreter-mode iterations are slower (not C-compiled).
+        d.set_bridge_threshold(20);
         // warmspot.py:449 — portal function returns a Python object (int).
         // pyre's portal always returns PyObjectRef, but the JIT unboxes
         // int results to raw i64 via unbox_finish_result, so the static
@@ -983,9 +987,12 @@ fn jit_merge_point_hook(
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
 /// warmstate.py:446-511 maybe_compile_and_run.
 ///
-/// RPython: cell lookup (O(1)) → compiled → enter. No cell → counter.
-/// Cell-first (O(1) celltable hint) blocked by guard failure frame
-/// corruption from incomplete virtual materialization.
+/// RPython order: cell lookup (JC_TRACING → skip, JC_COMPILED → enter)
+/// BEFORE counter.tick(). This prevents compiled loops from occupying
+/// counter hash-table slots and evicting non-compiled loops.
+/// TODO: blocked by bridge loop_reentry targeting preamble instead of body.
+/// Once bridge target_token selection is fixed, move has_compiled_loop
+/// check before counter.tick().
 #[cold]
 #[inline(never)]
 fn maybe_compile_and_run(
