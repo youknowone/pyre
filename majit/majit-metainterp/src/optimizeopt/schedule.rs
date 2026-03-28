@@ -9,7 +9,8 @@ use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::dependency::DependencyGraph;
 
-/// A group of independent, isomorphic operations that can be packed.
+/// schedule.py:781+: A pack is a set of n isomorphic operations that can
+/// execute as a single SIMD instruction.
 #[derive(Clone, Debug)]
 pub struct Pack {
     /// The scalar opcode of the group members.
@@ -18,6 +19,8 @@ pub struct Pack {
     pub vector_opcode: OpCode,
     /// Indices into the DepGraph nodes.
     pub members: Vec<usize>,
+    /// schedule.py:811: whether this pack tracks an accumulation (reduction).
+    pub is_accumulating: bool,
 }
 
 /// vector.py: PackSet — manages packs and supports merging
@@ -94,6 +97,7 @@ impl PackSet {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![uleft, uright],
+                                is_accumulating: false,
                             });
                         }
                     }
@@ -111,6 +115,7 @@ impl PackSet {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![dleft, dright],
+                                is_accumulating: false,
                             });
                         }
                     }
@@ -379,4 +384,112 @@ impl Default for CostModel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── schedule.py:584-779: VecScheduleState ─────────────────────
+
+/// schedule.py:584-779: State for vector-aware instruction scheduling.
+/// Tracks which scalar ops have been mapped to vector ops, handles
+/// pack/unpack/expand operations, and manages the output op list.
+pub struct VecScheduleState {
+    /// Map from scalar OpRef → (index_in_vector, vector OpRef).
+    pub box_to_vbox: HashMap<OpRef, (usize, OpRef)>,
+    /// Output operations (vector + remaining scalar).
+    pub oplist: Vec<Op>,
+    /// Renamer for SSA fixup during vectorization.
+    pub renamer: super::renamer::Renamer,
+    /// Cost model for profitability analysis.
+    pub costmodel: CostModel,
+    /// schedule.py:587-588: expanded_map — tracks expanded scalars.
+    pub expanded_map: HashMap<OpRef, Vec<(OpRef, i32)>>,
+    /// schedule.py:591: inputargs of the loop label.
+    pub inputargs: HashMap<OpRef, ()>,
+    /// schedule.py:595: accumulation info.
+    pub accumulation: HashMap<OpRef, usize>,
+    /// Next OpRef counter for newly created vector ops.
+    next_pos: u32,
+}
+
+impl VecScheduleState {
+    pub fn new(start_pos: u32) -> Self {
+        VecScheduleState {
+            box_to_vbox: HashMap::new(),
+            oplist: Vec::new(),
+            renamer: super::renamer::Renamer::new(),
+            costmodel: CostModel::new(),
+            expanded_map: HashMap::new(),
+            inputargs: HashMap::new(),
+            accumulation: HashMap::new(),
+            next_pos: start_pos,
+        }
+    }
+
+    /// Allocate a fresh OpRef for a newly created vector op.
+    pub fn alloc_op_pos(&mut self) -> OpRef {
+        let pos = OpRef(self.next_pos);
+        self.next_pos += 1;
+        pos
+    }
+
+    /// schedule.py:625-630: setvector_of_box — record that scalar_op
+    /// is at index `idx` in the vector `vecop`.
+    pub fn setvector_of_box(&mut self, scalar_op: OpRef, idx: usize, vecop: OpRef) {
+        self.box_to_vbox.insert(scalar_op, (idx, vecop));
+    }
+
+    /// schedule.py:632-638: getvector_of_box — look up which vector
+    /// op contains the scalar op.
+    pub fn getvector_of_box(&self, scalar_op: OpRef) -> Option<(usize, OpRef)> {
+        self.box_to_vbox.get(&scalar_op).copied()
+    }
+
+    /// schedule.py:640-650: append to output.
+    pub fn append_to_oplist(&mut self, op: Op) {
+        self.oplist.push(op);
+    }
+}
+
+// ── schedule.py:322-350: turn_into_vector ─────────────────────
+
+/// schedule.py:322-350: Turn a pack of scalar ops into a single vector op.
+/// Creates VecOperation with the appropriate vector opcode and lane count.
+pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
+    if pack.members.is_empty() {
+        return;
+    }
+    let count = pack.members.len();
+    let first_op = &ops[pack.members[0]];
+    let Some(vec_opcode) = first_op.opcode.to_vector() else {
+        return; // not vectorizable
+    };
+
+    // schedule.py:337-338: create VecOperation
+    let mut vecop = Op::new(vec_opcode, &first_op.args);
+    vecop.pos = state.alloc_op_pos();
+    vecop.descr = first_op.descr.clone();
+    let datatype = if first_op.opcode.result_type() == majit_ir::Type::Float {
+        'f'
+    } else {
+        'i'
+    };
+    let mut vinfo = majit_ir::VectorizationInfo::new();
+    vinfo.count = count as i16;
+    vinfo.setinfo(datatype, -1, datatype == 'i');
+    vecop.vecinfo = Some(Box::new(vinfo));
+
+    let vecop_pos = vecop.pos;
+    // schedule.py:340-346: map scalar ops to vector positions
+    for (i, &member_idx) in pack.members.iter().enumerate() {
+        let scalar_pos = ops[member_idx].pos;
+        if !scalar_pos.is_none() {
+            state.setvector_of_box(scalar_pos, i, vecop_pos);
+            // schedule.py:345-346: only rename for accumulating packs
+            if pack.is_accumulating {
+                state.renamer.start_renaming(scalar_pos, vecop_pos);
+            }
+        }
+    }
+
+    state.append_to_oplist(vecop);
+    assert!(count >= 1);
 }
