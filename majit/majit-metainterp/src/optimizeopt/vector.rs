@@ -29,7 +29,8 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 pub use crate::optimizeopt::dependency::schedule_operations;
 pub use crate::optimizeopt::dependency::{DependencyGraph, Node};
 pub use crate::optimizeopt::schedule::{
-    AccumPack, CostModel, GenericCostModel, GuardAnalysis, Pack, PackSet, are_adjacent_memory_refs,
+    AccumPack, CostModel, GenericCostModel, GuardAnalysis, Pack, PackSet, VecScheduleState,
+    are_adjacent_memory_refs, turn_into_vector, unpack_from_vector,
 };
 
 /// vector.py: VectorLoop — wraps a loop body for vectorization analysis.
@@ -363,8 +364,8 @@ impl VectorizingOptimizer {
         }
 
         // Filter by cost model
-        let profitable: Vec<&Pack> = groups
-            .iter()
+        let profitable: Vec<Pack> = groups
+            .into_iter()
             .filter(|g| self.cost_model.is_profitable(g))
             .collect();
 
@@ -372,51 +373,56 @@ impl VectorizingOptimizer {
             return None;
         }
 
-        // Build the vectorized ops
-        let mut vectorized_indices: HashSet<usize> = HashSet::new();
-        let mut new_ops: Vec<Op> = Vec::with_capacity(self.body_ops.len());
-        let mut vector_results: Vec<(usize, OpRef)> = Vec::new(); // (group member 0 idx, vector result ref)
+        // schedule.py:672-681: Use VecScheduleState to emit vectorized ops.
+        // Allocate OpRef positions starting after existing ops.
+        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
+        let mut sched_state = VecScheduleState::new(start_pos);
 
-        // First, emit vector operations
+        // Build set of vectorized indices
+        let mut vectorized_indices: HashSet<usize> = HashSet::new();
         for group in &profitable {
             for &idx in &group.members {
                 vectorized_indices.insert(idx);
             }
-
-            // Emit VecPack for inputs: pack the first args of each member
-            let first_member = &self.body_ops[group.members[0]];
-            let mut vec_op = Op::new(group.vector_opcode, &first_member.args);
-            vec_op.pos = OpRef(ctx.new_operations.len() as u32 + new_ops.len() as u32);
-            let vec_ref = vec_op.pos;
-            new_ops.push(vec_op);
-
-            // Record that group members' results are now in the vector result
-            for (lane, &idx) in group.members.iter().enumerate() {
-                vector_results.push((idx, vec_ref));
-                // Emit VecUnpack for each lane if the result is used
-                if !dep_graph.nodes[idx].users.is_empty() {
-                    let unpack_opcode = if is_float_opcode(group.scalar_opcode) {
-                        OpCode::VecUnpackF
-                    } else {
-                        OpCode::VecUnpackI
-                    };
-                    let lane_ref = OpRef(lane as u32 + 10_000); // constant for lane index
-                    let count_ref = OpRef(group.members.len() as u32 + 10_000); // constant for count
-                    let mut unpack = Op::new(unpack_opcode, &[vec_ref, lane_ref, count_ref]);
-                    unpack.pos = OpRef(ctx.new_operations.len() as u32 + new_ops.len() as u32);
-                    new_ops.push(unpack);
-                }
-            }
         }
 
-        // Then, emit remaining (non-vectorized) ops
+        // schedule.py:672-681: try_emit_or_delay — emit packs via turn_into_vector,
+        // emit remaining ops directly with ensure_args_unpacked.
+        for group in &profitable {
+            turn_into_vector(&mut sched_state, group, &self.body_ops);
+        }
+
+        // Emit remaining (non-vectorized) ops, with scalar unpacking
         for (i, op) in self.body_ops.iter().enumerate() {
             if !vectorized_indices.contains(&i) {
-                new_ops.push(op.clone());
+                let mut scalar_op = op.clone();
+                // schedule.py:697-716: ensure_args_unpacked
+                for j in 0..scalar_op.args.len() {
+                    let arg = scalar_op.args[j];
+                    if let Some((pos, vec_ref)) = sched_state.getvector_of_box(arg) {
+                        // Unpack scalar from vector box
+                        let unpacked = unpack_from_vector(&mut sched_state, vec_ref, pos, 1);
+                        sched_state.renamer.start_renaming(arg, unpacked);
+                        scalar_op.args[j] = unpacked;
+                    }
+                }
+                // Also unpack failargs for guards
+                if scalar_op.opcode.is_guard() {
+                    if let Some(ref mut fail_args) = scalar_op.fail_args {
+                        for arg in fail_args.iter_mut() {
+                            if let Some((pos, vec_ref)) = sched_state.getvector_of_box(*arg) {
+                                let unpacked =
+                                    unpack_from_vector(&mut sched_state, vec_ref, pos, 1);
+                                *arg = unpacked;
+                            }
+                        }
+                    }
+                }
+                sched_state.append_to_oplist(scalar_op);
             }
         }
 
-        Some(new_ops)
+        Some(sched_state.oplist)
     }
 }
 

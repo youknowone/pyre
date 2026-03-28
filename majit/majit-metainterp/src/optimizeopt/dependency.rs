@@ -9,6 +9,90 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};
 
+// ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
+
+/// dependency.py:30-48: LOAD_COMPLEX_OBJ — returns (complex_obj_arg_idx, index_arg_idx).
+/// index_arg_idx == -1 means no index argument (field access, not array).
+fn load_complex_obj_args(opcode: OpCode) -> (usize, i32) {
+    match opcode {
+        // Array loads: (array, index)
+        OpCode::GetarrayitemGcI
+        | OpCode::GetarrayitemGcF
+        | OpCode::GetarrayitemGcR
+        | OpCode::GetarrayitemRawI
+        | OpCode::GetarrayitemRawF
+        | OpCode::RawLoadI
+        | OpCode::RawLoadF => (0, 1),
+        // Interior field: (obj, index)
+        OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcF | OpCode::GetinteriorfieldGcR => {
+            (0, 1)
+        }
+        // Field loads: (obj, no index)
+        OpCode::GetfieldGcI
+        | OpCode::GetfieldGcR
+        | OpCode::GetfieldGcF
+        | OpCode::GetfieldRawI
+        | OpCode::GetfieldRawR
+        | OpCode::GetfieldRawF => (0, -1),
+        _ => (0, -1),
+    }
+}
+
+/// dependency.py:15-26: MODIFY_COMPLEX_OBJ — returns (complex_obj_arg_idx, cell_arg_idx).
+/// cell_arg_idx == -1 means no cell argument (field store, not array).
+fn modify_complex_obj_args(opcode: OpCode) -> Option<(usize, i32)> {
+    match opcode {
+        // Array stores: (array, index)
+        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw | OpCode::RawStore => Some((0, 1)),
+        // Interior field stores: (obj, no cell)
+        OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => Some((0, -1)),
+        // Field stores: (obj, no cell)
+        OpCode::SetfieldGc | OpCode::SetfieldRaw => Some((0, -1)),
+        // Other
+        OpCode::ZeroArray => Some((0, -1)),
+        OpCode::Strsetitem | OpCode::Unicodesetitem => Some((0, -1)),
+        _ => None,
+    }
+}
+
+/// dependency.py:213-241: side_effect_arguments — determine which args are
+/// destroyed (modified) by the operation. Returns Vec<(arg, argcell, destroyed)>.
+fn side_effect_arguments(op: &Op) -> Vec<(OpRef, Option<OpRef>, bool)> {
+    let mut result = Vec::new();
+    if op.opcode.is_complex_modify() {
+        // dependency.py:218-230: known complex modification patterns
+        if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
+            if obj_idx < op.args.len() {
+                if cell_idx >= 0 && (cell_idx as usize) < op.args.len() {
+                    // (obj, cell, destroyed=true) for the array+index case
+                    result.push((op.args[obj_idx], Some(op.args[cell_idx as usize]), true));
+                    // remaining args are just used
+                    for j in (cell_idx as usize + 1)..op.args.len() {
+                        result.push((op.args[j], None, false));
+                    }
+                } else {
+                    // (obj, None, destroyed=true) for field stores
+                    result.push((op.args[obj_idx], None, true));
+                    for j in (obj_idx + 1)..op.args.len() {
+                        result.push((op.args[j], None, false));
+                    }
+                }
+            }
+        }
+    } else {
+        // dependency.py:232-240: generic side effect — assume args may be destroyed
+        for arg in &op.args {
+            if arg.is_constant() {
+                result.push((*arg, None, false));
+            } else {
+                // dependency.py:238-240: non-constant, non-float may be destroyed
+                result.push((*arg, None, true));
+            }
+        }
+    }
+    result
+}
+
 /// dependency.py:131-300: A node in the dependency graph.
 /// Each node wraps one operation and maintains forward/backward dependency edges.
 #[derive(Clone, Debug)]
@@ -209,13 +293,24 @@ impl DependencyGraph {
     /// dependency.py:708-735: build_guard_dependencies
     fn build_guard_dependencies(&mut self, guard_idx: usize, tracker: &mut DefTracker, ops: &[Op]) {
         let op = self.nodes[guard_idx].op.clone();
+        // dependency.py:710-712: ignore invalidated & future condition & early exit guards
+        if matches!(
+            op.opcode,
+            OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails | OpCode::GuardNotInvalidated
+        ) {
+            return;
+        }
         // dependency.py:714-715: true dependencies on args
         for arg in &op.args.to_vec() {
             Self::depends_on_arg_static(tracker, *arg, guard_idx, &mut self.nodes);
         }
         // dependency.py:717: guard_argument_protection
         self.guard_argument_protection(guard_idx, tracker);
-        // dependency.py:723-735: fail_args dependencies
+        // dependency.py:719-721: descr.exits_early() check
+        if self.nodes[guard_idx].exits_early() {
+            return;
+        }
+        // dependency.py:723-735: fail_args dependencies — iterate ALL redefinitions
         if let Some(ref fail_args) = op.fail_args {
             let fa = fail_args.to_vec();
             for arg in &fa {
@@ -225,7 +320,9 @@ impl DependencyGraph {
                 if !tracker.is_defined(*arg) {
                     continue;
                 }
-                if let Some(at_idx) = tracker.definition(*arg) {
+                // dependency.py:730-733: for at in tracker.redefinitions(arg)
+                let redefs = tracker.redefinitions(*arg);
+                for at_idx in redefs {
                     if self.nodes[at_idx].is_before(guard_idx) {
                         Self::add_edge(&mut self.nodes, at_idx, guard_idx, Some(*arg), true);
                     }
@@ -237,19 +334,19 @@ impl DependencyGraph {
     /// dependency.py:646-698: guard_argument_protection
     fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
         let op = self.nodes[guard_idx].op.clone();
-        // dependency.py:657-664: redefine non-int/float pointer args at guard
+        // dependency.py:657-664: redefine non-constant, non-int, non-float args (pointers)
         for arg in &op.args.to_vec() {
-            if !arg.is_constant() {
-                // In RPython, this checks arg.type not in ('i','f').
-                // For majit, we check if it's a reference type.
-                let tp = op.opcode.result_type();
-                // Conservatively redefine: guards on pointers
-                if matches!(
-                    self.nodes[guard_idx].op.opcode,
-                    OpCode::GuardNonnull | OpCode::GuardClass | OpCode::GuardSubclass
-                ) {
-                    tracker.define(*arg, guard_idx);
-                }
+            if arg.is_constant() || arg.is_none() {
+                continue;
+            }
+            // dependency.py:658: arg.type not in ('i','f')
+            // Look up the defining op's result type to determine arg type.
+            let arg_type = tracker
+                .definition(*arg)
+                .map(|def_idx| self.nodes[def_idx].op.opcode.result_type())
+                .unwrap_or(majit_ir::Type::Ref); // unknown → assume ref (conservative)
+            if arg_type != majit_ir::Type::Int && arg_type != majit_ir::Type::Float {
+                tracker.define(*arg, guard_idx);
             }
         }
         // dependency.py:665-698: special guard priorities
@@ -290,38 +387,69 @@ impl DependencyGraph {
         &mut self,
         node_idx: usize,
         tracker: &mut DefTracker,
-        ops: &[Op],
+        _ops: &[Op],
     ) {
         let op = self.nodes[node_idx].op.clone();
 
         if self.nodes[node_idx].loads_from_complex_object() {
-            // dependency.py:742-751: complex object load
-            let cobj = op.args[0];
-            Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
-            if op.args.len() > 1 {
-                let index_var = op.args[1];
-                Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
-            }
-        } else {
-            // dependency.py:752-777: side effect arguments
-            for arg in &op.args.to_vec() {
-                Self::depends_on_arg_static(tracker, *arg, node_idx, &mut self.nodes);
-            }
-            if self.nodes[node_idx].modifies_complex_object() {
-                // dependency.py:776-777: redefine modified args
-                if !op.args.is_empty() {
-                    tracker.define(op.args[0], node_idx);
+            // dependency.py:742-751: LOAD_COMPLEX_OBJ dispatch
+            // (opnum, complex_obj_arg_idx, index_arg_idx)
+            let (cobj_idx, index_idx) = load_complex_obj_args(op.opcode);
+            if cobj_idx < op.args.len() {
+                let cobj = op.args[cobj_idx];
+                if index_idx >= 0 && (index_idx as usize) < op.args.len() {
+                    // dependency.py:747-748: argcell-aware depends_on
+                    let index_var = op.args[index_idx as usize];
+                    Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
+                    Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
+                } else {
+                    // dependency.py:750: no index arg
+                    Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
                 }
             }
-        }
+        } else {
+            // dependency.py:752-777: side_effect_arguments processing
+            let side_effects = side_effect_arguments(&op);
+            for (arg, argcell, destroyed) in &side_effects {
+                if let Some(cell) = argcell {
+                    // dependency.py:754-757: exact cell tracking
+                    Self::depends_on_arg_static(tracker, *arg, node_idx, &mut self.nodes);
+                    Self::depends_on_arg_static(tracker, *cell, node_idx, &mut self.nodes);
+                } else if *destroyed {
+                    // dependency.py:759-772: WAR/WAW dependencies
+                    if let Some(def_idx) = tracker.definition(*arg) {
+                        // dependency.py:767-769: war edges from def's users
+                        let provides: Vec<usize> = self.nodes[def_idx]
+                            .adjacent_list
+                            .iter()
+                            .map(|d| d.to_idx)
+                            .collect();
+                        for to in provides {
+                            if to != node_idx {
+                                Self::add_edge(&mut self.nodes, to, node_idx, *argcell, false);
+                            }
+                        }
+                        // dependency.py:770: def_node.edge_to(node)
+                        Self::add_edge(&mut self.nodes, def_idx, node_idx, *argcell, false);
+                    }
+                } else {
+                    // dependency.py:774-775: normal use
+                    Self::depends_on_arg_static(tracker, *arg, node_idx, &mut self.nodes);
+                }
+                if *destroyed {
+                    // dependency.py:776-777: redefine
+                    tracker.define(*arg, node_idx);
+                }
+            }
 
-        // dependency.py:780-782: non-pure must follow last guard
-        if !self.guards.is_empty() {
-            let last_guard = *self.guards.last().unwrap();
-            Self::add_edge(&mut self.nodes, last_guard, node_idx, None, false);
+            // dependency.py:780-782: non-pure must follow last guard
+            if !self.guards.is_empty() {
+                let last_guard = *self.guards.last().unwrap();
+                Self::add_edge(&mut self.nodes, last_guard, node_idx, None, false);
+            }
+            // dependency.py:784: track as non-pure
+            tracker.add_non_pure(node_idx);
         }
-        // dependency.py:784: track as non-pure
-        tracker.add_non_pure(node_idx);
     }
 
     /// Helper: add a dependency edge between two nodes (dependency.py:170-195 Node.edge_to).
@@ -780,6 +908,14 @@ impl DefTracker {
             .push((node_idx, None));
     }
 
+    /// dependency.py:490-492: redefinitions — yield all nodes defining arg.
+    pub fn redefinitions(&self, arg: OpRef) -> Vec<usize> {
+        self.defs
+            .get(&arg)
+            .map(|chain| chain.iter().map(|(idx, _)| *idx).collect())
+            .unwrap_or_default()
+    }
+
     /// dependency.py:494-495
     pub fn is_defined(&self, arg: OpRef) -> bool {
         self.defs.contains_key(&arg)
@@ -917,6 +1053,7 @@ impl<'a> IntegralForwardModification<'a> {
     }
 
     /// dependency.py:950-975: inspect array access ops.
+    /// Only creates MemoryRef for primitive array accesses (dependency.py:954).
     fn inspect_array_access(&mut self, op: &Op, node_idx: usize, raw_access: bool) {
         if op.args.len() < 2 {
             return;
@@ -925,6 +1062,14 @@ impl<'a> IntegralForwardModification<'a> {
         let index = op.args[1];
         let idx_var = self.get_or_create(index);
         if let Some(ref descr) = op.descr {
+            // dependency.py:954: descr.is_array_of_primitives()
+            let is_prim = descr
+                .as_array_descr()
+                .map(|ad| ad.is_array_of_primitives())
+                .unwrap_or(false);
+            if !is_prim {
+                return;
+            }
             let mref = MemoryRef {
                 array,
                 descr: descr.clone(),
