@@ -584,9 +584,7 @@ impl<S: JitState> JitDriver<S> {
                     let provisional_meta = self.trace_meta.take().unwrap();
                     // When cross-loop cut redirects to a different header_pc,
                     // rebuild meta from merge point to get the inner header's
-                    // layout (vsd, slot_types, merge_pc). This ensures
-                    // extract_live_values reads the frame correctly at the
-                    // inner back-edge entry via alias.
+                    // frame layout (vsd, slot_types, merge_pc).
                     let meta = {
                         if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
                             S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
@@ -1648,6 +1646,11 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
+        // RPython has no is_compatible — warmstate.py:482 enters execute_token
+        // directly. The correct dispatch happens via target_tokens selecting
+        // the right entry point. Until target_tokens dispatch is implemented,
+        // is_compatible serves as a temporary substitute: skip (without
+        // invalidation) when the single entry's meta doesn't match.
         if !state.is_compatible(&meta) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -1655,9 +1658,6 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
-            // RPython has no is_compatible — always enters execute_token.
-            // Don't invalidate: the entry is reachable from the correct PC
-            // via alias (inner back-edge). Just skip execution here.
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,

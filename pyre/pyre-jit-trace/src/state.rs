@@ -5730,7 +5730,17 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     );
                     types
                 };
-                ctx.add_merge_point(back_edge_key, live_args, live_types, target);
+                // Register under back_edge_key for close detection on next visit.
+                ctx.add_merge_point(back_edge_key, live_args.clone(), live_types.clone(), target);
+                // RPython pyjitpl.py:3036: live_arg_boxes contains the outer
+                // loop's green boxes, so same_greenkey() matches on the root key.
+                // Register under root_green_key too so compile_loop's
+                // get_merge_point_at(green_key, header_pc) finds this merge point
+                // when the trace closes at a cross-loop cut header.
+                let root_key = ctx.root_green_key();
+                if root_key != back_edge_key {
+                    ctx.add_merge_point(root_key, live_args, live_types, target);
+                }
                 MIFrame::set_next_instr(this, ctx, target);
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -6704,9 +6714,6 @@ impl JitState for PyreJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        // RPython warmstate.py: only green key matching + token validity.
-        // Concrete slot types are NOT checked — preamble guards catch
-        // type mismatches at runtime.
         self.next_instr == meta.merge_pc
             && self.local_count() == meta.num_locals
             && self.namespace_len() == meta.ns_keys.len()
@@ -6757,14 +6764,16 @@ impl JitState for PyreJitState {
         meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
-        // vsd = total_slots - num_locals
+        // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         if original_box_types.len() >= 3 {
-            let total_slots = original_box_types.len() - 3;
-            let new_vsd = total_slots.saturating_sub(meta.num_locals);
-            if new_vsd != meta.valuestackdepth {
-                meta.slot_types.resize(total_slots, Type::Ref);
-                meta.valuestackdepth = new_vsd;
+            let new_vsd = original_box_types.len() - 3;
+            // Adjust slot_types length if valuestackdepth changed.
+            if new_vsd < meta.valuestackdepth && meta.slot_types.len() > new_vsd {
+                meta.slot_types.truncate(new_vsd);
+            } else if new_vsd > meta.valuestackdepth && meta.slot_types.len() < new_vsd {
+                meta.slot_types.resize(new_vsd, Type::Ref);
             }
+            meta.valuestackdepth = new_vsd;
         }
     }
 
@@ -6776,14 +6785,17 @@ impl JitState for PyreJitState {
         // pyjitpl.py:3158-3175 compile_loop parity:
         // Build meta from MergePoint's original_box_types.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
-        // vsd = total_slots - num_locals (locals come first, then stack)
+        // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         let slot_types = if original_box_types.len() >= 3 {
             original_box_types[3..].to_vec()
         } else {
             Vec::new()
         };
-        let total_slots = slot_types.len();
-        let vsd = total_slots.saturating_sub(provisional.num_locals);
+        let vsd = if original_box_types.len() >= 3 {
+            original_box_types.len() - 3
+        } else {
+            provisional.valuestackdepth
+        };
         PyreMeta {
             merge_pc: header_pc,
             num_locals: provisional.num_locals,
