@@ -386,14 +386,33 @@ pub fn rebuild_from_numbering(
     // Each frame encodes: jitcode_index, pc, slot_count, [tagged_values...].
     // The decoder reads exactly slot_count tagged values per frame, allowing
     // multi-frame guard recovery when a guard fires inside an inlined callee.
+    // Use total_size to bound decoding (prevents over-reading from
+    // bridge-inherited rd_numb that may have different encoding).
     let mut frames = Vec::new();
-    while reader.has_more() {
+    while reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
+        if reader.items_read >= total_size as usize {
+            // Legacy single-frame rd_numb without slot_count: the
+            // "jitcode_index" was actually the first tagged value.
+            // Treat remaining items as a single frame.
+            let pc = 0;
+            let mut values = vec![decode_tagged(jitcode_index as i16, num_failargs, rd_consts)];
+            while reader.items_read < total_size as usize && reader.has_more() {
+                let tagged = reader.next_item() as i16;
+                values.push(decode_tagged(tagged, num_failargs, rd_consts));
+            }
+            frames.push(RebuiltFrame {
+                jitcode_index: 0,
+                pc,
+                values,
+            });
+            break;
+        }
         let pc = reader.next_item();
         let slot_count = reader.next_item();
         let mut values = Vec::new();
         for _ in 0..slot_count {
-            if !reader.has_more() {
+            if reader.items_read >= total_size as usize || !reader.has_more() {
                 break;
             }
             let tagged = reader.next_item() as i16;
@@ -405,7 +424,5 @@ pub fn rebuild_from_numbering(
             values,
         });
     }
-
-    let _ = total_size;
     (num_failargs, frames)
 }

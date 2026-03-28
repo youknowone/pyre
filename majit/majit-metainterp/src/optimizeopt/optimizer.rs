@@ -183,6 +183,10 @@ pub struct Optimizer {
     /// Per-frame box counts for multi-frame snapshots.
     /// Propagated to OptContext for number_guard_inline multi-frame encoding.
     pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
+    /// Per-guard virtualizable boxes from tracing-time snapshots.
+    pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
+    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -783,6 +787,8 @@ impl Optimizer {
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
             snapshot_frame_sizes: std::collections::HashMap::new(),
+            snapshot_vable_boxes: std::collections::HashMap::new(),
+            snapshot_frame_pcs: std::collections::HashMap::new(),
         }
     }
 
@@ -1337,6 +1343,8 @@ impl Optimizer {
         // at each guard emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
+        ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+        ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)
         // into constant_types_for_numbering. These override Int → Ref for
