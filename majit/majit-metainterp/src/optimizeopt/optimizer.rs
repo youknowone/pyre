@@ -2582,6 +2582,12 @@ impl Optimizer {
         use crate::optimizeopt::info::PtrInfo;
         use majit_ir::GuardVirtualEntry;
 
+        // When fail_args is None (guards from inline_short_preamble),
+        // RPython's store_final_boxes_in_guard uses ResumeDataVirtualAdder
+        // to build fail_args from the snapshot. We don't have that infra,
+        // so return early — the guard will share resume data with the
+        // previous guard via _copy_resume_data_from when it's emitted
+        // through the normal emit path.
         let Some(ref mut fail_args) = op.fail_args else {
             return op;
         };

@@ -1513,6 +1513,16 @@ impl OptUnroll {
         for (i, &short_inputarg) in short_preamble.inputargs.iter().enumerate() {
             if let Some(&jump_arg) = jump_args.get(i) {
                 mapping.insert(short_inputarg, jump_arg);
+                // RPython: jump_arg Box inherits info from Phase 2 body
+                // via identity. In majit, forwarding target may lack PtrInfo.
+                // Propagate PtrInfo to forwarding target so guards
+                // on mapped args can be eliminated as redundant.
+                let resolved = ctx.get_box_replacement(jump_arg);
+                if ctx.get_ptr_info(resolved).is_none() {
+                    if let Some(info) = ctx.get_ptr_info(jump_arg).cloned() {
+                        ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
+                    }
+                }
             }
         }
 
@@ -1585,7 +1595,12 @@ impl OptUnroll {
                     if let Some(ref patch) = ctx.patchguardop {
                         new_op.rd_resume_position = patch.rd_resume_position;
                     }
-                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                    // RPython unroll.py:406 sets ResumeAtPositionDescr, which
+                    // triggers store_final_boxes_in_guard (via ResumeDataVirtualAdder).
+                    // We don't have ResumeDataVirtualAdder, so leave descr=None
+                    // to take the _copy_resume_data_from path in emit_guard_operation
+                    // (optimizer.py:672-675), sharing resume data with the previous guard.
+                    // new_op.descr = Some(make_resume_at_position_descr());
                 }
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;
@@ -2341,6 +2356,19 @@ impl OptUnroll {
                     ctx.replace_op(source, value);
                     let descr_idx = descr.index();
                     let obj_resolved = ctx.get_box_replacement(obj);
+                    // shortpreamble.py:66-68: HeapOp.produce_op
+                    // if g.getarg(0) in exported_infos:
+                    //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
+                    if let Some(einfo) = exported_state.exported_infos.get(&obj) {
+                        if let Some(ref pinfo) = einfo.ptr_info {
+                            ctx.setinfo_from_preamble(obj_resolved, pinfo);
+                        } else if let Some(cls) = einfo.known_class {
+                            ctx.ensure_ptr_info_preserve_forwarding(
+                                obj_resolved,
+                                crate::optimizeopt::info::PtrInfo::known_class(cls, true),
+                            );
+                        }
+                    }
                     let pop = crate::optimizeopt::info::PreambleOp {
                         op: source,
                         resolved: value,

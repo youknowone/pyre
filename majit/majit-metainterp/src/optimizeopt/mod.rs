@@ -785,23 +785,34 @@ impl OptContext {
     }
 
     /// unroll.py:26-39: force_op_from_preamble
-    /// Calls use_box (shortpreamble.py:382-407) then registers in
-    /// potential_extra_ops for later force_box consumption.
+    /// Calls use_box (shortpreamble.py:382-407) with info/guard replay,
+    /// then registers in potential_extra_ops for later force_box.
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        // Check imported short identity BEFORE get_box_replacement
-        // (RPython checks isinstance on the raw input, line 27).
+        // unroll.py:27: check isinstance BEFORE get_box_replacement
         let preamble_source = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
+            // shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+            let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
+
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
-            let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
-                builder.use_box(preamble_source).is_some()
-            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                builder.use_box(preamble_source).is_some()
+            let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
+                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
+                self.active_short_preamble_producer = Some(builder);
+                ok
+            } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
+                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
+                self.imported_short_preamble_builder = Some(builder);
+                ok
             } else {
                 false
             };
-            // unroll.py:33-37: if not constant → potential_extra_ops[op] = preamble_op
+            // shortpreamble.py:401-404: setinfo_from_preamble(box, info)
+            if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
+                self.setinfo_from_preamble(result, &info);
+            }
+
+            // unroll.py:33-37: potential_extra_ops[op] = preamble_op
             if tracked && !is_constant {
                 let produced = self
                     .imported_short_preamble_builder
@@ -813,7 +824,6 @@ impl OptContext {
                             .and_then(|b| b.produced_short_op(preamble_source))
                     });
                 if let Some(produced) = produced {
-                    // unroll.py:34-35: if invented_name: op = get_box_replacement(op)
                     let key = if produced.invented_name {
                         self.get_box_replacement(preamble_source)
                     } else {
@@ -829,10 +839,121 @@ impl OptContext {
                 }
             }
         }
-        // unroll.py:38: return preamble_op.op — raw imported op, no
-        // forwarding resolve. Callers store this in cache; subsequent
-        // reads go through get_box_replacement to resolve.
         result
+    }
+
+    /// shortpreamble.py:383-396,401-406: collect guards from PtrInfo
+    /// of preamble_op's args and result.
+    fn collect_use_box_guards(&mut self, preamble_source: OpRef) -> (Vec<Op>, Vec<Op>) {
+        let produced = self
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(preamble_source))
+            .or_else(|| {
+                self.active_short_preamble_producer
+                    .as_ref()
+                    .and_then(|b| b.produced_short_op(preamble_source))
+            });
+        let Some(produced) = produced else {
+            return (Vec::new(), Vec::new());
+        };
+
+        // shortpreamble.py:383-396: guards for InputArg args only
+        let short_inputargs: Vec<OpRef> = self
+            .imported_short_preamble_builder
+            .as_ref()
+            .map(|b| b.short_inputargs().to_vec())
+            .or_else(|| {
+                self.active_short_preamble_producer
+                    .as_ref()
+                    .map(|b| b.short_inputargs().to_vec())
+            })
+            .unwrap_or_default();
+
+        // Collect (arg, PtrInfo clone) pairs to avoid borrow conflicts
+        let arg_infos: Vec<(OpRef, PtrInfo)> = produced
+            .preamble_op
+            .args
+            .iter()
+            .filter(|arg| short_inputargs.contains(arg))
+            .filter_map(|&arg| self.get_ptr_info(arg).cloned().map(|info| (arg, info)))
+            .collect();
+        let result_info = self
+            .get_ptr_info(produced.preamble_op.pos)
+            .cloned()
+            .map(|info| (produced.preamble_op.pos, info));
+
+        // Now generate guards — can call &mut self for constant allocation
+        let mut arg_guards = Vec::new();
+        let mut const_pool = Vec::new();
+        for (arg, info) in &arg_infos {
+            info.make_guards(*arg, &mut arg_guards, &mut const_pool);
+        }
+        let mut result_guards = Vec::new();
+        if let Some((result_ref, info)) = &result_info {
+            info.make_guards(*result_ref, &mut result_guards, &mut const_pool);
+        }
+        // Replace placeholder OpRefs with properly allocated ones
+        // and register constants in the map.
+        let mut remap: std::collections::HashMap<OpRef, OpRef> = std::collections::HashMap::new();
+        for (placeholder, value) in const_pool {
+            let real = self.alloc_op_position();
+            self.make_constant(real, value);
+            remap.insert(placeholder, real);
+        }
+        if !remap.is_empty() {
+            for guard in arg_guards.iter_mut().chain(result_guards.iter_mut()) {
+                for arg in &mut guard.args {
+                    if let Some(&real) = remap.get(arg) {
+                        *arg = real;
+                    }
+                }
+            }
+        }
+        (arg_guards, result_guards)
+    }
+
+    /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
+    /// Propagate PtrInfo from preamble to Phase 2 OpRef so that subsequent
+    /// guards can be removed as redundant by the optimizer.
+    fn setinfo_from_preamble(&mut self, op: OpRef, preamble_info: &PtrInfo) {
+        let op = self.get_box_replacement(op);
+        // unroll.py:55-56: if op.get_forwarded() is not None: return
+        // In RPython, forwarded means info is already set (single field).
+        // In majit, check both PtrInfo and forwarding to avoid overwriting.
+        if self.get_ptr_info(op).is_some() || self.is_replaced(op) {
+            return;
+        }
+        // unroll.py:57-58: if op.is_constant(): return
+        if self.is_constant(op) {
+            return;
+        }
+        match preamble_info {
+            PtrInfo::Constant(gcref) => {
+                // unroll.py:65-68: op.set_forwarded(preamble_info.getconst())
+                self.make_constant(op, Value::Ref(*gcref));
+            }
+            PtrInfo::KnownClass { class_ptr, .. } => {
+                // unroll.py:76-78: make_constant_class(op, known_class, False)
+                self.ensure_ptr_info_preserve_forwarding(
+                    op,
+                    PtrInfo::known_class(*class_ptr, true),
+                );
+            }
+            PtrInfo::Instance(info) => {
+                // unroll.py:73-78
+                if let Some(cls) = info.known_class {
+                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::known_class(cls, true));
+                } else if preamble_info.is_nonnull() {
+                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
+                }
+            }
+            _ => {
+                if preamble_info.is_nonnull() {
+                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
+                }
+            }
+        }
     }
 
     pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
@@ -1766,6 +1887,20 @@ impl OptContext {
         if self.ptr_info[idx].is_none() {
             self.ptr_info[idx] = Some(PtrInfo::instance(None, None));
         }
+    }
+
+    /// Set PtrInfo without clearing forwarding.
+    /// Used by setinfo_from_preamble where the OpRef may have an
+    /// active forwarding chain that must be preserved.
+    fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
+        let idx = opref.0 as usize;
+        if idx >= self.ptr_info.len() {
+            self.ptr_info.resize(idx + 1, None);
+        }
+        if self.ptr_info[idx].is_none() {
+            self.ptr_info[idx] = Some(info);
+        }
+        // Do NOT clear forwarding — unlike set_ptr_info.
     }
 
     /// info.py:716-721: ConstPtrInfo._get_info(descr, optheap)
