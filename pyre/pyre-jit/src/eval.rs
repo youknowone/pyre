@@ -1376,6 +1376,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
         match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
             JitAction::Return(result) => return Some(result),
+            // warmspot.py:941-954 ll_portal_runner parity:
+            // Fall through to eval_loop_jit (= portal_ptr) which can
+            // re-enter compiled code via jit_merge_point.
             JitAction::ContinueRunningNormally | JitAction::Continue => {}
         }
 
