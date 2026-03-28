@@ -8804,6 +8804,9 @@ fn collect_guards(
             force_token_slots,
             recovery_layout,
         );
+        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            descr.vector_info = fd.vector_info();
+        }
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
         let descr = Arc::new(descr);

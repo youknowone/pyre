@@ -7,6 +7,7 @@
 /// for field access, array access, function calls, and guard failures.
 use std::sync::Arc;
 
+use crate::OpRef;
 use crate::value::Type;
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,24 @@ pub trait FailDescr: Descr {
     fn force_token_slots(&self) -> &[usize] {
         &[]
     }
+
+    /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
+    /// to a guard descriptor. Non-guard fail descriptors ignore this.
+    fn attach_vector_info(&self, _info: AccumVectorInfo) {}
+
+    /// Read back any attached vector resume info.
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        Vec::new()
+    }
+}
+
+/// resume.py:65-80: AccumInfo — metadata attached to guard descriptors
+/// so deoptimization can reconstruct vector accumulators.
+#[derive(Debug, Clone)]
+pub struct AccumVectorInfo {
+    pub failargs_pos: usize,
+    pub variable: OpRef,
+    pub operator: char,
 }
 
 /// Descriptor for a fixed-size struct/object allocation.
@@ -988,13 +1007,28 @@ impl CallDescr for SimpleCallDescr {
 }
 
 /// Simple concrete FailDescr for guard failure descriptors.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SimpleFailDescr {
     index: u32,
     fail_index: u32,
     fail_arg_types: Vec<Type>,
     is_finish: bool,
     trace_id: u64,
+    /// schedule.py:654: vector accumulation info attached during vectorization.
+    vector_info: std::sync::Mutex<Vec<AccumVectorInfo>>,
+}
+
+impl Clone for SimpleFailDescr {
+    fn clone(&self) -> Self {
+        SimpleFailDescr {
+            index: self.index,
+            fail_index: self.fail_index,
+            fail_arg_types: self.fail_arg_types.clone(),
+            is_finish: self.is_finish,
+            trace_id: self.trace_id,
+            vector_info: std::sync::Mutex::new(self.vector_info.lock().unwrap().clone()),
+        }
+    }
 }
 
 impl SimpleFailDescr {
@@ -1005,6 +1039,7 @@ impl SimpleFailDescr {
             fail_arg_types,
             is_finish: false,
             trace_id: 0,
+            vector_info: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1015,6 +1050,7 @@ impl SimpleFailDescr {
             fail_arg_types,
             is_finish: true,
             trace_id: 0,
+            vector_info: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1045,6 +1081,12 @@ impl FailDescr for SimpleFailDescr {
     }
     fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+    fn attach_vector_info(&self, info: AccumVectorInfo) {
+        self.vector_info.lock().unwrap().push(info);
+    }
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        self.vector_info.lock().unwrap().clone()
     }
 }
 

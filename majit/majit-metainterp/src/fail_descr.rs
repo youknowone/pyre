@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{DescrRef, FailDescr, Type};
+use majit_ir::{AccumVectorInfo, DescrRef, FailDescr, Type};
 
 use crate::resume::ResumeData;
 
@@ -32,6 +33,8 @@ fn alloc_fail_index() -> u32 {
 struct MetaFailDescr {
     fail_index: u32,
     types: Vec<Type>,
+    /// schedule.py:654: vector accumulation info attached during vectorization.
+    vector_info: Mutex<Vec<AccumVectorInfo>>,
 }
 
 impl majit_ir::Descr for MetaFailDescr {
@@ -50,6 +53,12 @@ impl FailDescr for MetaFailDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
     }
+    fn attach_vector_info(&self, info: AccumVectorInfo) {
+        self.vector_info.lock().unwrap().push(info);
+    }
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        self.vector_info.lock().unwrap().clone()
+    }
 }
 
 /// Per-guard FailDescr that also carries resume data for deoptimization.
@@ -63,6 +72,7 @@ struct ResumeGuardDescr {
     fail_index: u32,
     types: Vec<Type>,
     resume_data: ResumeData,
+    vector_info: Mutex<Vec<AccumVectorInfo>>,
 }
 
 impl majit_ir::Descr for ResumeGuardDescr {
@@ -80,6 +90,12 @@ impl FailDescr for ResumeGuardDescr {
     }
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
+    }
+    fn attach_vector_info(&self, info: AccumVectorInfo) {
+        self.vector_info.lock().unwrap().push(info);
+    }
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        self.vector_info.lock().unwrap().clone()
     }
 }
 
@@ -100,6 +116,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
+        vector_info: Mutex::new(Vec::new()),
     })
 }
 
@@ -112,6 +129,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
     Arc::new(MetaFailDescr {
         fail_index,
         types: vec![Type::Int; num_live],
+        vector_info: Mutex::new(Vec::new()),
     })
 }
 
@@ -120,12 +138,17 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types,
+        vector_info: Mutex::new(Vec::new()),
     })
 }
 
 /// Create a FailDescr with explicit types and an explicit fail_index.
 pub fn make_fail_descr_typed_with_index(fail_index: u32, types: Vec<Type>) -> DescrRef {
-    Arc::new(MetaFailDescr { fail_index, types })
+    Arc::new(MetaFailDescr {
+        fail_index,
+        types,
+        vector_info: Mutex::new(Vec::new()),
+    })
 }
 
 /// Create a ResumeGuardDescr — a FailDescr that carries resume data
@@ -140,6 +163,7 @@ pub fn make_resume_guard_descr(num_live: usize, resume_data: ResumeData) -> Desc
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
         resume_data,
+        vector_info: Mutex::new(Vec::new()),
     })
 }
 
@@ -154,6 +178,7 @@ pub fn make_resume_guard_descr_with_index(
         fail_index,
         types: vec![Type::Int; num_live],
         resume_data,
+        vector_info: Mutex::new(Vec::new()),
     })
 }
 
