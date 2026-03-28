@@ -86,6 +86,10 @@ pub(crate) const BC_ARRAYLEN_VABLE: u8 = 74;
 pub(crate) const BC_HINT_FORCE_VIRTUALIZABLE: u8 = 75;
 /// RPython bhimpl_ref_return: callee returns a ref value.
 pub(crate) const BC_REF_RETURN: u8 = 76;
+/// blackhole.py bhimpl_raise: raise an exception from a ref register.
+pub(crate) const BC_RAISE: u8 = 77;
+/// blackhole.py bhimpl_reraise: re-raise exception_last_value.
+pub(crate) const BC_RERAISE: u8 = 78;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

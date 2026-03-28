@@ -587,11 +587,13 @@ impl CodeWriter {
                 Instruction::RaiseVarargs { argc } => {
                     let n = argc.get(op_arg) as i64;
                     if n >= 1 {
+                        // blackhole.py bhimpl_raise(excvalue): pop exception, raise it.
                         assembler.pop_r(obj_tmp0); // exception value
+                        assembler.emit_raise(obj_tmp0);
+                    } else {
+                        // reraise: re-raise exception_last_value
+                        assembler.emit_reraise();
                     }
-                    // Exception path: use abort_permanent (BC_ABORT_PERMANENT=14)
-                    // so it doesn't trigger has_abort (BC_ABORT=13) check.
-                    assembler.abort_permanent();
                 }
 
                 Instruction::PushExcInfo => {
