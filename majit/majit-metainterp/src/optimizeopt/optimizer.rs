@@ -2437,7 +2437,8 @@ impl Optimizer {
                         .iter()
                         .map(|opref| {
                             if opref.is_none() {
-                                majit_ir::Type::Int
+                                // Virtual placeholder — materialized as Ref (PyObject*).
+                                majit_ir::Type::Ref
                             } else if let Some(&tp) = self.constant_types.get(&opref.0) {
                                 tp
                             } else if let Some(info) = ctx.get_ptr_info(*opref) {

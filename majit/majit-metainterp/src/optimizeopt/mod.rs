@@ -1338,16 +1338,27 @@ impl OptContext {
             if let Some(ref fa) = op.fail_args {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
+                // resume.py parity: num_failargs = number of actual deadframe slots
+                // (exit_types length). Virtual field values appended by
+                // store_final_boxes_in_guard are NOT deadframe slots — they're
+                // encoded as TAGBOX(fail_arg_index) in rd_virtuals fieldnums.
+                // The original fail_args length (before extra fields) equals
+                // the number of types in fail_arg_types or descr.
+                let num_failargs = op
+                    .fail_arg_types
+                    .as_ref()
+                    .map(|t| t.len())
+                    .unwrap_or(fa_len);
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
                 let mut rd_consts: Vec<(i64, majit_ir::Type)> =
                     op.rd_consts.take().unwrap_or_default();
                 ns.append_int(0); // size (patched)
-                ns.append_int(fa_len as i32); // num_failargs
+                ns.append_int(num_failargs as i32); // num_failargs (deadframe slots)
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
-                ns.append_int(fa_len as i32); // slot_count
+                ns.append_int(fa_len as i32); // slot_count (all fail_args incl. virtual fields)
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         let vidx = op
@@ -1405,40 +1416,15 @@ impl OptContext {
                         .map(|entry| {
                             let fielddescr_indices: Vec<u32> =
                                 entry.fields.iter().map(|(idx, _)| *idx).collect();
-                            // Tag each field value: fail_arg_index → TAGBOX(fail_arg_index)
+                            // Tag each field value: fail_arg_index → TAGBOX(fail_arg_index).
+                            // resume.py:576-860: fieldnums encode how to recover each field
+                            // value from the deadframe at guard failure time.
                             let fieldnums: Vec<i16> = entry
                                 .fields
                                 .iter()
                                 .map(|(_, fa_idx)| {
-                                    let fa = fa.get(*fa_idx).copied().unwrap_or(OpRef::NONE);
-                                    if fa.is_none() {
-                                        resumedata::NULLREF
-                                    } else if let Some((raw, tp)) = self.getconst_for_numbering(fa)
-                                    {
-                                        if tp == majit_ir::Type::Int {
-                                            if let Ok(t) =
-                                                resumedata::tag(raw as i32, resumedata::TAGINT)
-                                            {
-                                                return t;
-                                            }
-                                        }
-                                        if tp == majit_ir::Type::Ref && raw == 0 {
-                                            return resumedata::NULLREF;
-                                        }
-                                        // Find or add to rd_consts
-                                        let ci = rd_consts_ref
-                                            .iter()
-                                            .position(|(v, t)| *v == raw && *t == tp)
-                                            .unwrap_or(0);
-                                        resumedata::tag(
-                                            (ci + resumedata::TAG_CONST_OFFSET as usize) as i32,
-                                            resumedata::TAGCONST,
-                                        )
+                                    resumedata::tag(*fa_idx as i32, resumedata::TAGBOX)
                                         .unwrap_or(resumedata::NULLREF)
-                                    } else {
-                                        resumedata::tag(*fa_idx as i32, resumedata::TAGBOX)
-                                            .unwrap_or(resumedata::NULLREF)
-                                    }
                                 })
                                 .collect();
                             let kc = entry
