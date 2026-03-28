@@ -339,6 +339,8 @@ pub struct MIFrame {
     /// PyPy capture_resumedata: parent frame fail_args for multi-frame guards.
     pub parent_fail_args: Option<Vec<OpRef>>,
     pub parent_fail_arg_types: Option<Vec<Type>>,
+    /// opencoder.py:806 parent frame pc (return_point_pc).
+    pub parent_resumepc: usize,
     pub pending_inline_frame: Option<PendingInlineFrame>,
 }
 
@@ -1425,6 +1427,7 @@ impl MIFrame {
             orgpc,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
         }
     }
@@ -2137,6 +2140,13 @@ impl MIFrame {
             // opencoder.py:819-832: snapshot = [top_frame, parent_frame]
             let callee_boxes = Self::fail_args_to_snapshot_boxes(&callee_fail_args);
             let caller_boxes = Self::fail_args_to_snapshot_boxes(&caller_fail_args);
+            // pyjitpl.py:2588-2590: virtualizable_boxes includes frame ref.
+            let frame_opref = callee_fail_args.first().copied().unwrap_or(OpRef::NONE);
+            let vable_boxes = if !frame_opref.is_none() {
+                vec![majit_trace::recorder::SnapshotTagged::Box(frame_opref.0)]
+            } else {
+                Vec::new()
+            };
             let snapshot = majit_trace::recorder::Snapshot {
                 frames: vec![
                     majit_trace::recorder::SnapshotFrame {
@@ -2144,13 +2154,14 @@ impl MIFrame {
                         pc: self.orgpc as u32,
                         boxes: callee_boxes,
                     },
+                    // opencoder.py:806 parent frame uses its own pc.
                     majit_trace::recorder::SnapshotFrame {
                         jitcode_index: 0,
-                        pc: 0, // caller pc encoded in fail_args[1]
+                        pc: self.parent_resumepc as u32,
                         boxes: caller_boxes,
                     },
                 ],
-                vable_boxes: Vec::new(),
+                vable_boxes,
                 vref_boxes: Vec::new(),
             };
             let snapshot_id = ctx.capture_resumedata(snapshot);
@@ -2177,29 +2188,26 @@ impl MIFrame {
         let fail_arg_types = self.build_single_frame_fail_arg_types();
         let fail_args = self.build_single_frame_fail_args(ctx);
 
-        // opencoder.py:819 parity: capture snapshot of frame state.
-        // Store actual OpRef values (not fail_args indices) so the
-        // optimizer can resolve them through the replacement chain
-        // when rebuilding fail_args in store_final_boxes_in_guard.
-        let snapshot_boxes: Vec<majit_trace::recorder::SnapshotTagged> = fail_args
-            .iter()
-            .map(|&opref| {
-                if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0)
-                } else {
-                    // Store the actual OpRef value (includes constants >= 10_000).
-                    // The optimizer resolves these via get_replacement().
-                    majit_trace::recorder::SnapshotTagged::Box(opref.0)
-                }
-            })
-            .collect();
+        // opencoder.py:767-770 parity: snapshot boxes = active boxes only
+        // (get_list_of_active_boxes result = locals + stack).
+        // Frame/ni/vsd are metadata stored in SnapshotFrame.pc / vable_boxes.
+        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&fail_args);
+        // opencoder.py:776-778: top snapshot uses frame.jitcode.index
+        // and frame.pc (= resumepc set by capture_resumedata).
+        // pyjitpl.py:2588-2590: virtualizable_boxes includes frame ref.
+        let frame_opref = fail_args.first().copied().unwrap_or(OpRef::NONE);
+        let vable_boxes = if !frame_opref.is_none() {
+            vec![majit_trace::recorder::SnapshotTagged::Box(frame_opref.0)]
+        } else {
+            Vec::new()
+        };
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: 0,
-                pc: self.sym().valuestackdepth as u32,
+                pc: self.orgpc as u32,
                 boxes: snapshot_boxes,
             }],
-            vable_boxes: Vec::new(),
+            vable_boxes,
             vref_boxes: Vec::new(),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
@@ -2208,11 +2216,18 @@ impl MIFrame {
         ctx.set_last_guard_resume_position(snapshot_id);
     }
 
+    /// opencoder.py:767-770 / 806-808 parity: snapshot boxes contain
+    /// only active boxes (get_list_of_active_boxes result), which in
+    /// pyre's model is locals + stack. Frame/ni/vsd metadata is stored
+    /// separately in SnapshotFrame.pc and Snapshot.vable_boxes.
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+        // fail_args = [frame, ni, vsd, locals..., stack...]
+        // Active boxes = fail_args[3..] (skip metadata prefix)
         fail_args
             .iter()
+            .skip(3)
             .map(|&opref| {
                 if opref.is_none() {
                     majit_trace::recorder::SnapshotTagged::Const(0)
@@ -4414,6 +4429,7 @@ impl MIFrame {
             green_key: callee_key,
             parent_fail_args,
             parent_fail_arg_types,
+            parent_resumepc: return_point_pc,
             nargs: args.len(),
             caller_result_stack_idx: None,
         })
@@ -7442,6 +7458,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7474,6 +7491,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7737,6 +7755,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7767,6 +7786,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7811,6 +7831,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7848,6 +7869,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7879,6 +7901,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7920,6 +7943,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -7984,6 +8008,7 @@ mod tests {
             fallthrough_pc: branch_pc,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8068,6 +8093,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8160,6 +8186,7 @@ mod tests {
             fallthrough_pc: compare_pc + 1,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8228,6 +8255,7 @@ mod tests {
             fallthrough_pc: compare_pc + 2,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8274,6 +8302,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8312,6 +8341,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8368,6 +8398,7 @@ mod tests {
             fallthrough_pc: 459,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8429,6 +8460,7 @@ mod tests {
             fallthrough_pc: 459,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8480,6 +8512,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8524,6 +8557,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8574,6 +8608,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8623,6 +8658,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8687,6 +8723,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8751,6 +8788,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8843,6 +8881,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -8922,6 +8961,7 @@ mod tests {
             fallthrough_pc: 0,
             parent_fail_args: None,
             parent_fail_arg_types: None,
+            parent_resumepc: 0,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -9008,6 +9048,9 @@ pub struct PendingInlineFrame {
     pub green_key: u64,
     pub parent_fail_args: Vec<OpRef>,
     pub parent_fail_arg_types: Vec<Type>,
+    /// opencoder.py:806 parent frame pc for multi-frame snapshot.
+    /// Set to return_point_pc (CALL fallthrough) at inline entry.
+    pub parent_resumepc: usize,
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
 }
