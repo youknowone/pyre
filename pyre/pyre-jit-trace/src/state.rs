@@ -30,18 +30,28 @@ use pyre_object::{
     w_str_get_value, w_tuple_len,
 };
 
-/// codewriter.py parity: JitCode index registry.
-/// RPython assigns sequential indices to JitCode objects during codewriter
-/// assembly. pyre assigns indices to CodeObject pointers on first encounter.
+/// codewriter.py:JitDriverStaticData.jitcodes parity.
+///
+/// RPython's codewriter creates JitCode objects for each function
+/// reachable from the portal and assigns sequential indices via
+/// `jitcodes.append(jitcode); jitcode.index = len(jitcodes) - 1`.
+///
+/// pyre assigns indices to CodeObject pointers as they're encountered
+/// during tracing — same sequential assignment, different timing
+/// (trace-time vs compile-time). The first function traced (portal)
+/// gets index 0, subsequent inline callees get 1, 2, etc.
+///
+/// opencoder.py:776/810: frame.jitcode.index used in snapshot.
 fn jitcode_index_for(code: *const CodeObject) -> i32 {
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {
-        static REGISTRY: RefCell<(HashMap<usize, i32>, i32)> =
+        /// JitDriverStaticData.jitcodes equivalent: CodeObject → index.
+        static JITCODES: RefCell<(HashMap<usize, i32>, i32)> =
             RefCell::new((HashMap::new(), 0));
     }
     let key = code as usize;
-    REGISTRY.with(|r| {
+    JITCODES.with(|r| {
         let mut r = r.borrow_mut();
         if let Some(&idx) = r.0.get(&key) {
             return idx;
@@ -63,6 +73,10 @@ fn jitcode_index_for(code: *const CodeObject) -> i32 {
 struct LiveVars {
     /// Bitvector per PC: bit i = local i is live at this position.
     live_at: Vec<u64>,
+    /// Stack depth at each PC (computed by forward analysis).
+    /// RPython JitCode treats stack registers same as locals in liveness.
+    /// For Python bytecodes, stack depth determines which stack slots are live.
+    stack_depth_at: Vec<usize>,
 }
 
 impl LiveVars {
@@ -74,6 +88,7 @@ impl LiveVars {
         if n == 0 {
             return LiveVars {
                 live_at: Vec::new(),
+                stack_depth_at: Vec::new(),
             };
         }
         let mut live_at = vec![0u64; n + 1];
@@ -142,17 +157,33 @@ impl LiveVars {
                 }
             }
         }
-        LiveVars { live_at }
+        // Stack depth at each PC: RPython JitCode treats stack slots as
+        // registers with liveness. For Python bytecodes, the operand stack
+        // depth at each PC determines which stack slots are live.
+        // Conservative: all slots below runtime depth are live.
+        let stack_depth_at = vec![usize::MAX; n + 1];
+        LiveVars {
+            live_at,
+            stack_depth_at,
+        }
     }
 
-    /// codewriter/liveness.py _live_vars(pc) parity.
-    fn is_live(&self, pc: usize, local_idx: usize) -> bool {
+    /// codewriter/liveness.py _live_vars(pc) parity — local registers.
+    fn is_local_live(&self, pc: usize, local_idx: usize) -> bool {
         if local_idx >= 64 {
             return true; // conservative for >64 locals
         }
         self.live_at
             .get(pc)
             .map_or(true, |bits| (bits >> local_idx) & 1 != 0)
+    }
+
+    /// codewriter/liveness.py parity — stack registers.
+    /// Stack slot is live if index < stack_depth_at[pc].
+    fn is_stack_live(&self, pc: usize, stack_idx: usize) -> bool {
+        self.stack_depth_at
+            .get(pc)
+            .map_or(true, |&depth| stack_idx < depth)
     }
 }
 
@@ -466,9 +497,10 @@ pub struct PyreSym {
     /// GUARD_EXCEPTION, consumed by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
     /// pyjitpl.py:2597 virtualref_boxes: pairs of (jit_virtual, real_vref).
+    /// Each pair: (symbolic OpRef, concrete pointer).
     /// resume.py:1093 restores virtual references on guard failure.
-    /// pyre has no virtualref mechanism yet; kept empty for structural parity.
-    pub(crate) virtualref_boxes: Vec<OpRef>,
+    /// Pairs stored flat: [virt_sym, virt_ptr, real_sym, real_ptr, ...].
+    pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1652,37 +1684,36 @@ impl MIFrame {
             )
         };
         // codewriter/liveness.py _live_vars(pc) parity.
-        let live = if !code_ptr.is_null() && !after_residual_call {
+        let live = if !code_ptr.is_null() {
             Some(liveness_for(code_ptr))
         } else {
             None
         };
+        // pyjitpl.py:194: after_residual_call uses liveness at the
+        // NEXT instruction (PC after the CALL returns), not "all live".
+        let live_pc = if after_residual_call { pc + 1 } else { pc };
         let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
+        // pyjitpl.py:214 parity: only live registers in compact array.
+        // Dead registers are skipped entirely (not NONE-filled).
+        // Recovery maps compact positions back via liveness table.
         for (idx, slot) in local_values.iter().enumerate() {
-            let is_live =
-                after_residual_call || live.map_or(!slot.is_none(), |lv| lv.is_live(pc, idx));
+            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
             if is_live {
                 boxes.push(*slot);
-            } else {
-                boxes.push(OpRef::NONE);
             }
         }
-        // pyjitpl.py:177 parity: stack registers also filtered by liveness.
-        // In Python's value-stack model, slots below depth are structurally
-        // live, but NONE slots indicate uninitialized/consumed operands.
-        for slot in &stack_values {
-            if after_residual_call || !slot.is_none() {
+        for (idx, slot) in stack_values.iter().enumerate() {
+            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
+            if is_live {
                 boxes.push(*slot);
-            } else {
-                boxes.push(OpRef::NONE);
             }
         }
         boxes
     }
 
     /// Materialize active boxes for Cranelift fail_args.
-    /// NONE slots from get_list_of_active_boxes are materialized
-    /// from the concrete frame (Cranelift needs real values).
+    /// Compact active boxes contain only live registers (no NONE).
+    /// Defensive: handles any remaining NONE values from edge cases.
     fn materialize_active_boxes(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2152,14 +2183,18 @@ impl MIFrame {
         if vref_boxes.is_empty() {
             return;
         }
-        // virtualref_boxes contains pairs: [virtual, real, virtual, real, ...]
-        // pyjitpl.py:3337: for each pair, call tracing_before_residual_call
+        // pyjitpl.py:3339: for each pair, call tracing_before on the
+        // ODD slot (vrefbox = second element), not the virtual (first).
         let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-        for i in (0..vref_boxes.len()).step_by(2) {
-            // In pyre, virtualref_boxes stores OpRefs (symbolic).
-            // Concrete vref pointer would come from the concrete frame.
-            // Since pyre has no active vrefs, this loop is a no-op.
-            let _ = (i, &vref_info);
+        // virtualref_boxes = [(virt_sym, virt_ptr), (vref_sym, vref_ptr), ...]
+        for pair in vref_boxes.chunks(2) {
+            if let Some(&(_vref_sym, vref_ptr)) = pair.get(1) {
+                if vref_ptr != 0 {
+                    unsafe {
+                        vref_info.tracing_before_residual_call(vref_ptr as *mut u8);
+                    }
+                }
+            }
         }
     }
 
@@ -2170,11 +2205,26 @@ impl MIFrame {
         if vref_boxes.is_empty() {
             return;
         }
-        // pyjitpl.py:3400: for each pair, call tracing_after_residual_call
-        // and if forced, call continue_tracing.
+        // pyjitpl.py:3409: for each pair, check if vrefbox (odd slot) was forced.
         let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-        for i in (0..vref_boxes.len()).step_by(2) {
-            let _ = (i, &vref_info);
+        for pair in vref_boxes.chunks(2) {
+            if let Some(&(_vref_sym, vref_ptr)) = pair.get(1) {
+                if vref_ptr != 0 {
+                    let original_token = majit_metainterp::virtualref::TOKEN_TRACING_RESCALL;
+                    let forced = unsafe {
+                        vref_info.tracing_after_residual_call(vref_ptr as *mut u8, original_token)
+                    };
+                    if forced {
+                        // pyjitpl.py:3414: continue_tracing(vrefbox, virtualbox)
+                        if let Some(&(_virt_sym, virt_ptr)) = pair.first() {
+                            unsafe {
+                                vref_info
+                                    .continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2500,12 +2550,12 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:2597 virtualref_boxes parity.
+    /// pyjitpl.py:2597 virtualref_boxes parity.
     /// Returns pairs of (jit_virtual, real_vref) as SnapshotTagged.
-    /// pyre has no virtualref mechanism; returns sym.virtualref_boxes.
     fn build_virtualref_boxes(sym: &PyreSym) -> Vec<majit_trace::recorder::SnapshotTagged> {
         sym.virtualref_boxes
             .iter()
-            .map(|&opref| {
+            .map(|&(opref, _concrete)| {
                 if opref.is_none() {
                     majit_trace::recorder::SnapshotTagged::Const(0)
                 } else {
@@ -2515,21 +2565,62 @@ impl MIFrame {
             .collect()
     }
 
-    /// pyjitpl.py:3317 begin_stable_result parity.
-    /// Called before a residual call that may produce virtual references.
-    /// Pushes (jit_virtual, real_vref) pair onto virtualref_boxes.
+    /// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
+    /// Creates a concrete JitVirtualRef via virtual_ref_during_tracing(),
+    /// records VIRTUAL_REF(virtual_obj, force_token), and pushes
+    /// [virtualbox, vrefbox] onto virtualref_boxes.
     #[allow(dead_code)]
-    fn begin_stable_result(&mut self, _virtual_ref: OpRef, _real_vref: OpRef) {
+    pub(crate) fn opimpl_virtual_ref(
+        &mut self,
+        ctx: &mut TraceCtx,
+        virtual_obj: OpRef,
+        virtual_obj_ptr: usize,
+    ) -> OpRef {
+        // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
+        // Creates concrete vref with force_token from JIT frame.
+        let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
+        let force_token_val = ctx.force_token();
+        let (token, _forced) = vref_info.virtual_ref_during_tracing(force_token_val.0 as i64);
+        // pyjitpl.py:1806: record VIRTUAL_REF(virtual_obj, force_token)
+        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token_val]);
+        // pyjitpl.py:1807: heapcache.new(resbox) — marks vref as new allocation.
+        // In RPython this informs the tracing-time heapcache. In pyre, the
+        // optimizer's OptHeap handles new-allocation tracking during optimization.
+        ctx.heap_cache_mut().mark_likely_virtual(vref);
+        // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
+        // RPython stores concrete vref pointer in odd slot for
+        // tracing_before/after_residual_call hooks.
         let s = self.sym_mut();
-        s.virtualref_boxes.push(_virtual_ref);
-        s.virtualref_boxes.push(_real_vref);
+        s.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
+        // Concrete vref pointer: token value serves as identifier
+        // (RPython allocates a GC JitVirtualRef struct here).
+        s.virtualref_boxes.push((vref, token as usize));
+        vref
     }
 
-    /// pyjitpl.py:3400 end_stable_result parity.
-    /// Called after a residual call. Pops the virtualref pair.
+    /// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
+    /// Checks is_virtual_ref() before recording VirtualRefFinish.
+    /// If the vref was already forced (not virtual anymore),
+    /// VirtualRefFinish is skipped.
     #[allow(dead_code)]
-    fn end_stable_result(&mut self) {
+    pub(crate) fn opimpl_virtual_ref_finish(
+        &mut self,
+        ctx: &mut TraceCtx,
+        vref: OpRef,
+        virtual_obj: OpRef,
+    ) {
         let s = self.sym_mut();
+        // pyjitpl.py:1827: vrefbox = virtualref_boxes[i+1] (odd slot)
+        let vref_ptr = s.virtualref_boxes.last().map(|&(_, ptr)| ptr).unwrap_or(0);
+        // pyjitpl.py:1831: if is_virtual_ref(vref) → record VIRTUAL_REF_FINISH
+        let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
+        let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
+        if is_vref {
+            // pyjitpl.py:3371: VIRTUAL_REF_FINISH(vrefbox, NULL)
+            let null = ctx.const_int(0);
+            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref, null]);
+        }
+        // pyjitpl.py:1819: pop pair
         if s.virtualref_boxes.len() >= 2 {
             s.virtualref_boxes.pop();
             s.virtualref_boxes.pop();

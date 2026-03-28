@@ -8,6 +8,30 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
+// Vec<bool> helpers — RPython stores these as FrontendOp flags, not sets.
+#[inline(always)]
+fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
+    let i = opref.0 as usize;
+    if i >= v.len() {
+        v.resize(i + 1, false);
+    }
+    v[i] = true;
+}
+#[inline(always)]
+fn vb_contains(v: &[bool], opref: &OpRef) -> bool {
+    v.get(opref.0 as usize).copied().unwrap_or(false)
+}
+#[inline(always)]
+fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
+    let i = opref.0 as usize;
+    if i < v.len() && v[i] {
+        v[i] = false;
+        true
+    } else {
+        false
+    }
+}
+
 use majit_ir::{GcRef, OpCode, OpRef};
 
 // heapcache.py: HF_* flags stored per-box on RefFrontendOp.
@@ -173,15 +197,15 @@ impl CacheEntry {
         self.read_now_known(ref_box, fieldbox, &mut cache)
     }
 
-    pub fn invalidate_unescaped(&mut self, unescaped: &HashSet<OpRef>) {
+    pub fn invalidate_unescaped(&mut self, unescaped: &[bool]) {
         self._invalidate_unescaped(unescaped)
     }
 
-    pub fn _invalidate_unescaped(&mut self, unescaped: &HashSet<OpRef>) {
+    pub fn _invalidate_unescaped(&mut self, unescaped: &[bool]) {
         self.cache_anything
-            .retain(|box_ref, _| unescaped.contains(box_ref));
+            .retain(|box_ref, _| unescaped.get(box_ref.0 as usize).copied().unwrap_or(false));
         self.cache_seen_allocation
-            .retain(|box_ref, _| unescaped.contains(box_ref));
+            .retain(|box_ref, _| unescaped.get(box_ref.0 as usize).copied().unwrap_or(false));
         if let Some(seen) = &mut self.quasiimmut_seen {
             seen.clear();
         }
@@ -267,26 +291,28 @@ pub struct HeapCache {
     array_cache: HashMap<(OpRef, OpRef, u32), OpRef>,
 
     /// Known class map: object_ref -> class pointer.
-    known_class: HashMap<OpRef, GcRef>,
+    /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
+    known_class: Vec<Option<GcRef>>,
 
     /// Quasi-immutable fields known in this trace.
     /// heapcache.py: `quasi_immut_known`.
     quasi_immut_known: HashSet<(OpRef, u32)>,
 
-    /// Set of OpRefs known to be newly allocated and not yet escaped.
-    is_unescaped: HashSet<OpRef>,
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    is_unescaped: Vec<bool>,
 
-    /// Set of OpRefs for which we saw the allocation during this trace.
-    seen_allocation: HashSet<OpRef>,
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    seen_allocation: Vec<bool>,
 
-    /// heapcache.py: known nullity — values known to be null or non-null.
-    known_nullity: HashMap<OpRef, bool>,
+    /// RPython: FrontendOp flag. Vec<u8> indexed by OpRef.0.
+    /// 0 = unknown, 1 = non-null, 2 = null.
+    known_nullity: Vec<u8>,
 
     /// heapcache.py: cached_arraylen — cached array lengths.
     cached_arraylen: HashMap<(OpRef, u32), OpRef>,
 
-    /// heapcache.py: likely_virtual — values likely to be virtual objects.
-    likely_virtual: HashSet<OpRef>,
+    /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
+    likely_virtual: Vec<bool>,
 
     /// heapcache.py: loop-invariant call result cache.
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
@@ -307,7 +333,8 @@ pub struct HeapCache {
 
     head_version: u32,
     likely_virtual_version: u32,
-    heapc_flags: HashMap<OpRef, u32>,
+    /// RPython: FrontendOp flags. Vec<u32> indexed by OpRef.0.
+    heapc_flags: Vec<u32>,
 }
 
 impl HeapCache {
@@ -318,13 +345,13 @@ impl HeapCache {
             heap_cache: HashMap::new(),
             heap_array_cache: HashMap::new(),
             array_cache: HashMap::new(),
-            known_class: HashMap::new(),
+            known_class: Vec::new(),
             quasi_immut_known: HashSet::new(),
-            is_unescaped: HashSet::new(),
-            seen_allocation: HashSet::new(),
-            known_nullity: HashMap::new(),
+            is_unescaped: Vec::new(),
+            seen_allocation: Vec::new(),
+            known_nullity: Vec::new(),
             cached_arraylen: HashMap::new(),
-            likely_virtual: HashSet::new(),
+            likely_virtual: Vec::new(),
             loopinvariant_descr: None,
             loopinvariant_arg0: None,
             loopinvariant_result: None,
@@ -332,20 +359,20 @@ impl HeapCache {
             need_guard_not_invalidated: true,
             head_version: 0,
             likely_virtual_version: 0,
-            heapc_flags: HashMap::new(),
+            heapc_flags: Vec::new(),
         }
     }
 
     fn flags_for_ref(&self, opref: OpRef) -> u32 {
-        self.heapc_flags.get(&opref).copied().unwrap_or(0)
+        self.heapc_flags.get(opref.0 as usize).copied().unwrap_or(0)
     }
 
     fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
-        if flags == 0 {
-            self.heapc_flags.remove(&opref);
-        } else {
-            self.heapc_flags.insert(opref, flags);
+        let i = opref.0 as usize;
+        if i >= self.heapc_flags.len() {
+            self.heapc_flags.resize(i + 1, 0);
         }
+        self.heapc_flags[i] = flags;
     }
 
     fn versioned_or(self_flags: u32, op_version: u32) -> bool {
@@ -399,19 +426,31 @@ impl HeapCache {
         // Keep mirrors: boolean flags used by this Rust implementation.
         match flag {
             HF_SEEN_ALLOCATION => {
-                self.seen_allocation.insert(opref);
+                vb_insert(&mut self.seen_allocation, opref);
             }
             HF_KNOWN_CLASS => {
-                self.known_class.entry(opref).or_insert(GcRef(0));
+                let i = opref.0 as usize;
+                if i >= self.known_class.len() {
+                    self.known_class.resize(i + 1, None);
+                }
+                if self.known_class[i].is_none() {
+                    self.known_class[i] = Some(GcRef(0));
+                }
             }
             HF_KNOWN_NULLITY => {
-                self.known_nullity.entry(opref).or_insert(false);
+                let i = opref.0 as usize;
+                if i >= self.known_nullity.len() {
+                    self.known_nullity.resize(i + 1, 0);
+                }
+                if self.known_nullity[i] == 0 {
+                    self.known_nullity[i] = 1;
+                }
             }
             HF_IS_UNESCAPED => {
-                self.is_unescaped.insert(opref);
+                vb_insert(&mut self.is_unescaped, opref);
             }
             HF_LIKELY_VIRTUAL => {
-                self.likely_virtual.insert(opref);
+                vb_insert(&mut self.likely_virtual, opref);
             }
             HF_NONSTD_VABLE => {
                 self.nonstandard_virtualizables_now_known(opref);
@@ -429,19 +468,29 @@ impl HeapCache {
         self.set_flags_for_ref(opref, updated);
         match flag {
             HF_IS_UNESCAPED => {
-                self.is_unescaped.remove(&opref);
+                vb_remove(&mut self.is_unescaped, &opref);
             }
             HF_LIKELY_VIRTUAL => {
-                self.likely_virtual.remove(&opref);
+                vb_remove(&mut self.likely_virtual, &opref);
             }
             HF_SEEN_ALLOCATION => {
-                self.seen_allocation.remove(&opref);
+                vb_remove(&mut self.seen_allocation, &opref);
             }
             HF_KNOWN_NULLITY => {
-                self.known_nullity.remove(&opref);
+                {
+                    let _i = opref.0 as usize;
+                    if _i < self.known_nullity.len() {
+                        self.known_nullity[_i] = 0;
+                    }
+                };
             }
             HF_KNOWN_CLASS => {
-                self.known_class.remove(&opref);
+                {
+                    let _i = opref.0 as usize;
+                    if _i < self.known_class.len() {
+                        self.known_class[_i] = None;
+                    }
+                };
             }
             _ => {}
         }
@@ -472,11 +521,16 @@ impl HeapCache {
 
     /// Alias to keep recursion behavior explicit with Python name.
     pub fn mark_escaped_box(&mut self, opref: OpRef) {
-        if !self.is_unescaped.remove(&opref) {
+        if !vb_remove(&mut self.is_unescaped, &opref) {
             return;
         }
-        self.likely_virtual.remove(&opref);
-        self.known_nullity.remove(&opref);
+        vb_remove(&mut self.likely_virtual, &opref);
+        {
+            let _i = opref.0 as usize;
+            if _i < self.known_nullity.len() {
+                self.known_nullity[_i] = 0;
+            }
+        };
         if let Some(deps) = self.escape_deps.remove(&opref) {
             let mut pending = deps;
             while let Some(dep) = pending.pop() {
@@ -565,7 +619,7 @@ impl HeapCache {
     }
 
     pub fn setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        let obj_is_unescaped = self.is_unescaped.contains(&obj);
+        let obj_is_unescaped = vb_contains(&self.is_unescaped, &obj);
         if !obj_is_unescaped {
             // Potential aliasing: clear all cached values for this field
             // from objects that are not known-unescaped.
@@ -574,7 +628,7 @@ impl HeapCache {
                     return true;
                 }
                 // Keep entries for unescaped objects (no aliasing possible)
-                self.is_unescaped.contains(&cached_obj)
+                vb_contains(&self.is_unescaped, &cached_obj)
             });
         }
         self.field_cache.insert((obj, field_index), value);
@@ -602,9 +656,9 @@ impl HeapCache {
     /// be affected by external calls, so their caches are preserved.
     pub fn invalidate_caches_for_escaped(&mut self) {
         self.field_cache
-            .retain(|&(obj, _), _| self.is_unescaped.contains(&obj));
+            .retain(|&(obj, _), _| vb_contains(&self.is_unescaped, &obj));
         self.array_cache
-            .retain(|&(obj, _, _), _| self.is_unescaped.contains(&obj));
+            .retain(|&(obj, _, _), _| vb_contains(&self.is_unescaped, &obj));
     }
 
     /// heapcache.py: mark_escaped_varargs — escape call arguments before
@@ -618,19 +672,25 @@ impl HeapCache {
     /// Record a new object allocation. The object is marked as unescaped
     /// and seen-allocation.
     pub fn new_object(&mut self, opref: OpRef) {
-        self.is_unescaped.insert(opref);
-        self.seen_allocation.insert(opref);
+        vb_insert(&mut self.is_unescaped, opref);
+        vb_insert(&mut self.seen_allocation, opref);
     }
 
     /// heapcache.py: new_array(box, lengthbox)
     /// Record a new array allocation. Constant-length arrays are also
     /// marked as likely_virtual.
     pub fn new_array(&mut self, opref: OpRef, length_is_const: bool) {
-        self.is_unescaped.insert(opref);
-        self.seen_allocation.insert(opref);
-        self.known_nullity.insert(opref, true);
+        vb_insert(&mut self.is_unescaped, opref);
+        vb_insert(&mut self.seen_allocation, opref);
+        {
+            let _i = opref.0 as usize;
+            if _i >= self.known_nullity.len() {
+                self.known_nullity.resize(_i + 1, 0);
+            }
+            self.known_nullity[_i] = 1;
+        };
         if length_is_const {
-            self.likely_virtual.insert(opref);
+            vb_insert(&mut self.likely_virtual, opref);
         }
     }
 
@@ -639,7 +699,13 @@ impl HeapCache {
     pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
         // In RPython this sets HF_NONSTD_VABLE flag.
         // We track it as a known non-null value.
-        self.known_nullity.insert(opref, true);
+        {
+            let _i = opref.0 as usize;
+            if _i >= self.known_nullity.len() {
+                self.known_nullity.resize(_i + 1, 0);
+            }
+            self.known_nullity[_i] = 1;
+        };
     }
 
     /// heapcache.py: replace_box(oldbox, newbox)
@@ -658,11 +724,11 @@ impl HeapCache {
             }
         }
         // Transfer escape/allocation status
-        if self.is_unescaped.remove(&old) {
-            self.is_unescaped.insert(new);
+        if vb_remove(&mut self.is_unescaped, &old) {
+            vb_insert(&mut self.is_unescaped, new);
         }
-        if self.seen_allocation.remove(&old) {
-            self.seen_allocation.insert(new);
+        if vb_remove(&mut self.seen_allocation, &old) {
+            vb_insert(&mut self.seen_allocation, new);
         }
     }
 
@@ -674,28 +740,36 @@ impl HeapCache {
 
     /// Record that the class of an object is now known (e.g., after GUARD_CLASS).
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
-        self.known_class.insert(opref, class);
+        {
+            let _i = opref.0 as usize;
+            if _i >= self.known_class.len() {
+                self.known_class.resize(_i + 1, None);
+            }
+            self.known_class[_i] = Some(class);
+        };
     }
 
     /// Check if the class of an object is known.
     pub fn is_class_known(&self, opref: OpRef) -> bool {
-        self.known_class.contains_key(&opref)
+        self.known_class
+            .get(opref.0 as usize)
+            .map_or(false, |v| v.is_some())
     }
 
     /// Get the known class of an object, if available.
     pub fn get_known_class(&self, opref: OpRef) -> Option<GcRef> {
-        self.known_class.get(&opref).copied()
+        self.known_class.get(opref.0 as usize).and_then(|v| *v)
     }
 
     /// Check if an object is unescaped (allocated in this trace and not
     /// yet passed to external code).
     pub fn is_unescaped(&self, opref: OpRef) -> bool {
-        self.is_unescaped.contains(&opref)
+        vb_contains(&self.is_unescaped, &opref)
     }
 
     /// Check if we saw the allocation of this object in the current trace.
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
-        self.seen_allocation.contains(&opref)
+        vb_contains(&self.seen_allocation, &opref)
     }
 
     /// Notify the cache about an operation, potentially invalidating entries.
@@ -716,9 +790,11 @@ impl HeapCache {
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
             let container = args[0];
             let value = args[1];
-            if self.is_unescaped.contains(&container) && self.is_unescaped.contains(&value) {
+            if vb_contains(&self.is_unescaped, &container)
+                && vb_contains(&self.is_unescaped, &value)
+            {
                 self.escape_deps.entry(container).or_default().push(value);
-            } else if self.is_unescaped.contains(&container) {
+            } else if vb_contains(&self.is_unescaped, &container) {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -727,9 +803,11 @@ impl HeapCache {
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
             let container = args[0];
             let value = args[2];
-            if self.is_unescaped.contains(&container) && self.is_unescaped.contains(&value) {
+            if vb_contains(&self.is_unescaped, &container)
+                && vb_contains(&self.is_unescaped, &value)
+            {
                 self.escape_deps.entry(container).or_default().push(value);
-            } else if self.is_unescaped.contains(&container) {
+            } else if vb_contains(&self.is_unescaped, &container) {
                 // Container unescaped, value already escaped — no-op
             } else {
                 self.mark_escaped_recursive(value);
@@ -1011,13 +1089,21 @@ impl HeapCache {
     /// Record that a value's nullity is known.
     /// heapcache.py: nullity_now_known(box, is_nonnull)
     pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
-        self.known_nullity.insert(opref, is_nonnull);
+        {
+            let _i = opref.0 as usize;
+            if _i >= self.known_nullity.len() {
+                self.known_nullity.resize(_i + 1, 0);
+            }
+            self.known_nullity[_i] = if is_nonnull { 1 } else { 2 };
+        };
     }
 
     /// Check if a value's nullity is known.
     /// heapcache.py: is_nullity_known(box)
     pub fn is_nullity_known(&self, opref: OpRef) -> Option<bool> {
-        self.known_nullity.get(&opref).copied()
+        self.known_nullity
+            .get(opref.0 as usize)
+            .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
     }
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
@@ -1039,12 +1125,12 @@ impl HeapCache {
     /// Mark a value as likely virtual.
     /// heapcache.py: HF_LIKELY_VIRTUAL flag
     pub fn mark_likely_virtual(&mut self, opref: OpRef) {
-        self.likely_virtual.insert(opref);
+        vb_insert(&mut self.likely_virtual, opref);
     }
 
     /// Check if a value is likely virtual.
     pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
-        self.likely_virtual.contains(&opref)
+        vb_contains(&self.likely_virtual, &opref)
     }
 
     // ── Loop-invariant call result caching ──
