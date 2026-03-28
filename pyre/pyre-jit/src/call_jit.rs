@@ -2450,10 +2450,16 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return 0;
     }
 
-    // op_code is the raw CPython COMPARE_OP oparg (= ComparisonOperator discriminant).
-    // Transmute back and call compare_value.
-    use pyre_bytecode::bytecode::ComparisonOperator;
-    let op: ComparisonOperator = unsafe { std::mem::transmute(op_code as u8) };
+    // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
+    // ComparisonOperator discriminant. Reverse the mapping to get the enum.
+    let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            format!("unknown compare op tag {op_code}"),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        return 0;
+    };
     match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
@@ -2480,10 +2486,16 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return 0;
     }
 
-    // op_code is the raw CPython BINARY_OP oparg (= BinaryOperator discriminant).
-    // Transmute back to BinaryOperator enum and call binary_value.
-    use pyre_bytecode::bytecode::BinaryOperator;
-    let op: BinaryOperator = unsafe { std::mem::transmute(op_code as u8) };
+    // op_code is the compact tag from binary_op_tag (0-12), NOT the raw
+    // BinaryOperator discriminant. Reverse the mapping to get the enum.
+    let Some(op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_code) else {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            format!("unknown binary op tag {op_code}"),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
+        return 0;
+    };
     match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
         Err(err) => {
