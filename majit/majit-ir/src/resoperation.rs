@@ -15,9 +15,16 @@ pub struct OpRef(pub u32);
 
 impl OpRef {
     pub const NONE: OpRef = OpRef(u32::MAX);
+    /// Constants use OpRef indices starting from this base.
+    pub const CONST_BASE: u32 = 10_000;
 
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX
+    }
+
+    /// resoperation.py: is_constant() — constants have OpRef >= CONST_BASE.
+    pub fn is_constant(self) -> bool {
+        self.0 >= Self::CONST_BASE && self.0 != u32::MAX
     }
 }
 
@@ -141,7 +148,7 @@ pub struct Op {
     pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
-    pub vecinfo: Option<VectorizationInfo>,
+    pub vecinfo: Option<Box<VectorizationInfo>>,
 }
 
 /// resoperation.py:156-200: Per-op vector metadata for the vectorizer.
@@ -169,21 +176,36 @@ impl VectorizationInfo {
         }
     }
 
-    /// resoperation.py:212-217: setinfo
+    /// resoperation.py:214-230: setinfo — normalize bytesize by datatype.
     pub fn setinfo(&mut self, datatype: char, bytesize: i8, signed: bool) {
         self.datatype = datatype;
-        self.bytesize = bytesize;
+        self.bytesize = if bytesize == -1 {
+            match datatype {
+                'i' => Self::INT_WORD,
+                'f' => Self::FLOAT_WORD,
+                'r' => Self::INT_WORD,
+                'v' => 0,
+                'V' => Self::INT_WORD,
+                _ => Self::INT_WORD, // safe default
+            }
+        } else {
+            bytesize
+        };
         self.signed = signed;
     }
 
-    /// resoperation.py:219-222: getbytesize (uses word size if -1)
+    /// resoperation.py:219-222: getbytesize
     pub fn getbytesize(&self) -> usize {
         if self.bytesize == -1 {
-            8
+            Self::INT_WORD as usize
         } else {
             self.bytesize as usize
         }
     }
+
+    /// Machine word sizes (64-bit platform).
+    const INT_WORD: i8 = 8;
+    const FLOAT_WORD: i8 = 8;
 
     /// resoperation.py:224-227: getcount
     pub fn getcount(&self) -> usize {
@@ -2070,6 +2092,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                vecinfo: None,
             }
         };
     }

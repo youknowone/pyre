@@ -270,6 +270,7 @@ impl VectorizingOptimizer {
                                         scalar_opcode: graph.nodes[l_user].op.opcode,
                                         vector_opcode: vec_op,
                                         members: vec![l_user, r_user],
+                                        is_accumulating: false,
                                     });
                                 }
                             }
@@ -604,6 +605,7 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3], // 4 ops
+            is_accumulating: false,
         };
         // savings = 3 * 1 = 3, cost = 2 * 2 = 4 → not profitable with 4
         // Actually savings = 3, cost = 4, so NOT profitable by default
@@ -614,6 +616,7 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3, 4], // 5 ops → savings = 4 > cost = 4
+            is_accumulating: false,
         };
         assert!(!cm.is_profitable(&group5)); // 4 == 4, not strictly greater
     }
@@ -625,6 +628,7 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0], // Only 1 op
+            is_accumulating: false,
         };
         assert!(!cm.is_profitable(&group));
     }
@@ -640,6 +644,7 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1], // savings = 1*2 = 2, cost = 2*1 = 2 → not profitable
+            is_accumulating: false,
         };
         assert!(!cm.is_profitable(&group));
 
@@ -647,6 +652,7 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2], // savings = 2*2 = 4, cost = 2*1 = 2 → profitable
+            is_accumulating: false,
         };
         assert!(cm.is_profitable(&group3));
     }
@@ -845,11 +851,13 @@ mod tests {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1],
+            is_accumulating: false,
         });
         ps.add_pack(Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![2, 3],
+            is_accumulating: false,
         });
         assert_eq!(ps.num_packs(), 2);
         assert_eq!(ps.total_ops(), 4);

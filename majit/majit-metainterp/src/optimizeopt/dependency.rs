@@ -160,6 +160,7 @@ impl DependencyGraph {
                     scalar_opcode: *opcode,
                     vector_opcode: vec_opcode,
                     members: group_indices,
+                    is_accumulating: false,
                 });
             }
         }
@@ -376,9 +377,21 @@ impl MemoryRef {
         self.index_var.constant_diff(&other.index_var).abs() < self.stride()
     }
 
-    /// dependency.py:1196-1197
+    /// dependency.py:1196-1197: same_array — array identity + descriptor equality.
+    /// RPython uses `self.descr == other.descr` (value equality).
+    /// In majit, Descr is a trait object; we compare by index() for value equality,
+    /// falling back to Arc::ptr_eq for descriptors without assigned indices.
     pub fn same_array(&self, other: &MemoryRef) -> bool {
-        self.array == other.array && std::sync::Arc::ptr_eq(&self.descr, &other.descr)
+        if self.array != other.array {
+            return false;
+        }
+        let si = self.descr.index();
+        let oi = other.descr.index();
+        if si != u32::MAX && oi != u32::MAX {
+            si == oi
+        } else {
+            std::sync::Arc::ptr_eq(&self.descr, &other.descr)
+        }
     }
 
     /// dependency.py:1213-1217: stride in elements (1) or bytes (for raw)
@@ -390,6 +403,259 @@ impl MemoryRef {
                 .as_array_descr()
                 .map(|ad| ad.item_size() as i64)
                 .unwrap_or(8)
+        }
+    }
+}
+
+// ── dependency.py:412-471: Dependency (rich edge) ─────────────
+
+/// dependency.py:412-471: A dependency edge in the graph.
+/// Carries which args caused the dependency and whether it's a failarg dep.
+#[derive(Clone, Debug)]
+pub struct Dependency {
+    /// Index of the source node.
+    pub at_idx: usize,
+    /// Index of the target node.
+    pub to_idx: usize,
+    /// (source_node_idx, arg OpRef) pairs that caused this dependency.
+    pub args: Vec<(usize, OpRef)>,
+    /// Whether this is a failarg dependency.
+    pub failarg: bool,
+}
+
+impl Dependency {
+    pub fn new(at_idx: usize, to_idx: usize, arg: Option<OpRef>) -> Self {
+        let mut d = Dependency {
+            at_idx,
+            to_idx,
+            args: Vec::new(),
+            failarg: false,
+        };
+        if let Some(a) = arg {
+            d.args.push((at_idx, a));
+        }
+        d
+    }
+
+    /// dependency.py:423-427: because_of
+    pub fn because_of(&self, var: OpRef) -> bool {
+        self.args.iter().any(|(_, a)| *a == var)
+    }
+}
+
+// ── dependency.py:473-535: DefTracker ─────────────────────────
+
+/// dependency.py:473-535: Tracks definitions of OpRefs during
+/// dependency graph construction. Maps each OpRef to the node(s)
+/// that define it, enabling def-use chain queries.
+pub struct DefTracker<'a> {
+    pub graph: &'a DependencyGraph,
+    /// OpRef → list of (defining node index, optional memory ref cell)
+    pub defs: HashMap<OpRef, Vec<(usize, Option<usize>)>>,
+    /// Nodes with side effects (non-pure).
+    pub non_pure: Vec<usize>,
+}
+
+impl<'a> DefTracker<'a> {
+    pub fn new(graph: &'a DependencyGraph) -> Self {
+        DefTracker {
+            graph,
+            defs: HashMap::new(),
+            non_pure: Vec::new(),
+        }
+    }
+
+    /// dependency.py:479-480
+    pub fn add_non_pure(&mut self, node_idx: usize) {
+        self.non_pure.push(node_idx);
+    }
+
+    /// dependency.py:482-488: define — register that node_idx defines arg.
+    pub fn define(&mut self, arg: OpRef, node_idx: usize) {
+        // dependency.py:483-484: skip constants.
+        if arg.is_constant() {
+            return;
+        }
+        self.defs
+            .entry(arg)
+            .or_insert_with(Vec::new)
+            .push((node_idx, None));
+    }
+
+    /// dependency.py:494-495
+    pub fn is_defined(&self, arg: OpRef) -> bool {
+        self.defs.contains_key(&arg)
+    }
+
+    /// dependency.py:497-523: definition — find the defining node for arg.
+    pub fn definition(&self, arg: OpRef) -> Option<usize> {
+        if arg.is_constant() {
+            return None;
+        }
+        let chain = self.defs.get(&arg)?;
+        if chain.is_empty() {
+            return None;
+        }
+        Some(chain.last()?.0)
+    }
+
+    /// dependency.py:525-534: depends_on_arg — add edge from definition to `to_idx`.
+    pub fn depends_on_arg(&self, arg: OpRef, to_idx: usize, graph: &mut Vec<Vec<usize>>) {
+        if let Some(at_idx) = self.definition(arg) {
+            if at_idx != to_idx && !graph[at_idx].contains(&to_idx) {
+                graph[at_idx].push(to_idx);
+            }
+        }
+    }
+}
+
+// ── dependency.py:877-978: IntegralForwardModification ────────
+
+/// dependency.py:877-978: Calculates integral modifications on integer
+/// boxes. Propagates INT_ADD/INT_SUB/INT_MUL through IndexVar linear
+/// combinations, and recognizes array access patterns for MemoryRef.
+pub struct IntegralForwardModification<'a> {
+    /// OpRef → IndexVar mapping
+    pub index_vars: HashMap<OpRef, IndexVar>,
+    /// Node index → MemoryRef mapping
+    pub memory_refs: HashMap<usize, MemoryRef>,
+    /// Callback to resolve constant OpRef → i64 value.
+    /// dependency.py:885-888: is_const_integral + box.getint()
+    constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
+}
+
+impl<'a> IntegralForwardModification<'a> {
+    pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
+        IntegralForwardModification {
+            index_vars: HashMap::new(),
+            memory_refs: HashMap::new(),
+            constant_of,
+        }
+    }
+
+    fn is_const(opref: OpRef) -> bool {
+        opref.is_constant()
+    }
+
+    fn const_val(&self, opref: OpRef) -> Option<i64> {
+        (self.constant_of)(opref)
+    }
+
+    fn get_or_create(&mut self, arg: OpRef) -> IndexVar {
+        self.index_vars
+            .get(&arg)
+            .cloned()
+            .unwrap_or_else(|| IndexVar::new(arg))
+    }
+
+    /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
+    fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
+        let result = op.pos;
+        let a0 = op.args[0];
+        let a1 = op.args[1];
+        if Self::is_const(a0) && Self::is_const(a1) {
+            let mut idx = IndexVar::new(result);
+            let v0 = self.const_val(a0).unwrap_or(0);
+            let v1 = self.const_val(a1).unwrap_or(0);
+            idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
+            self.index_vars.insert(result, idx);
+        } else if Self::is_const(a0) {
+            let mut idx = self.get_or_create(a1);
+            idx = idx.clone_var();
+            if let Some(v) = self.const_val(a0) {
+                if is_sub {
+                    idx.constant -= v;
+                } else {
+                    idx.constant += v;
+                }
+            }
+            self.index_vars.insert(result, idx);
+        } else if Self::is_const(a1) {
+            let mut idx = self.get_or_create(a0);
+            idx = idx.clone_var();
+            if let Some(v) = self.const_val(a1) {
+                if is_sub {
+                    idx.constant -= v;
+                } else {
+                    idx.constant += v;
+                }
+            }
+            self.index_vars.insert(result, idx);
+        } else {
+            // Both non-const: track the variable.
+            let idx = self.get_or_create(a0);
+            self.index_vars.insert(result, idx);
+        }
+    }
+
+    /// dependency.py:922-948: operation_INT_MUL.
+    fn inspect_multiplicative(&mut self, op: &Op) {
+        let result = op.pos;
+        let a0 = op.args[0];
+        let a1 = op.args[1];
+        if Self::is_const(a0) && Self::is_const(a1) {
+            let mut idx = IndexVar::new(result);
+            let v0 = self.const_val(a0).unwrap_or(0);
+            let v1 = self.const_val(a1).unwrap_or(0);
+            idx.constant = v0 * v1;
+            self.index_vars.insert(result, idx);
+        } else if Self::is_const(a0) {
+            let mut idx = self.get_or_create(a1);
+            idx = idx.clone_var();
+            if let Some(v) = self.const_val(a0) {
+                idx.coefficient_mul *= v;
+                idx.constant *= v;
+            }
+            self.index_vars.insert(result, idx);
+        } else if Self::is_const(a1) {
+            let mut idx = self.get_or_create(a0);
+            idx = idx.clone_var();
+            if let Some(v) = self.const_val(a1) {
+                idx.coefficient_mul *= v;
+                idx.constant *= v;
+            }
+            self.index_vars.insert(result, idx);
+        }
+    }
+
+    /// dependency.py:950-975: inspect array access ops.
+    fn inspect_array_access(&mut self, op: &Op, node_idx: usize, raw_access: bool) {
+        if op.args.len() < 2 {
+            return;
+        }
+        let array = op.args[0];
+        let index = op.args[1];
+        let idx_var = self.get_or_create(index);
+        if let Some(ref descr) = op.descr {
+            let mref = MemoryRef {
+                array,
+                descr: descr.clone(),
+                index_var: idx_var,
+                raw_access,
+            };
+            self.memory_refs.insert(node_idx, mref);
+        }
+    }
+
+    /// dependency.py:977: inspect_operation dispatcher (integral_dispatch_opt)
+    pub fn inspect_operation(&mut self, op: &Op, node_idx: usize) {
+        match op.opcode {
+            OpCode::IntAdd => self.inspect_additive(op, false),
+            OpCode::IntSub => self.inspect_additive(op, true),
+            OpCode::IntMul => self.inspect_multiplicative(op),
+            // Array access ops
+            OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore => {
+                self.inspect_array_access(op, node_idx, true);
+            }
+            OpCode::GetarrayitemRawI
+            | OpCode::GetarrayitemRawF
+            | OpCode::SetarrayitemRaw
+            | OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcF
+            | OpCode::SetarrayitemGc => {
+                self.inspect_array_access(op, node_idx, false);
+            }
+            _ => {}
         }
     }
 }
