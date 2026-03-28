@@ -40,6 +40,7 @@ pub struct JitCodeBuilder {
     sub_jitcodes: Vec<JitCode>,
     fn_ptrs: Vec<JitCallTarget>,
     assembler_targets: Vec<JitCallAssemblerTarget>,
+    has_abort: bool,
 }
 
 impl JitCodeBuilder {
@@ -354,6 +355,7 @@ impl JitCodeBuilder {
 
     pub fn abort(&mut self) {
         self.push_u8(BC_ABORT);
+        self.has_abort = true;
     }
 
     /// RPython bhimpl_ref_return: emit return-ref opcode.
@@ -916,6 +918,7 @@ impl JitCodeBuilder {
             assembler_targets: self.assembler_targets,
             exception_handlers: Vec::new(),
             jit_to_py_pc: Vec::new(),
+            has_abort: self.has_abort,
         }
     }
 
