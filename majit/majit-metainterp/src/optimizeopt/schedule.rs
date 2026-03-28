@@ -21,6 +21,8 @@ pub struct Pack {
     pub members: Vec<usize>,
     /// schedule.py:811: whether this pack tracks an accumulation (reduction).
     pub is_accumulating: bool,
+    /// schedule.py:989: accumulation argument position (-1 = none).
+    pub position: i32,
 }
 
 /// vector.py: PackSet — manages packs and supports merging
@@ -59,8 +61,16 @@ impl PackSet {
                         // schedule.py:931-942: rightmost_match_leftmost
                         let rightmost = *self.packs[i].members.last().unwrap_or(&usize::MAX);
                         let leftmost = *self.packs[j].members.first().unwrap_or(&usize::MAX);
+                        // schedule.py:937-941: accumulating pack constraints
+                        let accum_ok = if self.packs[i].is_accumulating {
+                            self.packs[j].is_accumulating
+                                && self.packs[i].position == self.packs[j].position
+                        } else {
+                            true
+                        };
                         if rightmost == leftmost
                             && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
+                            && accum_ok
                         {
                             // vector.py:753+: combine — merge j into i, skip overlap
                             let mut merged_members = self.packs[i].members.clone();
@@ -112,6 +122,7 @@ impl PackSet {
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![uleft, uright],
                                 is_accumulating: false,
+                                position: -1,
                             });
                         }
                     }
@@ -130,6 +141,7 @@ impl PackSet {
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
                                 members: vec![dleft, dright],
                                 is_accumulating: false,
+                                position: -1,
                             });
                         }
                     }
@@ -427,6 +439,10 @@ pub struct VecScheduleState {
     pub accumulation: HashMap<OpRef, usize>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
+    /// Type registry: OpRef → is_float for vector ops.
+    /// Registered at creation time (before append_to_oplist),
+    /// so is_float_vector works even before the op is in oplist.
+    vec_type_registry: HashMap<OpRef, bool>,
 }
 
 impl VecScheduleState {
@@ -440,6 +456,7 @@ impl VecScheduleState {
             inputargs: HashMap::new(),
             accumulation: HashMap::new(),
             next_pos: start_pos,
+            vec_type_registry: HashMap::new(),
         }
     }
 
@@ -450,16 +467,15 @@ impl VecScheduleState {
         pos
     }
 
+    /// Register a vector op's datatype at creation time.
+    pub fn register_vec_type(&mut self, opref: OpRef, is_float: bool) {
+        self.vec_type_registry.insert(opref, is_float);
+    }
+
     /// Check if an OpRef refers to a float-type vector op.
+    /// Uses the type registry (populated at op creation, before append_to_oplist).
     pub fn is_float_vector(&self, opref: OpRef) -> bool {
-        self.oplist.iter().any(|op| {
-            op.pos == opref
-                && op
-                    .vecinfo
-                    .as_ref()
-                    .map(|vi| vi.datatype == 'f')
-                    .unwrap_or(false)
-        })
+        self.vec_type_registry.get(&opref).copied().unwrap_or(false)
     }
 
     /// schedule.py:625-630: setvector_of_box — record that scalar_op
@@ -607,6 +623,9 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     vecop.vecinfo = Some(Box::new(vinfo));
 
     let vecop_pos = vecop.pos;
+    // Register type before append_to_oplist so is_float_vector works
+    // in prepare_fail_arguments (called before append).
+    state.register_vec_type(vecop_pos, datatype == 'f');
     // schedule.py:340-346: map scalar ops to vector positions
     for (i, &member_idx) in pack.members.iter().enumerate() {
         let op = &ops[member_idx];

@@ -599,6 +599,7 @@ impl DependencyGraph {
                     vector_opcode: vec_opcode,
                     members: group_indices,
                     is_accumulating: false,
+                    position: -1,
                 });
             }
         }
