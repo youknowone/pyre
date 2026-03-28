@@ -842,6 +842,13 @@ impl OptVirtualize {
         let value_ref = ctx.get_box_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
+        // Pre-extract constant value before mutable borrow of ptr_info.
+        // Class pointer may be stored as Value::Int OR Value::Ref.
+        let value_as_constant: Option<usize> = ctx.get_constant(value_ref).and_then(|v| match v {
+            majit_ir::Value::Int(i) => Some(*i as usize),
+            majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
+            _ => None,
+        });
 
         // RPython virtualize.py:200-202: virtual SetfieldGc always updates
         // the field, even for imported virtual heads. Body computation must
@@ -862,6 +869,19 @@ impl OptVirtualize {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
+                        }
+                        // RPython: NewWithVtable carries the class directly.
+                        // pyre: New() + SetfieldGc(offset=0, class_ptr).
+                        // When setting ob_type (offset 0) to a constant,
+                        // capture it as known_class for rd_virtuals
+                        // materialization (resume.py:612 VirtualInfo.allocate).
+                        if vinfo.known_class.is_none() {
+                            let offset = extract_field_offset(field_idx);
+                            if offset == Some(0) {
+                                if let Some(class_val) = value_as_constant {
+                                    vinfo.known_class = Some(majit_ir::GcRef(class_val));
+                                }
+                            }
                         }
                         return OptimizationResult::Remove;
                     }
