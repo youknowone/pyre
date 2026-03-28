@@ -24,10 +24,9 @@ pub struct MetaInterpFrame {
     pub concrete_frame: usize,
     /// Box for heap stability across Vec reallocs.
     pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
-    pub parent_fail_args: Vec<OpRef>,
-    pub parent_fail_arg_types: Vec<Type>,
-    /// opencoder.py:806 parent frame pc for multi-frame snapshot.
-    pub parent_resumepc: usize,
+    /// opencoder.py:819-834: accumulated parent frame chain.
+    /// Each: (fail_args, types, resumepc, jitcode_index).
+    pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,
     pub drop_frame_opref: Option<OpRef>,
     pub caller_result_stack_idx: Option<usize>,
     pub arg_state: pyre_bytecode::bytecode::OpArgState,
@@ -193,16 +192,12 @@ impl PyreMetaInterp {
         let code = unsafe { &*top.jitcode };
         let sym = unsafe { &mut *top.sym };
         let cf_addr = top.concrete_frame_addr();
-        let pfa = top.parent_fail_args.clone();
-        let pfa_types = top.parent_fail_arg_types.clone();
-        let pfa_resumepc = top.parent_resumepc;
+        let parent_frames = top.parent_frames.clone();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
         let inline_action = {
             let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc, pc);
-            fs.parent_fail_args = Some(pfa);
-            fs.parent_fail_arg_types = Some(pfa_types);
-            fs.parent_resumepc = pfa_resumepc;
+            fs.parent_frames = parent_frames;
             let result = fs.trace_code_step_inline(code, pc);
             let pending = fs.pending_inline_frame.take();
             drop(fs);
@@ -319,9 +314,7 @@ impl PyreMetaInterp {
             greenkey: Some(pending.green_key),
             concrete_frame: cf_addr,
             owned_concrete_frame: Some(owned_cf),
-            parent_fail_args: pending.parent_fail_args,
-            parent_fail_arg_types: pending.parent_fail_arg_types,
-            parent_resumepc: pending.parent_resumepc,
+            parent_frames: pending.parent_frames,
             drop_frame_opref: pending.drop_frame_opref,
             caller_result_stack_idx: caller_result_idx,
             arg_state: pyre_bytecode::bytecode::OpArgState::default(),
