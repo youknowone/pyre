@@ -61,7 +61,18 @@ pub struct CodeWriter {
     /// RPython: CallControl manages these via callinfocollection.
     /// In pyre, we store the concrete function pointers that the
     /// BlackholeInterpreter calls through JitCode.fn_ptrs.
+    /// blackhole.py bhimpl_residual_call: per-arity call helpers.
+    /// call_fn = nargs=1 (callable, arg0, frame_ptr).
+    /// call_fn_0..4 = nargs=0..4.
     pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
+    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
+    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     pub load_global_fn: extern "C" fn(i64, i64) -> i64,
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
@@ -91,6 +102,14 @@ impl CodeWriter {
     ) -> Self {
         Self {
             call_fn,
+            call_fn_0: crate::call_jit::bh_call_fn_0,
+            call_fn_2: crate::call_jit::bh_call_fn_2,
+            call_fn_3: crate::call_jit::bh_call_fn_3,
+            call_fn_4: crate::call_jit::bh_call_fn_4,
+            call_fn_5: crate::call_jit::bh_call_fn_5,
+            call_fn_6: crate::call_jit::bh_call_fn_6,
+            call_fn_7: crate::call_jit::bh_call_fn_7,
+            call_fn_8: crate::call_jit::bh_call_fn_8,
             load_global_fn,
             compare_fn,
             binary_op_fn,
@@ -116,8 +135,8 @@ impl CodeWriter {
         // scratch bank for opcode immediates, truth flags, and the frame ptr.
         let obj_tmp0 = nlocals as u16;
         let obj_tmp1 = (nlocals + 1) as u16;
-        let arg_regs_start = (nlocals + 2) as u16; // up to CALL 4
-        let null_ref_reg = (nlocals + 6) as u16; // permanently zero / null
+        let arg_regs_start = (nlocals + 2) as u16; // up to CALL 8
+        let null_ref_reg = (nlocals + 10) as u16; // permanently zero / null
 
         let int_tmp0 = 0u16;
         let int_tmp1 = 1u16;
@@ -143,6 +162,15 @@ impl CodeWriter {
         let load_const_fn_idx = assembler.add_fn_ptr(self.load_const_fn as *const ());
         let store_subscr_fn_idx = assembler.add_fn_ptr(self.store_subscr_fn as *const ());
         let build_list_fn_idx = assembler.add_fn_ptr(self.build_list_fn as *const ());
+        // Per-arity call helpers (appended AFTER existing fn_ptrs to preserve indices).
+        let call_fn_0_idx = assembler.add_fn_ptr(self.call_fn_0 as *const ());
+        let call_fn_2_idx = assembler.add_fn_ptr(self.call_fn_2 as *const ());
+        let call_fn_3_idx = assembler.add_fn_ptr(self.call_fn_3 as *const ());
+        let call_fn_4_idx = assembler.add_fn_ptr(self.call_fn_4 as *const ());
+        let call_fn_5_idx = assembler.add_fn_ptr(self.call_fn_5 as *const ());
+        let call_fn_6_idx = assembler.add_fn_ptr(self.call_fn_6 as *const ());
+        let call_fn_7_idx = assembler.add_fn_ptr(self.call_fn_7 as *const ());
+        let call_fn_8_idx = assembler.add_fn_ptr(self.call_fn_8 as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -420,7 +448,27 @@ impl CodeWriter {
                         ));
                     }
                     call_args.push(majit_metainterp::jitcode::JitCallArg::int(frame_reg));
-                    assembler.call_may_force_ref_typed(call_fn_idx, &call_args, obj_tmp0);
+                    // Select the correct arity-specific call helper.
+                    // RPython blackhole.py: call_int_function transmutes
+                    // to the correct arity. Each nargs needs a matching
+                    // extern "C" fn with that many i64 parameters.
+                    // nargs > 8 → abort_permanent (no matching helper).
+                    if nargs > 8 {
+                        assembler.abort_permanent();
+                    } else {
+                        let fn_idx = match nargs {
+                            0 => call_fn_0_idx,
+                            1 => call_fn_idx,
+                            2 => call_fn_2_idx,
+                            3 => call_fn_3_idx,
+                            4 => call_fn_4_idx,
+                            5 => call_fn_5_idx,
+                            6 => call_fn_6_idx,
+                            7 => call_fn_7_idx,
+                            _ => call_fn_8_idx,
+                        };
+                        assembler.call_may_force_ref_typed(fn_idx, &call_args, obj_tmp0);
+                    }
                     assembler.push_r(obj_tmp0);
                 }
 

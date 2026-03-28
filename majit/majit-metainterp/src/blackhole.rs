@@ -770,6 +770,11 @@ pub struct BlackholeInterpreter {
     /// must not treat abort as DoneWithThisFrame — side effects from
     /// partial execution have corrupted state.
     pub aborted: bool,
+    /// RPython blackhole.py handle_exception_in_frame parity:
+    /// True when a residual call raised an exception (returned NULL ref).
+    /// Unlike `aborted`, this indicates a Python-level exception that
+    /// should propagate up the blackhole chain, not a JIT infrastructure error.
+    pub got_exception: bool,
 }
 
 impl Default for BlackholeInterpreter {
@@ -796,6 +801,7 @@ impl BlackholeInterpreter {
             merge_point_jitcode_pc: None,
             reached_merge_point: false,
             aborted: false,
+            got_exception: false,
         }
     }
 
@@ -822,6 +828,9 @@ impl BlackholeInterpreter {
 
         self.jitcode = jitcode;
         self.position = position;
+        self.aborted = false;
+        self.got_exception = false;
+        self.reached_merge_point = false;
     }
 
     /// Set an integer register value.
@@ -1272,6 +1281,17 @@ impl BlackholeInterpreter {
                 // Execute callee
                 let _ = callee.run();
 
+                // RPython blackhole.py: propagate callee exceptions/aborts.
+                // If callee aborted or got an exception, propagate to caller.
+                if callee.aborted {
+                    self.aborted = true;
+                    return Err(LeaveFrame);
+                }
+                if callee.got_exception {
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
+
                 // Copy runtime stacks back
                 self.runtime_stacks = callee.runtime_stacks;
                 self.current_selected = callee.current_selected;
@@ -1315,6 +1335,14 @@ impl BlackholeInterpreter {
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
                 let result = call_int_function(target.concrete_ptr, &args);
+                // RPython blackhole.py:351 handle_exception_in_frame:
+                // residual call returning NULL/0 indicates a Python exception.
+                // Set got_exception and leave frame so the caller can propagate
+                // up the blackhole chain (RPython _run_forever exception flow).
+                if result == 0 {
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
                 self.registers_r[dst] = result;
             }
             // -- Float-typed calls --
@@ -1476,6 +1504,7 @@ impl BlackholeInterpBuilder {
         interp.merge_point_jitcode_pc = None;
         interp.reached_merge_point = false;
         interp.aborted = false;
+        interp.got_exception = false;
         self.pool.push(interp);
     }
 

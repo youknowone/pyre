@@ -967,6 +967,25 @@ pub fn resume_in_blackhole(
             return BlackholeResult::Failed;
         }
 
+        // RPython blackhole.py:351 handle_exception_in_frame +
+        // blackhole.py:1752 _run_forever exception propagation:
+        // A residual call raised a Python exception (got_exception=true).
+        //
+        // RPython would call handle_exception_in_frame() to check for
+        // catch_exception in the current frame, and only propagate up
+        // the chain if no handler is found. pyre conservatively aborts
+        // the entire blackhole chain on exception — the interpreter
+        // will re-execute from the guard failure point and handle the
+        // exception through its own exception table dispatch.
+        if bh.got_exception {
+            let next = bh.nextblackholeinterp.take();
+            builder.release_interp(bh);
+            if let Some(next) = next {
+                builder.release_chain(Some(*next));
+            }
+            return BlackholeResult::Failed;
+        }
+
         // DoneWithThisFrame: callee finished (RETURN_VALUE).
         let return_value = bh.registers_r.get(0).copied().unwrap_or(0);
         let next = bh.nextblackholeinterp.take();
@@ -2157,36 +2176,194 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 /// RPython: bhimpl_recursive_call_i — call a Python function in blackhole mode.
 ///
 /// The blackhole pops callable and args into registers before calling this.
-/// Convention: args = [callable, arg0, ..., argN, frame_ptr]
-/// frame_ptr is always the LAST argument.
+/// blackhole.py bhimpl_residual_call parity: variable-arity call helper.
 ///
-/// Since the C ABI signature is fixed at 3 args, we use call_user_function_plain
-/// for calls with >1 Python arg, falling back to the interpreter instead of
-/// trying to shoehorn variable args into a fixed signature.
+/// Convention: call_int_function dispatches with args=[callable, arg0, ..., argN, frame_ptr].
+/// frame_ptr is always the LAST argument. The number of Python args = total_args - 2
+/// (subtract callable and frame_ptr).
+///
+/// For nargs=0: fn(callable, frame_ptr) → 2 args
+/// For nargs=1: fn(callable, arg0, frame_ptr) → 3 args
+/// For nargs=2: fn(callable, arg0, arg1, frame_ptr) → 4 args
+/// For nargs=3: fn(callable, arg0, arg1, arg2, frame_ptr) → 5 args
+/// etc.
+///
+/// call_int_function in machine.rs transmutes to the correct arity.
 pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
-    let callable = callable as PyObjectRef;
+    // This is the 3-arg entry point (nargs=1). For other arities,
+    // call_int_function transmutes to bh_call_fn_N variants below.
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[arg0 as PyObjectRef],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_0(callable: i64, frame_ptr: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, &[], frame_ptr as *const PyFrame)
+}
+
+pub extern "C" fn bh_call_fn_2(callable: i64, arg0: i64, arg1: i64, frame_ptr: i64) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[arg0 as PyObjectRef, arg1 as PyObjectRef],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_3(
+    callable: i64,
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            arg0 as PyObjectRef,
+            arg1 as PyObjectRef,
+            arg2 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_4(
+    callable: i64,
+    arg0: i64,
+    arg1: i64,
+    arg2: i64,
+    arg3: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            arg0 as PyObjectRef,
+            arg1 as PyObjectRef,
+            arg2 as PyObjectRef,
+            arg3 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_5(
+    callable: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            a0 as PyObjectRef,
+            a1 as PyObjectRef,
+            a2 as PyObjectRef,
+            a3 as PyObjectRef,
+            a4 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_6(
+    callable: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            a0 as PyObjectRef,
+            a1 as PyObjectRef,
+            a2 as PyObjectRef,
+            a3 as PyObjectRef,
+            a4 as PyObjectRef,
+            a5 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_7(
+    callable: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            a0 as PyObjectRef,
+            a1 as PyObjectRef,
+            a2 as PyObjectRef,
+            a3 as PyObjectRef,
+            a4 as PyObjectRef,
+            a5 as PyObjectRef,
+            a6 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+pub extern "C" fn bh_call_fn_8(
+    callable: i64,
+    a0: i64,
+    a1: i64,
+    a2: i64,
+    a3: i64,
+    a4: i64,
+    a5: i64,
+    a6: i64,
+    a7: i64,
+    frame_ptr: i64,
+) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[
+            a0 as PyObjectRef,
+            a1 as PyObjectRef,
+            a2 as PyObjectRef,
+            a3 as PyObjectRef,
+            a4 as PyObjectRef,
+            a5 as PyObjectRef,
+            a6 as PyObjectRef,
+            a7 as PyObjectRef,
+        ],
+        frame_ptr as *const PyFrame,
+    )
+}
+
+fn bh_call_fn_impl(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    parent_frame: *const PyFrame,
+) -> i64 {
     if callable.is_null() {
         return 0;
     }
-
-    let parent_frame = unsafe { &*(frame_ptr as *const PyFrame) };
-
+    // RPython bhimpl_residual_call: dispatch builtin vs user function.
     if !unsafe { is_function(callable) } {
-        // Builtin function: call directly
         let func = unsafe { pyre_interpreter::builtin_code_get(callable) };
-        let args = [arg0 as PyObjectRef];
-        return func(&args).unwrap_or(pyre_object::PY_NULL) as i64;
+        return func(args).unwrap_or(pyre_object::PY_NULL) as i64;
     }
-
-    let code_ptr = unsafe { function_get_code(callable) };
-    let globals = unsafe { function_get_globals(callable) };
-    let closure = unsafe { function_get_closure(callable) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
-
-    // Use the plain interpreter for the callee — handles any arg count
-    // correctly by reading from the code object's parameter list.
-    let args = [arg0 as PyObjectRef];
-    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, &args) {
+    let parent_frame = unsafe { &*parent_frame };
+    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
         Ok(result) => result as i64,
         Err(_) => 0,
     }
