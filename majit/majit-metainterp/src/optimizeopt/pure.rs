@@ -869,6 +869,21 @@ impl Optimization for OptPure {
     /// then this method transfers them into OptPure's preamble caches.
     fn install_preamble_pure_ops(&mut self, ctx: &OptContext) {
         for entry in &ctx.imported_short_pure_ops {
+            // heap.py:640-643: GetfieldGcPure on constant objects are
+            // handled by constant_fold in the heap optimizer. Skip these
+            // to avoid conflicting with the heap path. Non-constant
+            // GetfieldGcPure ops go through the pure cache normally.
+            if matches!(
+                entry.opcode,
+                OpCode::GetfieldGcPureI | OpCode::GetfieldGcPureR | OpCode::GetfieldGcPureF
+            ) {
+                let arg0_is_const = entry.args.first().map_or(false, |a| {
+                    matches!(a, crate::optimizeopt::ImportedShortPureArg::Const(..))
+                });
+                if arg0_is_const {
+                    continue;
+                }
+            }
             let resolved_args: Vec<OpRef> = entry
                 .args
                 .iter()

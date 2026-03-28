@@ -4815,10 +4815,14 @@ mod tests {
             &mut ctx,
         );
 
-        assert_eq!(ctx.new_operations.len(), 2);
-        assert_eq!(ctx.new_operations[0].opcode, OpCode::IntAddOvf);
-        assert_eq!(ctx.new_operations[1].opcode, OpCode::GuardNoOverflow);
-        assert_eq!(extra, vec![ctx.new_operations[0].pos]);
+        // RPython optimizer.py:357-359: force_box → add_preamble_op
+        // adds to used_boxes + short_preamble_jump, NOT to short/new_operations.
+        // The ovf op was already added to the short by force_op_from_preamble's
+        // use_box_from_preamble call.
+        let builder = ctx.active_short_preamble_producer_mut().unwrap();
+        let sp = builder.build_short_preamble_struct();
+        assert!(sp.used_boxes.contains(&OpRef(20)));
+        assert_eq!(extra, vec![OpRef(20)]);
     }
 
     #[test]
