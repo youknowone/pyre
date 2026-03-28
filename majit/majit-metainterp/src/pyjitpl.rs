@@ -405,6 +405,9 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
+    /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
+    /// even when Phase 2 raises InvalidLoop.
+    pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -717,6 +720,7 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
+            pending_preamble_tokens: HashMap::new(),
         }
     }
 
@@ -1712,6 +1716,7 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_loops
             .get(&green_key)
             .map(|compiled| compiled.front_target_tokens.clone())
+            .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
@@ -1803,7 +1808,9 @@ impl<M: Clone> MetaInterp<M> {
                                         green_key
                                     );
                                 }
-                                unroll_opt.target_tokens.clear();
+                                // compile.py:236-245 compile_simple_loop parity:
+                                unroll_opt.target_tokens =
+                                    vec![crate::optimizeopt::unroll::TargetToken::new_preamble(0)];
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
                                 (retry_ops, ni)
@@ -1815,6 +1822,17 @@ impl<M: Clone> MetaInterp<M> {
                             }
                         }
                     } else {
+                        // compile.py:288-290 parity: preserve preamble target tokens
+                        if !unroll_opt.target_tokens.is_empty() {
+                            if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                                if compiled.front_target_tokens.is_empty() {
+                                    compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                                }
+                            } else {
+                                self.pending_preamble_tokens
+                                    .insert(green_key, unroll_opt.target_tokens.clone());
+                            }
+                        }
                         // RPython pyjitpl.py:3014-3017 parity: InvalidLoop
                         // but cancel_count < limit — set up retrace with
                         // Phase 1 preamble so the next compile_loop call
@@ -2420,6 +2438,7 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_loops
             .get(&green_key)
             .map(|compiled| compiled.front_target_tokens.clone())
+            .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
@@ -4209,6 +4228,17 @@ impl<M: Clone> MetaInterp<M> {
     /// compiled loop. In majit, search all compiled entries when the
     /// dispatch key doesn't own this guard's trace.
     pub fn must_compile(&mut self, green_key: u64, trace_id: u64, fail_index: u32) -> (bool, u64) {
+        self.must_compile_with_values(green_key, trace_id, fail_index, &[])
+    }
+
+    /// compile.py:738-784: must_compile with fail_values for GUARD_VALUE per-value hash.
+    pub fn must_compile_with_values(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+    ) -> (bool, u64) {
         let owning_key = self.find_owning_key(green_key, trace_id);
         let Some(compiled) = self.compiled_loops.get_mut(&owning_key) else {
             return (false, green_key);
@@ -4223,11 +4253,28 @@ impl<M: Clone> MetaInterp<M> {
                 per_value: None,
                 copied_from: None,
             });
-        // compile.py:738: jitcounter.tick(hash, increment) — single tick+check.
-        let fired = self.warm_state.tick_guard_failure(info.guard_hash);
-        // compile.py:750-751: ST_BUSY_FLAG + stack_almost_full.
-        let should = fired && !info.compiling && !Self::stack_almost_full();
-        (should, owning_key)
+        // compile.py:750-751: ST_BUSY_FLAG + stack_almost_full
+        if info.compiling || Self::stack_almost_full() {
+            return (false, owning_key);
+        }
+        // compile.py:753-781: GUARD_VALUE per-value hash
+        let hash = if let Some((idx, tp)) = info.per_value {
+            let raw = fail_values.get(idx as usize).copied().unwrap_or(0);
+            let intval = match tp {
+                Type::Int => raw,
+                Type::Ref => raw,
+                Type::Float => raw,
+                _ => raw,
+            };
+            info.guard_hash
+                .wrapping_mul(777767777)
+                .wrapping_add((intval as u64).wrapping_mul(1442968193))
+        } else {
+            info.guard_hash
+        };
+        // compile.py:783-784: jitcounter.tick(hash, increment)
+        let fired = self.warm_state.tick_guard_failure(hash);
+        (fired, owning_key)
     }
 
     /// Find the compiled_loops key that owns a given trace_id.
