@@ -582,31 +582,17 @@ impl<S: JitState> JitDriver<S> {
                 if S::validate_close(sym, trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
                     let provisional_meta = self.trace_meta.take().unwrap();
-                    // pyjitpl.py:3158-3175 compile_loop parity: rebuild meta
-                    // from the MergePoint that matched at close time.
-                    // When cut_trace_from redirects to a different header_pc,
-                    // update merge_pc so is_compatible matches at entry.
-                    let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
-                    let meta = match hpc {
-                        Some(0) => {
-                            if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
-                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
-                            } else {
-                                provisional_meta
-                            }
+                    // When cross-loop cut redirects to a different header_pc,
+                    // rebuild meta from merge point to get the inner header's
+                    // layout (vsd, slot_types, merge_pc). This ensures
+                    // extract_live_values reads the frame correctly at the
+                    // inner back-edge entry via alias.
+                    let meta = {
+                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                        } else {
+                            provisional_meta
                         }
-                        Some(cut_pc)
-                            if cut_pc != S::meta_merge_pc(&provisional_meta)
-                                && self.meta.cross_loop_cut_info().is_some() =>
-                        {
-                            // cut_trace_from redirected to an inner loop header.
-                            // Only update merge_pc — nlocals/vsd/slot_types remain
-                            // the same since it's the same function.
-                            let mut meta = provisional_meta;
-                            S::update_meta_merge_pc(&mut meta, cut_pc);
-                            meta
-                        }
-                        _ => provisional_meta,
                     };
                     // RPython pyjitpl.py:3000-3009 parity: if partial_trace
                     // is set from a previous InvalidLoop, clear it and do a
@@ -618,28 +604,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                         self.meta.clear_retrace_state();
                     }
-                    let outcome = self.meta.compile_loop(&jump_args, meta);
-                    // RPython pyjitpl.py:3160-3175 parity: when compile_loop
-                    // cuts the trace to a different header_pc (inner loop),
-                    // update the stored meta's merge_pc so is_compatible
-                    // matches at compiled code entry.
-                    if let crate::pyjitpl::CompileOutcome::Compiled {
-                        cut_header_pc: Some(cut_pc),
-                        green_key: gk,
-                        from_retry: false,
-                        ..
-                    } = outcome
-                    {
-                        // pyjitpl.py:3160-3175 parity: cut_trace_from redirected
-                        // to an inner loop header. Update meta.merge_pc so
-                        // is_compatible matches at entry.
-                        if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                            let existing_pc = S::meta_merge_pc(&entry.meta);
-                            if existing_pc != cut_pc && entry.retraced_count == 0 {
-                                S::update_meta_merge_pc(&mut entry.meta, cut_pc);
-                            }
-                        }
-                    }
+                    let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -701,29 +666,11 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
                     let provisional_meta = self.trace_meta.take().unwrap();
-                    // pyjitpl.py:3158-3175 compile_loop parity: rebuild meta
-                    // from the MergePoint that matched at close time.
-                    // When cut_trace_from redirects to a different header_pc
-                    // (e.g. inner loop at pc=14 within outer loop at pc=38),
-                    // the meta must use the inner loop's merge_pc so
-                    // is_compatible matches at entry.
                     let meta = {
-                        let hpc = self.meta.trace_ctx().map(|c| c.header_pc);
-                        match hpc {
-                            Some(0) => {
-                                if let Some((cut_pc, ref cut_types)) =
-                                    self.meta.cross_loop_cut_info()
-                                {
-                                    S::build_meta_from_merge_point(
-                                        &provisional_meta,
-                                        cut_pc,
-                                        cut_types,
-                                    )
-                                } else {
-                                    provisional_meta
-                                }
-                            }
-                            _ => provisional_meta,
+                        if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
+                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
+                        } else {
+                            provisional_meta
                         }
                     };
                     // RPython pyjitpl.py:3000-3009 parity: if partial_trace
@@ -736,25 +683,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                         self.meta.clear_retrace_state();
                     }
-                    let outcome = self.meta.compile_loop(&jump_args, meta);
-                    // Same cut_header_pc fixup as CloseLoop above.
-                    if let crate::pyjitpl::CompileOutcome::Compiled {
-                        cut_header_pc: Some(cut_pc),
-                        green_key: gk,
-                        from_retry: false,
-                        ..
-                    } = outcome
-                    {
-                        // pyjitpl.py:3160-3175 parity: cut_trace_from redirected
-                        // to an inner loop header. Update meta.merge_pc so
-                        // is_compatible matches at entry.
-                        if let Some(entry) = self.meta.compiled_loops.get_mut(&gk) {
-                            let existing_pc = S::meta_merge_pc(&entry.meta);
-                            if existing_pc != cut_pc && entry.retraced_count == 0 {
-                                S::update_meta_merge_pc(&mut entry.meta, cut_pc);
-                            }
-                        }
-                    }
+                    let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -1722,13 +1651,13 @@ impl<S: JitState> JitDriver<S> {
         if !state.is_compatible(&meta) {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit][run-compiled-abort] key={} reason=incompatible-state target_pc={}",
+                    "[jit][run-compiled-skip] key={} reason=incompatible-state target_pc={}",
                     green_key, target_pc
                 );
             }
-            // RPython parity: invalidate mismatched entry so next attempt
-            // starts a fresh trace at the correct PC.
-            self.meta.invalidate_loop(green_key);
+            // RPython has no is_compatible — always enters execute_token.
+            // Don't invalidate: the entry is reachable from the correct PC
+            // via alias (inner back-edge). Just skip execution here.
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,

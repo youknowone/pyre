@@ -53,6 +53,10 @@ pub struct TraceCtx {
     virtualizable_array_lengths: Option<Vec<usize>>,
     /// Header PC at which this trace started (0 = function entry).
     pub header_pc: usize,
+    /// When a cross-loop cut occurs (trace closes at inner loop header),
+    /// the green key for the inner loop. Used to register an alias
+    /// so can_enter_jit at the inner back-edge finds the outer key's entry.
+    pub cut_inner_green_key: Option<u64>,
     /// Pending OpRef replacements from inline callee returns.
     /// Applied when the trace is finalized (close_loop/compile).
     replacements: Vec<(OpRef, OpRef)>,
@@ -132,6 +136,34 @@ impl TraceCtx {
             .iter()
             .rev()
             .find(|mp| mp.green_key == key)
+    }
+
+    /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
+    /// loop header (key, header_pc) was already visited.
+    pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
+        self.current_merge_points
+            .iter()
+            .any(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    }
+
+    /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
+    /// searching in reverse order (most recent first).
+    pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    }
+
+    /// Find merge point by header_pc only, ignoring green_key.
+    /// Used by compile_loop for cross-loop cut detection: the inner
+    /// merge point may have been registered under a different key
+    /// (back_edge_key) than the trace's green_key (outer key).
+    pub fn get_merge_point_by_pc(&self, header_pc: usize) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.header_pc == header_pc && mp.position.ops_len > 0)
     }
 
     /// history.py: get_trace_position — current recorder position.
@@ -215,6 +247,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             header_pc: 0,
+            cut_inner_green_key: None,
             replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,
@@ -250,6 +283,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             header_pc: 0,
+            cut_inner_green_key: None,
             replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,

@@ -6757,15 +6757,14 @@ impl JitState for PyreJitState {
         meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+        // vsd = total_slots - num_locals
         if original_box_types.len() >= 3 {
-            let new_vsd = original_box_types.len() - 3;
-            // Adjust slot_types length if valuestackdepth changed.
-            if new_vsd < meta.valuestackdepth && meta.slot_types.len() > new_vsd {
-                meta.slot_types.truncate(new_vsd);
-            } else if new_vsd > meta.valuestackdepth && meta.slot_types.len() < new_vsd {
-                meta.slot_types.resize(new_vsd, Type::Ref);
+            let total_slots = original_box_types.len() - 3;
+            let new_vsd = total_slots.saturating_sub(meta.num_locals);
+            if new_vsd != meta.valuestackdepth {
+                meta.slot_types.resize(total_slots, Type::Ref);
+                meta.valuestackdepth = new_vsd;
             }
-            meta.valuestackdepth = new_vsd;
         }
     }
 
@@ -6775,18 +6774,16 @@ impl JitState for PyreJitState {
         original_box_types: &[Type],
     ) -> PyreMeta {
         // pyjitpl.py:3158-3175 compile_loop parity:
-        // Build meta entirely from MergePoint's original_box_types.
-        // Layout: [Ref(frame), Int(ni), Int(vsd), slot_types...]
+        // Build meta from MergePoint's original_box_types.
+        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+        // vsd = total_slots - num_locals (locals come first, then stack)
         let slot_types = if original_box_types.len() >= 3 {
             original_box_types[3..].to_vec()
         } else {
             Vec::new()
         };
-        let vsd = if original_box_types.len() >= 3 {
-            original_box_types.len() - 3
-        } else {
-            provisional.valuestackdepth
-        };
+        let total_slots = slot_types.len();
+        let vsd = total_slots.saturating_sub(provisional.num_locals);
         PyreMeta {
             merge_pc: header_pc,
             num_locals: provisional.num_locals,
