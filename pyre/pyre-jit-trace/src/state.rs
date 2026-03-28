@@ -1496,50 +1496,80 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:177 get_list_of_active_boxes parity.
-    /// Returns live register boxes only: [locals..., stack...].
-    /// Does NOT include frame/ni/vsd — those are metadata stored
-    /// separately in virtualizable_boxes (vable_array).
+    /// Returns register boxes: [locals..., stack...].
+    /// Does NOT include frame/ni/vsd (stored in virtualizable_boxes).
     ///
-    /// RPython filters by JitCode liveness info (_live_vars(pc)).
-    /// When `after_residual_call=True`, all boxes are live (liveness
-    /// disabled). pyre does not have JitCode liveness annotations
-    /// yet, so all boxes are always returned regardless of the flag.
+    /// RPython filters by JitCode liveness info (_live_vars(pc)):
+    ///   after_residual_call=true  → all registers are live
+    ///   after_residual_call=false → only live registers (dead = NONE)
+    /// pyre approximation: uninitialized (NONE) slots are dead.
+    /// Dead slots are OpRef::NONE in snapshot (→ UNINITIALIZED_TAG in rd_numb).
     fn get_list_of_active_boxes(
         &mut self,
-        ctx: &mut TraceCtx,
-        _after_residual_call: bool,
+        _ctx: &mut TraceCtx,
+        after_residual_call: bool,
     ) -> Vec<OpRef> {
-        let (nlocals, local_values, local_types, stack_values, stack_types) = {
+        let (nlocals, local_values, stack_values) = {
             let s = self.sym();
-            let (stack_values, stack_types) = if let Some(ref pre_stack) = s.pre_opcode_stack {
-                let pre_types = s.pre_opcode_stack_types.as_deref().unwrap_or(&[]);
-                (pre_stack.clone(), pre_types.to_vec())
+            let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
+                pre_stack.clone()
             } else {
                 let stack_only = s.stack_only_depth();
-                (
-                    s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
-                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
-                )
+                s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            (
-                s.nlocals,
-                s.symbolic_locals.clone(),
-                s.symbolic_local_types.clone(),
-                stack_values,
-                stack_types,
-            )
+            (s.nlocals, s.symbolic_locals.clone(), stack_values)
         };
-        // pyjitpl.py:177: registers only (no frame/ni/vsd header).
-        let mut boxes = Vec::new();
-        for (idx, slot) in local_values.into_iter().enumerate() {
-            let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
-            boxes.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
+        let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
+        for slot in &local_values {
+            if after_residual_call || !slot.is_none() {
+                boxes.push(*slot);
+            } else {
+                // Dead register: NONE → UNINITIALIZED_TAG in rd_numb
+                boxes.push(OpRef::NONE);
+            }
         }
-        for (stack_idx, slot) in stack_values.into_iter().enumerate() {
-            let slot_type = stack_types.get(stack_idx).copied().unwrap_or(Type::Ref);
-            boxes.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, nlocals + stack_idx));
+        for slot in &stack_values {
+            // Stack slots below depth are always live.
+            boxes.push(*slot);
         }
         boxes
+    }
+
+    /// Materialize active boxes for Cranelift fail_args.
+    /// NONE slots from get_list_of_active_boxes are materialized
+    /// from the concrete frame (Cranelift needs real values).
+    fn materialize_active_boxes(
+        &mut self,
+        ctx: &mut TraceCtx,
+        active_boxes: &[OpRef],
+    ) -> Vec<OpRef> {
+        let (nlocals, local_types, stack_types) = {
+            let s = self.sym();
+            let stack_types = if let Some(ref pre_types) = s.pre_opcode_stack_types {
+                pre_types.clone()
+            } else {
+                let stack_only = s.stack_only_depth();
+                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec()
+            };
+            (s.nlocals, s.symbolic_local_types.clone(), stack_types)
+        };
+        active_boxes
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| {
+                if slot.is_none() {
+                    let abs_idx = if i < nlocals { i } else { i };
+                    let slot_type = if i < nlocals {
+                        local_types.get(i).copied().unwrap_or(Type::Ref)
+                    } else {
+                        stack_types.get(i - nlocals).copied().unwrap_or(Type::Ref)
+                    };
+                    self.materialize_fail_arg_slot(ctx, slot, slot_type, abs_idx)
+                } else {
+                    slot
+                }
+            })
+            .collect()
     }
 
     fn build_single_frame_fail_arg_types(&self) -> Vec<Type> {
@@ -2133,9 +2163,10 @@ impl MIFrame {
         }
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false);
+        let materialized = self.materialize_active_boxes(ctx, &active_boxes);
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-        fa.extend_from_slice(&active_boxes);
+        fa.extend_from_slice(&materialized);
         fa
     }
 
@@ -2170,12 +2201,13 @@ impl MIFrame {
                 pc: self.orgpc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes),
             }];
-            // fail_args = header + active_boxes (pyre Cranelift adaptation).
+            // fail_args = header + materialized active_boxes (for Cranelift deadframe).
+            let materialized = self.materialize_active_boxes(ctx, &callee_active_boxes);
             let mut fail_args = {
                 let s = self.sym();
                 vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth]
             };
-            fail_args.extend_from_slice(&callee_active_boxes);
+            fail_args.extend_from_slice(&materialized);
             let mut types = callee_types;
             // opencoder.py:806: parent frames keep their original pc.
             // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
@@ -2221,11 +2253,12 @@ impl MIFrame {
         let fail_arg_types = self.build_single_frame_fail_arg_types();
         // pyjitpl.py:177: active boxes = registers only (no header).
         let active_boxes = self.get_list_of_active_boxes(ctx, after_residual_call);
-        // fail_args = header + active_boxes (pyre Cranelift adaptation).
+        // fail_args = header + materialized active_boxes (for Cranelift deadframe).
+        let materialized = self.materialize_active_boxes(ctx, &active_boxes);
         let fail_args = {
             let s = self.sym();
             let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-            fa.extend_from_slice(&active_boxes);
+            fa.extend_from_slice(&materialized);
             fa
         };
 
@@ -4519,15 +4552,16 @@ impl MIFrame {
             s.vable_next_instr = ni;
             s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
         });
-        // pyjitpl.py:177: active boxes for parent frame's fail_args.
+        // pyjitpl.py:177: active boxes for parent frame.
         let my_active_boxes = self.with_ctx(|this, ctx| this.get_list_of_active_boxes(ctx, false));
-        // fail_args = header + active_boxes (for Cranelift deadframe).
-        let my_fail_args = {
-            let s = self.sym();
+        // fail_args = header + materialized active_boxes (for Cranelift deadframe).
+        let my_fail_args = self.with_ctx(|this, ctx| {
+            let materialized = this.materialize_active_boxes(ctx, &my_active_boxes);
+            let s = this.sym();
             let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-            fa.extend(my_active_boxes);
+            fa.extend(materialized);
             fa
-        };
+        });
         let my_fail_arg_types = self.build_single_frame_fail_arg_types();
         // opencoder.py:810: parent frame's jitcode.index.
         let my_jitcode_index = jitcode_index_for(self.sym().concrete_code);
@@ -5105,10 +5139,11 @@ impl MIFrame {
                 this.flush_to_frame_for_guard(ctx);
                 let fail_arg_types = this.build_single_frame_fail_arg_types();
                 let active_boxes = this.get_list_of_active_boxes(ctx, false);
+                let materialized = this.materialize_active_boxes(ctx, &active_boxes);
                 let fail_args = {
                     let s = this.sym();
                     let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
-                    fa.extend(active_boxes);
+                    fa.extend(materialized);
                     fa
                 };
                 let exc_type_const = ctx.const_int(exc_type_ptr);
