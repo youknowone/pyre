@@ -405,26 +405,23 @@ impl OptHeap {
         Some((obj, descr.index()))
     }
 
-    /// Build the array item cache key from a GETARRAYITEM or SETARRAYITEM op.
-    ///
-    /// For GETARRAYITEM_GC_I/R/F: args = [array, index], descr = array descriptor.
-    /// For SETARRAYITEM_GC: args = [array, index, value], descr = array descriptor.
-    /// Returns None if index is not a known constant.
+    /// heap.py:409-415 arrayitem_cache: constant-index array cache key.
+    /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &OptContext) -> Option<ArrayItemKey> {
         let descr = op.descr.as_ref()?;
-        let array = op.arg(0);
-        let index_ref = op.arg(1);
+        let array = ctx.get_box_replacement(op.arg(0));
+        let index_ref = ctx.get_box_replacement(op.arg(1));
         let index_val = ctx.get_constant_int(index_ref)?;
         Some((array, descr.index(), index_val))
     }
 
-    /// heap.py: variable-index array key — use the OpRef itself as
-    /// the key when the index is not a known constant. This allows
-    /// caching array reads where the same variable index is used twice.
-    fn arrayitem_key_variable(op: &Op) -> Option<(OpRef, u32, OpRef)> {
+    /// heap.py:319-324 lookup_cached: variable-index array cache key.
+    /// Canonicalizes array and index through get_box_replacement so
+    /// forwarded refs hit the same cache entry.
+    fn arrayitem_key_variable(op: &Op, ctx: &OptContext) -> Option<(OpRef, u32, OpRef)> {
         let descr = op.descr.as_ref()?;
-        let array = op.arg(0);
-        let index_ref = op.arg(1);
+        let array = ctx.get_box_replacement(op.arg(0));
+        let index_ref = ctx.get_box_replacement(op.arg(1));
         Some((array, descr.index(), index_ref))
     }
 
@@ -1341,8 +1338,8 @@ impl OptHeap {
             return OptimizationResult::Emit(op.clone());
         }
 
-        // heap.py: variable-index cache — same array + same index OpRef.
-        if let Some(var_key) = Self::arrayitem_key_variable(op) {
+        // heap.py:688-699 variable-index cache — same array + same index OpRef.
+        if let Some(var_key) = Self::arrayitem_key_variable(op, ctx) {
             if let Some(&cached) = self.cached_arrayitems_var.get(&var_key) {
                 let cached = ctx.get_box_replacement(cached);
                 ctx.replace_op(op.pos, cached);
@@ -1376,15 +1373,17 @@ impl OptHeap {
                 self.array_min_lengths.clear();
                 // heap.py: cache_varindex_write -- cache this write so that
                 // a subsequent read with the same variable index can hit.
-                if let Some(var_key) = Self::arrayitem_key_variable(op) {
-                    self.cached_arrayitems_var.insert(var_key, op.arg(2));
+                // heap.py:764 cache_varindex_write: canonicalize value
+                if let Some(var_key) = Self::arrayitem_key_variable(op, ctx) {
+                    self.cached_arrayitems_var
+                        .insert(var_key, ctx.get_box_replacement(op.arg(2)));
                 }
                 return OptimizationResult::Emit(op.clone());
             }
         };
 
         let (array, descr_idx, const_index) = key;
-        let array = ctx.get_box_replacement(array);
+        // array is already canonicalized by arrayitem_key
         let new_value = op.arg(2);
 
         // heap.py:77-101: do_setfield (shared by CachedField AND ArrayCachedItem)
