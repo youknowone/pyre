@@ -1825,9 +1825,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardNonnullClass => {
-                // GUARD_NONNULL_CLASS(obj, cls): combines GUARD_NONNULL + GUARD_CLASS.
                 let obj = ctx.get_box_replacement(op.arg(0));
-                // If already known class, check match.
                 if let Some(known_class) = ctx
                     .get_ptr_info(obj)
                     .and_then(|i| i.get_known_class())
@@ -1860,7 +1858,13 @@ impl Optimization for OptRewrite {
                 }
                 // postprocess: record known class
                 if op.num_args() >= 2 {
-                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                    // Class pointer may be Value::Int or Value::Ref
+                    if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
+                        ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                            majit_ir::Value::Ref(r) => Some(r.0 as i64),
+                            _ => None,
+                        })
+                    }) {
                         let should_record = ctx
                             .get_ptr_info(obj)
                             .map(|info| !info.is_virtual())

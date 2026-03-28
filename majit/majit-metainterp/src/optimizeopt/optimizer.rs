@@ -1340,9 +1340,8 @@ impl Optimizer {
         let mut ctx = OptContext::with_num_inputs(ops.len(), effective_inputs);
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
-        // RPython resume.py parity: Phase 2 optimizer needs exported_jump_virtuals
-        // and imported_virtuals to create GuardVirtualEntry for NONE positions
-        // in fail_args inherited from Phase 1 virtualization.
+        // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
+        // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
         ctx.imported_label_args = self.imported_label_args.clone();
         // Phase 1's exported_jump_virtuals tell store_final_boxes_in_guard
@@ -2590,7 +2589,7 @@ impl Optimizer {
     /// Encode virtual objects in guard fail_args via rd_virtuals for lazy
     /// reconstruction on guard failure. Resolves all fail_args through
     /// get_box_replacement, replaces virtual OpRefs with NONE, appends
-    /// virtual field values, and creates GuardVirtualEntry for materialization.
+    /// virtual field values. finalize_guard_resume_data builds rd_virtuals_info.
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
 

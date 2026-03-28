@@ -186,8 +186,8 @@ pub struct OptContext {
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
-    /// store_final_boxes_in_guard to create GuardVirtualEntry for
-    /// NONE positions inherited from Phase 1 virtualization.
+    /// store_final_boxes_in_guard to resolve NONE positions
+    /// inherited from Phase 1 virtualization.
     pub imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
     /// Phase 2 imported label args (OpRefs in Phase 2 namespace).
     pub imported_label_args: Option<Vec<OpRef>>,
@@ -1038,9 +1038,26 @@ impl OptContext {
             self.forwarding.resize(idx + 1, OpRef::NONE);
         }
         self.forwarding[idx] = new;
-        // Clear ptr_info: this position is now a transit (forwarding).
+        // RPython set_forwarded parity: when forwarding old → new,
+        // if old has PtrInfo and new doesn't, propagate PtrInfo to new.
+        // RPython's Box._forwarded is a single field: setting it to new_box
+        // overwrites the old info. But getptrinfo(old) follows forwarding
+        // to new_box and reads new_box's info. If new_box has no info yet,
+        // getptrinfo returns None — same as clearing old's info.
+        // However, in practice RPython always sets info on new_box before
+        // or after forwarding (via make_equal_to / postprocess).
+        // To match RPython behavior, propagate old's PtrInfo to new if
+        // new has no PtrInfo yet.
         if idx < self.ptr_info.len() {
-            self.ptr_info[idx] = None;
+            if let Some(info) = self.ptr_info[idx].take() {
+                let new_idx = new.0 as usize;
+                if new_idx >= self.ptr_info.len() {
+                    self.ptr_info.resize(new_idx + 1, None);
+                }
+                if self.ptr_info[new_idx].is_none() {
+                    self.ptr_info[new_idx] = Some(info);
+                }
+            }
         }
     }
 
@@ -2006,9 +2023,9 @@ impl OptContext {
         // resume.py:447,450-451: patch and store.
         numb_state.patch(1, liveboxes.len() as i32);
         op.store_final_boxes(liveboxes);
-        // Store rd_virtuals_info directly (indexed by vidx, RPython parity).
-        // Bypass op.rd_virtuals (GuardVirtualEntry path) — rd_virtuals_info
-        // is the authoritative source, indexed consistently with rd_numb.
+        // Store rd_virtuals_info (indexed by vidx, RPython parity).
+        // rd_virtuals_info is the authoritative source for virtual
+        // materialization, indexed consistently with TAGVIRTUAL in rd_numb.
         if !rd_virt_info.is_empty() {
             op.rd_virtuals_info = Some(rd_virt_info);
         }
@@ -2259,9 +2276,8 @@ impl OptContext {
             self.ptr_info.resize(idx + 1, None);
         }
         self.ptr_info[idx] = Some(info);
-        // RPython set_forwarded parity: _forwarded is a single field that
-        // holds EITHER an Op (forwarding) OR an Info (terminal).
-        // Setting Info replaces any existing forwarding.
+        // RPython set_forwarded parity: _forwarded is a single field.
+        // Setting info replaces any existing forwarding.
         if idx < self.forwarding.len() {
             self.forwarding[idx] = OpRef::NONE;
         }

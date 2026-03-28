@@ -6,6 +6,31 @@ use crate::optimizeopt::intutils::IntBound;
 /// pointer info, virtual object state).
 use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
+/// resoperation.py: AbstractResOpOrInputArg._forwarded
+///
+/// RPython uses a single `_forwarded` field per Box that holds EITHER:
+/// - None (no forwarding, no info)
+/// - another Box (forwarding to that box)
+/// - a PtrInfo instance (terminal info)
+///
+/// `get_box_replacement` follows Box→Box links, stops at None/PtrInfo.
+/// `getptrinfo` reads PtrInfo from the terminal Box.
+#[derive(Clone, Debug)]
+pub enum Forwarded {
+    /// No forwarding or info set.
+    None,
+    /// Forwarding to another OpRef (RPython: _forwarded = other_box).
+    Op(OpRef),
+    /// Terminal info (RPython: _forwarded = info_instance).
+    Info(PtrInfo),
+}
+
+impl Default for Forwarded {
+    fn default() -> Self {
+        Forwarded::None
+    }
+}
+
 /// shortpreamble.py:11-49: PreambleOp
 ///
 /// Wrapper stored in PtrInfo._fields during Phase 2 import.

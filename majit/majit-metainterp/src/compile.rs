@@ -254,7 +254,7 @@ pub(crate) fn build_guard_metadata(
 
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
-            // Build recovery_layout directly from rd_numb without rd_virtuals.
+            // Build recovery_layout from rd_numb + rd_virtuals_info.
             use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout};
             let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
                 (&op.rd_numb, &op.rd_consts)
