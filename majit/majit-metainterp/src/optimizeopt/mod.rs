@@ -263,8 +263,16 @@ pub struct OptContext {
     /// opencoder.py:819 capture_resumedata encodes multiple frames;
     /// this tracks the boundary between callee and caller sections.
     pub snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+    /// Per-guard virtualizable boxes from tracing-time snapshots.
+    pub snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
+    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
+    /// optimizer.py:644,679 _last_guard_op — index of the last guard in
+    /// new_operations that had full resume data built. Consecutive guards
+    /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
+    last_guard_idx: Option<usize>,
 }
 
 /// resume.py:192-226 parity — BoxEnv for optimizer context.
@@ -432,7 +440,10 @@ impl OptContext {
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
+            snapshot_vable_boxes: HashMap::new(),
+            snapshot_frame_pcs: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
+            last_guard_idx: None,
         }
     }
 
@@ -479,7 +490,10 @@ impl OptContext {
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
             snapshot_frame_sizes: HashMap::new(),
+            snapshot_vable_boxes: HashMap::new(),
+            snapshot_frame_pcs: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
+            last_guard_idx: None,
         }
     }
 
@@ -527,10 +541,27 @@ impl OptContext {
         // has unique identity. The forwarding set by import_box must
         // survive body op emission for consumer switchover to work.
 
-        // RPython optimizer.py:_emit_operation → store_final_boxes_in_guard:
-        // produce rd_numb inline at guard emission time, not post-assembly.
+        // RPython optimizer.py:652-686 emit_guard_operation — guard resume
+        // data sharing via _copy_resume_data_from / ResumeGuardCopiedDescr.
         if op.opcode.is_guard() {
-            self.number_guard_inline(&mut op);
+            self.emit_guard_operation(&mut op);
+        } else {
+            // optimizer.py:639-644: side-effectful non-guard ops clear sharing.
+            // optimizer.py:705-711: is_call_pure_pure_canraise — CallPure that
+            // can_raise(ignore_memoryerror=True) counts as side-effectful even
+            // though has_no_side_effect is true for call_pure opcodes.
+            let dominated_by_side_effect = if (op.opcode.has_no_side_effect()
+                || op.opcode.is_ovf()
+                || op.opcode.is_jit_debug())
+                && !Self::is_call_pure_pure_canraise(&op)
+            {
+                false
+            } else {
+                true
+            };
+            if dominated_by_side_effect {
+                self.last_guard_idx = None;
+            }
         }
 
         self.new_operations.push(op);
@@ -1007,6 +1038,103 @@ impl OptContext {
         })
     }
 
+    /// optimizer.py:705-711: is_call_pure_pure_canraise — a CallPure op whose
+    /// effectinfo says check_can_raise(ignore_memoryerror=True). These ops are
+    /// formally side-effect-free (has_no_side_effect), but their potential to
+    /// raise means they break guard resume-data sharing.
+    fn is_call_pure_pure_canraise(op: &Op) -> bool {
+        if !op.opcode.is_call_pure() {
+            return false;
+        }
+        let Some(ref descr) = op.descr else {
+            return false;
+        };
+        let Some(cd) = descr.as_call_descr() else {
+            return false;
+        };
+        cd.effect_info().check_can_raise(true)
+    }
+
+    /// optimizer.py:652-686 emit_guard_operation — decide whether to share
+    /// resume data from the previous guard (_copy_resume_data_from) or build
+    /// new resume data (store_final_boxes_in_guard / number_guard_inline).
+    fn emit_guard_operation(&mut self, op: &mut Op) {
+        let opnum = op.opcode;
+
+        // optimizer.py:655-664: GUARD_(NO_)EXCEPTION following a guard that
+        // is NOT GUARD_NOT_FORCED — give up sharing.
+        if (opnum == OpCode::GuardNoException || opnum == OpCode::GuardException) {
+            if let Some(idx) = self.last_guard_idx {
+                if self.new_operations[idx].opcode != OpCode::GuardNotForced
+                    && self.new_operations[idx].opcode != OpCode::GuardNotForced2
+                {
+                    self.last_guard_idx = None;
+                }
+            }
+        }
+
+        // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share.
+        if opnum == OpCode::GuardAlwaysFails {
+            self.last_guard_idx = None;
+        }
+
+        // optimizer.py:672-683: _copy_resume_data_from vs store_final_boxes_in_guard.
+        // RPython condition: self._last_guard_op and guard_op.getdescr() is None.
+        // RPython's sharing copies fail_args from the previous guard because
+        // snapshot-based resume data correctly maps to the interpreter state
+        // regardless of which guard's fail_args are used.
+        //
+        // majit's resume data is fail_args-based (not snapshot-based), so copying
+        // fail_args from another guard corrupts the value mapping. Therefore we
+        // only share when the guard has NO own fail_args (optimizer-created guards).
+        // The tracking/clearing of last_guard_idx matches RPython exactly;
+        // only the sharing eligibility condition is stricter.
+        //
+        // GUARD_NOT_FORCED never uses copied descr (compile.py:926 assert).
+        let can_share = self.last_guard_idx.is_some()
+            && op.rd_numb.is_none()
+            && op.fail_args.is_none()
+            && opnum != OpCode::GuardNotForced
+            && opnum != OpCode::GuardNotForced2;
+
+        if can_share {
+            let idx = self.last_guard_idx.unwrap();
+            // _copy_resume_data_from: share resume data from last guard.
+            op.rd_numb = self.new_operations[idx].rd_numb.clone();
+            op.rd_consts = self.new_operations[idx].rd_consts.clone();
+            op.rd_virtuals_info = self.new_operations[idx].rd_virtuals_info.clone();
+            op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
+            op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
+            op.fail_args = self.new_operations[idx].fail_args.clone();
+            // Don't update last_guard_idx — copied guards don't become sources.
+        } else {
+            // store_final_boxes_in_guard: build new resume data.
+            self.number_guard_inline(op);
+            self.last_guard_idx = Some(self.new_operations.len());
+            // optimizer.py:680-683: force_box on fail_args for unrolling.
+            // Ensures all fail_arg boxes are concrete (not virtual) so the
+            // unroller can export them to the next iteration.
+            if let Some(ref fa) = op.fail_args {
+                let fargs: Vec<OpRef> = fa.iter().copied().collect();
+                for farg in fargs {
+                    if !farg.is_none() {
+                        let resolved = self.get_box_replacement(farg);
+                        if let Some(mut info) = self.get_ptr_info(resolved).cloned() {
+                            if info.is_virtual() {
+                                info.force_to_ops_direct(resolved, self);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // optimizer.py:684-685: GUARD_EXCEPTION clears sharing.
+        if opnum == OpCode::GuardException {
+            self.last_guard_idx = None;
+        }
+    }
+
     /// RPython optimizer.py:722-752 store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
@@ -1164,26 +1292,45 @@ impl OptContext {
         }
 
         let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
+        let vable_oprefs = self
+            .snapshot_vable_boxes
+            .get(&op.rd_resume_position)
+            .cloned()
+            .unwrap_or_default();
+        let frame_pcs = self
+            .snapshot_frame_pcs
+            .get(&op.rd_resume_position)
+            .cloned()
+            .unwrap_or_default();
 
         // resume.py:201-202 get_box_replacement parity:
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
         let frame_sizes = self.snapshot_frame_sizes.get(&op.rd_resume_position);
-        let snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
+        let mut snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
             // Multi-frame: split snapshot_boxes into per-frame chunks.
             let mut frames = Vec::new();
             let mut offset = 0;
-            for &size in sizes {
+            for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
                 let frame_boxes: Vec<OpRef> = snapshot_boxes[offset..end].to_vec();
-                frames.push((0i32, 0i32, frame_boxes));
+                let (jitcode_index, pc) = frame_pcs.get(i).copied().unwrap_or((0, 0));
+                frames.push((jitcode_index, pc, frame_boxes));
                 offset = end;
             }
             Snapshot::multi_frame(frames)
         } else {
-            Snapshot::single_frame(0, snapshot_boxes.clone())
+            let pc = frame_pcs.first().map(|&(_, pc)| pc).unwrap_or(0);
+            Snapshot::single_frame(pc, snapshot_boxes.clone())
         };
+        // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
+        // Currently kept empty for numbering because pyre's recovery
+        // path reads frame/ni/vsd from fail_args[0..3], not from
+        // vable_array. Populating vable_array would shift TAGBOX
+        // indices and break the fail_args ↔ deadframe correspondence.
+        // TODO: populate once recovery reads frame from vable_array.
+        let _ = vable_oprefs;
 
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {

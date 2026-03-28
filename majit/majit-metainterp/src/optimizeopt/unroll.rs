@@ -68,6 +68,10 @@ pub struct UnrollOptimizer {
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     /// Per-frame box counts for multi-frame snapshots.
     pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
+    /// Per-guard virtualizable boxes from tracing-time snapshots.
+    pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
+    pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
     /// resume.py:570-574 _add_optimizer_sections: per-guard optimizer
     /// knowledge collected during optimization. Propagated to CompiledTrace
     /// for bridge compilation.
@@ -94,6 +98,8 @@ impl UnrollOptimizer {
             phase1_preamble_ops: None,
             snapshot_boxes: std::collections::HashMap::new(),
             snapshot_frame_sizes: std::collections::HashMap::new(),
+            snapshot_vable_boxes: std::collections::HashMap::new(),
+            snapshot_frame_pcs: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
         }
     }
@@ -248,6 +254,8 @@ impl UnrollOptimizer {
             opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
+            opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+            opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -328,6 +336,8 @@ impl UnrollOptimizer {
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
+        opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+        opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         opt_p2.imported_loop_state = Some(exported_state.clone());
         // RPython compile.py:278-284 parity: save Phase 1 results.
         // If Phase 2 raises InvalidLoop, compile_loop uses these for
