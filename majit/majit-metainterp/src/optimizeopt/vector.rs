@@ -374,10 +374,11 @@ impl VectorizingOptimizer {
             return None;
         }
 
-        // schedule.py:292-311, 672-681: walk_and_emit + try_emit_or_delay.
-        // Walk nodes in dependency order. For each node:
-        //   - if it belongs to a pack → turn_into_vector (once per pack)
-        //   - otherwise → ensure_args_unpacked + emit scalar op
+        // schedule.py:292-311, 672-695: walk_and_emit + try_emit_or_delay.
+        //
+        // RPython scheduler: walk in dependency order. For pack nodes,
+        // delay() gates emission until ALL members' dependencies are resolved.
+        // For scalar nodes, ensure_unpacked avoids duplicate unpacks via `seen`.
         let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
         let mut sched_state = VecScheduleState::new(start_pos);
 
@@ -389,41 +390,75 @@ impl VectorizingOptimizer {
             }
         }
 
-        // Track which packs have already been emitted
+        // schedule.py:683-695: delay() — track how many members of each pack
+        // have been "visited" (their dependencies satisfied in topo order).
+        // A pack is only emittable when ALL its members have been visited.
         let mut pack_emitted = vec![false; profitable.len()];
+        let mut pack_visited_count = vec![0usize; profitable.len()];
+
+        // schedule.py:718-719: seen — prevents duplicate unpack creation
+        let mut seen: HashSet<OpRef> = HashSet::new();
 
         // Walk in scheduled (dependency) order
         let scheduled_order = schedule_operations(&dep_graph);
         for &node_idx in &scheduled_order {
             if let Some(&pack_idx) = node_to_pack.get(&node_idx) {
-                // schedule.py:674-679: pack node — emit pack once (on first member)
-                if !pack_emitted[pack_idx] {
+                // schedule.py:683-695: delay() gating.
+                // Count this member as visited.
+                pack_visited_count[pack_idx] += 1;
+                let pack = &profitable[pack_idx];
+                let all_ready = pack_visited_count[pack_idx] == pack.members.len();
+
+                if all_ready && !pack_emitted[pack_idx] {
+                    // schedule.py:674-679: all members ready → emit pack
                     pack_emitted[pack_idx] = true;
-                    turn_into_vector(&mut sched_state, &profitable[pack_idx], &self.body_ops);
+                    turn_into_vector(&mut sched_state, pack, &self.body_ops);
                 }
-                // Other members of this pack are consumed by the vector op
+                // Members consumed by the vector op — skip individual emit
             } else {
-                // schedule.py:680-681, 697-716: scalar node — ensure_args_unpacked
+                // schedule.py:680-681: scalar node — ensure_args_unpacked
                 let mut scalar_op = self.body_ops[node_idx].clone();
+                // schedule.py:697-716: ensure_args_unpacked with seen/accum/invariant
                 for j in 0..scalar_op.args.len() {
                     let arg = scalar_op.args[j];
+                    if arg.is_constant() || seen.contains(&arg) {
+                        continue; // schedule.py:719: already seen → skip
+                    }
                     if let Some((pos, vec_ref)) = sched_state.getvector_of_box(arg) {
+                        // schedule.py:723-724: invariant_vector_vars → skip
+                        if sched_state.inputargs.contains_key(&vec_ref) {
+                            continue;
+                        }
+                        // schedule.py:725-726: accumulation → skip
+                        if sched_state.accumulation.contains_key(&arg) {
+                            continue;
+                        }
                         let unpacked = unpack_from_vector(&mut sched_state, vec_ref, pos, 1);
                         sched_state.renamer.start_renaming(arg, unpacked);
+                        seen.insert(unpacked);
                         scalar_op.args[j] = unpacked;
                     }
                 }
+                // schedule.py:708-716: unpack guard failargs
                 if scalar_op.opcode.is_guard() {
                     if let Some(ref mut fail_args) = scalar_op.fail_args {
                         for arg in fail_args.iter_mut() {
+                            if arg.is_constant() || seen.contains(arg) {
+                                continue;
+                            }
                             if let Some((pos, vec_ref)) = sched_state.getvector_of_box(*arg) {
+                                if sched_state.accumulation.contains_key(arg) {
+                                    continue;
+                                }
                                 let unpacked =
                                     unpack_from_vector(&mut sched_state, vec_ref, pos, 1);
+                                seen.insert(unpacked);
                                 *arg = unpacked;
                             }
                         }
                     }
                 }
+                seen.insert(scalar_op.pos);
                 sched_state.append_to_oplist(scalar_op);
             }
         }
