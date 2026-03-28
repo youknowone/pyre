@@ -154,7 +154,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
-    pub(crate) rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
+    pub(crate) rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
 }
 
 impl StoredExitLayout {

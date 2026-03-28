@@ -2557,7 +2557,7 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8));
+        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -2583,7 +2583,7 @@ mod tests {
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8));
+        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();

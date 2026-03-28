@@ -47,6 +47,49 @@ pub struct GuardVirtualEntry {
     pub fields: Vec<(u32, usize)>,
 }
 
+/// resume.py:576-860: virtual object serialization for rd_virtuals_info.
+///
+/// Each variant corresponds to a concrete virtual type in RPython's
+/// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RdVirtualInfo {
+    Instance {
+        descr_index: u32,
+        known_class: Option<i64>,
+        fielddescr_indices: Vec<u32>,
+        field_offsets: Vec<usize>,
+        fieldnums: Vec<i16>,
+    },
+    Struct {
+        descr_index: u32,
+        fielddescr_indices: Vec<u32>,
+        field_offsets: Vec<usize>,
+        fieldnums: Vec<i16>,
+    },
+    Array {
+        descr_index: u32,
+        clear: bool,
+        fieldnums: Vec<i16>,
+    },
+    ArrayStruct {
+        descr_index: u32,
+        size: usize,
+        fielddescr_indices: Vec<u32>,
+        fieldnums: Vec<i16>,
+    },
+    RawBuffer {
+        size: usize,
+        offsets: Vec<usize>,
+        entry_sizes: Vec<usize>,
+        fieldnums: Vec<i16>,
+    },
+    RawSlice {
+        offset: usize,
+        fieldnums: Vec<i16>,
+    },
+    Empty,
+}
+
 /// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
 /// where the stored value is virtual. Encoded into the guard's resume data
 /// and replayed on guard failure after virtual materialization.
@@ -145,10 +188,8 @@ pub struct Op {
     /// resume.py:451 — shared constant pool referenced by rd_numb.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info.
-    /// (descr_index, known_class, fieldnums, field_offsets)
-    /// field_offsets: byte offset of each field within the struct
-    /// (resume.py AbstractVirtualStructInfo.fielddescrs parity).
-    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
+    /// Each entry describes a virtual's type, field descriptors, and fieldnums.
+    pub rd_virtuals_info: Option<Vec<RdVirtualInfo>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,

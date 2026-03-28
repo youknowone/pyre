@@ -1285,48 +1285,27 @@ impl OptContext {
         //       assert info.is_virtual()   # resume.py:498
         //       virtuals[num] = vinfo
         //
-        // All TAGVIRTUAL entries have PtrInfo (is_virtual_ref uses
-        // PtrInfo.is_virtual() only — no virtual_oprefs fallback).
-        let num_virtuals = numb_state.num_virtuals as usize;
-        let mut rd_virt_info: Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)> =
-            vec![(0, None, vec![], vec![]); num_virtuals];
-        for (vbox, vidx) in &virtual_boxes {
-            let idx = *vidx as usize;
-            if idx >= num_virtuals {
-                continue;
+        // resume.py:490-506 _number_virtuals + _gettagged parity.
+        // Worklist loop: nested virtual field values get TAGVIRTUAL and are
+        // added to the worklist for recursive processing (resume.py:495).
+        let mut rd_virt_info: Vec<majit_ir::RdVirtualInfo> =
+            vec![majit_ir::RdVirtualInfo::Empty; numb_state.num_virtuals as usize];
+        let mut worklist: std::collections::VecDeque<(OpRef, i32)> =
+            virtual_boxes.into_iter().collect();
+        while let Some((vbox, vidx)) = worklist.pop_front() {
+            let idx = vidx as usize;
+            if idx >= rd_virt_info.len() {
+                rd_virt_info.resize(idx + 1, majit_ir::RdVirtualInfo::Empty);
             }
-            let vinfo_opt = self.get_ptr_info(*vbox).cloned();
-            let (descr, known_class, fields_data, field_descrs) = match vinfo_opt {
-                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => (
-                    vi.descr.clone(),
-                    vi.known_class,
-                    vi.fields.clone(),
-                    vi.field_descrs.clone(),
-                ),
-                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => (
-                    vi.descr.clone(),
-                    None,
-                    vi.fields.clone(),
-                    vi.field_descrs.clone(),
-                ),
-                _ => {
-                    // resume.py:498: assert info.is_virtual()
-                    // Phase 2 PtrInfo detachment → placeholder stays.
-                    continue;
-                }
-            };
-            let mut fieldnums: Vec<i16> = Vec::new();
-            for (_field_idx, value_ref) in &fields_data {
-                let resolved_val = self.get_box_replacement(*value_ref);
-                // resume.py:500,560 _gettagged(box) parity:
-                //   None        → UNINITIALIZED
-                //   Const       → memo.getconst(box) (TAGCONST)
-                //   in liveboxes → existing tag (TAGBOX/TAGVIRTUAL)
-                //   else        → liveboxes[box] (newly numbered)
+            let vinfo_opt = self.get_ptr_info(vbox).cloned();
+            // resume.py:560-568 _gettagged(box) parity.
+            let mut gettagged = |value_ref: OpRef| -> i16 {
+                let resolved_val = self.get_box_replacement(value_ref);
+                // resume.py:561: None → UNINITIALIZED
                 if resolved_val.is_none() {
-                    fieldnums.push(resumedata::NULLREF);
-                } else if self.is_constant(resolved_val) {
-                    // Constant field → TAGCONST (resume.py:563-564)
+                    return resumedata::UNINITIALIZED_TAG;
+                }
+                if self.is_constant(resolved_val) {
                     if let Some(val) = self.get_constant(resolved_val) {
                         let (c, tp) = match val {
                             Value::Int(i) => (*i, majit_ir::Type::Int),
@@ -1334,46 +1313,126 @@ impl OptContext {
                             Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
                             Value::Void => (0, majit_ir::Type::Void),
                         };
-                        fieldnums.push(memo.getconst(c, tp));
-                    } else {
-                        fieldnums.push(resumedata::NULLREF);
+                        return memo.getconst(c, tp);
                     }
-                } else if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
-                    // Already numbered (TAGBOX or TAGVIRTUAL) → reuse tag
-                    fieldnums.push(existing_tag);
-                } else {
-                    // New livebox → add and tag as TAGBOX
-                    let fa_idx = liveboxes.len();
-                    liveboxes.push(resolved_val);
-                    numb_state.liveboxes.insert(
-                        resolved_val.0,
-                        resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
-                            .unwrap_or(resumedata::NULLREF),
-                    );
-                    fieldnums.push(
-                        resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
-                            .unwrap_or(resumedata::NULLREF),
-                    );
+                    return resumedata::NULLREF;
                 }
-            }
-            // resume.py:593 AbstractVirtualStructInfo.fielddescrs parity:
-            // extract byte offset from each field descriptor for setfield.
-            let field_offsets: Vec<usize> = fields_data
-                .iter()
-                .map(|(field_idx, _)| {
-                    field_descrs
+                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
+                    return existing_tag;
+                }
+                // resume.py:495 parity: nested virtual → TAGVIRTUAL + worklist
+                if self
+                    .get_ptr_info(resolved_val)
+                    .is_some_and(|info| info.is_virtual())
+                {
+                    let nested_vidx = rd_virt_info.len() as i32;
+                    rd_virt_info.push(majit_ir::RdVirtualInfo::Empty);
+                    let tagged = resumedata::tag(nested_vidx, resumedata::TAGVIRTUAL)
+                        .unwrap_or(resumedata::NULLREF);
+                    numb_state.liveboxes.insert(resolved_val.0, tagged);
+                    worklist.push_back((resolved_val, nested_vidx));
+                    return tagged;
+                }
+                // Non-virtual → TAGBOX
+                let fa_idx = liveboxes.len();
+                liveboxes.push(resolved_val);
+                let tagged = resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
+                    .unwrap_or(resumedata::NULLREF);
+                numb_state.liveboxes.insert(resolved_val.0, tagged);
+                tagged
+            };
+            // resume.py:326-338: dispatch by virtual type.
+            let entry = match vinfo_opt {
+                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
+                    let fielddescr_indices: Vec<u32> =
+                        vi.fields.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = vi
+                        .fields
                         .iter()
-                        .find(|(di, _)| *di == *field_idx)
-                        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                        .unwrap_or((*field_idx as usize + 1) * 8)
-                })
-                .collect();
-            rd_virt_info[idx] = (
-                descr.index(),
-                known_class.map(|gc| gc.as_usize() as i64),
-                fieldnums,
-                field_offsets,
-            );
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+                                .unwrap_or((*fi as usize + 1) * 8)
+                        })
+                        .collect();
+                    let fieldnums: Vec<i16> =
+                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    majit_ir::RdVirtualInfo::Instance {
+                        descr_index: vi.descr.index(),
+                        known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
+                        fielddescr_indices,
+                        field_offsets,
+                        fieldnums,
+                    }
+                }
+                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
+                    let fielddescr_indices: Vec<u32> =
+                        vi.fields.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+                                .unwrap_or((*fi as usize + 1) * 8)
+                        })
+                        .collect();
+                    let fieldnums: Vec<i16> =
+                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    majit_ir::RdVirtualInfo::Struct {
+                        descr_index: vi.descr.index(),
+                        fielddescr_indices,
+                        field_offsets,
+                        fieldnums,
+                    }
+                }
+                Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {
+                    let fieldnums: Vec<i16> = vi.items.iter().map(|vr| gettagged(*vr)).collect();
+                    majit_ir::RdVirtualInfo::Array {
+                        descr_index: vi.descr.index(),
+                        clear: vi.clear,
+                        fieldnums,
+                    }
+                }
+                Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(ref vi)) => {
+                    let fielddescr_indices: Vec<u32> = vi
+                        .element_fields
+                        .first()
+                        .map(|ef| ef.iter().map(|(idx, _)| *idx).collect())
+                        .unwrap_or_default();
+                    let mut fieldnums = Vec::new();
+                    for ef in &vi.element_fields {
+                        for (_, vr) in ef {
+                            fieldnums.push(gettagged(*vr));
+                        }
+                    }
+                    majit_ir::RdVirtualInfo::ArrayStruct {
+                        descr_index: vi.descr.index(),
+                        size: vi.element_fields.len(),
+                        fielddescr_indices,
+                        fieldnums,
+                    }
+                }
+                Some(crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(ref vi)) => {
+                    let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _)| *o).collect();
+                    let entry_sizes: Vec<usize> =
+                        vi.entries.iter().map(|(_, len, _)| *len).collect();
+                    let fieldnums: Vec<i16> =
+                        vi.entries.iter().map(|(_, _, vr)| gettagged(*vr)).collect();
+                    majit_ir::RdVirtualInfo::RawBuffer {
+                        size: vi.size,
+                        offsets,
+                        entry_sizes,
+                        fieldnums,
+                    }
+                }
+                _ => continue,
+            };
+            rd_virt_info[idx] = entry;
         }
 
         // resume.py:447,450-451: patch and store.
@@ -1382,7 +1441,7 @@ impl OptContext {
         // Store rd_virtuals_info directly (indexed by vidx, RPython parity).
         // Bypass op.rd_virtuals (GuardVirtualEntry path) — rd_virtuals_info
         // is the authoritative source, indexed consistently with rd_numb.
-        if num_virtuals > 0 {
+        if !rd_virt_info.is_empty() {
             op.rd_virtuals_info = Some(rd_virt_info);
             op.rd_virtuals = None;
         }

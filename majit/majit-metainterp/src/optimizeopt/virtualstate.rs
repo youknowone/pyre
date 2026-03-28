@@ -1748,6 +1748,7 @@ fn import_single_value(
             }
             ptr_info[idx] = Some(PtrInfo::VirtualArray(VirtualArrayInfo {
                 descr: descr.clone(),
+                clear: false,
                 items: vitems,
                 last_guard_pos: -1,
             }));

@@ -816,6 +816,7 @@ impl OptVirtualize {
                 let items = vec![OpRef::NONE; size as usize];
                 let vinfo = VirtualArrayInfo {
                     descr,
+                    clear: matches!(op.opcode, OpCode::NewArrayClear),
                     items,
                     last_guard_pos: -1,
                 };
