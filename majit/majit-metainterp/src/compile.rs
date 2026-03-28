@@ -200,7 +200,8 @@ pub(crate) fn build_guard_metadata(
             // Multi-frame: push_frame per frame with correct pc.
             if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, _vable_values, _vref_values, frames) =
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 // rd_numb encodes [callee(top), caller(parent)] order.
                 // resume_layout expects [outer, ..., innermost] order.
                 for frame in frames.iter().rev() {
@@ -259,7 +260,8 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, _vable_values, _vref_values, frames) =
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 let mut slots = Vec::new();
                 for frame in &frames {
                     for val in &frame.values {

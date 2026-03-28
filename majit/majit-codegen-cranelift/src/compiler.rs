@@ -8845,7 +8845,8 @@ fn collect_guards(
             let rd_vi = op.rd_virtuals_info.as_deref();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[(i64, Type)] = rd_consts_data;
-            let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+            let (_num_failargs, _vable_values, _vref_values, frames) =
+                rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
 
             // Rebuild frame slots from rd_numb values.
             let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
