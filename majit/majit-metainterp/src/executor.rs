@@ -9,8 +9,115 @@ use majit_ir::{Op, OpCode, OpRef};
 
 use crate::blackhole::ExceptionState;
 
+/// Fast value store for trace execution.
+///
+/// Op results (OpRef < CONST_BASE) → `results` Vec, direct indexed.
+/// Constants (OpRef >= CONST_BASE) → `constants` Vec, offset by CONST_BASE.
+///
+/// Replaces `HashMap<u32, i64>` on the hot path with O(1) Vec indexing.
+pub(crate) struct TraceValues {
+    /// Op results, indexed by OpRef.0 (always < CONST_BASE).
+    pub results: Vec<i64>,
+    /// Constants, indexed by (OpRef.0 - CONST_BASE).
+    pub constants: Vec<i64>,
+}
+
+impl TraceValues {
+    pub fn new(num_ops: usize, num_constants: usize) -> Self {
+        Self {
+            results: vec![0; num_ops],
+            constants: vec![0; num_constants],
+        }
+    }
+
+    pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
+        let max_op = map
+            .keys()
+            .filter(|&&k| k < OpRef::CONST_BASE)
+            .max()
+            .copied()
+            .unwrap_or(0) as usize;
+        let max_const = map
+            .keys()
+            .filter(|&&k| k >= OpRef::CONST_BASE)
+            .max()
+            .map(|&k| (k - OpRef::CONST_BASE) as usize)
+            .unwrap_or(0);
+        let mut tv = Self::new(max_op + 1, max_const + 1);
+        for (&k, &v) in map {
+            tv.set(k, v);
+        }
+        tv
+    }
+
+    #[inline(always)]
+    pub fn get(&self, idx: u32) -> i64 {
+        if idx >= OpRef::CONST_BASE {
+            let ci = (idx - OpRef::CONST_BASE) as usize;
+            if ci < self.constants.len() {
+                self.constants[ci]
+            } else {
+                0
+            }
+        } else {
+            let i = idx as usize;
+            if i < self.results.len() {
+                self.results[i]
+            } else {
+                0
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, idx: u32, value: i64) {
+        if idx >= OpRef::CONST_BASE {
+            let ci = (idx - OpRef::CONST_BASE) as usize;
+            if ci >= self.constants.len() {
+                self.constants.resize(ci + 1, 0);
+            }
+            self.constants[ci] = value;
+        } else {
+            let i = idx as usize;
+            if i >= self.results.len() {
+                self.results.resize(i + 1, 0);
+            }
+            self.results[i] = value;
+        }
+    }
+
+    #[inline(always)]
+    pub fn resolve(&self, opref: OpRef) -> i64 {
+        self.get(opref.0)
+    }
+}
+
+/// Trait for resolving OpRef → i64 values in trace execution.
+/// Allows both HashMap (legacy) and TraceValues (fast) backends.
+pub(crate) trait ValueStore {
+    fn resolve(&self, opref: OpRef) -> i64;
+}
+
+impl ValueStore for HashMap<u32, i64> {
+    #[inline(always)]
+    fn resolve(&self, opref: OpRef) -> i64 {
+        self.get(&opref.0).copied().unwrap_or(0)
+    }
+}
+
+impl ValueStore for TraceValues {
+    #[inline(always)]
+    fn resolve(&self, opref: OpRef) -> i64 {
+        self.get(opref.0)
+    }
+}
+
 pub(crate) fn resolve(values: &HashMap<u32, i64>, opref: OpRef) -> i64 {
-    values.get(&opref.0).copied().unwrap_or(0)
+    values.resolve(opref)
+}
+
+pub(crate) fn resolve_fast(values: &TraceValues, opref: OpRef) -> i64 {
+    values.resolve(opref)
 }
 
 pub(crate) enum OpResult {
@@ -24,7 +131,7 @@ pub(crate) enum OpResult {
 
 pub(crate) fn execute_one(
     op: &Op,
-    values: &HashMap<u32, i64>,
+    values: &(impl ValueStore + ?Sized),
     exc: &mut ExceptionState,
 ) -> OpResult {
     match op.opcode {
@@ -157,9 +264,9 @@ pub(crate) fn execute_one(
         }
         OpCode::IntBetween => {
             // int_between(a, b, c) => a <= b < c
-            let a = resolve(values, op.args[0]);
-            let b = resolve(values, op.args[1]);
-            let c = resolve(values, op.args[2]);
+            let a = values.resolve(op.args[0]);
+            let b = values.resolve(op.args[1]);
+            let c = values.resolve(op.args[2]);
             OpResult::Value((a <= b && b < c) as i64)
         }
 
@@ -275,7 +382,7 @@ pub(crate) fn execute_one(
             // Guard expects an exception of a specific class.
             // arg(0) is the expected exception class.
             if exc.is_pending() {
-                let expected_class = resolve(values, op.args[0]);
+                let expected_class = values.resolve(op.args[0]);
                 if exc.exc_class == expected_class {
                     // Match — return the exception value and clear exception state.
                     let (_, val) = exc.clear();
@@ -332,14 +439,14 @@ pub(crate) fn execute_one(
         }
         OpCode::RestoreException => {
             // Restore exception state from (class, value) args.
-            let cls = resolve(values, op.args[0]);
-            let val = resolve(values, op.args[1]);
+            let cls = values.resolve(op.args[0]);
+            let val = values.resolve(op.args[1]);
             exc.set(cls, val);
             OpResult::Void
         }
         OpCode::CheckMemoryError => {
             // If the allocation returned null, set a MemoryError exception.
-            let ptr = resolve(values, op.args[0]);
+            let ptr = values.resolve(op.args[0]);
             if ptr == 0 {
                 // Set a generic memory error (class=1 by convention).
                 exc.set(1, 0);
@@ -643,7 +750,7 @@ pub(crate) fn execute_one(
         }
         OpCode::VecPackI | OpCode::VecPackF => {
             // pack(vec, scalar, lane, count) -> return scalar
-            let scalar = resolve(values, op.args[1]);
+            let scalar = values.resolve(op.args[1]);
             OpResult::Value(scalar)
         }
         OpCode::VecExpandI | OpCode::VecExpandF => {
@@ -703,32 +810,32 @@ pub(crate) fn execute_one(
     }
 }
 
-pub(crate) fn binop(values: &HashMap<u32, i64>, op: &Op) -> (i64, i64) {
-    let a = resolve(values, op.args[0]);
-    let b = resolve(values, op.args[1]);
+pub(crate) fn binop(values: &(impl ValueStore + ?Sized), op: &Op) -> (i64, i64) {
+    let a = values.resolve(op.args[0]);
+    let b = values.resolve(op.args[1]);
     (a, b)
 }
 
-pub(crate) fn unop(values: &HashMap<u32, i64>, op: &Op) -> i64 {
-    resolve(values, op.args[0])
+pub(crate) fn unop(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
+    values.resolve(op.args[0])
 }
 
-pub(crate) fn same_as_value(values: &HashMap<u32, i64>, op: &Op) -> i64 {
+pub(crate) fn same_as_value(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
     if op.num_args() > 0 {
         unop(values, op)
     } else if !op.pos.is_none() {
-        resolve(values, op.pos)
+        values.resolve(op.pos)
     } else {
         0
     }
 }
 
-pub(crate) fn float_binop(values: &HashMap<u32, i64>, op: &Op) -> (f64, f64) {
-    let a = f64::from_bits(resolve(values, op.args[0]) as u64);
-    let b = f64::from_bits(resolve(values, op.args[1]) as u64);
+pub(crate) fn float_binop(values: &(impl ValueStore + ?Sized), op: &Op) -> (f64, f64) {
+    let a = f64::from_bits(values.resolve(op.args[0]) as u64);
+    let b = f64::from_bits(values.resolve(op.args[1]) as u64);
     (a, b)
 }
 
-pub(crate) fn float_unop(values: &HashMap<u32, i64>, op: &Op) -> f64 {
-    f64::from_bits(resolve(values, op.args[0]) as u64)
+pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
+    f64::from_bits(values.resolve(op.args[0]) as u64)
 }

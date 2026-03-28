@@ -114,11 +114,57 @@ pub struct JitCode {
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
     assembler_targets: Vec<JitCallAssemblerTarget>,
+    /// blackhole.py handle_exception_in_frame: exception handler table.
+    /// Pre-computed from Python's code.exceptiontable during compilation.
+    pub exception_handlers: Vec<JitExceptionHandler>,
+    /// Reverse PC map: sorted (jitcode_pc, py_pc) pairs for binary search.
+    /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
+    pub jit_to_py_pc: Vec<(usize, usize)>,
+}
+
+/// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.
+#[derive(Clone, Debug)]
+pub struct JitExceptionHandler {
+    /// Start JitCode PC (inclusive).
+    pub jit_start: usize,
+    /// End JitCode PC (exclusive).
+    pub jit_end: usize,
+    /// Handler target JitCode PC.
+    pub jit_target: usize,
+    /// Stack depth at handler entry (runtime stack items to keep).
+    pub stack_depth: u16,
+    /// Whether to push lasti (Python PC) before exception object.
+    pub push_lasti: bool,
+    /// Raw Python PC for lasti (boxed at runtime via box_int_fn).
+    pub lasti_value: i64,
+    /// fn_ptr index for box_int_fn (to box lasti at dispatch time).
+    pub box_int_fn_idx: u16,
 }
 
 // -- RPython jitcode.py parity methods --
 
 impl JitCode {
+    /// blackhole.py:396 handle_exception_in_frame: find exception handler
+    /// for the given JitCode PC. Returns the first matching handler.
+    pub fn find_exception_handler(&self, jitcode_pc: usize) -> Option<&JitExceptionHandler> {
+        self.exception_handlers
+            .iter()
+            .find(|h| jitcode_pc >= h.jit_start && jitcode_pc < h.jit_end)
+    }
+
+    /// Reverse lookup: JitCode PC → Python PC.
+    /// Binary search in jit_to_py_pc for the largest jit_pc <= target.
+    pub fn jit_pc_to_py_pc(&self, jit_pc: usize) -> i64 {
+        match self
+            .jit_to_py_pc
+            .binary_search_by_key(&jit_pc, |&(jp, _)| jp)
+        {
+            Ok(idx) => self.jit_to_py_pc[idx].1 as i64,
+            Err(idx) if idx > 0 => self.jit_to_py_pc[idx - 1].1 as i64,
+            _ => 0,
+        }
+    }
+
     /// RPython: `JitCode.num_regs_i()`
     pub fn num_regs_i(&self) -> u16 {
         self.num_regs[0]

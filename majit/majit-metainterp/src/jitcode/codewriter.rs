@@ -914,6 +914,8 @@ impl JitCodeBuilder {
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,
             assembler_targets: self.assembler_targets,
+            exception_handlers: Vec::new(),
+            jit_to_py_pc: Vec::new(),
         }
     }
 

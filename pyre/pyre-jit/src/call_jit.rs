@@ -967,23 +967,33 @@ pub fn resume_in_blackhole(
             return BlackholeResult::Failed;
         }
 
-        // RPython blackhole.py:351 handle_exception_in_frame +
         // blackhole.py:1752 _run_forever exception propagation:
-        // A residual call raised a Python exception (got_exception=true).
-        //
-        // RPython would call handle_exception_in_frame() to check for
-        // catch_exception in the current frame, and only propagate up
-        // the chain if no handler is found. pyre conservatively aborts
-        // the entire blackhole chain on exception — the interpreter
-        // will re-execute from the guard failure point and handle the
-        // exception through its own exception table dispatch.
+        // Exception not handled in this frame (no handler found by
+        // dispatch_one's handle_exception_in_frame). Propagate to caller.
         if bh.got_exception {
+            let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();
             builder.release_interp(bh);
-            if let Some(next) = next {
-                builder.release_chain(Some(*next));
+
+            let Some(mut caller_bh) = next.map(|b| *b) else {
+                return BlackholeResult::Failed;
+            };
+
+            // blackhole.py:396 handle_exception_in_frame in caller.
+            // Ensure last_opcode_position reflects the caller's call-site PC.
+            // The caller may not have run any opcodes in this blackhole session
+            // (it was suspended), so last_opcode_position must match position.
+            caller_bh.last_opcode_position = caller_bh.position;
+            if caller_bh.handle_exception_in_frame(exc_value) {
+                bh = caller_bh;
+                continue;
             }
-            return BlackholeResult::Failed;
+
+            // No handler in caller: propagate further up.
+            caller_bh.exception_last_value = exc_value;
+            caller_bh.got_exception = true;
+            bh = caller_bh;
+            continue;
         }
 
         // DoneWithThisFrame: callee finished (RETURN_VALUE).
@@ -2355,17 +2365,34 @@ fn bh_call_fn_impl(
     parent_frame: *const PyFrame,
 ) -> i64 {
     if callable.is_null() {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            "call on null callable".to_string(),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
     // RPython bhimpl_residual_call: dispatch builtin vs user function.
     if !unsafe { is_function(callable) } {
         let func = unsafe { pyre_interpreter::builtin_code_get(callable) };
-        return func(args).unwrap_or(pyre_object::PY_NULL) as i64;
+        match func(args) {
+            Ok(result) if !result.is_null() => return result as i64,
+            Ok(_) => return 0,
+            Err(err) => {
+                let exc_obj = err.to_exc_object();
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                return 0;
+            }
+        }
     }
     let parent_frame = unsafe { &*parent_frame };
     match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
         Ok(result) => result as i64,
-        Err(_) => 0,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
     }
 }
 
@@ -2390,7 +2417,16 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
     let ns = unsafe { &*frame.namespace };
     match ns.get(name) {
         Some(&value) => value as i64,
-        None => 0,
+        None => {
+            // NameError: set exception object in TLS.
+            let err = pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::NameError,
+                format!("name '{}' is not defined", name),
+            );
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
     }
 }
 
@@ -2423,6 +2459,11 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let lhs = lhs as PyObjectRef;
     let rhs = rhs as PyObjectRef;
     if lhs.is_null() || rhs.is_null() {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            "comparison on null operand".to_string(),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
 
@@ -2432,7 +2473,11 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let op: ComparisonOperator = unsafe { std::mem::transmute(op_code as u8) };
     match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
         Ok(result) => result as i64,
-        Err(_) => 0,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
     }
 }
 
@@ -2444,6 +2489,11 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let lhs = lhs as PyObjectRef;
     let rhs = rhs as PyObjectRef;
     if lhs.is_null() || rhs.is_null() {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            "binary op on null operand".to_string(),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
 
@@ -2453,7 +2503,11 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     let op: BinaryOperator = unsafe { std::mem::transmute(op_code as u8) };
     match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
         Ok(result) => result as i64,
-        Err(_) => 0,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
     }
 }
 
@@ -2480,8 +2534,17 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
     let key = key as pyre_object::PyObjectRef;
     let value = value as pyre_object::PyObjectRef;
     if obj.is_null() || key.is_null() {
+        let err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            "store subscript on null operand".to_string(),
+        );
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    let _ = pyre_interpreter::baseobjspace::setitem(obj, key, value);
-    0
+    if let Err(err) = pyre_interpreter::baseobjspace::setitem(obj, key, value) {
+        let exc_obj = err.to_exc_object();
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+        return 0;
+    }
+    1 // success (non-zero)
 }
