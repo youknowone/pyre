@@ -1560,6 +1560,8 @@ impl OptUnroll {
                 .unwrap_or_else(|| short_preamble.jump_args.clone())
         }
 
+        // RPython unroll.py:397: "a fix-point loop, runs only once in
+        // almost all cases"
         loop {
             while replay_index < current_short_len(short_preamble, ctx) {
                 let Some(sp_op) = current_short_op(short_preamble, ctx, replay_index) else {
@@ -1588,19 +1590,13 @@ impl OptUnroll {
                         }
                     }
                 }
-                // unroll.py:405-409: guards in short preamble inherit
-                // rd_resume_position from patchguardop and get
-                // ResumeAtPositionDescr as their descr.
+                // unroll.py:405-414: all ops go through send_extra_operation.
+                // Guards get rd_resume_position from patchguardop. descr=None
+                // so emit_guard_operation uses _copy_resume_data_from path.
                 if new_op.opcode.is_guard() {
                     if let Some(ref patch) = ctx.patchguardop {
                         new_op.rd_resume_position = patch.rd_resume_position;
                     }
-                    // RPython unroll.py:406 sets ResumeAtPositionDescr, which
-                    // triggers store_final_boxes_in_guard (via ResumeDataVirtualAdder).
-                    // We don't have ResumeDataVirtualAdder, so leave descr=None
-                    // to take the _copy_resume_data_from path in emit_guard_operation
-                    // (optimizer.py:672-675), sharing resume data with the previous guard.
-                    // new_op.descr = Some(make_resume_at_position_descr());
                 }
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;

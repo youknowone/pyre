@@ -208,7 +208,7 @@ pub struct OptContext {
     imported_short_preamble_used: HashSet<OpRef>,
     /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
     /// and later consumed by optimizer.force_box().
-    potential_extra_ops: HashMap<OpRef, TrackedPreambleUse>,
+    pub(crate) potential_extra_ops: HashMap<OpRef, TrackedPreambleUse>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -893,11 +893,12 @@ impl OptContext {
         if let Some((result_ref, info)) = &result_info {
             info.make_guards(*result_ref, &mut result_guards, &mut const_pool);
         }
-        // Replace placeholder OpRefs with properly allocated ones
-        // and register constants in the map.
+        // Replace placeholder OpRefs with stable constant pool OpRefs.
+        // Use 10600+ range to avoid interfering with alloc_op_position
+        // (which advances next_pos and shifts all subsequent OpRefs).
         let mut remap: std::collections::HashMap<OpRef, OpRef> = std::collections::HashMap::new();
-        for (placeholder, value) in const_pool {
-            let real = self.alloc_op_position();
+        for (i, (placeholder, value)) in const_pool.into_iter().enumerate() {
+            let real = OpRef(10600 + i as u32);
             self.make_constant(real, value);
             remap.insert(placeholder, real);
         }

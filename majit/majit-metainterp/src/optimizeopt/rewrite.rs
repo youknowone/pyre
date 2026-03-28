@@ -1834,7 +1834,14 @@ impl Optimization for OptRewrite {
                     .cloned()
                 {
                     if op.num_args() >= 2 {
-                        if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
+                        // Class pointer may be stored as Value::Int or Value::Ref
+                        let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
+                            ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                                majit_ir::Value::Ref(r) => Some(r.0 as i64),
+                                _ => None,
+                            })
+                        });
+                        if let Some(expected) = expected {
                             if known_class.0 as i64 == expected {
                                 return OptimizationResult::Remove;
                             }

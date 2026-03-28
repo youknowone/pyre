@@ -1646,11 +1646,11 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        // RPython has no is_compatible — warmstate.py:482 enters execute_token
-        // directly. The correct dispatch happens via target_tokens selecting
-        // the right entry point. Until target_tokens dispatch is implemented,
-        // is_compatible serves as a temporary substitute: skip (without
-        // invalidation) when the single entry's meta doesn't match.
+        // RPython warmstate.py:482-511 has no is_compatible check —
+        // runtime enters execute_token directly. However, our compiled
+        // code doesn't yet have sufficient entry guards to handle
+        // mismatched inputs safely. Keep is_compatible as a safety net
+        // until compiled code entry guards match RPython's.
         if !state.is_compatible(&meta) {
             if crate::majit_log_enabled() {
                 eprintln!(
