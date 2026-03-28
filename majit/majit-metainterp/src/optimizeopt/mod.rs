@@ -1081,11 +1081,10 @@ impl OptContext {
                 majit_ir::Type::Ref
             }
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
-                // resume.py:210-216 is_virtual check.
+                // resume.py:210-216: info = getptrinfo(box)
+                //                    is_virtual = (info is not None and info.is_virtual())
                 // RPython: getptrinfo(box).is_virtual() — checks Box's PtrInfo.
-                // majit: walk replacement chain checking PtrInfo at each node.
-                // The virtual_oprefs set (from legacy NONE pattern) is a fallback
-                // that is NOT needed when PtrInfo is correctly propagated.
+                // Walk replacement chain checking PtrInfo at each node.
                 let mut check = opref;
                 for _ in 0..20 {
                     if self
@@ -1103,7 +1102,7 @@ impl OptContext {
                     }
                     check = next;
                 }
-                // Fallback: check legacy NONE pattern (dual-write parity).
+                // Fallback: fail_args NONE pattern for Phase 2 PtrInfo detachment.
                 self.virtual_oprefs.contains(&opref.0)
             }
             fn is_virtual_raw(&self, _opref: OpRef) -> bool {
@@ -1172,9 +1171,24 @@ impl OptContext {
             }
         }
 
-        // resume.py:419-426 + 444 _number_virtuals: append virtual field boxes.
-        let mut virtual_entries: Vec<majit_ir::GuardVirtualEntry> = Vec::new();
+        // resume.py:490-506 _number_virtuals: create rd_virtuals indexed by
+        // the TAGVIRTUAL number assigned in _number_boxes. RPython:
+        //   virtuals = [None] * length
+        //   for virtualbox, fieldboxes in vfieldboxes.iteritems():
+        //       num, _ = untag(self.liveboxes[virtualbox])
+        //       virtuals[num] = vinfo
+        //
+        // Build rd_virtuals_info directly (indexed by vidx). Entries with
+        // no PtrInfo (Phase 2 detachment) → placeholder (0, None, [])
+        // that materialize_virtual_from_rd handles as GcRef::NULL.
+        let num_virtuals = numb_state.num_virtuals as usize;
+        let mut rd_virt_info: Vec<(u32, Option<i64>, Vec<i16>)> =
+            vec![(0, None, vec![]); num_virtuals];
         for (vbox, vidx) in &virtual_boxes {
+            let idx = *vidx as usize;
+            if idx >= num_virtuals {
+                continue;
+            }
             let vinfo_opt = self.get_ptr_info(*vbox).cloned();
             let (descr, known_class, fields_data) = match vinfo_opt {
                 Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
@@ -1183,35 +1197,40 @@ impl OptContext {
                 Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
                     (vi.descr.clone(), None, vi.fields.clone())
                 }
-                _ => continue,
+                _ => {
+                    // resume.py:498: assert info.is_virtual()
+                    // Phase 2 PtrInfo detachment → placeholder stays.
+                    continue;
+                }
             };
             let base_idx = liveboxes.len();
-            let mut fields = Vec::new();
-            for (fi, (field_idx, value_ref)) in fields_data.iter().enumerate() {
+            let mut fieldnums: Vec<i16> = Vec::new();
+            for (_fi, (_field_idx, value_ref)) in fields_data.iter().enumerate() {
                 let resolved_val = self.get_replacement(*value_ref);
+                let fa_idx = liveboxes.len();
                 liveboxes.push(resolved_val);
-                fields.push((*field_idx, base_idx + fi));
+                fieldnums.push(
+                    majit_ir::resumedata::tag(fa_idx as i32, majit_ir::resumedata::TAGBOX)
+                        .unwrap_or(majit_ir::resumedata::NULLREF),
+                );
             }
-            // fail_arg_index = snapshot frame position (not vidx)
-            let frame_pos = vidx_to_frame_pos
-                .get(vidx)
-                .copied()
-                .unwrap_or(*vidx as usize);
-            virtual_entries.push(majit_ir::GuardVirtualEntry {
-                fail_arg_index: frame_pos,
-                descr,
-                known_class,
-                fields,
-            });
+            let _ = base_idx;
+            rd_virt_info[idx] = (
+                descr.index(),
+                known_class.map(|gc| gc.as_usize() as i64),
+                fieldnums,
+            );
         }
 
         // resume.py:447,450-451: patch and store.
-        // resume.py:447: patch num_failargs
         numb_state.patch(1, liveboxes.len() as i32);
-        // compile.py:875: descr.store_final_boxes(guard_op, newboxes)
         op.store_final_boxes(liveboxes);
-        if !virtual_entries.is_empty() {
-            op.rd_virtuals = Some(virtual_entries);
+        // Store rd_virtuals_info directly (indexed by vidx, RPython parity).
+        // Bypass op.rd_virtuals (GuardVirtualEntry path) — rd_virtuals_info
+        // is the authoritative source, indexed consistently with rd_numb.
+        if num_virtuals > 0 {
+            op.rd_virtuals_info = Some(rd_virt_info);
+            op.rd_virtuals = None;
         }
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
