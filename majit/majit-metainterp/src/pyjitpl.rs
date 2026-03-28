@@ -1671,7 +1671,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_snapshots = trace.snapshots.clone();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
-        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
+        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
             trace.ops.clone(),
@@ -1747,15 +1747,22 @@ impl<M: Clone> MetaInterp<M> {
         // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
         // holds the Phase 1 results.
         let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
+        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
+            let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
                 &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
                 vable_config.clone(),
                 Some(&mut phase1_out),
-            )
+            );
+            // Capture Phase 2 constant types before unroll_opt is dropped.
+            for (k, v) in &unroll_opt.constant_types {
+                updated_constant_types.entry(*k).or_insert(*v);
+            }
+            result
         }));
+        constant_types = updated_constant_types;
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
@@ -2418,7 +2425,8 @@ impl<M: Clone> MetaInterp<M> {
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
-        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
+        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
             trace.ops.clone(),
@@ -2454,19 +2462,26 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
+        unroll_opt.numbering_type_overrides = numbering_overrides;
         unroll_opt.snapshot_boxes = snapshot_map_from_trace_snapshots(&trace.snapshots);
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
 
+        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
+            let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
                 vable_config,
-            )
+            );
+            for (k, v) in &unroll_opt.constant_types {
+                updated_constant_types.entry(*k).or_insert(*v);
+            }
+            result
         }));
+        constant_types = updated_constant_types;
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
             Err(payload) => {
@@ -2740,7 +2755,8 @@ impl<M: Clone> MetaInterp<M> {
         recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         let trace = recorder.get_trace();
 
-        let (mut constants, constant_types) = ctx.constants.into_inner_with_types();
+        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = compile::fold_box_into_create_frame(
             trace.ops.clone(),
@@ -2761,15 +2777,22 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         optimizer.constant_types = constant_types.clone();
+        optimizer.numbering_type_overrides = numbering_overrides;
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
+        let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs(
+            let result = optimizer.optimize_with_constants_and_inputs(
                 &trace_ops,
                 &mut constants,
                 trace.inputargs.len(),
-            )
+            );
+            for (k, v) in &optimizer.constant_types {
+                updated_constant_types.entry(*k).or_insert(*v);
+            }
+            result
         }));
+        constant_types = updated_constant_types;
         let mut optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {

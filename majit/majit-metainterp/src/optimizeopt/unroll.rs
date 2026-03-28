@@ -704,6 +704,11 @@ impl UnrollOptimizer {
             eprintln!("[jit] consts_p2: {:?}", sorted_consts);
         }
         *constants = consts_p2;
+        // Merge Phase 2 constant types back so build_guard_metadata
+        // can resolve Phase 2 allocated constants for rd_virtuals_info.
+        for (k, v) in &opt_p2.constant_types {
+            self.constant_types.entry(*k).or_insert(*v);
+        }
         (combined, p2_ni)
     }
 

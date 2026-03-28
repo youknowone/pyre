@@ -944,6 +944,43 @@ impl OptContext {
         self.constants[idx] = Some(value);
     }
 
+    /// resume.py:157 getconst parity for synthetic rd_numb encoding.
+    /// Matches OptBoxEnv::get_const: checks constant_types_for_numbering
+    /// override, PtrInfo::Constant, and constant pool.
+    /// Returns None if opref is not a constant.
+    pub fn getconst_for_numbering(&self, opref: OpRef) -> Option<(i64, majit_ir::Type)> {
+        let type_override = self.constant_types_for_numbering.get(&opref.0).copied();
+        // Check constant pool (through replacement chain).
+        if let Some(val) = self.get_constant(opref) {
+            let (raw, tp) = match val {
+                Value::Int(v) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
+                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                _ => return None,
+            };
+            return Some((raw, tp));
+        }
+        // Check raw constants (before replacement).
+        if let Some(val) = self
+            .constants
+            .get(opref.0 as usize)
+            .and_then(|v| v.as_ref())
+        {
+            let (raw, tp) = match val {
+                Value::Int(v) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
+                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                _ => return None,
+            };
+            return Some((raw, tp));
+        }
+        // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo.
+        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self.get_ptr_info(opref) {
+            return Some((gcref.0 as i64, majit_ir::Type::Ref));
+        }
+        None
+    }
+
     /// Get the constant value for an operation, if known.
     pub fn get_constant(&self, opref: OpRef) -> Option<&Value> {
         let opref = self.get_box_replacement(opref);
@@ -988,13 +1025,18 @@ impl OptContext {
             if let Some(ref fa) = op.fail_args {
                 let fa_len = fa.len();
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
+                // Start from existing rd_consts so TAGCONST indices are correct.
+                // resume.py: getconst() uses a single memo.consts pool shared
+                // with all prior numbering — indices are absolute, not 0-based.
+                let mut rd_consts: Vec<(i64, majit_ir::Type)> =
+                    op.rd_consts.take().unwrap_or_default();
                 ns.append_int(0); // slot 0: size (patched)
                 ns.append_int(fa_len as i32); // slot 1: num_failargs
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
-                // resume.py _number_virtuals: TAGVIRTUAL for virtual slots.
+                // resume.py _number_boxes + _number_virtuals + getconst parity.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         let vidx = op
@@ -1008,6 +1050,30 @@ impl OptContext {
                         } else {
                             ns.append_short(resumedata::NULLREF);
                         }
+                    } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
+                        // resume.py:157 getconst: INT → try TAGINT first.
+                        if tp == majit_ir::Type::Int {
+                            if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
+                                ns.append_short(tagged);
+                                continue;
+                            }
+                        }
+                        if tp == majit_ir::Type::Ref && raw == 0 {
+                            ns.append_short(resumedata::NULLREF);
+                            continue;
+                        }
+                        let existing = rd_consts.iter().position(|(v, t)| *v == raw && *t == tp);
+                        let idx = existing.unwrap_or_else(|| {
+                            let j = rd_consts.len();
+                            rd_consts.push((raw, tp));
+                            j
+                        });
+                        let t = resumedata::tag(
+                            (idx + resumedata::TAG_CONST_OFFSET as usize) as i32,
+                            resumedata::TAGCONST,
+                        )
+                        .unwrap_or(resumedata::NULLREF);
+                        ns.append_short(t);
                     } else {
                         let t = resumedata::tag(i as i32, resumedata::TAGBOX)
                             .unwrap_or(resumedata::NULLREF);
@@ -1016,7 +1082,76 @@ impl OptContext {
                 }
                 ns.patch_current_size(0);
                 op.rd_numb = Some(ns.create_numbering());
-                op.rd_consts = Some(Vec::new());
+                op.rd_consts = Some(rd_consts);
+            }
+            return;
+        }
+
+        // If store_final_boxes_in_guard already encoded virtuals in
+        // op.rd_virtuals, use the no-snapshot path with getconst parity.
+        // The fail_args already contain NONE placeholders + appended
+        // field values. Re-processing via snapshot_boxes would overwrite
+        // these and lose the GuardVirtualEntry metadata.
+        // NOTE: RPython has no separate snapshot re-encoding step —
+        // store_final_boxes_in_guard produces final resume data directly.
+        // This fallback is a majit-specific compensation layer.
+        if op.rd_virtuals.is_some() {
+            if let Some(ref fa) = op.fail_args {
+                let fa_len = fa.len();
+                let mut ns = resumedata::NumberingState::new(fa_len + 8);
+                let mut rd_consts: Vec<(i64, majit_ir::Type)> =
+                    op.rd_consts.take().unwrap_or_default();
+                ns.append_int(0);
+                ns.append_int(fa_len as i32);
+                ns.append_int(0);
+                ns.append_int(0);
+                ns.append_int(0);
+                ns.append_int(0);
+                for (i, &opref) in fa.iter().enumerate() {
+                    if opref.is_none() {
+                        let vidx = op
+                            .rd_virtuals
+                            .as_ref()
+                            .and_then(|entries| entries.iter().position(|e| e.fail_arg_index == i));
+                        if let Some(vidx) = vidx {
+                            let t = resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
+                                .unwrap_or(resumedata::NULLREF);
+                            ns.append_short(t);
+                        } else {
+                            ns.append_short(resumedata::NULLREF);
+                        }
+                    } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
+                        if tp == majit_ir::Type::Int {
+                            if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
+                                ns.append_short(tagged);
+                                continue;
+                            }
+                        }
+                        if tp == majit_ir::Type::Ref && raw == 0 {
+                            ns.append_short(resumedata::NULLREF);
+                            continue;
+                        }
+                        let existing = rd_consts.iter().position(|(v, t)| *v == raw && *t == tp);
+                        let idx = existing.unwrap_or_else(|| {
+                            let j = rd_consts.len();
+                            rd_consts.push((raw, tp));
+                            j
+                        });
+                        let t = resumedata::tag(
+                            (idx + resumedata::TAG_CONST_OFFSET as usize) as i32,
+                            resumedata::TAGCONST,
+                        )
+                        .unwrap_or(resumedata::NULLREF);
+                        ns.append_short(t);
+                    } else {
+                        let t = resumedata::tag(i as i32, resumedata::TAGBOX)
+                            .unwrap_or(resumedata::NULLREF);
+                        ns.append_short(t);
+                    }
+                }
+                ns.patch_current_size(0);
+                op.rd_numb = Some(ns.create_numbering());
+                op.rd_consts = Some(rd_consts);
             }
             return;
         }
