@@ -572,8 +572,21 @@ pub(crate) fn execute_one(
         OpCode::ArraylenGc => OpResult::Value(0),
         OpCode::Strlen | OpCode::Unicodelen => OpResult::Value(0),
 
-        // ── Allocation (no-op in blackhole, objects already materialized) ──
-        OpCode::New | OpCode::NewWithVtable => OpResult::Value(0),
+        // ── Allocation ──
+        // Allocate a real object so SetfieldGc can write fields.
+        // IR blackhole may encounter New+SetfieldGc when the trace
+        // contains unoptimized allocation (e.g. result_type=Ref finish).
+        OpCode::New | OpCode::NewWithVtable => {
+            let size = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_size_descr())
+                .map_or(16, |sd| sd.size());
+            let layout = std::alloc::Layout::from_size_align(size, 8)
+                .unwrap_or(std::alloc::Layout::new::<[u8; 16]>());
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            OpResult::Value(ptr as i64)
+        }
         OpCode::NewArray | OpCode::NewArrayClear => OpResult::Value(0),
         OpCode::Newstr | OpCode::Newunicode => OpResult::Value(0),
 
