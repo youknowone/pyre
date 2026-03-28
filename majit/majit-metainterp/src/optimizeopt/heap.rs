@@ -961,12 +961,41 @@ impl OptHeap {
             }
         }
 
-        // heap.py:640-643: constant_fold — for pure getfield on constant
-        // objects, RPython uses execute_nonspec_const (CPU execution) +
-        // protect_speculative_operation (GC validity check). Direct memory
-        // dereference is unsafe (GcRef may be stale after GC). The safe
-        // path requires porting optimizer.py constant_fold +
-        // protect_speculative_operation infrastructure.
+        // heap.py:640-643: constant_fold — pure getfield on constant object.
+        // RPython: protect_speculative_operation + execute_nonspec_const.
+        // optimizer.py:783-790: constant_fold calls protect_speculative_field
+        // to validate the GcRef, then execute_nonspec_const to read the field.
+        if let Some(descr) = &op.descr {
+            if descr.is_always_pure() {
+                let obj_ref = op.arg(0);
+                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
+                    // protect_speculative_operation (optimizer.py:802-806):
+                    // non-null + aligned = valid GC object heuristic.
+                    if !ptr_val.is_null() && ptr_val.0 % 8 == 0 && ptr_val.0 > 0x1000 {
+                        if let Some((offset, field_size, _field_type)) =
+                            majit_ir::unpack_fielddescr(descr)
+                        {
+                            let addr = ptr_val.0 + offset;
+                            // execute_nonspec_const: read field via CPU.
+                            // Catch any access violation as SpeculativeError.
+                            let folded = std::panic::catch_unwind(|| match field_size {
+                                8 => unsafe { *(addr as *const i64) },
+                                4 => unsafe { *(addr as *const i32) as i64 },
+                                2 => unsafe { *(addr as *const i16) as i64 },
+                                1 => unsafe { *(addr as *const u8) as i64 },
+                                _ => 0,
+                            });
+                            if let Ok(value) = folded {
+                                let const_ref = ctx.make_constant_int(value);
+                                ctx.replace_op(op.pos, const_ref);
+                                return OptimizationResult::Remove;
+                            }
+                            // SpeculativeError: skip fold, fall through to cache.
+                        }
+                    }
+                }
+            }
+        }
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;

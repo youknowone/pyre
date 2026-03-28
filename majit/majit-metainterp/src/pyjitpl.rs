@@ -4682,21 +4682,6 @@ impl<M: Clone> MetaInterp<M> {
                         remap.insert(src_ref, majit_ir::OpRef(i as u32));
                     }
                 }
-                // Bridge knowledge for virtual (NONE) slots: the virtual's
-                // field values are at fail_args positions recorded in
-                // GuardVirtualEntry.fields. No original_opref needed.
-                if let Some(ref rd_virts) = guard_op.rd_virtuals {
-                    for entry in rd_virts {
-                        for &(_field_idx, fa_pos) in &entry.fields {
-                            if fa_pos < fail_args.len() {
-                                let src = fail_args[fa_pos];
-                                if !src.is_none() {
-                                    remap.entry(src).or_insert(majit_ir::OpRef(fa_pos as u32));
-                                }
-                            }
-                        }
-                    }
-                }
                 // Also map constants: they keep their original OpRef
                 // (constants are in the bridge's constant pool too).
                 for (&idx, _) in trace.constants.iter() {

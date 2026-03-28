@@ -1219,7 +1219,6 @@ impl OptContext {
             op.rd_numb = self.new_operations[idx].rd_numb.clone();
             op.rd_consts = self.new_operations[idx].rd_consts.clone();
             op.rd_virtuals_info = self.new_operations[idx].rd_virtuals_info.clone();
-            op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
             op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
             op.fail_args = self.new_operations[idx].fail_args.clone();
             // Don't update last_guard_idx — copied guards don't become sources.
@@ -1285,8 +1284,12 @@ impl OptContext {
     /// Generate rd_numb + rd_consts + rd_virtuals for a guard.
     /// Called from store_final_boxes_in_guard in optimizer.rs.
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
-    pub fn finalize_guard_resume_data(&self, op: &mut Op) {
-        self.store_final_boxes_in_guard(op);
+    pub fn finalize_guard_resume_data(
+        &self,
+        op: &mut Op,
+        guard_virtuals: &[crate::optimizeopt::optimizer::GuardVirtualEntry],
+    ) {
+        self.store_final_boxes_in_guard(op, guard_virtuals);
     }
 
     fn number_guard_inline_fallback(&self, op: &mut Op) {
@@ -1305,7 +1308,11 @@ impl OptContext {
         );
     }
 
-    fn store_final_boxes_in_guard(&self, op: &mut Op) {
+    fn store_final_boxes_in_guard(
+        &self,
+        op: &mut Op,
+        guard_virtuals: &[crate::optimizeopt::optimizer::GuardVirtualEntry],
+    ) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
         // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
@@ -1361,10 +1368,7 @@ impl OptContext {
                 ns.append_int(fa_len as i32); // slot_count (all fail_args incl. virtual fields)
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
-                        let vidx = op
-                            .rd_virtuals
-                            .as_ref()
-                            .and_then(|entries| entries.iter().position(|e| e.fail_arg_index == i));
+                        let vidx = guard_virtuals.iter().position(|e| e.fail_arg_index == i);
                         if let Some(vidx) = vidx {
                             let t = resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
                                 .unwrap_or(resumedata::NULLREF);
@@ -1406,61 +1410,101 @@ impl OptContext {
                 op.rd_consts = Some(rd_consts);
 
                 // Build rd_virtuals_info from GuardVirtualEntry for no-snapshot guards.
-                // resume.py:576-860 parity: the optimizer's GuardVirtualEntry contains
-                // the same information as RdVirtualInfo but in a different format.
-                // Convert here so compile.rs and guard failure recovery can read it.
-                if let Some(ref entries) = op.rd_virtuals {
-                    let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
-                    let rd_virt_info: Vec<majit_ir::RdVirtualInfo> = entries
-                        .iter()
-                        .map(|entry| {
-                            let fielddescr_indices: Vec<u32> =
-                                entry.fields.iter().map(|(idx, _)| *idx).collect();
-                            // Tag each field value: fail_arg_index → TAGBOX(fail_arg_index).
-                            // resume.py:576-860: fieldnums encode how to recover each field
-                            // value from the deadframe at guard failure time.
-                            let fieldnums: Vec<i16> = entry
-                                .fields
-                                .iter()
-                                .map(|(_, fa_idx)| {
-                                    resumedata::tag(*fa_idx as i32, resumedata::TAGBOX)
-                                        .unwrap_or(resumedata::NULLREF)
-                                })
-                                .collect();
-                            let kc = entry
-                                .known_class
-                                .map(|gc| gc.as_usize() as i64)
-                                .or_else(|| {
-                                    entry.descr.as_size_descr().map(|sd| sd.vtable() as i64)
-                                })
-                                .filter(|&v| v != 0);
-                            let descr_size =
-                                entry.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                            if kc.is_some() {
-                                majit_ir::RdVirtualInfo::Instance {
-                                    descr_index: entry.descr.index(),
-                                    known_class: kc,
-                                    fielddescr_indices,
-                                    field_offsets: entry.field_offsets.clone(),
-                                    field_types: entry.field_types.clone(),
-                                    field_sizes: entry.field_sizes.clone(),
-                                    fieldnums,
-                                    descr_size,
+                // resume.py _gettagged parity: tag each field value as
+                // TAGBOX/TAGCONST/TAGINT/TAGVIRTUAL based on its nature.
+                if op.rd_virtuals_info.is_none() && !guard_virtuals.is_empty() {
+                    let entries = guard_virtuals;
+                    {
+                        let mut rd_cv = op.rd_consts.take().unwrap_or_default();
+                        let info: Vec<majit_ir::RdVirtualInfo> = entries
+                            .iter()
+                            .map(|entry| {
+                                let di = entry.descr.index();
+                                let kc = entry
+                                    .known_class
+                                    .map(|gc| gc.as_usize() as i64)
+                                    .or_else(|| {
+                                        entry.descr.as_size_descr().map(|sd| sd.vtable() as i64)
+                                    })
+                                    .filter(|&v| v != 0);
+                                let fdi: Vec<u32> =
+                                    entry.fields.iter().map(|(fd, _)| *fd).collect();
+                                let ds = entry.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                                let fns: Vec<i16> = entry
+                                    .fields
+                                    .iter()
+                                    .map(|&(_fd, fap)| {
+                                        let opref = fa.get(fap).copied().unwrap_or(OpRef::NONE);
+                                        if opref.is_none() {
+                                            if let Some(vi) =
+                                                entries.iter().position(|e| e.fail_arg_index == fap)
+                                            {
+                                                return resumedata::tag(
+                                                    vi as i32,
+                                                    resumedata::TAGVIRTUAL,
+                                                )
+                                                .unwrap_or(resumedata::NULLREF);
+                                            }
+                                            return resumedata::NULLREF;
+                                        }
+                                        if let Some((raw, tp)) = self.getconst(opref) {
+                                            if tp == majit_ir::Type::Int {
+                                                if let Ok(t) =
+                                                    resumedata::tag(raw as i32, resumedata::TAGINT)
+                                                {
+                                                    return t;
+                                                }
+                                            }
+                                            if tp == majit_ir::Type::Ref && raw == 0 {
+                                                return resumedata::NULLREF;
+                                            }
+                                            let ex = rd_cv
+                                                .iter()
+                                                .position(|(v, t)| *v == raw && *t == tp);
+                                            let ci = ex.unwrap_or_else(|| {
+                                                let j = rd_cv.len();
+                                                rd_cv.push((raw, tp));
+                                                j
+                                            });
+                                            return resumedata::tag(
+                                                (ci + resumedata::TAG_CONST_OFFSET as usize) as i32,
+                                                resumedata::TAGCONST,
+                                            )
+                                            .unwrap_or(resumedata::NULLREF);
+                                        }
+                                        resumedata::tag(fap as i32, resumedata::TAGBOX)
+                                            .unwrap_or(resumedata::NULLREF)
+                                    })
+                                    .collect();
+                                if kc.is_some() {
+                                    majit_ir::RdVirtualInfo::Instance {
+                                        descr_index: di,
+                                        known_class: kc,
+                                        fielddescr_indices: fdi,
+                                        field_offsets: entry.field_offsets.clone(),
+                                        field_types: entry.field_types.clone(),
+                                        field_sizes: entry.field_sizes.clone(),
+                                        fieldnums: fns,
+                                        descr_size: ds,
+                                    }
+                                } else {
+                                    majit_ir::RdVirtualInfo::Struct {
+                                        descr_index: di,
+                                        fielddescr_indices: fdi,
+                                        field_offsets: entry.field_offsets.clone(),
+                                        field_types: entry.field_types.clone(),
+                                        field_sizes: entry.field_sizes.clone(),
+                                        fieldnums: fns,
+                                        descr_size: ds,
+                                    }
                                 }
-                            } else {
-                                majit_ir::RdVirtualInfo::Struct {
-                                    descr_index: entry.descr.index(),
-                                    fielddescr_indices,
-                                    field_offsets: entry.field_offsets.clone(),
-                                    field_types: entry.field_types.clone(),
-                                    field_sizes: entry.field_sizes.clone(),
-                                    fieldnums,
-                                    descr_size,
-                                }
-                            }
-                        })
-                        .collect();
-                    op.rd_virtuals_info = Some(rd_virt_info);
+                            })
+                            .collect();
+                        op.rd_consts = Some(rd_cv);
+                        if !info.is_empty() {
+                            op.rd_virtuals_info = Some(info);
+                        }
+                    }
                 }
             }
             return;
@@ -1826,7 +1870,8 @@ impl OptContext {
                     majit_ir::RdVirtualInfo::ArrayStruct {
                         descr_index: vi.descr.index(),
                         size: vi.element_fields.len(),
-                        fielddescr_indices,
+                        fielddescr_indices: fielddescr_indices.clone(),
+                        field_types: vec![0u8; fielddescr_indices.len()],
                         fieldnums,
                     }
                 }
@@ -1856,7 +1901,6 @@ impl OptContext {
         // is the authoritative source, indexed consistently with rd_numb.
         if !rd_virt_info.is_empty() {
             op.rd_virtuals_info = Some(rd_virt_info);
-            op.rd_virtuals = None;
         }
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts

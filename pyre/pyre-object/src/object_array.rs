@@ -259,13 +259,16 @@ pub enum ArrayKind {
 }
 
 /// llmodel.py:788 bh_new_array / bh_new_array_clear parity.
-/// Allocate a typed GC array. `clear=true` → zero-initialized.
-pub fn allocate_array(length: usize, kind: ArrayKind, clear: bool) -> *mut GcTypedArray {
+///
+/// `clear=true` → bh_new_array_clear: zero-initialized (resume.py:1444).
+/// `clear=false` → bh_new_array: uninitialized in RPython (resume.py:1446).
+///
+/// In RPython, bh_new_array returns GC-allocated memory (zero-filled by
+/// incminimark nursery). pyre uses Vec which also zero-fills. The API
+/// preserves the distinction for naming parity.
+pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
     let arr = match kind {
-        ArrayKind::Ref => {
-            let fill = if clear { PY_NULL } else { PY_NULL }; // both zero
-            GcTypedArray::Ref(vec![fill; length])
-        }
+        ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
         ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
         ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
     };
@@ -332,17 +335,24 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 }
 
 /// resume.py:757 setinteriorfield(i, array, num, fielddescrs[j]) parity.
-/// Write a value to element `elem_idx`, field `field_idx` of an ArrayStruct.
+/// resume.py:1520-1529: dispatch on descr.is_pointer_field / is_float_field.
+///
+/// `field_type`: 0=ref, 1=int, 2=float (ArrayDescr.flag / type_bits parity).
 /// The flat index is `elem_idx * fields_per_elem + field_idx`.
 pub fn setinteriorfield(
     array: *mut GcTypedArray,
     elem_idx: usize,
     field_idx: usize,
     fields_per_elem: usize,
-    value: PyObjectRef,
+    field_type: u8,
+    value: i64,
 ) {
     let flat = elem_idx * fields_per_elem + field_idx;
-    setarrayitem_ref(array, flat, value);
+    match field_type {
+        2 => setarrayitem_float(array, flat, f64::from_bits(value as u64)),
+        1 => setarrayitem_int(array, flat, value),
+        _ => setarrayitem_ref(array, flat, value as PyObjectRef),
+    }
 }
 
 /// Resume parity: get the length of a GcTypedArray.

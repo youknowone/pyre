@@ -395,6 +395,8 @@ pub enum ResumeVirtualLayoutSummary {
     },
     ArrayStruct {
         descr_index: u32,
+        /// Per-field type within each element: 0=ref, 1=int, 2=float.
+        field_types: Vec<u8>,
         element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
     },
     RawBuffer {
@@ -619,6 +621,7 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::ArrayStruct {
                 descr_index,
                 element_fields,
+                ..
             } => VirtualInfo::VArrayStruct {
                 descr_index: *descr_index,
                 element_fields: element_fields
@@ -702,9 +705,11 @@ impl ResumeVirtualLayoutSummary {
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
                 descr_index,
+                field_types,
                 element_fields,
             } => ExitVirtualLayout::ArrayStruct {
                 descr_index: *descr_index,
+                field_types: field_types.clone(),
                 element_fields: element_fields
                     .iter()
                     .map(|fields| {
@@ -1248,20 +1253,24 @@ impl VirtualInfo {
             VirtualInfo::VArrayStruct {
                 descr_index,
                 element_fields,
-            } => ResumeVirtualLayoutSummary::ArrayStruct {
-                descr_index: *descr_index,
-                element_fields: element_fields
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(field_descr, source)| {
-                                (*field_descr, source.layout_summary(fail_arg_positions))
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            },
+            } => {
+                let fpe = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
+                ResumeVirtualLayoutSummary::ArrayStruct {
+                    descr_index: *descr_index,
+                    field_types: vec![0u8; fpe],
+                    element_fields: element_fields
+                        .iter()
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .map(|(field_descr, source)| {
+                                    (*field_descr, source.layout_summary(fail_arg_positions))
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                }
+            }
             VirtualInfo::VRawBuffer { size, entries } => ResumeVirtualLayoutSummary::RawBuffer {
                 size: *size,
                 entries: entries
