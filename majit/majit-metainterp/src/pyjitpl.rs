@@ -4368,6 +4368,12 @@ impl<M: Clone> MetaInterp<M> {
         };
         // compile.py:783-784: jitcounter.tick(hash, increment)
         let fired = self.warm_state.tick_guard_failure(hash);
+        if fired && crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] must_compile FIRED: key={} trace={} guard={}",
+                owning_key, trace_id, fail_index
+            );
+        }
         (fired, owning_key)
     }
 

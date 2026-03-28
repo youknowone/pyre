@@ -961,6 +961,9 @@ pub fn resume_in_blackhole(
                     }
                 }
                 frame.next_instr = merge_py_pc;
+                // RPython parity: blackhole writeback succeeds unconditionally.
+                // The blackhole interpreter produces correct values by
+                // construction (all operations are concrete Python calls).
             }
             builder.release_interp(bh);
             return BlackholeResult::ContinueRunningNormally;
