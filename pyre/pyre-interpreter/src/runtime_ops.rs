@@ -280,6 +280,28 @@ pub fn binary_op_tag(op: BinaryOperator) -> Option<i64> {
     })
 }
 
+/// Reverse of binary_op_tag: tag (0-12) → BinaryOperator.
+/// The blackhole interpreter receives the compact tag from the codewriter
+/// and needs to recover the original operator for binary_value dispatch.
+pub fn binary_op_from_tag(tag: i64) -> Option<BinaryOperator> {
+    Some(match tag {
+        0 => BinaryOperator::Add,
+        1 => BinaryOperator::Subtract,
+        2 => BinaryOperator::Multiply,
+        3 => BinaryOperator::FloorDivide,
+        4 => BinaryOperator::Remainder,
+        5 => BinaryOperator::TrueDivide,
+        6 => BinaryOperator::Subscr,
+        7 => BinaryOperator::Power,
+        8 => BinaryOperator::Lshift,
+        9 => BinaryOperator::Rshift,
+        10 => BinaryOperator::And,
+        11 => BinaryOperator::Or,
+        12 => BinaryOperator::Xor,
+        _ => return None,
+    })
+}
+
 pub fn compare_op_tag(op: ComparisonOperator) -> i64 {
     match op {
         ComparisonOperator::Less => 0,
@@ -289,6 +311,19 @@ pub fn compare_op_tag(op: ComparisonOperator) -> i64 {
         ComparisonOperator::Equal => 4,
         ComparisonOperator::NotEqual => 5,
     }
+}
+
+/// Reverse of compare_op_tag: tag (0-5) → ComparisonOperator.
+pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
+    Some(match tag {
+        0 => ComparisonOperator::Less,
+        1 => ComparisonOperator::LessOrEqual,
+        2 => ComparisonOperator::Greater,
+        3 => ComparisonOperator::GreaterOrEqual,
+        4 => ComparisonOperator::Equal,
+        5 => ComparisonOperator::NotEqual,
+        _ => return None,
+    })
 }
 
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {

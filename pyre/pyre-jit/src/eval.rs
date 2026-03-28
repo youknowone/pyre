@@ -1288,6 +1288,16 @@ fn execute_assembler(
                             frame.fix_array_ptrs();
                             return None;
                         }
+                        // Blackhole reached merge point successfully.
+                        // RPython: ContinueRunningNormally → interpreter dispatch
+                        // → re-enter compiled code. This works in RPython because
+                        // bridge compilation breaks the guard failure cycle.
+                        // In pyre, bridge execution doesn't reliably break the
+                        // cycle yet (GuardNotInvalidated fires on re-entry).
+                        // Invalidate to prevent infinite guard→blackhole→reentry.
+                        // The interpreter continues normally; the counter will
+                        // recompile if needed.
+                        driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
                     crate::call_jit::BlackholeResult::DoneWithThisFrame(Ok(v)) => {
