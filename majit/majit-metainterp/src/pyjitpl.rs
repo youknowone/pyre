@@ -437,10 +437,6 @@ pub struct JitHooks {
     pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
     /// Called on guard failure. Args: (green_key, fail_index, fail_count).
     pub on_guard_failure: Option<Box<dyn Fn(u64, u32, u32) + Send>>,
-    /// RPython compile.py:714 (_trace_and_compile_from_bridge):
-    /// Called when guard failure threshold is reached to trigger bridge
-    /// compilation. Args: (green_key, trace_id, fail_index).
-    pub on_bridge_threshold: Option<Box<dyn Fn(u64, u64, u32) + Send>>,
     /// Called when tracing starts. Args: (green_key).
     pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
     /// Called when tracing is aborted. Args: (green_key, permanent).

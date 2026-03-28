@@ -385,12 +385,6 @@ impl<S: JitState> JitDriver<S> {
         self.is_recursive = value;
     }
 
-    /// RPython compile.py:714: set callback for bridge compilation on
-    /// guard failure threshold.
-    pub fn set_bridge_threshold_hook(&mut self, hook: Box<dyn Fn(u64, u64, u32) + Send>) {
-        self.meta.hooks.on_bridge_threshold = Some(hook);
-    }
-
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {
         self.meta.set_max_unroll_recursion(value);

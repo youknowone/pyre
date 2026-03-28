@@ -90,11 +90,15 @@ pub enum ExitVirtualLayout {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
+        /// fail_arg_index: position in fail_args where this virtual
+        /// should be placed on guard failure (from GuardVirtualEntry).
+        target_slot: Option<usize>,
     },
     Struct {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
+        target_slot: Option<usize>,
     },
     Array {
         descr_index: u32,
@@ -117,6 +121,7 @@ impl ExitVirtualLayout {
                 type_id,
                 descr_index,
                 fields,
+                target_slot,
             } => Self::Object {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -126,11 +131,13 @@ impl ExitVirtualLayout {
                         (*field_index, source.shifted_virtuals(virtual_offset))
                     })
                     .collect(),
+                target_slot: *target_slot,
             },
             Self::Struct {
                 type_id,
                 descr_index,
                 fields,
+                target_slot,
             } => Self::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -140,6 +147,7 @@ impl ExitVirtualLayout {
                         (*field_index, source.shifted_virtuals(virtual_offset))
                     })
                     .collect(),
+                target_slot: *target_slot,
             },
             Self::Array { descr_index, items } => Self::Array {
                 descr_index: *descr_index,

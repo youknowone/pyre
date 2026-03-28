@@ -84,9 +84,6 @@ thread_local! {
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
         // warmstate.py:259 trace_eagerness=200 (RPython default).
-        // Cranelift backend has its own DEFAULT_BRIDGE_THRESHOLD=5 for
-        // inline bridge dispatch. This WarmState threshold controls the
-        // MetaInterp-layer bridge compilation request.
         // warmspot.py:449 — portal function returns a Python object (int).
         // pyre's portal always returns PyObjectRef, but the JIT unboxes
         // int results to raw i64 via unbox_finish_result, so the static
@@ -2238,25 +2235,45 @@ fn rebuild_state_after_failure_from_recovery_layout(
     }
 
     // Replace Virtual(idx) frame slots with materialized pointers.
-    let mut all_ok = true;
+    let mut replaced = 0usize;
     if let Some(frame) = recovery.frames.last() {
         for (slot_idx, src) in frame.slots.iter().enumerate() {
             if let majit_codegen::ExitValueSourceLayout::Virtual(vidx) = src {
                 if let Some(&ptr) = materialized.get(*vidx) {
                     if slot_idx < typed.len() {
                         typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
-                    } else {
-                        all_ok = false;
+                        replaced += 1;
                     }
-                } else {
-                    all_ok = false;
                 }
             }
         }
-    } else {
-        all_ok = false;
     }
-    all_ok
+
+    // [pyre safety] target_slot fallback: Virtual markers in frame.slots
+    // can be lost during to_exit_recovery_layout_with_caller_prefix merge.
+    // Use target_slot from ExitVirtualLayout to place remaining objects.
+    if replaced == 0 && !materialized.is_empty() {
+        for (vidx, vl) in recovery.virtual_layouts.iter().enumerate() {
+            let target = match vl {
+                majit_codegen::ExitVirtualLayout::Object { target_slot, .. }
+                | majit_codegen::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
+                _ => None,
+            };
+            if let Some(slot_idx) = target {
+                if slot_idx < typed.len()
+                    && matches!(typed[slot_idx], Value::Ref(majit_ir::GcRef(0)))
+                {
+                    if let Some(&ptr) = materialized.get(vidx) {
+                        if ptr != 0 {
+                            typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
+                            replaced += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    replaced > 0 || materialized.is_empty()
 }
 
 fn decode_recovery_payload_from_source(

@@ -1166,9 +1166,6 @@ pub fn register_call_assembler_blackhole(f: fn(u64, u64, u32, *const i64, usize)
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i64> =
     OnceLock::new();
 
-/// Guard failure threshold before triggering bridge compilation.
-const DEFAULT_BRIDGE_THRESHOLD: u32 = 5;
-
 /// Thread-local: raw local0 value from CallAssemblerI inputs,
 /// for force_fn to re-box before interpreter execution.
 thread_local! {
@@ -1220,25 +1217,6 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
     PENDING_FRAME_RESTORE.with(|c| c.take())
 }
 
-/// Deferred bridge compile request stack. Pushed by call_assembler guard
-/// failure when threshold is reached; popped by MetaInterp after execute_token.
-/// Stack-based to handle nested call_assembler dispatch (self-recursion).
-/// Deferred bridge compile requests with depth tracking.
-/// Only requests at the current depth are taken; deeper requests
-/// RPython handle_fail parity: when a guard failure reaches the bridge
-/// compilation threshold, invoke the registered callback directly instead
-/// of deferring via a pending queue. The callback is registered by
-/// pyre-jit (install_jit_call_bridge) and performs synchronous bridge
-/// compilation matching RPython's _trace_and_compile_from_bridge.
-type BridgeThresholdFn = fn(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize);
-
-static BRIDGE_THRESHOLD_FN: std::sync::OnceLock<BridgeThresholdFn> = std::sync::OnceLock::new();
-
-/// Register the bridge threshold callback.
-pub fn register_bridge_threshold_callback(f: BridgeThresholdFn) {
-    let _ = BRIDGE_THRESHOLD_FN.set(f);
-}
-
 // ── Inline frame arena for self-recursive CallAssemblerI ────────────
 
 /// Stable addresses for inline arena take/put in Cranelift IR.
@@ -1262,12 +1240,6 @@ static INLINE_ARENA: OnceLock<InlineFrameArenaInfo> = OnceLock::new();
 
 pub fn register_inline_frame_arena(info: InlineFrameArenaInfo) {
     let _ = INLINE_ARENA.set(info);
-}
-
-fn notify_bridge_threshold(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
-    if let Some(f) = BRIDGE_THRESHOLD_FN.get() {
-        f(green_key, trace_id, fail_index, resume_pc);
-    }
 }
 
 /// Enter a new bridge compile depth level (kept for compatibility with
@@ -2208,17 +2180,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         }
         drop(bridge_guard);
 
-        // RPython compile.py:696 (handle_fail → must_compile): trigger bridge
-        // Bridge compilation is deferred: store a pending request that the
-        // MetaInterp layer can pick up after execute_token returns.
-        // Direct bridge_fn calls from shim cause MetaInterp reentrancy issues.
-        if fail_count >= DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-            // RPython resumedescr.original_greenkey parity:
-            // use the green_key stored on the guard's fail_descr.
-            let gk = fail_descr.green_key;
-            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-            notify_bridge_threshold(gk, target.trace_id, fail_index, resume_pc);
-        }
+        // Bridge compilation is decided by MetaInterp.must_compile()
+        // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
 
         let saved_data = if let Some(ref ff) = force_frame {
             take_force_frame_saved_data(ff)
@@ -2300,19 +2263,6 @@ extern "C" fn call_assembler_guard_failure(
         let _result_jf = unsafe { func(jf_ptr) };
         // Result is at jf_frame[0] = outputs_ptr[0]
         return unsafe { *outputs_ptr };
-    } else if fail_count == DEFAULT_BRIDGE_THRESHOLD {
-        // RPython: bridge compilation goes through MetaInterp, not the
-        // backend. Notify the bridge threshold callback so the JIT driver
-        // can trace and compile a proper bridge.
-        let green_key = target.header_pc;
-        let trace_id = target.trace_id;
-        // Resume PC from guard's fail_args[1] (next_instr).
-        let resume_pc = if !outputs_ptr.is_null() && fail_descr.fail_arg_types.len() > 1 {
-            unsafe { *outputs_ptr.add(1) as usize }
-        } else {
-            0
-        };
-        notify_bridge_threshold(green_key, trace_id, fail_index, resume_pc);
     }
 
     // RPython resume_in_blackhole parity: resume execution from the guard
@@ -2596,19 +2546,6 @@ fn call_assembler_fast_path(
     }
     drop(bridge_guard);
 
-    // Trigger bridge compilation when threshold is reached
-    if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
-        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
-            let callee_frame_ptr = outputs[0];
-            let trace_info = fail_descr.trace_info_ref();
-            if let Some(ref info) = *trace_info {
-                let trace_id = info.trace_id;
-                drop(trace_info);
-                bridge_fn(callee_frame_ptr, fail_index, trace_id, 0);
-            }
-        }
-    }
-
     release_force_token(handle);
 
     // RPython assembler_call_helper: force_fn receives the callee frame.
@@ -2700,18 +2637,6 @@ fn call_assembler_fast_path_heap(
         return 0;
     }
     drop(bridge_guard);
-
-    if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
-        if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
-            let callee_frame_ptr = outputs[0];
-            let trace_info = fail_descr.trace_info_ref();
-            if let Some(ref info) = *trace_info {
-                let trace_id = info.trace_id;
-                drop(trace_info);
-                bridge_fn(callee_frame_ptr, fail_index, trace_id, 0);
-            }
-        }
-    }
 
     release_force_token(handle);
 
@@ -4713,13 +4638,6 @@ impl CraneliftBackend {
             }
             drop(bridge_guard);
 
-            // RPython compile.py:696 handle_fail: trigger bridge compilation.
-            if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-                let gk = fail_descr.green_key;
-                let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-                notify_bridge_threshold(gk, compiled.trace_id, fail_index, resume_pc);
-            }
-
             let saved_data = if let Some(ref ff) = force_frame {
                 take_force_frame_saved_data(ff)
             } else {
@@ -4792,13 +4710,6 @@ impl CraneliftBackend {
 
         // compile.py:701-717: handle_fail / must_compile — trigger bridge
         // compilation for bridge guards just like for loop guards.
-        let fail_count = fail_descr.get_fail_count();
-        if fail_count == DEFAULT_BRIDGE_THRESHOLD && !fail_descr.has_bridge() {
-            let gk = bridge.header_pc;
-            let resume_pc = outputs.get(1).copied().unwrap_or(0) as usize;
-            notify_bridge_threshold(gk, bridge.trace_id, fail_index, resume_pc);
-        }
-
         let saved_data = if let Some(ref ff) = force_frame {
             take_force_frame_saved_data(ff)
         } else {
@@ -8817,12 +8728,14 @@ fn collect_guards(
                         type_id,
                         descr_index,
                         fields,
+                        target_slot: Some(entry.fail_arg_index),
                     }
                 } else {
                     ExitVirtualLayout::Struct {
                         type_id,
                         descr_index,
                         fields,
+                        target_slot: Some(entry.fail_arg_index),
                     }
                 };
                 recovery_layout.virtual_layouts.push(layout);
