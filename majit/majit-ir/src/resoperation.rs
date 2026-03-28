@@ -31,25 +31,30 @@ impl OpRef {
 /// resume.py:576-860: virtual object serialization for rd_virtuals_info.
 ///
 /// Each variant corresponds to a concrete virtual type in RPython's
+/// resume.py:591-593 AbstractVirtualStructInfo.fielddescrs parity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldDescrInfo {
+    pub index: u32,
+    pub offset: usize,
+    pub field_type: Type,
+    pub field_size: usize,
+}
+
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RdVirtualInfo {
+    /// resume.py:612 VirtualInfo (NEW_WITH_VTABLE).
     Instance {
         descr_index: u32,
         known_class: Option<i64>,
-        fielddescr_indices: Vec<u32>,
-        field_offsets: Vec<usize>,
-        field_types: Vec<Type>,
-        field_sizes: Vec<usize>,
+        fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
         descr_size: usize,
     },
+    /// resume.py:628 VStructInfo (NEW).
     Struct {
         descr_index: u32,
-        fielddescr_indices: Vec<u32>,
-        field_offsets: Vec<usize>,
-        field_types: Vec<Type>,
-        field_sizes: Vec<usize>,
+        fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
         descr_size: usize,
     },

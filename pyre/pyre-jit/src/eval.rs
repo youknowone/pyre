@@ -2023,37 +2023,29 @@ fn materialize_virtual_from_rd(
         _ => {} // Instance/Struct: fall through
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
-    let (known_class, fieldnums, field_offsets, field_types, field_sizes, descr_size) = match entry
-    {
+    // resume.py:593 fielddescrs + fieldnums
+    let (known_class, fielddescrs, fieldnums, descr_size) = match entry {
         majit_ir::RdVirtualInfo::Instance {
             known_class,
+            fielddescrs,
             fieldnums,
-            field_offsets,
-            field_types,
-            field_sizes,
             descr_size,
             ..
         } => (
             *known_class,
+            fielddescrs.as_slice(),
             fieldnums.as_slice(),
-            field_offsets.as_slice(),
-            field_types.as_slice(),
-            field_sizes.as_slice(),
             *descr_size,
         ),
         majit_ir::RdVirtualInfo::Struct {
+            fielddescrs,
             fieldnums,
-            field_offsets,
-            field_types,
-            field_sizes,
             descr_size,
             ..
         } => (
             None,
+            fielddescrs.as_slice(),
             fieldnums.as_slice(),
-            field_offsets.as_slice(),
-            field_types.as_slice(),
-            field_sizes.as_slice(),
             *descr_size,
         ),
         _ => unreachable!(),
@@ -2183,17 +2175,17 @@ fn materialize_virtual_from_rd(
                 Value::Ref(gc) => gc.0 as i64,
                 _ => 0,
             };
-            // resume.py:598-602,1509-1518: decoder.setfield(struct, num, descr)
-            let Some(&byte_offset) = field_offsets.get(i) else {
-                debug_assert!(false, "field_offsets missing for field {}", i);
+            // resume.py:597-602: descr = self.fielddescrs[i]; decoder.setfield(struct, num, descr)
+            let Some(descr) = fielddescrs.get(i) else {
+                debug_assert!(false, "fielddescrs missing for field {}", i);
                 continue;
             };
-            if byte_offset == 0 && ob_type != 0 {
-                // Skip ob_type field when known_class already set it.
+            if descr.offset == 0 && ob_type != 0 {
                 continue;
             }
-            let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
-            let fsz = field_sizes.get(i).copied().unwrap_or(8);
+            let byte_offset = descr.offset;
+            let ftype = descr.field_type;
+            let fsz = descr.field_size;
             unsafe {
                 let addr = (obj_ptr as *mut u8).add(byte_offset);
                 match ftype {

@@ -8921,26 +8921,32 @@ fn collect_guards(
                         majit_ir::RdVirtualInfo::Instance {
                             descr_index,
                             known_class,
-                            fielddescr_indices,
+                            fielddescrs,
                             fieldnums,
                             ..
-                        } => ExitVirtualLayout::Object {
-                            type_id: known_class.map_or(0, |kc| kc as u32),
-                            descr_index: *descr_index,
-                            fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                            target_slot,
-                        },
+                        } => {
+                            let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
+                            ExitVirtualLayout::Object {
+                                type_id: known_class.map_or(0, |kc| kc as u32),
+                                descr_index: *descr_index,
+                                fields: resolve_fieldnums(fieldnums, &indices),
+                                target_slot,
+                            }
+                        }
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index,
-                            fielddescr_indices,
+                            fielddescrs,
                             fieldnums,
                             ..
-                        } => ExitVirtualLayout::Struct {
-                            type_id: 0,
-                            descr_index: *descr_index,
-                            fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                            target_slot,
-                        },
+                        } => {
+                            let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
+                            ExitVirtualLayout::Struct {
+                                type_id: 0,
+                                descr_index: *descr_index,
+                                fields: resolve_fieldnums(fieldnums, &indices),
+                                target_slot,
+                            }
+                        }
                         majit_ir::RdVirtualInfo::Array {
                             descr_index,
                             clear,
