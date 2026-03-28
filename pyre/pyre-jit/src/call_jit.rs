@@ -891,11 +891,17 @@ pub fn resume_in_blackhole(
             if let Some(val) = section.get(slot) {
                 bh.setarg_r(i, materialize_virtual(val));
             } else {
-                // RPython resume.py:1381 parity: rd_numb always encodes
-                // all locals. Missing slot = incomplete resume data.
-                // Abort blackhole rather than inject stale frame values.
-                builder.release_interp(bh);
-                return BlackholeResult::Failed;
+                // resume.py:1017 _prepare_next_section + liveness.py:170
+                // LivenessIterator parity: RPython snapshots contain ONLY
+                // LIVE boxes. Dead registers are initialized to safe defaults
+                // in setposition(). In pyre, rd_numb may not encode all
+                // locals. Use the frame's current value as fallback — this
+                // is safe because the frame was live at guard failure time.
+                // SAFETY: frame_ptr is valid (checked above) and i < nlocals.
+                let arr_ptr =
+                    unsafe { std::ptr::addr_of!((*frame_ptr).locals_cells_stack_w) as *const i64 };
+                let frame_val = unsafe { *arr_ptr.add(i) };
+                bh.setarg_r(i, frame_val);
             }
         }
         for i in 0..stack_only {
