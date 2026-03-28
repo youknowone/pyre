@@ -327,7 +327,7 @@ pub(crate) fn build_guard_metadata(
                                     known_class,
                                     fielddescrs,
                                     fieldnums,
-                                    ..
+                                    descr_size,
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
@@ -336,13 +336,15 @@ pub(crate) fn build_guard_metadata(
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
+                                        fielddescrs: fielddescrs.clone(),
+                                        descr_size: *descr_size,
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::Struct {
                                     descr_index,
                                     fielddescrs,
                                     fieldnums,
-                                    ..
+                                    descr_size,
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
@@ -351,6 +353,8 @@ pub(crate) fn build_guard_metadata(
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
+                                        fielddescrs: fielddescrs.clone(),
+                                        descr_size: *descr_size,
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::Array {

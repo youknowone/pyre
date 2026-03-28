@@ -667,14 +667,11 @@ impl ResumeVirtualLayoutSummary {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_descr, source)| {
-                        (
-                            *field_descr,
-                            source.to_exit_source(fail_arg_positions, virtual_offset),
-                        )
-                    })
+                    .map(|(fd, src)| (*fd, src.to_exit_source(fail_arg_positions, virtual_offset)))
                     .collect(),
                 target_slot: None,
+                fielddescrs: vec![],
+                descr_size: 0,
             },
             ResumeVirtualLayoutSummary::Struct {
                 type_id,
@@ -693,6 +690,8 @@ impl ResumeVirtualLayoutSummary {
                     })
                     .collect(),
                 target_slot: None,
+                fielddescrs: vec![],
+                descr_size: 0,
             },
             ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,

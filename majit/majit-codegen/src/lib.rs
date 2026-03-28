@@ -90,15 +90,18 @@ pub enum ExitVirtualLayout {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
-        /// fail_arg_index: position in fail_args where this virtual
-        /// should be placed on guard failure (from GuardVirtualEntry).
         target_slot: Option<usize>,
+        /// resume.py:593 fielddescrs for setfield dispatch.
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
     Struct {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
         target_slot: Option<usize>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
     Array {
         descr_index: u32,
@@ -134,22 +137,26 @@ impl ExitVirtualLayout {
                 descr_index,
                 fields,
                 target_slot,
+                fielddescrs,
+                descr_size,
             } => Self::Object {
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_index, source)| {
-                        (*field_index, source.shifted_virtuals(virtual_offset))
-                    })
+                    .map(|(fi, src)| (*fi, src.shifted_virtuals(virtual_offset)))
                     .collect(),
                 target_slot: *target_slot,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             Self::Struct {
                 type_id,
                 descr_index,
                 fields,
                 target_slot,
+                fielddescrs,
+                descr_size,
             } => Self::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -160,6 +167,8 @@ impl ExitVirtualLayout {
                     })
                     .collect(),
                 target_slot: *target_slot,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             Self::Array {
                 descr_index,
