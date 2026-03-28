@@ -1761,6 +1761,24 @@ fn take_call_assembler_deadframe(handle: u64) -> Option<DeadFrame> {
     CALL_ASSEMBLER_DEADFRAMES.with(|map| map.borrow_mut().remove(&handle))
 }
 
+/// Read typed values from a deadframe, dispatching on per-slot type.
+/// RPython: cpu.get_{int,ref,float}_value(deadframe, i).
+fn raw_values_from_deadframe_typed(
+    frame: &DeadFrame,
+    types: &[Type],
+) -> Result<Vec<i64>, BackendError> {
+    types
+        .iter()
+        .enumerate()
+        .map(|(i, tp)| match tp {
+            Type::Int => get_int_from_deadframe(frame, i),
+            Type::Ref => get_ref_from_deadframe(frame, i).map(|value| value.0 as i64),
+            Type::Float => get_float_from_deadframe(frame, i).map(|value| value.to_bits() as i64),
+            Type::Void => Ok(0),
+        })
+        .collect()
+}
+
 fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendError> {
     let fail_arg_types = {
         let descr = get_latest_descr_from_deadframe(frame)?;
@@ -2452,6 +2470,9 @@ fn call_assembler_fast_path(
     // jf_buf: header + output slots + ref root slots (all in one buffer).
     const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
     let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS + FAST_PATH_MAX_ROOTS];
+    // jitframe.py:48-52 jitframe_allocate: set jf_frame length for GC bounds check.
+    let frame_depth = actual_outputs + actual_roots;
+    jf_buf[JF_FRAME_LENGTH_OFS as usize / 8] = frame_depth as i64;
     for (i, &val) in inputs.iter().enumerate() {
         jf_buf[HEADER_WORDS + i] = val;
     }
@@ -2495,7 +2516,9 @@ fn call_assembler_fast_path(
         }
         return match fail_descr.fail_arg_types() {
             [] | [Type::Void] => 0,
-            [Type::Int] | [Type::Float] => outputs[0] as u64,
+            // compile.py:649 DoneWithThisFrameDescr*.get_result:
+            // cpu.get_{int,ref,float}_value(deadframe, 0)
+            [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
             _ => {
                 let outputs_vec = outputs[..actual_outputs].to_vec();
                 let mut frame =
@@ -2600,7 +2623,9 @@ fn call_assembler_fast_path_heap(
         }
         return match fail_descr.fail_arg_types() {
             [] | [Type::Void] => 0,
-            [Type::Int] | [Type::Float] => outputs[0] as u64,
+            // compile.py:649 DoneWithThisFrameDescr*.get_result:
+            // cpu.get_{int,ref,float}_value(deadframe, 0)
+            [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
             _ => {
                 let outputs_vec = outputs[..actual_outputs].to_vec();
                 let mut frame =

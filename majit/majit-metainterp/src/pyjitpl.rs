@@ -5250,7 +5250,9 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         match blackhole_result {
-            BlackholeResult::Finish { op_index, values } => {
+            BlackholeResult::Finish {
+                op_index, values, ..
+            } => {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
@@ -5487,7 +5489,9 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         match blackhole_result {
-            BlackholeResult::Finish { op_index, values } => {
+            BlackholeResult::Finish {
+                op_index, values, ..
+            } => {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;

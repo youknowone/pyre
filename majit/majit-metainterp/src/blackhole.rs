@@ -130,8 +130,14 @@ impl ExceptionState {
 ///
 /// **Deprecated**: Part of the IR-based blackhole path.
 pub enum BlackholeResult {
-    /// Reached a Finish operation with output values.
-    Finish { op_index: usize, values: Vec<i64> },
+    /// Reached a Finish operation with output values and their types.
+    /// compile.py:636 DoneWithThisFrameDescr*.handle_fail:
+    /// the descr type determines how to interpret the value.
+    Finish {
+        op_index: usize,
+        values: Vec<i64>,
+        value_types: Vec<majit_ir::Type>,
+    },
     /// Reached a Jump — loop back to header with these values.
     Jump { op_index: usize, values: Vec<i64> },
     /// A guard failed during blackhole execution.
@@ -222,10 +228,17 @@ fn blackhole_execute_full(
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vtypes = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_fail_descr())
+                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {
                         op_index: op_idx,
                         values: vals,
+                        value_types: vtypes,
                     },
                     exc_state,
                 );
@@ -529,10 +542,17 @@ pub(crate) fn blackhole_execute_with_state(
             OpResult::Void => {}
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vtypes = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_fail_descr())
+                    .map(|fd| fd.fail_arg_types().to_vec())
+                    .unwrap_or_default();
                 return (
                     BlackholeResult::Finish {
                         op_index: op_idx,
                         values: vals,
+                        value_types: vtypes,
                     },
                     exc_state,
                 );

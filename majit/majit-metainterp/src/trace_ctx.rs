@@ -1652,6 +1652,18 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::CallAssemblerI, args, descr)
     }
 
+    /// Emit CALL_ASSEMBLER_R by token number with explicit arg types.
+    /// resoperation.py:1251 call_assembler_for_descr: result_type=Ref → CALL_ASSEMBLER_R.
+    pub fn call_assembler_ref_by_number_typed(
+        &mut self,
+        target_number: u64,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let descr = make_call_assembler_descr(target_number, arg_types, Type::Ref);
+        self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
+    }
+
     /// Emit CALL_ASSEMBLER_N (void). Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_void_typed`.
     pub fn call_assembler_void(&mut self, target: &JitCellToken, args: &[OpRef]) {
