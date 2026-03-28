@@ -120,6 +120,9 @@ pub struct JitCode {
     /// Reverse PC map: sorted (jitcode_pc, py_pc) pairs for binary search.
     /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
     pub jit_to_py_pc: Vec<(usize, usize)>,
+    /// True if BC_ABORT was emitted (not BC_ABORT_PERMANENT).
+    /// Set by JitCodeBuilder::abort(), not by raw byte scan.
+    pub has_abort: bool,
 }
 
 /// blackhole.py catch_exception: pre-computed exception handler for a JitCode PC range.
