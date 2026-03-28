@@ -66,10 +66,86 @@ pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
 
+/// Vec-backed livebox map: OpRef → i16 tag.
+/// Replaces HashMap<u32, i16> with O(1) Vec indexing.
+/// Sentinel i16::MIN means "not present".
+pub struct LiveboxMap {
+    /// Op results (OpRef < CONST_BASE).
+    results: Vec<i16>,
+    /// Constants (OpRef >= CONST_BASE), offset by CONST_BASE.
+    constants: Vec<i16>,
+}
+
+const LIVEBOX_ABSENT: i16 = i16::MIN;
+
+impl LiveboxMap {
+    pub fn new() -> Self {
+        Self {
+            results: Vec::new(),
+            constants: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, key: u32) -> Option<i16> {
+        let (vec, idx) = if key >= majit_ir::OpRef::CONST_BASE {
+            (
+                &self.constants,
+                (key - majit_ir::OpRef::CONST_BASE) as usize,
+            )
+        } else {
+            (&self.results, key as usize)
+        };
+        if idx < vec.len() {
+            let v = vec[idx];
+            if v != LIVEBOX_ABSENT { Some(v) } else { None }
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn insert(&mut self, key: u32, value: i16) {
+        let (vec, idx) = if key >= majit_ir::OpRef::CONST_BASE {
+            (
+                &mut self.constants,
+                (key - majit_ir::OpRef::CONST_BASE) as usize,
+            )
+        } else {
+            (&mut self.results, key as usize)
+        };
+        if idx >= vec.len() {
+            vec.resize(idx + 1, LIVEBOX_ABSENT);
+        }
+        vec[idx] = value;
+    }
+
+    #[inline(always)]
+    pub fn contains_key(&self, key: u32) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Iterate over all (key, value) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, i16)> + '_ {
+        self.results
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != LIVEBOX_ABSENT)
+            .map(|(i, v)| (i as u32, *v))
+            .chain(
+                self.constants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| **v != LIVEBOX_ABSENT)
+                    .map(|(i, v)| (i as u32 + majit_ir::OpRef::CONST_BASE, *v)),
+            )
+    }
+}
+
 // resume.py:134-139
 pub struct NumberingState {
     pub writer: crate::resumecode::Writer,
-    pub liveboxes: HashMap<u32, i16>,
+    pub liveboxes: LiveboxMap,
     pub num_boxes: i32,
     pub num_virtuals: i32,
 }
@@ -78,7 +154,7 @@ impl NumberingState {
     pub fn new(size: usize) -> Self {
         NumberingState {
             writer: crate::resumecode::Writer::new(size),
-            liveboxes: HashMap::new(),
+            liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
         }
@@ -2730,14 +2806,14 @@ impl ResumeDataLoopMemo {
         &self,
         opref: majit_ir::OpRef,
         env: &dyn majit_ir::BoxEnv,
-        liveboxes_from_env: &HashMap<u32, i16>,
-        new_liveboxes: &mut HashMap<u32, i16>,
+        liveboxes_from_env: &LiveboxMap,
+        new_liveboxes: &mut LiveboxMap,
         new_liveboxes_order: &mut Vec<u32>,
     ) {
         if opref.is_none()
             || env.is_const(opref)
-            || liveboxes_from_env.contains_key(&opref.0)
-            || new_liveboxes.contains_key(&opref.0)
+            || liveboxes_from_env.contains_key(opref.0)
+            || new_liveboxes.contains_key(opref.0)
         {
             return;
         }
@@ -2762,8 +2838,8 @@ impl ResumeDataLoopMemo {
         &mut self,
         opref: majit_ir::OpRef,
         env: &dyn majit_ir::BoxEnv,
-        liveboxes_from_env: &HashMap<u32, i16>,
-        new_liveboxes: &HashMap<u32, i16>,
+        liveboxes_from_env: &LiveboxMap,
+        new_liveboxes: &LiveboxMap,
     ) -> i16 {
         if opref.is_none() {
             return UNINITIALIZED_TAG;
@@ -2772,10 +2848,10 @@ impl ResumeDataLoopMemo {
             let (val, tp) = env.get_const(opref);
             return self.getconst(val, tp);
         }
-        if let Some(&tagged) = liveboxes_from_env.get(&opref.0) {
+        if let Some(tagged) = liveboxes_from_env.get(opref.0) {
             return tagged;
         }
-        if let Some(&tagged) = new_liveboxes.get(&opref.0) {
+        if let Some(tagged) = new_liveboxes.get(opref.0) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
                 if let Some(&num) = self.cached_boxes.get(&opref.0) {
@@ -2821,7 +2897,7 @@ impl ResumeDataLoopMemo {
                 continue;
             }
             // resume.py:207-208: liveboxes[box] (already seen)
-            if let Some(&tagged) = numb_state.liveboxes.get(&opref.0) {
+            if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
                 numb_state.append_short(tagged);
                 continue;
             }
@@ -2956,14 +3032,13 @@ impl ResumeDataLoopMemo {
 
         // resume.py:413: self.vfieldboxes collected by virtual walk
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
-        let mut new_liveboxes: HashMap<u32, i16> = HashMap::new();
+        let mut new_liveboxes = LiveboxMap::new();
         // Insertion-order tracking for _number_virtuals (RPython dict is ordered).
         let mut new_liveboxes_order: Vec<u32> = Vec::new();
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual fields.
         // RPython iterates in insertion order; we sort by tag for determinism.
-        let mut sorted_liveboxes: Vec<(u32, i16)> =
-            numb_state.liveboxes.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut sorted_liveboxes: Vec<(u32, i16)> = numb_state.liveboxes.iter().collect();
         sorted_liveboxes.sort_by_key(|&(_, tagged)| {
             let (val, tagbits) = untag(tagged);
             (tagbits, val)
@@ -3044,7 +3119,7 @@ impl ResumeDataLoopMemo {
         // Iterate in insertion order (RPython dict iteration = insertion order).
         let keys: Vec<(u32, i16)> = new_liveboxes_order
             .iter()
-            .filter_map(|&k| new_liveboxes.get(&k).map(|&v| (k, v)))
+            .filter_map(|&k| new_liveboxes.get(k).map(|v| (k, v)))
             .collect();
         for (opref_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
@@ -3085,8 +3160,7 @@ impl ResumeDataLoopMemo {
                 // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
                 let tagged = numb_state
                     .liveboxes
-                    .get(&opref_id)
-                    .copied()
+                    .get(opref_id)
                     .unwrap_or(UNASSIGNEDVIRTUAL);
                 let (num, _) = untag(tagged);
                 if num >= 0 && (num as usize) < rd_virtuals.len() {
@@ -3104,11 +3178,11 @@ impl ResumeDataLoopMemo {
                                 return self.getconst(val, tp);
                             }
                             // Check liveboxes_from_env first
-                            if let Some(&t) = numb_state.liveboxes.get(&opref.0) {
+                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
                                 return t;
                             }
                             // Then check new_liveboxes
-                            if let Some(&t) = new_liveboxes.get(&opref.0) {
+                            if let Some(t) = new_liveboxes.get(opref.0) {
                                 // If still UNASSIGNED, get the real tag from cached_boxes
                                 if tagged_eq(t, UNASSIGNED) {
                                     if let Some(&num) = self.cached_boxes.get(&opref.0) {
