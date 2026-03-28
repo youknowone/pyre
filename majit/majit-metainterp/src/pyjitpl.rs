@@ -4264,6 +4264,13 @@ impl<M: Clone> MetaInterp<M> {
         (fired, owning_key)
     }
 
+    /// memmgr.py:58-61: keep_loop_alive(looptoken).
+    /// Marks the compiled loop as recently used. Currently a no-op stub
+    /// since majit does not have loop aging / memory management yet.
+    pub fn keep_loop_alive(&mut self, _green_key: u64) {
+        // TODO: implement loop aging when memory_manager is added.
+    }
+
     /// compile.py:786-795: start_compiling / done_compiling — set/clear
     /// ST_BUSY_FLAG on a guard's GuardFailureInfo.
     pub fn set_guard_compiling(

@@ -1033,8 +1033,14 @@ enum HandleFailOutcome {
 ///
 /// Single function containing the complete guard failure handling:
 /// must_compile decision (already computed by jitdriver) → if bridge:
-/// start_compiling + trace_and_compile_from_bridge + done_compiling;
+/// start_compiling + _trace_and_compile_from_bridge + done_compiling;
 /// else: restore state for blackhole resume.
+///
+/// RPython: deadframe is passed to _trace_and_compile_from_bridge which
+/// creates a fresh MetaInterp (compile.py:730). No state restoration
+/// happens before the bridge/blackhole decision. Pyre differs: we call
+/// restore_guard_failure_for_loop to extract resume_pc, which also sets
+/// LAST_GUARD_TYPED as a side-effect (cleared on bridge success).
 fn handle_fail(
     frame: &mut PyFrame,
     green_key: u64,
@@ -1061,11 +1067,13 @@ fn handle_fail(
                     .meta_interp_mut()
                     .set_guard_compiling(owning_key, trace_id, fail_index, true);
             }
-            // compile.py:706-708: _trace_and_compile_from_bridge
-            // Restore state to get resume_pc, then trace bridge.
+            // compile.py:706-708: _trace_and_compile_from_bridge(deadframe, ...)
+            // RPython creates a fresh MetaInterp and passes deadframe to
+            // handle_guard_failure. We extract resume_pc from state restoration,
+            // then pass it to trace_and_compile_from_bridge.
             let meta = {
                 let (driver, _) = driver_pair();
-                driver.meta_interp().get_compiled_meta(green_key).cloned()
+                driver.meta_interp().get_compiled_meta(owning_key).cloned()
             };
             let resume_pc = if let Some(ref meta) = meta {
                 restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout)
@@ -1087,28 +1095,30 @@ fn handle_fail(
                     .set_guard_compiling(owning_key, trace_id, fail_index, false);
             }
             if compiled {
+                // Bridge compiled — clear blackhole payload that was stored
+                // during state restoration. RPython's bridge path never stores
+                // blackhole payload since it uses a fresh MetaInterp.
+                LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
                 return HandleFailOutcome::BridgeCompiled;
             }
-            // Bridge failed — state already restored, fall through to blackhole
+            // Bridge failed — state already restored, fall through to blackhole.
             return HandleFailOutcome::ResumeInBlackhole {
                 restored: resume_pc.is_some(),
             };
         }
     }
     // compile.py:710-716: resume_in_blackhole
-    // Restore state for blackhole path.
+    // Restore state from deadframe for blackhole path.
     let meta = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().get_compiled_meta(green_key).cloned()
+        driver.meta_interp().get_compiled_meta(owning_key).cloned()
     };
-    let resume_pc = if let Some(ref meta) = meta {
-        restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout)
+    let ok = if let Some(ref meta) = meta {
+        restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout).is_some()
     } else {
-        None
+        false
     };
-    HandleFailOutcome::ResumeInBlackhole {
-        restored: resume_pc.is_some(),
-    }
+    HandleFailOutcome::ResumeInBlackhole { restored: ok }
 }
 
 /// RPython warmstate.py:387-423 execute_assembler.
@@ -1126,9 +1136,11 @@ fn execute_assembler(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
-    // RPython parity: save frame state before compiled code entry.
-    // If guard recovery fails (blackhole error), restore pre-entry state
-    // instead of leaving a corrupted frame for the interpreter.
+    // Pyre safety net: save frame state before compiled code entry.
+    // RPython does NOT do this — its resume data (rd_numb + rd_virtuals)
+    // is always complete, so blackhole always succeeds. Pyre's rd_numb
+    // can be incomplete, so guard recovery may fail. This snapshot allows
+    // fallback to the pre-entry frame state. Remove when rd_numb is complete.
     let saved_locals: Vec<pyre_object::PyObjectRef> = {
         let len = frame.locals_cells_stack_w.len();
         (0..len).map(|i| frame.locals_cells_stack_w[i]).collect()
@@ -1332,6 +1344,12 @@ fn bound_reached(
             debug_first_arg_int(frame),
         );
     }
+    // warmstate.py:429: jitcounter.decay_all_counters()
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .counter
+        .decay_all_counters();
     // warmstate.py:430
     if stack_almost_full() {
         return None;
@@ -1461,16 +1479,6 @@ fn bound_reached(
             }
         }
     }
-    // warmstate.py:429 jitcounter.decay_all_counters()
-    // RPython calls decay_all_counters (all keys ×0.96). Pyre uses
-    // per-key reset because counter gating + decay changes OTHER
-    // keys' compilation timing → wrong output. When cell-first is
-    // enabled (guard failure recovery complete), switch to full decay.
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .counter
-        .reset(green_key);
     driver.meta_interp_mut().tracing_call_depth = None;
     None
 }
@@ -1583,7 +1591,26 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     frame.fix_array_ptrs();
                     return None;
                 }
-                HandleFailOutcome::ResumeInBlackhole { .. } => {}
+                HandleFailOutcome::ResumeInBlackhole { restored: true } => {
+                    // compile.py:710-716: resume_in_blackhole
+                    let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+                    if let Some(ref vals) = typed {
+                        match crate::call_jit::resume_in_blackhole(frame, vals, frame.next_instr) {
+                            crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                                return Some(r);
+                            }
+                            crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                                // Fall through to eval_loop_jit
+                            }
+                            crate::call_jit::BlackholeResult::Failed => {
+                                // Fall through to interpreter
+                            }
+                        }
+                    }
+                }
+                HandleFailOutcome::ResumeInBlackhole { restored: false } => {
+                    // Recovery failed — fall through to interpreter
+                }
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {

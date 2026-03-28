@@ -1425,10 +1425,7 @@ pub fn install_jit_call_bridge() {
         // Bridge compilation is triggered by MetaInterp.must_compile()
         // (compile.py:783-784), not by backend fail_count threshold.
         majit_codegen_cranelift::register_inline_frame_arena(arena_global_info());
-        // Bridge compilation for guards hit via try_function_entry_jit is
-        // handled at the eval.rs level: run_compiled_detailed_with_bridge_keyed
-        // returns BridgeCompilationRequest, and try_function_entry_jit calls
-        // trace_and_compile_from_bridge after releasing the driver borrow.
+        // Bridge compilation is handled by handle_fail() in eval.rs.
     });
 }
 
