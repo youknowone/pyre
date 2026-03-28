@@ -595,6 +595,7 @@ impl ResumeVirtualLayoutSummary {
                         )
                     })
                     .collect(),
+                target_slot: None,
             },
             ResumeVirtualLayoutSummary::Struct {
                 type_id,
@@ -612,6 +613,7 @@ impl ResumeVirtualLayoutSummary {
                         )
                     })
                     .collect(),
+                target_slot: None,
             },
             ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,
@@ -736,13 +738,13 @@ impl ResumeLayoutSummary {
         let mut frames = caller_prefix
             .map(|layout| layout.frames[..prefix_frame_count].to_vec())
             .unwrap_or_default();
-        let mut virtual_layouts = if preserve_prefix {
-            caller_prefix
-                .map(|layout| layout.virtual_layouts.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // RPython parity: rd_virtuals is stored once on the guard descriptor
+        // and never replaced (compile.py:866, resume.py:492). Always preserve
+        // caller_prefix's virtual_layouts — they originate from
+        // build_guard_metadata and must not be overwritten.
+        let mut virtual_layouts = caller_prefix
+            .map(|layout| layout.virtual_layouts.clone())
+            .unwrap_or_default();
         let mut pending_field_layouts = if preserve_prefix {
             caller_prefix
                 .map(|layout| layout.pending_field_layouts.clone())

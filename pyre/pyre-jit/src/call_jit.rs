@@ -539,9 +539,8 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // warmspot.py:1022 — fail_descr = cpu.get_latest_descr(deadframe)
     // compile.py:701 handle_fail: dispatches on fail_descr to either
     // _trace_and_compile_from_bridge or resume_in_blackhole.
-    // In pyre, bridge compilation is driven by eval.rs (via
-    // PENDING_BRIDGE_REQUEST), and this force path always resumes
-    // in the interpreter (blackhole equivalent).
+    // Bridge compilation is driven by must_compile() in jitdriver.
+    // This force path always resumes in the interpreter (blackhole).
     let _descr = unsafe { JitFrame::get_latest_descr(jf) };
 
     // For now, reconstruct a PyFrame and run it in the interpreter.
@@ -1394,43 +1393,14 @@ pub fn install_jit_call_bridge() {
         majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
         majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
         majit_codegen_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
-        // RPython compile.py:696 handle_fail parity: bridge compilation
-        // callback invoked synchronously when guard fail count reaches
-        // threshold. Replaces the deferred pending queue.
-        majit_codegen_cranelift::register_bridge_threshold_callback(on_bridge_threshold_reached);
+        // Bridge compilation is triggered by MetaInterp.must_compile()
+        // (compile.py:783-784), not by backend fail_count threshold.
         majit_codegen_cranelift::register_inline_frame_arena(arena_global_info());
         // Bridge compilation for guards hit via try_function_entry_jit is
         // handled at the eval.rs level: run_compiled_detailed_with_bridge_keyed
         // returns BridgeCompilationRequest, and try_function_entry_jit calls
         // jit_bridge_compile_for_guard after releasing the driver borrow.
     });
-}
-
-/// RPython handle_fail → _trace_and_compile_from_bridge parity.
-/// Called synchronously from Cranelift's execute_with_inputs when guard
-/// fail count reaches the bridge threshold. The frame state is still
-/// valid at this point (not yet reset by force_fn).
-fn on_bridge_threshold_reached(green_key: u64, trace_id: u64, fail_index: u32, resume_pc: usize) {
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[jit][bridge-threshold] gk={} trace={} fail={} resume_pc={}",
-            green_key, trace_id, fail_index, resume_pc
-        );
-    }
-    // Store the bridge request for synchronous processing in
-    // restore_guard_failure_for_loop, which has access to the
-    // restored frame state.
-    PENDING_BRIDGE_REQUEST.with(|c| {
-        c.set(Some((green_key, trace_id, fail_index, resume_pc)));
-    });
-}
-
-thread_local! {
-    /// Single pending bridge request set by on_bridge_threshold_reached,
-    /// consumed by restore_guard_failure_for_loop. At most one request
-    /// per guard failure, matching RPython's handle_fail pattern.
-    pub(crate) static PENDING_BRIDGE_REQUEST: std::cell::Cell<Option<(u64, u64, u32, usize)>> =
-        const { std::cell::Cell::new(None) };
 }
 
 /// RPython resume_in_blackhole parity: resume execution from the guard
@@ -1541,10 +1511,32 @@ pub fn jit_bridge_compile_for_guard(
 
     let (driver, info) = crate::eval::driver_pair();
 
-    // compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    // compile.py:702-709: try/finally start_compiling/done_compiling.
+    // Use Drop guard to ensure ST_BUSY_FLAG is always cleared.
     driver
         .meta_interp_mut()
         .set_guard_compiling(green_key, trace_id, fail_index, true);
+    struct DoneCompilingGuard {
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    }
+    impl Drop for DoneCompilingGuard {
+        fn drop(&mut self) {
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().set_guard_compiling(
+                self.green_key,
+                self.trace_id,
+                self.fail_index,
+                false,
+            );
+        }
+    }
+    let _done_compiling = DoneCompilingGuard {
+        green_key,
+        trace_id,
+        fail_index,
+    };
 
     // RPython resume_in_blackhole parity: use resume_pc from guard's
     // resume data (via LAST_GUARD_RESUME_PC or recovery_layout), not
@@ -1779,14 +1771,7 @@ extern "C" fn jit_bridge_compile_callee(
         );
     }
 
-    // compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .set_guard_compiling(green_key, trace_id, fail_index, false);
-    }
-
+    // done_compiling happens automatically via DoneCompilingGuard Drop.
     result
 }
 

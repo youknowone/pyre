@@ -283,6 +283,7 @@ pub(crate) fn build_guard_metadata(
                             )
                         })
                         .collect(),
+                    target_slot: Some(entry.fail_arg_index),
                 })
                 .collect();
             // Convert op.rd_pendingfields to ExitPendingFieldLayout
@@ -443,6 +444,7 @@ pub(crate) fn build_guard_metadata(
                                         (fi as u32, source)
                                     })
                                     .collect(),
+                                target_slot: None,
                             }
                         })
                         .collect()
