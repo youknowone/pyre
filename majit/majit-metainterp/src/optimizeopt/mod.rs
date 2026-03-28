@@ -1560,9 +1560,20 @@ impl OptContext {
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {
                     let fieldnums: Vec<i16> = vi.items.iter().map(|vr| gettagged(*vr)).collect();
+                    // resume.py:656: arraydescr element kind
+                    let kind = vi
+                        .descr
+                        .as_array_descr()
+                        .map(|ad| match ad.item_type() {
+                            majit_ir::Type::Float => 2u8,
+                            majit_ir::Type::Int => 1u8,
+                            _ => 0u8, // Ref
+                        })
+                        .unwrap_or(0);
                     majit_ir::RdVirtualInfo::Array {
                         descr_index: vi.descr.index(),
                         clear: vi.clear,
+                        kind,
                         fieldnums,
                     }
                 }

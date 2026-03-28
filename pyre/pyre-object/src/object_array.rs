@@ -331,6 +331,20 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
     }
 }
 
+/// resume.py:757 setinteriorfield(i, array, num, fielddescrs[j]) parity.
+/// Write a value to element `elem_idx`, field `field_idx` of an ArrayStruct.
+/// The flat index is `elem_idx * fields_per_elem + field_idx`.
+pub fn setinteriorfield(
+    array: *mut GcTypedArray,
+    elem_idx: usize,
+    field_idx: usize,
+    fields_per_elem: usize,
+    value: PyObjectRef,
+) {
+    let flat = elem_idx * fields_per_elem + field_idx;
+    setarrayitem_ref(array, flat, value);
+}
+
 /// Resume parity: get the length of a GcTypedArray.
 pub fn gcarray_len(array: *const GcTypedArray) -> usize {
     if array.is_null() {

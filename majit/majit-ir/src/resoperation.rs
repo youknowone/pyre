@@ -69,6 +69,8 @@ pub enum RdVirtualInfo {
     Array {
         descr_index: u32,
         clear: bool,
+        /// resume.py:656: arraydescr element kind (ref/int/float).
+        kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
     },
     ArrayStruct {

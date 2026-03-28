@@ -1868,12 +1868,18 @@ fn materialize_virtual_from_rd(
     // resume.py:643-760: dispatch by virtual kind.
     match entry {
         majit_ir::RdVirtualInfo::Array {
-            clear, fieldnums, ..
+            clear,
+            kind,
+            fieldnums,
+            ..
         } => {
             // resume.py:650-670: allocate_array(len, arraydescr, clear)
-            // then setarrayitem_ref/float/int per element.
-            let array =
-                pyre_object::allocate_array(fieldnums.len(), pyre_object::ArrayKind::Ref, *clear);
+            let arr_kind = match kind {
+                2 => pyre_object::ArrayKind::Float,
+                1 => pyre_object::ArrayKind::Int,
+                _ => pyre_object::ArrayKind::Ref,
+            };
+            let array = pyre_object::allocate_array(fieldnums.len(), arr_kind, *clear);
             // resume.py:656-670: element kind dispatch + UNINITIALIZED skip.
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -1906,31 +1912,47 @@ fn materialize_virtual_from_rd(
             size, fieldnums, ..
         } => {
             // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
-            // then setinteriorfield(i, array, num, fielddescrs[j]) per element.
-            // Allocate total fieldnums slots (size * fields_per_elem).
-            let total = fieldnums.len();
+            // then setinteriorfield(i, array, num, fielddescrs[j]).
+            // Array has self.size elements; total fieldnums = size * fields_per_elem.
+            let fields_per_elem = if *size > 0 {
+                fieldnums.len() / *size
+            } else {
+                0
+            };
+            let total = fieldnums.len(); // flat size for backing storage
             let array = pyre_object::allocate_array(total, pyre_object::ArrayKind::Ref, true);
             // resume.py:751: virtuals_cache.set_ptr BEFORE setfields
             let result = Value::Ref(majit_ir::GcRef(array as usize));
             virtuals_cache.insert(vidx, result.clone());
-            for (p, &fnum) in fieldnums.iter().enumerate() {
-                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
-                    continue;
-                }
-                let v = decode_tagged_fieldnum(
-                    fnum,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals_info,
-                    virtuals_cache,
-                );
-                if let Some(val) = v {
-                    // resume.py:757: setinteriorfield — element-kind dispatch
-                    match val {
-                        Value::Float(f) => pyre_object::setarrayitem_float(array, p, f),
-                        Value::Int(n) => pyre_object::setarrayitem_int(array, p, n),
-                        _ => pyre_object::setarrayitem_ref(array, p, box_opt_value(&Some(val))),
+            // resume.py:752-759: nested loop — for i in range(size), for j in range(fielddescrs)
+            let mut p = 0;
+            for i in 0..*size {
+                for j in 0..fields_per_elem {
+                    if p >= fieldnums.len() {
+                        break;
+                    }
+                    let fnum = fieldnums[p];
+                    p += 1;
+                    if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                        continue; // resume.py:756: skip UNINITIALIZED
+                    }
+                    let v = decode_tagged_fieldnum(
+                        fnum,
+                        dead_frame,
+                        num_failargs,
+                        rd_consts,
+                        rd_virtuals_info,
+                        virtuals_cache,
+                    );
+                    if let Some(val) = v {
+                        // resume.py:757: setinteriorfield(i, array, num, fielddescrs[j])
+                        pyre_object::setinteriorfield(
+                            array,
+                            i,
+                            j,
+                            fields_per_elem,
+                            box_opt_value(&Some(val)),
+                        );
                     }
                 }
             }
@@ -2372,7 +2394,8 @@ fn rebuild_typed_from_rd_numb(
 ) -> Vec<Value> {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
-    let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
+    let (_num_failargs, _vable_values, _vref_values, frames) =
+        rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
@@ -2762,40 +2785,58 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 };
                 materialized.push(obj);
             }
-            majit_codegen::ExitVirtualLayout::Array { clear, items, .. } => {
+            majit_codegen::ExitVirtualLayout::Array {
+                clear, kind, items, ..
+            } => {
                 // resume.py:650-670: allocate_array(len, arraydescr, clear)
-                let array =
-                    pyre_object::allocate_array(items.len(), pyre_object::ArrayKind::Ref, *clear);
+                let arr_kind = match kind {
+                    2 => pyre_object::ArrayKind::Float,
+                    1 => pyre_object::ArrayKind::Int,
+                    _ => pyre_object::ArrayKind::Ref,
+                };
+                let array = pyre_object::allocate_array(items.len(), arr_kind, *clear);
                 for (i, src) in items.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
-                        // resume.py:656-670: element kind dispatch.
-                        // In recovery-layout, values are raw i64 — treat as ref
-                        // (PyObjectRef pointers). For int/float arrays, the raw
-                        // value IS the boxed object pointer.
-                        pyre_object::setarrayitem_ref(array, i, val as pyre_object::PyObjectRef);
+                        // resume.py:656-670: element kind dispatch
+                        match kind {
+                            2 => pyre_object::setarrayitem_float(
+                                array,
+                                i,
+                                f64::from_bits(val as u64),
+                            ),
+                            1 => pyre_object::setarrayitem_int(array, i, val),
+                            _ => pyre_object::setarrayitem_ref(
+                                array,
+                                i,
+                                val as pyre_object::PyObjectRef,
+                            ),
+                        }
                     }
                 }
                 // resume.py:654: return array GcRef directly
                 materialized.push(array as usize);
             }
             majit_codegen::ExitVirtualLayout::ArrayStruct { element_fields, .. } => {
-                // resume.py:748-760: allocate_array(size, arraydescr, clear=True)
-                let total = element_fields.iter().map(|ef| ef.len()).sum();
+                // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
+                // then setinteriorfield(i, array, num, fielddescrs[j]).
+                let size = element_fields.len();
+                let fields_per_elem = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
+                let total = size * fields_per_elem;
                 let array = pyre_object::allocate_array(total, pyre_object::ArrayKind::Ref, true);
-                let mut idx = 0;
-                for ef in element_fields {
-                    for (_, src) in ef {
+                for (i, ef) in element_fields.iter().enumerate() {
+                    for (j, (_, src)) in ef.iter().enumerate() {
                         if let Some(val) = resolve_value(src, &materialized) {
-                            pyre_object::setarrayitem_ref(
+                            // resume.py:757: setinteriorfield(i, array, num, descr)
+                            pyre_object::setinteriorfield(
                                 array,
-                                idx,
+                                i,
+                                j,
+                                fields_per_elem,
                                 val as pyre_object::PyObjectRef,
                             );
                         }
-                        idx += 1;
                     }
                 }
-                // resume.py:751: return array GcRef directly
                 materialized.push(array as usize);
             }
             majit_codegen::ExitVirtualLayout::RawBuffer { size, entries } => {

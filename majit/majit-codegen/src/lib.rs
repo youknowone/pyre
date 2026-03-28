@@ -104,6 +104,8 @@ pub enum ExitVirtualLayout {
         descr_index: u32,
         /// resume.py:653: allocate_array(length, arraydescr, self.clear)
         clear: bool,
+        /// resume.py:656: arraydescr element kind (0=ref, 1=int, 2=float)
+        kind: u8,
         items: Vec<ExitValueSourceLayout>,
     },
     ArrayStruct {
@@ -159,10 +161,12 @@ impl ExitVirtualLayout {
             Self::Array {
                 descr_index,
                 clear,
+                kind,
                 items,
             } => Self::Array {
                 descr_index: *descr_index,
                 clear: *clear,
+                kind: *kind,
                 items: items
                     .iter()
                     .map(|source| source.shifted_virtuals(virtual_offset))

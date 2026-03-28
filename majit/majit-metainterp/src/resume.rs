@@ -694,6 +694,7 @@ impl ResumeVirtualLayoutSummary {
             ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,
                 clear: false,
+                kind: 0, // default ref
                 items: items
                     .iter()
                     .map(|source| source.to_exit_source(fail_arg_positions, virtual_offset))
