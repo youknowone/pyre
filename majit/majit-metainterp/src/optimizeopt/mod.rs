@@ -1315,23 +1315,12 @@ impl OptContext {
     ) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
-        // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
-        // already produced rd_numb + liveboxes. Don't overwrite — UNLESS the
-        // guard has virtual placeholders (OpRef::NONE) in fail_args that need
-        // fresh TAGVIRTUAL encoding. Phase 2 guards inherit Phase 1 rd_numb
-        // which has wrong slot indices for Phase 2 fail_args.
+        // resume.py:397: assert not storage.rd_numb
+        // RPython's finish() is called exactly once per guard.
+        // If rd_numb is already set (from _copy_resume_data_from / shared
+        // guard path), the numbering is already correct — return immediately.
         if op.rd_numb.is_some() {
-            let has_virtual_slots = op
-                .fail_args
-                .as_ref()
-                .map_or(false, |fa| fa.iter().any(|r| r.is_none()));
-            if !has_virtual_slots {
-                return;
-            }
-            // Clear stale rd_numb/rd_virtuals_info to regenerate from
-            // current fail_args with correct TAGVIRTUAL encoding.
-            op.rd_numb = None;
-            op.rd_virtuals_info = None;
+            return;
         }
 
         // RPython parity: every guard has a snapshot from capture_resumedata.
@@ -1345,27 +1334,21 @@ impl OptContext {
             if let Some(ref fa) = op.fail_args {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
-                // resume.py parity: num_failargs = number of actual deadframe slots
-                // (exit_types length). Virtual field values appended by
-                // store_final_boxes_in_guard are NOT deadframe slots — they're
-                // encoded as TAGBOX(fail_arg_index) in rd_virtuals fieldnums.
-                // The original fail_args length (before extra fields) equals
-                // the number of types in fail_arg_types or descr.
-                let num_failargs = op
-                    .fail_arg_types
-                    .as_ref()
-                    .map(|t| t.len())
-                    .unwrap_or(fa_len);
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
                 let mut rd_consts: Vec<(i64, majit_ir::Type)> =
                     op.rd_consts.take().unwrap_or_default();
+                // resume.py:228-256 number() format:
+                // [0] size (patched), [1] num_failargs (patched by finish),
+                // vable_len, [vable_boxes], vref_len, [vref_boxes],
+                // per-frame: jitcode_index, pc, [tagged_boxes]
                 ns.append_int(0); // size (patched)
-                ns.append_int(num_failargs as i32); // num_failargs (deadframe slots)
+                ns.append_int(0); // num_failargs (patched after encoding)
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
+                // resume.py:251-253: single frame with jitcode_index=0, pc=0.
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
-                ns.append_int(fa_len as i32); // slot_count (all fail_args incl. virtual fields)
+                // resume.py:253: _number_boxes — tagged values, no slot_count.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         let vidx = guard_virtuals.iter().position(|e| e.fail_arg_index == i);
@@ -1405,6 +1388,9 @@ impl OptContext {
                         ns.append_short(t);
                     }
                 }
+                // resume.py:447: numb_state.patch(1, len(liveboxes))
+                // pyre: all fail_args slots are in deadframe (NONE slots = 0).
+                ns.patch(1, fa_len as i32);
                 ns.patch_current_size(0);
                 op.rd_numb = Some(ns.create_numbering());
                 op.rd_consts = Some(rd_consts);
