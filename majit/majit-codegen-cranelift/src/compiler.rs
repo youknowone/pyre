@@ -313,13 +313,20 @@ struct PendingForceFrame {
     ref_slot_map: Vec<Option<usize>>,
 }
 
+/// RPython virtualref.py force token state — single-threaded, no lock needed.
+/// RPython has no lock here (GIL-protected). pyre is single-threaded.
 struct ActiveForceFrame {
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
     gc_runtime_id: Option<u64>,
-    pending_force: Mutex<Option<PendingForceFrame>>,
-    pending_may_force: Mutex<Vec<PendingMayForceFrame>>,
-    saved_data_root: Mutex<Option<Box<GcRef>>>,
+    pending_force: UnsafeCell<Option<PendingForceFrame>>,
+    pending_may_force: UnsafeCell<Vec<PendingMayForceFrame>>,
+    saved_data_root: UnsafeCell<Option<Box<GcRef>>>,
 }
+
+// Safety: single-threaded access only. Write-once or scoped mutation
+// during force/bridge compilation, never concurrent.
+unsafe impl Send for ActiveForceFrame {}
+unsafe impl Sync for ActiveForceFrame {}
 
 struct PendingMayForceFrame {
     preview: PendingForceFrame,
@@ -513,7 +520,12 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
 }
 
 static NEXT_FORCE_TOKEN_HANDLE: AtomicU64 = AtomicU64::new(1);
-static FORCE_FRAMES: OnceLock<Mutex<HashMap<u64, Arc<ActiveForceFrame>>>> = OnceLock::new();
+thread_local! {
+    /// Force frame registry — single-threaded, no lock.
+    /// RPython virtualref.py has no lock (GIL-protected).
+    static FORCE_FRAMES: RefCell<HashMap<u64, Arc<ActiveForceFrame>>> =
+        RefCell::new(HashMap::new());
+}
 
 /// Global exception state for JIT-compiled code.
 /// pyre is no-GIL single-threaded, so global statics are safe and allow
@@ -849,32 +861,35 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
 }
 
 static NEXT_GC_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
-static GC_RUNTIMES: OnceLock<Mutex<HashMap<u64, Box<dyn GcAllocator>>>> = OnceLock::new();
-
-fn gc_runtime_registry() -> &'static Mutex<HashMap<u64, Box<dyn GcAllocator>>> {
-    GC_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    /// GC allocator registry — single-threaded, no lock needed.
+    /// RPython's GC has no lock on allocator lookup (GIL-protected).
+    static GC_RUNTIMES: RefCell<HashMap<u64, Box<dyn GcAllocator>>> =
+        RefCell::new(HashMap::new());
 }
 
 fn register_gc_runtime(gc: Box<dyn GcAllocator>) -> u64 {
     let id = NEXT_GC_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
-    gc_runtime_registry().lock().unwrap().insert(id, gc);
+    GC_RUNTIMES.with(|r| r.borrow_mut().insert(id, gc));
     id
 }
 
 fn replace_gc_runtime(id: u64, gc: Box<dyn GcAllocator>) {
-    gc_runtime_registry().lock().unwrap().insert(id, gc);
+    GC_RUNTIMES.with(|r| r.borrow_mut().insert(id, gc));
 }
 
 fn unregister_gc_runtime(id: u64) {
-    gc_runtime_registry().lock().unwrap().remove(&id);
+    GC_RUNTIMES.with(|r| r.borrow_mut().remove(&id));
 }
 
 fn with_gc_runtime<R>(id: u64, f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    let mut guard = gc_runtime_registry().lock().unwrap();
-    let runtime = guard
-        .get_mut(&id)
-        .unwrap_or_else(|| panic!("missing GC runtime {id}"));
-    f(runtime.as_mut())
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        let runtime = guard
+            .get_mut(&id)
+            .unwrap_or_else(|| panic!("missing GC runtime {id}"));
+        f(runtime.as_mut())
+    })
 }
 
 pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
@@ -894,16 +909,14 @@ pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
     }
-    let mut guard = gc_runtime_registry().lock().unwrap();
-    if let Some(runtime) = guard.get_mut(&runtime_id) {
-        for root in roots.iter_mut() {
-            runtime.remove_root(root as *mut GcRef);
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        if let Some(runtime) = guard.get_mut(&runtime_id) {
+            for root in roots.iter_mut() {
+                runtime.remove_root(root as *mut GcRef);
+            }
         }
-    }
-}
-
-fn force_frame_registry() -> &'static Mutex<HashMap<u64, Arc<ActiveForceFrame>>> {
-    FORCE_FRAMES.get_or_init(|| Mutex::new(HashMap::new()))
+    });
 }
 
 fn register_force_frame(
@@ -914,23 +927,20 @@ fn register_force_frame(
     let frame = Arc::new(ActiveForceFrame {
         fail_descrs: fail_descrs.to_vec(),
         gc_runtime_id,
-        pending_force: Mutex::new(None),
-        pending_may_force: Mutex::new(Vec::new()),
-        saved_data_root: Mutex::new(None),
+        pending_force: UnsafeCell::new(None),
+        pending_may_force: UnsafeCell::new(Vec::new()),
+        saved_data_root: UnsafeCell::new(None),
     });
-    force_frame_registry()
-        .lock()
-        .unwrap()
-        .insert(handle, frame.clone());
+    FORCE_FRAMES.with(|ff| ff.borrow_mut().insert(handle, frame.clone()));
     (handle, frame)
 }
 
 fn lookup_force_frame(handle: u64) -> Option<Arc<ActiveForceFrame>> {
-    force_frame_registry().lock().unwrap().get(&handle).cloned()
+    FORCE_FRAMES.with(|ff| ff.borrow().get(&handle).cloned())
 }
 
 fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
-    let mut saved_data_root = frame.saved_data_root.lock().unwrap();
+    let mut saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
     if let Some(saved_data) = saved_data_root.as_mut() {
         if let Some(runtime_id) = frame.gc_runtime_id {
             unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
@@ -1081,16 +1091,13 @@ fn resolve_virtual_field_value(
 }
 
 fn get_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
-    frame
-        .saved_data_root
-        .lock()
-        .unwrap()
+    unsafe { &*frame.saved_data_root.get() }
         .as_ref()
         .map(|saved_data| **saved_data)
 }
 
 fn take_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
-    let mut saved_data_root = frame.saved_data_root.lock().unwrap();
+    let mut saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
     let mut saved_data = saved_data_root.take()?;
     if let Some(runtime_id) = frame.gc_runtime_id {
         unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
@@ -1102,11 +1109,11 @@ pub(crate) fn release_force_token(handle: u64) {
     if handle == 0 {
         return;
     }
-    if let Some(frame) = force_frame_registry().lock().unwrap().remove(&handle) {
-        if let Some(pending) = frame.pending_force.lock().unwrap().take() {
+    if let Some(frame) = FORCE_FRAMES.with(|ff| ff.borrow_mut().remove(&handle)) {
+        if let Some(pending) = unsafe { &mut *frame.pending_force.get() }.take() {
             let _ = pending.into_raw_values(frame.gc_runtime_id);
         }
-        for pending in frame.pending_may_force.lock().unwrap().drain(..) {
+        for pending in unsafe { &mut *frame.pending_may_force.get() }.drain(..) {
             let _ = pending.preview.into_raw_values(frame.gc_runtime_id);
         }
         let _ = take_force_frame_saved_data(&frame);
@@ -1880,7 +1887,7 @@ extern "C" fn begin_may_force_call_shim(fail_index: u64, values_ptr: u64, num_va
         .to_vec()
     };
     let preview = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
-    let mut pending_may_force = frame.pending_may_force.lock().unwrap();
+    let mut pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
     pending_may_force.push(PendingMayForceFrame {
         preview,
         was_forced: false,
@@ -1895,10 +1902,7 @@ extern "C" fn finish_may_force_guard_shim() -> u64 {
     );
     let frame = lookup_force_frame(handle)
         .unwrap_or_else(|| panic!("missing active force frame for handle {handle}"));
-    let pending = frame
-        .pending_may_force
-        .lock()
-        .unwrap()
+    let pending = unsafe { &mut *frame.pending_may_force.get() }
         .pop()
         .expect("guard_not_forced without a preceding call_may_force");
     let was_forced = pending.was_forced;
@@ -1929,7 +1933,7 @@ extern "C" fn record_guard_not_forced_2_shim(fail_index: u64, values_ptr: u64, n
     };
     let pending = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
     let previous = {
-        let mut pending_force = frame.pending_force.lock().unwrap();
+        let mut pending_force = unsafe { &mut *frame.pending_force.get() };
         pending_force.replace(pending)
     };
     if let Some(previous) = previous {
@@ -1944,7 +1948,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     };
 
     {
-        let mut pending_may_force = frame.pending_may_force.lock().unwrap();
+        let mut pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
         if let Some(pending) = pending_may_force.last_mut() {
             assert!(
                 !pending.was_forced,
@@ -1962,15 +1966,10 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         }
     }
 
-    let frame = force_frame_registry()
-        .lock()
-        .unwrap()
-        .remove(&handle)
+    let frame = FORCE_FRAMES
+        .with(|ff| ff.borrow_mut().remove(&handle))
         .unwrap_or_else(|| panic!("invalid force token {handle}"));
-    let pending = frame
-        .pending_force
-        .lock()
-        .unwrap()
+    let pending = unsafe { &mut *frame.pending_force.get() }
         .take()
         .unwrap_or_else(|| panic!("force token {handle} has no pending GUARD_NOT_FORCED_2"));
     let fail_descr = pending.fail_descr.clone();
