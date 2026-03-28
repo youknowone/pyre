@@ -2875,16 +2875,25 @@ fn rebuild_state_after_failure_from_recovery_layout(
                     if ob_type != 0 {
                         unsafe { *(ptr as *mut i64) = ob_type as i64 };
                     }
+                    // resume.py:597-602 setfields using fielddescrs
                     for (i, &val) in field_vals.iter().enumerate() {
                         if let Some(fd) = fielddescrs.get(i) {
                             if fd.offset > 0 || ob_type == 0 {
                                 let addr = unsafe { ptr.add(fd.offset) };
                                 unsafe {
-                                    match fd.field_size {
-                                        1 => std::ptr::write(addr, val as u8),
-                                        2 => std::ptr::write(addr as *mut u16, val as u16),
-                                        4 => std::ptr::write(addr as *mut u32, val as u32),
-                                        _ => std::ptr::write(addr as *mut i64, val),
+                                    match fd.field_type {
+                                        majit_ir::Type::Ref => {
+                                            std::ptr::write(addr as *mut i64, val)
+                                        }
+                                        majit_ir::Type::Float => {
+                                            std::ptr::write(addr as *mut u64, val as u64)
+                                        }
+                                        _ => match fd.field_size {
+                                            1 => std::ptr::write(addr, val as u8),
+                                            2 => std::ptr::write(addr as *mut u16, val as u16),
+                                            4 => std::ptr::write(addr as *mut u32, val as u32),
+                                            _ => std::ptr::write(addr as *mut i64, val),
+                                        },
                                     }
                                 }
                             }
