@@ -961,36 +961,12 @@ impl OptHeap {
             }
         }
 
-        // heap.py:640-643: constant_fold — read immutable field from a
-        // constant object at optimization time.
-        //   if descr.is_always_pure() and self.get_constant_box(arg0):
-        //       resbox = self.optimizer.constant_fold(op)
-        if let Some(descr) = &op.descr {
-            if descr.is_always_pure() {
-                let obj_ref = op.arg(0);
-                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
-                    if !ptr_val.is_null() {
-                        if let Some((offset, field_size, _field_type)) =
-                            majit_ir::unpack_fielddescr(descr)
-                        {
-                            let addr = ptr_val.0 + offset;
-                            let folded = match field_size {
-                                8 => Some(unsafe { *(addr as *const i64) }),
-                                4 => Some(unsafe { *(addr as *const i32) as i64 }),
-                                2 => Some(unsafe { *(addr as *const i16) as i64 }),
-                                1 => Some(unsafe { *(addr as *const u8) as i64 }),
-                                _ => None,
-                            };
-                            if let Some(value) = folded {
-                                let const_ref = ctx.make_constant_int(value);
-                                ctx.replace_op(op.pos, const_ref);
-                                return OptimizationResult::Remove;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // heap.py:640-643: constant_fold — for pure getfield on constant
+        // objects, RPython uses execute_nonspec_const (CPU execution) +
+        // protect_speculative_operation (GC validity check). Direct memory
+        // dereference is unsafe (GcRef may be stale after GC). The safe
+        // path requires porting optimizer.py constant_fold +
+        // protect_speculative_operation infrastructure.
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
