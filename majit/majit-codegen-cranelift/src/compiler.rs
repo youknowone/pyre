@@ -4625,7 +4625,7 @@ impl CraneliftBackend {
         // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
         let mut current_inputs = inputs.to_vec();
         loop {
-            let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+            let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
                 compiled.code_ptr,
                 &compiled.fail_descrs,
                 compiled.gc_runtime_id,
@@ -4680,41 +4680,36 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
 
             // If a bridge is attached to this guard, execute it.
+            // Uses lock-free bridge_ref() (main's Mutex removal parity).
             let bridge_guard = fail_descr.bridge_ref();
-            if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
-                eprintln!(
-                    "[exec-with-inputs] guard={fail_index} has_bridge={}",
-                    bridge_guard.is_some()
-                );
-            }
             if let Some(ref bridge) = *bridge_guard {
                 release_force_token(handle);
-                // RPython rebuild_state_after_failure parity: materialize
-                // virtual objects before bridge dispatch.
-                let mut mat_outputs = outputs.clone();
+                // Materialize virtuals in-place (avoid clone).
                 rebuild_state_after_failure(
-                    &mut mat_outputs,
+                    &mut outputs,
                     &fail_descr.fail_arg_types,
                     fail_descr.recovery_layout_ref().as_ref(),
                     bridge.num_inputs,
                 );
                 if bridge.loop_reentry {
                     let bridge_frame =
-                        Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
+                        Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
                     drop(bridge_guard);
                     let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
                         let num_outputs = bridge_descr.fail_arg_types().len();
-                        current_inputs = (0..num_outputs)
-                            .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                            .collect();
+                        current_inputs.clear();
+                        current_inputs.reserve(num_outputs);
+                        for i in 0..num_outputs {
+                            current_inputs
+                                .push(get_int_from_deadframe(&bridge_frame, i).unwrap_or(0));
+                        }
                         continue;
                     }
-                    // Bridge internal guard fail — return deadframe to caller
                     return bridge_frame;
                 }
-                return Self::execute_bridge(bridge, &mat_outputs, &fail_descr.fail_arg_types);
+                return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             }
             drop(bridge_guard);
 
