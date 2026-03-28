@@ -11,7 +11,7 @@
 use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_roots};
 use majit_codegen::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
-use majit_ir::{FailDescr, GcRef, Type};
+use majit_ir::{AccumVectorInfo, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -123,6 +123,9 @@ pub struct CraneliftFailDescr {
     pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
     /// Number of times this guard has failed (for bridge compilation heuristics).
     pub fail_count: AtomicU32,
+    /// schedule.py:654-655 / history.py:143-147 — vector guard metadata
+    /// copied from the frontend fail descriptor during lowering.
+    pub vector_info: Vec<AccumVectorInfo>,
     /// Compiled bridge attached to this guard, if any.
     /// Write-once when bridge is compiled, read-only after.
     /// No lock — RPython compile.py attach_bridge has no lock (GIL).
@@ -144,6 +147,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("trace_info", unsafe { &*self.trace_info.get() })
             .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
             .field("fail_count", &self.fail_count.load(Ordering::Relaxed))
+            .field("vector_info", &self.vector_info)
             .field("has_bridge", &unsafe { &*self.bridge.get() }.is_some())
             .finish()
     }
@@ -228,6 +232,7 @@ impl CraneliftFailDescr {
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
             fail_count: AtomicU32::new(0),
+            vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -363,6 +368,10 @@ impl FailDescr for CraneliftFailDescr {
 
     fn force_token_slots(&self) -> &[usize] {
         &self.force_token_slots
+    }
+
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        self.vector_info.clone()
     }
 }
 

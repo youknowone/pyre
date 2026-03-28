@@ -6,9 +6,9 @@ pub mod value;
 
 // Re-export key types at crate root for convenience.
 pub use descr::{
-    ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr, DescrRef, EffectInfo,
-    ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, OopSpecIndex, SimpleFailDescr,
-    SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
+    AccumVectorInfo, ArrayDescr, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
+    DescrRef, EffectInfo, ExtraEffect, FailDescr, FieldDescr, InteriorFieldDescr, OopSpecIndex,
+    SimpleFailDescr, SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
 };
 pub use resoperation::{
     BoxEnv, GuardPendingFieldEntry, GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef,

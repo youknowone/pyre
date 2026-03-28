@@ -600,6 +600,7 @@ impl DependencyGraph {
                     members: group_indices,
                     is_accumulating: false,
                     position: -1,
+                    operator: None,
                 });
             }
         }
