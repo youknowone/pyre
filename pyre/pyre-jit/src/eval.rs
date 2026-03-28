@@ -2066,16 +2066,13 @@ fn materialize_virtual_from_rd(
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
         // General struct: allocate based on max field offset + 8.
-        // resume.py:1437 allocate_with_vtable / allocate_struct parity.
         let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
         let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-        unsafe { *ptr = ob_type }; // ob_type at offset 0
+        unsafe { *ptr = ob_type };
         ptr as usize
     } else {
-        // VStructInfo without known_class: resume.py:634-637 uses typedescr.
-        // pyre doesn't have typedescr in rd_virtuals_info yet — return NULL.
         return Value::Ref(majit_ir::GcRef::NULL);
     };
 
@@ -2087,11 +2084,12 @@ fn materialize_virtual_from_rd(
     // Phase 3: setfields — decode each field and write to object.
     // resume.py:596-603: for each fielddescr, decoder.setfield(struct, num, descr)
     //
-    // fieldnums does NOT include ob_type — only actual instance fields.
-    // W_IntObject: fieldnums[0] = intval (offset 8)
-    // W_FloatObject: fieldnums[0] = floatval (offset 8)
+    // W_IntObject/W_FloatObject: payload is the LAST fieldnum.
+    // PtrInfo::Virtual has 1 fieldnum (intval only, no ob_type).
+    // PtrInfo::VirtualStruct has 2 fieldnums (ob_type + intval).
+    // Using last() handles both cases correctly.
     if ob_type == int_type_addr {
-        if let Some(&tagged) = fieldnums.first() {
+        if let Some(&tagged) = fieldnums.last() {
             let val = decode_tagged_value(
                 tagged,
                 dead_frame,
@@ -2112,7 +2110,7 @@ fn materialize_virtual_from_rd(
             }
         }
     } else if ob_type == float_type_addr {
-        if let Some(&tagged) = fieldnums.first() {
+        if let Some(&tagged) = fieldnums.last() {
             let val = decode_tagged_value(
                 tagged,
                 dead_frame,
@@ -2147,15 +2145,13 @@ fn materialize_virtual_from_rd(
                 rd_virtuals_info,
                 virtuals_cache,
             );
+            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8);
             let raw = match val {
                 Value::Int(n) => n,
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Ref(gc) => gc.0 as i64,
                 _ => 0,
             };
-            // resume.py:598-602: decoder.setfield(struct, num, descr)
-            // descr.offset() provides byte offset within the struct.
-            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8); // fallback: contiguous after ob_type
             unsafe {
                 *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
             }
