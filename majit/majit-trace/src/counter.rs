@@ -62,7 +62,7 @@ impl JitCounter {
         JitCounter {
             timetable: vec![Entry::default(); DEFAULT_SIZE],
             celltable: vec![false; DEFAULT_SIZE],
-            next_hash: 1,
+            next_hash: 0,
             decay_by_mult: 0.96_f64, // counter.py default decay=40 → 1.0-40*0.001=0.96
             increment: Self::compute_threshold_static(threshold),
             threshold,

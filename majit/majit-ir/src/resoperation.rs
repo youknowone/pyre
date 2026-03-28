@@ -144,8 +144,11 @@ pub struct Op {
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by rd_numb.
     pub rd_consts: Option<Vec<(i64, Type)>>,
-    /// resume.py:488 — virtual object field info (descr_index, known_class, fieldnums).
-    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
+    /// resume.py:488 — virtual object field info.
+    /// (descr_index, known_class, fieldnums, field_offsets)
+    /// field_offsets: byte offset of each field within the struct
+    /// (resume.py AbstractVirtualStructInfo.fielddescrs parity).
+    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,

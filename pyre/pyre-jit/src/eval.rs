@@ -13,6 +13,7 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
@@ -1020,6 +1021,96 @@ fn maybe_compile_and_run(
     None
 }
 
+/// compile.py:701-717 handle_fail outcome.
+enum HandleFailOutcome {
+    /// Bridge compiled successfully — continue in compiled code.
+    BridgeCompiled,
+    /// Resume in blackhole interpreter.
+    ResumeInBlackhole { restored: bool },
+}
+
+/// compile.py:701-717 handle_fail.
+///
+/// Single function containing the complete guard failure handling:
+/// must_compile decision (already computed by jitdriver) → if bridge:
+/// start_compiling + trace_and_compile_from_bridge + done_compiling;
+/// else: restore state for blackhole resume.
+fn handle_fail(
+    frame: &mut PyFrame,
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    should_bridge: bool,
+    owning_key: u64,
+    exit_layout: &CompiledExitLayout,
+    raw_values: &[i64],
+    jit_state: &mut PyreJitState,
+    _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+) -> HandleFailOutcome {
+    // compile.py:702-703: must_compile() AND not stack_almost_full()
+    if should_bridge && !stack_almost_full() {
+        let is_tracing = {
+            let (driver, _) = driver_pair();
+            driver.is_tracing()
+        };
+        if !is_tracing {
+            // compile.py:704: start_compiling (set ST_BUSY_FLAG)
+            {
+                let (driver, _) = driver_pair();
+                driver
+                    .meta_interp_mut()
+                    .set_guard_compiling(owning_key, trace_id, fail_index, true);
+            }
+            // compile.py:706-708: _trace_and_compile_from_bridge
+            // Restore state to get resume_pc, then trace bridge.
+            let meta = {
+                let (driver, _) = driver_pair();
+                driver.meta_interp().get_compiled_meta(green_key).cloned()
+            };
+            let resume_pc = if let Some(ref meta) = meta {
+                restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout)
+            } else {
+                None
+            };
+            let compiled = if let Some(pc) = resume_pc {
+                crate::call_jit::trace_and_compile_from_bridge(
+                    owning_key, trace_id, fail_index, frame, pc,
+                )
+            } else {
+                false
+            };
+            // compile.py:709: done_compiling (clear ST_BUSY_FLAG)
+            {
+                let (driver, _) = driver_pair();
+                driver
+                    .meta_interp_mut()
+                    .set_guard_compiling(owning_key, trace_id, fail_index, false);
+            }
+            if compiled {
+                return HandleFailOutcome::BridgeCompiled;
+            }
+            // Bridge failed — state already restored, fall through to blackhole
+            return HandleFailOutcome::ResumeInBlackhole {
+                restored: resume_pc.is_some(),
+            };
+        }
+    }
+    // compile.py:710-716: resume_in_blackhole
+    // Restore state for blackhole path.
+    let meta = {
+        let (driver, _) = driver_pair();
+        driver.meta_interp().get_compiled_meta(green_key).cloned()
+    };
+    let resume_pc = if let Some(ref meta) = meta {
+        restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout)
+    } else {
+        None
+    };
+    HandleFailOutcome::ResumeInBlackhole {
+        restored: resume_pc.is_some(),
+    }
+}
+
 /// RPython warmstate.py:387-423 execute_assembler.
 ///
 /// Run compiled machine code for a given green_key. Handles the
@@ -1063,7 +1154,6 @@ fn execute_assembler(
         &mut jit_state,
         env,
         || {},
-        restore_guard_failure_for_loop,
     );
 
     if majit_metainterp::majit_log_enabled() {
@@ -1071,8 +1161,7 @@ fn execute_assembler(
             DetailedDriverRunOutcome::Finished { .. } => "finished",
             DetailedDriverRunOutcome::Jump { .. } => "jump",
             DetailedDriverRunOutcome::Abort { .. } => "abort",
-            DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
-            DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
+            DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
         };
         eprintln!(
             "[jit][execute-assembler] outcome key={} pc={} kind={}",
@@ -1080,30 +1169,56 @@ fn execute_assembler(
         );
     }
 
-    // compile.py:701-710 handle_fail: bridge compilation REPLACES blackhole.
-    // compile.py:701-710: must_compile → _trace_and_compile_from_bridge.
-    // compile.py:703: not rstack.stack_almost_full() check before bridge.
+    // compile.py:701-717 handle_fail: bridge/blackhole decision.
     if let DetailedDriverRunOutcome::GuardFailure {
-        bridge_request: Some(req),
-        ..
-    } = &outcome
+        fail_index,
+        trace_id,
+        should_bridge,
+        owning_key,
+        ref raw_values,
+        ref exit_layout,
+    } = outcome
     {
-        let compiled = if !stack_almost_full() {
-            crate::call_jit::jit_bridge_compile_for_guard(
-                req.green_key,
-                req.trace_id,
-                req.fail_index,
-                frame,
-                req.resume_pc,
-            )
-        } else {
-            false
-        };
-        if compiled {
-            // RPython: ContinueRunningNormally after successful bridge.
-            return Some(LoopResult::ContinueRunningNormally);
+        match handle_fail(
+            frame,
+            green_key,
+            trace_id,
+            fail_index,
+            should_bridge,
+            owning_key,
+            exit_layout,
+            raw_values,
+            &mut jit_state,
+            info,
+        ) {
+            HandleFailOutcome::BridgeCompiled => {
+                return Some(LoopResult::ContinueRunningNormally);
+            }
+            HandleFailOutcome::ResumeInBlackhole { restored } => {
+                // Repackage as the old outcome format for handle_jit_outcome
+                let repackaged = DetailedDriverRunOutcome::GuardFailure {
+                    fail_index,
+                    trace_id,
+                    should_bridge: false,
+                    owning_key,
+                    raw_values: raw_values.clone(),
+                    exit_layout: exit_layout.clone(),
+                };
+                if !restored {
+                    // Guard recovery failed — restore pre-entry frame.
+                    driver.invalidate_loop(green_key);
+                    frame.next_instr = saved_ni;
+                    frame.valuestackdepth = saved_vsd;
+                    let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
+                    for i in 0..restore_len {
+                        frame.locals_cells_stack_w[i] = saved_locals[i];
+                    }
+                    frame.fix_array_ptrs();
+                    return None;
+                }
+                // Fall through to blackhole resume below
+            }
         }
-        // Bridge failed → fall through to handle_jit_outcome (blackhole).
     }
 
     // warmstate.py:410-421: no bridge → handle fail_descr outcomes (blackhole)
@@ -1238,7 +1353,6 @@ fn bound_reached(
             &mut jit_state,
             env,
             || {},
-            restore_guard_failure_for_loop,
         ))
     } else if !driver.is_tracing() {
         // warmstate.py:437-444 compile_and_run_once parity:
@@ -1254,7 +1368,6 @@ fn bound_reached(
                 &mut jit_state,
                 env,
                 || {},
-                restore_guard_failure_for_loop,
             ))
         } else if driver.is_tracing() {
             // RPython pyjitpl.py:2876-2888 _compile_and_run_once:
@@ -1300,45 +1413,32 @@ fn bound_reached(
         None
     };
     if let Some(outcome) = outcome {
-        // compile.py:701-710 handle_fail parity: bridge compilation and
-        // blackhole resume are MUTUALLY EXCLUSIVE. If must_compile is
-        // true, compile the bridge BEFORE any blackhole execution (the
-        // frame state must reflect the guard's restore point, not a
-        // post-blackhole advanced state). If bridge compilation fails
-        // or is not needed, fall through to blackhole.
-        let bridge_request = match &outcome {
-            DetailedDriverRunOutcome::GuardFailure {
-                bridge_request: Some(req),
-                ..
-            } => Some(req.clone()),
-            _ => None,
-        };
-        // compile.py:701-710 handle_fail parity: attempt bridge compilation.
-        // jit_bridge_compile_for_guard returns true only on success.
-        // On failure → fall through to blackhole (pyjitpl.py:2906-2907
-        // SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-        let bridge_compiled = if let Some(ref req) = bridge_request {
-            if !stack_almost_full() {
-                crate::call_jit::jit_bridge_compile_for_guard(
-                    req.green_key,
-                    req.trace_id,
-                    req.fail_index,
-                    frame,
-                    req.resume_pc,
-                )
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            JitAction::Return(result) => return Some(LoopResult::Done(result)),
-            JitAction::ContinueRunningNormally => {
-                // compile.py:714-716: if bridge was compiled, skip blackhole.
-                // RPython: handle_fail either compiles bridge OR resumes in
-                // blackhole, never both.
-                if !bridge_compiled {
+        // compile.py:701-717 handle_fail: bridge/blackhole decision.
+        if let DetailedDriverRunOutcome::GuardFailure {
+            fail_index,
+            trace_id,
+            should_bridge,
+            owning_key,
+            ref raw_values,
+            ref exit_layout,
+        } = outcome
+        {
+            match handle_fail(
+                frame,
+                green_key,
+                trace_id,
+                fail_index,
+                should_bridge,
+                owning_key,
+                exit_layout,
+                raw_values,
+                &mut jit_state,
+                info,
+            ) {
+                HandleFailOutcome::BridgeCompiled => {
+                    return Some(LoopResult::ContinueRunningNormally);
+                }
+                HandleFailOutcome::ResumeInBlackhole { restored: true } => {
                     let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
                     if let Some(ref vals) = typed {
                         match crate::call_jit::resume_in_blackhole(frame, vals, loop_header_pc) {
@@ -1352,8 +1452,13 @@ fn bound_reached(
                         }
                     }
                 }
+                HandleFailOutcome::ResumeInBlackhole { restored: false } => {}
             }
-            JitAction::Continue => {}
+        } else {
+            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+                JitAction::Return(result) => return Some(LoopResult::Done(result)),
+                JitAction::ContinueRunningNormally | JitAction::Continue => {}
+            }
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
@@ -1436,15 +1541,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             &mut jit_state,
             &env,
             || {},
-            restore_guard_failure_for_loop,
         );
         if majit_metainterp::majit_log_enabled() {
             let kind = match &outcome {
                 DetailedDriverRunOutcome::Finished { .. } => "finished",
                 DetailedDriverRunOutcome::Jump { .. } => "jump",
                 DetailedDriverRunOutcome::Abort { .. } => "abort",
-                DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => "guard-restored",
-                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-unrestored",
+                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
             };
             eprintln!(
                 "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
@@ -1454,35 +1557,39 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             );
         }
 
-        // compile.py:701-710 handle_fail parity.
+        // compile.py:701-717 handle_fail parity.
         if let DetailedDriverRunOutcome::GuardFailure {
-            bridge_request: Some(req),
-            ..
-        } = &outcome
+            fail_index,
+            trace_id,
+            should_bridge,
+            owning_key,
+            ref raw_values,
+            ref exit_layout,
+        } = outcome
         {
-            let compiled = if !stack_almost_full() {
-                crate::call_jit::jit_bridge_compile_for_guard(
-                    req.green_key,
-                    req.trace_id,
-                    req.fail_index,
-                    frame,
-                    req.resume_pc,
-                )
-            } else {
-                false
-            };
-            if compiled {
-                frame.fix_array_ptrs();
-                return None; // caller re-enters eval_with_jit → compiled code with bridge
+            match handle_fail(
+                frame,
+                green_key,
+                trace_id,
+                fail_index,
+                should_bridge,
+                owning_key,
+                exit_layout,
+                raw_values,
+                &mut jit_state,
+                info,
+            ) {
+                HandleFailOutcome::BridgeCompiled => {
+                    frame.fix_array_ptrs();
+                    return None;
+                }
+                HandleFailOutcome::ResumeInBlackhole { .. } => {}
             }
-        }
-
-        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            JitAction::Return(result) => return Some(result),
-            // warmspot.py:941-954 ll_portal_runner parity:
-            // Fall through to eval_loop_jit (= portal_ptr) which can
-            // re-enter compiled code via jit_merge_point.
-            JitAction::ContinueRunningNormally | JitAction::Continue => {}
+        } else {
+            match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+                JitAction::Return(result) => return Some(result),
+                JitAction::ContinueRunningNormally | JitAction::Continue => {}
+            }
         }
 
         // After compiled code guard-restored fallback, re-establish the
@@ -1607,110 +1714,213 @@ fn handle_jit_outcome(
             let _ = frame;
             JitAction::Continue
         }
-        DetailedDriverRunOutcome::GuardFailure { restored: true, .. } => {
-            // RPython compile.py:710 handle_fail → resume_in_blackhole.
+        DetailedDriverRunOutcome::GuardFailure { .. } => {
+            // Guard failure handled by handle_fail() before reaching here.
+            // If we reach handle_jit_outcome with a GuardFailure, state was
+            // already restored — proceed to blackhole resume.
             JitAction::ContinueRunningNormally
         }
-        DetailedDriverRunOutcome::GuardFailure {
-            restored: false, ..
-        }
-        | DetailedDriverRunOutcome::Abort { .. } => JitAction::Continue,
+        DetailedDriverRunOutcome::Abort { .. } => JitAction::Continue,
     }
 }
 
-/// Materialize a virtual object from rd_virtuals_info.
-/// Each virtual has (descr_index, known_class, fieldnums) where fieldnums
-/// are tagged references (TAGBOX → dead_frame, TAGINT → inline, TAGCONST → pool).
+/// resume.py:945-956 getvirtual_ptr parity.
+///
+/// Lazily materializes a virtual from rd_virtuals_info[vidx].
+/// Pattern: check cache → allocate_with_vtable → cache(real ptr) → setfields.
+/// RPython caches the REAL object pointer before filling fields, enabling
+/// recursive/shared virtual resolution without NULL placeholders.
 fn materialize_virtual_from_rd(
     vidx: usize,
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>)]>,
+    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>, Vec<usize>)]>,
+    virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
+    // resume.py:951: v = self.virtuals_cache.get_ptr(index)
+    if let Some(cached) = virtuals_cache.get(&vidx) {
+        return cached.clone();
+    }
     let Some(virtuals) = rd_virtuals_info else {
         return Value::Ref(majit_ir::GcRef::NULL);
     };
-    let Some((_descr_idx, known_class, fieldnums)) = virtuals.get(vidx) else {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit] materialize_virtual: vidx={vidx} out of range (len={})",
-                virtuals.len()
-            );
-        }
+    let Some((_descr_idx, known_class, fieldnums, field_offsets)) = virtuals.get(vidx) else {
         return Value::Ref(majit_ir::GcRef::NULL);
     };
-    if majit_metainterp::majit_log_enabled() {
-        let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
-        eprintln!(
-            "[jit] materialize_virtual: vidx={vidx} known_class={known_class:?} fieldnums={fieldnums:?} rd_consts={rd_consts:?} INT_TYPE={int_type_addr:#x}",
-        );
-        for (i, &fnum) in fieldnums.iter().enumerate() {
-            let (val, tag) = majit_metainterp::resume::untag(fnum);
-            eprintln!("  field[{i}] tagged={fnum} → val={val} tag={tag}");
-        }
-    }
-    // Resolve field values from tagged numbering
-    let mut field_values = Vec::with_capacity(fieldnums.len());
-    for &tagged in fieldnums {
-        let (val, tagbits) = majit_metainterp::resume::untag(tagged);
-        let field_val = match tagbits {
-            majit_metainterp::resume::TAGBOX => {
-                let idx = if val < 0 {
-                    (val + num_failargs) as usize
-                } else {
-                    val as usize
-                };
-                dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
-            }
-            majit_metainterp::resume::TAGINT => Value::Int(val as i64),
-            majit_metainterp::resume::TAGCONST => {
-                let (c, tp) = rd_consts
-                    .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
-                    .copied()
-                    .unwrap_or((0, majit_ir::Type::Int));
-                match tp {
-                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
-                    majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
-                    _ => Value::Int(c),
-                }
-            }
-            _ => Value::Int(0), // TAGVIRTUAL — nested virtual, treat as 0 for now
-        };
-        field_values.push(field_val);
-    }
-    // Materialize the virtual object based on known_class (ob_type pointer).
-    // field_values[0] = ob_type (class pointer), field_values[1..] = payload.
-    // RPython resume.py: AbstractVirtualInfo.allocate_then_set_content.
-    let ob_type = known_class.unwrap_or_else(|| {
-        // No known_class: try field[0] (ob_type field at offset 0).
-        field_values
-            .first()
-            .map(|v| match v {
-                Value::Int(n) => *n,
-                Value::Ref(gc) => gc.0 as i64,
-                _ => 0,
-            })
-            .unwrap_or(0)
-    });
+
+    // resume.py:617-621 VirtualInfo.allocate parity:
+    //   Phase 1: struct = allocate_with_vtable(descr)
+    //   Phase 2: virtuals_cache.set_ptr(index, struct)  ← BEFORE setfields
+    //   Phase 3: self.setfields(decoder, struct)         ← fields filled AFTER
+    let ob_type = known_class.unwrap_or(0);
     let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
     let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
-    if ob_type == int_type_addr {
-        let payload = field_values
-            .get(1)
-            .map(decode_virtual_int_payload)
-            .unwrap_or(0);
-        let ptr = pyre_object::intobject::w_int_new(payload);
-        Value::Ref(majit_ir::GcRef(ptr as usize))
+
+    // Phase 1: allocate_with_vtable — create object with ob_type set.
+    let obj_ptr: usize = if ob_type == int_type_addr {
+        let obj = Box::new(pyre_object::intobject::W_IntObject {
+            ob_header: pyre_object::pyobject::PyObject {
+                ob_type: ob_type as *const pyre_object::pyobject::PyType,
+            },
+            intval: 0,
+        });
+        Box::into_raw(obj) as usize
     } else if ob_type == float_type_addr {
-        let payload = field_values
-            .get(1)
-            .map(decode_virtual_float_payload_bits)
-            .unwrap_or(0);
-        let ptr = pyre_object::floatobject::w_float_new(f64::from_bits(payload as u64));
-        Value::Ref(majit_ir::GcRef(ptr as usize))
+        let obj = Box::new(pyre_object::floatobject::W_FloatObject {
+            ob_header: pyre_object::pyobject::PyObject {
+                ob_type: ob_type as *const pyre_object::pyobject::PyType,
+            },
+            floatval: 0.0,
+        });
+        Box::into_raw(obj) as usize
+    } else if ob_type != 0 {
+        // General struct: allocate based on max field offset + 8.
+        // resume.py:1437 allocate_with_vtable / allocate_struct parity.
+        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
+        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
+        unsafe { *ptr = ob_type }; // ob_type at offset 0
+        ptr as usize
     } else {
-        Value::Ref(majit_ir::GcRef::NULL)
+        // VStructInfo without known_class: resume.py:634-637 uses typedescr.
+        // pyre doesn't have typedescr in rd_virtuals_info yet — return NULL.
+        return Value::Ref(majit_ir::GcRef::NULL);
+    };
+
+    // Phase 2: cache REAL object pointer BEFORE setting fields.
+    // resume.py:620: decoder.virtuals_cache.set_ptr(index, struct)
+    let obj_ref = Value::Ref(majit_ir::GcRef(obj_ptr));
+    virtuals_cache.insert(vidx, obj_ref.clone());
+
+    // Phase 3: setfields — decode each field and write to object.
+    // resume.py:596-603: for each fielddescr, decoder.setfield(struct, num, descr)
+    //
+    // fieldnums does NOT include ob_type — only actual instance fields.
+    // W_IntObject: fieldnums[0] = intval (offset 8)
+    // W_FloatObject: fieldnums[0] = floatval (offset 8)
+    if ob_type == int_type_addr {
+        if let Some(&tagged) = fieldnums.first() {
+            let val = decode_tagged_value(
+                tagged,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals_info,
+                virtuals_cache,
+            );
+            let intval = match val {
+                Value::Int(n) => n,
+                Value::Ref(gc) if !gc.is_null() => unsafe {
+                    pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
+                },
+                _ => 0,
+            };
+            unsafe {
+                (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
+            }
+        }
+    } else if ob_type == float_type_addr {
+        if let Some(&tagged) = fieldnums.first() {
+            let val = decode_tagged_value(
+                tagged,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals_info,
+                virtuals_cache,
+            );
+            let floatval = match val {
+                Value::Float(f) => f,
+                Value::Int(bits) => f64::from_bits(bits as u64),
+                _ => 0.0,
+            };
+            unsafe {
+                (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval = floatval;
+            }
+        }
+    } else {
+        // General struct: resume.py:598-602 decoder.setfield(struct, num, descr)
+        // Use field_offsets from fielddescrs for byte-accurate writes.
+        for (i, &tagged) in fieldnums.iter().enumerate() {
+            if tagged == majit_ir::resumedata::NULLREF
+                || tagged == majit_ir::resumedata::UNINITIALIZED_TAG
+            {
+                continue;
+            }
+            let val = decode_tagged_value(
+                tagged,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals_info,
+                virtuals_cache,
+            );
+            let raw = match val {
+                Value::Int(n) => n,
+                Value::Float(f) => f.to_bits() as i64,
+                Value::Ref(gc) => gc.0 as i64,
+                _ => 0,
+            };
+            // resume.py:598-602: decoder.setfield(struct, num, descr)
+            // descr.offset() provides byte offset within the struct.
+            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8); // fallback: contiguous after ob_type
+            unsafe {
+                *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
+            }
+        }
+    }
+    obj_ref
+}
+
+/// resume.py:1552-1588 ResumeDataDirectReader decode_int/decode_ref parity.
+///
+/// Decode a tagged value from rd_numb into a concrete Value.
+/// Handles TAGBOX (deadframe), TAGINT (inline), TAGCONST (constant pool),
+/// and TAGVIRTUAL (lazy materialization via materialize_virtual_from_rd).
+fn decode_tagged_value(
+    tagged: i16,
+    dead_frame: &[Value],
+    num_failargs: i32,
+    rd_consts: &[(i64, majit_ir::Type)],
+    rd_virtuals_info: Option<&[(u32, Option<i64>, Vec<i16>, Vec<usize>)]>,
+    virtuals_cache: &mut HashMap<usize, Value>,
+) -> Value {
+    let (val, tagbits) = majit_metainterp::resume::untag(tagged);
+    match tagbits {
+        majit_metainterp::resume::TAGBOX => {
+            let idx = if val < 0 {
+                (val + num_failargs) as usize
+            } else {
+                val as usize
+            };
+            dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
+        }
+        majit_metainterp::resume::TAGINT => Value::Int(val as i64),
+        majit_metainterp::resume::TAGCONST => {
+            let (c, tp) = rd_consts
+                .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
+                .copied()
+                .unwrap_or((0, majit_ir::Type::Int));
+            match tp {
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
+                majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
+                _ => Value::Int(c),
+            }
+        }
+        majit_metainterp::resume::TAGVIRTUAL => {
+            // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
+            materialize_virtual_from_rd(
+                val as usize,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals_info,
+                virtuals_cache,
+            )
+        }
+        _ => Value::Int(0),
     }
 }
 
@@ -1889,11 +2099,11 @@ fn rebuild_typed_from_rd_numb(
     let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
-    // RPython calls _prepare_virtuals then _prepare_next_section per frame.
     let mut typed = Vec::new();
-
-    // Decode dead frame raw values to typed values first.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+
+    // resume.py:988: _prepare_virtuals — initialize virtuals_cache.
+    let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
     // resume.py:1017-1026 _prepare_next_section: decode each frame's slots.
     for frame in &frames {
@@ -1903,6 +2113,7 @@ fn rebuild_typed_from_rd_numb(
             &dead_frame_typed,
             exit_layout,
             &mut typed,
+            &mut virtuals_cache,
         );
     }
 
@@ -1924,8 +2135,12 @@ fn _prepare_next_section(
     dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
     typed: &mut Vec<Value>,
+    virtuals_cache: &mut HashMap<usize, Value>,
 ) {
     use majit_ir::resumedata::RebuiltValue;
+    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    let rd_virtuals = exit_layout.rd_virtuals_info.as_deref();
+    let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
             RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
@@ -1936,13 +2151,14 @@ fn _prepare_next_section(
                 majit_ir::Type::Void => Value::Void,
             },
             RebuiltValue::Int(i) => Value::Int(*i as i64),
-            // resume.py:983-991: TAGVIRTUAL → materialize from rd_virtuals_info.
+            // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
             RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
                 *vidx,
                 dead_frame_typed,
-                exit_layout.exit_types.len() as i32,
-                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
-                exit_layout.rd_virtuals_info.as_deref(),
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
             ),
             RebuiltValue::Unassigned => Value::Int(0),
         });

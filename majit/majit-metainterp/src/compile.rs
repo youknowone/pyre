@@ -50,7 +50,7 @@ pub struct CompiledExitLayout {
     /// resume.py:451 — shared constant pool.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object blueprints (descr_index, known_class, fieldnums).
-    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>)>>,
+    pub rd_virtuals_info: Option<Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)>>,
 }
 
 /// Typed result from running compiled code.
@@ -197,7 +197,7 @@ pub(crate) fn build_guard_metadata(
         let (rd_virtuals_info, rd_consts) = if let Some(ref entries) = op.rd_virtuals {
             let mut rd_consts_vec = rd_consts.clone().unwrap_or_default();
             let initial_consts_len = rd_consts_vec.len();
-            let info: Vec<(u32, Option<i64>, Vec<i16>)> = entries
+            let info: Vec<(u32, Option<i64>, Vec<i16>, Vec<usize>)> = entries
                 .iter()
                 .map(|entry| {
                     let descr_idx = entry.descr.index();
@@ -251,7 +251,9 @@ pub(crate) fn build_guard_metadata(
                             }
                         })
                         .collect();
-                    (descr_idx, known_class, fieldnums)
+                    // Legacy GuardVirtualEntry doesn't carry field offsets.
+                    let field_offsets = vec![];
+                    (descr_idx, known_class, fieldnums, field_offsets)
                 })
                 .collect();
             // Only update rd_consts if new entries were added.
@@ -427,7 +429,7 @@ pub(crate) fn build_guard_metadata(
                 .map(|entries| {
                     entries
                         .iter()
-                        .map(|(descr_idx, known_class, fieldnums)| {
+                        .map(|(descr_idx, known_class, fieldnums, _field_offsets)| {
                             majit_codegen::ExitVirtualLayout::Struct {
                                 type_id: known_class.map_or(0, |kc| kc as u32),
                                 descr_index: *descr_idx,

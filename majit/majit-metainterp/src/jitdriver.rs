@@ -46,8 +46,8 @@ use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
-    BackEdgeAction, BridgeCompilationRequest, CompiledExitLayout, DetailedDriverRunOutcome,
-    InlineDecision, JitStats, MetaInterp,
+    BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision, JitStats,
+    MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::trace_ctx::TraceCtx;
@@ -1695,6 +1695,9 @@ impl<S: JitState> JitDriver<S> {
     /// run compiled code, distinguish normal JUMP from guard failure, and
     /// allow the caller to rebuild interpreter state and start bridge tracing
     /// from the recovered resume pc.
+    /// warmstate.py:398-422 execute_assembler: run compiled code and return
+    /// the outcome. For guard failures, returns raw exit data without any
+    /// state restoration — the caller processes it via handle_fail().
     pub fn run_compiled_detailed_with_bridge_keyed(
         &mut self,
         green_key: u64,
@@ -1702,12 +1705,6 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-        on_guard_failure: impl Fn(
-            &mut S,
-            &S::Meta,
-            &[i64],
-            &crate::compile::CompiledExitLayout,
-        ) -> Option<usize>,
     ) -> DetailedDriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             if crate::majit_log_enabled() {
@@ -1851,35 +1848,16 @@ impl<S: JitState> JitDriver<S> {
         let (should_bridge, owning_key) =
             self.meta
                 .must_compile_with_values(guard_loop_key, trace_id, fail_index, &raw_values);
-        let resume_pc = on_guard_failure(state, &exit_meta, &raw_values, &exit_layout);
-        let restored = resume_pc.is_some();
-        if restored {
-            self.sync_after(state, &exit_meta, descriptor.as_ref());
-        }
 
-        // RPython compile.py handle_fail parity: instead of starting
-        // bridge tracing here (where &mut self is held), return a
-        // BridgeCompilationRequest so the CALLER can compile with
-        // the driver borrow released. This matches RPython where
-        // handle_fail creates a fresh MetaInterp separate from the
-        // main execution loop.
-        let bridge_request = if should_bridge && restored && !self.is_tracing() {
-            Some(BridgeCompilationRequest {
-                green_key: owning_key,
-                trace_id,
-                fail_index,
-                resume_pc: resume_pc.unwrap(),
-            })
-        } else {
-            None
-        };
-
+        // Return raw guard failure data. State restoration and bridge/
+        // blackhole decision happen in the caller's handle_fail().
         DetailedDriverRunOutcome::GuardFailure {
-            restored,
-            via_blackhole: false,
-            fail_index: Some(fail_index),
-            trace_id: Some(trace_id),
-            bridge_request,
+            fail_index,
+            trace_id,
+            should_bridge,
+            owning_key,
+            raw_values,
+            exit_layout,
         }
     }
 
