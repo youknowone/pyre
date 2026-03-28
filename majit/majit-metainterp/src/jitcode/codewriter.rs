@@ -19,12 +19,13 @@ use super::{
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F,
     BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
     BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
-    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
+    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F,
     BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK,
-    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
+    BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
+    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
+    BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
+    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallAssemblerTarget,
+    JitCallTarget, JitCode,
 };
 
 #[derive(Default)]
@@ -367,6 +368,17 @@ impl JitCodeBuilder {
 
     pub fn abort_permanent(&mut self) {
         self.push_u8(BC_ABORT_PERMANENT);
+    }
+
+    /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
+    pub fn emit_raise(&mut self, src: u16) {
+        self.push_u8(BC_RAISE);
+        self.push_u16(src);
+    }
+
+    /// blackhole.py bhimpl_reraise(): re-raise exception_last_value.
+    pub fn emit_reraise(&mut self) {
+        self.push_u8(BC_RERAISE);
     }
 
     pub fn inline_call(&mut self, sub_jitcode_idx: u16) {

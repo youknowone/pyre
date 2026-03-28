@@ -724,12 +724,12 @@ use crate::jitcode::{
     BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F,
     BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
     BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
-    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
+    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F,
     BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK,
-    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCode, MIFrame, MIFrameStack,
+    BC_RERAISE, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
+    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
+    BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
+    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCode, MIFrame, MIFrameStack,
 };
 
 /// Return type of a blackhole frame.
@@ -743,10 +743,16 @@ pub enum BhReturnType {
     Void,
 }
 
-/// Signal that the current frame executed a return instruction.
+/// Signal from dispatch_one to run().
 ///
-/// RPython: `LeaveFrame` exception in blackhole.py
-struct LeaveFrame;
+/// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
+enum DispatchError {
+    /// Normal return from frame (RPython: LeaveFrame).
+    LeaveFrame,
+    /// Exception raised — must call handle_exception_in_frame.
+    /// Carries the exception value (GcRef pointer as i64).
+    RaiseException(i64),
+}
 
 /// Jitcode-based blackhole interpreter.
 ///
@@ -1053,7 +1059,8 @@ impl BlackholeInterpreter {
 
     /// Execute the dispatch loop on the current jitcode.
     ///
-    /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks.
+    /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
+    /// catches exceptions and calls `handle_exception_in_frame`.
     pub fn run(&mut self) {
         let trace = crate::majit_log_enabled();
         loop {
@@ -1081,15 +1088,32 @@ impl BlackholeInterpreter {
                     stack_len
                 );
             }
-            if self.dispatch_one(opcode).is_err() {
-                if trace {
-                    eprintln!(
-                        "[bh-trace] abort/return at pos={} reg0={}",
-                        pos_before,
-                        self.registers_i.get(0).copied().unwrap_or(-1)
-                    );
+            match self.dispatch_one(opcode) {
+                Ok(()) => {}
+                Err(DispatchError::LeaveFrame) => {
+                    if trace {
+                        eprintln!(
+                            "[bh-trace] leave-frame at pos={} reg0={}",
+                            pos_before,
+                            self.registers_i.get(0).copied().unwrap_or(-1)
+                        );
+                    }
+                    return;
                 }
-                return;
+                Err(DispatchError::RaiseException(exc)) => {
+                    // blackhole.py:359-361: except Exception → handle_exception_in_frame
+                    if trace {
+                        eprintln!("[bh-trace] exception at pos={} exc=0x{:x}", pos_before, exc);
+                    }
+                    if self.handle_exception_in_frame(exc) {
+                        // Handler found, continue execution at handler target
+                        continue;
+                    }
+                    // No handler: propagate exception via got_exception flag
+                    self.got_exception = true;
+                    self.exception_last_value = exc;
+                    return;
+                }
             }
         }
     }
@@ -1097,7 +1121,7 @@ impl BlackholeInterpreter {
     /// Dispatch a single bytecode instruction with concrete execution.
     ///
     /// RPython: bytecode dispatch in `dispatch_loop()`, each `bhimpl_*` method
-    fn dispatch_one(&mut self, opcode: u8) -> Result<(), LeaveFrame> {
+    fn dispatch_one(&mut self, opcode: u8) -> Result<(), DispatchError> {
         match opcode {
             BC_LOAD_CONST_I => {
                 let dst = self.next_u16() as usize;
@@ -1297,7 +1321,7 @@ impl BlackholeInterpreter {
                     if self.merge_point_jitcode_pc == Some(target) {
                         self.position = target;
                         self.reached_merge_point = true;
-                        return Err(LeaveFrame);
+                        return Err(DispatchError::LeaveFrame);
                     }
                     self.position = target;
                 }
@@ -1307,7 +1331,7 @@ impl BlackholeInterpreter {
                 if self.merge_point_jitcode_pc == Some(target) {
                     self.position = target;
                     self.reached_merge_point = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
                 self.position = target;
             }
@@ -1318,7 +1342,7 @@ impl BlackholeInterpreter {
                 // check if this is the merge point to hand back to JIT.
                 if self.merge_point_jitcode_pc == Some(self.last_opcode_position) {
                     self.reached_merge_point = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
             }
             BC_SET_SELECTED => {
@@ -1329,11 +1353,43 @@ impl BlackholeInterpreter {
                 let src = self.next_u16() as usize;
                 self.tmpreg_r = self.registers_r[src];
                 self.return_type = BhReturnType::Ref;
-                return Err(LeaveFrame);
+                return Err(DispatchError::LeaveFrame);
             }
-            BC_ABORT | BC_ABORT_PERMANENT => {
+            BC_ABORT => {
                 self.aborted = true;
-                return Err(LeaveFrame);
+                return Err(DispatchError::LeaveFrame);
+            }
+            BC_ABORT_PERMANENT => {
+                // blackhole.py bhimpl_raise parity: exception path bytecodes
+                // trigger RaiseException so handle_exception_in_frame can route
+                // to the except handler. If no TLS exception is available,
+                // fall back to abort.
+                let exc = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc != 0 {
+                    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                    return Err(DispatchError::RaiseException(exc));
+                }
+                self.aborted = true;
+                return Err(DispatchError::LeaveFrame);
+            }
+            // blackhole.py:1000 bhimpl_raise(excvalue)
+            BC_RAISE => {
+                let src = self.next_u16() as usize;
+                let exc = self.registers_r[src];
+                if exc != 0 {
+                    return Err(DispatchError::RaiseException(exc));
+                }
+                self.aborted = true;
+                return Err(DispatchError::LeaveFrame);
+            }
+            // blackhole.py:1006 bhimpl_reraise()
+            BC_RERAISE => {
+                let exc = self.exception_last_value;
+                if exc != 0 {
+                    return Err(DispatchError::RaiseException(exc));
+                }
+                self.aborted = true;
+                return Err(DispatchError::LeaveFrame);
             }
             BC_INLINE_CALL => {
                 let sub_idx = self.next_u16() as usize;
@@ -1384,7 +1440,7 @@ impl BlackholeInterpreter {
                 // If callee aborted or got an exception, propagate to caller.
                 if callee.aborted {
                     self.aborted = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
                 if callee.got_exception {
                     let exc_val = callee.exception_last_value;
@@ -1394,7 +1450,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
 
                 // Copy runtime stacks back
@@ -1434,7 +1490,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
                 self.registers_i[dst] = result;
             }
@@ -1478,7 +1534,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
                 // result == 0 without exception is a legitimate null ref
                 // (e.g., None object has non-zero address in pyre, so this
@@ -1507,7 +1563,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
                 self.registers_f[dst] = result;
             }
@@ -1530,7 +1586,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
             }
             BC_RESIDUAL_CALL_VOID => {
@@ -1547,7 +1603,7 @@ impl BlackholeInterpreter {
                     }
                     self.exception_last_value = exc_val;
                     self.got_exception = true;
-                    return Err(LeaveFrame);
+                    return Err(DispatchError::LeaveFrame);
                 }
             }
             // -- State field access --

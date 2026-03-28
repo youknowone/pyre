@@ -2490,6 +2490,28 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return 0;
     }
 
+    // op_code 10 = CHECK_EXC_MATCH isinstance check (from codewriter CheckExcMatch).
+    // lhs = exception value, rhs = exception type to match.
+    if op_code == 10 {
+        let matched = unsafe {
+            if !pyre_object::is_exception(lhs) {
+                true
+            } else {
+                let kind = pyre_object::w_exception_get_kind(lhs);
+                if pyre_object::is_str(rhs) {
+                    let type_name = pyre_object::w_str_get_value(rhs);
+                    pyre_object::exc_kind_matches(kind, type_name)
+                } else if pyre_interpreter::is_builtin_code(rhs) {
+                    let type_name = pyre_interpreter::builtin_code_name(rhs);
+                    pyre_object::exc_kind_matches(kind, type_name)
+                } else {
+                    true
+                }
+            }
+        };
+        return pyre_object::w_bool_from(matched) as i64;
+    }
+
     // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
     // ComparisonOperator discriminant. Reverse the mapping to get the enum.
     let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
