@@ -3927,8 +3927,16 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_loops
             .get(&green_key)
             .and_then(|c| c.guard_failures.get(&(c.root_trace_id, fail_index)))
-            .is_some_and(|info| self.warm_state.counter.would_fire(info.guard_hash));
-        if would { self.trace_eagerness } else { 0 }
+            .is_some_and(|info| {
+                self.warm_state
+                    .counter
+                    .would_fire_with_threshold(info.guard_hash, self.warm_state.bridge_threshold())
+            });
+        if would {
+            self.warm_state.bridge_threshold()
+        } else {
+            0
+        }
     }
 
     /// rstack.py stack_almost_full: True if stack is > 15/16th full.
@@ -4951,9 +4959,15 @@ impl<M: Clone> MetaInterp<M> {
                             .guard_hash
                             .wrapping_mul(777767777)
                             .wrapping_add((intval as u64).wrapping_mul(1442968193));
-                        self.warm_state.counter.would_fire(per_value_hash)
+                        self.warm_state.counter.would_fire_with_threshold(
+                            per_value_hash,
+                            self.warm_state.bridge_threshold(),
+                        )
                     } else {
-                        self.warm_state.counter.would_fire(info.guard_hash)
+                        self.warm_state.counter.would_fire_with_threshold(
+                            info.guard_hash,
+                            self.warm_state.bridge_threshold(),
+                        )
                     }
                 });
             if must_compile {

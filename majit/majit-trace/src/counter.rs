@@ -141,15 +141,24 @@ impl JitCounter {
 
     /// Check if counter would fire without modifying state.
     pub fn would_fire(&self, hash: u64) -> bool {
+        self.would_fire_with_increment(hash, self.increment)
+    }
+
+    /// Check if counter would fire against a specific threshold.
+    pub fn would_fire_with_threshold(&self, hash: u64, threshold: u32) -> bool {
+        self.would_fire_with_increment(hash, Self::compute_threshold_static(threshold))
+    }
+
+    fn would_fire_with_increment(&self, hash: u64, increment: f64) -> bool {
         let index = Self::get_index(hash);
         let subhash = Self::get_subhash(hash);
         let entry = &self.timetable[index];
         for i in 0..ASSOCIATIVITY {
             if entry.subhashes[i] == subhash {
-                return entry.times[i] as f64 + self.increment >= 1.0;
+                return entry.times[i] as f64 + increment >= 1.0;
             }
         }
-        self.increment >= 1.0
+        increment >= 1.0
     }
 
     /// counter.py:185-202 tick(hash, increment)
