@@ -101,10 +101,27 @@ impl RecentPureOps {
     }
 
     /// pure.py:57-65 lookup1(opt, box0, descr).
-    fn lookup1(&self, opcode: OpCode, arg0: OpRef) -> Option<OpRef> {
+    ///
+    /// RPython: `box0.same_box(get_box_replacement(op.getarg(0)))`.
+    /// `same_box` is identity for non-constants, value equality for constants.
+    /// The `same_box` callback combines get_box_replacement + value comparison.
+    fn lookup1(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        descr_index: Option<u32>,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
-            if k.opcode == opcode && k.args.len() == 1 && k.args[0] == arg0 {
+            if k.opcode != opcode || k.args.len() != 1 {
+                continue;
+            }
+            if k.descr_index != descr_index {
+                continue;
+            }
+            // pure.py:62 — box0.same_box(get_box_replacement(op.getarg(0)))
+            if same_box(arg0, k.args[0]) {
                 return Some(*result);
             }
         }
@@ -112,22 +129,30 @@ impl RecentPureOps {
     }
 
     /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
+    ///
+    /// `same_box` applies get_box_replacement internally and uses
+    /// value equality for constants (history.py:204-205 Const.same_box).
     fn lookup2(
         &self,
         opcode: OpCode,
         arg0: OpRef,
         arg1: OpRef,
+        descr_index: Option<u32>,
         commutative: bool,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
             if k.opcode != opcode || k.args.len() != 2 {
                 continue;
             }
-            if k.args[0] == arg0 && k.args[1] == arg1 {
-                return Some(*result);
+            if k.descr_index != descr_index {
+                continue;
             }
-            if commutative && k.args[0] == arg1 && k.args[1] == arg0 {
+            // pure.py:72-75 — same_box includes get_box_replacement
+            if (same_box(arg0, k.args[0]) && same_box(arg1, k.args[1]))
+                || (commutative && same_box(arg1, k.args[0]) && same_box(arg0, k.args[1]))
+            {
                 return Some(*result);
             }
         }
@@ -295,20 +320,32 @@ impl OptPure {
         self.lookup_pure(&key)
     }
 
-    /// pure.py: lookup1(opt, box0, descr) — look up a unary pure op result.
-    pub fn lookup1(&self, opcode: OpCode, arg0: OpRef) -> Option<OpRef> {
-        self.cache.lookup1(opcode, arg0)
+    /// pure.py:57-65 lookup1(opt, box0, descr).
+    ///
+    /// `same_box(a, b)`: should apply get_box_replacement to `b` and then
+    /// compare — identity for ops, value equality for constants.
+    pub fn lookup1(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        descr_index: Option<u32>,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
+        self.cache.lookup1(opcode, arg0, descr_index, same_box)
     }
 
-    /// pure.py: lookup2(opt, box0, box1, descr, commutative)
+    /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
     pub fn lookup2(
         &self,
         opcode: OpCode,
         arg0: OpRef,
         arg1: OpRef,
+        descr_index: Option<u32>,
         commutative: bool,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
-        self.cache.lookup2(opcode, arg0, arg1, commutative)
+        self.cache
+            .lookup2(opcode, arg0, arg1, descr_index, commutative, same_box)
     }
 
     /// Record a CALL_PURE result from a RECORD_KNOWN_RESULT hint.
@@ -1927,26 +1964,28 @@ mod tests {
         // Record via pure_from_args
         pass.pure_from_args(OpCode::IntAdd, &[OpRef(10), OpRef(20)], OpRef(30));
 
+        // same_box: identity comparison (no constants, no forwarding)
+        let sb = |a: OpRef, b: OpRef| a == b;
         // lookup2 should find it
         assert!(
-            pass.lookup2(OpCode::IntAdd, OpRef(10), OpRef(20), false)
+            pass.lookup2(OpCode::IntAdd, OpRef(10), OpRef(20), None, false, sb)
                 .is_some()
         );
         // lookup2 with commutative should find swapped
         assert!(
-            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), true)
+            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), None, true, sb)
                 .is_some()
         );
         // Non-commutative swapped should NOT find it
         assert!(
-            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), false)
+            pass.lookup2(OpCode::IntAdd, OpRef(20), OpRef(10), None, false, sb)
                 .is_none()
         );
 
         // lookup1 for a unary op
         pass.pure_from_args(OpCode::IntNeg, &[OpRef(10)], OpRef(40));
-        assert!(pass.lookup1(OpCode::IntNeg, OpRef(10)).is_some());
-        assert!(pass.lookup1(OpCode::IntNeg, OpRef(99)).is_none());
+        assert!(pass.lookup1(OpCode::IntNeg, OpRef(10), None, sb).is_some());
+        assert!(pass.lookup1(OpCode::IntNeg, OpRef(99), None, sb).is_none());
     }
 
     #[test]
