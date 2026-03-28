@@ -1996,23 +1996,6 @@ impl<M: Clone> MetaInterp<M> {
                         green_key,
                         inputargs.len()
                     );
-                    // Debug: print first 5 guards with their opcode and fail_index
-                    let mut gi = 0u32;
-                    for op in &optimized_ops {
-                        if op.opcode.is_guard() {
-                            eprintln!(
-                                "[jit] guard[{}] {:?} pos={:?} args={:?}",
-                                gi,
-                                op.opcode,
-                                op.pos,
-                                &op.args[..op.args.len().min(3)]
-                            );
-                            gi += 1;
-                            if gi >= 5 {
-                                break;
-                            }
-                        }
-                    }
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
                 let (resume_data, guard_op_indices, mut exit_layouts) =
