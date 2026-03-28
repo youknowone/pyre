@@ -754,8 +754,12 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
+    /// RPython warmstate.py set_param_trace_eagerness: updates both the
+    /// MetaInterp field and warmstate.bridge_threshold so that must_compile /
+    /// would_fire_with_threshold see the same value.
     pub fn set_trace_eagerness(&mut self, eagerness: u32) {
         self.trace_eagerness = eagerness;
+        self.warm_state.set_bridge_threshold(eagerness);
     }
 
     /// Update the green_key associated with the current trace.
@@ -779,6 +783,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Set the bridge compilation threshold.
     pub fn set_bridge_threshold(&mut self, threshold: u32) {
+        self.trace_eagerness = threshold;
         self.warm_state.set_bridge_threshold(threshold);
     }
 
