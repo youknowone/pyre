@@ -984,20 +984,13 @@ impl AbstractShortPreambleBuilderState {
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive: iterates preamble_op's args (adding non-input deps
-    /// + guards to short), then appends preamble_op + result guards.
+    /// to short), then appends preamble_op itself.
     /// Called by force_op_from_preamble (unroll.py:32).
-    ///
-    /// `arg_guards`: guards collected from PtrInfo::make_guards for each arg
-    /// `result_guards`: guards from PtrInfo::make_guards for the result
-    /// These are pre-collected by the caller (force_op_from_preamble) which
-    /// has access to PtrInfo via OptContext.
     fn use_box(
         &mut self,
         produced: &ProducedShortOp,
         already_in_short: &HashSet<OpRef>,
         all_produced: &HashMap<OpRef, ProducedShortOp>,
-        arg_guards: &[Op],
-        result_guards: &[Op],
     ) -> Op {
         let canonical_result = produced.preamble_op.pos;
         if self.short_results.contains(&canonical_result)
@@ -1006,14 +999,20 @@ impl AbstractShortPreambleBuilderState {
             return produced.preamble_op.clone();
         }
         // shortpreamble.py:383-396: iterate preamble_op args
+        // RPython: for arg in preamble_op.getarglist():
+        //   if isinstance(arg, Const): continue
+        //   if isinstance(arg, AbstractInputArg): make_guards
+        //   elif arg.get_forwarded() is None: pass
+        //   else: self.short.append(arg); make_guards
         for &arg in &produced.preamble_op.args {
+            // Constants and label inputargs: skip (RPython Const / AbstractInputArg)
             if self.short_results.contains(&arg)
                 || already_in_short.contains(&arg)
                 || self.short_inputargs.contains(&arg)
             {
                 continue;
             }
-            // shortpreamble.py:393: self.short.append(arg)
+            // Non-input produced arg: add to short (RPython line 393)
             if let Some(dep) = all_produced.get(&arg) {
                 let dep_canonical = dep.preamble_op.pos;
                 if !self.short_results.contains(&dep_canonical)
@@ -1027,8 +1026,6 @@ impl AbstractShortPreambleBuilderState {
                 }
             }
         }
-        // shortpreamble.py:389,396: info.make_guards(arg, self.short, optimizer)
-        self.short.extend_from_slice(arg_guards);
         // shortpreamble.py:398: self.short.append(preamble_op)
         let preamble_op = produced.preamble_op.clone();
         self.short_results.insert(canonical_result);
@@ -1036,8 +1033,6 @@ impl AbstractShortPreambleBuilderState {
         if preamble_op.opcode.is_ovf() {
             self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
         }
-        // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
-        self.short.extend_from_slice(result_guards);
         preamble_op
     }
 }
@@ -1157,20 +1152,12 @@ impl ShortPreambleBuilder {
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
-    pub fn use_box(
-        &mut self,
-        result: OpRef,
-        arg_guards: &[Op],
-        result_guards: &[Op],
-    ) -> Option<Op> {
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        Some(self.state.use_box(
-            &produced,
-            &HashSet::new(),
-            &self.produced_short_boxes,
-            arg_guards,
-            result_guards,
-        ))
+        Some(
+            self.state
+                .use_box(&produced, &HashSet::new(), &self.produced_short_boxes),
+        )
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
@@ -1331,28 +1318,16 @@ impl ExtendedShortPreambleBuilder {
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
-    pub fn use_box(
-        &mut self,
-        result: OpRef,
-        arg_guards: &[Op],
-        result_guards: &[Op],
-    ) -> Option<Op> {
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        Some(self.extra_state.use_box(
-            &produced,
-            &self.base_results,
-            &self.produced_short_boxes,
-            arg_guards,
-            result_guards,
-        ))
+        Some(
+            self.extra_state
+                .use_box(&produced, &self.base_results, &self.produced_short_boxes),
+        )
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
         self.produced_short_boxes.get(&result).cloned()
-    }
-
-    pub fn short_inputargs(&self) -> &[OpRef] {
-        &self.short_inputargs
     }
 
     pub fn build_short_preamble_struct(&self) -> ShortPreamble {

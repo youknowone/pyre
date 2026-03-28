@@ -283,24 +283,27 @@ pub(crate) fn build_guard_metadata(
                     // produce GuardVirtualEntry — only Instance/Struct reach here.
                     let fielddescr_indices: Vec<u32> =
                         entry.fields.iter().map(|(fd, _)| *fd).collect();
+                    let descr_size = entry.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     if known_class.is_some() {
                         majit_ir::RdVirtualInfo::Instance {
                             descr_index: descr_idx,
                             known_class,
                             fielddescr_indices,
-                            field_offsets: vec![],
+                            field_offsets: entry.field_offsets.clone(),
                             field_types: vec![],
                             fieldnums,
+                            descr_size,
                         }
                     } else {
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index: descr_idx,
                             known_class: None,
-                            object_size: 0,
+                            object_size: descr_size,
                             fielddescr_indices,
-                            field_offsets: vec![],
+                            field_offsets: entry.field_offsets.clone(),
                             field_types: vec![],
                             fieldnums,
+                            descr_size,
                         }
                     }
                 })
@@ -384,8 +387,7 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_vals, _vref_vals, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 // Build virtual_map from rd_virtuals for NULLREF → Virtual.
                 let virtual_map: std::collections::HashMap<usize, usize> = entries
                     .iter()
@@ -459,8 +461,7 @@ pub(crate) fn build_guard_metadata(
                 (&op.rd_numb, &op.rd_consts)
             {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_vals, _vref_vals, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 let mut slots = Vec::new();
                 for frame in &frames {
                     for val in &frame.values {

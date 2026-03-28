@@ -785,43 +785,23 @@ impl OptContext {
     }
 
     /// unroll.py:26-39: force_op_from_preamble
-    /// Calls use_box (shortpreamble.py:382-407) with info/guard replay,
-    /// then registers in potential_extra_ops for later force_box.
+    /// Calls use_box (shortpreamble.py:382-407) then registers in
+    /// potential_extra_ops for later force_box consumption.
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        // unroll.py:27: check isinstance BEFORE get_box_replacement
+        // Check imported short identity BEFORE get_box_replacement
+        // (RPython checks isinstance on the raw input, line 27).
         let preamble_source = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
-            // shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
-            // Guards are collected but not yet passed to use_box.
-            // Connecting them causes extra retraces in nested loops (nbody)
-            // because the expanded short preamble changes target token
-            // compatibility. The retrace control path in jump_to_existing_trace
-            // needs RPython parity first (virtual state matching with
-            // short-preamble-aware guard elimination).
-            let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
-
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
-            let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
-                self.active_short_preamble_producer = Some(builder);
-                ok
-            } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
-                self.imported_short_preamble_builder = Some(builder);
-                ok
+            let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
+                builder.use_box(preamble_source).is_some()
+            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                builder.use_box(preamble_source).is_some()
             } else {
                 false
             };
-            // shortpreamble.py:401-404: setinfo_from_preamble(box, info)
-            // Propagate preamble PtrInfo to the Phase 2 result so that
-            // subsequent guards in inline_short_preamble can be removed
-            // as redundant (e.g. GuardNonnull on an already-nonnull OpRef).
-            if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
-                self.setinfo_from_preamble(result, &info);
-            }
-
-            // unroll.py:33-37: potential_extra_ops[op] = preamble_op
+            // unroll.py:33-37: if not constant → potential_extra_ops[op] = preamble_op
             if tracked && !is_constant {
                 let produced = self
                     .imported_short_preamble_builder
@@ -833,6 +813,7 @@ impl OptContext {
                             .and_then(|b| b.produced_short_op(preamble_source))
                     });
                 if let Some(produced) = produced {
+                    // unroll.py:34-35: if invented_name: op = get_box_replacement(op)
                     let key = if produced.invented_name {
                         self.get_box_replacement(preamble_source)
                     } else {
@@ -848,118 +829,10 @@ impl OptContext {
                 }
             }
         }
+        // unroll.py:38: return preamble_op.op — raw imported op, no
+        // forwarding resolve. Callers store this in cache; subsequent
+        // reads go through get_box_replacement to resolve.
         result
-    }
-
-    /// shortpreamble.py:383-396,401-406: collect guards from PtrInfo
-    /// of preamble_op's args and result.
-    fn collect_use_box_guards(&mut self, preamble_source: OpRef) -> (Vec<Op>, Vec<Op>) {
-        let produced = self
-            .imported_short_preamble_builder
-            .as_ref()
-            .and_then(|b| b.produced_short_op(preamble_source))
-            .or_else(|| {
-                self.active_short_preamble_producer
-                    .as_ref()
-                    .and_then(|b| b.produced_short_op(preamble_source))
-            });
-        let Some(produced) = produced else {
-            return (Vec::new(), Vec::new());
-        };
-
-        // shortpreamble.py:383-396: guards for InputArg args only
-        let short_inputargs: Vec<OpRef> = self
-            .imported_short_preamble_builder
-            .as_ref()
-            .map(|b| b.short_inputargs().to_vec())
-            .or_else(|| {
-                self.active_short_preamble_producer
-                    .as_ref()
-                    .map(|b| b.short_inputargs().to_vec())
-            })
-            .unwrap_or_default();
-
-        // Collect (arg, PtrInfo clone) pairs to avoid borrow conflicts
-        let arg_infos: Vec<(OpRef, PtrInfo)> = produced
-            .preamble_op
-            .args
-            .iter()
-            .filter(|arg| short_inputargs.contains(arg))
-            .filter_map(|&arg| self.get_ptr_info(arg).cloned().map(|info| (arg, info)))
-            .collect();
-        let result_info = self
-            .get_ptr_info(produced.preamble_op.pos)
-            .cloned()
-            .map(|info| (produced.preamble_op.pos, info));
-
-        // Now generate guards — can call &mut self for constant allocation
-        let mut arg_guards = Vec::new();
-        let mut const_pool = Vec::new();
-        for (arg, info) in &arg_infos {
-            info.make_guards(*arg, &mut arg_guards, &mut const_pool);
-        }
-        let mut result_guards = Vec::new();
-        if let Some((result_ref, info)) = &result_info {
-            info.make_guards(*result_ref, &mut result_guards, &mut const_pool);
-        }
-        // Replace placeholder OpRefs with properly allocated ones
-        // and register constants in the map.
-        let mut remap: std::collections::HashMap<OpRef, OpRef> = std::collections::HashMap::new();
-        for (placeholder, value) in const_pool {
-            let real = self.alloc_op_position();
-            self.make_constant(real, value);
-            remap.insert(placeholder, real);
-        }
-        if !remap.is_empty() {
-            for guard in arg_guards.iter_mut().chain(result_guards.iter_mut()) {
-                for arg in &mut guard.args {
-                    if let Some(&real) = remap.get(arg) {
-                        *arg = real;
-                    }
-                }
-            }
-        }
-        (arg_guards, result_guards)
-    }
-
-    /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
-    /// Propagate PtrInfo from preamble to Phase 2 OpRef so that subsequent
-    /// guards can be removed as redundant by the optimizer.
-    fn setinfo_from_preamble(&mut self, op: OpRef, preamble_info: &PtrInfo) {
-        let op = self.get_box_replacement(op);
-        // unroll.py:55-56: if op.get_forwarded() is not None: return
-        if self.get_ptr_info(op).is_some() {
-            return;
-        }
-        // unroll.py:57-58: if op.is_constant(): return
-        if self.is_constant(op) {
-            return;
-        }
-        match preamble_info {
-            PtrInfo::Constant(gcref) => {
-                // unroll.py:65-68: op.set_forwarded(preamble_info.getconst())
-                self.make_constant(op, Value::Ref(*gcref));
-            }
-            PtrInfo::KnownClass { class_ptr, .. } => {
-                // unroll.py:76-78: make_constant_class(op, known_class, False)
-                self.set_ptr_info(op, PtrInfo::known_class(*class_ptr, true));
-            }
-            PtrInfo::Instance(info) => {
-                // unroll.py:73-78
-                if let Some(cls) = info.known_class {
-                    self.set_ptr_info(op, PtrInfo::known_class(cls, true));
-                } else if preamble_info.is_nonnull() {
-                    // unroll.py:91-92: make_nonnull(op)
-                    self.set_ptr_info(op, PtrInfo::nonnull());
-                }
-            }
-            _ => {
-                // unroll.py:91-92: if preamble_info.is_nonnull(): make_nonnull
-                if preamble_info.is_nonnull() {
-                    self.set_ptr_info(op, PtrInfo::nonnull());
-                }
-            }
-        }
     }
 
     pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
@@ -1207,17 +1080,17 @@ impl OptContext {
 
         // optimizer.py:672-683: _copy_resume_data_from vs store_final_boxes_in_guard.
         // RPython condition: self._last_guard_op and guard_op.getdescr() is None.
-        // RPython's sharing copies fail_args from the previous guard because
-        // snapshot-based resume data correctly maps to the interpreter state
-        // regardless of which guard's fail_args are used.
-        //
-        // majit's resume data is fail_args-based (not snapshot-based), so copying
-        // fail_args from another guard corrupts the value mapping. Therefore we
-        // only share when the guard has NO own fail_args (optimizer-created guards).
-        // The tracking/clearing of last_guard_idx matches RPython exactly;
-        // only the sharing eligibility condition is stricter.
+        // In RPython, getdescr() is None before store_final_boxes_in_guard
+        // processes the guard (which sets the descr + replaces fail_args with
+        // normalized liveboxes). In majit, number_guard_inline produces rd_numb
+        // and normalizes fail_args to liveboxes (store_final_boxes parity).
+        // rd_numb.is_some() means already processed.
         //
         // GUARD_NOT_FORCED never uses copied descr (compile.py:926 assert).
+        // optimizer.py:672 — fail_args.is_none() is kept because majit's
+        // number_guard_inline doesn't yet normalize fail_args to liveboxes
+        // (store_final_boxes parity). This requires coordinated changes to
+        // compile.rs resume_layout construction + backend jitframe sizing.
         let can_share = self.last_guard_idx.is_some()
             && op.rd_numb.is_none()
             && op.fail_args.is_none()
@@ -1239,18 +1112,13 @@ impl OptContext {
             self.number_guard_inline(op);
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
-            // Ensures all fail_arg boxes are concrete (not virtual) so the
-            // unroller can export them to the next iteration.
+            // Mirrors Optimizer.force_box contract: resolve replacement,
+            // handle tracked preamble ops, force virtuals.
             if let Some(ref fa) = op.fail_args {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {
-                        let resolved = self.get_box_replacement(farg);
-                        if let Some(mut info) = self.get_ptr_info(resolved).cloned() {
-                            if info.is_virtual() {
-                                info.force_to_ops_direct(resolved, self);
-                            }
-                        }
+                        self.force_box_inline(farg);
                     }
                 }
             }
@@ -1262,45 +1130,95 @@ impl OptContext {
         }
     }
 
+    /// optimizer.py:345-364 force_box — inline equivalent for
+    /// emit_guard_operation's fail_arg forcing (optimizer.py:680-683).
+    /// Mirrors Optimizer.force_box contract: resolve imported short source,
+    /// handle tracked preamble ops, then force virtuals to concrete.
+    fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
+        let preamble_source = self.imported_short_source(opref);
+        let resolved = self.get_box_replacement(opref);
+        let tracked = self
+            .take_potential_extra_op(resolved)
+            .or_else(|| self.take_potential_extra_op(opref))
+            .or_else(|| {
+                (preamble_source != resolved && preamble_source != opref)
+                    .then(|| self.take_potential_extra_op(preamble_source))
+                    .flatten()
+            });
+        if let Some(tracked) = tracked {
+            if let Some(builder) = self.active_short_preamble_producer_mut() {
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+            } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
+                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+            }
+        }
+        if let Some(mut info) = self.get_ptr_info(resolved).cloned() {
+            if info.is_virtual() {
+                let forced = info.force_to_ops_direct(resolved, self);
+                return self.get_box_replacement(forced);
+            }
+        }
+        resolved
+    }
+
     /// RPython optimizer.py:722-752 store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
     /// (replacement chain, constants, virtual info).
+    /// resume.py ResumeDataVirtualAdder.finish() parity:
+    /// Generate rd_numb + rd_consts + rd_virtuals for a guard.
+    /// Called from store_final_boxes_in_guard in optimizer.rs.
+    /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
+    pub fn finalize_guard_resume_data(&self, op: &mut Op) {
+        self.number_guard_inline_impl(op);
+    }
+
     fn number_guard_inline(&self, op: &mut Op) {
+        // RPython parity: store_final_boxes_in_guard already produced
+        // rd_numb via finalize_guard_resume_data. Assert completeness.
+        if op.rd_numb.is_some() {
+            return;
+        }
+        if op.fail_args.is_none() {
+            return;
+        }
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[jit] WARNING: guard {:?} at {:?} missing rd_numb",
+                op.opcode, op.pos,
+            );
+        }
+    }
+
+    fn number_guard_inline_impl(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
-        // RPython parity: store_final_boxes_in_guard (in emit_with_guard_check)
-        // already produced rd_numb + liveboxes. Don't overwrite.
         if op.rd_numb.is_some() {
             return;
         }
 
-        // RPython: every guard has a snapshot (from capture_resumedata).
-        // Use tracing-time snapshot if available, otherwise build from
-        // current fail_args (for guards created by the optimizer itself,
-        // e.g. GUARD_NOT_INVALIDATED from quasi-immutable field access).
-        // For guards without tracing-time snapshot (optimizer-created guards
-        // like GUARD_NOT_INVALIDATED from quasi-immut), produce a simple
-        // 1:1 TAGBOX rd_numb without modifying fail_args.
+        // RPython parity: every guard has a snapshot from capture_resumedata.
+        // Guards without snapshot (optimizer-created, rd_resume_position < 0)
+        // share resume data from _copy_resume_data_from. If they reach here
+        // without a snapshot, build a minimal rd_numb directly from fail_args
+        // using the same format as memo.number() but without replacement/
+        // virtual resolution (the fail_args are already final from
+        // store_final_boxes_in_guard).
         if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
             if let Some(ref fa) = op.fail_args {
+                use majit_ir::resumedata;
                 let fa_len = fa.len();
                 let mut ns = resumedata::NumberingState::new(fa_len + 8);
-                // Start from existing rd_consts so TAGCONST indices are correct.
-                // resume.py: getconst() uses a single memo.consts pool shared
-                // with all prior numbering — indices are absolute, not 0-based.
-                let mut rd_consts: Vec<(i64, majit_ir::Type)> =
-                    op.rd_consts.take().unwrap_or_default();
-                ns.append_int(0); // slot 0: size (patched)
-                ns.append_int(fa_len as i32); // slot 1: num_failargs
+                ns.append_int(0); // size (patched)
+                ns.append_int(fa_len as i32); // num_failargs
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
                 ns.append_int(fa_len as i32); // slot_count
-                // resume.py _number_boxes + _number_virtuals + getconst parity.
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
+                        // TAGVIRTUAL if rd_virtuals has entry for this slot.
                         let vidx = op
                             .rd_virtuals
                             .as_ref()
@@ -1313,7 +1231,7 @@ impl OptContext {
                             ns.append_short(resumedata::NULLREF);
                         }
                     } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
-                        // resume.py:157 getconst: INT → try TAGINT first.
+                        // resume.py getconst: TAGINT for small ints, TAGCONST for rest.
                         if tp == majit_ir::Type::Int {
                             if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
                                 ns.append_short(tagged);
@@ -1324,12 +1242,17 @@ impl OptContext {
                             ns.append_short(resumedata::NULLREF);
                             continue;
                         }
-                        let existing = rd_consts.iter().position(|(v, t)| *v == raw && *t == tp);
+                        let mut rd_consts_local: Vec<(i64, majit_ir::Type)> =
+                            op.rd_consts.take().unwrap_or_default();
+                        let existing = rd_consts_local
+                            .iter()
+                            .position(|(v, t)| *v == raw && *t == tp);
                         let idx = existing.unwrap_or_else(|| {
-                            let j = rd_consts.len();
-                            rd_consts.push((raw, tp));
+                            let j = rd_consts_local.len();
+                            rd_consts_local.push((raw, tp));
                             j
                         });
+                        op.rd_consts = Some(rd_consts_local);
                         let t = resumedata::tag(
                             (idx + resumedata::TAG_CONST_OFFSET as usize) as i32,
                             resumedata::TAGCONST,
@@ -1344,80 +1267,12 @@ impl OptContext {
                 }
                 ns.patch_current_size(0);
                 op.rd_numb = Some(ns.create_numbering());
-                op.rd_consts = Some(rd_consts);
-            }
-            return;
-        }
-
-        // If store_final_boxes_in_guard already encoded virtuals in
-        // op.rd_virtuals, use the no-snapshot path with getconst parity.
-        // The fail_args already contain NONE placeholders + appended
-        // field values. Re-processing via snapshot_boxes would overwrite
-        // these and lose the GuardVirtualEntry metadata.
-        // NOTE: RPython has no separate snapshot re-encoding step —
-        // store_final_boxes_in_guard produces final resume data directly.
-        // This fallback is a majit-specific compensation layer.
-        if op.rd_virtuals.is_some() {
-            if let Some(ref fa) = op.fail_args {
-                let fa_len = fa.len();
-                let mut ns = resumedata::NumberingState::new(fa_len + 8);
-                let mut rd_consts: Vec<(i64, majit_ir::Type)> =
-                    op.rd_consts.take().unwrap_or_default();
-                ns.append_int(0);
-                ns.append_int(fa_len as i32);
-                ns.append_int(0);
-                ns.append_int(0);
-                ns.append_int(0);
-                ns.append_int(0);
-                for (i, &opref) in fa.iter().enumerate() {
-                    if opref.is_none() {
-                        let vidx = op
-                            .rd_virtuals
-                            .as_ref()
-                            .and_then(|entries| entries.iter().position(|e| e.fail_arg_index == i));
-                        if let Some(vidx) = vidx {
-                            let t = resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
-                                .unwrap_or(resumedata::NULLREF);
-                            ns.append_short(t);
-                        } else {
-                            ns.append_short(resumedata::NULLREF);
-                        }
-                    } else if let Some((raw, tp)) = self.getconst_for_numbering(opref) {
-                        if tp == majit_ir::Type::Int {
-                            if let Ok(tagged) = resumedata::tag(raw as i32, resumedata::TAGINT) {
-                                ns.append_short(tagged);
-                                continue;
-                            }
-                        }
-                        if tp == majit_ir::Type::Ref && raw == 0 {
-                            ns.append_short(resumedata::NULLREF);
-                            continue;
-                        }
-                        let existing = rd_consts.iter().position(|(v, t)| *v == raw && *t == tp);
-                        let idx = existing.unwrap_or_else(|| {
-                            let j = rd_consts.len();
-                            rd_consts.push((raw, tp));
-                            j
-                        });
-                        let t = resumedata::tag(
-                            (idx + resumedata::TAG_CONST_OFFSET as usize) as i32,
-                            resumedata::TAGCONST,
-                        )
-                        .unwrap_or(resumedata::NULLREF);
-                        ns.append_short(t);
-                    } else {
-                        let t = resumedata::tag(i as i32, resumedata::TAGBOX)
-                            .unwrap_or(resumedata::NULLREF);
-                        ns.append_short(t);
-                    }
+                if op.rd_consts.is_none() {
+                    op.rd_consts = Some(Vec::new());
                 }
-                ns.patch_current_size(0);
-                op.rd_numb = Some(ns.create_numbering());
-                op.rd_consts = Some(rd_consts);
             }
             return;
         }
-
         let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
         let vable_oprefs = self
             .snapshot_vable_boxes
@@ -1637,25 +1492,35 @@ impl OptContext {
                 tagged
             };
             // resume.py:326-338: dispatch by virtual type.
+            // RPython info.py:243-247: _visitor_walk_recursive iterates
+            // _fields in descr.get_all_fielddescrs() order. Sort by
+            // field_idx (= descr.index()) to match.
             let entry = match vinfo_opt {
                 Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
-                    let fielddescr_indices: Vec<u32> =
-                        vi.fields.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = vi
-                        .fields
+                    let mut sorted: Vec<_> = vi.fields.clone();
+                    sorted.sort_by_key(|(idx, _)| *idx);
+                    let fielddescr_indices: Vec<u32> = sorted.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = sorted
                         .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
+                        .enumerate()
+                        .map(|(i, (fi, _))| {
+                            let off = vi
+                                .field_descrs
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
                                 .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or((*fi as usize + 1) * 8)
+                                .unwrap_or(0);
+                            debug_assert!(
+                                off > 0 || vi.field_descrs.is_empty(),
+                                "field_descrs missing for Instance field[{}] idx={}",
+                                i,
+                                fi
+                            );
+                            off
                         })
                         .collect();
-                    let fieldnums: Vec<i16> =
-                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    let field_types: Vec<majit_ir::Type> = vi
-                        .fields
+                    let fieldnums: Vec<i16> = sorted.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    let field_types: Vec<majit_ir::Type> = sorted
                         .iter()
                         .map(|(fi, _)| {
                             vi.field_descrs
@@ -1665,35 +1530,56 @@ impl OptContext {
                                 .unwrap_or(majit_ir::Type::Int)
                         })
                         .collect();
+                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                    // virtualize.py:208: known_class = descr.get_vtable()
+                    let kc = vi
+                        .known_class
+                        .map(|gc| gc.as_usize() as i64)
+                        .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
+                        .filter(|&v| v != 0);
                     majit_ir::RdVirtualInfo::Instance {
                         descr_index: vi.descr.index(),
-                        known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
+                        known_class: kc,
                         fielddescr_indices,
                         field_offsets,
                         field_types,
                         fieldnums,
+                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
-                    let fielddescr_indices: Vec<u32> =
-                        vi.fields.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = vi
-                        .fields
+                    let mut sorted: Vec<_> = vi.fields.clone();
+                    sorted.sort_by_key(|(idx, _)| *idx);
+                    let fielddescr_indices: Vec<u32> = sorted.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = sorted
                         .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
+                        .enumerate()
+                        .map(|(i, (fi, _))| {
+                            let off = vi
+                                .field_descrs
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
                                 .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or((*fi as usize + 1) * 8)
+                                .unwrap_or(0);
+                            debug_assert!(
+                                off > 0 || vi.field_descrs.is_empty(),
+                                "field_descrs missing for Struct field[{}] idx={}",
+                                i,
+                                fi
+                            );
+                            off
                         })
                         .collect();
-                    let fieldnums: Vec<i16> =
-                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    let known_class_val: Option<i64> = None;
+                    let fieldnums: Vec<i16> = sorted.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    // virtualize.py:208: for VirtualStruct, check if descr has
+                    // vtable (misclassified NEW_WITH_VTABLE as NEW).
+                    let known_class_val: Option<i64> = vi
+                        .descr
+                        .as_size_descr()
+                        .map(|sd| sd.vtable() as i64)
+                        .filter(|&v| v != 0);
                     let object_size_val = vi.descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
-                    let field_types: Vec<majit_ir::Type> = vi
-                        .fields
+                    let field_types: Vec<majit_ir::Type> = sorted
                         .iter()
                         .map(|(fi, _)| {
                             vi.field_descrs
@@ -1703,6 +1589,7 @@ impl OptContext {
                                 .unwrap_or(majit_ir::Type::Int)
                         })
                         .collect();
+                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Struct {
                         descr_index: vi.descr.index(),
                         known_class: known_class_val,
@@ -1711,6 +1598,7 @@ impl OptContext {
                         field_offsets,
                         field_types,
                         fieldnums,
+                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {

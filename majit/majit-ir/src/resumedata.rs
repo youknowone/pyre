@@ -361,37 +361,25 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
 }
 
 /// resume.py:1042-1057 rebuild_from_numbering parity.
-/// Returns (num_failargs, vable_values, vref_values, frames).
-/// resume.py:1044-1047: vable/vref decoded before frame sections.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
-) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
+) -> (i32, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
     let total_size = reader.next_item();
     let num_failargs = reader.next_item();
 
-    // resume.py:1045: consume_vref_and_vable_boxes — virtualizable array.
+    // Virtualizable array (skip).
     let vable_len = reader.next_item();
-    let mut vable_values = Vec::new();
-    for _ in 0..vable_len {
-        if !reader.has_more() {
-            break;
-        }
-        let tagged = reader.next_item() as i16;
-        vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
+    if vable_len > 0 {
+        reader.jump(vable_len as usize);
     }
 
-    // resume.py:1045: virtualref array (pairs).
+    // Virtualref array (skip).
     let vref_len = reader.next_item();
-    let mut vref_values = Vec::new();
-    for _ in 0..(vref_len * 2) {
-        if !reader.has_more() {
-            break;
-        }
-        let tagged = reader.next_item() as i16;
-        vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
+    if vref_len > 0 {
+        reader.jump((vref_len * 2) as usize);
     }
 
     // Frames.
@@ -436,5 +424,5 @@ pub fn rebuild_from_numbering(
             values,
         });
     }
-    (num_failargs, vable_values, vref_values, frames)
+    (num_failargs, frames)
 }
