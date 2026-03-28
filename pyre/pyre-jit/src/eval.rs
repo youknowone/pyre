@@ -83,10 +83,10 @@ thread_local! {
         );
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
-        // warmstate.py:259 trace_eagerness: guard failure threshold for
-        // bridge compilation. RPython default 200, pyre uses 20 because
-        // interpreter-mode iterations are slower (not C-compiled).
-        d.set_bridge_threshold(20);
+        // warmstate.py:259 trace_eagerness=200 (RPython default).
+        // Cranelift backend has its own DEFAULT_BRIDGE_THRESHOLD=5 for
+        // inline bridge dispatch. This WarmState threshold controls the
+        // MetaInterp-layer bridge compilation request.
         // warmspot.py:449 — portal function returns a Python object (int).
         // pyre's portal always returns PyObjectRef, but the JIT unboxes
         // int results to raw i64 via unbox_finish_result, so the static

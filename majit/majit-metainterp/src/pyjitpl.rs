@@ -4466,7 +4466,11 @@ impl<M: Clone> MetaInterp<M> {
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         let retraced_count = compiled.retraced_count;
-        let retrace_limit = 0u32;
+        // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
+        // new target_token specializations when existing body token doesn't
+        // match. Without this, bridges fall back to preamble (causing
+        // infinite guard failure loops on preamble guards).
+        let retrace_limit = 5u32;
         // bridgeopt.py: retrieve optimizer knowledge from the source trace
         // and remap OpRefs from the source trace's numbering to the bridge's
         // inputarg numbering. The bridge inputargs correspond to the guard's
