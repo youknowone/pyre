@@ -1820,6 +1820,9 @@ impl<S: JitState> JitDriver<S> {
         let raw_values = result.values.clone();
         drop(result);
 
+        // memmgr.py:58-61: keep_loop_alive(loop_token)
+        self.meta.keep_loop_alive(green_key);
+
         if is_finish {
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
