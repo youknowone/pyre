@@ -3712,6 +3712,12 @@ fn emit_load_from_addr(
     signed: bool,
     opcode: OpCode,
 ) -> Result<CValue, BackendError> {
+    // Use non-trusted MemFlags so Cranelift does NOT speculate loads
+    // past guards. With trusted(), Cranelift can hoist a load before
+    // a GuardNonnull branch, causing SEGFAULT on null pointers.
+    // RPython's x86 backend emits in IR order (no scheduling), so
+    // loads after guards are safe. Cranelift needs this annotation.
+    let heap_flags = MemFlags::new();
     match value_type {
         Type::Float => {
             if size != 8 {
@@ -3720,9 +3726,7 @@ fn emit_load_from_addr(
                     "float memory operations currently require 8-byte values",
                 ));
             }
-            let fval = builder
-                .ins()
-                .load(cl_types::F64, MemFlags::trusted(), addr, 0);
+            let fval = builder.ins().load(cl_types::F64, heap_flags, addr, 0);
             Ok(builder.ins().bitcast(cl_types::I64, MemFlags::new(), fval))
         }
         Type::Int | Type::Ref => {
@@ -3737,7 +3741,7 @@ fn emit_load_from_addr(
                 opcode,
                 "memory operations only support 1-, 2-, 4-, and 8-byte values",
             )?;
-            let raw = builder.ins().load(mem_ty, MemFlags::trusted(), addr, 0);
+            let raw = builder.ins().load(mem_ty, heap_flags, addr, 0);
             if mem_ty == cl_types::I64 {
                 Ok(raw)
             } else if value_type == Type::Int && signed {

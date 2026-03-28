@@ -2157,11 +2157,19 @@ impl Optimizer {
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
         // JUMP args (live_arg_boxes from compile_trace / deadframe values).
+        // RPython unroll.py:207: jump_to_existing_trace skips preamble
+        // (target_tokens[0]) and tries body targets (target_tokens[1:]).
+        // Preamble is for initial loop entry; bridge should go to body.
+        let body_tokens = if front_target_tokens.len() > 1 {
+            &mut front_target_tokens[1..]
+        } else {
+            &mut front_target_tokens[..]
+        };
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
-            front_target_tokens,
+            body_tokens,
             self,
             &mut ctx,
             false,

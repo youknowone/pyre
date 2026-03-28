@@ -460,7 +460,20 @@ impl WarmEnterState {
     /// `maybe_compile_and_run(increment_threshold, ...)`.
     /// Returns true if counter reached threshold (should enter slow path).
     /// Returns false for DONT_TRACE keys or cold keys.
-    #[inline]
+    /// Advance counter toward threshold. Respects DONT_TRACE_HERE and
+    /// DontTraceHere — does not tick suppressed keys (warmstate.py:484).
+    pub fn counter_tick(&mut self, green_key_hash: u64) {
+        if let Some(cell) = self.cells.get(&green_key_hash) {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                return;
+            }
+            if cell.state == BaseJitCellState::DontTraceHere {
+                return;
+            }
+        }
+        let _ = self.counter.tick(green_key_hash);
+    }
+
     pub fn counter_tick_checked(&mut self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
