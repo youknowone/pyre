@@ -888,6 +888,10 @@ impl Optimizer {
         self.last_guard_op.as_ref()
     }
 
+    pub fn set_last_guard_op(&mut self, op: Op) {
+        self.last_guard_op = Some(op);
+    }
+
     /// optimizer.py: notice_guard_future_condition(op)
     /// Record that a guard at the given position should be replaced
     /// with the given op when the future condition is realized.
