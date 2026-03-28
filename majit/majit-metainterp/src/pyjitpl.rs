@@ -3657,59 +3657,16 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         Self::finish_compiled_run_io(is_finish);
 
-        // RPython compile.py:696 (handle_fail):
-        // Guard failure counter + bridge compilation trigger.
+        // RPython: guard failure counter tick and bridge compilation happen
+        // in handle_fail → must_compile (compile.py:701-784). The single
+        // tick point is must_compile() called by jitdriver. Do NOT create
+        // guard_failures entries or tick here — must_compile handles both.
         if !is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-            // compile.py:741-784: must_compile — for GUARD_VALUE (per_value
-            // is Some), skip tick here. Per-value tick happens in
-            // handle_guard_failure_in_trace_with_savedata where fail_values
-            // are available. For normal guards, tick the guard_hash.
-            let must_compile = if info.per_value.is_none() {
-                self.warm_state.tick_guard_failure(info.guard_hash) && !info.compiling
-            } else {
-                false // GUARD_VALUE: ticked in handle_guard_failure_in_trace
-            };
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
             if let Some(ref hook) = self.hooks.on_guard_failure {
                 hook(green_key, fail_index, 0);
-            }
-
-            // compile.py:701-709: handle_fail → must_compile → start_compiling
-            if must_compile {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] bridge threshold reached: key={} trace={} guard={}",
-                        green_key, trace_id, fail_index
-                    );
-                }
-                // compile.py:786-788: start_compiling
-                if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                    if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
-                        info.compiling = true;
-                    }
-                }
-                // compile.py:706-708: _trace_and_compile_from_bridge
-                if let Some(ref hook) = self.hooks.on_bridge_threshold {
-                    hook(green_key, trace_id, fail_index);
-                }
-                // compile.py:790-795: done_compiling
-                if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                    if let Some(info) = compiled.guard_failures.get_mut(&(trace_id, fail_index)) {
-                        info.compiling = false;
-                    }
-                }
             }
         }
 
