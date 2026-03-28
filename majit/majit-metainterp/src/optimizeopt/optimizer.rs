@@ -1034,16 +1034,12 @@ impl Optimizer {
                     .flatten()
             });
         if let Some(tracked) = tracked {
+            // optimizer.py:357-359: sb.add_preamble_op(preamble_op)
+            // RPython calls add_preamble_op only — use_box was already
+            // called in force_op_from_preamble (unroll.py:32).
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                // RPython unroll.py: force_op_from_preamble() routes the
-                // tracked preamble use through short_preamble_producer.use_box(...)
-                // before recording it for jump replay. This matters for ovf
-                // ops, where the short builder must materialize both the
-                // overflowing operation and its guard together.
-                let _ = builder.use_box(tracked.result);
                 builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                let _ = builder.use_box(tracked.result);
                 builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
             }
         }
@@ -1511,12 +1507,11 @@ impl Optimizer {
         // directly in opt.optimizer.optpure. In majit, imported short pure ops
         // are first collected in ctx.imported_short_pure_ops, then transferred
         // to the OptPure pass here (matching RPython's produce_op timing).
-        // NOTE: currently disabled — see next commit for activation.
-        // if !ctx.imported_short_pure_ops.is_empty() {
-        //     for pass in &mut self.passes {
-        //         pass.install_preamble_pure_ops(&ctx);
-        //     }
-        // }
+        if !ctx.imported_short_pure_ops.is_empty() {
+            for pass in &mut self.passes {
+                pass.install_preamble_pure_ops(&ctx);
+            }
+        }
 
         // RPython optimizer.py:536-556: JUMP/FINISH is separated from
         // the main loop. With flush=False (Phase 2), JUMP is NOT processed

@@ -966,11 +966,67 @@ impl AbstractShortPreambleBuilderState {
         self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
-    fn use_box(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
+    /// Internal: append preamble_op to short (with ovf guard).
+    /// Used by add_op_to_short (recursive export-time path).
+    fn append_to_short(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
         let canonical_result = produced.preamble_op.pos;
         if self.short_results.contains(&canonical_result) {
             return produced.preamble_op.clone();
         }
+        let preamble_op = produced.preamble_op.clone();
+        self.short_results.insert(canonical_result);
+        self.short.push(preamble_op.clone());
+        if preamble_op.opcode.is_ovf() {
+            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+        }
+        preamble_op
+    }
+
+    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+    /// Non-recursive: iterates preamble_op's args (adding non-input deps
+    /// to short), then appends preamble_op itself.
+    /// Called by force_op_from_preamble (unroll.py:32).
+    fn use_box(
+        &mut self,
+        produced: &ProducedShortOp,
+        already_in_short: &HashSet<OpRef>,
+        all_produced: &HashMap<OpRef, ProducedShortOp>,
+    ) -> Op {
+        let canonical_result = produced.preamble_op.pos;
+        if self.short_results.contains(&canonical_result)
+            || already_in_short.contains(&canonical_result)
+        {
+            return produced.preamble_op.clone();
+        }
+        // shortpreamble.py:383-396: iterate preamble_op args
+        // RPython: for arg in preamble_op.getarglist():
+        //   if isinstance(arg, Const): continue
+        //   if isinstance(arg, AbstractInputArg): make_guards
+        //   elif arg.get_forwarded() is None: pass
+        //   else: self.short.append(arg); make_guards
+        for &arg in &produced.preamble_op.args {
+            // Constants and label inputargs: skip (RPython Const / AbstractInputArg)
+            if self.short_results.contains(&arg)
+                || already_in_short.contains(&arg)
+                || self.short_inputargs.contains(&arg)
+            {
+                continue;
+            }
+            // Non-input produced arg: add to short (RPython line 393)
+            if let Some(dep) = all_produced.get(&arg) {
+                let dep_canonical = dep.preamble_op.pos;
+                if !self.short_results.contains(&dep_canonical)
+                    && !already_in_short.contains(&dep_canonical)
+                {
+                    self.short_results.insert(dep_canonical);
+                    self.short.push(dep.preamble_op.clone());
+                    if dep.preamble_op.opcode.is_ovf() {
+                        self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+                    }
+                }
+            }
+        }
+        // shortpreamble.py:398: self.short.append(preamble_op)
         let preamble_op = produced.preamble_op.clone();
         self.short_results.insert(canonical_result);
         self.short.push(preamble_op.clone());
@@ -1085,11 +1141,23 @@ impl ShortPreambleBuilder {
             }
         }
         visiting.remove(&result);
-        Some(self.state.use_box(result, &produced))
+        Some(self.state.append_to_short(result, &produced))
     }
 
-    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+    /// shortpreamble.py:310: add_op_to_short — recursive, used during
+    /// export-time create_short_boxes to resolve transitive dependencies.
+    pub fn add_op_to_short(&mut self, result: OpRef) -> Option<Op> {
         self.use_box_recursive(result, &mut HashSet::new())
+    }
+
+    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+    /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+        let produced = self.produced_short_boxes.get(&result)?.clone();
+        Some(
+            self.state
+                .use_box(&produced, &HashSet::new(), &self.produced_short_boxes),
+        )
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
@@ -1225,7 +1293,7 @@ impl ExtendedShortPreambleBuilder {
             }
         }
         visiting.remove(&result);
-        Some(self.extra_state.use_box(result, &produced))
+        Some(self.extra_state.append_to_short(result, &produced))
     }
 
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
@@ -1243,8 +1311,19 @@ impl ExtendedShortPreambleBuilder {
         true
     }
 
-    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+    /// shortpreamble.py:310: add_op_to_short — recursive, export-time.
+    pub fn add_op_to_short(&mut self, result: OpRef) -> Option<Op> {
         self.use_box_recursive(result, &mut HashSet::new())
+    }
+
+    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+    /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
+    pub fn use_box(&mut self, result: OpRef) -> Option<Op> {
+        let produced = self.produced_short_boxes.get(&result)?.clone();
+        Some(
+            self.extra_state
+                .use_box(&produced, &self.base_results, &self.produced_short_boxes),
+        )
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
@@ -1469,7 +1548,7 @@ pub fn build_short_preamble_from_exported_boxes(
         .collect();
     let mut builder = ShortPreambleBuilder::new(label_args, &produced, short_inputargs);
     for (result, _) in &produced {
-        let _ = builder.use_box(*result);
+        let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
     builder.build_short_preamble_struct()
@@ -1921,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rpython_short_preamble_builder_use_box_recurses_dependencies() {
+    fn test_rpython_short_preamble_builder_add_op_to_short_recurses_dependencies() {
         let produced = vec![
             (
                 OpRef(7),
@@ -1953,7 +2032,7 @@ mod tests {
         let mut builder =
             ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
 
-        let used = builder.use_box(OpRef(8)).unwrap();
+        let used = builder.add_op_to_short(OpRef(8)).unwrap();
         assert!(builder.add_preamble_op(OpRef(7)));
         assert!(builder.add_preamble_op(OpRef(8)));
         assert_eq!(used.opcode, OpCode::IntMul);
@@ -1981,7 +2060,7 @@ mod tests {
         let mut builder =
             ShortPreambleBuilder::new(&[OpRef(0), OpRef(1)], &produced, &[OpRef(0), OpRef(1)]);
 
-        let _ = builder.use_box(OpRef(7));
+        let _ = builder.add_op_to_short(OpRef(7));
         assert!(builder.add_preamble_op(OpRef(7)));
         let sp = builder.build_short_preamble_struct();
 
@@ -2183,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rpython_short_preamble_builder_use_box_builds_label_short_and_jump() {
+    fn test_rpython_short_preamble_builder_add_op_to_short_builds_label_short_and_jump() {
         let mut sb = ShortBoxes::with_label_args(&[OpRef(10), OpRef(30), OpRef(31)]);
 
         let mut ovf = Op::new(OpCode::IntAddOvf, &[OpRef(30), OpRef(31)]);
@@ -2192,7 +2271,7 @@ mod tests {
 
         let produced = sb.produced_ops();
         let mut builder = ShortPreambleBuilder::new(&[OpRef(10)], &produced, &[OpRef(10)]);
-        let used = builder.use_box(OpRef(10)).unwrap();
+        let used = builder.add_op_to_short(OpRef(10)).unwrap();
         assert!(builder.add_preamble_op(OpRef(10)));
         assert_eq!(used.opcode, OpCode::IntAddOvf);
         assert_eq!(builder.used_boxes(), &[OpRef(10)]);

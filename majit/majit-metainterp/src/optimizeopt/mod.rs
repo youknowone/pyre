@@ -747,22 +747,16 @@ impl OptContext {
             .unwrap_or(result)
     }
 
-    /// unroll.py:26-39 force_op_from_preamble.
-    ///
-    /// RPython: if isinstance(preamble_op, PreambleOp):
-    ///   op = preamble_op.op
-    ///   use_box(op, preamble_op.preamble_op, self)
-    ///   if not op.is_constant():
-    ///     if invented_name: op = get_box_replacement(op)
-    ///     potential_extra_ops[op] = preamble_op
-    ///   return preamble_op.op   ← raw imported op (no forwarding resolve)
+    /// unroll.py:26-39: force_op_from_preamble
+    /// Calls use_box (shortpreamble.py:382-407) then registers in
+    /// potential_extra_ops for later force_box consumption.
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
         // Check imported short identity BEFORE get_box_replacement
         // (RPython checks isinstance on the raw input, line 27).
         let preamble_source = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
-            // unroll.py:31 use_box(op, preamble_op.preamble_op, self)
+            // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
                 builder.use_box(preamble_source).is_some()
             } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
