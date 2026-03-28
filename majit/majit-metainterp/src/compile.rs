@@ -27,6 +27,27 @@ fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
     }
 }
 
+/// Derive slot_types from ExitValueSourceLayout + exit_types.
+/// Rules: ExitValue(idx) → exit_types[idx], Virtual → Ref,
+/// Constant → Int, Uninitialized/Unavailable → Ref (conservative).
+fn derive_slot_types(
+    slots: &[majit_codegen::ExitValueSourceLayout],
+    exit_types: &[Type],
+) -> Vec<Type> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                exit_types.get(*idx).copied().unwrap_or(Type::Ref)
+            }
+            majit_codegen::ExitValueSourceLayout::Virtual(_) => Type::Ref,
+            majit_codegen::ExitValueSourceLayout::Constant(_) => Type::Int,
+            majit_codegen::ExitValueSourceLayout::Uninitialized
+            | majit_codegen::ExitValueSourceLayout::Unavailable => Type::Ref,
+        })
+        .collect()
+}
+
 // ── Compilation result types (compile.py) ───────────────────────────────
 
 /// Static exit metadata for a compiled guard or finish point.
@@ -171,20 +192,25 @@ pub(crate) fn build_guard_metadata(
             inputargs.iter().map(|arg| arg.tp).collect()
         };
 
-        let mut resume_layout = None;
+        let resume_layout;
         if is_guard {
-            if let Some(ref fail_args) = op.fail_args {
-                let mut builder = ResumeDataVirtualAdder::new();
-                builder.push_frame(pc);
+            let mut builder = ResumeDataVirtualAdder::new();
+            builder.push_frame(pc);
 
-                for (slot_idx, _) in fail_args.iter().enumerate() {
-                    builder.map_slot(slot_idx, slot_idx);
-                }
-
-                let stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
-                resume_layout = Some(stored.layout.clone());
-                result.insert(fail_index, stored);
+            let num_slots = op
+                .fail_args
+                .as_ref()
+                .map(|fa| fa.len())
+                .unwrap_or(exit_types.len());
+            for slot_idx in 0..num_slots {
+                builder.map_slot(slot_idx, slot_idx);
             }
+
+            let stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
+            resume_layout = Some(stored.layout.clone());
+            result.insert(fail_index, stored);
+        } else {
+            resume_layout = None;
         }
 
         // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
@@ -405,18 +431,21 @@ pub(crate) fn build_guard_metadata(
             } else {
                 vec![]
             };
-            Some(ExitRecoveryLayout {
-                frames: vec![majit_codegen::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: None,
-                    source_guard: None,
-                    pc: 0,
-                    slots: frame_slots,
-                    slot_types: None,
-                }],
-                virtual_layouts,
-                pending_field_layouts: vec![],
-            })
+            {
+                let st = derive_slot_types(&frame_slots, &exit_types);
+                Some(ExitRecoveryLayout {
+                    frames: vec![majit_codegen::ExitFrameLayout {
+                        trace_id: None,
+                        header_pc: Some(pc),
+                        source_guard: None,
+                        pc,
+                        slots: frame_slots,
+                        slot_types: Some(st),
+                    }],
+                    virtual_layouts,
+                    pending_field_layouts,
+                })
+            }
         } else if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout directly from rd_numb without rd_virtuals.
@@ -644,20 +673,40 @@ pub(crate) fn build_guard_metadata(
                         .collect()
                 })
                 .unwrap_or_default();
+            {
+                let st = derive_slot_types(&frame_slots, &exit_types);
+                Some(ExitRecoveryLayout {
+                    frames: vec![majit_codegen::ExitFrameLayout {
+                        trace_id: None,
+                        header_pc: Some(pc),
+                        source_guard: None,
+                        pc,
+                        slots: frame_slots,
+                        slot_types: Some(st),
+                    }],
+                    virtual_layouts,
+                    pending_field_layouts: vec![],
+                })
+            }
+        } else {
+            // No rd_virtuals, no rd_numb: identity recovery layout.
+            // Every guard has at minimum an identity mapping from
+            // fail_args → frame slots, with exit_types as slot_types.
+            let slots: Vec<majit_codegen::ExitValueSourceLayout> = (0..exit_types.len())
+                .map(majit_codegen::ExitValueSourceLayout::ExitValue)
+                .collect();
             Some(ExitRecoveryLayout {
                 frames: vec![majit_codegen::ExitFrameLayout {
                     trace_id: None,
-                    header_pc: None,
+                    header_pc: Some(pc),
                     source_guard: None,
-                    pc: 0,
-                    slots: frame_slots,
-                    slot_types: None,
+                    pc,
+                    slots,
+                    slot_types: Some(exit_types.clone()),
                 }],
-                virtual_layouts,
+                virtual_layouts: vec![],
                 pending_field_layouts: vec![],
             })
-        } else {
-            None
         };
 
         exit_layouts.insert(
@@ -719,20 +768,21 @@ pub(crate) fn merge_backend_exit_layouts(
     backend_layouts: &[FailDescrLayout],
 ) {
     for layout in backend_layouts {
-        let entry = exit_layouts
-            .entry(layout.fail_index)
-            .or_insert_with(|| StoredExitLayout {
-                source_op_index: layout.source_op_index,
-                exit_types: layout.fail_arg_types.clone(),
-                is_finish: layout.is_finish,
-                gc_ref_slots: layout.gc_ref_slots.clone(),
-                force_token_slots: layout.force_token_slots.clone(),
-                recovery_layout: layout.recovery_layout.clone(),
-                resume_layout: None,
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals_info: None,
-            });
+        let entry: &mut StoredExitLayout =
+            exit_layouts
+                .entry(layout.fail_index)
+                .or_insert_with(|| StoredExitLayout {
+                    source_op_index: layout.source_op_index,
+                    exit_types: layout.fail_arg_types.clone(),
+                    is_finish: layout.is_finish,
+                    gc_ref_slots: layout.gc_ref_slots.clone(),
+                    force_token_slots: layout.force_token_slots.clone(),
+                    recovery_layout: layout.recovery_layout.clone(),
+                    resume_layout: None,
+                    rd_numb: None,
+                    rd_consts: None,
+                    rd_virtuals_info: None,
+                });
         entry.source_op_index = layout.source_op_index;
         entry.exit_types = layout.fail_arg_types.clone();
         entry.is_finish = layout.is_finish;
@@ -743,6 +793,57 @@ pub(crate) fn merge_backend_exit_layouts(
         // Merge backend frame_stack metadata into the stored resume layout.
         if let Some(frame_stack) = &layout.frame_stack {
             merge_frame_stack_into_resume_layout(entry, frame_stack);
+        }
+    }
+    validate_exit_layouts(exit_layouts);
+}
+
+/// Validate that guard exit layouts with recovery_layout have complete
+/// metadata. Called after merge_backend_exit_layouts to enforce:
+/// if recovery_layout is present, header_pc and slot_types must be set.
+///
+/// Guards that HAVE recovery_layout (all production guards after backend
+/// merge) must satisfy the full invariant. Guards without (only possible
+/// in unit tests with mock backends) are warned but not fatal.
+pub(crate) fn validate_exit_layouts(exit_layouts: &HashMap<u32, StoredExitLayout>) {
+    for (&fail_index, layout) in exit_layouts {
+        if layout.is_finish {
+            continue;
+        }
+        let Some(ref recovery) = layout.recovery_layout else {
+            // No recovery_layout — backend didn't provide one (test mock).
+            // In production, identity_recovery_layout always creates it.
+            continue;
+        };
+        for (fi, frame) in recovery.frames.iter().enumerate() {
+            // header_pc and slot_types are filled by both
+            // build_guard_metadata (metainterp) and identity_recovery_layout
+            // (backend). After backend merge, both must be present.
+            // Backend-provided layouts always have them (compiler.rs:4482,4488).
+            // Metainterp-provided layouts fill them since Step 1.
+            if frame.header_pc.is_none() || frame.slot_types.is_none() {
+                // Backend test mocks may omit these — not fatal in tests.
+                #[cfg(not(test))]
+                {
+                    debug_assert!(
+                        frame.header_pc.is_some(),
+                        "guard fail_index={fail_index} frame[{fi}] has no header_pc"
+                    );
+                    debug_assert!(
+                        frame.slot_types.is_some(),
+                        "guard fail_index={fail_index} frame[{fi}] has no slot_types"
+                    );
+                }
+                continue;
+            }
+            let st = frame.slot_types.as_ref().unwrap();
+            debug_assert_eq!(
+                st.len(),
+                frame.slots.len(),
+                "guard fail_index={fail_index} frame[{fi}]: slot_types.len()={} != slots.len()={}",
+                st.len(),
+                frame.slots.len(),
+            );
         }
     }
 }

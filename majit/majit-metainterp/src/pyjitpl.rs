@@ -4568,6 +4568,31 @@ impl<M: Clone> MetaInterp<M> {
         Some(exit_layout.exit_types.clone())
     }
 
+    /// Return the merge point PC for blackhole resume from a guard exit.
+    ///
+    /// Multi-frame (call_assembler with caller prefix): returns the
+    /// outermost (caller) frame's header_pc — the caller's trace entry.
+    /// Single-frame: returns the innermost frame's header_pc — the
+    /// callee's trace entry (jit_merge_point position).
+    ///
+    /// Producer invariant: after build_guard_metadata + backend merge,
+    /// every guard has recovery_layout with header_pc on all frames.
+    /// Returns None only if the (green_key, trace_id, fail_index) lookup
+    /// itself fails — a metadata consistency error, not a missing field.
+    pub fn get_merge_point_pc(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<u64> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let recovery = exit_layout.recovery_layout.as_ref()?;
+        recovery.frames.first()?.header_pc
+    }
+
     /// Compile a bridge from a guard failure point.
     ///
     /// In RPython, when a guard fails frequently, the JIT compiles a
