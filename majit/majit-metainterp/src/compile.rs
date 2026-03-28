@@ -296,33 +296,38 @@ pub(crate) fn build_guard_metadata(
                             }
                         })
                         .collect();
-                    // Legacy GuardVirtualEntry: Instance (known_class) or Struct.
-                    // Array/ArrayStruct/RawBuffer are force-allocated in
-                    // encode_virtual_for_guard (optimizer.rs) and don't
-                    // produce GuardVirtualEntry — only Instance/Struct reach here.
+                    // resume.py:596-603 setfields parity: extract byte offsets
+                    // from field descriptors. PyreFieldDescr's packed format:
+                    // (offset << 4) | 0x1000_0000.
                     let fielddescr_indices: Vec<u32> =
                         entry.fields.iter().map(|(fd, _)| *fd).collect();
-                    let descr_size = entry.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                    let field_offsets: Vec<usize> = entry
+                        .fields
+                        .iter()
+                        .map(|(field_descr_idx, _)| {
+                            let raw = *field_descr_idx;
+                            if raw & 0xF000_0000 == 0x1000_0000 {
+                                ((raw >> 4) & 0x000f_ffff) as usize
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    // resume.py:612-625 VirtualInfo / resume.py:628-641 VStructInfo
                     if known_class.is_some() {
                         majit_ir::RdVirtualInfo::Instance {
                             descr_index: descr_idx,
                             known_class,
                             fielddescr_indices,
-                            field_offsets: entry.field_offsets.clone(),
-                            field_types: vec![],
+                            field_offsets,
                             fieldnums,
-                            descr_size,
                         }
                     } else {
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index: descr_idx,
-                            known_class: None,
-                            object_size: descr_size,
                             fielddescr_indices,
-                            field_offsets: entry.field_offsets.clone(),
-                            field_types: vec![],
+                            field_offsets,
                             fieldnums,
-                            descr_size,
                         }
                     }
                 })

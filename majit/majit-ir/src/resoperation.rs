@@ -45,9 +45,6 @@ pub struct GuardVirtualEntry {
     /// Field descriptors and their positions in fail_args:
     /// (field_descr_index, fail_arg_index_of_field_value).
     pub fields: Vec<(u32, usize)>,
-    /// resume.py AbstractVirtualStructInfo.fielddescrs parity:
-    /// byte offsets from FieldDescr.offset(), parallel to `fields`.
-    pub field_offsets: Vec<usize>,
 }
 
 /// resume.py:576-860: virtual object serialization for rd_virtuals_info.
@@ -61,22 +58,13 @@ pub enum RdVirtualInfo {
         known_class: Option<i64>,
         fielddescr_indices: Vec<u32>,
         field_offsets: Vec<usize>,
-        /// resume.py:1509-1518: field type for type-dispatched setfield.
-        field_types: Vec<Type>,
         fieldnums: Vec<i16>,
-        descr_size: usize,
     },
     Struct {
         descr_index: u32,
-        /// Vtable from descr (for misclassified NEW_WITH_VTABLE).
-        known_class: Option<i64>,
-        /// Object size from descr.
-        object_size: usize,
         fielddescr_indices: Vec<u32>,
         field_offsets: Vec<usize>,
-        field_types: Vec<Type>,
         fieldnums: Vec<i16>,
-        descr_size: usize,
     },
     Array {
         descr_index: u32,
