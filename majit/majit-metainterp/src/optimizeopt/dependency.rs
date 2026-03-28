@@ -57,21 +57,22 @@ fn modify_complex_obj_args(opcode: OpCode) -> Option<(usize, i32)> {
 
 /// dependency.py:213-241: side_effect_arguments — determine which args are
 /// destroyed (modified) by the operation. Returns Vec<(arg, argcell, destroyed)>.
-fn side_effect_arguments(op: &Op) -> Vec<(OpRef, Option<OpRef>, bool)> {
+/// `arg_type_of` resolves an OpRef to its result type for the float check.
+fn side_effect_arguments(
+    op: &Op,
+    arg_type_of: &dyn Fn(OpRef) -> majit_ir::Type,
+) -> Vec<(OpRef, Option<OpRef>, bool)> {
     let mut result = Vec::new();
     if op.opcode.is_complex_modify() {
         // dependency.py:218-230: known complex modification patterns
         if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
             if obj_idx < op.args.len() {
                 if cell_idx >= 0 && (cell_idx as usize) < op.args.len() {
-                    // (obj, cell, destroyed=true) for the array+index case
                     result.push((op.args[obj_idx], Some(op.args[cell_idx as usize]), true));
-                    // remaining args are just used
                     for j in (cell_idx as usize + 1)..op.args.len() {
                         result.push((op.args[j], None, false));
                     }
                 } else {
-                    // (obj, None, destroyed=true) for field stores
                     result.push((op.args[obj_idx], None, true));
                     for j in (obj_idx + 1)..op.args.len() {
                         result.push((op.args[j], None, false));
@@ -80,12 +81,12 @@ fn side_effect_arguments(op: &Op) -> Vec<(OpRef, Option<OpRef>, bool)> {
             }
         }
     } else {
-        // dependency.py:232-240: generic side effect — assume args may be destroyed
+        // dependency.py:232-240: generic side effect
         for arg in &op.args {
-            if arg.is_constant() {
+            // dependency.py:237: arg.is_constant() or arg.type == 'f' → not destroyed
+            if arg.is_constant() || arg_type_of(*arg) == majit_ir::Type::Float {
                 result.push((*arg, None, false));
             } else {
-                // dependency.py:238-240: non-constant, non-float may be destroyed
                 result.push((*arg, None, true));
             }
         }
@@ -409,7 +410,16 @@ impl DependencyGraph {
             }
         } else {
             // dependency.py:752-777: side_effect_arguments processing
-            let side_effects = side_effect_arguments(&op);
+            let nodes_ref = &self.nodes;
+            let arg_type_of = |opref: OpRef| -> majit_ir::Type {
+                // Look up the defining op's result type
+                nodes_ref
+                    .iter()
+                    .find(|n| n.op.pos == opref)
+                    .map(|n| n.op.opcode.result_type())
+                    .unwrap_or(majit_ir::Type::Int)
+            };
+            let side_effects = side_effect_arguments(&op, &arg_type_of);
             for (arg, argcell, destroyed) in &side_effects {
                 if let Some(cell) = argcell {
                     // dependency.py:754-757: exact cell tracking
