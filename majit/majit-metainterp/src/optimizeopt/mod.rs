@@ -128,9 +128,9 @@ pub struct OptContext {
     pub new_operations: Vec<Op>,
     /// Constants known at optimization time (op -> value).
     pub constants: Vec<Option<Value>>,
-    /// Forwarding chain: maps old OpRef to replacement OpRef.
-    /// RPython: Box._forwarded — used for within-phase forwarding only.
-    pub forwarding: Vec<OpRef>,
+    /// resoperation.py: _forwarded — unified forwarding + PtrInfo.
+    /// Forwarded::Op(target) = forwarding, Forwarded::Info(info) = terminal.
+    pub forwarded: Vec<crate::optimizeopt::info::Forwarded>,
     /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
     /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
     /// Number of input arguments, used to offset emitted op positions
@@ -147,12 +147,7 @@ pub struct OptContext {
     /// Used by heap's force_lazy_set to route ops through remaining passes
     /// without re-entering the heap pass itself.
     pub(crate) extra_operations_after: VecDeque<(usize, Op)>,
-    /// info.py: per-OpRef pointer info, shared across all passes.
-    ///
-    /// RPython attaches info objects directly to operations via
-    /// `op.set_forwarded(info)`. majit uses an indexed Vec instead.
-    /// All passes can read/write this to share virtual/class/nonnull info.
-    pub ptr_info: Vec<Option<PtrInfo>>,
+    // ptr_info merged into forwarded (Forwarded::Info variant)
     /// Known lower bounds for integer-typed OpRefs, shared across passes.
     ///
     /// heap.py: arrayinfo.getlenbound().make_gt_const(index) records that
@@ -401,12 +396,11 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
-            forwarding: Vec::new(),
+            forwarded: Vec::new(),
             num_inputs: 0,
             next_pos: 0,
             extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
-            ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
@@ -451,12 +445,11 @@ impl OptContext {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
-            forwarding: Vec::new(),
+            forwarded: Vec::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
             extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
-            ptr_info: Vec::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
@@ -1033,30 +1026,22 @@ impl OptContext {
         if old == new {
             return;
         }
+        use crate::optimizeopt::info::Forwarded;
         let idx = old.0 as usize;
-        if idx >= self.forwarding.len() {
-            self.forwarding.resize(idx + 1, OpRef::NONE);
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        self.forwarding[idx] = new;
-        // RPython set_forwarded parity: when forwarding old → new,
-        // if old has PtrInfo and new doesn't, propagate PtrInfo to new.
-        // RPython's Box._forwarded is a single field: setting it to new_box
-        // overwrites the old info. But getptrinfo(old) follows forwarding
-        // to new_box and reads new_box's info. If new_box has no info yet,
-        // getptrinfo returns None — same as clearing old's info.
-        // However, in practice RPython always sets info on new_box before
-        // or after forwarding (via make_equal_to / postprocess).
-        // To match RPython behavior, propagate old's PtrInfo to new if
-        // new has no PtrInfo yet.
-        if idx < self.ptr_info.len() {
-            if let Some(info) = self.ptr_info[idx].take() {
-                let new_idx = new.0 as usize;
-                if new_idx >= self.ptr_info.len() {
-                    self.ptr_info.resize(new_idx + 1, None);
-                }
-                if self.ptr_info[new_idx].is_none() {
-                    self.ptr_info[new_idx] = Some(info);
-                }
+        let old_info = match std::mem::replace(&mut self.forwarded[idx], Forwarded::Op(new)) {
+            Forwarded::Info(info) => Some(info),
+            _ => None,
+        };
+        if let Some(info) = old_info {
+            let new_idx = new.0 as usize;
+            if new_idx >= self.forwarded.len() {
+                self.forwarded.resize(new_idx + 1, Forwarded::None);
+            }
+            if matches!(self.forwarded[new_idx], Forwarded::None) {
+                self.forwarded[new_idx] = Forwarded::Info(info);
             }
         }
     }
@@ -1098,16 +1083,16 @@ impl OptContext {
     /// NEVER consults mapping dicts — RPython's get_box_replacement only
     /// follows the _forwarded chain on the box itself.
     pub fn get_box_replacement(&self, mut opref: OpRef) -> OpRef {
+        use crate::optimizeopt::info::Forwarded;
         loop {
             let idx = opref.0 as usize;
-            if idx >= self.forwarding.len() {
+            if idx >= self.forwarded.len() {
                 return opref;
             }
-            let next = self.forwarding[idx];
-            if next.is_none() {
-                return opref;
+            match &self.forwarded[idx] {
+                Forwarded::Op(next) => opref = *next,
+                _ => return opref,
             }
-            opref = next;
         }
     }
 
@@ -2197,8 +2182,12 @@ impl OptContext {
 
     /// info.py: getptrinfo(op) — get PtrInfo for an OpRef.
     pub fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
-        let opref = self.get_box_replacement(opref);
-        self.ptr_info.get(opref.0 as usize).and_then(|v| v.as_ref())
+        use crate::optimizeopt::info::Forwarded;
+        let r = self.get_box_replacement(opref);
+        match self.forwarded.get(r.0 as usize)? {
+            Forwarded::Info(info) => Some(info),
+            _ => None,
+        }
     }
 
     /// Extract known class from PtrInfo, if available.
@@ -2214,22 +2203,25 @@ impl OptContext {
 
     /// info.py: getptrinfo(op) — mutable variant.
     pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
-        let opref = self.get_box_replacement(opref);
-        self.ptr_info
-            .get_mut(opref.0 as usize)
-            .and_then(|v| v.as_mut())
+        use crate::optimizeopt::info::Forwarded;
+        let r = self.get_box_replacement(opref);
+        match self.forwarded.get_mut(r.0 as usize)? {
+            Forwarded::Info(info) => Some(info),
+            _ => None,
+        }
     }
 
     /// info.py: op.set_forwarded(info) — set PtrInfo for an OpRef.
     /// Ensure a PtrInfo exists for the given OpRef. Creates an empty
     /// Instance if none exists, so that set_field can store values.
     pub fn ensure_ptr_info(&mut self, opref: OpRef) {
+        use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
-        if idx >= self.ptr_info.len() {
-            self.ptr_info.resize(idx + 1, None);
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        if self.ptr_info[idx].is_none() {
-            self.ptr_info[idx] = Some(PtrInfo::instance(None, None));
+        if matches!(self.forwarded[idx], Forwarded::None) {
+            self.forwarded[idx] = Forwarded::Info(PtrInfo::instance(None, None));
         }
     }
 
@@ -2237,14 +2229,14 @@ impl OptContext {
     /// Used by setinfo_from_preamble where the OpRef may have an
     /// active forwarding chain that must be preserved.
     fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
+        use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
-        if idx >= self.ptr_info.len() {
-            self.ptr_info.resize(idx + 1, None);
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        if self.ptr_info[idx].is_none() {
-            self.ptr_info[idx] = Some(info);
+        if matches!(self.forwarded[idx], Forwarded::None) {
+            self.forwarded[idx] = Forwarded::Info(info);
         }
-        // Do NOT clear forwarding — unlike set_ptr_info.
     }
 
     /// info.py:716-721: ConstPtrInfo._get_info(descr, optheap)
@@ -2271,16 +2263,12 @@ impl OptContext {
     /// any forwarding. In pyre, ptr_info and forwarding must be
     /// mutually exclusive — the last writer wins.
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
+        use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
-        if idx >= self.ptr_info.len() {
-            self.ptr_info.resize(idx + 1, None);
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        self.ptr_info[idx] = Some(info);
-        // RPython set_forwarded parity: _forwarded is a single field.
-        // Setting info replaces any existing forwarding.
-        if idx < self.forwarding.len() {
-            self.forwarding[idx] = OpRef::NONE;
-        }
+        self.forwarded[idx] = Forwarded::Info(info);
     }
 
     /// optimizer.py: replace_op_with(old, new_op, ctx)
@@ -2293,9 +2281,10 @@ impl OptContext {
 
     /// Check if an opref has been replaced (forwarded).
     pub fn is_replaced(&self, opref: OpRef) -> bool {
+        use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
-        if idx < self.forwarding.len() {
-            !self.forwarding[idx].is_none()
+        if idx < self.forwarded.len() {
+            matches!(self.forwarded[idx], Forwarded::Op(_))
         } else {
             false
         }

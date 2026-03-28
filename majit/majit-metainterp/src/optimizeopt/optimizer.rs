@@ -824,8 +824,8 @@ impl Optimizer {
         }
 
         // bridgeopt.py:74-88: known classes from ptr_info
-        for (idx, info_opt) in ctx.ptr_info.iter().enumerate() {
-            if let Some(info) = info_opt {
+        for (idx, fwd) in ctx.forwarded.iter().enumerate() {
+            if let crate::optimizeopt::info::Forwarded::Info(info) = fwd {
                 if let Some(class_ptr) = info.get_known_class() {
                     knowledge
                         .known_classes
@@ -1207,7 +1207,7 @@ impl Optimizer {
     /// Reset forwarding pointers on all ops before re-optimization.
     /// Called when re-optimizing a trace (e.g., retrace).
     pub fn clean_optimization_info(ctx: &mut OptContext) {
-        ctx.forwarding.clear();
+        ctx.forwarded.clear();
     }
 
     /// optimizer.py: get_count_of_ops()
@@ -1684,7 +1684,7 @@ impl Optimizer {
             // RPython unroll.py:454-457: use virtual state from BEFORE force.
             // OptVirtualize captures this in the JUMP handler.
             let preview_virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
-                crate::optimizeopt::virtualstate::export_state(&jump.args, &ctx, &ctx.ptr_info)
+                crate::optimizeopt::virtualstate::export_state(&jump.args, &ctx, &ctx.forwarded)
             });
             // Use pre-force args for make_inputargs so virtual entries can
             // look up their field values from the still-virtual PtrInfo.
@@ -1795,25 +1795,19 @@ impl Optimizer {
         // Resolve forwarding BEFORE remap.
         // RPython get_box_replacement: follow chain, stop at ptr_info terminal.
         {
-            let fwd = ctx.forwarding.clone();
-            let ptr_info = ctx.ptr_info.clone();
+            let fwd = ctx.forwarded.clone();
             let resolve = |opref: OpRef| -> OpRef {
+                use crate::optimizeopt::info::Forwarded;
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
                     if idx >= fwd.len() {
                         return cur;
                     }
-                    let next = fwd[idx];
-                    if next.is_none() || next == cur {
-                        return cur;
+                    match &fwd[idx] {
+                        Forwarded::Op(next) => cur = *next,
+                        _ => return cur,
                     }
-                    // ptr_info stop: next has Info → terminal
-                    let next_idx = next.0 as usize;
-                    if next_idx < ptr_info.len() && ptr_info[next_idx].is_some() {
-                        return next;
-                    }
-                    cur = next;
                 }
             };
             for op in &mut ctx.new_operations {
@@ -1841,24 +1835,19 @@ impl Optimizer {
         // forwarding a recently-emitted boxed-field read to its raw payload).
         // Resolve forwarding again with ptr_info stop.
         {
-            let fwd = ctx.forwarding.clone();
-            let ptr_info = ctx.ptr_info.clone();
+            let fwd = ctx.forwarded.clone();
             let resolve = |opref: OpRef| -> OpRef {
+                use crate::optimizeopt::info::Forwarded;
                 let mut cur = opref;
                 loop {
                     let idx = cur.0 as usize;
                     if idx >= fwd.len() {
                         return cur;
                     }
-                    let next = fwd[idx];
-                    if next.is_none() || next == cur {
-                        return cur;
+                    match &fwd[idx] {
+                        Forwarded::Op(next) => cur = *next,
+                        _ => return cur,
                     }
-                    let next_idx = next.0 as usize;
-                    if next_idx < ptr_info.len() && ptr_info[next_idx].is_some() {
-                        return next;
-                    }
-                    cur = next;
                 }
             };
             for op in &mut ctx.new_operations {
@@ -1886,9 +1875,11 @@ impl Optimizer {
                         s.insert(k as u32);
                     }
                 }
-                for (i, &fwd) in ctx.forwarding.iter().enumerate() {
-                    if !fwd.is_none() && fwd != OpRef(i as u32) {
-                        s.insert(fwd.0);
+                for (i, fwd) in ctx.forwarded.iter().enumerate() {
+                    if let crate::optimizeopt::info::Forwarded::Op(target) = fwd {
+                        if *target != OpRef(i as u32) {
+                            s.insert(target.0);
+                        }
                     }
                 }
                 s
@@ -1917,10 +1908,10 @@ impl Optimizer {
 
             // Op positions: reassign ALL ops to start from final_num_inputs.
             if crate::optimizeopt::majit_log_enabled() {
-                let fwd_1995 = if 1995 < ctx.forwarding.len() {
-                    ctx.forwarding[1995]
+                let fwd_1995 = if 1995 < ctx.forwarded.len() {
+                    format!("{:?}", ctx.forwarded[1995])
                 } else {
-                    OpRef::NONE
+                    "None".to_string()
                 };
                 let in_ops = ctx.new_operations.iter().any(|o| o.pos.0 == 1995);
                 let in_args = ctx
@@ -1959,10 +1950,10 @@ impl Optimizer {
 
             // Apply remap to forwarding table too, so forwarding resolution
             // after remap resolves to the correct remapped positions.
-            for entry in &mut ctx.forwarding {
-                if !entry.is_none() {
-                    if let Some(&new_pos) = remap.get(&entry.0) {
-                        *entry = OpRef(new_pos);
+            for entry in &mut ctx.forwarded {
+                if let crate::optimizeopt::info::Forwarded::Op(target) = entry {
+                    if let Some(&new_pos) = remap.get(&target.0) {
+                        *target = OpRef(new_pos);
                     }
                 }
             }

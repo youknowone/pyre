@@ -439,7 +439,7 @@ impl OptVirtualize {
                         let val = crate::optimizeopt::virtualstate::export_value_state(
                             *value_ref,
                             ctx,
-                            &ctx.ptr_info,
+                            &ctx.forwarded,
                         );
                         (descr, val)
                     })
@@ -467,7 +467,7 @@ impl OptVirtualize {
                         let val = crate::optimizeopt::virtualstate::export_value_state(
                             *value_ref,
                             ctx,
-                            &ctx.ptr_info,
+                            &ctx.forwarded,
                         );
                         (descr, val)
                     })
@@ -1975,7 +1975,7 @@ impl Optimization for OptVirtualize {
                 let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
                     &pre_force_args,
                     ctx,
-                    &ctx.ptr_info,
+                    &ctx.forwarded,
                 );
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
@@ -2021,7 +2021,7 @@ impl Optimization for OptVirtualize {
                 let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
                     &pre_force_args,
                     ctx,
-                    &ctx.ptr_info,
+                    &ctx.forwarded,
                 );
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());

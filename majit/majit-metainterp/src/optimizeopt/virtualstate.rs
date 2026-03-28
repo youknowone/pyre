@@ -1454,17 +1454,17 @@ impl GuardRequirement {
 /// a VirtualState snapshot for a set of loop-carried values.
 pub struct VirtualStateConstructor<'a> {
     ctx: &'a OptContext,
-    ptr_info: &'a [Option<PtrInfo>],
+    forwarded: &'a [crate::optimizeopt::info::Forwarded],
 }
 
 impl<'a> VirtualStateConstructor<'a> {
-    pub fn new(ctx: &'a OptContext, ptr_info: &'a [Option<PtrInfo>]) -> Self {
-        VirtualStateConstructor { ctx, ptr_info }
+    pub fn new(ctx: &'a OptContext, forwarded: &'a [crate::optimizeopt::info::Forwarded]) -> Self {
+        VirtualStateConstructor { ctx, forwarded }
     }
 
     /// Build a VirtualState for the given OpRefs.
     pub fn build(&self, oprefs: &[OpRef]) -> VirtualState {
-        export_state(oprefs, self.ctx, self.ptr_info)
+        export_state(oprefs, self.ctx, self.forwarded)
     }
 
     /// Build VirtualState for label args and return it along with
@@ -1485,7 +1485,7 @@ impl<'a> VirtualStateConstructor<'a> {
 pub fn export_state(
     oprefs: &[OpRef],
     ctx: &OptContext,
-    ptr_info: &[Option<PtrInfo>],
+    _forwarded: &[crate::optimizeopt::info::Forwarded],
 ) -> VirtualState {
     // RPython VirtualStateConstructor.create_state(): cache by resolved box.
     // If two different oprefs resolve to the same target via get_replacement,
@@ -1501,7 +1501,7 @@ pub fn export_state(
             if let Some(cached) = cache.get(&resolved) {
                 return cached.clone();
             }
-            let info = export_single_value(resolved, ctx, ptr_info, &mut HashMap::new());
+            let info = export_single_value(resolved, ctx, &mut HashMap::new());
             cache.insert(resolved, info.clone());
             info
         })
@@ -1512,21 +1512,15 @@ pub fn export_state(
 pub(crate) fn export_value_state(
     opref: OpRef,
     ctx: &OptContext,
-    ptr_info: &[Option<PtrInfo>],
+    _forwarded: &[crate::optimizeopt::info::Forwarded],
 ) -> VirtualStateInfo {
-    export_single_value(
-        ctx.get_box_replacement(opref),
-        ctx,
-        ptr_info,
-        &mut HashMap::new(),
-    )
+    export_single_value(ctx.get_box_replacement(opref), ctx, &mut HashMap::new())
 }
 
 /// Export abstract info for a single value.
 fn export_single_value(
     opref: OpRef,
     ctx: &OptContext,
-    ptr_info: &[Option<PtrInfo>],
     visited: &mut HashMap<OpRef, ()>,
 ) -> VirtualStateInfo {
     // Prevent infinite recursion on circular references
@@ -1570,16 +1564,15 @@ fn export_single_value(
         return VirtualStateInfo::Unknown;
     }
 
-    // Check PtrInfo
-    let idx = opref.0 as usize;
-    if let Some(Some(info)) = ptr_info.get(idx) {
+    // Check PtrInfo — use ctx.get_ptr_info which follows forwarding
+    if let Some(info) = ctx.get_ptr_info(opref) {
         match info {
             PtrInfo::Virtual(vinfo) => {
                 let fields = vinfo
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(*field_ref, ctx, ptr_info, visited);
+                        let field_state = export_single_value(*field_ref, ctx, visited);
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
@@ -1595,7 +1588,7 @@ fn export_single_value(
                     .items
                     .iter()
                     .map(|item_ref| {
-                        let item_state = export_single_value(*item_ref, ctx, ptr_info, visited);
+                        let item_state = export_single_value(*item_ref, ctx, visited);
                         Box::new(item_state)
                     })
                     .collect();
@@ -1611,7 +1604,7 @@ fn export_single_value(
                     .fields
                     .iter()
                     .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(*field_ref, ctx, ptr_info, visited);
+                        let field_state = export_single_value(*field_ref, ctx, visited);
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
@@ -1629,8 +1622,7 @@ fn export_single_value(
                         fields
                             .iter()
                             .map(|(field_idx, field_ref)| {
-                                let field_state =
-                                    export_single_value(*field_ref, ctx, ptr_info, visited);
+                                let field_state = export_single_value(*field_ref, ctx, visited);
                                 (*field_idx, Box::new(field_state))
                             })
                             .collect()
@@ -1646,7 +1638,7 @@ fn export_single_value(
                     .entries
                     .iter()
                     .map(|(offset, length, value_ref)| {
-                        let val_state = export_single_value(*value_ref, ctx, ptr_info, visited);
+                        let val_state = export_single_value(*value_ref, ctx, visited);
                         (*offset, *length, Box::new(val_state))
                     })
                     .collect();
