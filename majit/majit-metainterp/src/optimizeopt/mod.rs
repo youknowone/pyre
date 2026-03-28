@@ -747,48 +747,60 @@ impl OptContext {
             .unwrap_or(result)
     }
 
+    /// unroll.py:26-39 force_op_from_preamble.
+    ///
+    /// RPython: if isinstance(preamble_op, PreambleOp):
+    ///   op = preamble_op.op
+    ///   use_box(op, preamble_op.preamble_op, self)
+    ///   if not op.is_constant():
+    ///     if invented_name: op = get_box_replacement(op)
+    ///     potential_extra_ops[op] = preamble_op
+    ///   return preamble_op.op   ← raw imported op (no forwarding resolve)
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        // unroll.py:26-39 parity: check imported short identity BEFORE
-        // get_box_replacement. RPython checks isinstance(preamble_op,
-        // PreambleOp) on the raw (unresolved) input. After forwarding
-        // chain changes, the original imported identity may be lost.
-        let preamble_result = self.imported_short_source(result);
-        let result = self.get_box_replacement(result);
-        let is_constant = self.get_constant(preamble_result).is_some();
-        if self.imported_short_preamble_used.insert(preamble_result) {
+        // Check imported short identity BEFORE get_box_replacement
+        // (RPython checks isinstance on the raw input, line 27).
+        let preamble_source = self.imported_short_source(result);
+        let is_constant = self.get_constant(preamble_source).is_some();
+        if self.imported_short_preamble_used.insert(preamble_source) {
+            // unroll.py:31 use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
-                builder.use_box(preamble_result).is_some()
+                builder.use_box(preamble_source).is_some()
             } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                builder.use_box(preamble_result).is_some()
+                builder.use_box(preamble_source).is_some()
             } else {
                 false
             };
+            // unroll.py:33-37: if not constant → potential_extra_ops[op] = preamble_op
             if tracked && !is_constant {
-                if let Some(builder) = self.imported_short_preamble_builder.as_ref() {
-                    if let Some(produced) = builder.produced_short_op(preamble_result) {
-                        self.potential_extra_ops.insert(
-                            preamble_result,
-                            TrackedPreambleUse {
-                                result: preamble_result,
-                                produced,
-                            },
-                        );
-                    }
-                } else if let Some(builder) = self.active_short_preamble_producer.as_ref() {
-                    if let Some(produced) = builder.produced_short_op(preamble_result) {
-                        self.potential_extra_ops.insert(
-                            preamble_result,
-                            TrackedPreambleUse {
-                                result: preamble_result,
-                                produced,
-                            },
-                        );
-                    }
+                let produced = self
+                    .imported_short_preamble_builder
+                    .as_ref()
+                    .and_then(|b| b.produced_short_op(preamble_source))
+                    .or_else(|| {
+                        self.active_short_preamble_producer
+                            .as_ref()
+                            .and_then(|b| b.produced_short_op(preamble_source))
+                    });
+                if let Some(produced) = produced {
+                    // unroll.py:34-35: if invented_name: op = get_box_replacement(op)
+                    let key = if produced.invented_name {
+                        self.get_box_replacement(preamble_source)
+                    } else {
+                        preamble_source
+                    };
+                    self.potential_extra_ops.insert(
+                        key,
+                        TrackedPreambleUse {
+                            result: preamble_source,
+                            produced,
+                        },
+                    );
                 }
             }
         }
-        // Return the imported result (not preamble source) to avoid stale
-        // forwarding from Phase 2 body ops that reuse preamble OpRef positions.
+        // unroll.py:38: return preamble_op.op — raw imported op, no
+        // forwarding resolve. Callers store this in cache; subsequent
+        // reads go through get_box_replacement to resolve.
         result
     }
 
