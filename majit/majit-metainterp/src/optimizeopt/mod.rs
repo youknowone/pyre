@@ -133,8 +133,6 @@ pub struct OptContext {
     pub forwarding: Vec<OpRef>,
     /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
     /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
-    /// Consulted by get_replacement BEFORE the forwarding chain.
-    pub short_preamble_mapping: HashMap<OpRef, OpRef>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -276,7 +274,7 @@ pub struct OptBoxEnv<'a> {
 
 impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-        self.ctx.get_replacement(opref)
+        self.ctx.get_box_replacement(opref)
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
@@ -325,7 +323,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             return tp;
         }
         // Check emitted op result type (most accurate for concrete values)
-        let resolved = self.ctx.get_replacement(opref);
+        let resolved = self.ctx.get_box_replacement(opref);
         for op in &self.ctx.new_operations {
             if op.pos == resolved {
                 return op.result_type();
@@ -355,7 +353,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
-        let resolved = self.ctx.get_replacement(opref);
+        let resolved = self.ctx.get_box_replacement(opref);
         let info = self.ctx.get_ptr_info(resolved)?;
         match info {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -364,7 +362,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
-                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
             PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -373,7 +371,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
-                    .map(|(_, vref)| self.ctx.get_replacement(*vref))
+                    .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
             _ => None,
@@ -392,7 +390,6 @@ impl OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             forwarding: Vec::new(),
-            short_preamble_mapping: HashMap::new(),
             num_inputs: 0,
             next_pos: 0,
             extra_operations: VecDeque::new(),
@@ -439,7 +436,6 @@ impl OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
             constants: Vec::new(),
             forwarding: Vec::new(),
-            short_preamble_mapping: HashMap::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
             extra_operations: VecDeque::new(),
@@ -524,10 +520,6 @@ impl OptContext {
         // In RPython, Box._forwarded is never cleared by emit — each Box
         // has unique identity. The forwarding set by import_box must
         // survive body op emission for consumer switchover to work.
-        // Phase 2 body defines its own result at pos — supersede any cross-phase
-        // short_preamble_mapping entry, so get_replacement returns the body's
-        // value rather than the preamble import.
-        self.short_preamble_mapping.remove(&pos_ref);
 
         // RPython optimizer.py:_emit_operation → store_final_boxes_in_guard:
         // produce rd_numb inline at guard emission time, not post-assembly.
@@ -756,13 +748,12 @@ impl OptContext {
     }
 
     pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        let result = self.get_replacement(result);
-        // In RPython, preamble_result maps to the original preamble Box.
-        // In pyre, the preamble source OpRef can be overridden by Phase 2
-        // body processing (e.g., Virtualize sets forwarding on the same
-        // position). Use the imported result directly to avoid stale
-        // forwarding from body ops.
+        // unroll.py:26-39 parity: check imported short identity BEFORE
+        // get_box_replacement. RPython checks isinstance(preamble_op,
+        // PreambleOp) on the raw (unresolved) input. After forwarding
+        // chain changes, the original imported identity may be lost.
         let preamble_result = self.imported_short_source(result);
+        let result = self.get_box_replacement(result);
         let is_constant = self.get_constant(preamble_result).is_some();
         if self.imported_short_preamble_used.insert(preamble_result) {
             let tracked = if let Some(builder) = self.active_short_preamble_producer.as_mut() {
@@ -886,9 +877,6 @@ impl OptContext {
         if idx < self.ptr_info.len() {
             self.ptr_info[idx] = None;
         }
-        // Phase 2 body is defining the value for `old` — supersede any
-        // cross-phase mapping so get_replacement follows forwarding instead.
-        self.short_preamble_mapping.remove(&old);
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
@@ -920,17 +908,14 @@ impl OptContext {
         self.new_operations.get(pos)
     }
 
-    /// RPython get_box_replacement: follow the forwarding chain until
-    /// we reach a terminal. With ptr_info/forwarding mutual exclusion,
-    /// a position has EITHER forwarding (transit) OR ptr_info (terminal),
-    /// never both. A terminal position has no forwarding → the loop
-    /// ends naturally when forwarding[idx] is NONE.
-    pub fn get_replacement(&self, mut opref: OpRef) -> OpRef {
-        // RPython: mapping dict lookup (inline_short_preamble).
-        // Cross-phase mapping is separate from _forwarded chain.
-        if let Some(&mapped) = self.short_preamble_mapping.get(&opref) {
-            opref = mapped;
-        }
+    /// resoperation.py:57-68 get_box_replacement: follow the forwarding
+    /// chain (op._forwarded) until we reach a terminal. RPython: walks
+    /// op → op._forwarded → ... until None or Info instance.
+    /// In majit: forwarding[idx] == NONE means terminal.
+    ///
+    /// NEVER consults mapping dicts — RPython's get_box_replacement only
+    /// follows the _forwarded chain on the box itself.
+    pub fn get_box_replacement(&self, mut opref: OpRef) -> OpRef {
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarding.len() {
@@ -955,7 +940,7 @@ impl OptContext {
 
     /// Get the constant value for an operation, if known.
     pub fn get_constant(&self, opref: OpRef) -> Option<&Value> {
-        let opref = self.get_replacement(opref);
+        let opref = self.get_box_replacement(opref);
         let idx = opref.0 as usize;
         self.constants.get(idx).and_then(|v| v.as_ref())
     }
@@ -1045,7 +1030,7 @@ impl OptContext {
         impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
             fn get_box_replacement(&self, opref: OpRef) -> OpRef {
                 // resume.py:201-202 box.get_box_replacement()
-                let repl = self.ctx.get_replacement(opref);
+                let repl = self.ctx.get_box_replacement(opref);
                 if repl.is_none() && !opref.is_none() {
                     return opref;
                 }
@@ -1141,7 +1126,7 @@ impl OptContext {
             if !snap_opref.is_none() {
                 // Resolve through replacement chain (same as _number_boxes does
                 // via env.get_box_replacement) to match numb_state.liveboxes keys.
-                let resolved = self.get_replacement(snap_opref);
+                let resolved = self.get_box_replacement(snap_opref);
                 if let Some(&tagged) = numb_state.liveboxes.get(&resolved.0) {
                     let (v, tagbits) = resumedata::untag(tagged);
                     if tagbits == resumedata::TAGVIRTUAL {
@@ -1185,7 +1170,7 @@ impl OptContext {
             };
             let mut fieldnums: Vec<i16> = Vec::new();
             for (_field_idx, value_ref) in &fields_data {
-                let resolved_val = self.get_replacement(*value_ref);
+                let resolved_val = self.get_box_replacement(*value_ref);
                 // resume.py:500,560 _gettagged(box) parity:
                 //   None        → UNINITIALIZED
                 //   Const       → memo.getconst(box) (TAGCONST)
@@ -1249,7 +1234,7 @@ impl OptContext {
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.
     pub fn get_int_bound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
-        let opref = self.get_replacement(opref);
+        let opref = self.get_box_replacement(opref);
         // Check imported bounds first (from Phase 1 / preamble)
         if let Some(bound) = self.imported_int_bounds.get(&opref) {
             return Some(bound.clone());
@@ -1291,18 +1276,12 @@ impl OptContext {
         self.replace_op(opref, target);
     }
 
-    /// optimizer.py: get_box_replacement(opref)
-    /// Same as get_replacement — follows forwarding chain.
-    pub fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-        self.get_replacement(opref)
-    }
-
     /// Look up the operation that produces a given OpRef.
     /// Searches emitted operations and input ops.
     /// Used for pattern matching nested operations (e.g., int_add(int_add(x, C1), C2)).
     /// Returns a clone to avoid borrow conflicts with mutable ctx methods.
     pub fn get_producing_op(&self, opref: OpRef) -> Option<Op> {
-        let opref = self.get_replacement(opref);
+        let opref = self.get_box_replacement(opref);
         self.new_operations
             .iter()
             .find(|op| op.pos == opref)
@@ -1356,7 +1335,7 @@ impl OptContext {
 
     /// info.py: getptrinfo(op) — get PtrInfo for an OpRef.
     pub fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
-        let opref = self.get_replacement(opref);
+        let opref = self.get_box_replacement(opref);
         self.ptr_info.get(opref.0 as usize).and_then(|v| v.as_ref())
     }
 
@@ -1373,7 +1352,7 @@ impl OptContext {
 
     /// info.py: getptrinfo(op) — mutable variant.
     pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
-        let opref = self.get_replacement(opref);
+        let opref = self.get_box_replacement(opref);
         self.ptr_info
             .get_mut(opref.0 as usize)
             .and_then(|v| v.as_mut())

@@ -287,8 +287,8 @@ impl OptBridgeOpt {
         ctx: &OptContext,
     ) -> bool {
         let cmp_opcode = cond_op.opcode;
-        let a = ctx.get_replacement(cond_op.arg(0));
-        let b = ctx.get_replacement(cond_op.arg(1));
+        let a = ctx.get_box_replacement(cond_op.arg(0));
+        let b = ctx.get_box_replacement(cond_op.arg(1));
 
         let a_bounds = self.get_bounds(a, ctx);
         let b_bounds = self.get_bounds(b, ctx);
@@ -396,8 +396,8 @@ impl Optimization for OptBridgeOpt {
             // If the guard value is already known as a constant,
             // the guard is redundant.
             OpCode::GuardValue => {
-                let obj = ctx.get_replacement(op.arg(0));
-                let expected = ctx.get_replacement(op.arg(1));
+                let obj = ctx.get_box_replacement(op.arg(0));
+                let expected = ctx.get_box_replacement(op.arg(1));
                 if let (Some(a), Some(b)) =
                     (ctx.get_constant_int(obj), ctx.get_constant_int(expected))
                 {
@@ -411,7 +411,7 @@ impl Optimization for OptBridgeOpt {
             // If we know the value is non-null from bridge knowledge,
             // the guard is redundant.
             OpCode::GuardNonnull => {
-                let obj = ctx.get_replacement(op.arg(0));
+                let obj = ctx.get_box_replacement(op.arg(0));
                 if self.knowledge.known_nonnull.contains(&obj) {
                     return OptimizationResult::Remove;
                 }
@@ -420,7 +420,7 @@ impl Optimization for OptBridgeOpt {
 
             // If we know the class from bridge knowledge, class guard is redundant.
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                let obj = ctx.get_replacement(op.arg(0));
+                let obj = ctx.get_box_replacement(op.arg(0));
                 if self.knowledge.known_classes.contains_key(&obj) {
                     return OptimizationResult::Remove;
                 }
@@ -431,7 +431,7 @@ impl Optimization for OptBridgeOpt {
             // have known bounds that prove the guard always succeeds,
             // the guard is redundant.
             OpCode::GuardTrue | OpCode::GuardFalse => {
-                let cond_ref = ctx.get_replacement(op.arg(0));
+                let cond_ref = ctx.get_box_replacement(op.arg(0));
                 if let Some(cond_op) = self.produced_by.get(&cond_ref) {
                     let guard_true = op.opcode == OpCode::GuardTrue;
                     if self.can_eliminate_comparison_guard(cond_op, guard_true, ctx) {

@@ -66,7 +66,7 @@ impl OptString {
     /// Get the virtual string info for an OpRef, following forwarding.
     #[allow(dead_code)]
     fn get_vstring<'a>(&'a self, opref: OpRef, ctx: &OptContext) -> Option<&'a VStringInfo> {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         self.vstrings.get(&resolved)
     }
 
@@ -74,7 +74,7 @@ impl OptString {
     ///
     /// Returns the OpRef of the emitted NEWSTR.
     fn force_string(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let info = match self.vstrings.remove(&resolved) {
             Some(info) => info,
             None => return resolved, // already forced or not virtual
@@ -101,7 +101,7 @@ impl OptString {
                 for (i, ch) in chars.iter().enumerate() {
                     if let Some(ch_ref) = ch {
                         let idx_ref = self.emit_constant_int(i as i64, ctx);
-                        let ch_resolved = ctx.get_replacement(*ch_ref);
+                        let ch_resolved = ctx.get_box_replacement(*ch_ref);
                         let setitem_op = Op::new(set_opcode, &[str_ref, idx_ref, ch_resolved]);
                         ctx.emit(setitem_op);
                     }
@@ -162,8 +162,8 @@ impl OptString {
                 length,
             } => {
                 let src_forced = self.force_string(source, ctx);
-                let start_resolved = ctx.get_replacement(start);
-                let length_resolved = ctx.get_replacement(length);
+                let start_resolved = ctx.get_box_replacement(start);
+                let length_resolved = ctx.get_box_replacement(length);
                 let is_unicode = self.unicode_refs.contains(&resolved);
                 let new_opcode = if is_unicode {
                     OpCode::Newunicode
@@ -203,9 +203,9 @@ impl OptString {
 
     /// Get or compute the STRLEN for a string OpRef.
     fn get_or_emit_strlen(&self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
-            return ctx.get_replacement(len_ref);
+            return ctx.get_box_replacement(len_ref);
         }
         // Emit a STRLEN op.
         let strlen_op = Op::new(OpCode::Strlen, &[resolved]);
@@ -214,9 +214,9 @@ impl OptString {
 
     /// Get the strlen OpRef if already known, without emitting a new op.
     fn get_or_emit_strlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
-            return Some(ctx.get_replacement(len_ref));
+            return Some(ctx.get_box_replacement(len_ref));
         }
         if let Some(info) = self.vstrings.get(&resolved) {
             match info {
@@ -232,7 +232,7 @@ impl OptString {
 
     /// Try to get a character from a virtual string at a constant index.
     fn try_get_char(&self, opref: OpRef, index: i64, ctx: &OptContext) -> Option<OpRef> {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let info = self.vstrings.get(&resolved)?;
         match info {
             VStringInfo::Plain { chars } => {
@@ -241,7 +241,7 @@ impl OptString {
             }
             VStringInfo::Concat { left, right } => {
                 // Need to know the left length to decide which side.
-                let left_resolved = ctx.get_replacement(*left);
+                let left_resolved = ctx.get_box_replacement(*left);
                 let left_len = self.get_known_length(left_resolved, ctx)?;
                 if index < left_len {
                     self.try_get_char(*left, index, ctx)
@@ -258,7 +258,7 @@ impl OptString {
 
     /// Get the known length of a virtual string as a constant, if available.
     fn get_known_length(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         // Check known_lengths map.
         if let Some(&len_ref) = self.known_lengths.get(&resolved) {
             return ctx.get_constant_int(len_ref);
@@ -268,8 +268,8 @@ impl OptString {
         match info {
             VStringInfo::Plain { chars } => Some(chars.len() as i64),
             VStringInfo::Concat { left, right } => {
-                let left_resolved = ctx.get_replacement(*left);
-                let right_resolved = ctx.get_replacement(*right);
+                let left_resolved = ctx.get_box_replacement(*left);
+                let right_resolved = ctx.get_box_replacement(*right);
                 let l = self.get_known_length(left_resolved, ctx)?;
                 let r = self.get_known_length(right_resolved, ctx)?;
                 Some(l + r)
@@ -300,7 +300,7 @@ impl OptString {
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
     fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0));
         let idx_ref = op.arg(1);
         let char_ref = op.arg(2);
 
@@ -309,7 +309,7 @@ impl OptString {
                 if let VStringInfo::Plain { chars } = info {
                     let i = idx as usize;
                     if i < chars.len() {
-                        chars[i] = Some(ctx.get_replacement(char_ref));
+                        chars[i] = Some(ctx.get_box_replacement(char_ref));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -322,12 +322,12 @@ impl OptString {
 
     /// Handle STRGETITEM: if source is virtual, resolve the character.
     fn optimize_strgetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0));
         let idx_ref = op.arg(1);
 
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
             if let Some(ch_ref) = self.try_get_char(str_ref, idx, ctx) {
-                let ch_resolved = ctx.get_replacement(ch_ref);
+                let ch_resolved = ctx.get_box_replacement(ch_ref);
                 ctx.replace_op(op.pos, ch_resolved);
                 return OptimizationResult::Remove;
             }
@@ -339,7 +339,7 @@ impl OptString {
 
     /// Handle STRLEN: if source is virtual, return known length.
     fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0));
 
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             ctx.make_constant(op.pos, Value::Int(len));
@@ -356,8 +356,8 @@ impl OptString {
     /// Handle COPYSTRCONTENT: if destination is virtual Plain, track characters.
     fn optimize_copystrcontent(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // copystrcontent(src, dst, src_start, dst_start, length)
-        let src_ref = ctx.get_replacement(op.arg(0));
-        let dst_ref = ctx.get_replacement(op.arg(1));
+        let src_ref = ctx.get_box_replacement(op.arg(0));
+        let dst_ref = ctx.get_box_replacement(op.arg(1));
         let src_start_ref = op.arg(2);
         let dst_start_ref = op.arg(3);
         let length_ref = op.arg(4);
@@ -439,7 +439,7 @@ impl OptString {
 
     /// Force a string if it is virtual.
     fn force_if_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         if self.vstrings.contains_key(&resolved) {
             self.force_string(resolved, ctx);
         }
@@ -465,7 +465,7 @@ impl OptString {
         };
         for ch in chars {
             if let Some(ch_ref) = ch {
-                let ch_resolved = ctx.get_replacement(*ch_ref);
+                let ch_resolved = ctx.get_box_replacement(*ch_ref);
                 let set_op = Op::new(set_opcode, &[target, offset, ch_resolved]);
                 ctx.emit(set_op);
             }
@@ -480,7 +480,7 @@ impl OptString {
     /// Check if an OpRef references a virtual string (after forwarding).
     #[allow(dead_code)]
     fn is_virtual(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         self.vstrings.contains_key(&resolved)
     }
 
@@ -509,7 +509,7 @@ impl OptString {
     /// vstring.py: postprocess — after STRLEN on a known-length string,
     /// record as pure (for CSE with OptPure).
     fn postprocess_strlen(&self, op: &Op, ctx: &OptContext) {
-        let str_ref = ctx.get_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0));
         if let Some(len) = self.get_known_length(str_ref, ctx) {
             // STRLEN(s) = constant len: record for CSE
             let _ = len; // In RPython, this would call pure_from_args
@@ -518,7 +518,11 @@ impl OptString {
 
     fn force_args_if_virtual(&mut self, op: &Op, ctx: &mut OptContext) {
         // Collect refs first to avoid borrow issues.
-        let args: Vec<OpRef> = op.args.iter().map(|a| ctx.get_replacement(*a)).collect();
+        let args: Vec<OpRef> = op
+            .args
+            .iter()
+            .map(|a| ctx.get_box_replacement(*a))
+            .collect();
         for arg in args {
             if self.vstrings.contains_key(&arg) {
                 self.force_string(arg, ctx);
@@ -539,8 +543,8 @@ impl OptString {
                 // STR_CONCAT(a, b): create a virtual Concat.
                 if op.num_args() >= 3 {
                     // args: [func_ptr, a, b]
-                    let left = ctx.get_replacement(op.arg(1));
-                    let right = ctx.get_replacement(op.arg(2));
+                    let left = ctx.get_box_replacement(op.arg(1));
+                    let right = ctx.get_box_replacement(op.arg(2));
                     self.vstrings
                         .insert(op.pos, VStringInfo::Concat { left, right });
                     return OptimizationResult::Remove;
@@ -551,9 +555,9 @@ impl OptString {
             OopSpecIndex::StrSlice => {
                 // STR_SLICE(s, start, stop): create a virtual Slice.
                 if op.num_args() >= 4 {
-                    let source = ctx.get_replacement(op.arg(1));
-                    let start = ctx.get_replacement(op.arg(2));
-                    let stop = ctx.get_replacement(op.arg(3));
+                    let source = ctx.get_box_replacement(op.arg(1));
+                    let start = ctx.get_box_replacement(op.arg(2));
+                    let stop = ctx.get_box_replacement(op.arg(3));
                     // vstring.py: length = stop - start
                     let length = if let Some(length_ref) = self.int_sub_oprefs(stop, start, ctx) {
                         length_ref
@@ -577,8 +581,8 @@ impl OptString {
             OopSpecIndex::StrEqual => {
                 // vstring.py: opt_call_stroruni_STR_EQUAL
                 if op.num_args() >= 3 {
-                    let a = ctx.get_replacement(op.arg(1));
-                    let b = ctx.get_replacement(op.arg(2));
+                    let a = ctx.get_box_replacement(op.arg(1));
+                    let b = ctx.get_box_replacement(op.arg(2));
                     // Same ref → always equal
                     if a == b {
                         ctx.make_constant(op.pos, Value::Int(1));
@@ -627,8 +631,8 @@ impl OptString {
             // vstring.py: STR_CMP(a, b) → if same ref, result is 0 (equal).
             OopSpecIndex::StrCmp => {
                 if op.num_args() >= 3 {
-                    let a = ctx.get_replacement(op.arg(1));
-                    let b = ctx.get_replacement(op.arg(2));
+                    let a = ctx.get_box_replacement(op.arg(1));
+                    let b = ctx.get_box_replacement(op.arg(2));
                     if a == b {
                         ctx.make_constant(op.pos, Value::Int(0));
                         return OptimizationResult::Remove;
@@ -681,7 +685,7 @@ impl Optimization for OptString {
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
-                let src = ctx.get_replacement(op.arg(0));
+                let src = ctx.get_box_replacement(op.arg(0));
                 self.force_if_virtual(src, ctx);
                 OptimizationResult::PassOn
             }
@@ -768,7 +772,7 @@ mod tests {
             // Resolve forwarded arguments.
             let mut resolved_op = op.clone();
             for arg in &mut resolved_op.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {

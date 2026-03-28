@@ -45,7 +45,7 @@ impl Optimization for OptEarlyForce {
                 // pass has its forwarding pointer followed.
                 let mut new_op = op.clone();
                 for arg in &mut new_op.args {
-                    *arg = ctx.get_replacement(*arg);
+                    *arg = ctx.get_box_replacement(*arg);
                 }
                 OptimizationResult::Emit(new_op)
             }
@@ -55,7 +55,7 @@ impl Optimization for OptEarlyForce {
                 let mut new_op = op.clone();
                 if let Some(ref mut fa) = new_op.fail_args {
                     for arg in fa.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
+                        *arg = ctx.get_box_replacement(*arg);
                     }
                 }
                 OptimizationResult::Emit(new_op)

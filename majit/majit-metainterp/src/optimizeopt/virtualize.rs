@@ -213,14 +213,14 @@ impl OptVirtualize {
     // ── PtrInfo accessors (delegated to ctx) ──
 
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         ctx.get_ptr_info(resolved)
             .is_some_and(|info| info.is_virtual())
     }
 
     fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
         self.vable_config.is_some()
-            && opref == ctx.get_replacement(OpRef(0))
+            && opref == ctx.get_box_replacement(OpRef(0))
             && matches!(ctx.get_ptr_info(opref), Some(PtrInfo::Virtualizable(_)))
     }
 
@@ -251,7 +251,7 @@ impl OptVirtualize {
     /// Force a virtual to become concrete: emit the allocation + setfield ops.
     /// Returns the OpRef of the emitted allocation.
     fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let info = match ctx.get_ptr_info(resolved) {
             Some(info) if info.is_virtual() => info.clone(),
             _ => return resolved, // not virtual, nothing to do
@@ -291,7 +291,7 @@ impl OptVirtualize {
         // Emit SETFIELD_RAW for each tracked field, using the original DescrRef
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_replacement(value_ref);
+            let value_ref = ctx.get_box_replacement(value_ref);
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
@@ -331,7 +331,7 @@ impl OptVirtualize {
                     self.emit_default_value_for_type(ctx, item_type)
                 } else {
                     let forced = self.force_virtual(elem_ref, ctx);
-                    ctx.get_replacement(forced)
+                    ctx.get_box_replacement(forced)
                 };
                 let idx_ref = self.emit_constant_int(ctx, i as i64);
                 let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
@@ -353,7 +353,7 @@ impl OptVirtualize {
             ctx: &OptContext,
             visited: &mut std::collections::HashSet<OpRef>,
         ) -> Option<u32> {
-            let resolved = ctx.get_replacement(opref);
+            let resolved = ctx.get_box_replacement(opref);
             if !visited.insert(resolved) {
                 return None;
             }
@@ -364,7 +364,7 @@ impl OptVirtualize {
                 .find(|op| op.pos == resolved)
                 .filter(|op| matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR))
             {
-                let pool_ref = ctx.get_replacement(OpRef(0));
+                let pool_ref = ctx.get_box_replacement(OpRef(0));
                 if op.arg(0) == pool_ref {
                     return op.descr.as_ref().map(|d| d.index());
                 }
@@ -422,7 +422,7 @@ impl OptVirtualize {
         jump_arg_index: usize,
         ctx: &mut OptContext,
     ) {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let info = match ctx.get_ptr_info(resolved) {
             Some(info) if info.is_virtual() => info.clone(),
             _ => return,
@@ -493,7 +493,7 @@ impl OptVirtualize {
     /// RPython unroll.py: make_inputargs_and_virtuals — extract field values
     /// from a virtual without materializing it. Returns field OpRefs.
     fn flatten_virtual_fields(&self, opref: OpRef, ctx: &OptContext) -> Vec<OpRef> {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let info = match ctx.get_ptr_info(resolved) {
             Some(info) if info.is_virtual() => info.clone(),
             _ => return Vec::new(),
@@ -542,7 +542,7 @@ impl OptVirtualize {
         // Emit SETFIELD_GC for each tracked field
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
-            let value_ref = ctx.get_replacement(value_ref);
+            let value_ref = ctx.get_box_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
                 get_field_descr(&vinfo.field_descrs, field_idx)
@@ -578,7 +578,7 @@ impl OptVirtualize {
         // Emit SETARRAYITEM_GC for each item
         for (i, item_ref) in vinfo.items.iter().enumerate() {
             let item_ref = self.force_virtual(*item_ref, ctx);
-            let item_ref = ctx.get_replacement(item_ref);
+            let item_ref = ctx.get_box_replacement(item_ref);
             let idx_ref = self.emit_constant_int(ctx, i as i64);
             let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, item_ref]);
             set_op.descr = Some(vinfo.descr.clone());
@@ -623,7 +623,7 @@ impl OptVirtualize {
         // Emit through remaining passes, same as New().
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_replacement(value_ref);
+            let value_ref = ctx.get_box_replacement(value_ref);
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -660,7 +660,7 @@ impl OptVirtualize {
             let idx_ref = self.emit_constant_int(ctx, elem_idx as i64);
             for (field_idx, value_ref) in fields {
                 let value_ref = self.force_virtual(*value_ref, ctx);
-                let value_ref = ctx.get_replacement(value_ref);
+                let value_ref = ctx.get_box_replacement(value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, value_ref]);
                 set_op.descr = Some(make_field_index_descr(*field_idx));
@@ -692,7 +692,7 @@ impl OptVirtualize {
         // Emit RAW_STORE for each tracked entry
         for (offset, _length, value_ref) in &vinfo.entries {
             let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_replacement(value_ref);
+            let value_ref = ctx.get_box_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
             let set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
             ctx.emit_through_passes(set_op);
@@ -723,7 +723,7 @@ impl OptVirtualize {
 
     fn has_any_virtual_arg(op: &Op, ctx: &OptContext) -> bool {
         op.args.iter().any(|arg| {
-            let resolved = ctx.get_replacement(*arg);
+            let resolved = ctx.get_box_replacement(*arg);
             Self::is_virtual(resolved, ctx)
         })
     }
@@ -731,10 +731,10 @@ impl OptVirtualize {
     fn force_all_args(&mut self, op: &Op, ctx: &mut OptContext) -> Op {
         let mut new_op = op.clone();
         for arg in &mut new_op.args {
-            let resolved = ctx.get_replacement(*arg);
+            let resolved = ctx.get_box_replacement(*arg);
             if Self::is_virtual(resolved, ctx) {
                 let forced = self.force_virtual(resolved, ctx);
-                *arg = ctx.get_replacement(forced);
+                *arg = ctx.get_box_replacement(forced);
             } else {
                 *arg = resolved;
             }
@@ -832,8 +832,8 @@ impl OptVirtualize {
     }
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let struct_ref = ctx.get_replacement(op.arg(0));
-        let value_ref = ctx.get_replacement(op.arg(1));
+        let struct_ref = ctx.get_box_replacement(op.arg(0));
+        let value_ref = ctx.get_box_replacement(op.arg(1));
         let field_idx = descr_index(&op.descr);
         let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
 
@@ -889,7 +889,7 @@ impl OptVirtualize {
     }
 
     fn optimize_getfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let struct_ref = ctx.get_replacement(op.arg(0));
+        let struct_ref = ctx.get_box_replacement(op.arg(0));
         let field_idx = descr_index(&op.descr);
         let is_raw_op = matches!(
             op.opcode,
@@ -899,7 +899,7 @@ impl OptVirtualize {
         // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
         // which was virtual in the preamble, forward to the imported virtual head.
         if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
-            let pool_ref = ctx.get_replacement(OpRef(0)); // pool is always inputarg 0
+            let pool_ref = ctx.get_box_replacement(OpRef(0)); // pool is always inputarg 0
             if struct_ref == pool_ref {
                 for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
                     if field_idx == descr_idx as u32 {
@@ -972,9 +972,9 @@ impl OptVirtualize {
     }
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_replacement(op.arg(0));
+        let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        let value_ref = ctx.get_replacement(op.arg(2));
+        let value_ref = ctx.get_box_replacement(op.arg(2));
 
         // Virtualizable array check
         if !self.vable_array_ptrs.contains_key(&array_ref) {
@@ -1020,7 +1020,7 @@ impl OptVirtualize {
     }
 
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_replacement(op.arg(0));
+        let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
 
         // Virtualizable array check
@@ -1070,7 +1070,7 @@ impl OptVirtualize {
     }
 
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_replacement(op.arg(0));
+        let array_ref = ctx.get_box_replacement(op.arg(0));
 
         if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.get_ptr_info(array_ref) {
             let len = vinfo.items.len() as i64;
@@ -1081,7 +1081,7 @@ impl OptVirtualize {
     }
 
     fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_replacement(op.arg(0));
+        let str_ref = ctx.get_box_replacement(op.arg(0));
 
         if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.get_ptr_info(str_ref) {
             let len = vinfo.items.len() as i64;
@@ -1096,7 +1096,7 @@ impl OptVirtualize {
         op: &Op,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_ref = ctx.get_replacement(op.arg(0));
+        let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let field_idx = descr_index(&op.descr);
 
@@ -1119,9 +1119,9 @@ impl OptVirtualize {
         op: &Op,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_ref = ctx.get_replacement(op.arg(0));
+        let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        let value_ref = ctx.get_replacement(op.arg(2));
+        let value_ref = ctx.get_box_replacement(op.arg(2));
         let field_idx = descr_index(&op.descr);
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
@@ -1139,7 +1139,7 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_load(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_replacement(op.arg(0));
+        let buf_ref = ctx.get_box_replacement(op.arg(0));
         let offset_ref = op.arg(1);
 
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
@@ -1157,9 +1157,9 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_replacement(op.arg(0));
+        let buf_ref = ctx.get_box_replacement(op.arg(0));
         let offset_ref = op.arg(1);
-        let value_ref = ctx.get_replacement(op.arg(2));
+        let value_ref = ctx.get_box_replacement(op.arg(2));
 
         if let Some(offset) = ctx.get_constant_int(offset_ref) {
             if let Some(info) = ctx.get_ptr_info_mut(buf_ref) {
@@ -1182,7 +1182,7 @@ impl OptVirtualize {
     }
 
     fn optimize_guard_class(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let obj_ref = ctx.get_replacement(op.arg(0));
+        let obj_ref = ctx.get_box_replacement(op.arg(0));
         let expected_class = if op.num_args() >= 2 {
             ctx.get_constant(op.arg(1)).and_then(|value| match value {
                 Value::Ref(class_ref) => Some(*class_ref),
@@ -1279,7 +1279,7 @@ impl OptVirtualize {
 
         if let Some(ref mut fa) = guard_op.fail_args {
             for (i, arg) in fa.iter_mut().enumerate() {
-                let resolved = ctx.get_replacement(*arg);
+                let resolved = ctx.get_box_replacement(*arg);
                 // Int/Float fail_args are scalar constants, never virtual objects.
                 let is_scalar = fail_arg_types
                     .get(i)
@@ -1292,7 +1292,7 @@ impl OptVirtualize {
             }
         }
         for arg in &mut guard_op.args {
-            *arg = ctx.get_replacement(*arg);
+            *arg = ctx.get_box_replacement(*arg);
         }
         OptimizationResult::Replace(guard_op)
     }
@@ -1309,7 +1309,7 @@ impl OptVirtualize {
                     ctx,
                 ) {
                     let forced = self.force_virtual(resolved, ctx);
-                    ctx.get_replacement(forced)
+                    ctx.get_box_replacement(forced)
                 } else {
                     resolved
                 }
@@ -1321,7 +1321,7 @@ impl OptVirtualize {
                     ctx,
                 ) {
                     let forced = self.force_virtual(resolved, ctx);
-                    ctx.get_replacement(forced)
+                    ctx.get_box_replacement(forced)
                 } else {
                     resolved
                 }
@@ -1329,7 +1329,7 @@ impl OptVirtualize {
             PtrInfo::Virtualizable(_) => resolved,
             other if other.is_virtual() => {
                 let forced = self.force_virtual(resolved, ctx);
-                ctx.get_replacement(forced)
+                ctx.get_box_replacement(forced)
             }
             _ => resolved,
         }
@@ -1355,7 +1355,7 @@ impl OptVirtualize {
             if !is_ref_field {
                 return false;
             }
-            let resolved = ctx.get_replacement(value_ref);
+            let resolved = ctx.get_box_replacement(value_ref);
             !Self::guard_resume_value_is_concrete(resolved, ctx)
         })
     }
@@ -1398,11 +1398,11 @@ impl OptVirtualize {
                 let mut fields = Vec::with_capacity(vinfo.fields.len());
                 for &(field_idx, value_ref) in &vinfo.fields {
                     // Force nested virtuals — only one level of encoding for now
-                    let resolved = ctx.get_replacement(value_ref);
+                    let resolved = ctx.get_box_replacement(value_ref);
                     if Self::is_virtual(resolved, ctx) {
                         self.force_virtual(resolved, ctx);
                     }
-                    let final_ref = ctx.get_replacement(resolved);
+                    let final_ref = ctx.get_box_replacement(resolved);
                     let fa_index = extra_start + extra_fail_args.len();
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
@@ -1417,11 +1417,11 @@ impl OptVirtualize {
             PtrInfo::VirtualStruct(vinfo) => {
                 let mut fields = Vec::with_capacity(vinfo.fields.len());
                 for &(field_idx, value_ref) in &vinfo.fields {
-                    let resolved = ctx.get_replacement(value_ref);
+                    let resolved = ctx.get_box_replacement(value_ref);
                     if Self::is_virtual(resolved, ctx) {
                         self.force_virtual(resolved, ctx);
                     }
-                    let final_ref = ctx.get_replacement(resolved);
+                    let final_ref = ctx.get_box_replacement(resolved);
                     let fa_index = extra_start + extra_fail_args.len();
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
@@ -1450,7 +1450,7 @@ impl OptVirtualize {
         op: &Op,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let obj_ref = ctx.get_replacement(op.arg(0));
+        let obj_ref = ctx.get_box_replacement(op.arg(0));
         let expected_class = if op.num_args() >= 2 {
             ctx.get_constant(op.arg(1)).and_then(|value| match value {
                 Value::Ref(class_ref) => Some(*class_ref),
@@ -1494,11 +1494,11 @@ impl OptVirtualize {
     }
 
     fn optimize_guard_value(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let obj_ref = ctx.get_replacement(op.arg(0));
+        let obj_ref = ctx.get_box_replacement(op.arg(0));
 
         // If the object is already a known constant matching the guard value, remove
         if let Some(val) = ctx.get_constant(obj_ref) {
-            if let Some(expected) = ctx.get_constant(ctx.get_replacement(op.arg(1))) {
+            if let Some(expected) = ctx.get_constant(ctx.get_box_replacement(op.arg(1))) {
                 if val == expected {
                     return OptimizationResult::Remove;
                 }
@@ -1565,8 +1565,8 @@ impl OptVirtualize {
     /// virtual struct's field tracking and nothing is emitted.
     /// If the vref was already forced (escaped), we emit SETFIELD_GC ops.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.get_replacement(op.arg(0));
-        let obj_ref = ctx.get_replacement(op.arg(1));
+        let vref_ref = ctx.get_box_replacement(op.arg(0));
+        let obj_ref = ctx.get_box_replacement(op.arg(1));
 
         // Check if the virtual object arg is non-null (forced case)
         let obj_is_null = ctx.get_constant_int(obj_ref).is_some_and(|v| v == 0);
@@ -1611,9 +1611,9 @@ impl OptVirtualize {
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let mut forced = op.clone();
-        let frame_ref = ctx.get_replacement(OpRef(0));
+        let frame_ref = ctx.get_box_replacement(OpRef(0));
         for arg in &mut forced.args {
-            let resolved = ctx.get_replacement(*arg);
+            let resolved = ctx.get_box_replacement(*arg);
             if self.vable_config.is_some()
                 && resolved == frame_ref
                 && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
@@ -1623,7 +1623,7 @@ impl OptVirtualize {
             }
             if Self::is_virtual(resolved, ctx) {
                 let forced_arg = self.force_virtual(resolved, ctx);
-                *arg = ctx.get_replacement(forced_arg);
+                *arg = ctx.get_box_replacement(forced_arg);
             } else {
                 *arg = resolved;
             }
@@ -1648,10 +1648,10 @@ impl OptVirtualize {
         ) {
             return;
         }
-        if source_op.arg(0) != ctx.get_replacement(OpRef(0)) {
+        if source_op.arg(0) != ctx.get_box_replacement(OpRef(0)) {
             return;
         }
-        if self.is_standard_virtualizable_ref(ctx.get_replacement(OpRef(0)), ctx) {
+        if self.is_standard_virtualizable_ref(ctx.get_box_replacement(OpRef(0)), ctx) {
             return;
         }
         let field_idx = descr_index(&source_op.descr);
@@ -1675,7 +1675,7 @@ impl OptVirtualize {
     /// After the original fail_args, appends:
     ///   [next_instr, stack_depth, locals_len, local_0..N, stack_len, stack_0..M]
     fn augment_guard_with_virtualizable(&mut self, op: &mut Op, ctx: &mut OptContext) {
-        let frame_ref = ctx.get_replacement(OpRef(0));
+        let frame_ref = ctx.get_box_replacement(OpRef(0));
         let vstate = match ctx.get_ptr_info(frame_ref) {
             Some(PtrInfo::Virtualizable(v)) => v.clone(),
             _ => return,
@@ -1708,7 +1708,7 @@ impl OptVirtualize {
             });
             if let Some(v) = val {
                 let forced = self.force_virtual(v, ctx);
-                fail_args.push(ctx.get_replacement(forced));
+                fail_args.push(ctx.get_box_replacement(forced));
             } else {
                 // Not tracked — emit a read from the frame
                 let mut read_op = Op::new(OpCode::GetfieldRawI, &[frame_ref]);
@@ -1733,7 +1733,7 @@ impl OptVirtualize {
                         fail_args.push(default);
                     } else {
                         let forced = self.force_virtual(*elem, ctx);
-                        fail_args.push(ctx.get_replacement(forced));
+                        fail_args.push(ctx.get_box_replacement(forced));
                     }
                 }
             } else {
@@ -1846,7 +1846,7 @@ impl Optimization for OptVirtualize {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
                         if ei.oopspec_index == OopSpecIndex::JitForceVirtual && op.num_args() >= 2 {
-                            let vref = ctx.get_replacement(op.arg(1));
+                            let vref = ctx.get_box_replacement(op.arg(1));
                             if Self::is_virtual(vref, ctx) {
                                 // Virtual ref with known null token →
                                 // return the forced value directly.
@@ -1875,7 +1875,7 @@ impl Optimization for OptVirtualize {
                         if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable
                             && op.num_args() >= 3
                         {
-                            let target = ctx.get_replacement(op.arg(2));
+                            let target = ctx.get_box_replacement(op.arg(2));
                             if Self::is_virtual(target, ctx) {
                                 return OptimizationResult::Remove;
                             }
@@ -1913,7 +1913,7 @@ impl Optimization for OptVirtualize {
                         // virtualize.py: OS_RAW_FREE → remove if target is virtual raw buffer
                         if ei.oopspec_index == OopSpecIndex::RawFree {
                             if op.num_args() >= 2 {
-                                let target = ctx.get_replacement(op.arg(1));
+                                let target = ctx.get_box_replacement(op.arg(1));
                                 if Self::is_virtual(target, ctx) {
                                     return OptimizationResult::Remove;
                                 }
@@ -1923,7 +1923,7 @@ impl Optimization for OptVirtualize {
                         // virtualize.py: OS_JIT_FORCE_VIRTUALIZABLE
                         if ei.oopspec_index == OopSpecIndex::JitForceVirtualizable {
                             if op.num_args() > 1 {
-                                let target = ctx.get_replacement(op.arg(1));
+                                let target = ctx.get_box_replacement(op.arg(1));
                                 if Self::is_virtual(target, ctx) {
                                     return OptimizationResult::Remove;
                                 }
@@ -1950,7 +1950,7 @@ impl Optimization for OptVirtualize {
             // already carry box-state in the interpreter/JitCode layout; the
             // optimizer must not append its own synthetic inputs here.
             OpCode::Jump if self.vable_config.is_some() => {
-                let frame_ref = ctx.get_replacement(OpRef(0));
+                let frame_ref = ctx.get_box_replacement(OpRef(0));
                 // RPython carries virtualizable fields as JUMP args,
                 // avoiding per-iteration writeback. When JUMP args
                 // include locals (args.len() > 3), they are SSA values
@@ -1967,7 +1967,7 @@ impl Optimization for OptVirtualize {
                 let pre_force_args: Vec<OpRef> = jump_op
                     .args
                     .iter()
-                    .map(|a| ctx.get_replacement(*a))
+                    .map(|a| ctx.get_box_replacement(*a))
                     .collect();
                 let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
                     &pre_force_args,
@@ -1977,7 +1977,7 @@ impl Optimization for OptVirtualize {
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
                 ctx.pre_force_jump_args = Some(pre_force_args.clone());
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
-                    let resolved = ctx.get_replacement(*arg);
+                    let resolved = ctx.get_box_replacement(*arg);
                     if resolved == frame_ref {
                         if matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_))) {
                             *arg = resolved;
@@ -1987,7 +1987,7 @@ impl Optimization for OptVirtualize {
                     if Self::is_virtual(resolved, ctx) {
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                         let forced = self.force_virtual(resolved, ctx);
-                        *arg = ctx.get_replacement(forced);
+                        *arg = ctx.get_box_replacement(forced);
                     } else {
                         *arg = resolved;
                     }
@@ -2003,7 +2003,7 @@ impl Optimization for OptVirtualize {
                 }
                 let mut jump_op = op.clone();
                 for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
-                    let resolved = ctx.get_replacement(*arg);
+                    let resolved = ctx.get_box_replacement(*arg);
                     if Self::is_virtual(resolved, ctx) {
                         self.export_virtual_for_preamble(resolved, arg_idx, ctx);
                     }
@@ -2013,7 +2013,7 @@ impl Optimization for OptVirtualize {
                 let pre_force_args: Vec<OpRef> = jump_op
                     .args
                     .iter()
-                    .map(|a| ctx.get_replacement(*a))
+                    .map(|a| ctx.get_box_replacement(*a))
                     .collect();
                 let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
                     &pre_force_args,
@@ -2038,7 +2038,7 @@ impl Optimization for OptVirtualize {
             // RECORD_EXACT_CLASS(ref, class_const): record that ref has class class_const.
             // Enables subsequent GUARD_CLASS elimination.
             OpCode::RecordExactClass => {
-                let ref_opref = ctx.get_replacement(op.arg(0));
+                let ref_opref = ctx.get_box_replacement(op.arg(0));
                 if let Some(&Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
                     self.record_known_class(ref_opref, class_ref, ctx);
                 }
@@ -2047,7 +2047,7 @@ impl Optimization for OptVirtualize {
 
             // RECORD_EXACT_VALUE_I(ref, int_const): record that ref has exact int value.
             OpCode::RecordExactValueI => {
-                let ref_opref = ctx.get_replacement(op.arg(0));
+                let ref_opref = ctx.get_box_replacement(op.arg(0));
                 if let Some(val) = ctx.get_constant_int(op.arg(1)) {
                     ctx.make_constant(ref_opref, Value::Int(val));
                 }
@@ -2056,8 +2056,8 @@ impl Optimization for OptVirtualize {
 
             // RECORD_EXACT_VALUE_R(ref, ref_const): record that ref equals ref_const.
             OpCode::RecordExactValueR => {
-                let ref_opref = ctx.get_replacement(op.arg(0));
-                ctx.replace_op(ref_opref, ctx.get_replacement(op.arg(1)));
+                let ref_opref = ctx.get_box_replacement(op.arg(0));
+                ctx.replace_op(ref_opref, ctx.get_box_replacement(op.arg(1)));
                 OptimizationResult::Remove
             }
 
@@ -2067,10 +2067,10 @@ impl Optimization for OptVirtualize {
 
                 // Force virtual op args
                 for i in 0..op.num_args() {
-                    let arg = ctx.get_replacement(op.arg(i));
+                    let arg = ctx.get_box_replacement(op.arg(i));
                     if is_guard
                         && self.vable_config.is_some()
-                        && arg == ctx.get_replacement(OpRef(0))
+                        && arg == ctx.get_box_replacement(OpRef(0))
                     {
                         if matches!(ctx.get_ptr_info(arg), Some(PtrInfo::Virtualizable(_))) {
                             continue;
@@ -2085,12 +2085,12 @@ impl Optimization for OptVirtualize {
                     let mut guard_op = op.clone();
 
                     for arg in &mut guard_op.args {
-                        *arg = ctx.get_replacement(*arg);
+                        *arg = ctx.get_box_replacement(*arg);
                     }
 
                     if let Some(ref mut fa) = guard_op.fail_args {
                         for arg in fa.iter_mut() {
-                            let resolved = ctx.get_replacement(*arg);
+                            let resolved = ctx.get_box_replacement(*arg);
                             *arg = self.prepare_guard_fail_arg(resolved, ctx);
                         }
                     }
@@ -2375,7 +2375,7 @@ mod tests {
             // Resolve forwarded arguments
             let mut resolved_op = op.clone();
             for arg in &mut resolved_op.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
@@ -2502,7 +2502,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2556,7 +2556,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3570,7 +3570,7 @@ mod tests {
         for op in ops {
             let mut resolved_op = op.clone();
             for arg in &mut resolved_op.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {

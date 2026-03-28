@@ -740,7 +740,7 @@ impl UnrollOptimizer {
     /// unroll.py: _check_no_forwarding(lsts)
     /// Debug assertion: verify no OpRef in the lists has been forwarded.
     pub fn check_no_forwarding(ctx: &crate::optimizeopt::OptContext, oprefs: &[OpRef]) -> bool {
-        oprefs.iter().all(|&r| ctx.get_replacement(r) == r)
+        oprefs.iter().all(|&r| ctx.get_box_replacement(r) == r)
     }
 
     /// unroll.py: disable_retracing_if_max_retrace_guards(ops, target_token)
@@ -1172,7 +1172,7 @@ impl OptUnroll {
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
             original_label_args
                 .iter()
-                .map(|&a| ctx.get_replacement(a))
+                .map(|&a| ctx.get_box_replacement(a))
                 .collect()
         });
         // unroll.py:457: use pre-force virtual state if available
@@ -1226,7 +1226,7 @@ impl OptUnroll {
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, ExportedValueInfo>,
     ) {
-        let resolved = ctx.get_replacement(arg);
+        let resolved = ctx.get_box_replacement(arg);
         if infos.contains_key(&resolved) {
             // Also store under the original key so import_state can
             // find the info using the unresolved next_iteration_args key.
@@ -1349,7 +1349,10 @@ impl OptUnroll {
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         let mut virtual_state =
             crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
-        let mut args: Vec<OpRef> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
+        let mut args: Vec<OpRef> = jump_args
+            .iter()
+            .map(|&a| ctx.get_box_replacement(a))
+            .collect();
         let mut first_target_attempt = true;
 
         for target_token in target_tokens {
@@ -1405,7 +1408,10 @@ impl OptUnroll {
                 Ok(result) => result,
                 Err(()) => {
                     if force_boxes {
-                        args = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
+                        args = jump_args
+                            .iter()
+                            .map(|&a| ctx.get_box_replacement(a))
+                            .collect();
                         virtual_state = crate::optimizeopt::virtualstate::export_state(
                             &args,
                             ctx,
@@ -1581,7 +1587,7 @@ impl OptUnroll {
                     .iter()
                     .map(|jump_arg| {
                         let mapped = *mapping.get(jump_arg).unwrap_or(jump_arg);
-                        ctx.get_replacement(mapped)
+                        ctx.get_box_replacement(mapped)
                     })
                     .collect();
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
@@ -1602,7 +1608,7 @@ impl OptUnroll {
             .iter()
             .map(|&jump_arg| {
                 let mapped = *mapping.get(&jump_arg).unwrap_or(&jump_arg);
-                ctx.get_replacement(mapped)
+                ctx.get_box_replacement(mapped)
             })
             .collect()
     }
@@ -1653,7 +1659,7 @@ impl OptUnroll {
                 // RPython unroll.py:53-54: setinfo_from_preamble does
                 //   op = get_box_replacement(op)
                 // Follow forwarding so info is set on TARGET, not source.
-                let resolved = ctx.get_replacement(source);
+                let resolved = ctx.get_box_replacement(source);
                 self.apply_exported_info_recursive(
                     resolved,
                     info,
@@ -1709,7 +1715,7 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
     ) -> ExportedValueInfo {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let constant = ctx.get_constant(resolved).cloned();
         let (ptr_kind, ptr_descr, known_class, array_lenbound, nonnull) =
             match ctx.get_ptr_info(resolved) {
@@ -1790,7 +1796,7 @@ impl OptUnroll {
         // target carries its own info. Without this, forwarding[A] → B where
         // B later gets a different slot's info causes get_replacement(A) to
         // stop at B's wrong info.
-        let target = ctx.get_replacement(opref);
+        let target = ctx.get_box_replacement(opref);
         if !seen.insert(target) {
             return;
         }
@@ -2224,7 +2230,7 @@ impl OptUnroll {
                     let Some(result_opref) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.short_preamble_mapping.insert(source, result_opref);
+                    ctx.replace_op(source, result_opref);
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -2312,9 +2318,9 @@ impl OptUnroll {
                     if let Some((csrc, cval)) = const_to_register {
                         ctx.make_constant(csrc, cval);
                     }
-                    ctx.short_preamble_mapping.insert(source, value);
+                    ctx.replace_op(source, value);
                     let descr_idx = descr.index();
-                    let obj_resolved = ctx.get_replacement(obj);
+                    let obj_resolved = ctx.get_box_replacement(obj);
                     let pop = crate::optimizeopt::info::PreambleOp {
                         op: source,
                         resolved: value,
@@ -2383,7 +2389,7 @@ impl OptUnroll {
                     if let Some((csrc, cval)) = const_to_register {
                         ctx.make_constant(csrc, cval);
                     }
-                    ctx.short_preamble_mapping.insert(source, value);
+                    ctx.replace_op(source, value);
                     let descr_idx = descr.index();
                     ctx.imported_short_arrayitems
                         .insert((obj, descr_idx, index), value);
@@ -2418,7 +2424,7 @@ impl OptUnroll {
                     let Some(value) = resolve_result(result) else {
                         continue;
                     };
-                    ctx.short_preamble_mapping.insert(source, value);
+                    ctx.replace_op(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources
                         .push(crate::optimizeopt::ImportedShortSource {
@@ -3975,7 +3981,7 @@ mod tests {
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_resolved = ctx2.get_replacement(OpRef(10));
+        let obj_resolved = ctx2.get_box_replacement(OpRef(10));
         let pop = ctx2
             .get_ptr_info_mut(obj_resolved)
             .and_then(|info| info.take_preamble_field(0));
@@ -4030,7 +4036,7 @@ mod tests {
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
         // RPython PreambleOp parity: PreambleOp in PtrInfo._fields
-        let obj_resolved = ctx2.get_replacement(OpRef(10));
+        let obj_resolved = ctx2.get_box_replacement(OpRef(10));
         let pop = ctx2
             .get_ptr_info_mut(obj_resolved)
             .and_then(|info| info.take_preamble_field(56));

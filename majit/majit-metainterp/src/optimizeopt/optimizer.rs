@@ -498,7 +498,7 @@ impl Optimizer {
             );
         }
         for iv in &self.imported_virtuals {
-            let virtual_head = ctx.get_replacement(OpRef(iv.inputarg_index as u32));
+            let virtual_head = ctx.get_box_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
             let mut field_descrs = Vec::new();
             for (descr, field_info) in &iv.fields {
@@ -740,7 +740,7 @@ impl Optimizer {
                     });
                 *label_slot += 1;
                 Self::apply_imported_virtual_state(info, opref, ctx);
-                ctx.get_replacement(opref)
+                ctx.get_box_replacement(opref)
             }
         }
     }
@@ -1019,9 +1019,12 @@ impl Optimizer {
     /// If the opref refers to a virtual object, emit the allocation and field writes.
     /// Returns the concrete OpRef (unchanged if not virtual).
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        // Follow forwarding chain first.
-        let resolved = ctx.get_replacement(opref);
-        let preamble_source = ctx.imported_short_source(resolved);
+        // optimizer.py:345-364 force_box parity:
+        // Resolve imported short identity BEFORE get_box_replacement,
+        // then resolve. Prevents identity drift when Phase 2 body
+        // adds forwarding on the imported result.
+        let preamble_source = ctx.imported_short_source(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let tracked = ctx
             .take_potential_extra_op(resolved)
             .or_else(|| ctx.take_potential_extra_op(opref))
@@ -1050,7 +1053,7 @@ impl Optimizer {
                 // RPython info.py: force_box→emit_extra inserts ops at the
                 // current position so they appear BEFORE the current op.
                 let forced = info.force_to_ops_direct(resolved, ctx);
-                return ctx.get_replacement(forced);
+                return ctx.get_box_replacement(forced);
             }
         }
         resolved
@@ -1071,7 +1074,7 @@ impl Optimizer {
         ctx: &mut OptContext,
         rec: &mut std::collections::HashSet<OpRef>,
     ) -> OpRef {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         let Some(mut info) = ctx.get_ptr_info(resolved).cloned() else {
             return resolved;
         };
@@ -1219,7 +1222,7 @@ impl Optimizer {
     /// optimizer.py: getnullness(op)
     /// Check the nullness of an OpRef: NONNULL (1), NULL (-1), or UNKNOWN (0).
     pub fn getnullness(ctx: &OptContext, opref: OpRef) -> i8 {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         if let Some(val) = ctx.get_constant_int(resolved) {
             if val != 0 { 1 } else { -1 }
         } else {
@@ -1472,7 +1475,7 @@ impl Optimizer {
                     // Duplicate: `source` shares target with `first`.
                     // `first` got import_box forwarding → get_replacement → target head.
                     // `source` was skipped → get_replacement = source itself.
-                    let first_head = ctx.get_replacement(first);
+                    let first_head = ctx.get_box_replacement(first);
                     if crate::optimizeopt::majit_log_enabled() {
                         let has_info = ctx.get_ptr_info(first_head).is_some();
                         let is_virt = ctx
@@ -1550,12 +1553,12 @@ impl Optimizer {
             if self.skip_flush {
                 // RPython optimizer.py:553: resolve args via get_box_replacement.
                 for arg in &mut terminal_op.args {
-                    *arg = ctx.get_replacement(*arg);
+                    *arg = ctx.get_box_replacement(*arg);
                 }
                 self.terminal_op = Some(terminal_op);
             } else {
                 for arg in &mut terminal_op.args {
-                    *arg = ctx.get_replacement(*arg);
+                    *arg = ctx.get_box_replacement(*arg);
                 }
                 self.propagate_one(&terminal_op, &mut ctx);
             }
@@ -1603,7 +1606,7 @@ impl Optimizer {
             // Virtual. Only after dedup do we force the virtuals.
             let mut resolved_args: Vec<OpRef> = original_jump_args
                 .iter()
-                .map(|&arg| ctx.get_replacement(arg))
+                .map(|&arg| ctx.get_box_replacement(arg))
                 .collect();
             // Dedup: when two slots reference the same OpRef (e.g. b and t
             // in fib_loop), create SameAsR with fresh OpRef and copy the
@@ -1679,15 +1682,15 @@ impl Optimizer {
             ctx.exported_short_boxes = produced
                 .into_iter()
                 .map(|(result, produced)| {
-                    let canonical_result = ctx.get_replacement(result);
+                    let canonical_result = ctx.get_box_replacement(result);
                     let mut preamble_op = produced.preamble_op;
-                    preamble_op.pos = ctx.get_replacement(preamble_op.pos);
+                    preamble_op.pos = ctx.get_box_replacement(preamble_op.pos);
                     for arg in &mut preamble_op.args {
-                        *arg = ctx.get_replacement(*arg);
+                        *arg = ctx.get_box_replacement(*arg);
                     }
                     if let Some(fail_args) = preamble_op.fail_args.as_mut() {
                         for arg in fail_args {
-                            *arg = ctx.get_replacement(*arg);
+                            *arg = ctx.get_box_replacement(*arg);
                         }
                     }
                     crate::optimizeopt::shortpreamble::PreambleOp {
@@ -1695,7 +1698,7 @@ impl Optimizer {
                         kind: produced.kind,
                         label_arg_idx: short_boxes.lookup_label_arg(canonical_result),
                         invented_name: produced.invented_name,
-                        same_as_source: produced.same_as_source.map(|src| ctx.get_replacement(src)),
+                        same_as_source: produced.same_as_source.map(|src| ctx.get_box_replacement(src)),
                     }
                 })
                 .collect();
@@ -1754,7 +1757,7 @@ impl Optimizer {
                 .filter(|r| !r.is_none())
                 .collect();
             for opref in all_refs {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 if let Some(info) = ctx.get_ptr_info(resolved) {
                     if info.is_virtual() {
                         self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2133,7 +2136,10 @@ impl Optimizer {
         }
 
         // Resolve JUMP args after forcing
-        let jump_args: Vec<_> = jump_args.iter().map(|&a| ctx.get_replacement(a)).collect();
+        let jump_args: Vec<_> = jump_args
+            .iter()
+            .map(|&a| ctx.get_box_replacement(a))
+            .collect();
 
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
@@ -2271,11 +2277,11 @@ impl Optimizer {
         // Resolve forwarded arguments
         let mut resolved_op = op.clone();
         for arg in &mut resolved_op.args {
-            *arg = ctx.get_replacement(*arg);
+            *arg = ctx.get_box_replacement(*arg);
         }
         if let Some(ref mut fa) = resolved_op.fail_args {
             for arg in fa.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
         }
 
@@ -2346,7 +2352,7 @@ impl Optimizer {
         ) {
             ctx.in_final_emission = true;
             for i in 0..op.num_args() {
-                let arg = ctx.get_replacement(op.arg(i));
+                let arg = ctx.get_box_replacement(op.arg(i));
                 op.args[i] = self.force_box(arg, ctx);
             }
             ctx.in_final_emission = false;
@@ -2459,7 +2465,7 @@ impl Optimizer {
                             let (target, value, item_index) =
                                 if pf_op.opcode == OpCode::SetarrayitemGc {
                                     let idx = ctx
-                                        .get_constant_int(ctx.get_replacement(pf_op.arg(1)))
+                                        .get_constant_int(ctx.get_box_replacement(pf_op.arg(1)))
                                         .unwrap_or(0);
                                     (pf_op.arg(0), pf_op.arg(2), idx as i32)
                                 } else {
@@ -2484,8 +2490,8 @@ impl Optimizer {
                             majit_ir::GuardPendingFieldEntry {
                                 descr_index: pf_op.descr.as_ref().map_or(0, |d| d.index()),
                                 item_index,
-                                target: ctx.get_replacement(target),
-                                value: ctx.get_replacement(value),
+                                target: ctx.get_box_replacement(target),
+                                value: ctx.get_box_replacement(value),
                                 field_offset,
                                 field_size,
                                 field_type,
@@ -2579,7 +2585,7 @@ impl Optimizer {
                         .imported_label_args
                         .as_ref()
                         .and_then(|la| la.get(fa_idx).copied());
-                    let resolved = label_ref.map(|r| ctx.get_replacement(r));
+                    let resolved = label_ref.map(|r| ctx.get_box_replacement(r));
                     if let Some(resolved) = resolved {
                         if let Some(info) = ctx.get_ptr_info(resolved).cloned() {
                             if info.is_virtual() {
@@ -2600,7 +2606,7 @@ impl Optimizer {
                 }
                 continue;
             }
-            let resolved = ctx.get_replacement(fail_args[fa_idx]);
+            let resolved = ctx.get_box_replacement(fail_args[fa_idx]);
             let info = ctx.get_ptr_info(resolved).cloned();
             let Some(info) = info else {
                 fail_args[fa_idx] = resolved;
@@ -2689,12 +2695,12 @@ impl Optimizer {
         let base_idx = original_len + extra_fail_args.len();
         let mut fields = Vec::with_capacity(fields_vec.len());
         for &(field_idx, value_ref) in fields_vec {
-            let mut final_ref = ctx.get_replacement(value_ref);
+            let mut final_ref = ctx.get_box_replacement(value_ref);
             if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
                 if nested.is_virtual() {
                     let mut nested_mut = nested;
                     let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
-                    final_ref = ctx.get_replacement(forced);
+                    final_ref = ctx.get_box_replacement(forced);
                 }
             }
             extra_fail_args.push(final_ref);
@@ -2719,7 +2725,7 @@ impl Optimizer {
         slot: usize,
         ctx: &OptContext,
     ) -> majit_ir::Type {
-        let resolved = ctx.get_replacement(opref);
+        let resolved = ctx.get_box_replacement(opref);
         // Constants carry explicit types.
         if let Some(val) = ctx.get_constant(resolved) {
             return val.get_type();
@@ -3721,9 +3727,9 @@ mod tests {
         let result = opt.force_box_for_end_of_preamble(OpRef(10), &mut ctx);
 
         // The virtual is forced to a concrete allocation; the returned ref
-        // is the allocation's position, which ctx.get_replacement(OpRef(10))
+        // is the allocation's position, which ctx.get_box_replacement(OpRef(10))
         // should resolve to.
-        assert_eq!(result, ctx.get_replacement(OpRef(10)));
+        assert_eq!(result, ctx.get_box_replacement(OpRef(10)));
         // After forcing, the struct's ptr_info reflects that field 1
         // (originally OpRef(11), forwarded to OpRef(20)) has been recursively forced.
         match ctx.get_ptr_info(result) {
