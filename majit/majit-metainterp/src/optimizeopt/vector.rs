@@ -516,7 +516,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         assert_eq!(graph.nodes.len(), 3);
 
         // op1 depends on op0
@@ -530,7 +530,7 @@ mod tests {
         let mut ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(101)])];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         // Self-reference should not create self-dependency
         assert!(graph.nodes[0].deps.is_empty());
     }
@@ -546,7 +546,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let groups = graph.find_packable_groups();
 
         assert_eq!(groups.len(), 1);
@@ -564,7 +564,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let groups = graph.find_packable_groups();
 
         // Can't pack because of dependency
@@ -580,7 +580,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let groups = graph.find_packable_groups();
 
         // Each group needs 2+ members, single ops can't form a group
@@ -598,7 +598,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let groups = graph.find_packable_groups();
 
         assert_eq!(groups.len(), 1);
@@ -741,7 +741,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let sched = schedule_operations(&graph);
 
         assert_eq!(sched.len(), 3);
@@ -764,7 +764,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let sched = schedule_operations(&graph);
 
         assert_eq!(sched.len(), 2);
@@ -786,7 +786,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let sched = schedule_operations(&graph);
 
         assert_eq!(sched.len(), 4);
@@ -808,7 +808,7 @@ mod tests {
         ];
         assign_positions(&mut ops, 0);
 
-        let graph = DependencyGraph::build(&ops);
+        let graph = DependencyGraph::build(&ops, &|_| None);
         let sched = schedule_operations(&graph);
 
         assert_eq!(sched.len(), 4);

@@ -277,11 +277,11 @@ pub struct WarmEnterState {
     /// Loop longevity factor (how long compiled loops survive without being hot).
     /// RPython: `set_param_loop_longevity`
     loop_longevity: u32,
-    /// Whether SIMD vectorization is enabled.
-    /// RPython: `set_param_vectorize`
+    /// jit.py:581,602: vec — enable vectorization optimization.
     vectorize: bool,
-    /// Cost threshold for vectorization decisions.
-    /// RPython: `set_param_vec_cost`
+    /// jit.py:585,603: vec_all — vectorize loops outside numpypy library.
+    vec_all: bool,
+    /// jit.py:583,604: vec_cost — cost threshold for vectorization decisions.
     vec_cost: u32,
     /// warmstate.py: enable_opts — list of enabled optimization pass names.
     enable_opts: Vec<String>,
@@ -368,6 +368,7 @@ impl WarmEnterState {
             max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
+            vec_all: false,
             vec_cost: 0,
             enable_opts: Vec::new(),
             inlining: true,
@@ -401,6 +402,7 @@ impl WarmEnterState {
             max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
             loop_longevity: 1000,
             vectorize: false,
+            vec_all: false,
             vec_cost: 0,
             enable_opts: Vec::new(),
             inlining: true,
@@ -731,9 +733,9 @@ impl WarmEnterState {
         self.vectorize = enabled;
     }
 
-    /// Backward-compatible spelling: set_param_vec_all.
+    /// jit.py:585: set_param_vec_all.
     pub fn set_param_vec_all(&mut self, enabled: bool) {
-        self.vectorize = enabled;
+        self.vec_all = enabled;
     }
 
     /// RPython-compatible wrapper: set_param_vec_cost.
@@ -1110,9 +1112,10 @@ impl WarmEnterState {
     ///   - "bridge_threshold": guard fail count before bridge compilation
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
-    /// Set a JIT parameter by name.
-    ///
-    /// RPython warmstate.py: all `set_param_*` methods unified.
+    /// warmstate.py: set_param() — set a JIT parameter by name.
+    /// Negative values for thresholds mean "disabled/off" (rpython/rlib/jit.py:843).
+    /// counter.py:124 — compute_threshold(threshold<=0) returns 0.0 (JIT off).
+    /// Parameter names match RPython exactly: vec, vec_all, vec_cost.
     pub fn set_param(&mut self, name: &str, value: i64) {
         // counter.py:124 — threshold <= 0 → compute_threshold returns 0.0
         // (JIT off). Negative i64 must clamp to 0, not wrap to u32::MAX.
@@ -1128,13 +1131,14 @@ impl WarmEnterState {
             "max_unroll_loops" => self.max_unroll_loops = as_u32,
             "max_unroll_recursion" => self.max_unroll_recursion = as_u32,
             "loop_longevity" => self.loop_longevity = as_u32,
-            // rlib/jit.py:602-604 — vec, vec_all, vec_cost
-            "vec" | "vec_all" => self.vectorize = value != 0,
+            // warmstate.py:322-329 — vec, vec_all, vec_cost are separate fields
+            "vec" | "vectorize" => self.vectorize = value != 0,
+            "vec_all" => self.vec_all = value != 0,
             "vec_cost" => self.vec_cost = as_u32,
             "inlining" => self.inlining = value != 0,
             "disable_unrolling" => self.disable_unrolling_threshold = as_u32,
-            "pureop_historylength" => self.pureop_historylength = value as u32,
-            "decay" => self.decay = value as u32,
+            "pureop_historylength" => self.pureop_historylength = as_u32,
+            "decay" => self.decay = as_u32,
             "enable_opts" => {} // string param, handled by set_param_enable_opts
             _ => {}
         }

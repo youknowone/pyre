@@ -41,32 +41,46 @@ impl PackSet {
         self.packs.push(pack);
     }
 
-    /// vector.py: combine() — try to merge 2-packs into 4-packs.
-    /// Two packs can merge if they have the same opcode and one
-    /// pack's last member feeds into another pack's first member.
+    /// vector.py:460-494: combine_packset — merge packs where
+    /// pack1.rightmost == pack2.leftmost (schedule.py:931-942).
+    /// Only merges packs with matching edge, NOT just same opcode.
     pub fn try_merge_packs(&mut self) {
-        let mut merged = Vec::new();
-        let mut used = vec![false; self.packs.len()];
-
-        for i in 0..self.packs.len() {
-            if used[i] {
-                continue;
-            }
-            let mut current = self.packs[i].clone();
-            for j in (i + 1)..self.packs.len() {
-                if used[j] {
-                    continue;
+        loop {
+            let len_before = self.packs.len();
+            let mut i = 0;
+            while i < self.packs.len() {
+                let mut j = 0;
+                while j < self.packs.len() {
+                    if i == j {
+                        j += 1;
+                        continue;
+                    }
+                    if i < self.packs.len() && j < self.packs.len() {
+                        // schedule.py:931-942: rightmost_match_leftmost
+                        let rightmost = *self.packs[i].members.last().unwrap_or(&usize::MAX);
+                        let leftmost = *self.packs[j].members.first().unwrap_or(&usize::MAX);
+                        if rightmost == leftmost
+                            && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
+                        {
+                            // vector.py:753+: combine — merge j into i, skip overlap
+                            let mut merged_members = self.packs[i].members.clone();
+                            merged_members.extend_from_slice(&self.packs[j].members[1..]);
+                            self.packs[i].members = merged_members;
+                            self.packs.remove(j);
+                            if j < i {
+                                i -= 1;
+                            }
+                            continue; // re-check from j
+                        }
+                    }
+                    j += 1;
                 }
-                if self.packs[j].scalar_opcode == current.scalar_opcode {
-                    // Merge: append the second pack's members
-                    current.members.extend(&self.packs[j].members);
-                    used[j] = true;
-                }
+                i += 1;
             }
-            merged.push(current);
+            if self.packs.len() == len_before {
+                break;
+            }
         }
-
-        self.packs = merged;
     }
 
     /// vector.py: extend_packset()
@@ -436,6 +450,18 @@ impl VecScheduleState {
         pos
     }
 
+    /// Check if an OpRef refers to a float-type vector op.
+    pub fn is_float_vector(&self, opref: OpRef) -> bool {
+        self.oplist.iter().any(|op| {
+            op.pos == opref
+                && op
+                    .vecinfo
+                    .as_ref()
+                    .map(|vi| vi.datatype == 'f')
+                    .unwrap_or(false)
+        })
+    }
+
     /// schedule.py:625-630: setvector_of_box — record that scalar_op
     /// is at index `idx` in the vector `vecop`.
     pub fn setvector_of_box(&mut self, scalar_op: OpRef, idx: usize, vecop: OpRef) {
@@ -476,7 +502,8 @@ pub fn check_if_pack_supported(pack: &Pack, ops: &[Op]) -> Result<(), NotAProfit
 }
 
 /// schedule.py:476-486: unpack_from_vector — extract a scalar from a vector box.
-/// Creates a VecUnpack op and appends it to state's oplist.
+/// Creates a VecUnpack op with the correct type (I or F) based on the
+/// vector box's datatype. Mirrors OpHelpers.create_vec_unpack(var.type, ...).
 pub fn unpack_from_vector(
     state: &mut VecScheduleState,
     vec_ref: OpRef,
@@ -486,8 +513,13 @@ pub fn unpack_from_vector(
     assert!(count > 0);
     let index_const = OpRef(OpRef::CONST_BASE + index as u32);
     let count_const = OpRef(OpRef::CONST_BASE + count as u32);
-    // schedule.py:482-483: create_vec_unpack
-    let mut unpack_op = Op::new(OpCode::VecUnpackI, &[vec_ref, index_const, count_const]);
+    // schedule.py:482: create_vec_unpack(arg.type, ...) — pick opcode by type
+    let unpack_opcode = if state.is_float_vector(vec_ref) {
+        OpCode::VecUnpackF
+    } else {
+        OpCode::VecUnpackI
+    };
+    let mut unpack_op = Op::new(unpack_opcode, &[vec_ref, index_const, count_const]);
     unpack_op.pos = state.alloc_op_pos();
     let result = unpack_op.pos;
     state.append_to_oplist(unpack_op);
@@ -521,6 +553,22 @@ pub fn prepare_fail_arguments(
     }
 }
 
+/// schedule.py:352-386: prepare_arguments — transform scalar args to vector args.
+/// Handles reuse, crop, scatter, position, and expand cases.
+/// Requires CPU vector extension restrictions; currently a no-op since majit
+/// does not yet have a vector extension backend.
+/// When oprestrict is None (no restriction), RPython returns immediately (line 364-365).
+pub fn prepare_arguments(
+    _state: &mut VecScheduleState,
+    _pack: &Pack,
+    _args: &mut Vec<OpRef>,
+    _ops: &[Op],
+) {
+    // schedule.py:364-365: if not oprestrict: return
+    // majit does not yet have CPU vector extension restrictions,
+    // so this is equivalent to oprestrict=None → early return.
+}
+
 /// schedule.py:322-350: Turn a pack of scalar ops into a single vector op.
 pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
     if pack.members.is_empty() {
@@ -540,8 +588,9 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
         return; // not vectorizable
     };
 
-    // schedule.py:335-336: build args list
-    let args = first_op.args.to_vec();
+    // schedule.py:335-336: build args list + prepare_arguments
+    let mut args = first_op.args.to_vec();
+    prepare_arguments(state, pack, &mut args, ops);
 
     // schedule.py:337-338: create VecOperation
     let mut vecop = Op::new(vec_opcode, &args);
