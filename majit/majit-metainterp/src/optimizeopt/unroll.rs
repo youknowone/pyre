@@ -776,9 +776,9 @@ impl UnrollOptimizer {
     pub fn get_virtual_state(
         args: &[OpRef],
         ctx: &crate::optimizeopt::OptContext,
-        ptr_info: &[Option<crate::optimizeopt::info::PtrInfo>],
+        forwarded: &[crate::optimizeopt::info::Forwarded],
     ) -> crate::optimizeopt::virtualstate::VirtualState {
-        crate::optimizeopt::virtualstate::export_state(args, ctx, ptr_info)
+        crate::optimizeopt::virtualstate::export_state(args, ctx, forwarded)
     }
 }
 
@@ -1197,7 +1197,7 @@ impl OptUnroll {
         });
         // unroll.py:457: use pre-force virtual state if available
         let virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
-            crate::optimizeopt::virtualstate::export_state(&end_args, ctx, &ctx.ptr_info)
+            crate::optimizeopt::virtualstate::export_state(&end_args, ctx, &ctx.forwarded)
         });
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: HashMap<OpRef, ExportedValueInfo> = HashMap::new();
@@ -1368,7 +1368,7 @@ impl OptUnroll {
         runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         let mut virtual_state =
-            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.ptr_info);
+            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.forwarded);
         let mut args: Vec<OpRef> = jump_args
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
@@ -1435,7 +1435,7 @@ impl OptUnroll {
                         virtual_state = crate::optimizeopt::virtualstate::export_state(
                             &args,
                             ctx,
-                            &ctx.ptr_info,
+                            &ctx.forwarded,
                         );
                     }
                     continue;
