@@ -2114,12 +2114,31 @@ impl OptContext {
 
         // resume.py:447,450-451: patch and store.
         numb_state.patch(1, liveboxes.len() as i32);
+
+        // resume.py:447: store liveboxes as new fail_args.
+        // Snapshot-based numbering replaces the original fail_args with
+        // only the live boxes (TAGBOX entries). Virtual fields are encoded
+        // in rd_numb via TAGVIRTUAL + rd_virtuals_info.
+        // Update fail_arg_types to match the new liveboxes.
+        let new_types: Vec<majit_ir::Type> = liveboxes
+            .iter()
+            .map(|opref| {
+                if opref.is_constant() {
+                    self.constant_types_for_numbering
+                        .get(&opref.0)
+                        .copied()
+                        .unwrap_or(majit_ir::Type::Int)
+                } else {
+                    self.new_operations
+                        .iter()
+                        .find(|o| o.pos == *opref)
+                        .map(|o| o.result_type())
+                        .unwrap_or(majit_ir::Type::Int)
+                }
+            })
+            .collect();
         op.store_final_boxes(liveboxes);
-        // RPython Box type parity: recompute fail_arg_types on final
-        // liveboxes. In RPython, Box objects carry their type intrinsically.
-        // In pyre, fail_arg_types must be recomputed EVERY time
-        // store_final_boxes replaces fail_args — virtual expansion in
-        // optimizer.rs may have set stale types for the old fail_args.
+        // Recompute fail_arg_types on final liveboxes.
         {
             if let Some(ref fa) = op.fail_args {
                 op.fail_arg_types = Some(
@@ -2138,33 +2157,19 @@ impl OptContext {
                                     _ => majit_ir::Type::Int,
                                 }
                             } else {
-                                // RPython Box type parity: each Box carries
-                                // its type. value_types is seeded from trace
-                                // ops + inputargs + emitted ops. On miss,
-                                // search new_operations (the emitted ops list)
-                                // for the producing op's result_type.
                                 if let Some(&tp) = self.value_types.get(&opref.0) {
                                     tp
                                 } else {
-                                    // Fallback: search emitted ops for this
-                                    // position. Equivalent to Box.type lookup.
                                     self.new_operations
                                         .iter()
                                         .find(|op| op.pos == *opref)
                                         .map(|op| op.result_type())
                                         .unwrap_or_else(|| {
-                                            // Last resort: check forwarding chain
                                             let fwd = self.get_box_replacement(*opref);
                                             if fwd != *opref {
                                                 if let Some(&tp) = self.value_types.get(&fwd.0) {
                                                     return tp;
                                                 }
-                                            }
-                                            if crate::optimizeopt::majit_log_enabled() {
-                                                eprintln!(
-                                                    "[jit][value_types] MISS: opref={:?} fwd={:?} not in value_types/new_ops/chain",
-                                                    opref, fwd
-                                                );
                                             }
                                             majit_ir::Type::Int
                                         })
