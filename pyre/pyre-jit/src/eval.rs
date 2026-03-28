@@ -1218,6 +1218,12 @@ fn bound_reached(
         None
     };
     if let Some(outcome) = outcome {
+        // compile.py:701-710 handle_fail parity: bridge compilation and
+        // blackhole resume are MUTUALLY EXCLUSIVE. If must_compile is
+        // true, compile the bridge BEFORE any blackhole execution (the
+        // frame state must reflect the guard's restore point, not a
+        // post-blackhole advanced state). If bridge compilation fails
+        // or is not needed, fall through to blackhole.
         let bridge_request = match &outcome {
             DetailedDriverRunOutcome::GuardFailure {
                 bridge_request: Some(req),
@@ -1225,26 +1231,10 @@ fn bound_reached(
             } => Some(req.clone()),
             _ => None,
         };
-        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-            JitAction::Return(result) => return Some(LoopResult::Done(result)),
-            JitAction::ContinueRunningNormally => {
-                let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
-                if let Some(ref vals) = typed {
-                    match crate::call_jit::resume_in_blackhole(frame, vals, loop_header_pc) {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            return Some(LoopResult::ContinueRunningNormally);
-                        }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                            return Some(LoopResult::Done(r));
-                        }
-                        crate::call_jit::BlackholeResult::Failed => {}
-                    }
-                }
-            }
-            JitAction::Continue => {}
-        }
-        // compile.py:703: not rstack.stack_almost_full()
-        if let Some(req) = bridge_request {
+        // compile.py:701-703: must_compile → _trace_and_compile_from_bridge.
+        // Bridge is compiled BEFORE blackhole, with the frame in its
+        // guard-failure-restored state (ni, vsd from fail_args).
+        let bridge_compiled = if let Some(ref req) = bridge_request {
             if !stack_almost_full() {
                 crate::call_jit::jit_bridge_compile_for_guard(
                     req.green_key,
@@ -1253,7 +1243,35 @@ fn bound_reached(
                     frame,
                     req.resume_pc,
                 );
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
+            JitAction::Return(result) => return Some(LoopResult::Done(result)),
+            JitAction::ContinueRunningNormally => {
+                // compile.py:714-716: if bridge was compiled, skip blackhole.
+                // RPython: handle_fail either compiles bridge OR resumes in
+                // blackhole, never both.
+                if !bridge_compiled {
+                    let typed = LAST_GUARD_TYPED.with(|c| c.borrow_mut().take());
+                    if let Some(ref vals) = typed {
+                        match crate::call_jit::resume_in_blackhole(frame, vals, loop_header_pc) {
+                            crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                                return Some(LoopResult::ContinueRunningNormally);
+                            }
+                            crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                                return Some(LoopResult::Done(r));
+                            }
+                            crate::call_jit::BlackholeResult::Failed => {}
+                        }
+                    }
+                }
+            }
+            JitAction::Continue => {}
         }
     }
     // warmstate.py:429 jitcounter.decay_all_counters()
