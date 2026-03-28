@@ -962,40 +962,16 @@ impl OptHeap {
         }
 
         // heap.py:640-643: constant_fold — pure getfield on constant object.
-        // RPython: protect_speculative_operation + execute_nonspec_const.
-        // optimizer.py:783-790: constant_fold calls protect_speculative_field
-        // to validate the GcRef, then execute_nonspec_const to read the field.
-        if let Some(descr) = &op.descr {
-            if descr.is_always_pure() {
-                let obj_ref = op.arg(0);
-                if let Some(majit_ir::Value::Ref(ptr_val)) = ctx.get_constant(obj_ref).cloned() {
-                    // protect_speculative_operation (optimizer.py:802-806):
-                    // non-null + aligned = valid GC object heuristic.
-                    if !ptr_val.is_null() && ptr_val.0 % 8 == 0 && ptr_val.0 > 0x1000 {
-                        if let Some((offset, field_size, _field_type)) =
-                            majit_ir::unpack_fielddescr(descr)
-                        {
-                            let addr = ptr_val.0 + offset;
-                            // execute_nonspec_const: read field via CPU.
-                            // Catch any access violation as SpeculativeError.
-                            let folded = std::panic::catch_unwind(|| match field_size {
-                                8 => unsafe { *(addr as *const i64) },
-                                4 => unsafe { *(addr as *const i32) as i64 },
-                                2 => unsafe { *(addr as *const i16) as i64 },
-                                1 => unsafe { *(addr as *const u8) as i64 },
-                                _ => 0,
-                            });
-                            if let Ok(value) = folded {
-                                let const_ref = ctx.make_constant_int(value);
-                                ctx.replace_op(op.pos, const_ref);
-                                return OptimizationResult::Remove;
-                            }
-                            // SpeculativeError: skip fold, fall through to cache.
-                        }
-                    }
-                }
-            }
-        }
+        // RPython: protect_speculative_operation(op) validates the GcRef via
+        // cpu.protect_speculative_field(ref, fielddescr) which checks GC type
+        // ownership. Then execute_nonspec_const reads the field via CPU dispatch.
+        //
+        // majit has no GC type registry to validate object ownership, so
+        // protect_speculative_operation cannot be implemented safely.
+        // Without it, raw pointer dereference is UB (object may be stale).
+        // This is equivalent to protect_speculative_operation always raising
+        // SpeculativeError — the fold is skipped, falling through to the
+        // heap cache path below.
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
