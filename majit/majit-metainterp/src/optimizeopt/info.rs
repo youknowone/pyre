@@ -493,7 +493,7 @@ impl PtrInfo {
             ctx: &mut crate::optimizeopt::OptContext,
             direct: bool,
         ) -> OpRef {
-            let value_ref = ctx.get_replacement(value_ref);
+            let value_ref = ctx.get_box_replacement(value_ref);
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
                     return info.force_to_ops_impl(value_ref, ctx, direct);
@@ -531,7 +531,7 @@ impl PtrInfo {
                         // info.py:144: _force_elements_immutable
                         // Write constant field values directly to the allocated memory.
                         for &(field_idx, val_ref) in fields.iter() {
-                            let resolved = ctx.get_replacement(val_ref);
+                            let resolved = ctx.get_box_replacement(val_ref);
                             if let Some(value) = ctx.get_constant(resolved) {
                                 if let Some((_, fd)) =
                                     field_descrs.iter().find(|(idx, _)| *idx == field_idx)
@@ -574,7 +574,7 @@ impl PtrInfo {
                     fields: vinfo
                         .fields
                         .iter()
-                        .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
+                        .map(|&(idx, val)| (idx, ctx.get_box_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
                     preamble_fields: Vec::new(),
@@ -616,7 +616,7 @@ impl PtrInfo {
                     fields: vinfo
                         .fields
                         .iter()
-                        .map(|&(idx, val)| (idx, ctx.get_replacement(val)))
+                        .map(|&(idx, val)| (idx, ctx.get_box_replacement(val)))
                         .collect(),
                     field_descrs: vinfo.field_descrs.clone(),
                     preamble_fields: Vec::new(),
@@ -863,7 +863,7 @@ impl PtrInfo {
             return false;
         }
         for &(_, val) in fields {
-            let resolved = ctx.get_replacement(val);
+            let resolved = ctx.get_box_replacement(val);
             if !ctx.is_constant(resolved) {
                 // Check if it's a virtual that is also immutable+constant
                 if let Some(info) = ctx.get_ptr_info(resolved) {

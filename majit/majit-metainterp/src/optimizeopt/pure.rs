@@ -356,7 +356,7 @@ impl OptPure {
 
         // Check if we've already computed this loop-invariant call.
         if let Some(cached_ref) = self.loopinvariant_cache.get(&key).copied() {
-            let cached_ref = ctx.get_replacement(cached_ref);
+            let cached_ref = ctx.get_box_replacement(cached_ref);
             ctx.replace_op(op.pos, cached_ref);
             return OptimizationResult::Remove;
         }
@@ -414,8 +414,8 @@ impl OptPure {
                 .iter()
                 .zip(op.args.iter())
                 .all(|(&stored, &query)| {
-                    let s = ctx.get_replacement(stored);
-                    let q = ctx.get_replacement(query);
+                    let s = ctx.get_box_replacement(stored);
+                    let q = ctx.get_box_replacement(query);
                     if s == q {
                         return true;
                     }
@@ -450,7 +450,7 @@ impl OptPure {
             }
             // same_box: identity for non-constants, same_constant for constants.
             for (expected, &arg) in entry.args.iter().zip(op.args.iter()) {
-                let query = ctx.get_replacement(arg);
+                let query = ctx.get_box_replacement(arg);
                 match expected {
                     crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
                         if query != *expected_ref {
@@ -659,7 +659,7 @@ impl Optimization for OptPure {
                 // guard pairing requires the OVF semantic.
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key) {
-                    let cached_ref = ctx.get_replacement(cached_ref);
+                    let cached_ref = ctx.get_box_replacement(cached_ref);
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -736,7 +736,7 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_replacement(cached_ref);
+                let cached_ref = ctx.get_box_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -759,7 +759,7 @@ impl Optimization for OptPure {
 
             // CSE: same call_pure with same args → reuse result.
             if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_replacement(cached_ref);
+                let cached_ref = ctx.get_box_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -767,7 +767,7 @@ impl Optimization for OptPure {
 
             // Check RECORD_KNOWN_RESULT cache.
             if let Some(result_ref) = self.lookup_known_result(&key) {
-                let result_ref = ctx.get_replacement(result_ref);
+                let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -794,14 +794,14 @@ impl Optimization for OptPure {
             };
 
             if let Some(cached_ref) = self.lookup_pure(&key) {
-                let cached_ref = ctx.get_replacement(cached_ref);
+                let cached_ref = ctx.get_box_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             if let Some(result_ref) = self.lookup_known_result(&key) {
-                let result_ref = ctx.get_replacement(result_ref);
+                let result_ref = ctx.get_box_replacement(result_ref);
                 ctx.replace_op(op.pos, result_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -829,7 +829,7 @@ impl Optimization for OptPure {
                     descr_index: None,
                 };
                 if let Some(cached_ref) = self.lookup_pure(&key) {
-                    let cached_ref = ctx.get_replacement(cached_ref);
+                    let cached_ref = ctx.get_box_replacement(cached_ref);
                     ctx.replace_op(op.pos, cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
@@ -1764,7 +1764,7 @@ mod tests {
         op.pos = OpRef(2);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
     }
 
     #[test]
@@ -1801,7 +1801,7 @@ mod tests {
         op.descr = Some(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
     }
 
     #[test]

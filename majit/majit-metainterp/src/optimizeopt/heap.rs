@@ -152,7 +152,7 @@ impl CachedField {
     /// heap.py:189-196: invalidate with PtrInfo cleanup.
     fn invalidate_with_ctx(&mut self, field_idx: u32, ctx: &mut crate::optimizeopt::OptContext) {
         for &obj in &self.cached_structs {
-            let obj_resolved = ctx.get_replacement(obj);
+            let obj_resolved = ctx.get_box_replacement(obj);
             if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                 info.clear_field(field_idx);
             }
@@ -498,7 +498,7 @@ impl OptHeap {
     /// Emit a lazy SetfieldGc. If the value is virtual, return false (the
     /// caller should handle it via pendingfields / rd_pendingfields).
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, _allow_force: bool) -> bool {
-        let orig_val = ctx.get_replacement(op.arg(1));
+        let orig_val = ctx.get_box_replacement(op.arg(1));
 
         // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
         // If value is virtual, the op gets re-absorbed as lazy_set → lost.
@@ -512,7 +512,7 @@ impl OptHeap {
 
         // Non-virtual path: resolve forwarding and emit
         for arg in op.args.iter_mut() {
-            *arg = ctx.get_replacement(*arg);
+            *arg = ctx.get_box_replacement(*arg);
         }
         ctx.emit(op.clone());
         true
@@ -548,16 +548,16 @@ impl OptHeap {
         for (field_idx, obj, mut op) in pending {
             // RPython force_lazy_set: force virtual values, emit, restore cache.
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
-            let value_ref = ctx.get_replacement(op.arg(1));
+            let value_ref = ctx.get_box_replacement(op.arg(1));
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
                     info.force_to_ops_direct(value_ref, ctx);
                 }
             }
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let final_value = op.arg(1);
             // heap.py:136: emit_extra(op) — always emit
@@ -582,7 +582,7 @@ impl OptHeap {
         // re-absorbs the op. Drop and update cache only.
         for (descr_idx, index, obj, mut op) in pending {
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let value_ref = op.arg(2);
             self.cache_arrayitem(obj, descr_idx, index, value_ref, None);
@@ -618,7 +618,7 @@ impl OptHeap {
             .collect();
         for (field_idx, obj, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
-            let value_ref = ctx.get_replacement(op.arg(1));
+            let value_ref = ctx.get_box_replacement(op.arg(1));
             let is_virtual = matches!(
                 ctx.get_ptr_info(value_ref),
                 Some(info) if info.is_virtual()
@@ -632,7 +632,7 @@ impl OptHeap {
             // invalidate first, then emit_extra(op, emit=False),
             // then put_field_back_to_info restores the cache.
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let final_value = op.arg(1);
             let descr = op.descr.clone();
@@ -645,7 +645,7 @@ impl OptHeap {
             ctx.emit_through_passes_after(ctx.current_pass_idx, op);
             // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo
             self.cache_field(obj, field_idx, final_value, descr.as_ref());
-            let obj_resolved = ctx.get_replacement(obj);
+            let obj_resolved = ctx.get_box_replacement(obj);
             if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                 info.set_field(field_idx, final_value);
             }
@@ -663,7 +663,7 @@ impl OptHeap {
             .collect();
         for (descr_idx, index, _obj, mut op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
-            let value_ref = ctx.get_replacement(op.arg(2));
+            let value_ref = ctx.get_box_replacement(op.arg(2));
             let is_virtual = matches!(
                 ctx.get_ptr_info(value_ref),
                 Some(info) if info.is_virtual()
@@ -675,7 +675,7 @@ impl OptHeap {
             }
 
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let final_value = op.arg(2);
             let array_ref = op.arg(0);
@@ -758,8 +758,8 @@ impl OptHeap {
                 if idx1 != idx2 {
                     continue;
                 }
-                let v1r = ctx.get_replacement(v1);
-                let v2r = ctx.get_replacement(v2);
+                let v1r = ctx.get_box_replacement(v1);
+                let v2r = ctx.get_box_replacement(v2);
                 // heap.py:222-224: both constant and different → CANNOT_ALIAS
                 if ctx.is_constant(v1r) && ctx.is_constant(v2r) && v1r != v2r {
                     return true;
@@ -998,7 +998,7 @@ impl OptHeap {
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
         // Resolve forwarding (PtrInfo identity semantics, heap.py same_info).
-        let obj = ctx.get_replacement(raw_obj);
+        let obj = ctx.get_box_replacement(raw_obj);
         let mut force_lazy = false;
         if let Some(cf) = self.field_cache.get(&field_idx) {
             if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
@@ -1020,7 +1020,7 @@ impl OptHeap {
                 // heap.py:198-226: possible_aliasing_two_infos
                 // RPython checks: class/length, then content. No seen_allocation.
                 let cannot_alias = cannot_alias_via_class || {
-                    let lazy_obj_resolved = ctx.get_replacement(*lazy_obj);
+                    let lazy_obj_resolved = ctx.get_box_replacement(*lazy_obj);
                     Self::cannot_alias_via_content(lazy_obj_resolved, obj, ctx)
                 };
                 if !cannot_alias {
@@ -1029,7 +1029,7 @@ impl OptHeap {
                 }
                 // CANNOT_ALIAS: skip lazy_set, check entries below
             } else if let Some(cached) = cf.get_entry(obj) {
-                let cached = ctx.get_replacement(cached);
+                let cached = ctx.get_box_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
             }
@@ -1057,7 +1057,7 @@ impl OptHeap {
                     let descr = lazy_op.descr.clone();
                     let cf = self.get_or_create_cached_field(field_idx);
                     cf.register(lazy_obj, final_value, descr.as_ref());
-                    let lazy_resolved = ctx.get_replacement(lazy_obj);
+                    let lazy_resolved = ctx.get_box_replacement(lazy_obj);
                     if let Some(info) = ctx.get_ptr_info_mut(lazy_resolved) {
                         info.set_field(field_idx, final_value);
                     }
@@ -1106,7 +1106,7 @@ impl OptHeap {
 
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
-            let cached = ctx.get_replacement(cached);
+            let cached = ctx.get_box_replacement(cached);
             ctx.replace_op(op.pos, cached);
             return OptimizationResult::Remove;
         }
@@ -1114,7 +1114,7 @@ impl OptHeap {
         // Check read cache (after import).
         if let Some(cf) = self.field_cache.get(&field_idx) {
             if let Some(cached) = cf.get_entry(obj) {
-                let cached = ctx.get_replacement(cached);
+                let cached = ctx.get_box_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
             }
@@ -1125,7 +1125,7 @@ impl OptHeap {
         if let Some(&qi_cached) = self.quasi_immut_cache.get(&key) {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
-                let qi_cached = ctx.get_replacement(qi_cached);
+                let qi_cached = ctx.get_box_replacement(qi_cached);
                 ctx.replace_op(op.pos, qi_cached);
                 return OptimizationResult::Remove;
             }
@@ -1139,7 +1139,7 @@ impl OptHeap {
         // Cache miss: emit the load and cache the result.
         // heap.py line 652: make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
-        let struct_ref = ctx.get_replacement(op.arg(0));
+        let struct_ref = ctx.get_box_replacement(op.arg(0));
         self.known_nonnull.insert(struct_ref);
         if ctx.get_ptr_info(struct_ref).is_none() {
             ctx.set_ptr_info(struct_ref, crate::optimizeopt::info::PtrInfo::nonnull());
@@ -1183,7 +1183,7 @@ impl OptHeap {
         let (raw_obj, field_idx) = key;
         // Resolve forwarding so that two OpRefs pointing to the same object
         // compare equal (PtrInfo identity semantics, heap.py same_info).
-        let obj = ctx.get_replacement(raw_obj);
+        let obj = ctx.get_box_replacement(raw_obj);
         let new_value = op.arg(1);
 
         // The stored value escapes (it becomes reachable via the heap).
@@ -1198,7 +1198,7 @@ impl OptHeap {
                     return OptimizationResult::Remove;
                 }
             } else if let Some(&cached) = cf.get_entry(obj).as_ref() {
-                let cached_resolved = ctx.get_replacement(cached);
+                let cached_resolved = ctx.get_box_replacement(cached);
                 if cached_resolved == new_value {
                     return OptimizationResult::Remove;
                 }
@@ -1222,7 +1222,7 @@ impl OptHeap {
                 return false;
             }
             // heap.py:206-226: _cannot_alias_via_content
-            let lazy_resolved = ctx.get_replacement(lazy_obj);
+            let lazy_resolved = ctx.get_box_replacement(lazy_obj);
             if Self::cannot_alias_via_content(lazy_resolved, obj, ctx) {
                 return false;
             }
@@ -1255,7 +1255,7 @@ impl OptHeap {
                 let final_value = lazy_op.arg(1);
                 let descr = lazy_op.descr.clone();
                 self.cache_field(lazy_obj, field_idx, final_value, descr.as_ref());
-                let lazy_obj_resolved = ctx.get_replacement(lazy_obj);
+                let lazy_obj_resolved = ctx.get_box_replacement(lazy_obj);
                 if let Some(info) = ctx.get_ptr_info_mut(lazy_obj_resolved) {
                     info.set_field(field_idx, final_value);
                 }
@@ -1266,7 +1266,7 @@ impl OptHeap {
         {
             let cf = self.get_or_create_cached_field(field_idx);
             if let Some(&cached) = cf.get_entry(obj).as_ref() {
-                let cached_resolved = ctx.get_replacement(cached);
+                let cached_resolved = ctx.get_box_replacement(cached);
                 if cached_resolved == new_value {
                     cf.lazy_set = None;
                     return OptimizationResult::Remove;
@@ -1317,14 +1317,14 @@ impl OptHeap {
             }
             if let Some(cai) = self.array_cache.get(&(descr_idx, const_index)) {
                 if let Some(cached) = cai.get_entry(array) {
-                    let cached = ctx.get_replacement(cached);
+                    let cached = ctx.get_box_replacement(cached);
                     ctx.replace_op(op.pos, cached);
                     return OptimizationResult::Remove;
                 }
             }
             self.cache_arrayitem(array, descr_idx, const_index, op.pos, op.descr.as_ref());
             // heap.py line 701: make_nonnull(op.getarg(0))
-            let array_ref = ctx.get_replacement(op.arg(0));
+            let array_ref = ctx.get_box_replacement(op.arg(0));
             self.known_nonnull.insert(array_ref);
             // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
             // Record that array length >= index + 1
@@ -1344,7 +1344,7 @@ impl OptHeap {
         // heap.py: variable-index cache — same array + same index OpRef.
         if let Some(var_key) = Self::arrayitem_key_variable(op) {
             if let Some(&cached) = self.cached_arrayitems_var.get(&var_key) {
-                let cached = ctx.get_replacement(cached);
+                let cached = ctx.get_box_replacement(cached);
                 ctx.replace_op(op.pos, cached);
                 return OptimizationResult::Remove;
             }
@@ -1352,7 +1352,8 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
-        self.known_nonnull.insert(ctx.get_replacement(op.arg(0)));
+        self.known_nonnull
+            .insert(ctx.get_box_replacement(op.arg(0)));
         OptimizationResult::Emit(op.clone())
     }
 
@@ -1383,7 +1384,7 @@ impl OptHeap {
         };
 
         let (array, descr_idx, const_index) = key;
-        let array = ctx.get_replacement(array);
+        let array = ctx.get_box_replacement(array);
         let new_value = op.arg(2);
 
         // heap.py:77-101: do_setfield (shared by CachedField AND ArrayCachedItem)
@@ -1395,7 +1396,7 @@ impl OptHeap {
                     return OptimizationResult::Remove;
                 }
             } else if let Some(cached) = cai.get_entry(array) {
-                let cached = ctx.get_replacement(cached);
+                let cached = ctx.get_box_replacement(cached);
                 if cached == new_value {
                     return OptimizationResult::Remove;
                 }
@@ -1441,7 +1442,7 @@ impl OptHeap {
         {
             let cai = self.get_or_create_cached_arrayitem(descr_idx, const_index);
             if let Some(cached) = cai.get_entry(array) {
-                let cached = ctx.get_replacement(cached);
+                let cached = ctx.get_box_replacement(cached);
                 if cached == new_value {
                     cai.lazy_set = None;
                     return OptimizationResult::Remove;
@@ -1459,7 +1460,7 @@ impl OptHeap {
             cai.cached_values.swap_remove(idx);
             cai.cached_descrs.retain(|(k, _)| *k != array);
         }
-        if let Some(info) = ctx.get_ptr_info_mut(ctx.get_replacement(op.arg(0))) {
+        if let Some(info) = ctx.get_ptr_info_mut(ctx.get_box_replacement(op.arg(0))) {
             info.set_item(const_index as usize, new_value);
         }
         // heap.py: ArrayCachedItem.invalidate() calls parent.clear_varindex()
@@ -1481,7 +1482,7 @@ impl OptHeap {
         let cache_key = (descr_idx, args_hash);
 
         if let Some(&cached_result) = self.loopinvariant_cache.get(&cache_key) {
-            let cached_result = ctx.get_replacement(cached_result);
+            let cached_result = ctx.get_box_replacement(cached_result);
             ctx.replace_op(op.pos, cached_result);
             return OptimizationResult::Remove;
         }
@@ -1681,10 +1682,10 @@ impl Optimization for OptHeap {
 
             // ── heap.py: ARRAYLEN_GC — cache array lengths ──
             OpCode::ArraylenGc => {
-                let array = ctx.get_replacement(op.arg(0));
+                let array = ctx.get_box_replacement(op.arg(0));
                 let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
                 if let Some(&cached) = self.cached_arraylens.get(&(array, descr_idx)) {
-                    let cached = ctx.get_replacement(cached);
+                    let cached = ctx.get_box_replacement(cached);
                     ctx.replace_op(op.pos, cached);
                     return OptimizationResult::Remove;
                 }
@@ -1705,7 +1706,7 @@ impl Optimization for OptHeap {
                 let str_ref = op.arg(0);
                 let key = (str_ref, op.opcode as u32 + 0xFF00);
                 if let Some(&cached) = self.cached_arraylens.get(&key) {
-                    let cached = ctx.get_replacement(cached);
+                    let cached = ctx.get_box_replacement(cached);
                     ctx.replace_op(op.pos, cached);
                     return OptimizationResult::Remove;
                 }
@@ -1746,7 +1747,7 @@ impl Optimization for OptHeap {
                     .collect();
                 for (_obj, mut set_op) in pending_fields {
                     for arg in set_op.args.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
+                        *arg = ctx.get_box_replacement(*arg);
                     }
                     ctx.emit(set_op);
                 }
@@ -1757,7 +1758,7 @@ impl Optimization for OptHeap {
                     .collect();
                 for (_obj, mut set_op) in pending_items {
                     for arg in set_op.args.iter_mut() {
-                        *arg = ctx.get_replacement(*arg);
+                        *arg = ctx.get_box_replacement(*arg);
                     }
                     ctx.emit(set_op);
                 }
@@ -1822,7 +1823,7 @@ impl Optimization for OptHeap {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
                         if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
-                            let array = ctx.get_replacement(pending_op.arg(0));
+                            let array = ctx.get_box_replacement(pending_op.arg(0));
                             let cai = self.get_or_create_cached_arrayitem(descr_idx, index);
                             cai.lazy_set = Some((array, pending_op));
                         } else {
@@ -1830,7 +1831,7 @@ impl Optimization for OptHeap {
                         }
                     } else {
                         let field_idx = pending_op.descr.as_ref().map_or(0, |d| d.index());
-                        let obj = ctx.get_replacement(pending_op.arg(0));
+                        let obj = ctx.get_box_replacement(pending_op.arg(0));
                         let cf = self.get_or_create_cached_field(field_idx);
                         cf.lazy_set = Some((obj, pending_op));
                     }
@@ -1930,7 +1931,7 @@ impl Optimization for OptHeap {
                         .get_cached_field(field_idx)
                         .and_then(|cf| cf.get_entry(obj))
                     {
-                        let cached = ctx.get_replacement(cached);
+                        let cached = ctx.get_box_replacement(cached);
                         ctx.replace_op(op.pos, cached);
                         return OptimizationResult::Remove;
                     }
@@ -2016,14 +2017,14 @@ impl Optimization for OptHeap {
             })
             .collect();
         for (field_idx, obj, mut op) in vable_entries {
-            let value_ref = ctx.get_replacement(op.arg(1));
+            let value_ref = ctx.get_box_replacement(op.arg(1));
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
                     info.force_to_ops_direct(value_ref, ctx);
                 }
             }
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let final_value = op.arg(1);
             let descr = op.descr.clone();
@@ -2049,14 +2050,14 @@ impl Optimization for OptHeap {
         // SetfieldGc, flush those fields so the callee sees them in memory.
         if op.opcode.is_call() && op.num_args() > 1 {
             let call_args: Vec<OpRef> = (1..op.num_args())
-                .map(|i| ctx.get_replacement(op.arg(i)))
+                .map(|i| ctx.get_box_replacement(op.arg(i)))
                 .collect();
             let flush_indices: Vec<u32> = self
                 .field_cache
                 .iter()
                 .filter_map(|(&field_idx, cf)| {
                     let (obj, _) = cf.lazy_set.as_ref()?;
-                    let resolved = ctx.get_replacement(*obj);
+                    let resolved = ctx.get_box_replacement(*obj);
                     call_args.contains(&resolved).then_some(field_idx)
                 })
                 .collect();
@@ -2065,7 +2066,7 @@ impl Optimization for OptHeap {
                     if let Some((obj, mut lazy_op)) = cf.lazy_set.take() {
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                         // Restore cache after emit
-                        let value_ref = ctx.get_replacement(lazy_op.arg(1));
+                        let value_ref = ctx.get_box_replacement(lazy_op.arg(1));
                         self.cache_field(obj, field_idx, value_ref, lazy_op.descr.as_ref());
                     }
                 }
@@ -2093,7 +2094,7 @@ impl Optimization for OptHeap {
             debug_assert!(cf.lazy_set.is_none());
             for i in 0..cf.cached_structs.len() {
                 // heap.py:55: structbox = get_box_replacement(self.cached_structs[i])
-                let obj = ctx.get_replacement(cf.cached_structs[i]);
+                let obj = ctx.get_box_replacement(cf.cached_structs[i]);
                 if obj.is_none() {
                     continue;
                 }
@@ -2102,8 +2103,8 @@ impl Optimization for OptHeap {
                 let cached_val = ctx
                     .get_ptr_info(obj)
                     .and_then(|info| info.get_field(field_idx))
-                    .map(|v| ctx.get_replacement(v))
-                    .unwrap_or_else(|| ctx.get_replacement(cf.cached_values[i]));
+                    .map(|v| ctx.get_box_replacement(v))
+                    .unwrap_or_else(|| ctx.get_box_replacement(cf.cached_values[i]));
                 if cached_val.is_none() {
                     continue;
                 }
@@ -2166,7 +2167,7 @@ impl Optimization for OptHeap {
         }
         for (_obj, mut op) in pending {
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             let val = op.arg(1);
             if !val.is_none()
@@ -2188,7 +2189,7 @@ impl Optimization for OptHeap {
             .collect();
         for (_obj, mut op) in pending_arr {
             for arg in op.args.iter_mut() {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             ctx.emit(op);
         }
@@ -2337,7 +2338,7 @@ mod tests {
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
     }
 
     /// After consuming an imported short field, a cache invalidation followed
@@ -2369,7 +2370,7 @@ mod tests {
         op1.pos = OpRef(2);
         let result1 = heap.optimize_getfield(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
 
         // A call invalidates all mutable field caches.
         heap.invalidate_caches();
@@ -2397,7 +2398,7 @@ mod tests {
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(1));
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
@@ -2527,7 +2528,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2795,7 +2796,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3246,7 +3247,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3804,7 +3805,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3858,7 +3859,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -3953,7 +3954,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4031,7 +4032,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4098,7 +4099,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4164,7 +4165,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4237,7 +4238,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4440,7 +4441,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4493,7 +4494,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -4540,7 +4541,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {

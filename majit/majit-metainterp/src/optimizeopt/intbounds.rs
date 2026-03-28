@@ -53,7 +53,7 @@ impl OptIntBounds {
 
     /// Get or create bounds for an operation.
     fn getintbound(&self, opref: OpRef, ctx: &OptContext) -> IntBound {
-        let opref = ctx.get_replacement(opref);
+        let opref = ctx.get_box_replacement(opref);
         // Check if there is a known constant
         if let Some(val) = ctx.get_constant_int(opref) {
             return IntBound::from_constant(val);
@@ -150,8 +150,8 @@ impl OptIntBounds {
     // ── Comparison optimizations ──
 
     fn optimize_int_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_lt(&b1) {
@@ -167,8 +167,8 @@ impl OptIntBounds {
     }
 
     fn optimize_int_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_gt(&b1) {
@@ -184,8 +184,8 @@ impl OptIntBounds {
     }
 
     fn optimize_int_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_le(&b1) || arg0 == arg1 {
@@ -201,8 +201,8 @@ impl OptIntBounds {
     }
 
     fn optimize_int_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_ge(&b1) || arg0 == arg1 {
@@ -218,8 +218,8 @@ impl OptIntBounds {
     }
 
     fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if arg0 == arg1 {
@@ -235,8 +235,8 @@ impl OptIntBounds {
     }
 
     fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if arg0 == arg1 {
@@ -254,8 +254,8 @@ impl OptIntBounds {
     // ── Unsigned comparison optimizations ──
 
     fn optimize_uint_lt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_unsigned_lt(&b1) {
@@ -271,8 +271,8 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_gt(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_unsigned_gt(&b1) {
@@ -288,8 +288,8 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_le(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_unsigned_le(&b1) || arg0 == arg1 {
@@ -305,8 +305,8 @@ impl OptIntBounds {
     }
 
     fn optimize_uint_ge(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if b0.known_unsigned_ge(&b1) || arg0 == arg1 {
@@ -331,8 +331,8 @@ impl OptIntBounds {
     /// intbounds.py: INT_ADD pure_from_args synthesis.
     /// Record INT_SUB reverse: if res = INT_ADD(a, b), then a = INT_SUB(res, b).
     fn postprocess_int_add(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b = if arg0 == arg1 {
             b0.lshift_bound(&IntBound::from_constant(1))
@@ -369,8 +369,8 @@ impl OptIntBounds {
 
     /// intbounds.py: INT_SUB postprocess with constant inversion synthesis.
     fn postprocess_int_sub(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         let b = b0.sub_bound(&b1);
@@ -435,8 +435,8 @@ impl OptIntBounds {
     /// intbounds.py: INT_LSHIFT pure_from_args synthesis.
     /// If res = INT_LSHIFT(a, b), then a = INT_RSHIFT(res, b).
     fn postprocess_int_lshift(&mut self, op: &Op, ctx: &OptContext) {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         let b = b0.lshift_bound(&b1);
@@ -573,8 +573,8 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_add_ovf(&mut self, op: &Op, ctx: &OptContext) {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b = if arg0 == arg1 {
             b0.mul2_bound_no_overflow()
@@ -596,8 +596,8 @@ impl OptIntBounds {
                 return OptimizationResult::Remove;
             }
         }
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
         if arg0 == arg1 {
@@ -654,8 +654,8 @@ impl OptIntBounds {
     }
 
     fn postprocess_int_mul_ovf(&mut self, op: &Op, ctx: &OptContext) {
-        let arg0 = ctx.get_replacement(op.arg(0));
-        let arg1 = ctx.get_replacement(op.arg(1));
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b = if arg0 == arg1 {
             b0.square_bound_no_overflow()
@@ -695,7 +695,7 @@ impl OptIntBounds {
     // ── Guard optimizations ──
 
     fn optimize_guard_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let cond_ref = ctx.get_replacement(op.arg(0));
+        let cond_ref = ctx.get_box_replacement(op.arg(0));
 
         // If the condition is a known constant, we can determine the guard outcome
         if let Some(val) = ctx.get_constant_int(cond_ref) {
@@ -720,7 +720,7 @@ impl OptIntBounds {
     }
 
     fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let cond_ref = ctx.get_replacement(op.arg(0));
+        let cond_ref = ctx.get_box_replacement(op.arg(0));
 
         if let Some(val) = ctx.get_constant_int(cond_ref) {
             if val == 0 {
@@ -1425,7 +1425,7 @@ impl Optimization for OptIntBounds {
     ) -> std::collections::HashMap<OpRef, IntBound> {
         let mut exported = std::collections::HashMap::new();
         for &arg in args {
-            let resolved = ctx.get_replacement(arg);
+            let resolved = ctx.get_box_replacement(arg);
             let bound = self.getintbound(resolved, ctx);
             if !bound.is_unbounded() {
                 exported.insert(resolved, bound);
@@ -1463,7 +1463,7 @@ mod tests {
             let mut resolved_op = op.clone();
             // Keep the op.pos as set by the test (not overriding with index)
             for arg in &mut resolved_op.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emit_op) => {

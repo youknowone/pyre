@@ -466,7 +466,7 @@ impl VirtualState {
         let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
-            let resolved = ctx.get_replacement(opref);
+            let resolved = ctx.get_box_replacement(opref);
             if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
                 if let Some(&existing_slot) = assigned_slots.get(&resolved) {
                     // Same resolved box — reuse existing slot (RPython alias dedup)
@@ -541,7 +541,7 @@ impl VirtualState {
         let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
-            let resolved = ctx.get_replacement(opref);
+            let resolved = ctx.get_box_replacement(opref);
             if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
                 if let Some(&existing_slot) = assigned_slots.get(&resolved) {
                     if let Some(slot) = args.get_mut(existing_slot) {
@@ -583,12 +583,12 @@ impl VirtualState {
             VirtualStateInfo::Constant(_) => {}
             VirtualStateInfo::Virtual { fields, .. }
             | VirtualStateInfo::VirtualStruct { fields, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (field_idx, field_state) in fields {
                     let field_ref = ptr_info
                         .and_then(|info| info.get_field(*field_idx))
-                        .map(|f| ctx.get_replacement(f))
+                        .map(|f| ctx.get_box_replacement(f))
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_for_entry(
                         field_state,
@@ -600,7 +600,7 @@ impl VirtualState {
                 }
             }
             VirtualStateInfo::VirtualArray { items, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = ptr_info
@@ -610,7 +610,7 @@ impl VirtualState {
                 }
             }
             VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 let mut flat_index = 0usize;
                 for fields in element_fields {
@@ -630,7 +630,7 @@ impl VirtualState {
                 }
             }
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (index, (_, _, entry_state)) in entries.iter().enumerate() {
                     let entry_ref = ptr_info
@@ -659,7 +659,7 @@ impl VirtualState {
                 // the same position_in_notvirtuals via create_state cache,
                 // so they write to the same slot (dedup handled by caller).
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_replacement(opref);
+                    *slot = ctx.get_box_replacement(opref);
                 }
                 *next_slot += 1;
             }
@@ -748,7 +748,7 @@ impl VirtualState {
             VirtualStateInfo::Virtual { fields, .. }
             | VirtualStateInfo::VirtualStruct { fields, .. } => {
                 // RPython virtualstate.py:185: if not info.is_virtual() → VirtualStatesCantMatch
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let is_virtual = ctx
                     .get_ptr_info(resolved)
                     .map_or(false, |pi| pi.is_virtual());
@@ -760,7 +760,7 @@ impl VirtualState {
                     .map(|(field_idx, _)| {
                         ctx.get_ptr_info(resolved)
                             .and_then(|info| info.get_field(*field_idx))
-                            .map(|f| ctx.get_replacement(f))
+                            .map(|f| ctx.get_box_replacement(f))
                             .unwrap_or(OpRef::NONE)
                     })
                     .collect();
@@ -778,7 +778,7 @@ impl VirtualState {
                 Ok(())
             }
             VirtualStateInfo::VirtualArray { items, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = ctx
                         .get_ptr_info(resolved)
@@ -797,7 +797,7 @@ impl VirtualState {
                 Ok(())
             }
             VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let mut flat_index = 0usize;
                 for fields in element_fields {
                     for (_, field_state) in fields {
@@ -820,7 +820,7 @@ impl VirtualState {
                 Ok(())
             }
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 for (index, (_, _, entry_state)) in entries.iter().enumerate() {
                     let entry_ref = ctx
                         .get_ptr_info(resolved)
@@ -847,7 +847,7 @@ impl VirtualState {
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
             | VirtualStateInfo::Unknown => {
-                let resolved = ctx.get_replacement(opref);
+                let resolved = ctx.get_box_replacement(opref);
                 let forced = match ctx.get_ptr_info(resolved) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
@@ -863,7 +863,7 @@ impl VirtualState {
                 // Aliased boxes are deduped by the caller via
                 // assigned_slots / position_in_notvirtuals.
                 if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_replacement(forced);
+                    *slot = ctx.get_box_replacement(forced);
                 }
                 *next_slot += 1;
                 Ok(())
@@ -1497,7 +1497,7 @@ pub fn export_state(
     let state = oprefs
         .iter()
         .map(|opref| {
-            let resolved = ctx.get_replacement(*opref);
+            let resolved = ctx.get_box_replacement(*opref);
             if let Some(cached) = cache.get(&resolved) {
                 return cached.clone();
             }
@@ -1515,7 +1515,7 @@ pub(crate) fn export_value_state(
     ptr_info: &[Option<PtrInfo>],
 ) -> VirtualStateInfo {
     export_single_value(
-        ctx.get_replacement(opref),
+        ctx.get_box_replacement(opref),
         ctx,
         ptr_info,
         &mut HashMap::new(),
@@ -2294,7 +2294,7 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(inputargs[0], ctx.get_replacement(virtual_ref));
+        assert_eq!(inputargs[0], ctx.get_box_replacement(virtual_ref));
         assert!(virtuals.is_empty());
     }
 

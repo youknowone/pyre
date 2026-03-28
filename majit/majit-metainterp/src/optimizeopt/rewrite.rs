@@ -1365,7 +1365,7 @@ impl OptRewrite {
             // optimizer context. Also set on the resolved target so
             // export_state picks it up regardless of forwarding.
             ctx.make_constant(arg0, majit_ir::Value::Int(expected));
-            let resolved_arg0 = ctx.get_replacement(arg0);
+            let resolved_arg0 = ctx.get_box_replacement(arg0);
             ctx.make_constant(resolved_arg0, majit_ir::Value::Int(expected));
             if expected == 0 {
                 let mut new_op = Op::new(OpCode::GuardFalse, &[arg0]);
@@ -1386,7 +1386,7 @@ impl OptRewrite {
         // rewrite.py postprocess_GUARD_VALUE:
         //   box = get_box_replacement(op.getarg(0))
         //   self.make_constant(box, op.getarg(1))
-        let box_ref = ctx.get_replacement(arg0);
+        let box_ref = ctx.get_box_replacement(arg0);
         if let Some(v) = ctx.get_constant(arg1).cloned() {
             ctx.make_constant(box_ref, v);
         } else {
@@ -1746,7 +1746,7 @@ impl Optimization for OptRewrite {
             // the guard can be removed entirely.
             OpCode::GuardNonnull => {
                 // rewrite.py:269-278 optimize_GUARD_NONNULL
-                let obj = ctx.get_replacement(op.arg(0));
+                let obj = ctx.get_box_replacement(op.arg(0));
                 if let Some(info) = ctx.get_ptr_info(obj) {
                     if info.is_nonnull() {
                         return OptimizationResult::Remove;
@@ -1787,7 +1787,7 @@ impl Optimization for OptRewrite {
             OpCode::GuardClass => {
                 // rewrite.py: optimize_GUARD_CLASS
                 // If the class is already known, check match → Remove or abort.
-                let obj = ctx.get_replacement(op.arg(0));
+                let obj = ctx.get_box_replacement(op.arg(0));
                 if let Some(known_class) = ctx
                     .get_ptr_info(obj)
                     .and_then(|i| i.get_known_class())
@@ -1826,7 +1826,7 @@ impl Optimization for OptRewrite {
             }
             OpCode::GuardNonnullClass => {
                 // GUARD_NONNULL_CLASS(obj, cls): combines GUARD_NONNULL + GUARD_CLASS.
-                let obj = ctx.get_replacement(op.arg(0));
+                let obj = ctx.get_box_replacement(op.arg(0));
                 // If already known class, check match.
                 if let Some(known_class) = ctx
                     .get_ptr_info(obj)
@@ -2115,7 +2115,7 @@ impl Optimization for OptRewrite {
                             }
                             LoopInvariantEntry::Direct(r) => r,
                         };
-                        let cached_result = ctx.get_replacement(cached_result);
+                        let cached_result = ctx.get_box_replacement(cached_result);
                         ctx.replace_op(op.pos, cached_result);
                         self.last_op_removed = true;
                         return OptimizationResult::Remove;
@@ -2223,7 +2223,7 @@ mod tests {
             // Resolve forwarded arguments
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
 
             match pass.propagate_forward(&resolved, &mut ctx) {
@@ -2273,7 +2273,7 @@ mod tests {
             "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
         );
         assert_eq!(
-            ctx.get_replacement(OpRef(2)),
+            ctx.get_box_replacement(OpRef(2)),
             OpRef(expected_forward_to),
             "{opcode:?} should forward to {expected_forward_to}"
         );
@@ -2685,7 +2685,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     // ── Integration test: full optimizer with OptRewrite ──
@@ -2716,7 +2716,7 @@ mod tests {
         for op in &ops {
             let mut resolved = op.clone();
             for arg in &mut resolved.args {
-                *arg = ctx.get_replacement(*arg);
+                *arg = ctx.get_box_replacement(*arg);
             }
             match pass.propagate_forward(&resolved, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2737,7 +2737,7 @@ mod tests {
         // the IntAdd was removed and the result is forwarded.
         // op0 is emitted, op1 is emitted (just a constant), op2 is removed.
         // After forwarding, any reference to op2 should resolve to op0.
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -2757,7 +2757,7 @@ mod tests {
             for op in &ops {
                 let mut resolved = op.clone();
                 for arg in &mut resolved.args {
-                    *arg = ctx.get_replacement(*arg);
+                    *arg = ctx.get_box_replacement(*arg);
                 }
                 match pass.propagate_forward(&resolved, &mut ctx) {
                     OptimizationResult::Emit(emitted) => {
@@ -2934,7 +2934,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -2976,7 +2976,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -2995,7 +2995,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
     }
 
     #[test]
@@ -3034,7 +3034,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -3073,7 +3073,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -3092,7 +3092,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
     }
 
     #[test]
@@ -3131,7 +3131,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -3192,7 +3192,7 @@ mod tests {
         // Process op2: should detect double negation
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
     }
 
     #[test]
@@ -3326,7 +3326,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(3)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(3)), OpRef(0));
     }
 
     #[test]
@@ -3465,7 +3465,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     #[test]
@@ -3482,7 +3482,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     #[test]
@@ -3499,7 +3499,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     // ── CONVERT_FLOAT_BYTES round-trip tests ──
@@ -3518,7 +3518,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     #[test]
@@ -3535,7 +3535,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     // ── GUARD_NO_EXCEPTION tests ──
@@ -3719,6 +3719,6 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_replacement(OpRef(3)), OpRef(1));
+        assert_eq!(ctx.get_box_replacement(OpRef(3)), OpRef(1));
     }
 }
