@@ -2132,9 +2132,16 @@ impl<M: Clone> MetaInterp<M> {
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                // RPython parity: preserve guard failure counters across
+                // recompilations. In RPython, guard failure counters live in
+                // the ResumeGuardDescr (per guard, not per JitCellToken).
+                // When a loop is recompiled, the new guards inherit the old
+                // counters so bridge threshold accumulates across compilations.
+                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
+                    inherited_guard_failures = old_entry.guard_failures;
                 }
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
@@ -2152,7 +2159,7 @@ impl<M: Clone> MetaInterp<M> {
                         },
                         retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
-                        guard_failures: HashMap::new(),
+                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },

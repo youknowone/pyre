@@ -1290,6 +1290,8 @@ fn execute_assembler(
                         // Pyre limitation: compiled code partially modifies heap
                         // before guard failure (forced virtuals in JUMP args).
                         // Invalidate to prevent double-update on re-entry.
+                        // TODO: remove when short preamble guards are complete
+                        // (will protect re-entry from wrong values).
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
@@ -2056,6 +2058,7 @@ fn materialize_virtual_from_rd(
     //   Phase 1: struct = allocate_with_vtable(descr)
     //   Phase 2: virtuals_cache.set_ptr(index, struct)  ← BEFORE setfields
     //   Phase 3: self.setfields(decoder, struct)         ← fields filled AFTER
+    //
     let ob_type = known_class.unwrap_or(0);
     let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
     let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
@@ -2087,9 +2090,11 @@ fn materialize_virtual_from_rd(
         ptr as usize
     } else if descr_size > 0 {
         // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
-        // VStruct allocation crashes when used as Python object (ob_type dispatch).
-        // Keep NULL until trace emission distinguishes NEW vs NEW_WITH_VTABLE.
-        return Value::Ref(majit_ir::GcRef::NULL);
+        // pyre NEW (no vtable): ob_type is stored as field[0] at offset 0.
+        // Allocate raw memory; setfield will write ob_type at offset 0.
+        let layout = std::alloc::Layout::from_size_align(descr_size, 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        ptr as usize
     } else {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -2179,7 +2184,8 @@ fn materialize_virtual_from_rd(
                 debug_assert!(false, "field_offsets missing for field {}", i);
                 continue;
             };
-            if byte_offset == 0 {
+            if byte_offset == 0 && ob_type != 0 {
+                // Skip ob_type field when known_class already set it.
                 continue;
             }
             let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
