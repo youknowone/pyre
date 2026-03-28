@@ -1848,20 +1848,9 @@ fn restore_guard_failure_for_loop(
             return None;
         }
     }
-    // compile.py:783-784: jitcounter.tick(hash, increment).
-    // Use the same guard_hash as should_compile_bridge_in_trace
-    // (allocated via store_hash / fetch_next_hash). RPython uses
-    // one hash per guard across all paths.
-    {
-        let (driver, _) = driver_pair();
-        let guard_hash = driver
-            .meta_interp_mut()
-            .guard_hash_for_trace(exit_layout.trace_id, exit_layout.fail_index);
-        driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .tick_guard_failure(guard_hash);
-    }
+    // RPython: guard failure counter tick is in handle_fail → must_compile
+    // (compile.py:783-784), called by jitdriver before this callback.
+    // Do NOT tick here — must_compile is the single tick point.
 
     // RPython compile.py:710 handle_fail → resume_in_blackhole.
     LAST_GUARD_TYPED.with(|c| *c.borrow_mut() = Some(typed.clone()));
