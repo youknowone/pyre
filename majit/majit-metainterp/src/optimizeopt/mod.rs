@@ -1168,18 +1168,47 @@ impl OptContext {
                     continue;
                 }
             };
-            let base_idx = liveboxes.len();
             let mut fieldnums: Vec<i16> = Vec::new();
-            for (_fi, (_field_idx, value_ref)) in fields_data.iter().enumerate() {
+            for (_field_idx, value_ref) in &fields_data {
                 let resolved_val = self.get_replacement(*value_ref);
-                let fa_idx = liveboxes.len();
-                liveboxes.push(resolved_val);
-                fieldnums.push(
-                    majit_ir::resumedata::tag(fa_idx as i32, majit_ir::resumedata::TAGBOX)
-                        .unwrap_or(majit_ir::resumedata::NULLREF),
-                );
+                // resume.py:500,560 _gettagged(box) parity:
+                //   None        → UNINITIALIZED
+                //   Const       → memo.getconst(box) (TAGCONST)
+                //   in liveboxes → existing tag (TAGBOX/TAGVIRTUAL)
+                //   else        → liveboxes[box] (newly numbered)
+                if resolved_val.is_none() {
+                    fieldnums.push(resumedata::NULLREF);
+                } else if self.is_constant(resolved_val) {
+                    // Constant field → TAGCONST (resume.py:563-564)
+                    if let Some(val) = self.get_constant(resolved_val) {
+                        let (c, tp) = match val {
+                            Value::Int(i) => (*i, majit_ir::Type::Int),
+                            Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                            Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                            Value::Void => (0, majit_ir::Type::Void),
+                        };
+                        fieldnums.push(memo.getconst(c, tp));
+                    } else {
+                        fieldnums.push(resumedata::NULLREF);
+                    }
+                } else if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
+                    // Already numbered (TAGBOX or TAGVIRTUAL) → reuse tag
+                    fieldnums.push(existing_tag);
+                } else {
+                    // New livebox → add and tag as TAGBOX
+                    let fa_idx = liveboxes.len();
+                    liveboxes.push(resolved_val);
+                    numb_state.liveboxes.insert(
+                        resolved_val.0,
+                        resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
+                            .unwrap_or(resumedata::NULLREF),
+                    );
+                    fieldnums.push(
+                        resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
+                            .unwrap_or(resumedata::NULLREF),
+                    );
+                }
             }
-            let _ = base_idx;
             rd_virt_info[idx] = (
                 descr.index(),
                 known_class.map(|gc| gc.as_usize() as i64),
