@@ -1388,12 +1388,9 @@ impl OptContext {
         }
 
         // RPython parity: every guard has a snapshot from capture_resumedata.
-        // Guards without snapshot (optimizer-created, rd_resume_position < 0)
-        // share resume data from _copy_resume_data_from. If they reach here
-        // without a snapshot, build a minimal rd_numb directly from fail_args
-        // using the same format as memo.number() but without replacement/
-        // virtual resolution (the fail_args are already final from
-        // store_final_boxes_in_guard).
+        // Guards without snapshot fall through to this synthetic fallback.
+        // Remaining cases: GuardNotInvalidated (optimizer-created, shared path
+        // missed rd_numb copy), Phase 2 guards without patchguardop propagation.
         if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
             // RPython resume.py:397: assert resume_position >= 0.
             // This fallback should not exist in RPython-parity code.
@@ -2123,18 +2120,25 @@ impl OptContext {
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
-                if opref.is_constant() {
-                    self.constant_types_for_numbering
-                        .get(&opref.0)
-                        .copied()
-                        .unwrap_or(majit_ir::Type::Int)
-                } else {
-                    self.new_operations
-                        .iter()
-                        .find(|o| o.pos == *opref)
-                        .map(|o| o.result_type())
-                        .unwrap_or(majit_ir::Type::Int)
+                let resolved = self.get_box_replacement(*opref);
+                // Constants carry explicit types.
+                if let Some(val) = self.get_constant(resolved) {
+                    return val.get_type();
                 }
+                // Check constant_types_for_numbering (ob_type overrides etc.)
+                if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
+                    return tp;
+                }
+                // Operation result type (covers new_operations + input args).
+                if let Some(tp) = self.get_op_result_type(resolved) {
+                    return tp;
+                }
+                // PtrInfo indicates Ref.
+                if self.get_ptr_info(resolved).is_some() {
+                    return majit_ir::Type::Ref;
+                }
+                // Default: Ref (RPython boxes are GCREF by default).
+                majit_ir::Type::Ref
             })
             .collect();
         op.store_final_boxes(liveboxes);

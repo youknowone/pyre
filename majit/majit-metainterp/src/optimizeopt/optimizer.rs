@@ -2601,45 +2601,11 @@ impl Optimizer {
                 }
             }
 
-            // RPython parity: store fail_arg types using constant_types.
-            if !self.constant_types.is_empty() {
-                if let Some(ref fa) = op.fail_args {
-                    let types: Vec<majit_ir::Type> = fa
-                        .iter()
-                        .map(|opref| {
-                            if opref.is_none() {
-                                // Virtual placeholder — materialized as Ref (PyObject*).
-                                majit_ir::Type::Ref
-                            } else if let Some(&tp) = self.constant_types.get(&opref.0) {
-                                tp
-                            } else if let Some(info) = ctx.get_ptr_info(*opref) {
-                                if matches!(
-                                    info,
-                                    crate::optimizeopt::info::PtrInfo::NonNull { .. }
-                                        | crate::optimizeopt::info::PtrInfo::Instance(_)
-                                ) {
-                                    majit_ir::Type::Ref
-                                } else if info.is_virtual() {
-                                    majit_ir::Type::Ref
-                                } else {
-                                    ctx.new_operations
-                                        .iter()
-                                        .find(|o| o.pos == *opref)
-                                        .map(|o| o.result_type())
-                                        .unwrap_or(majit_ir::Type::Int)
-                                }
-                            } else {
-                                ctx.new_operations
-                                    .iter()
-                                    .find(|o| o.pos == *opref)
-                                    .map(|o| o.result_type())
-                                    .unwrap_or(majit_ir::Type::Int)
-                            }
-                        })
-                        .collect();
-                    op.fail_arg_types = Some(types);
-                }
-            }
+            // RPython parity: fail_arg_types are set by store_final_boxes_in_guard
+            // (both snapshot path and no-snapshot path). No separate re-inference
+            // needed here — RPython's typed Box objects carry type information
+            // intrinsically. pyre's store_final_boxes_in_guard sets fail_arg_types
+            // via infer_fail_arg_type (no-snapshot) or snapshot-based type inference.
 
             // optimizer.py:630-631: pendingfields → rd_pendingfields
             // resume.py:428-445: encode pending SetfieldGc/SetarrayitemGc
@@ -2753,16 +2719,65 @@ impl Optimizer {
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
 
-        // When fail_args is None (guards from inline_short_preamble),
-        // RPython's store_final_boxes_in_guard uses ResumeDataVirtualAdder
-        // to build fail_args from the snapshot. We don't have that infra,
-        // so return early — the guard will share resume data with the
-        // previous guard via _copy_resume_data_from when it's emitted
-        // through the normal emit path.
         let Some(ref mut fail_args) = op.fail_args else {
             return op;
         };
 
+        // RPython optimizer.py:722-752 parity: store_final_boxes_in_guard
+        // calls ResumeDataVirtualAdder.finish() which handles virtual encoding
+        // via snapshot-based numbering. When a snapshot exists (rd_resume_position >= 0
+        // AND snapshot_boxes has the key), the snapshot path in
+        // finalize_guard_resume_data handles everything: _number_boxes resolves
+        // virtuals to TAGVIRTUAL, builds rd_virtuals_info, and
+        // store_final_boxes(liveboxes) replaces fail_args with concrete liveboxes.
+        let has_snapshot =
+            op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
+        if has_snapshot {
+            // optimizer.py:732-735 + resume.py:389-452:
+            // RPython's finish() handles numbering + virtual encoding +
+            // rd_virtuals in one pass. liveboxes are set via
+            // descr.store_final_boxes(op, newboxes).
+            //
+            // Majit deviation: virtual encoding (NONE + extra fields) runs
+            // here BEFORE finalize_guard_resume_data, because majit's Phase 2
+            // peeling uses fail_args NONE slots to track virtual state for
+            // exported_jump_virtuals and JUMP arg construction. Without this,
+            // body loop loses virtual tracking → wrong computation.
+            // RPython uses box identity (_forwarded chain) instead.
+            let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
+            let mut extra_fail_args: Vec<OpRef> = Vec::new();
+            let original_len = fail_args.len();
+            for fa_idx in 0..original_len {
+                if fail_args[fa_idx].is_none() {
+                    continue;
+                }
+                let resolved = ctx.get_box_replacement(fail_args[fa_idx]);
+                if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
+                    if info.is_virtual() {
+                        if Self::collect_virtual_field_values(
+                            &info,
+                            original_len,
+                            &mut extra_fail_args,
+                            ctx,
+                        ) {
+                            virtual_slots.push((fa_idx, resolved));
+                            fail_args[fa_idx] = OpRef::NONE;
+                        } else {
+                            let forced = info.force_to_ops_direct(resolved, ctx);
+                            fail_args[fa_idx] = ctx.get_box_replacement(forced);
+                        }
+                        continue;
+                    }
+                }
+                fail_args[fa_idx] = resolved;
+            }
+            if !extra_fail_args.is_empty() {
+                let fa = op.fail_args.as_mut().unwrap();
+                fa.extend(extra_fail_args);
+            }
+            ctx.finalize_guard_resume_data(&mut op, &virtual_slots);
+            return op;
+        }
         let original_len = fail_args.len();
         let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
         let mut extra_fail_args: Vec<OpRef> = Vec::new();
