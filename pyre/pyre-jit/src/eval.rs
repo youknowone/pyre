@@ -2822,8 +2822,18 @@ fn rebuild_state_after_failure_from_recovery_layout(
     let mut materialized: Vec<usize> = Vec::new();
     for vl in &recovery.virtual_layouts {
         match vl {
-            majit_codegen::ExitVirtualLayout::Object { fields, .. }
-            | majit_codegen::ExitVirtualLayout::Struct { fields, .. } => {
+            majit_codegen::ExitVirtualLayout::Object {
+                fields,
+                fielddescrs,
+                descr_size,
+                ..
+            }
+            | majit_codegen::ExitVirtualLayout::Struct {
+                fields,
+                fielddescrs,
+                descr_size,
+                ..
+            } => {
                 let field_vals: Vec<i64> = fields
                     .iter()
                     .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
@@ -2831,6 +2841,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 let ob_type = field_vals.first().copied().unwrap_or(0) as usize;
                 let payload_src = fields.get(1).map(|(_, src)| src);
                 let val_raw = field_vals.get(1).copied().unwrap_or(0);
+                // resume.py:617-621 VirtualInfo.allocate + setfields
                 let obj = if ob_type == w_float_type {
                     pyre_object::floatobject::w_float_new(f64::from_bits(
                         decode_recovery_float_payload_bits(
@@ -2849,6 +2860,30 @@ fn rebuild_state_after_failure_from_recovery_layout(
                         raw_values,
                         exit_layout,
                     )) as usize
+                } else if ob_type != 0 || *descr_size > 0 {
+                    // General struct: allocate + setfields using fielddescrs
+                    let size = if *descr_size > 0 { *descr_size } else { 16 };
+                    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+                    if ob_type != 0 {
+                        unsafe { *(ptr as *mut i64) = ob_type as i64 };
+                    }
+                    for (i, &val) in field_vals.iter().enumerate() {
+                        if let Some(fd) = fielddescrs.get(i) {
+                            if fd.offset > 0 || ob_type == 0 {
+                                let addr = unsafe { ptr.add(fd.offset) };
+                                unsafe {
+                                    match fd.field_size {
+                                        1 => std::ptr::write(addr, val as u8),
+                                        2 => std::ptr::write(addr as *mut u16, val as u16),
+                                        4 => std::ptr::write(addr as *mut u32, val as u32),
+                                        _ => std::ptr::write(addr as *mut i64, val),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ptr as usize
                 } else {
                     return false;
                 };

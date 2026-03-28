@@ -8923,7 +8923,7 @@ fn collect_guards(
                             known_class,
                             fielddescrs,
                             fieldnums,
-                            ..
+                            descr_size,
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Object {
@@ -8931,13 +8931,15 @@ fn collect_guards(
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
+                                fielddescrs: fielddescrs.clone(),
+                                descr_size: *descr_size,
                             }
                         }
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index,
                             fielddescrs,
                             fieldnums,
-                            ..
+                            descr_size,
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Struct {
@@ -8945,6 +8947,8 @@ fn collect_guards(
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
+                                fielddescrs: fielddescrs.clone(),
+                                descr_size: *descr_size,
                             }
                         }
                         majit_ir::RdVirtualInfo::Array {
