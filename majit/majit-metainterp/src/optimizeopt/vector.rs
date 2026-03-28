@@ -272,6 +272,7 @@ impl VectorizingOptimizer {
                                         vector_opcode: vec_op,
                                         members: vec![l_user, r_user],
                                         is_accumulating: false,
+                                        position: -1,
                                     });
                                 }
                             }
@@ -373,40 +374,45 @@ impl VectorizingOptimizer {
             return None;
         }
 
-        // schedule.py:672-681: Use VecScheduleState to emit vectorized ops.
-        // Allocate OpRef positions starting after existing ops.
+        // schedule.py:292-311, 672-681: walk_and_emit + try_emit_or_delay.
+        // Walk nodes in dependency order. For each node:
+        //   - if it belongs to a pack → turn_into_vector (once per pack)
+        //   - otherwise → ensure_args_unpacked + emit scalar op
         let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
         let mut sched_state = VecScheduleState::new(start_pos);
 
-        // Build set of vectorized indices
-        let mut vectorized_indices: HashSet<usize> = HashSet::new();
-        for group in &profitable {
+        // Build node→pack mapping
+        let mut node_to_pack: HashMap<usize, usize> = HashMap::new();
+        for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
-                vectorized_indices.insert(idx);
+                node_to_pack.insert(idx, pi);
             }
         }
 
-        // schedule.py:672-681: try_emit_or_delay — emit packs via turn_into_vector,
-        // emit remaining ops directly with ensure_args_unpacked.
-        for group in &profitable {
-            turn_into_vector(&mut sched_state, group, &self.body_ops);
-        }
+        // Track which packs have already been emitted
+        let mut pack_emitted = vec![false; profitable.len()];
 
-        // Emit remaining (non-vectorized) ops, with scalar unpacking
-        for (i, op) in self.body_ops.iter().enumerate() {
-            if !vectorized_indices.contains(&i) {
-                let mut scalar_op = op.clone();
-                // schedule.py:697-716: ensure_args_unpacked
+        // Walk in scheduled (dependency) order
+        let scheduled_order = schedule_operations(&dep_graph);
+        for &node_idx in &scheduled_order {
+            if let Some(&pack_idx) = node_to_pack.get(&node_idx) {
+                // schedule.py:674-679: pack node — emit pack once (on first member)
+                if !pack_emitted[pack_idx] {
+                    pack_emitted[pack_idx] = true;
+                    turn_into_vector(&mut sched_state, &profitable[pack_idx], &self.body_ops);
+                }
+                // Other members of this pack are consumed by the vector op
+            } else {
+                // schedule.py:680-681, 697-716: scalar node — ensure_args_unpacked
+                let mut scalar_op = self.body_ops[node_idx].clone();
                 for j in 0..scalar_op.args.len() {
                     let arg = scalar_op.args[j];
                     if let Some((pos, vec_ref)) = sched_state.getvector_of_box(arg) {
-                        // Unpack scalar from vector box
                         let unpacked = unpack_from_vector(&mut sched_state, vec_ref, pos, 1);
                         sched_state.renamer.start_renaming(arg, unpacked);
                         scalar_op.args[j] = unpacked;
                     }
                 }
-                // Also unpack failargs for guards
                 if scalar_op.opcode.is_guard() {
                     if let Some(ref mut fail_args) = scalar_op.fail_args {
                         for arg in fail_args.iter_mut() {
@@ -615,6 +621,7 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3], // 4 ops
             is_accumulating: false,
+            position: -1,
         };
         // savings = 3 * 1 = 3, cost = 2 * 2 = 4 → not profitable with 4
         // Actually savings = 3, cost = 4, so NOT profitable by default
@@ -626,6 +633,7 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2, 3, 4], // 5 ops → savings = 4 > cost = 4
             is_accumulating: false,
+            position: -1,
         };
         assert!(!cm.is_profitable(&group5)); // 4 == 4, not strictly greater
     }
@@ -638,6 +646,7 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0], // Only 1 op
             is_accumulating: false,
+            position: -1,
         };
         assert!(!cm.is_profitable(&group));
     }
@@ -654,6 +663,7 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1], // savings = 1*2 = 2, cost = 2*1 = 2 → not profitable
             is_accumulating: false,
+            position: -1,
         };
         assert!(!cm.is_profitable(&group));
 
@@ -662,6 +672,7 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1, 2], // savings = 2*2 = 4, cost = 2*1 = 2 → profitable
             is_accumulating: false,
+            position: -1,
         };
         assert!(cm.is_profitable(&group3));
     }
@@ -861,12 +872,14 @@ mod tests {
             vector_opcode: OpCode::VecIntAdd,
             members: vec![0, 1],
             is_accumulating: false,
+            position: -1,
         });
         ps.add_pack(Pack {
             scalar_opcode: OpCode::IntAdd,
             vector_opcode: OpCode::VecIntAdd,
             members: vec![2, 3],
             is_accumulating: false,
+            position: -1,
         });
         assert_eq!(ps.num_packs(), 2);
         assert_eq!(ps.total_ops(), 4);
