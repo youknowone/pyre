@@ -1154,7 +1154,7 @@ fn execute_assembler(
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
     // Pyre safety net: save frame state before compiled code entry.
-    // RPython does NOT do this — its resume data (rd_numb + rd_virtuals)
+    // RPython does NOT do this — its resume data (rd_numb + rd_virtuals_info)
     // is always complete, so blackhole always succeeds. Pyre's rd_numb
     // can be incomplete, so guard recovery may fail. This snapshot allows
     // fallback to the pre-entry frame state. Remove when rd_numb is complete.
@@ -2025,7 +2025,7 @@ fn materialize_virtual_from_rd(
             return Value::Int(0);
         }
         majit_ir::RdVirtualInfo::Empty => {
-            panic!("[jit] materialize_virtual: rd_virtuals[{vidx}] is Empty");
+            panic!("[jit] materialize_virtual: rd_virtuals_info[{vidx}] is Empty");
         }
         _ => {} // Instance/Struct: fall through
     }
@@ -2368,7 +2368,7 @@ fn restore_guard_failure_for_loop(
     replay_pending_fields(&typed, exit_layout);
     // Check for remaining null Ref: if materialization replaced all virtual
     // slots, null_ref count is 0 and we proceed normally. If some slots
-    // couldn't be materialized (incomplete rd_virtuals), fall back to
+    // couldn't be materialized (incomplete rd_virtuals_info), fall back to
     // invalidation. The vsd-bounded check avoids false positives from
     // virtual field values stored after the frame slots.
     let vsd = typed
@@ -2389,7 +2389,7 @@ fn restore_guard_failure_for_loop(
     // resume.py parity: null Ref slots in the frame are virtual objects
     // whose rd_numb encoding used NULLREF (incomplete virtual tracking).
     // Fall back to raw values from the deadframe for these slots.
-    // RPython's full virtual materialization via rd_virtuals would
+    // RPython's full virtual materialization via rd_virtuals_info would
     // reconstruct the objects; pyre uses the raw Cranelift output
     // which already had materialize_virtuals_for_bridge applied.
     if has_null_ref {
@@ -2410,11 +2410,11 @@ fn restore_guard_failure_for_loop(
         if still_null {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], skip recovery (rd_virtuals gap)",
+                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], skip recovery (rd_virtuals_info gap)",
                     frame_end
                 );
             }
-            // Workaround for incomplete rd_virtuals materialization:
+            // Workaround for incomplete rd_virtuals_info materialization:
             // remove the compiled entry so both has_compiled_loop and
             // has_compiled_targets return false. WarmState JC_COMPILED
             // cell prevents infinite retrace (force_start_tracing →
@@ -2695,7 +2695,7 @@ fn rebuild_state_after_failure_with_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) {
-    // Try recovery layout first (rd_virtuals parity).
+    // Try recovery layout first (rd_virtuals_info parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
             if rebuild_state_after_failure_from_recovery_layout(
@@ -2796,7 +2796,7 @@ fn rebuild_state_after_failure_with_exit_layout(
     }
 }
 
-/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals).
+/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals_info).
 /// Field values are read from raw_values (deadframe) since rd_numb-decoded
 /// typed array only contains frame slots, not the appended virtual fields.
 fn rebuild_state_after_failure_from_recovery_layout(

@@ -976,7 +976,7 @@ fn rebuild_state_after_failure(
     recovery: Option<&majit_codegen::ExitRecoveryLayout>,
     bridge_num_inputs: usize,
 ) {
-    // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
+    // Phase 1: recovery_layout-based materialization (rd_virtuals_info parity).
     // Process ALL frames, not just frames[0].
     if let Some(recovery) = recovery {
         if !recovery.frames.is_empty()
@@ -3406,8 +3406,7 @@ fn normalize_ops_for_codegen(
                     }
                 }
             }
-            // Remap rd_virtuals field fail_arg indices to match renumbered fail_args.
-            // rd_virtuals entries reference fail_arg positions by index, not OpRef,
+            // rd_virtuals_info fieldnums use TAGBOX indices, not OpRef,
             // so they don't need OpRef remapping — only fail_arg_index adjustment
             // if fail_args were reordered (they aren't in dense renumbering).
             n
@@ -4461,7 +4460,7 @@ fn infer_fail_arg_types(
         if opref.is_none() {
             // resume.py parity: OpRef::NONE marks a virtual object slot
             // in fail_args. The backend stores 0 in this slot; the actual
-            // value is reconstructed from rd_virtuals on guard failure.
+            // value is reconstructed from rd_virtuals_info on guard failure.
             fail_arg_types.push(Type::Int);
             continue;
         }
@@ -4858,7 +4857,7 @@ impl CraneliftBackend {
         // The bridge's fail_args contain the full frame state needed
         // for interpreter resume (bridge inputargs include parent locals).
         // RPython resume.py:rebuild_state_after_failure uses the bridge's
-        // rd_numb/rd_virtuals to reconstruct frame state.
+        // rd_numb/rd_virtuals_info to reconstruct frame state.
         DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
