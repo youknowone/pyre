@@ -183,6 +183,26 @@ impl CodeWriter {
             labels.push(assembler.new_label());
         }
 
+        // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header:
+        // Pre-scan JUMP_BACKWARD targets to identify loop headers.
+        // RPython emits jit_merge_point + loop_header opcodes at these
+        // positions; pyre emits BC_JUMP_TARGET as equivalent marker.
+        let mut loop_header_pcs: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        {
+            let mut scan_state = OpArgState::default();
+            for scan_pc in 0..num_instrs {
+                let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+                if let Instruction::JumpBackward { delta } = scan_instr {
+                    let target = skip_caches(code, scan_pc + 1)
+                        .saturating_sub(delta.get(scan_arg).as_usize());
+                    if target < num_instrs {
+                        loop_header_pcs.insert(target);
+                    }
+                }
+            }
+        }
+
         // pc_map: Python PC → JitCode byte offset
         let mut pc_map = vec![0usize; num_instrs];
 
@@ -196,6 +216,14 @@ impl CodeWriter {
             // RPython flatten.py: Label(block) at block entry
             assembler.mark_label(labels[py_pc]);
             pc_map[py_pc] = assembler.current_pos();
+
+            // RPython jtransform.py:1690 + blackhole.py:1066 parity:
+            // Emit BC_JUMP_TARGET at loop headers (JUMP_BACKWARD targets).
+            // RPython emits jit_merge_point opcode; pyre uses BC_JUMP_TARGET.
+            // The blackhole checks this to detect merge point arrival.
+            if loop_header_pcs.contains(&py_pc) {
+                assembler.jump_target();
+            }
 
             let code_unit = code.instructions[py_pc];
             let (instruction, op_arg) = arg_state.get(code_unit);
