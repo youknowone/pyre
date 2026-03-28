@@ -2223,9 +2223,14 @@ impl<S: JitState> JitDriver<S> {
         let key_hash = crate::green_key_hash(green_values);
 
         if !self.has_compiled_loop(key_hash) {
-            // Don't tick here. back_edge_internal → maybe_start_tracing →
-            // on_back_edge_typed → maybe_compile does the tick. Ticking here
-            // causes fire→reset, then maybe_compile sees a cold counter.
+            // RPython parity: cold fast path — skip GreenKey allocation,
+            // build_meta, sync_before, extract_live_values when counter
+            // is clearly below threshold. counter_would_fire is read-only
+            // (no tick). The real tick happens inside maybe_compile via
+            // back_edge_structured → maybe_start_tracing → on_back_edge_typed.
+            if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
+                return None;
+            }
             let green_key = GreenKey::new(green_values.to_vec());
             let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
             return ran.then_some(target_pc);
