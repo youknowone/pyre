@@ -540,7 +540,21 @@ pub(crate) fn execute_one(
         | OpCode::GetfieldGcPureI
         | OpCode::GetfieldGcPureR
         | OpCode::GetfieldGcPureF => OpResult::Value(0),
-        OpCode::SetfieldGc | OpCode::SetfieldRaw => OpResult::Void,
+        OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+            let resolved_args: Vec<i64> = op.args.iter().map(|&r| values.resolve(r)).collect();
+            if let (Some(&obj_ptr), Some(&value)) = (resolved_args.first(), resolved_args.get(1)) {
+                if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) {
+                    let offset = fd.offset();
+                    if obj_ptr != 0 {
+                        unsafe {
+                            let dest = (obj_ptr as *mut u8).add(offset) as *mut i64;
+                            *dest = value;
+                        }
+                    }
+                }
+            }
+            OpResult::Void
+        }
 
         // ── Array access ──
         OpCode::GetarrayitemGcI
