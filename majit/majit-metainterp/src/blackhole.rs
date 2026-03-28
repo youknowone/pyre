@@ -1468,8 +1468,8 @@ impl BlackholeInterpreter {
                 if exc_val != 0 {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[bh] call_ref EXCEPTION fn={} pos={} exc={:#x}",
-                            fn_ptr_idx, self.last_opcode_position, exc_val,
+                            "[bh] call_ref EXCEPTION fn={} pos={} nargs={} exc={:#x}",
+                            fn_ptr_idx, self.last_opcode_position, num_args, exc_val,
                         );
                     }
                     // Actual exception: try handler dispatch.

@@ -967,10 +967,47 @@ pub fn resume_in_blackhole(
         }
 
         // BC_ABORT: unsupported bytecode hit during execution.
-        // Return Failed so caller falls back to restore_guard_failure_values.
         if bh.aborted {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][blackhole] ABORT at jitcode_pc={} last_opcode_pos={}",
+                    bh.position, bh.last_opcode_position
+                );
+            }
             builder.release_interp(bh);
             return BlackholeResult::Failed;
+        }
+
+        if bh.got_exception {
+            if majit_metainterp::majit_log_enabled() {
+                let jitcode_bytes = &bh.jitcode.code;
+                let opcode_at = if bh.last_opcode_position < jitcode_bytes.len() {
+                    jitcode_bytes[bh.last_opcode_position]
+                } else {
+                    255
+                };
+                // Try to get fn_ptr info for call opcodes
+                let fn_info = if bh.last_opcode_position + 2 < jitcode_bytes.len() {
+                    let fn_idx = u16::from_le_bytes([
+                        jitcode_bytes[bh.last_opcode_position + 1],
+                        jitcode_bytes[bh.last_opcode_position + 2],
+                    ]) as usize;
+                    if fn_idx < bh.jitcode.fn_ptrs.len() {
+                        format!(
+                            "fn_ptr={:#x}",
+                            bh.jitcode.fn_ptrs[fn_idx].concrete_ptr as usize
+                        )
+                    } else {
+                        format!("fn_idx={} (out of range)", fn_idx)
+                    }
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "[jit][blackhole] EXCEPTION at jitcode_pc={} last_opcode_pos={} opcode={} {}",
+                    bh.position, bh.last_opcode_position, opcode_at, fn_info
+                );
+            }
         }
 
         // blackhole.py:1752 _run_forever exception propagation:
