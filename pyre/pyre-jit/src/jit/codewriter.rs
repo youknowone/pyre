@@ -33,6 +33,9 @@ pub struct PyJitCode {
     pub jitcode: JitCode,
     /// py_pc → jitcode byte offset.
     pub pc_map: Vec<usize>,
+    /// jitcode byte offset → py_pc (sorted pairs for binary search reverse lookup).
+    /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
+    pub jit_to_py_pc: Vec<(usize, usize)>,
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
@@ -633,11 +636,72 @@ impl CodeWriter {
         // falling off the end is unreachable if all bytecodes are covered.
 
         // RPython: assembler.assemble() → jitcode via make_jitcode()
-        let jitcode = assembler.finish();
+        let assembler_code_len = assembler.current_pos();
+        let mut jitcode = assembler.finish();
         let has_abort = jitcode.code.contains(&13 /* BC_ABORT */);
+
+        // blackhole.py handle_exception_in_frame: build exception handler table
+        // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
+        //
+        // Python 3.11+ exception table: each entry covers [start, end) instruction
+        // range. find_exception_handler(table, offset) returns the handler for
+        // `offset` if offset >= start && offset < end.
+        //
+        // The faulting Python PC (lasti) is determined at runtime from the
+        // blackhole's current jitcode position via jit_to_py_pc reverse map.
+        // lasti_value on JitExceptionHandler is unused; the blackhole dispatch
+        // reads the actual faulting PC.
+        {
+            use majit_metainterp::jitcode::JitExceptionHandler;
+            // decode_exception_table: decode ALL entries from the binary table.
+            // Each ExceptionTableEntry: { start, end, target, depth, push_lasti }.
+            let entries = pyre_bytecode::bytecode::decode_exception_table(&code.exceptiontable);
+            let handlers: Vec<JitExceptionHandler> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let jit_start = *pc_map.get(entry.start as usize)?;
+                    let jit_end = if (entry.end as usize) < num_instrs {
+                        pc_map
+                            .get(entry.end as usize)
+                            .copied()
+                            .unwrap_or(assembler_code_len)
+                    } else {
+                        assembler_code_len
+                    };
+                    let jit_target = *pc_map.get(entry.target as usize)?;
+                    Some(JitExceptionHandler {
+                        jit_start,
+                        jit_end,
+                        jit_target,
+                        stack_depth: entry.depth,
+                        push_lasti: entry.push_lasti,
+                        lasti_value: 0, // determined at runtime
+                        box_int_fn_idx: box_int_fn_idx as u16,
+                    })
+                })
+                .collect();
+            jitcode.exception_handlers = handlers;
+        }
+
+        // Build jit_to_py_pc reverse map for lasti lookup at runtime.
+        let jit_to_py_pc: Vec<(usize, usize)> = {
+            let mut pairs: Vec<(usize, usize)> = pc_map
+                .iter()
+                .enumerate()
+                .map(|(py_pc, &jit_pc)| (jit_pc, py_pc))
+                .collect();
+            pairs.sort_by_key(|&(jit_pc, _)| jit_pc);
+            pairs.dedup_by_key(|entry| entry.0);
+            pairs
+        };
+
+        // Store reverse map on JitCode for handle_exception_in_frame lasti lookup.
+        jitcode.jit_to_py_pc = jit_to_py_pc.clone();
+
         PyJitCode {
             jitcode,
             pc_map,
+            jit_to_py_pc,
             has_abort,
         }
     }

@@ -13,7 +13,7 @@ use crate::resume::{
 };
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::executor::{OpResult, execute_one, resolve};
+use crate::executor::{OpResult, TraceValues, ValueStore, execute_one, resolve};
 
 /// Trait for IR-based blackhole memory access.
 ///
@@ -208,26 +208,29 @@ fn blackhole_execute_full(
     initial_exception: ExceptionState,
     memory: &dyn BlackholeMemory,
 ) -> (BlackholeResult, ExceptionState) {
-    let mut values: HashMap<u32, i64> = initial_values.clone();
-    let mut exc_state = initial_exception;
-
+    // Build TraceValues from the initial HashMap state.
+    // This replaces per-op HashMap lookups with O(1) Vec indexing.
+    let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        values.entry(k).or_insert(v);
+        merged.entry(k).or_insert(v);
     }
+    let mut tv = TraceValues::from_hashmap(&merged);
+    drop(merged);
+    let mut exc_state = initial_exception;
 
     for op_idx in start_index..ops.len() {
         let op = &ops[op_idx];
-        let result = execute_one_with_memory(op, &values, &mut exc_state, memory);
+        let result = execute_one_with_memory(op, &tv, &mut exc_state, memory);
 
         match result {
             OpResult::Value(v) => {
                 if !op.pos.is_none() {
-                    values.insert(op.pos.0, v);
+                    tv.set(op.pos.0, v);
                 }
             }
             OpResult::Void => {}
             OpResult::Finish(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
                     .descr
                     .as_ref()
@@ -244,7 +247,7 @@ fn blackhole_execute_full(
                 );
             }
             OpResult::Jump(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 return (
                     BlackholeResult::Jump {
                         op_index: op_idx,
@@ -255,7 +258,7 @@ fn blackhole_execute_full(
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
-                    fail_args.iter().map(|&r| resolve(&values, r)).collect()
+                    fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
                 };
@@ -282,75 +285,75 @@ fn blackhole_execute_full(
 /// Dispatch an op using real memory access when a BlackholeMemory backend is available.
 fn execute_one_with_memory(
     op: &Op,
-    values: &HashMap<u32, i64>,
+    values: &(impl ValueStore + ?Sized),
     exc: &mut ExceptionState,
     memory: &dyn BlackholeMemory,
 ) -> OpResult {
     match op.opcode {
         // Memory access ops with real backend
         OpCode::GcLoadI => {
-            let base = resolve(values, op.args[0]);
-            let offset = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let offset = values.resolve(op.args[1]);
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GcLoadR => {
-            let base = resolve(values, op.args[0]);
-            let offset = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let offset = values.resolve(op.args[1]);
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GcLoadF => {
-            let base = resolve(values, op.args[0]);
-            let offset = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let offset = values.resolve(op.args[1]);
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::GcStore => {
-            let base = resolve(values, op.args[0]);
-            let offset = resolve(values, op.args[1]);
-            let value = resolve(values, op.args[2]);
+            let base = values.resolve(op.args[0]);
+            let offset = values.resolve(op.args[1]);
+            let value = values.resolve(op.args[2]);
             memory.gc_store(base, offset, value);
             OpResult::Void
         }
         OpCode::GcLoadIndexedI => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
-            let scale = resolve(values, op.args[2]);
-            let offset = resolve(values, op.args[3]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
+            let scale = values.resolve(op.args[2]);
+            let offset = values.resolve(op.args[3]);
             OpResult::Value(memory.gc_load_indexed_i(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedR => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
-            let scale = resolve(values, op.args[2]);
-            let offset = resolve(values, op.args[3]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
+            let scale = values.resolve(op.args[2]);
+            let offset = values.resolve(op.args[3]);
             OpResult::Value(memory.gc_load_indexed_r(base, index, scale, offset))
         }
         OpCode::GcLoadIndexedF => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
-            let scale = resolve(values, op.args[2]);
-            let offset = resolve(values, op.args[3]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
+            let scale = values.resolve(op.args[2]);
+            let offset = values.resolve(op.args[3]);
             OpResult::Value(memory.gc_load_indexed_f(base, index, scale, offset))
         }
         OpCode::GcStoreIndexed => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
-            let value = resolve(values, op.args[2]);
-            let scale = resolve(values, op.args[3]);
-            let offset = resolve(values, op.args[4]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
+            let value = values.resolve(op.args[2]);
+            let scale = values.resolve(op.args[3]);
+            let offset = values.resolve(op.args[4]);
             memory.gc_store_indexed(base, index, scale, offset, value);
             OpResult::Void
         }
         OpCode::ArraylenGc => {
-            let base = resolve(values, op.args[0]);
+            let base = values.resolve(op.args[0]);
             OpResult::Value(memory.arraylen(base))
         }
         OpCode::Strlen | OpCode::Unicodelen => {
-            let base = resolve(values, op.args[0]);
+            let base = values.resolve(op.args[0]);
             OpResult::Value(memory.strlen(base))
         }
         // ── Field access via descr offset ──
         OpCode::GetfieldGcI | OpCode::GetfieldRawI | OpCode::GetfieldGcPureI => {
-            let base = resolve(values, op.args[0]);
+            let base = values.resolve(op.args[0]);
             let offset = op
                 .descr
                 .as_ref()
@@ -359,7 +362,7 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_i(base, offset))
         }
         OpCode::GetfieldGcR | OpCode::GetfieldRawR | OpCode::GetfieldGcPureR => {
-            let base = resolve(values, op.args[0]);
+            let base = values.resolve(op.args[0]);
             let offset = op
                 .descr
                 .as_ref()
@@ -368,7 +371,7 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_r(base, offset))
         }
         OpCode::GetfieldGcF | OpCode::GetfieldRawF | OpCode::GetfieldGcPureF => {
-            let base = resolve(values, op.args[0]);
+            let base = values.resolve(op.args[0]);
             let offset = op
                 .descr
                 .as_ref()
@@ -377,8 +380,8 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_f(base, offset))
         }
         OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-            let base = resolve(values, op.args[0]);
-            let value = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let value = values.resolve(op.args[1]);
             let offset = op
                 .descr
                 .as_ref()
@@ -389,8 +392,8 @@ fn execute_one_with_memory(
         }
         // ── Array access via descr ──
         OpCode::GetarrayitemGcI | OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcPureI => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
                 .descr
                 .as_ref()
@@ -399,8 +402,8 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_indexed_i(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR | OpCode::GetarrayitemGcPureR => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
                 .descr
                 .as_ref()
@@ -409,8 +412,8 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_indexed_r(base, index, item_size, base_ofs))
         }
         OpCode::GetarrayitemGcF | OpCode::GetarrayitemRawF | OpCode::GetarrayitemGcPureF => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
             let (item_size, base_ofs) = op
                 .descr
                 .as_ref()
@@ -419,9 +422,9 @@ fn execute_one_with_memory(
             OpResult::Value(memory.gc_load_indexed_f(base, index, item_size, base_ofs))
         }
         OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-            let base = resolve(values, op.args[0]);
-            let index = resolve(values, op.args[1]);
-            let value = resolve(values, op.args[2]);
+            let base = values.resolve(op.args[0]);
+            let index = values.resolve(op.args[1]);
+            let value = values.resolve(op.args[2]);
             let (item_size, base_ofs) = op
                 .descr
                 .as_ref()
@@ -436,8 +439,8 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceI
         | OpCode::CallReleaseGilI
         | OpCode::CallLoopinvariantI => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallR
@@ -445,8 +448,8 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceR
         | OpCode::CallReleaseGilR
         | OpCode::CallLoopinvariantR => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallF
@@ -454,8 +457,8 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceF
         | OpCode::CallReleaseGilF
         | OpCode::CallLoopinvariantF => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallN
@@ -463,47 +466,47 @@ fn execute_one_with_memory(
         | OpCode::CallMayForceN
         | OpCode::CallReleaseGilN
         | OpCode::CallLoopinvariantN => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CallAssembler — delegate to call dispatch
         OpCode::CallAssemblerI => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CallAssemblerR => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CallAssemblerF => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_f(func, &args))
         }
         OpCode::CallAssemblerN => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
         // CondCallValue — delegate to call dispatch
         OpCode::CondCallValueI => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
         OpCode::CondCallValueR => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
         }
         OpCode::CondCallN => {
-            let func = resolve(values, op.args[0]);
-            let args: Vec<i64> = op.args[1..].iter().map(|&r| resolve(values, r)).collect();
+            let func = values.resolve(op.args[0]);
+            let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             memory.call_n(func, &args);
             OpResult::Void
         }
@@ -521,27 +524,27 @@ pub(crate) fn blackhole_execute_with_state(
     start_index: usize,
     initial_exception: ExceptionState,
 ) -> (BlackholeResult, ExceptionState) {
-    let mut values: HashMap<u32, i64> = initial_values.clone();
-    let mut exc_state = initial_exception;
-
-    // Merge constants into values
+    let mut merged = initial_values.clone();
     for (&k, &v) in constants {
-        values.entry(k).or_insert(v);
+        merged.entry(k).or_insert(v);
     }
+    let mut tv = TraceValues::from_hashmap(&merged);
+    drop(merged);
+    let mut exc_state = initial_exception;
 
     for op_idx in start_index..ops.len() {
         let op = &ops[op_idx];
-        let result = execute_one(op, &values, &mut exc_state);
+        let result = execute_one(op, &tv, &mut exc_state);
 
         match result {
             OpResult::Value(v) => {
                 if !op.pos.is_none() {
-                    values.insert(op.pos.0, v);
+                    tv.set(op.pos.0, v);
                 }
             }
             OpResult::Void => {}
             OpResult::Finish(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
                     .descr
                     .as_ref()
@@ -558,7 +561,7 @@ pub(crate) fn blackhole_execute_with_state(
                 );
             }
             OpResult::Jump(args) => {
-                let vals: Vec<i64> = args.iter().map(|&r| resolve(&values, r)).collect();
+                let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 return (
                     BlackholeResult::Jump {
                         op_index: op_idx,
@@ -569,7 +572,7 @@ pub(crate) fn blackhole_execute_with_state(
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
-                    fail_args.iter().map(|&r| resolve(&values, r)).collect()
+                    fail_args.iter().map(|&r| tv.resolve(r)).collect()
                 } else {
                     vec![]
                 };
@@ -795,6 +798,22 @@ pub struct BlackholeInterpreter {
     /// Unlike `aborted`, this indicates a Python-level exception that
     /// should propagate up the blackhole chain, not a JIT infrastructure error.
     pub got_exception: bool,
+    /// Position of the last dispatched opcode (before position advances past operands).
+    /// Used by handle_exception_in_frame for handler lookup — the faulting instruction
+    /// PC, not the next instruction PC. Public so caller-chain propagation in
+    /// call_jit.rs can set it to the suspended caller's position.
+    pub last_opcode_position: usize,
+    /// blackhole.py:391 exception_last_value: the caught exception object.
+    /// Set when handle_exception_in_frame finds a handler.
+    /// Read by CheckExcMatch and other exception opcodes in the handler.
+    pub exception_last_value: i64,
+}
+
+/// blackhole.py: last exception value from a residual call.
+/// Set by pyre call helpers (bh_call_fn_impl etc.) on error.
+/// Read by dispatch_one to populate exception_last_value on handler dispatch.
+thread_local! {
+    pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 impl Default for BlackholeInterpreter {
@@ -822,6 +841,8 @@ impl BlackholeInterpreter {
             reached_merge_point: false,
             aborted: false,
             got_exception: false,
+            last_opcode_position: 0,
+            exception_last_value: 0,
         }
     }
 
@@ -850,6 +871,8 @@ impl BlackholeInterpreter {
         self.position = position;
         self.aborted = false;
         self.got_exception = false;
+        self.last_opcode_position = position;
+        self.exception_last_value = 0;
         self.reached_merge_point = false;
     }
 
@@ -969,6 +992,49 @@ impl BlackholeInterpreter {
         self.runtime_stacks.get(&selected).map_or(0, |s| s.len())
     }
 
+    /// blackhole.py:396 handle_exception_in_frame: check if the current
+    /// position has an exception handler. If found, unwind stack, push
+    /// exception, jump to handler. Returns true if handled.
+    ///
+    /// lasti (faulting Python PC) is determined internally from
+    /// self.position via jit_pc_to_py_pc reverse map.
+    pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
+        // Use the position of the opcode that raised, not the post-operand
+        // position. This matches pyre-interpreter/eval.rs:79 (next_instr - 1)
+        // and ensures the last protected instruction hits its handler.
+        let faulting_jit_pc = self.last_opcode_position;
+        let handler_opt = self
+            .jitcode
+            .find_exception_handler(faulting_jit_pc)
+            .cloned();
+        let Some(handler) = handler_opt else {
+            return false;
+        };
+        let selected = self.current_selected;
+        while self.runtime_stack_len(selected) > handler.stack_depth as usize {
+            self.runtime_stacks.get_mut(&selected).map(|s| s.pop());
+        }
+        if handler.push_lasti {
+            // last_opcode_position is already the faulting instruction's
+            // jitcode PC (set before dispatch_one). No additional -1 needed.
+            let faulting_py_pc = self.jitcode.jit_pc_to_py_pc(faulting_jit_pc);
+            let box_fn_ptr = self
+                .jitcode
+                .fn_ptrs
+                .get(handler.box_int_fn_idx as usize)
+                .map(|t| t.concrete_ptr);
+            if let Some(ptr) = box_fn_ptr {
+                let lasti_boxed = call_int_function(ptr, &[faulting_py_pc]);
+                self.runtime_stack_push(selected, lasti_boxed);
+            }
+        }
+        self.runtime_stack_push(selected, exc_value);
+        self.position = handler.jit_target;
+        self.exception_last_value = exc_value;
+        self.got_exception = false;
+        true
+    }
+
     /// Drain the runtime stack for the given selected index, returning
     /// all values in order (bottom → top).
     pub fn runtime_stack_drain(&mut self, selected: usize) -> Vec<i64> {
@@ -1002,6 +1068,7 @@ impl BlackholeInterpreter {
                 return;
             }
             let pos_before = self.position;
+            self.last_opcode_position = pos_before;
             let opcode = self.next_u8();
             if trace {
                 let stack_len = self.runtime_stack_len(0);
@@ -1308,6 +1375,12 @@ impl BlackholeInterpreter {
                     return Err(LeaveFrame);
                 }
                 if callee.got_exception {
+                    let exc_val = callee.exception_last_value;
+                    // Try to handle in this (caller) frame first.
+                    if exc_val != 0 && self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
                     self.got_exception = true;
                     return Err(LeaveFrame);
                 }
@@ -1339,7 +1412,18 @@ impl BlackholeInterpreter {
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 let result = call_int_function(target.concrete_ptr, &args);
+                // Check if call raised an exception (TLS set by helper).
+                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc_val != 0 {
+                    if self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
                 self.registers_i[dst] = result;
             }
             // -- Ref-typed calls --
@@ -1354,15 +1438,24 @@ impl BlackholeInterpreter {
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
+                // Clear stale exception before call to prevent false positives.
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 let result = call_int_function(target.concrete_ptr, &args);
-                // RPython blackhole.py:351 handle_exception_in_frame:
-                // residual call returning NULL/0 indicates a Python exception.
-                // Set got_exception and leave frame so the caller can propagate
-                // up the blackhole chain (RPython _run_forever exception flow).
-                if result == 0 {
+                // Check if call raised an exception (TLS set by helper).
+                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc_val != 0 {
+                    // Actual exception: try handler dispatch.
+                    if self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
                     self.got_exception = true;
                     return Err(LeaveFrame);
                 }
+                // result == 0 without exception is a legitimate null ref
+                // (e.g., None object has non-zero address in pyre, so this
+                // only happens for actual PY_NULL returns which are rare
+                // but legal in generic majit BC_CALL_REF semantics).
                 self.registers_r[dst] = result;
             }
             // -- Float-typed calls --
@@ -1377,7 +1470,17 @@ impl BlackholeInterpreter {
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 let result = call_int_function(target.concrete_ptr, &args);
+                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc_val != 0 {
+                    if self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
                 self.registers_f[dst] = result;
             }
             // -- Void-typed calls --
@@ -1390,14 +1493,34 @@ impl BlackholeInterpreter {
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 call_int_function(target.concrete_ptr, &args);
+                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc_val != 0 {
+                    if self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
             }
             BC_RESIDUAL_CALL_VOID => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = &self.jitcode.fn_ptrs[fn_ptr_idx];
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 call_int_function(target.concrete_ptr, &args);
+                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+                if exc_val != 0 {
+                    if self.handle_exception_in_frame(exc_val) {
+                        return Ok(());
+                    }
+                    self.exception_last_value = exc_val;
+                    self.got_exception = true;
+                    return Err(LeaveFrame);
+                }
             }
             // -- State field access --
             BC_LOAD_STATE_FIELD | BC_LOAD_STATE_VARRAY => {
@@ -1525,6 +1648,7 @@ impl BlackholeInterpBuilder {
         interp.reached_merge_point = false;
         interp.aborted = false;
         interp.got_exception = false;
+        interp.exception_last_value = 0;
         self.pool.push(interp);
     }
 
