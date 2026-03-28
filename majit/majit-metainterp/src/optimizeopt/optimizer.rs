@@ -2388,6 +2388,11 @@ impl Optimizer {
                 op.descr = last.descr.clone();
                 op.fail_args = last.fail_args.clone();
                 op.rd_resume_position = last.rd_resume_position;
+                // Copy complete resume data so number_guard_inline is a no-op.
+                op.rd_numb = last.rd_numb.clone();
+                op.rd_consts = last.rd_consts.clone();
+                op.rd_virtuals = last.rd_virtuals.clone();
+                op.rd_virtuals_info = last.rd_virtuals_info.clone();
             } else {
                 // optimizer.py:678: store_final_boxes_in_guard
                 op = Self::store_final_boxes_in_guard(op, ctx);
@@ -2680,6 +2685,12 @@ impl Optimizer {
         if !virtual_entries.is_empty() {
             op.rd_virtuals = Some(virtual_entries);
         }
+
+        // resume.py ResumeDataVirtualAdder.finish() parity:
+        // Generate rd_numb + rd_consts + rd_virtuals in the SAME call as
+        // fail_args finalization. RPython does not defer to a later phase.
+        ctx.finalize_guard_resume_data(&mut op);
+
         op
     }
 
@@ -2717,18 +2728,34 @@ impl Optimizer {
                 }
             }
             extra_fail_args.push(final_ref);
-            let descr_idx = field_descrs
-                .iter()
-                .find(|(idx, _)| *idx == field_idx)
-                .map(|(_, d)| d.index())
-                .unwrap_or(field_idx);
-            fields.push((descr_idx, base_idx + fields.len()));
+            // Keep original field_idx (= descr.index() from set_field).
+            fields.push((field_idx, base_idx + fields.len()));
         }
+        let field_offsets: Vec<usize> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (fidx, _))| {
+                let offset = field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.offset())
+                    .unwrap_or(0);
+                debug_assert!(
+                    offset > 0 || field_descrs.is_empty(),
+                    "field_descrs missing for field[{}] idx={}",
+                    i,
+                    fidx
+                );
+                offset
+            })
+            .collect();
         Some(majit_ir::GuardVirtualEntry {
             fail_arg_index: fa_idx,
             descr,
             known_class,
             fields,
+            field_offsets,
         })
     }
 

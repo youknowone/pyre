@@ -1007,13 +1007,9 @@ fn maybe_compile_and_run(
     if driver.is_tracing() {
         return None;
     }
-    // warmstate.py:482-511: JC_COMPILED → execute_assembler (no counter tick)
-    // RPython uses target_tokens to select the right entry point within a
-    // JitCellToken. Until target_tokens dispatch is fully implemented,
-    // check that the compiled entry's merge_pc matches the current back-edge.
-    // Incompatible entries (e.g. cross-loop cut with inner merge_pc stored
-    // under outer key) are skipped, allowing the counter to tick and
-    // an independent trace to be compiled at the correct back-edge key.
+    // warmstate.py:482-509: compiled procedure_token exists.
+    // RPython NEVER falls through to counter when compiled cell exists.
+    // Either execute_assembler runs, or return without counter tick.
     if driver.has_compiled_loop(green_key) {
         let compatible = driver
             .get_compiled_meta(green_key)
@@ -1021,9 +1017,11 @@ fn maybe_compile_and_run(
         if compatible {
             return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
         }
-        // Incompatible entry — fall through to counter.
-        // RPython equivalent: target_tokens has no matching target for
-        // this entry state → retrace to produce a compatible one.
+        // Incompatible entry (e.g. cross-loop cut with inner merge_pc).
+        // RPython would enter via target_tokens dispatch; pyre skips.
+        // No counter tick — RPython warmstate.py:482 returns from this
+        // branch without touching the counter.
+        return None;
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
@@ -2022,8 +2020,9 @@ fn materialize_virtual_from_rd(
         }
         _ => {} // Instance/Struct: fall through
     }
-    // Instance/Struct: extract fields for ob_type-based materialization.
-    let (known_class, fieldnums, field_offsets, field_types, object_size): (
+    // resume.py:612-637: VirtualInfo (Instance, known_class=Some) vs
+    // VStructInfo (Struct, known_class=None). descr_size from SizeDescr.
+    let (known_class, fieldnums, field_offsets, field_types, descr_size): (
         Option<i64>,
         &[i16],
         &[usize],
@@ -2035,13 +2034,14 @@ fn materialize_virtual_from_rd(
             fieldnums,
             field_offsets,
             field_types,
+            descr_size,
             ..
         } => (
             *known_class,
             fieldnums.as_slice(),
             field_offsets.as_slice(),
             field_types.as_slice(),
-            0,
+            *descr_size,
         ),
         majit_ir::RdVirtualInfo::Struct {
             known_class: struct_kc,
@@ -2049,13 +2049,14 @@ fn materialize_virtual_from_rd(
             fieldnums,
             field_offsets,
             field_types: struct_ft,
+            descr_size,
             ..
         } => (
             *struct_kc,
             fieldnums.as_slice(),
             field_offsets.as_slice(),
             struct_ft.as_slice(),
-            *object_size,
+            *descr_size,
         ),
         _ => unreachable!(),
     };
@@ -2086,18 +2087,38 @@ fn materialize_virtual_from_rd(
         });
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
-        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
+        // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
+        let size = if descr_size > 0 {
+            descr_size
+        } else {
+            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+            (max_offset + 8).max(16)
+        };
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         unsafe { *ptr = ob_type };
         ptr as usize
-    } else if object_size > 0 {
-        // resume.py:634 VStructInfo.allocate → allocate_struct(typedescr)
-        let layout = std::alloc::Layout::from_size_align(object_size.max(8), 8).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    } else if descr_size > 0 || !field_offsets.is_empty() {
+        // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
+        // Use descr_size (from SizeDescr) when available; fall back to
+        // field_offsets for size estimation.
+        let size = if descr_size > 0 {
+            descr_size
+        } else {
+            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+            (max_offset + 8).max((1 + fieldnums.len()) * 8)
+        };
+        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         ptr as usize
     } else {
+        // No known_class and no field_offsets — can't allocate.
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit] materialize_virtual: vidx={} no known_class and no field_offsets",
+                vidx
+            );
+        }
         return Value::Ref(majit_ir::GcRef::NULL);
     };
 
@@ -2109,12 +2130,11 @@ fn materialize_virtual_from_rd(
     // Phase 3: setfields — decode each field and write to object.
     // resume.py:596-603: for each fielddescr, decoder.setfield(struct, num, descr)
     //
-    // W_IntObject/W_FloatObject: payload is the LAST fieldnum.
-    // PtrInfo::Virtual has 1 fieldnum (intval only, no ob_type).
-    // PtrInfo::VirtualStruct has 2 fieldnums (ob_type + intval).
-    // Using last() handles both cases correctly.
+    // fieldnums does NOT include ob_type — only actual instance fields.
+    // W_IntObject: fieldnums[0] = intval (offset 8)
+    // W_FloatObject: fieldnums[0] = floatval (offset 8)
     if ob_type == int_type_addr {
-        if let Some(&tagged) = fieldnums.last() {
+        if let Some(&tagged) = fieldnums.first() {
             let val = decode_tagged_value(
                 tagged,
                 dead_frame,
@@ -2135,7 +2155,7 @@ fn materialize_virtual_from_rd(
             }
         }
     } else if ob_type == float_type_addr {
-        if let Some(&tagged) = fieldnums.last() {
+        if let Some(&tagged) = fieldnums.first() {
             let val = decode_tagged_value(
                 tagged,
                 dead_frame,
@@ -2171,7 +2191,13 @@ fn materialize_virtual_from_rd(
                 virtuals_cache,
             );
             // resume.py:1509-1518 setfield: type-dispatched write.
-            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8);
+            let Some(&byte_offset) = field_offsets.get(i) else {
+                debug_assert!(false, "field_offsets missing for field {}", i);
+                continue;
+            };
+            if byte_offset == 0 {
+                continue;
+            }
             let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
             unsafe {
                 match ftype {
@@ -2396,12 +2422,20 @@ fn restore_guard_failure_for_loop(
                     frame_end
                 );
             }
-            // RPython compile.py:701 handle_fail: bridge compile or blackhole
-            // resume. No permanent invalidation. The null Refs are from
-            // incomplete rd_virtuals materialization (pyre limitation).
-            // Return None to signal "recovery failed" — the caller
-            // (execute_assembler) restores saved frame state.
-            // Entry is NOT invalidated or removed.
+            // Workaround for incomplete rd_virtuals materialization:
+            // remove the compiled entry so both has_compiled_loop and
+            // has_compiled_targets return false. WarmState JC_COMPILED
+            // cell prevents infinite retrace (force_start_tracing →
+            // RunCompiled). Use rd_loop_token (= root green key) which
+            // correctly identifies the owning loop even from bridge guards.
+            // When blackhole resume is complete (RPython compile.py:701
+            // handle_fail parity), this should be replaced with proper
+            // blackhole execution.
+            let (driver, _) = driver_pair();
+            let loop_key = exit_layout.rd_loop_token;
+            if loop_key != 0 {
+                driver.remove_compiled_loop(loop_key);
+            }
             return None;
         }
     }
@@ -2437,8 +2471,7 @@ fn rebuild_typed_from_rd_numb(
 ) -> Vec<Value> {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
-    let (_num_failargs, _vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts);
+    let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);

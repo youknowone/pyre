@@ -1916,6 +1916,14 @@ impl<S: JitState> JitDriver<S> {
             .retain(|_, entry| entry.root_trace_id != trace_id);
     }
 
+    /// Remove the compiled entry for a specific green key.
+    /// Unlike invalidate_loop (which flags the token), this removes the
+    /// entry entirely so both has_compiled_loop and has_compiled_targets
+    /// return false, allowing recompilation.
+    pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.meta.compiled_loops.remove(&green_key);
+    }
+
     /// warmspot.py:449 — set the per-driver result_type.
     pub fn set_result_type(&mut self, tp: Type) {
         self.meta.set_result_type(tp);

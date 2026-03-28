@@ -785,9 +785,14 @@ impl OptVirtualize {
 
     fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let descr = op.descr.clone().expect("NEW_WITH_VTABLE needs descr");
+        // virtualize.py:208: known_class = ConstInt(op.getdescr().get_vtable())
+        let known_class = descr
+            .as_size_descr()
+            .map(|sd| majit_ir::GcRef(sd.vtable()))
+            .filter(|gc| !gc.is_null());
         let vinfo = VirtualInfo {
             descr,
-            known_class: None,
+            known_class,
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
@@ -1379,13 +1384,32 @@ impl OptVirtualize {
         ctx.new_operations.iter().any(|op| op.pos == resolved)
     }
 
+    /// resume.py AbstractVirtualStructInfo: extract byte offsets
+    /// from field_descrs, parallel to fields (sorted by descr index).
+    fn extract_field_offsets(
+        fields: &[(u32, usize)],
+        field_descrs: &[(u32, DescrRef)],
+    ) -> Vec<usize> {
+        fields
+            .iter()
+            .map(|(fidx, _)| {
+                let offset = field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.offset())
+                    .unwrap_or(0);
+                debug_assert!(
+                    offset > 0 || field_descrs.is_empty(),
+                    "field_descrs missing for field_idx={}",
+                    fidx
+                );
+                offset
+            })
+            .collect()
+    }
+
     /// Encode a single virtual PtrInfo into a GuardVirtualEntry.
-    ///
-    /// Adds the virtual's field values to `extra_fail_args` and returns
-    /// the entry metadata. Field values that are themselves virtual are
-    /// forced before being added.
-    ///
-    /// Returns None for unsupported virtual kinds (VirtualArray, etc. for now).
     fn encode_virtual_entry(
         &mut self,
         fail_arg_index: usize,
@@ -1396,9 +1420,11 @@ impl OptVirtualize {
     ) -> Option<GuardVirtualEntry> {
         match info {
             PtrInfo::Virtual(vinfo) => {
-                let mut fields = Vec::with_capacity(vinfo.fields.len());
-                for &(field_idx, value_ref) in &vinfo.fields {
-                    // Force nested virtuals — only one level of encoding for now
+                // RPython info.py: _fields indexed by fielddescr.get_index().
+                let mut sorted_fields: Vec<_> = vinfo.fields.clone();
+                sorted_fields.sort_by_key(|(idx, _)| *idx);
+                let mut fields = Vec::with_capacity(sorted_fields.len());
+                for &(field_idx, value_ref) in &sorted_fields {
                     let resolved = ctx.get_box_replacement(value_ref);
                     if Self::is_virtual(resolved, ctx) {
                         self.force_virtual(resolved, ctx);
@@ -1408,16 +1434,20 @@ impl OptVirtualize {
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
                 }
+                let field_offsets = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
                 Some(GuardVirtualEntry {
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
                     fields,
+                    field_offsets,
                 })
             }
             PtrInfo::VirtualStruct(vinfo) => {
-                let mut fields = Vec::with_capacity(vinfo.fields.len());
-                for &(field_idx, value_ref) in &vinfo.fields {
+                let mut sorted_fields: Vec<_> = vinfo.fields.clone();
+                sorted_fields.sort_by_key(|(idx, _)| *idx);
+                let mut fields = Vec::with_capacity(sorted_fields.len());
+                for &(field_idx, value_ref) in &sorted_fields {
                     let resolved = ctx.get_box_replacement(value_ref);
                     if Self::is_virtual(resolved, ctx) {
                         self.force_virtual(resolved, ctx);
@@ -1427,11 +1457,13 @@ impl OptVirtualize {
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
                 }
+                let field_offsets = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
                 Some(GuardVirtualEntry {
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: None,
                     fields,
+                    field_offsets,
                 })
             }
             // VirtualArray, VirtualArrayStruct, VirtualRawBuffer:
