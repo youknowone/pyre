@@ -1294,6 +1294,13 @@ impl BlackholeInterpreter {
                     );
                 }
                 if cond == 0 {
+                    // blackhole.py:1066 bhimpl_jit_merge_point parity:
+                    // branch target may be the merge point (loop header).
+                    if self.merge_point_jitcode_pc == Some(target) {
+                        self.position = target;
+                        self.reached_merge_point = true;
+                        return Err(LeaveFrame);
+                    }
                     self.position = target;
                 }
             }
@@ -1307,7 +1314,14 @@ impl BlackholeInterpreter {
                 self.position = target;
             }
             BC_JUMP_TARGET => {
-                // No-op in blackhole: just a marker for the tracing machine.
+                // blackhole.py:1066-1083 bhimpl_jit_merge_point parity:
+                // BC_JUMP_TARGET marks the loop header. When the blackhole
+                // reaches it (via fall-through after backward branch),
+                // check if this is the merge point to hand back to JIT.
+                if self.merge_point_jitcode_pc == Some(self.last_opcode_position) {
+                    self.reached_merge_point = true;
+                    return Err(LeaveFrame);
+                }
             }
             BC_SET_SELECTED => {
                 self.current_selected = self.next_u16() as usize;

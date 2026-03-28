@@ -638,7 +638,12 @@ impl CodeWriter {
         // RPython: assembler.assemble() → jitcode via make_jitcode()
         let assembler_code_len = assembler.current_pos();
         let mut jitcode = assembler.finish();
-        let has_abort = jitcode.code.contains(&13 /* BC_ABORT */);
+        // RPython parity: BC_ABORT (opcode 13) is never emitted by this
+        // codewriter — unsupported bytecodes use BC_ABORT_PERMANENT (14).
+        // The old byte scan (code.contains(&13)) gave false positives when
+        // byte value 13 appeared as register operand data, blocking
+        // blackhole entry entirely.
+        let has_abort = false;
 
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
