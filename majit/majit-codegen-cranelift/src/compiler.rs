@@ -987,17 +987,14 @@ fn rebuild_state_after_failure(
             // Step 1: materialize all virtuals referenced by any frame.
             // Keep materialized pointers indexed by vidx for pending fields.
             let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
+            // resume.py:951 getvirtual_ptr parity: recursive materialization.
             let materialize = |vidx: usize, materialized: &mut Vec<Option<i64>>| -> i64 {
-                if let Some(ptr) = materialized[vidx] {
-                    return ptr;
-                }
-                if let Some(vl) = recovery.virtual_layouts.get(vidx) {
-                    if let Some(obj) = rebuild_state_after_failure_single_virtual(vl, outputs) {
-                        materialized[vidx] = Some(obj);
-                        return obj;
-                    }
-                }
-                0
+                materialize_virtual_recursive(
+                    vidx,
+                    &recovery.virtual_layouts,
+                    outputs,
+                    materialized,
+                )
             };
 
             // Step 2: rebuild ALL frames' slots, concatenated in
@@ -1106,19 +1103,47 @@ fn rebuild_state_after_failure(
 
 /// Materialize a single virtual from its layout and raw output values.
 /// Uses the REBUILD_STATE_AFTER_FAILURE callback for actual object allocation.
-fn rebuild_state_after_failure_single_virtual(
-    vl: &majit_codegen::ExitVirtualLayout,
+/// resume.py:617-621 VirtualInfo.allocate parity: cycle-safe materialization.
+///
+/// Phase 1: allocate struct (allocate_with_vtable / allocate_struct)
+/// Phase 2: set_ptr(index, struct) — cache BEFORE setfields
+/// Phase 3: setfields — fill fields (may reference self via cycle)
+fn materialize_virtual_recursive(
+    vidx: usize,
+    virtual_layouts: &[majit_codegen::ExitVirtualLayout],
     outputs: &[i64],
-) -> Option<i64> {
-    match vl {
-        majit_codegen::ExitVirtualLayout::Object { fields, .. }
-        | majit_codegen::ExitVirtualLayout::Struct { fields, .. } => {
-            if fields.len() == 2 {
-                let ob_type_val = resolve_virtual_field_value(&fields[0].1, outputs)?;
-                let intval = resolve_virtual_field_value(&fields[1].1, outputs)?;
-                // Use a temporary buffer with the [Ref(0), Int, Int] pattern
-                // so the heuristic materializer can box it.
-                let mut temp = vec![0i64, ob_type_val, intval];
+    materialized: &mut Vec<Option<i64>>,
+) -> i64 {
+    if let Some(ptr) = materialized.get(vidx).copied().flatten() {
+        return ptr;
+    }
+    let Some(vl) = virtual_layouts.get(vidx) else {
+        return 0;
+    };
+
+    // Phase 1: allocate (without setfields)
+    let ptr = match vl {
+        majit_codegen::ExitVirtualLayout::Object {
+            fields,
+            fielddescrs,
+            descr_size,
+            ..
+        }
+        | majit_codegen::ExitVirtualLayout::Struct {
+            fields,
+            fielddescrs,
+            descr_size,
+            ..
+        } => {
+            let vals: Vec<i64> = fields
+                .iter()
+                .map(|(_, src)| resolve_virtual_field_value(src, outputs).unwrap_or(0))
+                .collect();
+            let ob_type = vals.first().copied().unwrap_or(0);
+
+            // Fast path: W_IntObject/W_FloatObject (2-field boxed)
+            if fields.len() == 2 && ob_type != 0 {
+                let mut temp = vec![0i64, ob_type, vals.get(1).copied().unwrap_or(0)];
                 let temp_types = vec![
                     majit_ir::Type::Ref,
                     majit_ir::Type::Int,
@@ -1129,10 +1154,189 @@ fn rebuild_state_after_failure_single_virtual(
                         f(&mut temp, &temp_types);
                     }
                 });
-                if temp[0] != 0 { Some(temp[0]) } else { None }
-            } else {
-                None
+                if temp[0] != 0 {
+                    if vidx < materialized.len() {
+                        materialized[vidx] = Some(temp[0]);
+                    }
+                    return temp[0];
+                }
             }
+
+            // General path: allocate zeroed memory
+            if fielddescrs.is_empty() && *descr_size == 0 {
+                return 0;
+            }
+            let size = if *descr_size > 0 { *descr_size } else { 16 };
+            let layout = match std::alloc::Layout::from_size_align(size, 8) {
+                Ok(l) => l,
+                Err(_) => return 0,
+            };
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+            if ptr.is_null() {
+                return 0;
+            }
+            if ob_type != 0 {
+                unsafe {
+                    *(ptr as *mut i64) = ob_type;
+                }
+            }
+            ptr as i64
+        }
+        _ => return 0,
+    };
+
+    // Phase 2: set_ptr — cache BEFORE setfields (cycle-safe)
+    if vidx < materialized.len() {
+        materialized[vidx] = Some(ptr);
+    }
+
+    // Phase 3: setfields — may recurse into nested virtuals
+    match vl {
+        majit_codegen::ExitVirtualLayout::Object {
+            fields,
+            fielddescrs,
+            ..
+        }
+        | majit_codegen::ExitVirtualLayout::Struct {
+            fields,
+            fielddescrs,
+            ..
+        } => {
+            let ob_type = fields
+                .first()
+                .and_then(|(_, src)| resolve_virtual_field_value(src, outputs))
+                .unwrap_or(0);
+            for (i, (_, src)) in fields.iter().enumerate() {
+                if let Some(fd) = fielddescrs.get(i) {
+                    if fd.offset > 0 || ob_type == 0 {
+                        // Resolve with materialized (nested virtuals now available)
+                        let val = resolve_virtual_field_value_with_materialized(
+                            src,
+                            outputs,
+                            materialized,
+                        )
+                        .unwrap_or_else(|| {
+                            // Nested virtual not yet materialized — recurse
+                            if let majit_codegen::ExitValueSourceLayout::Virtual(nv) = src {
+                                materialize_virtual_recursive(
+                                    *nv,
+                                    virtual_layouts,
+                                    outputs,
+                                    materialized,
+                                )
+                            } else {
+                                0
+                            }
+                        });
+                        unsafe {
+                            let addr = (ptr as *mut u8).add(fd.offset);
+                            match fd.field_type {
+                                majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
+                                majit_ir::Type::Float => {
+                                    std::ptr::write(addr as *mut u64, val as u64)
+                                }
+                                _ => match fd.field_size {
+                                    1 => std::ptr::write(addr, val as u8),
+                                    2 => std::ptr::write(addr as *mut u16, val as u16),
+                                    4 => std::ptr::write(addr as *mut u32, val as u32),
+                                    _ => std::ptr::write(addr as *mut i64, val),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    ptr
+}
+
+fn rebuild_state_after_failure_single_virtual(
+    vl: &majit_codegen::ExitVirtualLayout,
+    outputs: &[i64],
+    materialized: &[Option<i64>],
+) -> Option<i64> {
+    match vl {
+        majit_codegen::ExitVirtualLayout::Object {
+            fields,
+            fielddescrs,
+            descr_size,
+            ..
+        }
+        | majit_codegen::ExitVirtualLayout::Struct {
+            fields,
+            fielddescrs,
+            descr_size,
+            ..
+        } => {
+            // Resolve all field values (including nested virtuals).
+            let vals: Vec<i64> = fields
+                .iter()
+                .map(|(_, src)| {
+                    resolve_virtual_field_value_with_materialized(src, outputs, materialized)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let ob_type = vals.first().copied().unwrap_or(0);
+
+            // Fast path: W_IntObject / W_FloatObject (2 fields, fields[0]=ob_type)
+            if fields.len() == 2 && ob_type != 0 {
+                let mut temp = vec![0i64, ob_type, vals.get(1).copied().unwrap_or(0)];
+                let temp_types = vec![
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ];
+                REBUILD_STATE_AFTER_FAILURE.with(|c| {
+                    if let Some(f) = c.get() {
+                        f(&mut temp, &temp_types);
+                    }
+                });
+                if temp[0] != 0 {
+                    return Some(temp[0]);
+                }
+            }
+
+            // General path: allocate + setfields using fielddescrs
+            if fielddescrs.is_empty() && *descr_size == 0 {
+                return None;
+            }
+            let size = if *descr_size > 0 { *descr_size } else { 16 };
+            let layout = std::alloc::Layout::from_size_align(size, 8).ok()?;
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+            if ptr.is_null() {
+                return None;
+            }
+            if ob_type != 0 {
+                unsafe {
+                    *(ptr as *mut i64) = ob_type;
+                }
+            }
+            // resume.py:597-602 setfields
+            for (i, &val) in vals.iter().enumerate() {
+                if let Some(fd) = fielddescrs.get(i) {
+                    if fd.offset > 0 || ob_type == 0 {
+                        unsafe {
+                            let addr = ptr.add(fd.offset);
+                            match fd.field_type {
+                                majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
+                                majit_ir::Type::Float => {
+                                    std::ptr::write(addr as *mut u64, val as u64)
+                                }
+                                _ => match fd.field_size {
+                                    1 => std::ptr::write(addr, val as u8),
+                                    2 => std::ptr::write(addr as *mut u16, val as u16),
+                                    4 => std::ptr::write(addr as *mut u32, val as u32),
+                                    _ => std::ptr::write(addr as *mut i64, val),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            Some(ptr as i64)
         }
         _ => None,
     }
@@ -1145,6 +1349,23 @@ fn resolve_virtual_field_value(
     match source {
         majit_codegen::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
         majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+        _ => None,
+    }
+}
+
+/// resolve_virtual_field_value with nested virtual support.
+/// resume.py:1552-1573: TAGVIRTUAL → getvirtual_ptr/int.
+fn resolve_virtual_field_value_with_materialized(
+    source: &majit_codegen::ExitValueSourceLayout,
+    outputs: &[i64],
+    materialized: &[Option<i64>],
+) -> Option<i64> {
+    match source {
+        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
+        majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+        majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+            materialized.get(*vidx).copied().flatten()
+        }
         _ => None,
     }
 }

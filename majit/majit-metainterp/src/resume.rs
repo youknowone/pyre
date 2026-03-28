@@ -383,11 +383,15 @@ pub enum ResumeVirtualLayoutSummary {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
     Struct {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
     Array {
         descr_index: u32,
@@ -587,29 +591,33 @@ impl ResumeVirtualLayoutSummary {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => VirtualInfo::VirtualObj {
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_descr, source)| {
-                        (*field_descr, source.to_resume_source(fail_arg_positions))
-                    })
+                    .map(|(fd, src)| (*fd, src.to_resume_source(fail_arg_positions)))
                     .collect(),
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Struct {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => VirtualInfo::VStruct {
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_descr, source)| {
-                        (*field_descr, source.to_resume_source(fail_arg_positions))
-                    })
+                    .map(|(fd, src)| (*fd, src.to_resume_source(fail_arg_positions)))
                     .collect(),
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Array { descr_index, items } => VirtualInfo::VArray {
                 descr_index: *descr_index,
@@ -662,6 +670,8 @@ impl ResumeVirtualLayoutSummary {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => ExitVirtualLayout::Object {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -670,13 +680,15 @@ impl ResumeVirtualLayoutSummary {
                     .map(|(fd, src)| (*fd, src.to_exit_source(fail_arg_positions, virtual_offset)))
                     .collect(),
                 target_slot: None,
-                fielddescrs: vec![],
-                descr_size: 0,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Struct {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => ExitVirtualLayout::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -690,8 +702,8 @@ impl ResumeVirtualLayoutSummary {
                     })
                     .collect(),
                 target_slot: None,
-                fielddescrs: vec![],
-                descr_size: 0,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Array { descr_index, items } => ExitVirtualLayout::Array {
                 descr_index: *descr_index,
@@ -1118,21 +1130,18 @@ pub type FrameSlotSource = ResumeValueSource;
 pub enum VirtualInfo {
     /// Virtual object with vtable (from NEW_WITH_VTABLE).
     VirtualObj {
-        /// Type ID (vtable pointer or class identifier).
         type_id: u32,
-        /// Descriptor index for the allocation.
         descr_index: u32,
-        /// Field values: (field_descr_index, source).
         fields: Vec<(u32, VirtualFieldSource)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
-    /// Virtual struct without vtable (from NEW).
     VStruct {
-        /// Type ID.
         type_id: u32,
-        /// Descriptor index.
         descr_index: u32,
-        /// Field values: (field_descr_index, source).
         fields: Vec<(u32, VirtualFieldSource)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     },
     /// Virtual array (from NEW_ARRAY).
     VArray {
@@ -1221,29 +1230,33 @@ impl VirtualInfo {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => ResumeVirtualLayoutSummary::Object {
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_descr, source)| {
-                        (*field_descr, source.layout_summary(fail_arg_positions))
-                    })
+                    .map(|(fd, src)| (*fd, src.layout_summary(fail_arg_positions)))
                     .collect(),
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             VirtualInfo::VStruct {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => ResumeVirtualLayoutSummary::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(field_descr, source)| {
-                        (*field_descr, source.layout_summary(fail_arg_positions))
-                    })
+                    .map(|(fd, src)| (*fd, src.layout_summary(fail_arg_positions)))
                     .collect(),
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
             },
             VirtualInfo::VArray { descr_index, items } => ResumeVirtualLayoutSummary::Array {
                 descr_index: *descr_index,
@@ -1298,6 +1311,8 @@ impl VirtualInfo {
                 type_id: 0,
                 descr_index: 0,
                 fields: vec![],
+                fielddescrs: vec![],
+                descr_size: 0,
             },
         }
     }
@@ -1481,6 +1496,8 @@ impl EncodedResumeData {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => {
                 code.push(EncodedVirtualKind::VirtualObj as i64);
                 code.push(i64::from(*type_id));
@@ -1497,11 +1514,27 @@ impl EncodedResumeData {
                         fail_arg_indices,
                     ));
                 }
+                // Encode fielddescrs + descr_size
+                code.push(encode_len(fielddescrs.len()));
+                for fd in fielddescrs {
+                    code.push(i64::from(fd.index));
+                    code.push(fd.offset as i64);
+                    code.push(match fd.field_type {
+                        majit_ir::Type::Void => 0,
+                        majit_ir::Type::Int => 1,
+                        majit_ir::Type::Ref => 2,
+                        majit_ir::Type::Float => 3,
+                    });
+                    code.push(fd.field_size as i64);
+                }
+                code.push(*descr_size as i64);
             }
             VirtualInfo::VStruct {
                 type_id,
                 descr_index,
                 fields,
+                fielddescrs,
+                descr_size,
             } => {
                 code.push(EncodedVirtualKind::VStruct as i64);
                 code.push(i64::from(*type_id));
@@ -1518,6 +1551,19 @@ impl EncodedResumeData {
                         fail_arg_indices,
                     ));
                 }
+                code.push(encode_len(fielddescrs.len()));
+                for fd in fielddescrs {
+                    code.push(i64::from(fd.index));
+                    code.push(fd.offset as i64);
+                    code.push(match fd.field_type {
+                        majit_ir::Type::Void => 0,
+                        majit_ir::Type::Int => 1,
+                        majit_ir::Type::Ref => 2,
+                        majit_ir::Type::Float => 3,
+                    });
+                    code.push(fd.field_size as i64);
+                }
+                code.push(*descr_size as i64);
             }
             VirtualInfo::VArray { descr_index, items } => {
                 code.push(EncodedVirtualKind::VArray as i64);
@@ -1699,10 +1745,33 @@ impl EncodedResumeData {
                     let source = self.decode_source(self.next_word(cursor));
                     fields.push((field_index, source));
                 }
+                let fd_count = decode_len(self.next_word(cursor));
+                let mut fielddescrs = Vec::with_capacity(fd_count);
+                for _ in 0..fd_count {
+                    let idx = u32::try_from(self.next_word(cursor)).unwrap_or(0);
+                    let offset = self.next_word(cursor) as usize;
+                    let ft = match self.next_word(cursor) as u8 {
+                        0 => majit_ir::Type::Void,
+                        1 => majit_ir::Type::Int,
+                        2 => majit_ir::Type::Ref,
+                        3 => majit_ir::Type::Float,
+                        _ => majit_ir::Type::Int,
+                    };
+                    let fs = self.next_word(cursor) as usize;
+                    fielddescrs.push(majit_ir::FieldDescrInfo {
+                        index: idx,
+                        offset,
+                        field_type: ft,
+                        field_size: fs,
+                    });
+                }
+                let descr_size = self.next_word(cursor) as usize;
                 VirtualInfo::VirtualObj {
                     type_id,
                     descr_index,
                     fields,
+                    fielddescrs,
+                    descr_size,
                 }
             }
             EncodedVirtualKind::VStruct => {
@@ -1717,10 +1786,33 @@ impl EncodedResumeData {
                     let source = self.decode_source(self.next_word(cursor));
                     fields.push((field_index, source));
                 }
+                let fd_count = decode_len(self.next_word(cursor));
+                let mut fielddescrs = Vec::with_capacity(fd_count);
+                for _ in 0..fd_count {
+                    let idx = u32::try_from(self.next_word(cursor)).unwrap_or(0);
+                    let offset = self.next_word(cursor) as usize;
+                    let ft = match self.next_word(cursor) as u8 {
+                        0 => majit_ir::Type::Void,
+                        1 => majit_ir::Type::Int,
+                        2 => majit_ir::Type::Ref,
+                        3 => majit_ir::Type::Float,
+                        _ => majit_ir::Type::Int,
+                    };
+                    let fs = self.next_word(cursor) as usize;
+                    fielddescrs.push(majit_ir::FieldDescrInfo {
+                        index: idx,
+                        offset,
+                        field_type: ft,
+                        field_size: fs,
+                    });
+                }
+                let descr_size = self.next_word(cursor) as usize;
                 VirtualInfo::VStruct {
                     type_id,
                     descr_index,
                     fields,
+                    fielddescrs,
+                    descr_size,
                 }
             }
             EncodedVirtualKind::VArray => {
@@ -2467,11 +2559,15 @@ impl ResumeDataVirtualAdder {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     ) -> usize {
         self.add_virtual(VirtualInfo::VirtualObj {
             type_id,
             descr_index,
             fields,
+            fielddescrs,
+            descr_size,
         })
     }
 
@@ -2481,11 +2577,15 @@ impl ResumeDataVirtualAdder {
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
+        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
+        descr_size: usize,
     ) -> usize {
         self.add_virtual(VirtualInfo::VStruct {
             type_id,
             descr_index,
             fields,
+            fielddescrs,
+            descr_size,
         })
     }
 
