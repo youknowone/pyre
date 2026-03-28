@@ -422,6 +422,15 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
+    /// pyjitpl.py:3317 virtualref_boxes: pairs of (symbolic OpRef, concrete ptr).
+    /// Managed by opimpl_virtual_ref/opimpl_virtual_ref_finish.
+    pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
+    /// codewriter.py JitDriverStaticData.jitcodes parity.
+    /// Maps CodeObject pointer → sequential index. RPython populates during
+    /// codewriter assembly; pyre populates during tracing. Portal function
+    /// gets index 0, inline callees get 1, 2, etc.
+    pub(crate) jitcodes: HashMap<usize, i32>,
+    jitcode_next_index: i32,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
@@ -732,6 +741,9 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
+            virtualref_boxes: Vec::new(),
+            jitcodes: HashMap::new(),
+            jitcode_next_index: 0,
             pending_preamble_tokens: HashMap::new(),
         }
     }
@@ -1497,6 +1509,49 @@ impl<M: Clone> MetaInterp<M> {
         self.emit_force_virtualizable(vable_opref);
     }
 
+    /// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
+    /// Creates concrete vref via virtual_ref_during_tracing(), records
+    /// VIRTUAL_REF(virtual_obj, force_token), pushes [virtualbox, vrefbox].
+    pub fn opimpl_virtual_ref(&mut self, virtual_obj: OpRef, virtual_obj_ptr: usize) -> OpRef {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return OpRef::NONE;
+        };
+        // pyjitpl.py:1804: virtual_ref_during_tracing
+        let vref_info = crate::virtualref::VirtualRefInfo::new();
+        let force_token = ctx.force_token();
+        let (token, _forced) = vref_info.virtual_ref_during_tracing(force_token.0 as i64);
+        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token]);
+        // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
+        self.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
+        self.virtualref_boxes.push((vref, token as usize));
+        vref
+    }
+
+    /// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
+    /// Checks is_virtual_ref() on concrete vref before recording.
+    pub fn opimpl_virtual_ref_finish(&mut self, vref: OpRef, virtual_obj: OpRef) {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        // pyjitpl.py:1827: check is_virtual_ref(vrefbox)
+        let vref_ptr = self
+            .virtualref_boxes
+            .last()
+            .map(|&(_, ptr)| ptr)
+            .unwrap_or(0);
+        let vref_info = crate::virtualref::VirtualRefInfo::new();
+        let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
+        if is_vref {
+            // pyjitpl.py:3371: VIRTUAL_REF_FINISH(vrefbox, NULL)
+            let null = ctx.const_int(0);
+            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref, null]);
+        }
+        if self.virtualref_boxes.len() >= 2 {
+            self.virtualref_boxes.pop();
+            self.virtualref_boxes.pop();
+        }
+    }
+
     /// Whether the engine is currently tracing.
     #[inline]
     pub fn is_tracing(&self) -> bool {
@@ -1511,6 +1566,18 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing
             .as_ref()
             .is_some_and(|ctx| ctx.green_key == green_key || ctx.root_green_key() == green_key)
+    }
+
+    /// codewriter.py parity: get or assign sequential jitcode index.
+    /// opencoder.py:776/810: frame.jitcode.index in snapshot.
+    pub fn jitcode_index_for(&mut self, code_ptr: usize) -> i32 {
+        if let Some(&idx) = self.jitcodes.get(&code_ptr) {
+            return idx;
+        }
+        let idx = self.jitcode_next_index;
+        self.jitcode_next_index += 1;
+        self.jitcodes.insert(code_ptr, idx);
+        idx
     }
 
     /// Finish the current active trace without optimizing or compiling it.

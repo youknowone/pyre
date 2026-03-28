@@ -10,8 +10,27 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+#[inline(always)]
+fn vb_set(v: &mut Vec<bool>, i: u32) {
+    let i = i as usize;
+    if i >= v.len() {
+        v.resize(i + 1, false);
+    }
+    v[i] = true;
+}
+#[inline(always)]
+fn vb_get(v: &[bool], i: u32) -> bool {
+    v.get(i as usize).copied().unwrap_or(false)
+}
+#[inline(always)]
+fn vb_unset(v: &mut Vec<bool>, i: u32) {
+    if let Some(s) = v.get_mut(i as usize) {
+        *s = false;
+    }
+}
 
 use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Type};
 
@@ -329,24 +348,13 @@ pub struct OptHeap {
     /// that may raise (CALL_MAY_FORCE, comparison ops) until we see
     /// a GUARD_NO_EXCEPTION, ensuring correct exception semantics.
     postponed_op: Option<Op>,
-    /// Descriptor indices known to be immutable (green fields).
-    /// Cached values for these descriptors survive invalidation.
-    immutable_field_descrs: HashSet<u32>,
+    /// Descriptor indices known to be immutable. RPython: descr.is_always_pure().
+    immutable_field_descrs: Vec<bool>,
 
-    // ── Aliasing analysis state ──
-    /// Objects allocated during this trace (NEW/NEW_WITH_VTABLE/NEW_ARRAY/etc.).
-    /// These cannot alias each other or pre-existing (input arg) objects.
-    seen_allocation: HashSet<OpRef>,
-    /// Subset of `seen_allocation`: objects that haven't escaped.
-    /// An object escapes when it is passed to a call or stored into another
-    /// object's field via SETFIELD_GC / SETARRAYITEM_GC.
-    /// Caches for unescaped objects survive calls (calls can't access them).
-    unescaped: HashSet<OpRef>,
-    // ── Nullity tracking ──
-    /// Values known to be non-null: proven by guards (GuardNonnull, GuardClass,
-    /// GuardNonnullClass, GuardValue) or by allocation (New, NewWithVtable, etc.).
-    /// Used to eliminate redundant GuardNonnull checks.
-    known_nonnull: HashSet<OpRef>,
+    // ── Aliasing analysis state — RPython: PtrInfo flags ──
+    seen_allocation: Vec<bool>,
+    unescaped: Vec<bool>,
+    known_nonnull: Vec<bool>,
 
     /// Cache for loop-invariant call results: (descr_index, args_hash) -> result OpRef.
     /// Survives calls and side-effecting operations (only cleared on setup).
@@ -381,10 +389,10 @@ impl OptHeap {
             array_cache: HashMap::new(),
             seen_guard_not_invalidated: false,
             postponed_op: None,
-            immutable_field_descrs: HashSet::new(),
-            seen_allocation: HashSet::new(),
-            unescaped: HashSet::new(),
-            known_nonnull: HashSet::new(),
+            immutable_field_descrs: Vec::new(),
+            seen_allocation: Vec::new(),
+            unescaped: Vec::new(),
+            known_nonnull: Vec::new(),
             loopinvariant_cache: HashMap::new(),
             last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
@@ -634,7 +642,7 @@ impl OptHeap {
             let final_value = op.arg(1);
             let descr = op.descr.clone();
             // heap.py:129,189-191: invalidate(descr) — skip if is_always_pure
-            if !self.immutable_field_descrs.contains(&field_idx) {
+            if !vb_get(&self.immutable_field_descrs, field_idx) {
                 self.get_or_create_cached_field(field_idx)
                     .invalidate_with_ctx(field_idx, ctx);
             }
@@ -691,20 +699,21 @@ impl OptHeap {
     /// - Unescaped object caches: calls cannot access objects that haven't
     ///   been passed to a call or stored into the heap.
     fn invalidate_caches(&mut self) {
-        let has_survivors = !self.immutable_field_descrs.is_empty() || !self.unescaped.is_empty();
+        let has_survivors =
+            self.immutable_field_descrs.iter().any(|&v| v) || self.unescaped.iter().any(|&v| v);
 
         if has_survivors {
             for (&field_idx, cf) in self.field_cache.iter_mut() {
-                if self.immutable_field_descrs.contains(&field_idx) {
+                if vb_get(&self.immutable_field_descrs, field_idx) {
                     continue; // immutable fields survive
                 }
-                cf.retain_entries(|obj| self.unescaped.contains(obj));
+                cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
             }
             for cai in self.array_cache.values_mut() {
-                cai.retain_entries(|obj| self.unescaped.contains(obj));
+                cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
             }
             self.cached_arrayitems_var
-                .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
+                .retain(|&(obj, _, _), _| vb_get(&self.unescaped, obj.0));
         } else {
             self.field_cache.values_mut().for_each(|cf| cf.invalidate());
             self.immutable_cached_fields.clear();
@@ -717,9 +726,13 @@ impl OptHeap {
 
         // Nullity: allocated objects are permanently non-null.
         // Other nonnull knowledge is invalidated conservatively.
-        if !self.seen_allocation.is_empty() {
-            self.known_nonnull
-                .retain(|v| self.seen_allocation.contains(v));
+        // RPython: per-box flag — keep nonnull only for seen_allocation boxes.
+        if self.seen_allocation.iter().any(|&v| v) {
+            for i in 0..self.known_nonnull.len() {
+                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
+                    self.known_nonnull[i] = false;
+                }
+            }
         } else {
             self.known_nonnull.clear();
         }
@@ -806,7 +819,7 @@ impl OptHeap {
     /// Mark call arguments as escaped.
     fn mark_args_escaped(&mut self, op: &Op) {
         for &arg in &op.args {
-            self.unescaped.remove(&arg);
+            vb_unset(&mut self.unescaped, arg.0);
         }
     }
 
@@ -865,19 +878,22 @@ impl OptHeap {
             if ei.forces_virtual_or_virtualizable() || ei.has_random_effects() {
                 self.force_all_lazy(ctx);
                 for (&field_idx, cf) in self.field_cache.iter_mut() {
-                    if self.immutable_field_descrs.contains(&field_idx) {
+                    if vb_get(&self.immutable_field_descrs, field_idx) {
                         continue;
                     }
-                    cf.retain_entries(|obj| self.unescaped.contains(obj));
+                    cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
                 }
                 for cai in self.array_cache.values_mut() {
-                    cai.retain_entries(|obj| self.unescaped.contains(obj));
+                    cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
                 }
                 self.cached_arrayitems_var
-                    .retain(|&(obj, _, _), _| self.unescaped.contains(&obj));
-                if !self.seen_allocation.is_empty() {
-                    self.known_nonnull
-                        .retain(|v| self.seen_allocation.contains(v));
+                    .retain(|&(obj, _, _), _| vb_get(&self.unescaped, obj.0));
+                if self.seen_allocation.iter().any(|&v| v) {
+                    for i in 0..self.known_nonnull.len() {
+                        if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
+                            self.known_nonnull[i] = false;
+                        }
+                    }
                 } else {
                     self.known_nonnull.clear();
                 }
@@ -906,7 +922,7 @@ impl OptHeap {
                     if let Some((_, mut lazy_op)) = cf.lazy_set.take() {
                         Self::emit_lazy_setfield(&mut lazy_op, ctx, true);
                     }
-                    if !self.immutable_field_descrs.contains(&field_idx) {
+                    if !vb_get(&self.immutable_field_descrs, field_idx) {
                         cf.invalidate();
                     }
                 }
@@ -937,9 +953,12 @@ impl OptHeap {
 
         // Remaining lazy sets for unaffected fields stay lazy.
         // Nonnull tracking: keep for allocated objects only.
-        if !self.seen_allocation.is_empty() {
-            self.known_nonnull
-                .retain(|v| self.seen_allocation.contains(v));
+        if self.seen_allocation.iter().any(|&v| v) {
+            for i in 0..self.known_nonnull.len() {
+                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
+                    self.known_nonnull[i] = false;
+                }
+            }
         } else {
             self.known_nonnull.clear();
         }
@@ -957,7 +976,7 @@ impl OptHeap {
         // invalidation by calls and side-effecting operations.
         if let Some(descr) = &op.descr {
             if descr.is_always_pure() {
-                self.immutable_field_descrs.insert(key.1);
+                vb_set(&mut self.immutable_field_descrs, key.1);
             }
         }
 
@@ -1077,7 +1096,7 @@ impl OptHeap {
                 let d = op.descr.clone();
                 let is_immutable = d.as_ref().map_or(false, |dd| dd.is_always_pure());
                 if is_immutable {
-                    self.immutable_field_descrs.insert(key.1);
+                    vb_set(&mut self.immutable_field_descrs, key.1);
                     self.immutable_cached_fields.insert(key, cached);
                 }
                 let cf = self.get_or_create_cached_field(field_idx);
@@ -1123,14 +1142,14 @@ impl OptHeap {
         // heap.py line 652: make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
         let struct_ref = ctx.get_box_replacement(op.arg(0));
-        self.known_nonnull.insert(struct_ref);
+        vb_set(&mut self.known_nonnull, struct_ref.0);
         if ctx.get_ptr_info(struct_ref).is_none() {
             ctx.set_ptr_info(struct_ref, crate::optimizeopt::info::PtrInfo::nonnull());
         }
         self.cache_field(obj, field_idx, op.pos, op.descr.as_ref());
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
-        if self.immutable_field_descrs.contains(&key.1) {
+        if vb_get(&self.immutable_field_descrs, key.1) {
             self.immutable_cached_fields.insert(key, op.pos);
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
@@ -1170,7 +1189,7 @@ impl OptHeap {
         let new_value = op.arg(1);
 
         // The stored value escapes (it becomes reachable via the heap).
-        self.unescaped.remove(&new_value);
+        vb_unset(&mut self.unescaped, new_value.0);
 
         // heap.py:77-101: do_setfield — check write-after-write, aliasing, lazy set
         // Check write-after-write first (before possible_aliasing).
@@ -1219,7 +1238,7 @@ impl OptHeap {
             if let Some((lazy_obj, mut lazy_op)) = lazy_data {
                 // heap.py:122-143: force_lazy_set
                 // 1. invalidate (skip pure)
-                if !self.immutable_field_descrs.contains(&field_idx) {
+                if !vb_get(&self.immutable_field_descrs, field_idx) {
                     self.get_or_create_cached_field(field_idx)
                         .invalidate_with_ctx(field_idx, ctx);
                 }
@@ -1308,7 +1327,7 @@ impl OptHeap {
             self.cache_arrayitem(array, descr_idx, const_index, op.pos, op.descr.as_ref());
             // heap.py line 701: make_nonnull(op.getarg(0))
             let array_ref = ctx.get_box_replacement(op.arg(0));
-            self.known_nonnull.insert(array_ref);
+            vb_set(&mut self.known_nonnull, array_ref.0);
             // heap.py line 681: arrayinfo.getlenbound(None).make_gt_const(index)
             // Record that array length >= index + 1
             if const_index >= 0 {
@@ -1335,15 +1354,17 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
-        self.known_nonnull
-            .insert(ctx.get_box_replacement(op.arg(0)));
+        vb_set(
+            &mut self.known_nonnull,
+            ctx.get_box_replacement(op.arg(0)).0,
+        );
         OptimizationResult::Emit(op.clone())
     }
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // The stored value escapes (becomes reachable via the heap).
         let stored_value = op.arg(2);
-        self.unescaped.remove(&stored_value);
+        vb_unset(&mut self.unescaped, stored_value.0);
 
         let key = match Self::arrayitem_key(op, ctx) {
             Some(k) => k,
@@ -1490,9 +1511,9 @@ impl OptHeap {
         // Track allocations for aliasing analysis.
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
-            self.seen_allocation.insert(op.pos);
-            self.unescaped.insert(op.pos);
-            self.known_nonnull.insert(op.pos);
+            vb_set(&mut self.seen_allocation, op.pos.0);
+            vb_set(&mut self.unescaped, op.pos.0);
+            vb_set(&mut self.known_nonnull, op.pos.0);
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -1506,13 +1527,13 @@ impl OptHeap {
         // exclusively by rewrite.py. Only track nullity for cache purposes.
         if opcode.is_guard() {
             if opcode == OpCode::GuardNonnull {
-                self.known_nonnull.insert(op.arg(0));
+                vb_set(&mut self.known_nonnull, op.arg(0).0);
             }
 
             // GuardClass / GuardNonnullClass / GuardValue imply non-null.
             match opcode {
                 OpCode::GuardClass | OpCode::GuardNonnullClass | OpCode::GuardValue => {
-                    self.known_nonnull.insert(op.arg(0));
+                    vb_set(&mut self.known_nonnull, op.arg(0).0);
                 }
                 _ => {}
             }
@@ -1701,9 +1722,9 @@ impl Optimization for OptHeap {
 
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                self.seen_allocation.insert(op.pos);
-                self.unescaped.insert(op.pos);
-                self.known_nonnull.insert(op.pos);
+                vb_set(&mut self.seen_allocation, op.pos.0);
+                vb_set(&mut self.unescaped, op.pos.0);
+                vb_set(&mut self.known_nonnull, op.pos.0);
                 OptimizationResult::PassOn
             }
 
@@ -1944,7 +1965,7 @@ impl Optimization for OptHeap {
             | OpCode::GcLoadIndexedF => {
                 self.force_all_lazy_setfields(ctx);
                 self.force_all_lazy_setarrayitems(ctx);
-                self.known_nonnull.insert(op.arg(0));
+                vb_set(&mut self.known_nonnull, op.arg(0).0);
                 OptimizationResult::Emit(op.clone())
             }
 
