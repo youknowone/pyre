@@ -985,14 +985,11 @@ fn jit_merge_point_hook(
 /// RPython warmstate.py:446-511 maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
-/// warmstate.py:446-511 maybe_compile_and_run.
 ///
 /// RPython order: cell lookup (JC_TRACING → skip, JC_COMPILED → enter)
 /// BEFORE counter.tick(). This prevents compiled loops from occupying
-/// counter hash-table slots and evicting non-compiled loops.
-/// TODO: blocked by bridge loop_reentry targeting preamble instead of body.
-/// Once bridge target_token selection is fixed, move has_compiled_loop
-/// check before counter.tick().
+/// counter hash-table slots and evicting non-compiled loops (the 5-way
+/// associative cache has only 5 slots per bucket).
 #[cold]
 #[inline(never)]
 fn maybe_compile_and_run(
@@ -1003,22 +1000,24 @@ fn maybe_compile_and_run(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
+    if driver.is_tracing() {
+        return None;
+    }
+    // warmstate.py:482-511: JC_COMPILED → execute_assembler (no counter tick)
+    if driver.has_compiled_loop(green_key) {
+        return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+    }
+    // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
         .meta_interp_mut()
         .warm_state_mut()
         .counter
         .tick(green_key)
-        && !driver.is_tracing()
     {
-        // warmstate.py:473-477: JC_TRACING
         if driver.meta_interp().is_tracing_key(green_key) {
             return None;
         }
-        // warmstate.py:482-511: compiled code → execute_assembler
-        if driver.has_compiled_loop(green_key) {
-            return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
-        }
-        // warmstate.py:425-444: bound_reached → compile_and_run_once
         return bound_reached(frame, green_key, loop_header_pc, driver, info, env);
     }
     None
@@ -1039,6 +1038,16 @@ fn execute_assembler(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
+    // RPython parity: save frame state before compiled code entry.
+    // If guard recovery fails (blackhole error), restore pre-entry state
+    // instead of leaving a corrupted frame for the interpreter.
+    let saved_locals: Vec<pyre_object::PyObjectRef> = {
+        let len = frame.locals_cells_stack_w.len();
+        (0..len).map(|i| frame.locals_cells_stack_w[i]).collect()
+    };
+    let saved_ni = frame.next_instr;
+    let saved_vsd = frame.valuestackdepth;
+
     let mut jit_state = build_jit_state(frame, info);
     jit_state.next_instr = entry_pc;
 
@@ -1105,15 +1114,65 @@ fn execute_assembler(
             if let Some(ref vals) = typed {
                 match crate::call_jit::resume_in_blackhole(frame, vals, entry_pc) {
                     crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                        // RPython parity: blackhole reached merge point and
+                        // wrote back frame state. Check if the writeback
+                        // produced null locals (incomplete rd_numb).
+                        let code = unsafe { &*frame.code };
+                        let nlocals = code.varnames.len();
+                        let has_null_local =
+                            (0..nlocals).any(|i| frame.locals_cells_stack_w[i].is_null());
+                        if has_null_local {
+                            // Writeback produced null locals — restore pre-entry
+                            // frame and invalidate.
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit] blackhole writeback has null locals for key={}, restoring",
+                                    green_key
+                                );
+                            }
+                            driver.invalidate_loop(green_key);
+                            frame.next_instr = saved_ni;
+                            frame.valuestackdepth = saved_vsd;
+                            let restore_len =
+                                saved_locals.len().min(frame.locals_cells_stack_w.len());
+                            for i in 0..restore_len {
+                                frame.locals_cells_stack_w[i] = saved_locals[i];
+                            }
+                            frame.fix_array_ptrs();
+                            return None;
+                        }
                         Some(LoopResult::ContinueRunningNormally)
                     }
-                    crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                        Some(LoopResult::Done(r))
+                    crate::call_jit::BlackholeResult::DoneWithThisFrame(Ok(v)) => {
+                        Some(LoopResult::Done(Ok(v)))
                     }
-                    crate::call_jit::BlackholeResult::Failed => None,
+                    crate::call_jit::BlackholeResult::DoneWithThisFrame(Err(_))
+                    | crate::call_jit::BlackholeResult::Failed => {
+                        // RPython parity: blackhole failure means incomplete
+                        // recovery (missing rd_numb slots, etc). Invalidate
+                        // and restore pre-entry frame state.
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] blackhole failed/error for key={}, invalidating",
+                                green_key
+                            );
+                        }
+                        driver.invalidate_loop(green_key);
+                        // Restore pre-entry frame state.
+                        frame.next_instr = saved_ni;
+                        frame.valuestackdepth = saved_vsd;
+                        let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
+                        for i in 0..restore_len {
+                            frame.locals_cells_stack_w[i] = saved_locals[i];
+                        }
+                        frame.fix_array_ptrs();
+                        None
+                    }
                 }
             } else {
-                None
+                // No typed values — frame was restored directly.
+                // RPython ContinueRunningNormally: restart eval_loop_jit.
+                Some(LoopResult::ContinueRunningNormally)
             }
         }
         JitAction::Continue => None,
