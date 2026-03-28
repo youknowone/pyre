@@ -1897,6 +1897,9 @@ impl OptContext {
                         size: vi.element_fields.len(),
                         fielddescr_indices: fielddescr_indices.clone(),
                         field_types: vec![0u8; fielddescr_indices.len()],
+                        item_size: 0,
+                        field_offsets: Vec::new(),
+                        field_sizes: Vec::new(),
                         fieldnums,
                     }
                 }

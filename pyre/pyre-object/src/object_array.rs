@@ -248,29 +248,70 @@ pub enum GcTypedArray {
     Int(Vec<i64>),
     /// FLAG_FLOAT: each slot is a raw f64.
     Float(Vec<f64>),
+    /// FLAG_STRUCT: Array(Struct(...)) — flat byte buffer.
+    /// llmodel.py:648-665 bh_setinteriorfield_gc_* parity.
+    /// Layout: num_elems elements, each item_size bytes, stored inline.
+    /// Access: elem_idx * item_size + field_offset.
+    Struct {
+        item_size: usize,
+        num_elems: usize,
+        data: Vec<u8>,
+    },
 }
 
-/// Array element kind — resume.py:656 arraydescr.is_array_of_* parity.
+/// Array element kind — resume.py:656 arraydescr.is_array_of_* / FLAG_STRUCT parity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArrayKind {
     Ref,
     Int,
     Float,
+    /// Array(Struct(...)) — interior fields, item_size from arraydescr.
+    Struct,
 }
 
-/// llmodel.py:788 bh_new_array / bh_new_array_clear parity.
-///
-/// `clear=true` → bh_new_array_clear: zero-initialized (resume.py:1444).
-/// `clear=false` → bh_new_array: uninitialized in RPython (resume.py:1446).
-///
-/// In RPython, bh_new_array returns GC-allocated memory (zero-filled by
-/// incminimark nursery). pyre uses Vec which also zero-fills. The API
-/// preserves the distinction for naming parity.
-pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
-    let arr = match kind {
-        ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
-        ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
-        ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
+/// resume.py:1444-1447, llmodel.py:788 parity.
+/// `clear=true` → bh_new_array_clear (explicit zero-init).
+/// `clear=false` → bh_new_array (GC nursery zero-filled in RPython).
+/// In pyre both produce zero-filled storage (Rust Vec/vec! default).
+/// RPython distinction: bh_new_array_clear emits memset; bh_new_array
+/// relies on GC nursery zeroing. pyre has no GC nursery — always zeroed.
+pub fn allocate_array(length: usize, kind: ArrayKind, clear: bool) -> *mut GcTypedArray {
+    let arr = if clear {
+        match kind {
+            ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
+            ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
+            ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
+            ArrayKind::Struct => GcTypedArray::Struct {
+                item_size: 0,
+                num_elems: length,
+                data: Vec::new(),
+            },
+        }
+    } else {
+        match kind {
+            ArrayKind::Ref => GcTypedArray::Ref(vec![PY_NULL; length]),
+            ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
+            ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
+            ArrayKind::Struct => GcTypedArray::Struct {
+                item_size: 0,
+                num_elems: length,
+                data: Vec::new(),
+            },
+        }
+    };
+    Box::into_raw(Box::new(arr))
+}
+
+/// resume.py:749 VArrayStructInfo.allocate parity.
+/// Allocate a flat byte buffer for Array(Struct(...)).
+/// Layout: num_elems elements × item_size bytes, zero-filled.
+/// llmodel.py: gc_malloc_array(basesize + num_elems * itemsize).
+pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTypedArray {
+    let total_bytes = num_elems * item_size;
+    let arr = GcTypedArray::Struct {
+        item_size,
+        num_elems,
+        data: vec![0u8; total_bytes],
     };
     Box::into_raw(Box::new(arr))
 }
@@ -335,23 +376,67 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 }
 
 /// resume.py:757 setinteriorfield(i, array, num, fielddescrs[j]) parity.
-/// resume.py:1520-1529: dispatch on descr.is_pointer_field / is_float_field.
+/// resume.py:1520-1529 ResumeDataDirectReader: dispatch on descr type.
+/// llmodel.py:648-665: byte offset = elem_idx * item_size + field_offset.
 ///
-/// `field_type`: 0=ref, 1=int, 2=float (ArrayDescr.flag / type_bits parity).
-/// The flat index is `elem_idx * fields_per_elem + field_idx`.
+/// For GcTypedArray::Struct: writes directly to the flat byte buffer.
+/// For legacy Ref/Int/Float arrays: falls back to flat index computation.
 pub fn setinteriorfield(
     array: *mut GcTypedArray,
     elem_idx: usize,
-    field_idx: usize,
-    fields_per_elem: usize,
-    field_type: u8,
+    field_offset: usize,
+    field_size: usize,
+    item_size: usize,
+    descr_field_type: u8,
     value: i64,
 ) {
-    let flat = elem_idx * fields_per_elem + field_idx;
-    match field_type {
-        2 => setarrayitem_float(array, flat, f64::from_bits(value as u64)),
-        1 => setarrayitem_int(array, flat, value),
-        _ => setarrayitem_ref(array, flat, value as PyObjectRef),
+    if array.is_null() {
+        return;
+    }
+    let arr = unsafe { &mut *array };
+    match arr {
+        GcTypedArray::Struct {
+            data,
+            item_size: is,
+            ..
+        } => {
+            // llmodel.py:648-665 parity: byte_offset = elem_idx * item_size + field_offset
+            let byte_offset = elem_idx * *is + field_offset;
+            let end = byte_offset + field_size.min(8);
+            if end <= data.len() {
+                match descr_field_type {
+                    2 => {
+                        // bh_setinteriorfield_gc_f: write f64
+                        let bits = value as u64;
+                        data[byte_offset..byte_offset + 8.min(field_size)]
+                            .copy_from_slice(&bits.to_ne_bytes()[..8.min(field_size)]);
+                    }
+                    0 => {
+                        // bh_setinteriorfield_gc_r: write ref (pointer)
+                        let ptr = value as usize;
+                        let sz = std::mem::size_of::<usize>().min(field_size);
+                        data[byte_offset..byte_offset + sz]
+                            .copy_from_slice(&ptr.to_ne_bytes()[..sz]);
+                    }
+                    _ => {
+                        // bh_setinteriorfield_gc_i: write int
+                        let sz = field_size.min(8);
+                        data[byte_offset..byte_offset + sz]
+                            .copy_from_slice(&value.to_ne_bytes()[..sz]);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Legacy fallback: flat index for Ref/Int/Float arrays.
+            let fields_per_elem = if item_size > 0 { item_size } else { 1 };
+            let flat = elem_idx * fields_per_elem + field_offset;
+            match descr_field_type {
+                2 => setarrayitem_float(array, flat, f64::from_bits(value as u64)),
+                1 => setarrayitem_int(array, flat, value),
+                _ => setarrayitem_ref(array, flat, value as PyObjectRef),
+            }
+        }
     }
 }
 
@@ -365,5 +450,6 @@ pub fn gcarray_len(array: *const GcTypedArray) -> usize {
         GcTypedArray::Ref(v) => v.len(),
         GcTypedArray::Int(v) => v.len(),
         GcTypedArray::Float(v) => v.len(),
+        GcTypedArray::Struct { num_elems, .. } => *num_elems,
     }
 }

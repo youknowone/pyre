@@ -1906,20 +1906,25 @@ fn materialize_virtual_from_rd(
         majit_ir::RdVirtualInfo::ArrayStruct {
             size,
             field_types,
+            item_size,
+            field_offsets,
+            field_sizes,
             fieldnums,
             ..
         } => {
-            // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
-            // then setinteriorfield(i, array, num, fielddescrs[j]).
+            // resume.py:749: allocate_array(self.size, self.arraydescr, clear=True)
             let fields_per_elem = if *size > 0 {
                 fieldnums.len() / *size
             } else {
                 0
             };
-            // resume.py:750: allocate with self.size elements, clear=True.
-            // Flat backing store: size * fields_per_elem slots.
-            let total = fieldnums.len();
-            let array = pyre_object::allocate_array(total, pyre_object::ArrayKind::Ref, true);
+            let is = if *item_size > 0 {
+                *item_size
+            } else {
+                // Fallback: estimate from fields_per_elem * 8 bytes per field.
+                fields_per_elem * 8
+            };
+            let array = pyre_object::allocate_array_struct(*size, is);
             // resume.py:751: virtuals_cache.set_ptr BEFORE setfields
             let result = Value::Ref(majit_ir::GcRef(array as usize));
             virtuals_cache.insert(vidx, result.clone());
@@ -1933,7 +1938,7 @@ fn materialize_virtual_from_rd(
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
-                        continue; // resume.py:756: skip UNINITIALIZED
+                        continue;
                     }
                     let v = decode_tagged_fieldnum(
                         fnum,
@@ -1944,15 +1949,17 @@ fn materialize_virtual_from_rd(
                         virtuals_cache,
                     );
                     if let Some(val) = v {
-                        // resume.py:757,1520-1529: setinteriorfield with type dispatch.
+                        // resume.py:757,1520-1529: setinteriorfield(i, array, num, fielddescrs[j])
                         let ft = field_types.get(j).copied().unwrap_or(0);
+                        let fo = field_offsets.get(j).copied().unwrap_or(j * 8);
+                        let fs = field_sizes.get(j).copied().unwrap_or(8);
                         let raw = match val {
                             Value::Int(i) => i,
                             Value::Float(f) => f.to_bits() as i64,
                             Value::Ref(r) => r.0 as i64,
                             Value::Void => 0,
                         };
-                        pyre_object::setinteriorfield(array, i, j, fields_per_elem, ft, raw);
+                        pyre_object::setinteriorfield(array, i, fo, fs, is, ft, raw);
                     }
                 }
             }
@@ -2922,28 +2929,29 @@ fn rebuild_state_after_failure_from_recovery_layout(
             }
             majit_codegen::ExitVirtualLayout::ArrayStruct {
                 field_types,
+                item_size,
+                field_offsets,
+                field_sizes,
                 element_fields,
                 ..
             } => {
-                // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
-                // then setinteriorfield(i, array, num, fielddescrs[j]).
+                // resume.py:749: allocate_array(self.size, self.arraydescr, clear=True)
                 let size = element_fields.len();
-                let fields_per_elem = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
-                let total = size * fields_per_elem;
-                let array = pyre_object::allocate_array(total, pyre_object::ArrayKind::Ref, true);
+                let is = if *item_size > 0 {
+                    *item_size
+                } else {
+                    let fpe = element_fields.first().map(|ef| ef.len()).unwrap_or(0);
+                    fpe * 8
+                };
+                let array = pyre_object::allocate_array_struct(size, is);
                 for (i, ef) in element_fields.iter().enumerate() {
                     for (j, (_, src)) in ef.iter().enumerate() {
                         if let Some(val) = resolve_value(src, &materialized) {
-                            // resume.py:757: setinteriorfield(i, array, num, descr)
+                            // resume.py:757: setinteriorfield(i, array, num, fielddescrs[j])
                             let ft = field_types.get(j).copied().unwrap_or(0);
-                            pyre_object::setinteriorfield(
-                                array,
-                                i,
-                                j,
-                                fields_per_elem,
-                                ft,
-                                val as i64,
-                            );
+                            let fo = field_offsets.get(j).copied().unwrap_or(j * 8);
+                            let fs = field_sizes.get(j).copied().unwrap_or(8);
+                            pyre_object::setinteriorfield(array, i, fo, fs, is, ft, val as i64);
                         }
                     }
                 }

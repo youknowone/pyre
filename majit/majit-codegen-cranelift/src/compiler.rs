@@ -8970,6 +8970,9 @@ fn collect_guards(
                             size,
                             fielddescr_indices,
                             field_types,
+                            item_size,
+                            field_offsets,
+                            field_sizes,
                             fieldnums,
                         } => {
                             let fpe = if *size > 0 {
@@ -8980,6 +8983,9 @@ fn collect_guards(
                             ExitVirtualLayout::ArrayStruct {
                                 descr_index: *descr_index,
                                 field_types: field_types.clone(),
+                                item_size: *item_size,
+                                field_offsets: field_offsets.clone(),
+                                field_sizes: field_sizes.clone(),
                                 element_fields: (0..*size)
                                     .map(|ei| {
                                         let s = ei * fpe;

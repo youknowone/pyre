@@ -68,10 +68,17 @@ pub enum RdVirtualInfo {
     ArrayStruct {
         descr_index: u32,
         size: usize,
+        /// resume.py VArrayStructInfo.fielddescrs — per-field descriptor indices.
         fielddescr_indices: Vec<u32>,
         /// resume.py:757: fielddescrs[j].is_pointer_field/is_float_field dispatch.
         /// Per-field type within each element: 0=ref, 1=int, 2=float.
         field_types: Vec<u8>,
+        /// llmodel.py:648: arraydescr.itemsize — bytes per struct element.
+        item_size: usize,
+        /// llmodel.py:649: fielddescr.offset — per-field byte offset within struct.
+        field_offsets: Vec<usize>,
+        /// llmodel.py:649: fielddescr.field_size — per-field byte width.
+        field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
     RawBuffer {
