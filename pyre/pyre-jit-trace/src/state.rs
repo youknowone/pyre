@@ -2116,29 +2116,53 @@ impl MIFrame {
     /// PyPy generate_guard + capture_resumedata: uses current_fail_args
     /// which encodes the full framestack for multi-frame resume.
     pub(crate) fn record_guard(&mut self, ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
-        // RPython opencoder.py:819 capture_resumedata(framestack) parity:
-        // Inlined callee guards encode BOTH callee and caller frames as
-        // separate sections. The blackhole builds a chain: callee → caller.
+        // opencoder.py:819 capture_resumedata(framestack) parity:
+        // Encode the full framestack [callee (top), caller (parent)] into
+        // a multi-frame snapshot. The callee's pc is set to resumepc
+        // (orgpc), while the caller keeps its original pc (return_point).
+        // pyjitpl.py:2597 passes full framestack + vable/vref boxes.
         if self.parent_fail_args.is_some() {
-            // Callee section: orgpc + pre-opcode locals/stack.
+            // pyjitpl.py:2593-2596: top frame pc = resumepc (orgpc)
             self.flush_to_frame_for_guard(ctx);
             let callee_fail_args = self.build_single_frame_fail_args(ctx);
             let callee_types = self.build_single_frame_fail_arg_types();
 
-            // Caller section: unchanged from parent_fail_args (captured at CALL).
+            // pyjitpl.py:2601-2602: parent frames keep original pc
             let caller_fail_args = self.parent_fail_args.clone().unwrap();
             let caller_types = self
                 .parent_fail_arg_types
                 .clone()
                 .unwrap_or_else(|| fail_arg_types_for_virtualizable_state(caller_fail_args.len()));
 
-            // Multi-frame: [callee_section..., caller_section...]
+            // opencoder.py:819-832: snapshot = [top_frame, parent_frame]
+            let callee_boxes = Self::fail_args_to_snapshot_boxes(&callee_fail_args);
+            let caller_boxes = Self::fail_args_to_snapshot_boxes(&caller_fail_args);
+            let snapshot = majit_trace::recorder::Snapshot {
+                frames: vec![
+                    majit_trace::recorder::SnapshotFrame {
+                        jitcode_index: 0,
+                        pc: self.orgpc as u32,
+                        boxes: callee_boxes,
+                    },
+                    majit_trace::recorder::SnapshotFrame {
+                        jitcode_index: 0,
+                        pc: 0, // caller pc encoded in fail_args[1]
+                        boxes: caller_boxes,
+                    },
+                ],
+                vable_boxes: Vec::new(),
+                vref_boxes: Vec::new(),
+            };
+            let snapshot_id = ctx.capture_resumedata(snapshot);
+
+            // Multi-frame fail_args: [callee_section..., caller_section...]
             let mut fail_args = callee_fail_args;
             fail_args.extend_from_slice(&caller_fail_args);
             let mut types = callee_types;
             types.extend_from_slice(&caller_types);
 
             ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
+            ctx.set_last_guard_resume_position(snapshot_id);
             return;
         }
 
@@ -2182,6 +2206,21 @@ impl MIFrame {
 
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
+    }
+
+    fn fail_args_to_snapshot_boxes(
+        fail_args: &[OpRef],
+    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+        fail_args
+            .iter()
+            .map(|&opref| {
+                if opref.is_none() {
+                    majit_trace::recorder::SnapshotTagged::Const(0)
+                } else {
+                    majit_trace::recorder::SnapshotTagged::Box(opref.0)
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn guard_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
@@ -4355,9 +4394,9 @@ impl MIFrame {
             (sym, Some(callee_frame_opref))
         };
 
-        // RPython capture_resumedata parity: parent frame's PC is the
-        // CALL return point (fallthrough_pc), not the CALL opcode start.
-        // The callee blackhole handles the call; the caller continues AFTER.
+        // pyjitpl.py:2601-2602: parent frame keeps its original pc
+        // (return_point_pc = CALL fallthrough). The callee blackhole
+        // handles the call; the caller continues AFTER the call returns.
         // Stack is post-dispatch (args consumed, no result yet).
         let return_point_pc = self.fallthrough_pc;
         self.with_ctx(|this, ctx| {
