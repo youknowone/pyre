@@ -1026,8 +1026,6 @@ impl OptContext {
         // BoxEnv bridging current optimizer state.
         struct InlineBoxEnv<'a> {
             ctx: &'a OptContext,
-            /// OpRef.0 values that are known to be virtual from fail_args analysis.
-            virtual_oprefs: &'a HashSet<u32>,
         }
         impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
             fn get_box_replacement(&self, opref: OpRef) -> OpRef {
@@ -1083,58 +1081,25 @@ impl OptContext {
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
                 // resume.py:210-216: info = getptrinfo(box)
                 //                    is_virtual = (info is not None and info.is_virtual())
-                // RPython: getptrinfo(box).is_virtual() — checks Box's PtrInfo.
-                // Walk replacement chain checking PtrInfo at each node.
-                let mut check = opref;
-                for _ in 0..20 {
-                    if self
-                        .ctx
-                        .ptr_info
-                        .get(check.0 as usize)
-                        .and_then(|v| v.as_ref())
-                        .is_some_and(|info| info.is_virtual())
-                    {
-                        return true;
-                    }
-                    let next = self.ctx.get_replacement(check);
-                    if next == check || next.is_none() {
-                        break;
-                    }
-                    check = next;
-                }
-                // Fallback: fail_args NONE pattern for Phase 2 PtrInfo detachment.
-                self.virtual_oprefs.contains(&opref.0)
+                // RPython uses ONLY PtrInfo.is_virtual() — no fallback.
+                // virtual_oprefs hint (from fail_args NONE) is checked only
+                // when PtrInfo confirms virtual. This prevents placeholder
+                // rd_virtuals entries (RPython resume.py:498 asserts
+                // info.is_virtual() for every virtual in _number_virtuals).
+                matches!(
+                    self.ctx.get_ptr_info(opref),
+                    Some(
+                        crate::optimizeopt::info::PtrInfo::Virtual(_)
+                            | crate::optimizeopt::info::PtrInfo::VirtualStruct(_),
+                    )
+                )
             }
             fn is_virtual_raw(&self, _opref: OpRef) -> bool {
                 false
             }
         }
 
-        // resume.py parity: identify virtual slots from fail_args.
-        // RPython's optimizer keeps PtrInfo::Virtual on replacement boxes;
-        // pyre's Phase 2 detaches virtual info from Phase 1 inputargs.
-        // Build a set of snapshot oprefs that are virtual (fail_args=NONE).
-        let virtual_oprefs: HashSet<u32> = op
-            .fail_args
-            .as_ref()
-            .map(|fa| {
-                fa.iter()
-                    .enumerate()
-                    .filter(|(i, opref)| {
-                        *i >= 3
-                            && opref.is_none()
-                            && *i < snapshot_boxes.len()
-                            && !snapshot_boxes[*i].is_none()
-                    })
-                    .map(|(i, _)| snapshot_boxes[i].0)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let env = InlineBoxEnv {
-            ctx: self,
-            virtual_oprefs: &virtual_oprefs,
-        };
+        let env = InlineBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
         let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
             return;
@@ -1176,11 +1141,11 @@ impl OptContext {
         //   virtuals = [None] * length
         //   for virtualbox, fieldboxes in vfieldboxes.iteritems():
         //       num, _ = untag(self.liveboxes[virtualbox])
+        //       assert info.is_virtual()   # resume.py:498
         //       virtuals[num] = vinfo
         //
-        // Build rd_virtuals_info directly (indexed by vidx). Entries with
-        // no PtrInfo (Phase 2 detachment) → placeholder (0, None, [])
-        // that materialize_virtual_from_rd handles as GcRef::NULL.
+        // All TAGVIRTUAL entries have PtrInfo (is_virtual_ref uses
+        // PtrInfo.is_virtual() only — no virtual_oprefs fallback).
         let num_virtuals = numb_state.num_virtuals as usize;
         let mut rd_virt_info: Vec<(u32, Option<i64>, Vec<i16>)> =
             vec![(0, None, vec![]); num_virtuals];
