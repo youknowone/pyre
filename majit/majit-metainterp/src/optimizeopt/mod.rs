@@ -1507,113 +1507,52 @@ impl OptContext {
                 tagged
             };
             // resume.py:326-338: dispatch by virtual type.
-            // RPython info.py:243-247: _visitor_walk_recursive iterates
-            // _fields in descr.get_all_fielddescrs() order. Sort by
-            // field_idx (= descr.index()) to match.
             let entry = match vinfo_opt {
                 Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
-                    let mut sorted: Vec<_> = vi.fields.clone();
-                    sorted.sort_by_key(|(idx, _)| *idx);
-                    let fielddescr_indices: Vec<u32> = sorted.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = sorted
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (fi, _))| {
-                            let off = vi
-                                .field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or(0);
-                            debug_assert!(
-                                off > 0 || vi.field_descrs.is_empty(),
-                                "field_descrs missing for Instance field[{}] idx={}",
-                                i,
-                                fi
-                            );
-                            off
-                        })
-                        .collect();
-                    let fieldnums: Vec<i16> = sorted.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    let field_types: Vec<majit_ir::Type> = sorted
+                    let fielddescr_indices: Vec<u32> =
+                        vi.fields.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = vi
+                        .fields
                         .iter()
                         .map(|(fi, _)| {
                             vi.field_descrs
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
-                                .unwrap_or(majit_ir::Type::Int)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+                                .unwrap_or((*fi as usize + 1) * 8)
                         })
                         .collect();
-                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                    // virtualize.py:208: known_class = descr.get_vtable()
-                    let kc = vi
-                        .known_class
-                        .map(|gc| gc.as_usize() as i64)
-                        .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
-                        .filter(|&v| v != 0);
+                    let fieldnums: Vec<i16> =
+                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
                     majit_ir::RdVirtualInfo::Instance {
                         descr_index: vi.descr.index(),
-                        known_class: kc,
+                        known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
                         fielddescr_indices,
                         field_offsets,
-                        field_types,
                         fieldnums,
-                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
-                    let mut sorted: Vec<_> = vi.fields.clone();
-                    sorted.sort_by_key(|(idx, _)| *idx);
-                    let fielddescr_indices: Vec<u32> = sorted.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = sorted
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (fi, _))| {
-                            let off = vi
-                                .field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or(0);
-                            debug_assert!(
-                                off > 0 || vi.field_descrs.is_empty(),
-                                "field_descrs missing for Struct field[{}] idx={}",
-                                i,
-                                fi
-                            );
-                            off
-                        })
-                        .collect();
-                    let fieldnums: Vec<i16> = sorted.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    // virtualize.py:208: for VirtualStruct, check if descr has
-                    // vtable (misclassified NEW_WITH_VTABLE as NEW).
-                    let known_class_val: Option<i64> = vi
-                        .descr
-                        .as_size_descr()
-                        .map(|sd| sd.vtable() as i64)
-                        .filter(|&v| v != 0);
-                    let object_size_val = vi.descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
-                    let field_types: Vec<majit_ir::Type> = sorted
+                    let fielddescr_indices: Vec<u32> =
+                        vi.fields.iter().map(|(idx, _)| *idx).collect();
+                    let field_offsets: Vec<usize> = vi
+                        .fields
                         .iter()
                         .map(|(fi, _)| {
                             vi.field_descrs
                                 .iter()
                                 .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
-                                .unwrap_or(majit_ir::Type::Int)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+                                .unwrap_or((*fi as usize + 1) * 8)
                         })
                         .collect();
-                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                    let fieldnums: Vec<i16> =
+                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
                     majit_ir::RdVirtualInfo::Struct {
                         descr_index: vi.descr.index(),
-                        known_class: known_class_val,
-                        object_size: object_size_val,
                         fielddescr_indices,
                         field_offsets,
-                        field_types,
                         fieldnums,
-                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {

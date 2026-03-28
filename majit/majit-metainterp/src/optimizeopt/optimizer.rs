@@ -2728,34 +2728,18 @@ impl Optimizer {
                 }
             }
             extra_fail_args.push(final_ref);
-            // Keep original field_idx (= descr.index() from set_field).
-            fields.push((field_idx, base_idx + fields.len()));
+            let descr_idx = field_descrs
+                .iter()
+                .find(|(idx, _)| *idx == field_idx)
+                .map(|(_, d)| d.index())
+                .unwrap_or(field_idx);
+            fields.push((descr_idx, base_idx + fields.len()));
         }
-        let field_offsets: Vec<usize> = fields
-            .iter()
-            .enumerate()
-            .map(|(i, (fidx, _))| {
-                let offset = field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.offset())
-                    .unwrap_or(0);
-                debug_assert!(
-                    offset > 0 || field_descrs.is_empty(),
-                    "field_descrs missing for field[{}] idx={}",
-                    i,
-                    fidx
-                );
-                offset
-            })
-            .collect();
         Some(majit_ir::GuardVirtualEntry {
             fail_arg_index: fa_idx,
             descr,
             known_class,
             fields,
-            field_offsets,
         })
     }
 

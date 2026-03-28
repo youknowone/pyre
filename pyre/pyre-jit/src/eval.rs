@@ -1008,8 +1008,11 @@ fn maybe_compile_and_run(
         return None;
     }
     // warmstate.py:482-509: compiled procedure_token exists.
-    // RPython NEVER falls through to counter when compiled cell exists.
-    // Either execute_assembler runs, or return without counter tick.
+    // RPython enters via target_tokens dispatch. Until target_tokens
+    // is implemented, check merge_pc compatibility. Incompatible entries
+    // fall through to counter to allow independent inner loop compilation.
+    // TODO: when target_tokens dispatch is implemented, return None for
+    // incompatible entries (RPython warmstate.py:482 parity).
     if driver.has_compiled_loop(green_key) {
         let compatible = driver
             .get_compiled_meta(green_key)
@@ -1017,11 +1020,8 @@ fn maybe_compile_and_run(
         if compatible {
             return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
         }
-        // Incompatible entry (e.g. cross-loop cut with inner merge_pc).
-        // RPython would enter via target_tokens dispatch; pyre skips.
-        // No counter tick — RPython warmstate.py:482 returns from this
-        // branch without touching the counter.
-        return None;
+        // Incompatible entry — fall through to counter so independent
+        // traces at the correct back-edge can be compiled.
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
@@ -2020,46 +2020,22 @@ fn materialize_virtual_from_rd(
         }
         _ => {} // Instance/Struct: fall through
     }
-    // resume.py:612-637: VirtualInfo (Instance, known_class=Some) vs
-    // VStructInfo (Struct, known_class=None). descr_size from SizeDescr.
-    let (known_class, fieldnums, field_offsets, field_types, descr_size): (
-        Option<i64>,
-        &[i16],
-        &[usize],
-        &[majit_ir::Type],
-        usize,
-    ) = match entry {
+    // Instance/Struct: extract fields for ob_type-based materialization.
+    let (known_class, fieldnums, field_offsets): (Option<i64>, &[i16], &[usize]) = match entry {
         majit_ir::RdVirtualInfo::Instance {
             known_class,
             fieldnums,
             field_offsets,
-            field_types,
-            descr_size,
             ..
-        } => (
-            *known_class,
-            fieldnums.as_slice(),
-            field_offsets.as_slice(),
-            field_types.as_slice(),
-            *descr_size,
-        ),
+        } => (*known_class, fieldnums.as_slice(), field_offsets.as_slice()),
         majit_ir::RdVirtualInfo::Struct {
-            known_class: struct_kc,
-            object_size,
             fieldnums,
             field_offsets,
-            field_types: struct_ft,
-            descr_size,
             ..
-        } => (
-            *struct_kc,
-            fieldnums.as_slice(),
-            field_offsets.as_slice(),
-            struct_ft.as_slice(),
-            *descr_size,
-        ),
+        } => (None, fieldnums.as_slice(), field_offsets.as_slice()),
         _ => unreachable!(),
     };
+    let _field_offsets = field_offsets;
 
     // resume.py:617-621 VirtualInfo.allocate parity:
     //   Phase 1: struct = allocate_with_vtable(descr)
@@ -2087,27 +2063,20 @@ fn materialize_virtual_from_rd(
         });
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
-        // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
-        let size = if descr_size > 0 {
-            descr_size
-        } else {
-            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-            (max_offset + 8).max(16)
-        };
+        // General struct: allocate based on max field offset + 8.
+        // resume.py:1437 allocate_with_vtable / allocate_struct parity.
+        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-        unsafe { *ptr = ob_type };
+        unsafe { *ptr = ob_type }; // ob_type at offset 0
         ptr as usize
-    } else if descr_size > 0 || !field_offsets.is_empty() {
-        // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
-        // Use descr_size (from SizeDescr) when available; fall back to
-        // field_offsets for size estimation.
-        let size = if descr_size > 0 {
-            descr_size
-        } else {
-            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-            (max_offset + 8).max((1 + fieldnums.len()) * 8)
-        };
+    } else if !field_offsets.is_empty() {
+        // VStructInfo without known_class but with field offsets:
+        // resume.py:634-637 VStructInfo.allocate uses typedescr for size.
+        // Pyre approximates from field_offsets.
+        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         ptr as usize
@@ -2190,43 +2159,17 @@ fn materialize_virtual_from_rd(
                 rd_virtuals_info,
                 virtuals_cache,
             );
-            // resume.py:1509-1518 setfield: type-dispatched write.
-            let Some(&byte_offset) = field_offsets.get(i) else {
-                debug_assert!(false, "field_offsets missing for field {}", i);
-                continue;
+            let raw = match val {
+                Value::Int(n) => n,
+                Value::Float(f) => f.to_bits() as i64,
+                Value::Ref(gc) => gc.0 as i64,
+                _ => 0,
             };
-            if byte_offset == 0 {
-                continue;
-            }
-            let ftype = field_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+            // resume.py:598-602: decoder.setfield(struct, num, descr)
+            // descr.offset() provides byte offset within the struct.
+            let byte_offset = field_offsets.get(i).copied().unwrap_or((1 + i) * 8); // fallback: contiguous after ob_type
             unsafe {
-                match ftype {
-                    majit_ir::Type::Ref => {
-                        let p = match val {
-                            Value::Ref(gc) => gc.0 as i64,
-                            Value::Int(n) => n,
-                            _ => 0,
-                        };
-                        *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = p;
-                    }
-                    majit_ir::Type::Float => {
-                        let bits = match val {
-                            Value::Float(f) => f.to_bits(),
-                            Value::Int(n) => n as u64,
-                            _ => 0,
-                        };
-                        *((obj_ptr as *mut u8).add(byte_offset) as *mut u64) = bits;
-                    }
-                    _ => {
-                        let raw = match val {
-                            Value::Int(n) => n,
-                            Value::Float(f) => f.to_bits() as i64,
-                            Value::Ref(gc) => gc.0 as i64,
-                            _ => 0,
-                        };
-                        *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
-                    }
-                }
+                *((obj_ptr as *mut u8).add(byte_offset) as *mut i64) = raw;
             }
         }
     }
@@ -2432,10 +2375,7 @@ fn restore_guard_failure_for_loop(
             // handle_fail parity), this should be replaced with proper
             // blackhole execution.
             let (driver, _) = driver_pair();
-            let loop_key = exit_layout.rd_loop_token;
-            if loop_key != 0 {
-                driver.remove_compiled_loop(loop_key);
-            }
+            driver.invalidate_compiled_trace(exit_layout.trace_id);
             return None;
         }
     }
