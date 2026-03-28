@@ -28,32 +28,6 @@ impl OpRef {
     }
 }
 
-/// Metadata for a virtual object in guard fail_args.
-///
-/// resume.py: ResumeDataVirtualAdder — instead of forcing a virtual at
-/// compile time, we record its shape so it can be reconstructed lazily
-/// on guard failure. The virtual's field values are stored as additional
-/// fail_args starting at `field_values_start`.
-#[derive(Clone, Debug)]
-pub struct GuardVirtualEntry {
-    /// Index in fail_args where this virtual was (now OpRef::NONE placeholder).
-    pub fail_arg_index: usize,
-    /// Type descriptor for the virtual object.
-    pub descr: DescrRef,
-    /// Known class pointer (for NewWithVtable objects).
-    pub known_class: Option<GcRef>,
-    /// Field descriptors and their positions in fail_args:
-    /// (field_descr_index, fail_arg_index_of_field_value).
-    pub fields: Vec<(u32, usize)>,
-    /// resume.py AbstractVirtualStructInfo.fielddescrs parity:
-    /// byte offsets from FieldDescr.offset(), parallel to `fields`.
-    pub field_offsets: Vec<usize>,
-    /// resume.py:1509-1518 setfield type dispatch parity.
-    pub field_types: Vec<Type>,
-    /// resume.py: fielddescr.field_size() for write width.
-    pub field_sizes: Vec<usize>,
-}
-
 /// resume.py:576-860: virtual object serialization for rd_virtuals_info.
 ///
 /// Each variant corresponds to a concrete virtual type in RPython's
@@ -90,6 +64,9 @@ pub enum RdVirtualInfo {
         descr_index: u32,
         size: usize,
         fielddescr_indices: Vec<u32>,
+        /// resume.py:757: fielddescrs[j].is_pointer_field/is_float_field dispatch.
+        /// Per-field type within each element: 0=ref, 1=int, 2=float.
+        field_types: Vec<u8>,
         fieldnums: Vec<i16>,
     },
     RawBuffer {
@@ -183,12 +160,6 @@ pub struct Op {
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     pub fail_arg_types: Option<Vec<Type>>,
-    /// Virtual objects in fail_args that should be reconstructed on guard
-    /// failure instead of being materialized at compile time.
-    ///
-    /// resume.py: ResumeDataVirtualAdder encodes virtual shapes so the
-    /// backend can lazily reconstruct them from stored field values.
-    pub rd_virtuals: Option<Vec<GuardVirtualEntry>>,
     /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values)
     /// to replay on guard failure after virtual materialization.
     /// resume.py: rd_pendingfields
@@ -285,7 +256,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             fail_arg_types: None,
-            rd_virtuals: None,
+
             rd_pendingfields: None,
             rd_resume_position: -1,
             rd_numb: None,
@@ -303,7 +274,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             fail_arg_types: None,
-            rd_virtuals: None,
+
             rd_pendingfields: None,
             rd_resume_position: -1,
             rd_numb: None,
@@ -3238,7 +3209,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3249,7 +3220,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3260,7 +3231,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
@@ -3283,7 +3254,7 @@ mod tests {
             descr: None,
             pos: OpRef(6),
             fail_args: None,
-            rd_virtuals: None,
+
             fail_arg_types: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
@@ -3300,7 +3271,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
-            rd_virtuals: None,
+
             fail_arg_types: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
@@ -3317,7 +3288,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
-            rd_virtuals: None,
+
 
             fail_arg_types: None,
             rd_pendingfields: None,
@@ -3335,7 +3306,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
-            rd_virtuals: None,
+
             fail_arg_types: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
@@ -3352,7 +3323,7 @@ mod tests {
             descr: None,
             pos: OpRef(1),
             fail_args: None,
-            rd_virtuals: None,
+
             fail_arg_types: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
@@ -3373,7 +3344,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(1),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3384,7 +3355,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3395,7 +3366,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
@@ -3416,7 +3387,7 @@ mod tests {
             descr: None,
             pos: OpRef::NONE,
             fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(10_000)]),
-            rd_virtuals: None,
+
 
             fail_arg_types: None,
             rd_pendingfields: None,
@@ -3449,7 +3420,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3460,7 +3431,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3471,7 +3442,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3482,7 +3453,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
@@ -3516,7 +3487,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(1),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3527,7 +3498,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(2),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3538,7 +3509,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3549,7 +3520,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
@@ -3580,7 +3551,7 @@ mod tests {
             descr: Some(descr),
             pos: OpRef::NONE,
             fail_args: None,
-            rd_virtuals: None,
+
             fail_arg_types: None,
             rd_pendingfields: None,
             rd_resume_position: -1,
@@ -3612,7 +3583,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3623,7 +3594,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(2),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3634,7 +3605,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(3),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3645,7 +3616,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3656,7 +3627,7 @@ mod tests {
                 descr: None,
                 pos: OpRef(4),
                 fail_args: None,
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3667,7 +3638,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,
@@ -3701,7 +3672,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0)]),
-                rd_virtuals: None,
+
                 fail_arg_types: None,
                 rd_pendingfields: None,
                 rd_resume_position: -1,
@@ -3712,7 +3683,7 @@ mod tests {
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]),
-                rd_virtuals: None,
+
 
                 fail_arg_types: None,
                 rd_pendingfields: None,

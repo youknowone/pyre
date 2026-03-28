@@ -8849,12 +8849,18 @@ fn collect_guards(
                 rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
 
             // Rebuild frame slots from rd_numb values.
+            // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
+            let mut vidx_to_slot: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
             let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
             for frame in &frames {
                 for val in &frame.values {
                     new_slots.push(match val {
                         RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
-                        RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
+                        RebuiltValue::Virtual(vidx) => {
+                            vidx_to_slot.insert(*vidx, new_slots.len());
+                            ExitValueSourceLayout::Virtual(*vidx)
+                        }
                         RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
                         RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
@@ -8862,8 +8868,20 @@ fn collect_guards(
                 }
             }
             if let Some(frame) = recovery_layout.frames.last_mut() {
+                // Rebuild slot_types to match new slots length.
+                // ExitValue → use original type (from fail_arg_types).
+                // Virtual/Constant/Uninitialized → Ref (default for objects).
+                let new_slot_types: Vec<Type> = new_slots
+                    .iter()
+                    .map(|slot| match slot {
+                        ExitValueSourceLayout::ExitValue(idx) => {
+                            fail_arg_types.get(*idx).copied().unwrap_or(Type::Ref)
+                        }
+                        _ => Type::Ref,
+                    })
+                    .collect();
                 frame.slots = new_slots;
-                frame.slot_types = None; // will be re-derived by backend
+                frame.slot_types = Some(new_slot_types);
             }
 
             // Build virtual_layouts from rd_virtuals_info.
@@ -8897,7 +8915,8 @@ fn collect_guards(
             // Build virtual_layouts from rd_virtuals_info or rd_virtuals.
             recovery_layout.virtual_layouts.clear();
             if let Some(rd_vi_slice) = rd_vi {
-                for entry in rd_vi_slice.iter() {
+                for (vidx, entry) in rd_vi_slice.iter().enumerate() {
+                    let target_slot = vidx_to_slot.get(&vidx).copied();
                     let layout = match entry {
                         majit_ir::RdVirtualInfo::Instance {
                             descr_index,
@@ -8909,7 +8928,7 @@ fn collect_guards(
                             type_id: known_class.map_or(0, |kc| kc as u32),
                             descr_index: *descr_index,
                             fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                            target_slot: None,
+                            target_slot,
                         },
                         majit_ir::RdVirtualInfo::Struct {
                             descr_index,
@@ -8920,7 +8939,7 @@ fn collect_guards(
                             type_id: 0,
                             descr_index: *descr_index,
                             fields: resolve_fieldnums(fieldnums, fielddescr_indices),
-                            target_slot: None,
+                            target_slot,
                         },
                         majit_ir::RdVirtualInfo::Array {
                             descr_index,
@@ -8940,6 +8959,7 @@ fn collect_guards(
                             descr_index,
                             size,
                             fielddescr_indices,
+                            field_types,
                             fieldnums,
                         } => {
                             let fpe = if *size > 0 {
@@ -8949,6 +8969,7 @@ fn collect_guards(
                             };
                             ExitVirtualLayout::ArrayStruct {
                                 descr_index: *descr_index,
+                                field_types: field_types.clone(),
                                 element_fields: (0..*size)
                                     .map(|ei| {
                                         let s = ei * fpe;
@@ -8987,39 +9008,6 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::Empty => continue,
-                    };
-                    recovery_layout.virtual_layouts.push(layout);
-                }
-            } else if let Some(ref rd_virtuals) = op.rd_virtuals {
-                // Fallback: build virtual_layouts from GuardVirtualEntry
-                // (for guards without rd_virtuals_info, e.g. fallback path).
-                for entry in rd_virtuals {
-                    let fields: Vec<(u32, ExitValueSourceLayout)> = entry
-                        .fields
-                        .iter()
-                        .map(|&(field_descr_idx, field_fail_arg_idx)| {
-                            (
-                                field_descr_idx,
-                                ExitValueSourceLayout::ExitValue(field_fail_arg_idx),
-                            )
-                        })
-                        .collect();
-                    let descr_index = entry.descr.index();
-                    let type_id = entry.known_class.map_or(0, |gc| gc.0 as u32);
-                    let layout = if entry.known_class.is_some() {
-                        ExitVirtualLayout::Object {
-                            type_id,
-                            descr_index,
-                            fields,
-                            target_slot: Some(entry.fail_arg_index),
-                        }
-                    } else {
-                        ExitVirtualLayout::Struct {
-                            type_id,
-                            descr_index,
-                            fields,
-                            target_slot: Some(entry.fail_arg_index),
-                        }
                     };
                     recovery_layout.virtual_layouts.push(layout);
                 }

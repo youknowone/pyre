@@ -1904,17 +1904,21 @@ fn materialize_virtual_from_rd(
             return result;
         }
         majit_ir::RdVirtualInfo::ArrayStruct {
-            size, fieldnums, ..
+            size,
+            field_types,
+            fieldnums,
+            ..
         } => {
             // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
             // then setinteriorfield(i, array, num, fielddescrs[j]).
-            // Array has self.size elements; total fieldnums = size * fields_per_elem.
             let fields_per_elem = if *size > 0 {
                 fieldnums.len() / *size
             } else {
                 0
             };
-            let total = fieldnums.len(); // flat size for backing storage
+            // resume.py:750: allocate with self.size elements, clear=True.
+            // Flat backing store: size * fields_per_elem slots.
+            let total = fieldnums.len();
             let array = pyre_object::allocate_array(total, pyre_object::ArrayKind::Ref, true);
             // resume.py:751: virtuals_cache.set_ptr BEFORE setfields
             let result = Value::Ref(majit_ir::GcRef(array as usize));
@@ -1940,14 +1944,15 @@ fn materialize_virtual_from_rd(
                         virtuals_cache,
                     );
                     if let Some(val) = v {
-                        // resume.py:757: setinteriorfield(i, array, num, fielddescrs[j])
-                        pyre_object::setinteriorfield(
-                            array,
-                            i,
-                            j,
-                            fields_per_elem,
-                            box_opt_value(&Some(val)),
-                        );
+                        // resume.py:757,1520-1529: setinteriorfield with type dispatch.
+                        let ft = field_types.get(j).copied().unwrap_or(0);
+                        let raw = match val {
+                            Value::Int(i) => i,
+                            Value::Float(f) => f.to_bits() as i64,
+                            Value::Ref(r) => r.0 as i64,
+                            Value::Void => 0,
+                        };
+                        pyre_object::setinteriorfield(array, i, j, fields_per_elem, ft, raw);
                     }
                 }
             }
@@ -2090,8 +2095,7 @@ fn materialize_virtual_from_rd(
         ptr as usize
     } else if descr_size > 0 {
         // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
-        // pyre NEW (no vtable): ob_type is stored as field[0] at offset 0.
-        // Allocate raw memory; setfield will write ob_type at offset 0.
+        // resume.py:634 allocate_struct(typedescr): allocate zeroed memory.
         let layout = std::alloc::Layout::from_size_align(descr_size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         ptr as usize
@@ -2889,7 +2893,11 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 // resume.py:654: return array GcRef directly
                 materialized.push(array as usize);
             }
-            majit_codegen::ExitVirtualLayout::ArrayStruct { element_fields, .. } => {
+            majit_codegen::ExitVirtualLayout::ArrayStruct {
+                field_types,
+                element_fields,
+                ..
+            } => {
                 // resume.py:748-760: allocate_array(self.size, arraydescr, clear=True)
                 // then setinteriorfield(i, array, num, fielddescrs[j]).
                 let size = element_fields.len();
@@ -2900,12 +2908,14 @@ fn rebuild_state_after_failure_from_recovery_layout(
                     for (j, (_, src)) in ef.iter().enumerate() {
                         if let Some(val) = resolve_value(src, &materialized) {
                             // resume.py:757: setinteriorfield(i, array, num, descr)
+                            let ft = field_types.get(j).copied().unwrap_or(0);
                             pyre_object::setinteriorfield(
                                 array,
                                 i,
                                 j,
                                 fields_per_elem,
-                                val as pyre_object::PyObjectRef,
+                                ft,
+                                val as i64,
                             );
                         }
                     }

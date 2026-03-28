@@ -110,6 +110,9 @@ pub enum ExitVirtualLayout {
     },
     ArrayStruct {
         descr_index: u32,
+        /// Per-field type within each element: 0=ref, 1=int, 2=float.
+        /// resume.py:757 fielddescrs[j].is_pointer_field/is_float_field.
+        field_types: Vec<u8>,
         element_fields: Vec<Vec<(u32, ExitValueSourceLayout)>>,
     },
     /// resume.py:717 VRawSliceInfo — base_buffer + offset.
@@ -178,9 +181,11 @@ impl ExitVirtualLayout {
             },
             Self::ArrayStruct {
                 descr_index,
+                field_types,
                 element_fields,
             } => Self::ArrayStruct {
                 descr_index: *descr_index,
+                field_types: field_types.clone(),
                 element_fields: element_fields
                     .iter()
                     .map(|element| {

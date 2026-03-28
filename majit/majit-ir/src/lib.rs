@@ -11,8 +11,8 @@ pub use descr::{
     SimpleFailDescr, SizeDescr, make_array_descr, make_field_descr, unpack_fielddescr,
 };
 pub use resoperation::{
-    BoxEnv, GuardPendingFieldEntry, GuardVirtualEntry, OPCODE_COUNT, Op, OpCode, OpRef,
-    RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
+    BoxEnv, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode, OpRef, RdVirtualInfo,
+    VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,

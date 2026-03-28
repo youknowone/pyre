@@ -12,9 +12,23 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{GcRef, GuardVirtualEntry, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
+
+/// Transient metadata for a virtual in guard fail_args.
+/// Used only within store_final_boxes_in_guard → finalize_guard_resume_data;
+/// never stored on Op. Converted to RdVirtualInfo by the fallback numbering path.
+#[derive(Clone, Debug)]
+pub(crate) struct GuardVirtualEntry {
+    pub fail_arg_index: usize,
+    pub descr: DescrRef,
+    pub known_class: Option<GcRef>,
+    pub fields: Vec<(u32, usize)>,
+    pub field_offsets: Vec<usize>,
+    pub field_types: Vec<Type>,
+    pub field_sizes: Vec<usize>,
+}
 
 /// bridgeopt.py: serialized optimizer knowledge for guard resume data.
 ///
@@ -2391,7 +2405,6 @@ impl Optimizer {
                 // Copy complete resume data so store_final_boxes_in_guard is a no-op.
                 op.rd_numb = last.rd_numb.clone();
                 op.rd_consts = last.rd_consts.clone();
-                op.rd_virtuals = last.rd_virtuals.clone();
                 op.rd_virtuals_info = last.rd_virtuals_info.clone();
             } else {
                 // optimizer.py:678: store_final_boxes_in_guard
@@ -2581,7 +2594,6 @@ impl Optimizer {
     /// virtual field values, and creates GuardVirtualEntry for materialization.
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
-        use majit_ir::GuardVirtualEntry;
 
         // When fail_args is None (guards from inline_short_preamble),
         // RPython's store_final_boxes_in_guard uses ResumeDataVirtualAdder
@@ -2594,7 +2606,7 @@ impl Optimizer {
         };
 
         let original_len = fail_args.len();
-        let mut virtual_entries: Vec<GuardVirtualEntry> = op.rd_virtuals.take().unwrap_or_default();
+        let mut virtual_entries: Vec<GuardVirtualEntry> = Vec::new();
         let mut extra_fail_args: Vec<OpRef> = Vec::new();
 
         for fa_idx in 0..original_len {
@@ -2689,14 +2701,10 @@ impl Optimizer {
             }
         }
 
-        if !virtual_entries.is_empty() {
-            op.rd_virtuals = Some(virtual_entries);
-        }
-
         // resume.py ResumeDataVirtualAdder.finish() parity:
-        // Generate rd_numb + rd_consts + rd_virtuals in the SAME call as
+        // Generate rd_numb + rd_consts + rd_virtuals_info in the SAME call as
         // fail_args finalization. RPython does not defer to a later phase.
-        ctx.finalize_guard_resume_data(&mut op);
+        ctx.finalize_guard_resume_data(&mut op, &virtual_entries);
 
         op
     }
@@ -2713,7 +2721,7 @@ impl Optimizer {
         original_len: usize,
         extra_fail_args: &mut Vec<OpRef>,
         ctx: &mut OptContext,
-    ) -> Option<majit_ir::GuardVirtualEntry> {
+    ) -> Option<GuardVirtualEntry> {
         use crate::optimizeopt::info::PtrInfo;
         let (fields_vec, field_descrs, descr, known_class) = match info {
             PtrInfo::Virtual(v) => (&v.fields, &v.field_descrs, v.descr.clone(), v.known_class),
@@ -2776,7 +2784,7 @@ impl Optimizer {
                     .unwrap_or(8)
             })
             .collect();
-        Some(majit_ir::GuardVirtualEntry {
+        Some(GuardVirtualEntry {
             fail_arg_index: fa_idx,
             descr,
             known_class,
@@ -3685,10 +3693,7 @@ mod tests {
             guard.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        assert!(
-            guard.rd_virtuals.is_some(),
-            "rd_virtuals should be set (GuardVirtualEntry from store_final_boxes_in_guard)"
-        );
+        // rd_virtuals removed — rd_virtuals_info is produced by number_guard_inline_impl.
         let fail_args = guard
             .fail_args
             .as_ref()

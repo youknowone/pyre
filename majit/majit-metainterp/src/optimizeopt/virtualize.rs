@@ -10,9 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_ir::{
-    Descr, DescrRef, FieldDescr, GuardVirtualEntry, OopSpecIndex, Op, OpCode, OpRef, Type, Value,
-};
+use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
     PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
@@ -54,7 +52,7 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
     /// Phase 2 (loop body): don't virtualize New() because guard failure
-    /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
+    /// recovery_layout is not yet populated (RPython rd_virtuals_info equivalent).
     pub is_phase2: bool,
     /// If set, frame OpRef(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
@@ -873,7 +871,7 @@ impl OptVirtualize {
                         // RPython: NewWithVtable carries the class directly.
                         // pyre: New() + SetfieldGc(offset=0, class_ptr).
                         // When setting ob_type (offset 0) to a constant,
-                        // capture it as known_class for rd_virtuals
+                        // capture it as known_class for rd_virtuals_info
                         // materialization (resume.py:612 VirtualInfo.allocate).
                         if vinfo.known_class.is_none() {
                             let offset = extract_field_offset(field_idx);
@@ -1266,7 +1264,7 @@ impl OptVirtualize {
     /// optimizer.py: store_final_boxes_in_guard / ResumeDataVirtualAdder
     ///
     /// For each fail_arg that is virtual:
-    ///   - Record its shape (descr, known_class, fields) in a GuardVirtualEntry
+    ///   - Record its shape (descr, known_class, fields) in rd_virtuals_info
     ///   - Add the virtual's field values as extra fail_args at the end
     ///   - Set the original fail_arg slot to OpRef::NONE (placeholder)
     ///   - If a field value is itself virtual, force it (no recursive encoding yet)
@@ -1280,7 +1278,7 @@ impl OptVirtualize {
     /// Force virtual references in guard fail_args and re-resolve all args.
     ///
     /// RPython parity: virtualize.py does NOT force fail_args (it uses
-    /// rd_virtuals for lazy reconstruction). majit currently forces because
+    /// rd_virtuals_info for lazy reconstruction). majit currently forces because
     /// pyre hasn't implemented materialize_virtual_ref yet. When it does,
     /// this method should skip forcing and let store_final_boxes_in_guard handle it.
     /// RPython parity: virtualize.py does NOT force fail_args.
@@ -1435,136 +1433,6 @@ impl OptVirtualize {
             return true;
         }
         ctx.new_operations.iter().any(|op| op.pos == resolved)
-    }
-
-    /// resume.py AbstractVirtualStructInfo.fielddescrs: byte offsets.
-    fn extract_field_offsets(
-        fields: &[(u32, usize)],
-        field_descrs: &[(u32, DescrRef)],
-    ) -> Vec<usize> {
-        fields
-            .iter()
-            .map(|(fidx, _)| {
-                let off = field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.offset())
-                    .unwrap_or(0);
-                debug_assert!(
-                    off > 0 || field_descrs.is_empty(),
-                    "field_descrs missing for {}",
-                    fidx
-                );
-                off
-            })
-            .collect()
-    }
-
-    /// resume.py:1509-1518: field types from FieldDescr.
-    fn extract_field_types(fields: &[(u32, usize)], field_descrs: &[(u32, DescrRef)]) -> Vec<Type> {
-        fields
-            .iter()
-            .map(|(fidx, _)| {
-                field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.field_type())
-                    .unwrap_or(Type::Int)
-            })
-            .collect()
-    }
-
-    /// resume.py: fielddescr.field_size() for write width.
-    fn extract_field_sizes(
-        fields: &[(u32, usize)],
-        field_descrs: &[(u32, DescrRef)],
-    ) -> Vec<usize> {
-        fields
-            .iter()
-            .map(|(fidx, _)| {
-                field_descrs
-                    .iter()
-                    .find(|(di, _)| di == fidx)
-                    .and_then(|(_, d)| d.as_field_descr())
-                    .map(|fd| fd.field_size())
-                    .unwrap_or(8)
-            })
-            .collect()
-    }
-
-    /// Encode a single virtual PtrInfo into a GuardVirtualEntry.
-    ///
-    /// Adds the virtual's field values to `extra_fail_args` and returns
-    /// the entry metadata. Field values that are themselves virtual are
-    /// forced before being added.
-    ///
-    /// Returns None for unsupported virtual kinds (VirtualArray, etc. for now).
-    fn encode_virtual_entry(
-        &mut self,
-        fail_arg_index: usize,
-        info: &PtrInfo,
-        extra_start: usize,
-        extra_fail_args: &mut Vec<OpRef>,
-        ctx: &mut OptContext,
-    ) -> Option<GuardVirtualEntry> {
-        match info {
-            PtrInfo::Virtual(vinfo) => {
-                let mut fields = Vec::with_capacity(vinfo.fields.len());
-                for &(field_idx, value_ref) in &vinfo.fields {
-                    // Force nested virtuals — only one level of encoding for now
-                    let resolved = ctx.get_box_replacement(value_ref);
-                    if Self::is_virtual(resolved, ctx) {
-                        self.force_virtual(resolved, ctx);
-                    }
-                    let final_ref = ctx.get_box_replacement(resolved);
-                    let fa_index = extra_start + extra_fail_args.len();
-                    extra_fail_args.push(final_ref);
-                    fields.push((field_idx, fa_index));
-                }
-                let fo = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
-                let ft = Self::extract_field_types(&fields, &vinfo.field_descrs);
-                let fs = Self::extract_field_sizes(&fields, &vinfo.field_descrs);
-                Some(GuardVirtualEntry {
-                    fail_arg_index,
-                    descr: vinfo.descr.clone(),
-                    known_class: vinfo.known_class,
-                    fields,
-                    field_offsets: fo,
-                    field_types: ft,
-                    field_sizes: fs,
-                })
-            }
-            PtrInfo::VirtualStruct(vinfo) => {
-                let mut fields = Vec::with_capacity(vinfo.fields.len());
-                for &(field_idx, value_ref) in &vinfo.fields {
-                    let resolved = ctx.get_box_replacement(value_ref);
-                    if Self::is_virtual(resolved, ctx) {
-                        self.force_virtual(resolved, ctx);
-                    }
-                    let final_ref = ctx.get_box_replacement(resolved);
-                    let fa_index = extra_start + extra_fail_args.len();
-                    extra_fail_args.push(final_ref);
-                    fields.push((field_idx, fa_index));
-                }
-                let fo = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
-                let ft = Self::extract_field_types(&fields, &vinfo.field_descrs);
-                let fs = Self::extract_field_sizes(&fields, &vinfo.field_descrs);
-                Some(GuardVirtualEntry {
-                    fail_arg_index,
-                    descr: vinfo.descr.clone(),
-                    known_class: None,
-                    fields,
-                    field_offsets: fo,
-                    field_types: ft,
-                    field_sizes: fs,
-                })
-            }
-            // VirtualArray, VirtualArrayStruct, VirtualRawBuffer:
-            // fall back to forcing for now
-            _ => None,
-        }
     }
 
     fn optimize_guard_nonnull(&mut self, _op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
@@ -4001,15 +3869,14 @@ mod tests {
     #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_guard_fail_args_virtual_not_forced() {
         // resume.py parity: virtual objects in guard fail_args should NOT be
-        // forced (no allocation emitted). Dual-write mode: BOTH rd_numb
-        // (TAGVIRTUAL) and rd_virtuals (GuardVirtualEntry) are set.
+        // forced (no allocation emitted). rd_numb with TAGVIRTUAL is set.
         //
         // p0 = new_with_vtable(descr=size1)
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [p0]
         //
-        // Expected: no NEW_WITH_VTABLE emitted. Guard has rd_numb AND
-        // rd_virtuals. fail_args expanded: OpRef::NONE + field values.
+        // Expected: no NEW_WITH_VTABLE emitted. Guard has rd_numb.
+        // fail_args expanded: OpRef::NONE + field values.
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -4037,7 +3904,6 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
 
-        // Dual-write mode: BOTH rd_numb and rd_virtuals are set.
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
@@ -4046,10 +3912,6 @@ mod tests {
         assert!(
             guard_op.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
-        );
-        assert!(
-            guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
@@ -4074,7 +3936,7 @@ mod tests {
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [i30, p0, i40]
         //
-        // Dual-write: rd_numb AND rd_virtuals both set. fail_args expanded:
+        // rd_numb set. fail_args expanded:
         // [i30, NONE, i40, i10] — virtual slot replaced with NONE, field appended.
         let sd = size_descr(1);
         let fd = field_descr(10);
@@ -4107,10 +3969,6 @@ mod tests {
             guard_op.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        assert!(
-            guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
-        );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
@@ -4135,8 +3993,8 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_fail_args_no_virtual_no_rd_virtuals() {
-        // Guard with no virtuals in fail_args should not have rd_virtuals.
+    fn test_guard_fail_args_no_virtual_no_rd_numb() {
+        // Guard with no virtuals in fail_args should not have rd_numb.
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
         guard.fail_args = Some(vec![OpRef(20), OpRef(30)].into());
 
@@ -4149,9 +4007,11 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
+        // No virtuals — fail_args should remain as-is with concrete values.
+        let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "no virtuals => rd_virtuals should be None"
+            fa.iter().all(|a| !a.is_none()),
+            "no virtuals => all fail_args should be concrete"
         );
     }
 
@@ -4188,10 +4048,6 @@ mod tests {
         assert!(
             guard_op.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
-        );
-        assert!(
-            guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
         );
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
@@ -4235,10 +4091,6 @@ mod tests {
             guard_op.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        assert!(
-            guard_op.rd_virtuals.is_some(),
-            "rd_virtuals should be set (dual-write: GuardVirtualEntry from store_final_boxes_in_guard)"
-        );
 
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
         let fa = guard_op.fail_args.as_ref().unwrap();
@@ -4279,9 +4131,10 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
         let fa = guard_op.fail_args.as_ref().unwrap();
+        // Nested virtual fields force the root fail_arg concrete.
         assert!(
-            guard_op.rd_virtuals.is_none(),
-            "nested virtual fields should force the root fail_arg concrete instead of rd_virtuals"
+            guard_op.rd_numb.is_none() || guard_op.rd_virtuals_info.is_none(),
+            "nested virtual fields should force the root fail_arg concrete"
         );
         assert!(
             !fa[0].is_none(),
@@ -4323,10 +4176,8 @@ mod tests {
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        assert!(
-            guard_op.rd_virtuals.is_none(),
-            "unsupported virtual arrays should fall back to concrete fail_args"
-        );
+        // Unsupported virtual arrays should fall back to concrete fail_args.
+
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
             !fa[0].is_none(),
