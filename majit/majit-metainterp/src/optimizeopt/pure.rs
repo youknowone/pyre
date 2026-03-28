@@ -56,59 +56,62 @@ impl PureOpKey {
     }
 }
 
-/// Cache mapping (opcode, args) -> result OpRef for recently seen pure operations.
+/// pure.py:36-95 RecentPureOps — fixed-size ring buffer with linear scan.
 ///
-/// Translated from RecentPureOps in pure.py.
-/// Uses a HashMap for O(1) lookup instead of the Python linear-scan ring buffer,
-/// combined with an LRU eviction list capped at `limit` entries.
+/// RPython uses a flat array of Op references, scanned linearly on lookup.
+/// At limit=16 (pureop_historylength), linear scan beats HashMap because:
+/// - No hashing overhead or Vec<OpRef> allocation per lookup
+/// - Cache-friendly sequential memory access
+/// - Typical hit is within first few entries
 struct RecentPureOps {
-    map: HashMap<PureOpKey, OpRef>,
-    /// Ring buffer of keys for LRU eviction.
-    order: Vec<Option<PureOpKey>>,
+    /// Ring buffer of (key, result) pairs. None = empty slot.
+    lst: Vec<Option<(PureOpKey, OpRef)>>,
     next_index: usize,
 }
 
 impl RecentPureOps {
     fn new(limit: usize) -> Self {
         RecentPureOps {
-            map: HashMap::with_capacity(limit),
-            order: vec![None; limit],
+            lst: vec![None; limit],
             next_index: 0,
         }
     }
 
-    /// Record that `key` produces the result `result`.
+    /// pure.py:41-48 — add(op): record a pure operation result.
     fn insert(&mut self, key: PureOpKey, result: OpRef) {
-        // Evict the oldest entry if the slot is occupied.
-        if let Some(old_key) = self.order[self.next_index].take() {
-            self.map.remove(&old_key);
-        }
-        self.order[self.next_index] = Some(key.clone());
-        self.map.insert(key, result);
+        self.lst[self.next_index] = Some((key, result));
         self.next_index += 1;
-        if self.next_index >= self.order.len() {
+        if self.next_index >= self.lst.len() {
             self.next_index = 0;
         }
     }
 
     /// Look up a previously recorded result for the given key.
+    /// Linear scan matching pure.py:81-95 lookup().
     fn lookup(&self, key: &PureOpKey) -> Option<OpRef> {
-        self.map.get(key).copied()
+        for entry in &self.lst {
+            let Some((k, result)) = entry else {
+                break; // None = no more entries
+            };
+            if k == key {
+                return Some(*result);
+            }
+        }
+        None
     }
 
-    /// pure.py: lookup1(opt, box0, descr) — look up a unary pure operation.
-    /// Searches for any cached op with the given opcode and single arg.
+    /// pure.py:57-65 lookup1(opt, box0, descr).
     fn lookup1(&self, opcode: OpCode, arg0: OpRef) -> Option<OpRef> {
-        let key = PureOpKey {
-            opcode,
-            args: vec![arg0],
-            descr_index: None,
-        };
-        self.map.get(&key).copied()
+        for entry in &self.lst {
+            let Some((k, result)) = entry else { break };
+            if k.opcode == opcode && k.args.len() == 1 && k.args[0] == arg0 {
+                return Some(*result);
+            }
+        }
+        None
     }
 
-    /// pure.py: lookup2(opt, box0, box1, descr, commutative)
-    /// Look up a binary pure operation, optionally checking swapped args.
+    /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
     fn lookup2(
         &self,
         opcode: OpCode,
@@ -116,21 +119,17 @@ impl RecentPureOps {
         arg1: OpRef,
         commutative: bool,
     ) -> Option<OpRef> {
-        let key = PureOpKey {
-            opcode,
-            args: vec![arg0, arg1],
-            descr_index: None,
-        };
-        if let Some(result) = self.map.get(&key).copied() {
-            return Some(result);
-        }
-        if commutative {
-            let key_swapped = PureOpKey {
-                opcode,
-                args: vec![arg1, arg0],
-                descr_index: None,
-            };
-            return self.map.get(&key_swapped).copied();
+        for entry in &self.lst {
+            let Some((k, result)) = entry else { break };
+            if k.opcode != opcode || k.args.len() != 2 {
+                continue;
+            }
+            if k.args[0] == arg0 && k.args[1] == arg1 {
+                return Some(*result);
+            }
+            if commutative && k.args[0] == arg1 && k.args[1] == arg0 {
+                return Some(*result);
+            }
         }
         None
     }
@@ -843,7 +842,7 @@ impl Optimization for OptPure {
     }
 
     fn setup(&mut self) {
-        let limit = self.cache.order.len();
+        let limit = self.cache.lst.len();
         self.cache = RecentPureOps::new(limit);
         self.loopinvariant_cache.clear();
         self.postponed_op = None;
