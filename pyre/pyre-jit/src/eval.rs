@@ -1287,11 +1287,10 @@ fn execute_assembler(
                             return None;
                         }
                         // RPython compile.py:710: blackhole resume succeeds.
-                        // Pyre limitation: compiled code partially modifies heap
-                        // before guard failure (forced virtuals in JUMP args).
-                        // Invalidate to prevent double-update on re-entry.
-                        // TODO: remove when short preamble guards are complete
-                        // (will protect re-entry from wrong values).
+                        // RPython does NOT invalidate here, but pyre needs to
+                        // until bridge compilation is robust. Without invalidation,
+                        // re-entry accumulates guard failures → bridge threshold
+                        // → bridge compile → Cranelift assertion (incomplete bridge).
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
