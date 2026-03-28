@@ -4898,7 +4898,15 @@ impl MIFrame {
             }
         }
         match step_result {
-            Err(_) => TraceAction::Abort,
+            Err(ref e) => {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][abort-reason] trace_code_step err at pc={} instr={:?} err={:?}",
+                        pc, instruction, e
+                    );
+                }
+                TraceAction::Abort
+            }
             other => self.into_trace_action(other),
         }
     }
@@ -6638,10 +6646,17 @@ impl JitState for PyreJitState {
         // Unified array: locals at base+0..base+nlocals, stack at base+nlocals..
         sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
         sym.nlocals = _meta.num_locals;
+        sym.valuestackdepth = _meta.valuestackdepth;
         sym.symbolic_local_types =
             _meta.slot_types[.._meta.num_locals.min(_meta.slot_types.len())].to_vec();
         sym.symbolic_stack_types =
             _meta.slot_types[_meta.num_locals.min(_meta.slot_types.len())..].to_vec();
+        // Pre-size symbolic_stack with OpRef::NONE for lazy loading from
+        // the concrete frame (RPython rebuild_state_after_failure parity:
+        // bridge traces start mid-execution with values on the stack).
+        let stack_only = _meta.valuestackdepth.saturating_sub(_meta.num_locals);
+        sym.symbolic_stack = vec![OpRef::NONE; stack_only];
+        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
         sym
     }
 
