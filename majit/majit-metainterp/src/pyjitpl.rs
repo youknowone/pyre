@@ -1985,11 +1985,19 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:288 parity: preserve preamble target_tokens
                 // even on InvalidLoop/panic. The unroller's Phase 1 created
                 // target_tokens that the next retrace needs.
+                // Store in compiled_loops if available, otherwise in
+                // pending_preamble_tokens for the first InvalidLoop before
+                // any successful compilation (RPython: jitcell_token.
+                // target_tokens = [start_descr] before Phase 2 runs).
                 if is_invalid_loop && !unroll_opt.target_tokens.is_empty() {
                     if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                         if compiled.front_target_tokens.is_empty() {
                             compiled.front_target_tokens = unroll_opt.target_tokens.clone();
                         }
+                    } else {
+                        self.pending_preamble_tokens
+                            .entry(green_key)
+                            .or_insert_with(|| unroll_opt.target_tokens.clone());
                     }
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
