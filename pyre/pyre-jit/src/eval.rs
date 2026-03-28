@@ -1003,8 +1003,22 @@ fn maybe_compile_and_run(
         return None;
     }
     // warmstate.py:482-511: JC_COMPILED → execute_assembler (no counter tick)
+    // RPython uses target_tokens to select the right entry point within a
+    // JitCellToken. Until target_tokens dispatch is fully implemented,
+    // check that the compiled entry's merge_pc matches the current back-edge.
+    // Incompatible entries (e.g. cross-loop cut with inner merge_pc stored
+    // under outer key) are skipped, allowing the counter to tick and
+    // an independent trace to be compiled at the correct back-edge key.
     if driver.has_compiled_loop(green_key) {
-        return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+        let compatible = driver
+            .get_compiled_meta(green_key)
+            .map_or(false, |meta| meta.merge_pc == loop_header_pc);
+        if compatible {
+            return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+        }
+        // Incompatible entry — fall through to counter.
+        // RPython equivalent: target_tokens has no matching target for
+        // this entry state → retrace to produce a compatible one.
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
@@ -2086,12 +2100,16 @@ fn restore_guard_failure_for_loop(
         if still_null {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], invalidate trace {}",
-                    frame_end, exit_layout.trace_id
+                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], skip recovery (rd_virtuals gap)",
+                    frame_end
                 );
             }
-            let (driver, _) = driver_pair();
-            driver.invalidate_compiled_trace(exit_layout.trace_id);
+            // RPython compile.py:701 handle_fail: bridge compile or blackhole
+            // resume. No permanent invalidation. The null Refs are from
+            // incomplete rd_virtuals materialization (pyre limitation).
+            // Return None to signal "recovery failed" — the caller
+            // (execute_assembler) restores saved frame state.
+            // Entry is NOT invalidated or removed.
             return None;
         }
     }

@@ -155,17 +155,6 @@ impl TraceCtx {
             .find(|mp| mp.green_key == key && mp.header_pc == header_pc)
     }
 
-    /// Find merge point by header_pc only, ignoring green_key.
-    /// Used by compile_loop for cross-loop cut detection: the inner
-    /// merge point may have been registered under a different key
-    /// (back_edge_key) than the trace's green_key (outer key).
-    pub fn get_merge_point_by_pc(&self, header_pc: usize) -> Option<&MergePoint> {
-        self.current_merge_points
-            .iter()
-            .rev()
-            .find(|mp| mp.header_pc == header_pc && mp.position.ops_len > 0)
-    }
-
     /// history.py: get_trace_position — current recorder position.
     pub fn get_trace_position(&self) -> TracePosition {
         self.recorder.get_position()

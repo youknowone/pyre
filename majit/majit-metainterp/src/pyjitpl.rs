@@ -400,10 +400,6 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
-    /// Cross-loop cut alias: inner_key → outer_key.
-    /// When cut_trace_from stores an inner loop entry under the outer greenkey,
-    /// this alias allows can_enter_jit at the inner back-edge to find the entry.
-    pub(crate) compiled_loop_aliases: HashMap<u64, u64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -712,7 +708,6 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
             pending_preamble_tokens: HashMap::new(),
-            compiled_loop_aliases: HashMap::new(),
         }
     }
 
@@ -770,7 +765,9 @@ impl<M: Clone> MetaInterp<M> {
         if ctx.cut_inner_green_key.is_none() {
             return None;
         }
-        ctx.get_merge_point_by_pc(ctx.header_pc)
+        let green_key = ctx.green_key;
+        ctx.get_merge_point_at(green_key, ctx.header_pc)
+            .filter(|mp| mp.position.ops_len > 0)
             .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
     }
 
@@ -1530,11 +1527,14 @@ impl<M: Clone> MetaInterp<M> {
             if let Some(retrace_pos) = self.retracing_from {
                 // pyjitpl.py:2994: if start != self.retracing_from
                 // Find the merge point whose position matches retracing_from.
+                // pyjitpl.py:2994: iterate current_merge_points in reverse,
+                // check same_greenkey and position match. Use header_pc
+                // for precise matching across root/inner key registrations.
                 let position_matches = self
                     .tracing
                     .as_ref()
                     .and_then(|ctx| {
-                        ctx.get_merge_point(ctx.green_key)
+                        ctx.get_merge_point_at(ctx.green_key, ctx.header_pc)
                             .map(|mp| mp.position == retrace_pos)
                     })
                     .unwrap_or(false);
@@ -1580,35 +1580,20 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // pyjitpl.py:3162: if self.jit_cell_token is not None → cancel.
-        // Prevent recompilation when the green_key already has a compiled entry.
-        // Also cancel if the cross-loop cut inner key already has a working entry
-        // (prevents the outer entry from adding overhead via incompatible-state skips).
+        // pyjitpl.py:3162: has_compiled_targets(ptoken) — cancel if the
+        // greenkey already has VALID compiled targets (not merely a stale
+        // entry in the map). Invalidated entries must not block recompilation.
         if let Some(ctx) = self.tracing.as_ref() {
             let gk = ctx.green_key;
-            if self.compiled_loops.contains_key(&gk) {
+            if self.has_compiled_targets(gk) {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compile_loop cancelled: entry already exists for key={}",
+                        "[jit] compile_loop cancelled: has_compiled_targets key={}",
                         gk
                     );
                 }
-                self.tracing = None;
+                self.abort_trace(false);
                 return CompileOutcome::Cancelled;
-            }
-            if let Some(inner_key) = ctx.cut_inner_green_key {
-                if self.compiled_loops.contains_key(&inner_key)
-                    || self.compiled_loop_aliases.contains_key(&inner_key)
-                {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_loop cancelled: inner key={} was previously compiled or aliased",
-                            inner_key
-                        );
-                    }
-                    self.tracing = None;
-                    return CompileOutcome::Cancelled;
-                }
             }
         }
 
@@ -1627,13 +1612,15 @@ impl<M: Clone> MetaInterp<M> {
         // is already red-only — no stripping needed.
         let cut_inner_green_key = ctx.cut_inner_green_key;
         let cross_loop_cut = if cut_inner_green_key.is_some() {
-            ctx.get_merge_point_by_pc(ctx.header_pc).map(|mp| {
-                (
-                    mp.original_boxes.clone(),
-                    mp.original_box_types.clone(),
-                    mp.position,
-                )
-            })
+            ctx.get_merge_point_at(green_key, ctx.header_pc)
+                .filter(|mp| mp.position.ops_len > 0)
+                .map(|mp| {
+                    (
+                        mp.original_boxes.clone(),
+                        mp.original_box_types.clone(),
+                        mp.position,
+                    )
+                })
         } else {
             None
         };
@@ -2155,18 +2142,7 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                     },
                 );
-                // Register inner_key → outer_key alias so can_enter_jit
-                // at the inner back-edge finds this entry.
-                if let Some(inner_key) = cut_inner_green_key {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit][alias] inner_key={} → outer_key={}",
-                            inner_key, green_key
-                        );
-                    }
-                    self.compiled_loop_aliases.insert(inner_key, green_key);
-                }
-
+                // RPython warmstate.py:342: attach_procedure_to_interp(greenkey, token)
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -3112,25 +3088,12 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Resolve a green_key through cross-loop cut aliases.
-    /// Returns the canonical key (outer key) if an alias exists,
-    /// otherwise returns the key unchanged.
+    /// RPython parity: green_key is used directly for all lookups.
+    /// No alias resolution — RPython uses target_tokens within the
+    /// same JitCellToken rather than cross-key aliases.
     #[inline]
     pub fn resolve_alias(&self, green_key: u64) -> u64 {
-        // Only use direct entry if its token is still valid.
-        // Invalidated entries should fall through to alias resolution
-        // so the second compile's entry (at a different key) can be found.
-        if self
-            .compiled_loops
-            .get(&green_key)
-            .map_or(false, |c| !c.token.is_invalidated())
-        {
-            return green_key;
-        }
-        self.compiled_loop_aliases
-            .get(&green_key)
-            .copied()
-            .unwrap_or(green_key)
+        green_key
     }
 
     /// Get the metadata for a compiled loop without executing it.
@@ -4203,22 +4166,12 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Check whether a compiled loop exists for a given green key.
     /// Follows cross-loop cut aliases (inner_key → outer_key).
+    /// Check whether a compiled loop exists for a given green key.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        if self
-            .compiled_loops
+        self.compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.token.is_invalidated())
-        {
-            return true;
-        }
-        if let Some(&alias) = self.compiled_loop_aliases.get(&green_key) {
-            return self
-                .compiled_loops
-                .get(&alias)
-                .map_or(false, |c| !c.token.is_invalidated());
-        }
-        false
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
