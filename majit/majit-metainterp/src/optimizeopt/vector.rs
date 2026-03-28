@@ -223,17 +223,27 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
             }
             if let Some(entry) = state.accumulation.get(arg) {
                 // schedule.py:654-655: AccumInfo → descr.attach_vector_info
+                // resume.py:29,37: variable = original scalar (getoriginal())
+                // regalloc.py:350: location = vector register (set by backend)
+                // In Cranelift SSA, vector_loc is the vector OpRef from box_to_vbox.
+                let vector_loc = state
+                    .getvector_of_box(*arg)
+                    .map(|(_, vec_ref)| vec_ref)
+                    .unwrap_or(*arg);
                 if let Some(ref descr) = op.descr {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumVectorInfo {
                             failargs_pos: fi,
                             variable: *arg,
+                            vector_loc,
                             operator: entry.operator,
                         });
                     }
                 }
                 // schedule.py:656-657: failargs[i] = renamer.rename_map.get(seed, seed)
-                *arg = state.renamer.rename_box(entry.seed);
+                // Cranelift has no regalloc swap (regalloc.py:350-352), so store
+                // the scalar seed directly to avoid vector OpRef in fail_args.
+                *arg = entry.seed;
             }
         }
         op.fail_args = Some(new_fa);
