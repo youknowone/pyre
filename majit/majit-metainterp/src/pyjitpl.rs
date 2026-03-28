@@ -400,6 +400,10 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    /// Cross-loop cut alias: inner_key → outer_key.
+    /// When cut_trace_from stores an inner loop entry under the outer greenkey,
+    /// this alias allows can_enter_jit at the inner back-edge to find the entry.
+    pub(crate) compiled_loop_aliases: HashMap<u64, u64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -708,6 +712,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
             pending_preamble_tokens: HashMap::new(),
+            compiled_loop_aliases: HashMap::new(),
         }
     }
 
@@ -762,9 +767,10 @@ impl<M: Clone> MetaInterp<M> {
     /// closes at a different loop header than where it started.
     pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<Type>)> {
         let ctx = self.tracing.as_ref()?;
-        let green_key = ctx.green_key;
-        ctx.get_merge_point(green_key)
-            .filter(|mp| mp.position.ops_len > 0)
+        if ctx.cut_inner_green_key.is_none() {
+            return None;
+        }
+        ctx.get_merge_point_by_pc(ctx.header_pc)
             .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
     }
 
@@ -1574,6 +1580,38 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        // pyjitpl.py:3162: if self.jit_cell_token is not None → cancel.
+        // Prevent recompilation when the green_key already has a compiled entry.
+        // Also cancel if the cross-loop cut inner key already has a working entry
+        // (prevents the outer entry from adding overhead via incompatible-state skips).
+        if let Some(ctx) = self.tracing.as_ref() {
+            let gk = ctx.green_key;
+            if self.compiled_loops.contains_key(&gk) {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_loop cancelled: entry already exists for key={}",
+                        gk
+                    );
+                }
+                self.tracing = None;
+                return CompileOutcome::Cancelled;
+            }
+            if let Some(inner_key) = ctx.cut_inner_green_key {
+                if self.compiled_loops.contains_key(&inner_key)
+                    || self.compiled_loop_aliases.contains_key(&inner_key)
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_loop cancelled: inner key={} was previously compiled or aliased",
+                            inner_key
+                        );
+                    }
+                    self.tracing = None;
+                    return CompileOutcome::Cancelled;
+                }
+            }
+        }
+
         let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
@@ -1587,16 +1625,18 @@ impl<M: Clone> MetaInterp<M> {
         // RPython pyjitpl.py:3160 strips green args: original_boxes[num_green_args:].
         // In pyre, green key is a u64 (not in original_boxes), so original_boxes
         // is already red-only — no stripping needed.
-        let cross_loop_cut = ctx
-            .get_merge_point(green_key)
-            .filter(|mp| mp.position.ops_len > 0)
-            .map(|mp| {
+        let cut_inner_green_key = ctx.cut_inner_green_key;
+        let cross_loop_cut = if cut_inner_green_key.is_some() {
+            ctx.get_merge_point_by_pc(ctx.header_pc).map(|mp| {
                 (
                     mp.original_boxes.clone(),
                     mp.original_box_types.clone(),
                     mp.position,
                 )
-            });
+            })
+        } else {
+            None
+        };
 
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
@@ -2115,6 +2155,18 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                     },
                 );
+                // Register inner_key → outer_key alias so can_enter_jit
+                // at the inner back-edge finds this entry.
+                if let Some(inner_key) = cut_inner_green_key {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][alias] inner_key={} → outer_key={}",
+                            inner_key, green_key
+                        );
+                    }
+                    self.compiled_loop_aliases.insert(inner_key, green_key);
+                }
+
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -3060,18 +3112,43 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Resolve a green_key through cross-loop cut aliases.
+    /// Returns the canonical key (outer key) if an alias exists,
+    /// otherwise returns the key unchanged.
+    #[inline]
+    pub fn resolve_alias(&self, green_key: u64) -> u64 {
+        // Only use direct entry if its token is still valid.
+        // Invalidated entries should fall through to alias resolution
+        // so the second compile's entry (at a different key) can be found.
+        if self
+            .compiled_loops
+            .get(&green_key)
+            .map_or(false, |c| !c.token.is_invalidated())
+        {
+            return green_key;
+        }
+        self.compiled_loop_aliases
+            .get(&green_key)
+            .copied()
+            .unwrap_or(green_key)
+    }
+
     /// Get the metadata for a compiled loop without executing it.
     ///
     /// Allows the interpreter to check preconditions (e.g., whether the
     /// current state matches the compiled loop's assumptions) before calling
     /// `run_compiled`.
+    /// Follows cross-loop cut aliases.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
-        self.compiled_loops.get(&green_key).map(|e| &e.meta)
+        let key = self.resolve_alias(green_key);
+        self.compiled_loops.get(&key).map(|e| &e.meta)
     }
 
     /// Get num_inputs of the compiled loop.
+    /// Follows cross-loop cut aliases.
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
-        self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
+        let key = self.resolve_alias(green_key);
+        self.compiled_loops.get(&key).map(|e| e.num_inputs)
     }
 
     /// Run the compiled loop for the given green key.
@@ -3085,7 +3162,8 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `None` if no compiled loop exists for this key.
     pub fn run_compiled(&mut self, green_key: u64, live_values: &[i64]) -> Option<(Vec<i64>, &M)> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+        let key = self.resolve_alias(green_key);
+        let compiled = self.compiled_loops.get(&key)?;
 
         Self::prepare_compiled_run_io();
         let result = self
@@ -3098,7 +3176,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // Track guard failures for bridge compilation decisions.
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3125,7 +3203,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        let compiled = self.compiled_loops.get(&key).unwrap();
         Some((result.outputs, &compiled.meta))
     }
 
@@ -3139,7 +3217,8 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<(Vec<Value>, &M)> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+        let key = self.resolve_alias(green_key);
+        let compiled = self.compiled_loops.get(&key)?;
 
         Self::prepare_compiled_run_io();
         let result = self
@@ -3151,7 +3230,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3178,7 +3257,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        let compiled = self.compiled_loops.get(&key).unwrap();
         Some((result.typed_outputs, &compiled.meta))
     }
 
@@ -3190,7 +3269,8 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<(Vec<Value>, &M)> {
-        let compiled = self.compiled_loops.get(&green_key)?;
+        let key = self.resolve_alias(green_key);
+        let compiled = self.compiled_loops.get(&key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
@@ -3200,7 +3280,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3227,7 +3307,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
+        let compiled = self.compiled_loops.get(&key).unwrap();
         Some((result.typed_outputs, &compiled.meta))
     }
 
@@ -3241,6 +3321,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<RawCompileResult<'_, M>> {
+        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -3508,6 +3589,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<CompileResult<'_, M>> {
+        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -3619,6 +3701,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         mut values: Vec<Value>,
     ) -> Vec<Value> {
+        let green_key = self.resolve_alias(green_key);
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return values;
         };
@@ -3662,6 +3745,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<CompileResult<'_, M>> {
+        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -3942,10 +4026,14 @@ impl<M: Clone> MetaInterp<M> {
     /// compiled code will fail at GUARD_NOT_INVALIDATED and fall back to
     /// the interpreter.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+        let key = self.resolve_alias(green_key);
+        if let Some(compiled) = self.compiled_loops.get(&key) {
             compiled.token.invalidate();
             if crate::majit_log_enabled() {
-                eprintln!("[jit] invalidated loop at key={}", green_key);
+                eprintln!(
+                    "[jit] invalidated loop at key={} (resolved={})",
+                    green_key, key
+                );
             }
         }
     }
@@ -4114,11 +4202,23 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Check whether a compiled loop exists for a given green key.
+    /// Follows cross-loop cut aliases (inner_key → outer_key).
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        self.compiled_loops
+        if self
+            .compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.token.is_invalidated())
+        {
+            return true;
+        }
+        if let Some(&alias) = self.compiled_loop_aliases.get(&green_key) {
+            return self
+                .compiled_loops
+                .get(&alias)
+                .map_or(false, |c| !c.token.is_invalidated());
+        }
+        false
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.

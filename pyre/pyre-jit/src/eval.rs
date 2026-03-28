@@ -2055,9 +2055,13 @@ fn restore_guard_failure_for_loop(
         })
         .unwrap_or(0);
     let frame_end = (3 + vsd).min(typed.len());
-    let has_null_ref = typed[3..frame_end]
-        .iter()
-        .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
+    let has_null_ref = if typed.len() > 3 {
+        typed[3..frame_end]
+            .iter()
+            .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))))
+    } else {
+        false
+    };
     // resume.py parity: null Ref slots in the frame are virtual objects
     // whose rd_numb encoding used NULLREF (incomplete virtual tracking).
     // Fall back to raw values from the deadframe for these slots.
