@@ -1647,12 +1647,38 @@ impl OptContext {
                         .collect();
                     let fieldnums: Vec<i16> =
                         vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    let field_types: Vec<majit_ir::Type> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
+                                .unwrap_or(majit_ir::Type::Int)
+                        })
+                        .collect();
+                    let field_sizes: Vec<usize> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_size()))
+                                .unwrap_or(8)
+                        })
+                        .collect();
+                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Instance {
                         descr_index: vi.descr.index(),
                         known_class: vi.known_class.map(|gc| gc.as_usize() as i64),
                         fielddescr_indices,
                         field_offsets,
+                        field_types,
+                        field_sizes,
                         fieldnums,
+                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
@@ -1671,11 +1697,37 @@ impl OptContext {
                         .collect();
                     let fieldnums: Vec<i16> =
                         vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
+                    let field_types: Vec<majit_ir::Type> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
+                                .unwrap_or(majit_ir::Type::Int)
+                        })
+                        .collect();
+                    let field_sizes: Vec<usize> = vi
+                        .fields
+                        .iter()
+                        .map(|(fi, _)| {
+                            vi.field_descrs
+                                .iter()
+                                .find(|(di, _)| *di == *fi)
+                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_size()))
+                                .unwrap_or(8)
+                        })
+                        .collect();
+                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Struct {
                         descr_index: vi.descr.index(),
                         fielddescr_indices,
                         field_offsets,
+                        field_types,
+                        field_sizes,
                         fieldnums,
+                        descr_size,
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {

@@ -8837,48 +8837,190 @@ fn collect_guards(
             &fail_arg_types,
             caller_layout,
         );
-        // resume.py parity: encode rd_virtuals into recovery layout.
-        // Virtual objects in fail_args are NOT materialized at compile time;
-        // their field values are stored as extra fail_args and reconstructed
-        // lazily on guard failure.
-        if let Some(ref rd_virtuals) = op.rd_virtuals {
-            for entry in rd_virtuals {
-                let virtual_index = recovery_layout.virtual_layouts.len();
-                // Convert field fail_arg positions to ExitValueSourceLayout
-                let fields: Vec<(u32, ExitValueSourceLayout)> = entry
-                    .fields
+        // RPython parity: when rd_numb is present, rebuild frame slots from
+        // rd_numb. rd_numb encodes ALL snapshot positions (including virtuals
+        // as TAGVIRTUAL), while the identity recovery_layout only has
+        // fail_args-count slots. The rd_numb-based layout is authoritative.
+        if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+            let rd_vi = op.rd_virtuals_info.as_deref();
+            use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
+            let rd_consts_ref: &[(i64, Type)] = rd_consts_data;
+            let (_num_failargs, frames) = rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+
+            // Rebuild frame slots from rd_numb values.
+            let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
+            for frame in &frames {
+                for val in &frame.values {
+                    new_slots.push(match val {
+                        RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
+                        RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
+                        RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
+                        RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                        RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
+                    });
+                }
+            }
+            if let Some(frame) = recovery_layout.frames.last_mut() {
+                frame.slots = new_slots;
+                frame.slot_types = None; // will be re-derived by backend
+            }
+
+            // Build virtual_layouts from rd_virtuals_info.
+            let resolve_fieldnum = |fnum: i16| -> ExitValueSourceLayout {
+                let (val, tagbits) = resumedata::untag(fnum);
+                match tagbits {
+                    resumedata::TAGBOX => ExitValueSourceLayout::ExitValue(val as usize),
+                    resumedata::TAGVIRTUAL => ExitValueSourceLayout::Virtual(val as usize),
+                    resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
+                    resumedata::TAGCONST => {
+                        let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;
+                        let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
+                        ExitValueSourceLayout::Constant(c)
+                    }
+                    _ => ExitValueSourceLayout::Constant(0),
+                }
+            };
+            let resolve_fieldnums = |fieldnums: &[i16],
+                                     fielddescr_indices: &[u32]|
+             -> Vec<(u32, ExitValueSourceLayout)> {
+                fieldnums
                     .iter()
-                    .map(|&(field_descr_idx, field_fail_arg_idx)| {
-                        (
-                            field_descr_idx,
-                            ExitValueSourceLayout::ExitValue(field_fail_arg_idx),
-                        )
+                    .enumerate()
+                    .map(|(fi, &fnum)| {
+                        let fdi = fielddescr_indices.get(fi).copied().unwrap_or(fi as u32);
+                        (fdi, resolve_fieldnum(fnum))
                     })
-                    .collect();
-                let descr_index = entry.descr.index();
-                let type_id = entry.known_class.map_or(0, |gc| gc.0 as u32);
-                let layout = if entry.known_class.is_some() {
-                    ExitVirtualLayout::Object {
-                        type_id,
-                        descr_index,
-                        fields,
-                        target_slot: Some(entry.fail_arg_index),
-                    }
-                } else {
-                    ExitVirtualLayout::Struct {
-                        type_id,
-                        descr_index,
-                        fields,
-                        target_slot: Some(entry.fail_arg_index),
-                    }
-                };
-                recovery_layout.virtual_layouts.push(layout);
-                // Update the frame slot for this fail_arg to Virtual(index)
-                if let Some(frame) = recovery_layout.frames.last_mut() {
-                    if entry.fail_arg_index < frame.slots.len() {
-                        frame.slots[entry.fail_arg_index] =
-                            ExitValueSourceLayout::Virtual(virtual_index);
-                    }
+                    .collect()
+            };
+
+            // Build virtual_layouts from rd_virtuals_info or rd_virtuals.
+            recovery_layout.virtual_layouts.clear();
+            if let Some(rd_vi_slice) = rd_vi {
+                for entry in rd_vi_slice.iter() {
+                    let layout = match entry {
+                        majit_ir::RdVirtualInfo::Instance {
+                            descr_index,
+                            known_class,
+                            fielddescr_indices,
+                            fieldnums,
+                            ..
+                        } => ExitVirtualLayout::Object {
+                            type_id: known_class.map_or(0, |kc| kc as u32),
+                            descr_index: *descr_index,
+                            fields: resolve_fieldnums(fieldnums, fielddescr_indices),
+                            target_slot: None,
+                        },
+                        majit_ir::RdVirtualInfo::Struct {
+                            descr_index,
+                            fielddescr_indices,
+                            fieldnums,
+                            ..
+                        } => ExitVirtualLayout::Struct {
+                            type_id: 0,
+                            descr_index: *descr_index,
+                            fields: resolve_fieldnums(fieldnums, fielddescr_indices),
+                            target_slot: None,
+                        },
+                        majit_ir::RdVirtualInfo::Array {
+                            descr_index,
+                            clear,
+                            kind,
+                            fieldnums,
+                        } => ExitVirtualLayout::Array {
+                            descr_index: *descr_index,
+                            clear: *clear,
+                            kind: *kind,
+                            items: fieldnums
+                                .iter()
+                                .map(|&fnum| resolve_fieldnum(fnum))
+                                .collect(),
+                        },
+                        majit_ir::RdVirtualInfo::ArrayStruct {
+                            descr_index,
+                            size,
+                            fielddescr_indices,
+                            fieldnums,
+                        } => {
+                            let fpe = if *size > 0 {
+                                fieldnums.len() / *size
+                            } else {
+                                0
+                            };
+                            ExitVirtualLayout::ArrayStruct {
+                                descr_index: *descr_index,
+                                element_fields: (0..*size)
+                                    .map(|ei| {
+                                        let s = ei * fpe;
+                                        let e = (s + fpe).min(fieldnums.len());
+                                        resolve_fieldnums(&fieldnums[s..e], fielddescr_indices)
+                                    })
+                                    .collect(),
+                            }
+                        }
+                        majit_ir::RdVirtualInfo::RawBuffer {
+                            size,
+                            offsets,
+                            entry_sizes,
+                            fieldnums,
+                        } => ExitVirtualLayout::RawBuffer {
+                            size: *size,
+                            entries: fieldnums
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &fnum)| {
+                                    (
+                                        offsets.get(i).copied().unwrap_or(i * 8),
+                                        entry_sizes.get(i).copied().unwrap_or(8),
+                                        resolve_fieldnum(fnum),
+                                    )
+                                })
+                                .collect(),
+                        },
+                        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+                            ExitVirtualLayout::RawSlice {
+                                offset: *offset,
+                                base: fieldnums
+                                    .first()
+                                    .map(|&fnum| resolve_fieldnum(fnum))
+                                    .unwrap_or(ExitValueSourceLayout::Constant(0)),
+                            }
+                        }
+                        majit_ir::RdVirtualInfo::Empty => continue,
+                    };
+                    recovery_layout.virtual_layouts.push(layout);
+                }
+            } else if let Some(ref rd_virtuals) = op.rd_virtuals {
+                // Fallback: build virtual_layouts from GuardVirtualEntry
+                // (for guards without rd_virtuals_info, e.g. fallback path).
+                for entry in rd_virtuals {
+                    let fields: Vec<(u32, ExitValueSourceLayout)> = entry
+                        .fields
+                        .iter()
+                        .map(|&(field_descr_idx, field_fail_arg_idx)| {
+                            (
+                                field_descr_idx,
+                                ExitValueSourceLayout::ExitValue(field_fail_arg_idx),
+                            )
+                        })
+                        .collect();
+                    let descr_index = entry.descr.index();
+                    let type_id = entry.known_class.map_or(0, |gc| gc.0 as u32);
+                    let layout = if entry.known_class.is_some() {
+                        ExitVirtualLayout::Object {
+                            type_id,
+                            descr_index,
+                            fields,
+                            target_slot: Some(entry.fail_arg_index),
+                        }
+                    } else {
+                        ExitVirtualLayout::Struct {
+                            type_id,
+                            descr_index,
+                            fields,
+                            target_slot: Some(entry.fail_arg_index),
+                        }
+                    };
+                    recovery_layout.virtual_layouts.push(layout);
                 }
             }
         }

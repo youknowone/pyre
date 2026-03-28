@@ -2021,21 +2021,41 @@ fn materialize_virtual_from_rd(
         _ => {} // Instance/Struct: fall through
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
-    let (known_class, fieldnums, field_offsets): (Option<i64>, &[i16], &[usize]) = match entry {
+    let (known_class, fieldnums, field_offsets, field_types, field_sizes, descr_size) = match entry
+    {
         majit_ir::RdVirtualInfo::Instance {
             known_class,
             fieldnums,
             field_offsets,
+            field_types,
+            field_sizes,
+            descr_size,
             ..
-        } => (*known_class, fieldnums.as_slice(), field_offsets.as_slice()),
+        } => (
+            *known_class,
+            fieldnums.as_slice(),
+            field_offsets.as_slice(),
+            field_types.as_slice(),
+            field_sizes.as_slice(),
+            *descr_size,
+        ),
         majit_ir::RdVirtualInfo::Struct {
             fieldnums,
             field_offsets,
+            field_types,
+            field_sizes,
+            descr_size,
             ..
-        } => (None, fieldnums.as_slice(), field_offsets.as_slice()),
+        } => (
+            None,
+            fieldnums.as_slice(),
+            field_offsets.as_slice(),
+            field_types.as_slice(),
+            field_sizes.as_slice(),
+            *descr_size,
+        ),
         _ => unreachable!(),
     };
-    let _field_offsets = field_offsets;
 
     // resume.py:617-621 VirtualInfo.allocate parity:
     //   Phase 1: struct = allocate_with_vtable(descr)
@@ -2063,25 +2083,28 @@ fn materialize_virtual_from_rd(
         });
         Box::into_raw(obj) as usize
     } else if ob_type != 0 {
-        // General struct: allocate based on max field offset + 8.
-        // resume.py:1437 allocate_with_vtable / allocate_struct parity.
-        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
+        // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
+        let size = if descr_size > 0 {
+            descr_size
+        } else {
+            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+            (max_offset + 8).max(16)
+        };
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
         unsafe { *ptr = ob_type }; // ob_type at offset 0
         ptr as usize
-    } else if !field_offsets.is_empty() {
-        // VStructInfo without known_class but with field offsets:
-        // resume.py:634-637 VStructInfo.allocate uses typedescr for size.
-        // Pyre approximates from field_offsets.
-        let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
-        let size = (max_offset + 8).max((1 + fieldnums.len()) * 8);
+    } else if descr_size > 0 || !field_offsets.is_empty() {
+        // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
+        let size = if descr_size > 0 {
+            descr_size
+        } else {
+            let max_offset = field_offsets.iter().copied().max().unwrap_or(0);
+            (max_offset + 8).max(16)
+        };
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-        ptr as usize
+        unsafe { std::alloc::alloc_zeroed(layout) as usize }
     } else {
-        // No known_class and no field_offsets — can't allocate.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit] materialize_virtual: vidx={} no known_class and no field_offsets",

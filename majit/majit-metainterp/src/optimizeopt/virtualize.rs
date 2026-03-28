@@ -1408,6 +1408,63 @@ impl OptVirtualize {
         ctx.new_operations.iter().any(|op| op.pos == resolved)
     }
 
+    /// resume.py AbstractVirtualStructInfo.fielddescrs: byte offsets.
+    fn extract_field_offsets(
+        fields: &[(u32, usize)],
+        field_descrs: &[(u32, DescrRef)],
+    ) -> Vec<usize> {
+        fields
+            .iter()
+            .map(|(fidx, _)| {
+                let off = field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.offset())
+                    .unwrap_or(0);
+                debug_assert!(
+                    off > 0 || field_descrs.is_empty(),
+                    "field_descrs missing for {}",
+                    fidx
+                );
+                off
+            })
+            .collect()
+    }
+
+    /// resume.py:1509-1518: field types from FieldDescr.
+    fn extract_field_types(fields: &[(u32, usize)], field_descrs: &[(u32, DescrRef)]) -> Vec<Type> {
+        fields
+            .iter()
+            .map(|(fidx, _)| {
+                field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.field_type())
+                    .unwrap_or(Type::Int)
+            })
+            .collect()
+    }
+
+    /// resume.py: fielddescr.field_size() for write width.
+    fn extract_field_sizes(
+        fields: &[(u32, usize)],
+        field_descrs: &[(u32, DescrRef)],
+    ) -> Vec<usize> {
+        fields
+            .iter()
+            .map(|(fidx, _)| {
+                field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.field_size())
+                    .unwrap_or(8)
+            })
+            .collect()
+    }
+
     /// Encode a single virtual PtrInfo into a GuardVirtualEntry.
     ///
     /// Adds the virtual's field values to `extra_fail_args` and returns
@@ -1437,11 +1494,17 @@ impl OptVirtualize {
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
                 }
+                let fo = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
+                let ft = Self::extract_field_types(&fields, &vinfo.field_descrs);
+                let fs = Self::extract_field_sizes(&fields, &vinfo.field_descrs);
                 Some(GuardVirtualEntry {
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
                     fields,
+                    field_offsets: fo,
+                    field_types: ft,
+                    field_sizes: fs,
                 })
             }
             PtrInfo::VirtualStruct(vinfo) => {
@@ -1456,11 +1519,17 @@ impl OptVirtualize {
                     extra_fail_args.push(final_ref);
                     fields.push((field_idx, fa_index));
                 }
+                let fo = Self::extract_field_offsets(&fields, &vinfo.field_descrs);
+                let ft = Self::extract_field_types(&fields, &vinfo.field_descrs);
+                let fs = Self::extract_field_sizes(&fields, &vinfo.field_descrs);
                 Some(GuardVirtualEntry {
                     fail_arg_index,
                     descr: vinfo.descr.clone(),
                     known_class: None,
                     fields,
+                    field_offsets: fo,
+                    field_types: ft,
+                    field_sizes: fs,
                 })
             }
             // VirtualArray, VirtualArrayStruct, VirtualRawBuffer:

@@ -2741,11 +2741,48 @@ impl Optimizer {
                 .unwrap_or(field_idx);
             fields.push((descr_idx, base_idx + fields.len()));
         }
+        let fo: Vec<usize> = fields
+            .iter()
+            .enumerate()
+            .map(|(_i, (fidx, _))| {
+                field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.offset())
+                    .unwrap_or(0)
+            })
+            .collect();
+        let ft: Vec<majit_ir::Type> = fields
+            .iter()
+            .map(|(fidx, _)| {
+                field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.field_type())
+                    .unwrap_or(majit_ir::Type::Int)
+            })
+            .collect();
+        let fs: Vec<usize> = fields
+            .iter()
+            .map(|(fidx, _)| {
+                field_descrs
+                    .iter()
+                    .find(|(di, _)| di == fidx)
+                    .and_then(|(_, d)| d.as_field_descr())
+                    .map(|fd| fd.field_size())
+                    .unwrap_or(8)
+            })
+            .collect();
         Some(majit_ir::GuardVirtualEntry {
             fail_arg_index: fa_idx,
             descr,
             known_class,
             fields,
+            field_offsets: fo,
+            field_types: ft,
+            field_sizes: fs,
         })
     }
 
