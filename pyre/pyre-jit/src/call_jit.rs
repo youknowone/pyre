@@ -891,6 +891,12 @@ pub fn resume_in_blackhole(
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
                 bh.setarg_r(i, materialize_virtual(val));
+            } else {
+                // RPython parity: rd_numb always encodes all locals.
+                // If missing from typed_values, read from the actual frame.
+                if i < frame.locals_cells_stack_w.len() {
+                    bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
+                }
             }
         }
         for i in 0..stack_only {
