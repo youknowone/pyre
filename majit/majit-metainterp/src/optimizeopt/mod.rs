@@ -997,6 +997,10 @@ impl OptContext {
                 ns.append_int(0); // pc
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
+                        // TODO(TAGVIRTUAL): resume.py _number_virtuals encodes
+                        // virtual slots as TAGVIRTUAL(vidx). Currently NULLREF;
+                        // requires investigation of spectral_norm/fannkuch
+                        // regression before enabling.
                         ns.append_short(resumedata::NULLREF);
                     } else {
                         let t = resumedata::tag(i as i32, resumedata::TAGBOX)
