@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 /// Cranelift-based JIT code generation backend.
 ///
 /// Translates majit IR traces into native code via Cranelift, then
@@ -1554,7 +1554,7 @@ fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
 fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
     unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(bridge.trace_id));
     for descr in &bridge.fail_descrs {
-        let attached = descr.bridge.lock().unwrap();
+        let attached = descr.bridge_ref();
         if let Some(ref child_bridge) = *attached {
             unregister_bridge_call_assembler_expectations(child_bridge);
         }
@@ -1563,7 +1563,7 @@ fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
 
 fn unregister_call_assembler_bridge_tree(fail_descrs: &[Arc<CraneliftFailDescr>]) {
     for descr in fail_descrs {
-        let attached = descr.bridge.lock().unwrap();
+        let attached = descr.bridge_ref();
         if let Some(ref bridge) = *attached {
             unregister_bridge_call_assembler_expectations(bridge);
         }
@@ -2170,7 +2170,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 
         let fail_descr = &target.fail_descrs[fail_index as usize];
         let fail_count = fail_descr.increment_fail_count();
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
             // RPython rebuild_state_after_failure parity: materialize virtual
@@ -2179,7 +2179,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             rebuild_state_after_failure(
                 &mut mat_outputs,
                 &fail_descr.fail_arg_types,
-                fail_descr.recovery_layout.lock().unwrap().as_ref(),
+                fail_descr.recovery_layout_ref().as_ref(),
                 bridge.num_inputs,
             );
             if bridge.loop_reentry {
@@ -2560,7 +2560,7 @@ fn call_assembler_fast_path(
     fail_descr.increment_fail_count();
 
     // If a bridge is attached, execute it instead of calling force_fn.
-    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    let bridge_guard = fail_descr.bridge_ref();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
         // RPython rebuild_state_after_failure parity: materialize virtual
@@ -2570,7 +2570,7 @@ fn call_assembler_fast_path(
         rebuild_state_after_failure(
             &mut bridge_outputs,
             &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout.lock().unwrap().as_ref(),
+            fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
         let outputs_slice = &bridge_outputs[..bridge_outputs.len().min(actual_outputs)];
@@ -2600,7 +2600,7 @@ fn call_assembler_fast_path(
     if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
         if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
             let callee_frame_ptr = outputs[0];
-            let trace_info = fail_descr.trace_info.lock().unwrap();
+            let trace_info = fail_descr.trace_info_ref();
             if let Some(ref info) = *trace_info {
                 let trace_id = info.trace_id;
                 drop(trace_info);
@@ -2677,7 +2677,7 @@ fn call_assembler_fast_path_heap(
     // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
 
-    let bridge_guard = fail_descr.bridge.lock().unwrap();
+    let bridge_guard = fail_descr.bridge_ref();
     if let Some(ref bridge) = *bridge_guard {
         release_force_token(handle);
         let mut frame =
@@ -2704,7 +2704,7 @@ fn call_assembler_fast_path_heap(
     if fail_descr.get_fail_count() >= DEFAULT_BRIDGE_THRESHOLD {
         if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
             let callee_frame_ptr = outputs[0];
-            let trace_info = fail_descr.trace_info.lock().unwrap();
+            let trace_info = fail_descr.trace_info_ref();
             if let Some(ref info) = *trace_info {
                 let trace_id = info.trace_id;
                 drop(trace_info);
@@ -4052,7 +4052,7 @@ struct CompiledLoop {
     code_ptr: *const u8,
     code_size: usize,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
-    terminal_exit_layouts: Mutex<Vec<TerminalExitLayout>>,
+    terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     gc_runtime_id: Option<u64>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -4063,13 +4063,26 @@ struct CompiledLoop {
 }
 
 unsafe impl Send for CompiledLoop {}
+unsafe impl Sync for CompiledLoop {}
+
+impl CompiledLoop {
+    #[inline]
+    fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
+        unsafe { &*self.terminal_exit_layouts.get() }
+    }
+
+    #[inline]
+    fn terminal_exit_layouts_mut(&self) -> &mut Vec<TerminalExitLayout> {
+        unsafe { &mut *self.terminal_exit_layouts.get() }
+    }
+}
 
 fn find_trace_fail_descr_layouts_in_fail_descrs(
     fail_descrs: &[Arc<CraneliftFailDescr>],
     trace_id: u64,
 ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
     for descr in fail_descrs {
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
                 return Some(
@@ -4095,10 +4108,10 @@ fn find_trace_terminal_exit_layouts_in_fail_descrs(
     trace_id: u64,
 ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
     for descr in fail_descrs {
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
-                return Some(bridge.terminal_exit_layouts.lock().unwrap().clone());
+                return Some(bridge.terminal_exit_layouts_ref().clone());
             }
             if let Some(layouts) =
                 find_trace_terminal_exit_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
@@ -4115,7 +4128,7 @@ fn find_trace_info_in_fail_descrs(
     trace_id: u64,
 ) -> Option<CompiledTraceInfo> {
     for descr in fail_descrs {
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if bridge.trace_id == trace_id {
                 return Some(CompiledTraceInfo {
@@ -4142,7 +4155,7 @@ fn find_fail_descr_in_fail_descrs(
         if descr.trace_id == trace_id && descr.fail_index == fail_index {
             return Some(descr.clone());
         }
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if let Some(found) =
                 find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
@@ -4315,7 +4328,7 @@ fn patch_fail_descr_recovery_layout(
             descr.set_recovery_layout(recovery_layout.clone());
             return true;
         }
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if patch_fail_descr_recovery_layout(
                 &bridge.fail_descrs,
@@ -4331,12 +4344,12 @@ fn patch_fail_descr_recovery_layout(
 }
 
 fn patch_terminal_exit_recovery_layout_in_vec(
-    terminal_exit_layouts: &Mutex<Vec<TerminalExitLayout>>,
+    terminal_exit_layouts: &UnsafeCell<Vec<TerminalExitLayout>>,
     trace_id: u64,
     op_index: usize,
     recovery_layout: &ExitRecoveryLayout,
 ) -> bool {
-    let mut terminal_exit_layouts = terminal_exit_layouts.lock().unwrap();
+    let terminal_exit_layouts = unsafe { &mut *terminal_exit_layouts.get() };
     if let Some(layout) = terminal_exit_layouts
         .iter_mut()
         .find(|layout| layout.trace_id == trace_id && layout.op_index == op_index)
@@ -4348,7 +4361,7 @@ fn patch_terminal_exit_recovery_layout_in_vec(
 }
 
 fn patch_terminal_exit_recovery_layout(
-    root_terminal_exit_layouts: &Mutex<Vec<TerminalExitLayout>>,
+    root_terminal_exit_layouts: &UnsafeCell<Vec<TerminalExitLayout>>,
     fail_descrs: &[Arc<CraneliftFailDescr>],
     trace_id: u64,
     op_index: usize,
@@ -4364,7 +4377,7 @@ fn patch_terminal_exit_recovery_layout(
     }
 
     for descr in fail_descrs {
-        let bridge_guard = descr.bridge.lock().unwrap();
+        let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if patch_terminal_exit_recovery_layout(
                 &bridge.terminal_exit_layouts,
@@ -4667,7 +4680,7 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
 
             // If a bridge is attached to this guard, execute it.
-            let bridge_guard = fail_descr.bridge.lock().unwrap();
+            let bridge_guard = fail_descr.bridge_ref();
             if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
                 eprintln!(
                     "[exec-with-inputs] guard={fail_index} has_bridge={}",
@@ -4682,7 +4695,7 @@ impl CraneliftBackend {
                 rebuild_state_after_failure(
                     &mut mat_outputs,
                     &fail_descr.fail_arg_types,
-                    fail_descr.recovery_layout.lock().unwrap().as_ref(),
+                    fail_descr.recovery_layout_ref().as_ref(),
                     bridge.num_inputs,
                 );
                 if bridge.loop_reentry {
@@ -4775,7 +4788,7 @@ impl CraneliftBackend {
         fail_descr.increment_fail_count();
 
         // Check for chained bridges (RPython: bridge-on-bridge).
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref next_bridge) = *bridge_guard {
             release_force_token(handle);
             return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
@@ -8620,7 +8633,7 @@ impl CraneliftBackend {
             code_ptr,
             code_size: 0,
             fail_descrs,
-            terminal_exit_layouts: Mutex::new(terminal_exit_layouts),
+            terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
             gc_runtime_id,
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
@@ -9027,7 +9040,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             )));
         }
         let caller_layout = source_descr.as_ref().and_then(|d| {
-            d.recovery_layout.lock().unwrap().clone().map(|mut layout| {
+            d.recovery_layout_ref().clone().map(|mut layout| {
                 layout.frames.pop();
                 layout
             })
@@ -9062,14 +9075,14 @@ impl majit_codegen::Backend for CraneliftBackend {
             descr.set_trace_info(bridge_trace_info.clone());
         }
         {
-            let mut terminal_exit_layouts = compiled.terminal_exit_layouts.lock().unwrap();
+            let terminal_exit_layouts = compiled.terminal_exit_layouts_mut();
             for layout in terminal_exit_layouts.iter_mut() {
                 layout.trace_info = Some(bridge_trace_info.clone());
             }
         }
         {
             if let Some(ref sd) = source_descr {
-                let existing_bridge = sd.bridge.lock().unwrap();
+                let existing_bridge = sd.bridge_ref();
                 if let Some(ref bridge) = *existing_bridge {
                     unregister_bridge_call_assembler_expectations(bridge);
                 }
@@ -9236,10 +9249,10 @@ impl majit_codegen::Backend for CraneliftBackend {
 
         // If a bridge is attached, dispatch to it.
         if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
-            let has_bridge = fail_descr.bridge.lock().unwrap().is_some();
+            let has_bridge = fail_descr.bridge_ref().is_some();
             eprintln!("[exec-guard0] fail_index={fail_index} has_bridge={has_bridge}");
         }
-        let bridge_guard = fail_descr.bridge.lock().unwrap();
+        let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
             let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
@@ -9364,7 +9377,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
             descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
         })?;
-        let bridge = source_descr.bridge.lock().unwrap();
+        let bridge = source_descr.bridge_ref();
         let bridge = bridge.as_ref()?;
         Some(
             bridge
@@ -9404,7 +9417,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             .compiled
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        Some(compiled.terminal_exit_layouts.lock().unwrap().clone())
+        Some(compiled.terminal_exit_layouts_ref().clone())
     }
 
     fn compiled_bridge_terminal_exit_layouts(
@@ -9420,9 +9433,9 @@ impl majit_codegen::Backend for CraneliftBackend {
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
             descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
         })?;
-        let bridge = source_descr.bridge.lock().unwrap();
+        let bridge = source_descr.bridge_ref();
         let bridge = bridge.as_ref()?;
-        Some(bridge.terminal_exit_layouts.lock().unwrap().clone())
+        Some(bridge.terminal_exit_layouts_ref().clone())
     }
 
     fn compiled_trace_terminal_exit_layouts(
@@ -9435,7 +9448,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         if compiled.trace_id == trace_id {
-            return Some(compiled.terminal_exit_layouts.lock().unwrap().clone());
+            return Some(compiled.terminal_exit_layouts_ref().clone());
         }
         find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
@@ -9470,7 +9483,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         let mut result = Vec::new();
         for descr in &compiled.fail_descrs {
-            let recovery = descr.recovery_layout.lock().unwrap();
+            let recovery = descr.recovery_layout_ref();
             if let Some(ref layout) = *recovery {
                 result.push((descr.fail_index, layout.frames.clone()));
             }
