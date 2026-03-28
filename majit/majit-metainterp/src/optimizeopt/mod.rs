@@ -2110,35 +2110,14 @@ impl OptContext {
     }
 
     /// executor.py:555: execute_nonspec_const — execute a pure op with
-    /// constant args via CPU dispatch. For GETFIELD_GC_*, reads the field
-    /// at (gcref + offset) with the correct type from FieldDescr.
-    fn execute_nonspec_const(&self, op: &Op) -> Option<Value> {
-        if !op.opcode.is_getfield() {
-            return None;
-        }
-        let gcref = match self.get_constant_box(op.arg(0))? {
-            Value::Ref(r) => r,
-            _ => return None,
-        };
-        let descr = op.descr.as_ref()?;
-        let (offset, field_size, field_type) = majit_ir::unpack_fielddescr(descr)?;
-        let addr = gcref.0 + offset;
-        // bh_getfield_gc_i/r/f dispatch by field_type + field_size.
-        match (field_type, field_size) {
-            (majit_ir::Type::Int, 8) => Some(Value::Int(unsafe { *(addr as *const i64) })),
-            (majit_ir::Type::Int, 4) => Some(Value::Int(unsafe { *(addr as *const i32) as i64 })),
-            (majit_ir::Type::Int, 2) => Some(Value::Int(unsafe { *(addr as *const i16) as i64 })),
-            (majit_ir::Type::Int, 1) => Some(Value::Int(unsafe { *(addr as *const u8) as i64 })),
-            (majit_ir::Type::Float, 8) => {
-                let bits = unsafe { *(addr as *const u64) };
-                Some(Value::Float(f64::from_bits(bits)))
-            }
-            (majit_ir::Type::Ref, _) => {
-                let ptr = unsafe { *(addr as *const usize) };
-                Some(Value::Ref(majit_ir::GcRef(ptr)))
-            }
-            _ => None,
-        }
+    /// constant args via CPU dispatch. RPython uses the CPU backend to
+    /// safely execute the op. Direct memory dereference is unsafe because
+    /// GcRef pointers may be stale after GC. Returns None until a safe
+    /// CPU execution path is implemented.
+    fn execute_nonspec_const(&self, _op: &Op) -> Option<Value> {
+        // TODO: implement safe CPU execution (executor.py execute_nonspec_const)
+        // with protect_speculative_operation validation.
+        None
     }
 
     /// RPython box.type parity: find the result type of the operation
