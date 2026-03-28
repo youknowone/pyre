@@ -444,6 +444,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
     }
 
+    /// RPython rlib.jit.current_trace_length().
+    /// Returns the number of ops in the active trace, or -1 if not tracing.
+    pub fn current_trace_length(&mut self) -> i64 {
+        match self.meta.trace_ctx() {
+            Some(ctx) => ctx.recorder.num_ops() as i64,
+            None => -1,
+        }
+    }
+
     /// Abort the active trace and clear driver-owned symbolic state.
     pub fn abort_current_trace(&mut self, permanent: bool) {
         if self.meta.is_tracing() {
@@ -1903,6 +1912,30 @@ impl<S: JitState> JitDriver<S> {
     /// resume data), preventing repeated entry→guard-fail loops.
     pub fn invalidate_all_compiled(&mut self) {
         self.meta.clear_compiled_loops();
+    }
+
+    /// interp_jit.py:259 releaseall → memmgr.py:85 release_all_loops.
+    ///
+    /// RPython: alive_loops.clear() drops the memory manager's strong
+    /// references to LoopTokens. JitCells hold weakrefs, so tokens
+    /// that are still on a thread stack survive; the rest become GC
+    /// garbage. Crucially, tokens are NOT invalidated — compiled code
+    /// that is currently running or reachable via a JitCell weakref
+    /// remains valid.
+    ///
+    /// majit has no GC or weakrefs. The closest equivalent is a no-op:
+    /// compiled code stays valid and warm-state is untouched. Future
+    /// work can add generation-based eviction (memmgr.py:16-20).
+    pub fn mark_all_loops_for_release(&mut self) {
+        // No-op: without GC, there is no "drop strong ref" to perform.
+        // Calling invalidate() here would be stronger than RPython and
+        // would break currently-running compiled code.
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][releaseall] {} compiled loops (no-op, no GC)",
+                self.meta.compiled_loops.len()
+            );
+        }
     }
 
     /// Invalidate compiled code for a specific trace_id, removing the

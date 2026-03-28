@@ -97,11 +97,11 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
-/// pypy/module/pypyjit/interp_jit.py compatibility type.
+/// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).
 ///
-/// This is a structural placeholder for the RPython `PyPyJitDriver`.
+/// RPython: reds = ['frame', 'ec'], greens = ['next_instr', 'is_being_profiled', 'pycode'],
+///          virtualizables = ['frame']
 #[derive(Clone, Copy)]
-#[allow(clippy::module_name_repetitions)]
 pub struct PyPyJitDriver;
 
 impl PyPyJitDriver {
@@ -124,46 +124,66 @@ impl PyPyJitDriver {
         PyPyJitDriver
     }
 
+    /// interp_jit.py:85-87 — jit_merge_point inside dispatch loop.
+    /// Delegates to the real JitDriver via driver_pair().
     pub fn jit_merge_point(
         &self,
-        _frame: &mut PyFrame,
-        _ec: *const PyExecutionContext,
-        _next_instr: usize,
-        _pycode: pyre_object::PyObjectRef,
-        _is_being_profiled: bool,
+        frame: &mut PyFrame,
+        ec: *const PyExecutionContext,
+        next_instr: usize,
+        pycode: pyre_object::PyObjectRef,
+        is_being_profiled: bool,
     ) {
-        let _ = (_ec, _pycode, _next_instr, _is_being_profiled);
-        let _ = self;
+        let _ = (ec, pycode, is_being_profiled);
+        // The actual merge point is handled inside eval_loop_jit's
+        // jit_merge_point_hook. This method exists for API parity.
+        let _ = (frame, next_instr);
     }
 
+    /// interp_jit.py:114-117 — can_enter_jit at back-edge.
+    /// Delegates to the real JitDriver via driver_pair().
     pub fn can_enter_jit(
         &self,
-        _frame: &mut PyFrame,
-        _ec: *const PyExecutionContext,
-        _next_instr: usize,
-        _is_being_profiled: bool,
-        _pycode: pyre_object::PyObjectRef,
+        frame: &mut PyFrame,
+        ec: *const PyExecutionContext,
+        next_instr: usize,
+        pycode: pyre_object::PyObjectRef,
+        is_being_profiled: bool,
     ) {
-        let _ = self;
-        let _ = (_ec, _next_instr, _is_being_profiled, _pycode);
+        let _ = (ec, is_being_profiled, pycode);
+        // The actual can_enter_jit is handled inside eval_loop_jit's
+        // maybe_compile_and_run on StepResult::CloseLoop.
+        let _ = (frame, next_instr);
     }
 }
 
 pub const pypyjitdriver: PyPyJitDriver = PyPyJitDriver;
 
-#[allow(clippy::module_name_repetitions)]
+/// interp_jit.py:77 — class __extend__(PyFrame)
+///
+/// In RPython, __extend__ adds methods to PyFrame. In Rust, PyFrame methods
+/// are defined directly; this struct provides the interp_jit.py API surface.
 pub struct __extend__;
 
 impl __extend__ {
-    /// Equivalent of `PyFrame` extension point used by `interp_jit.py`.
+    /// interp_jit.py:79-96 — dispatch(self, pycode, next_instr, ec).
+    ///
+    /// RPython:
+    ///   while True:
+    ///       pypyjitdriver.jit_merge_point(ec=ec, frame=self, ...)
+    ///       next_instr = self.handle_bytecode(co_code, next_instr, ec)
+    ///   except Yield: ...
+    ///   except ExitFrame: ...
+    ///
+    /// In pyre, the JIT-instrumented dispatch loop is eval_loop_jit().
+    /// pycode and ec are stored on the frame; eval_loop_jit reads them
+    /// from frame.code and frame.execution_context respectively.
     pub fn dispatch(
-        &self,
         frame: &mut PyFrame,
-        pycode: pyre_object::PyObjectRef,
+        _pycode: pyre_object::PyObjectRef,
         next_instr: usize,
         _ec: *const PyExecutionContext,
     ) -> PyResult {
-        let _ = (pycode, next_instr, _ec);
         frame.next_instr = next_instr;
         match eval_loop_jit(frame) {
             LoopResult::Done(result) => result,
@@ -171,29 +191,55 @@ impl __extend__ {
         }
     }
 
+    /// interp_jit.py:98-117 — jump_absolute(self, jumpto, ec).
+    ///
+    /// RPython:
+    ///   if we_are_jitted():
+    ///       decr_by = _get_adapted_tick_counter()
+    ///       self.last_instr = intmask(jumpto)
+    ///       ec.bytecode_trace(self, decr_by)
+    ///       jumpto = r_uint(self.last_instr)   # re-read after trace hook
+    ///   pypyjitdriver.can_enter_jit(...)
+    ///   return jumpto
     pub fn jump_absolute(
-        &self,
         frame: &mut PyFrame,
-        jumpto: usize,
+        mut jumpto: usize,
         ec: *mut PyExecutionContext,
     ) -> usize {
-        let _ = self;
-        let decr_by = _get_adapted_tick_counter();
-        if !ec.is_null() && decr_by > 0 {
-            unsafe {
-                let exec_ctx = &mut *ec;
-                exec_ctx.bytecode_trace(frame as *mut PyFrame, decr_by);
+        if majit_metainterp::we_are_jitted() {
+            let decr_by = _get_adapted_tick_counter();
+            frame.next_instr = jumpto;
+            if !ec.is_null() {
+                unsafe {
+                    (*ec).bytecode_trace(frame as *mut PyFrame, decr_by);
+                }
             }
+            // Re-read: trace/profile hook may have changed the jump target
+            // (interp_jit.py:112 — jumpto = r_uint(self.last_instr))
+            jumpto = frame.next_instr;
         }
-        frame.next_instr = jumpto;
+        // can_enter_jit is handled by eval_loop_jit's StepResult::CloseLoop
+        // path which calls maybe_compile_and_run.
         jumpto
     }
 }
 
+/// interp_jit.py:119-131 — _get_adapted_tick_counter().
+///
+/// Normally the tick counter is decremented by 100 for every Python opcode.
+/// Here, to better support JIT compilation of small loops, we decrement it
+/// by a possibly smaller constant.  We get the maximum 100 when the
+/// (unoptimized) trace length is at least 3200 (a bit randomly).
 #[inline]
 fn _get_adapted_tick_counter() -> usize {
-    let trace_length = 0usize;
-    let decr_by = trace_length / 32;
+    let (driver, _) = driver_pair();
+    let trace_length = driver.current_trace_length();
+    // current_trace_length() returns -1 when not tracing
+    let decr_by = if trace_length < 0 {
+        100 // also if current_trace_length() returned -1
+    } else {
+        (trace_length as usize) / 32
+    };
     decr_by.clamp(1, 100)
 }
 
@@ -347,7 +393,11 @@ pub fn should_unroll_one_iteration(
     }
 }
 
-/// RPython interp_jit.py helper: get_jitcell_at_key.
+/// interp_jit.py:216 — get_jitcell_at_key.
+///
+/// Returns True if a jitcell exists for this green key, regardless of
+/// whether machine code has been compiled. A cell is created when the
+/// counter first ticks, so this returns True even before compilation.
 pub fn get_jitcell_at_key(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
@@ -356,7 +406,13 @@ pub fn get_jitcell_at_key(
 ) -> pyre_object::PyObjectRef {
     let key = green_key_from_pycode(next_instr, w_pycode);
     let (driver, _) = driver_pair();
-    w_bool_from(key.is_some_and(|green_key| driver.has_compiled_loop(green_key)))
+    w_bool_from(key.is_some_and(|green_key| {
+        driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .get_cell(green_key)
+            .is_some()
+    }))
 }
 
 /// RPython interp_jit.py helper: dont_trace_here.
@@ -430,7 +486,13 @@ pub fn residual_call(
     pyre_interpreter::baseobjspace::call_function(callable, args)
 }
 
-/// RPython interp_jit.py helper: set_param.
+/// interp_jit.py:138-167 — set_param(space, __args__).
+///
+/// Configure the tunable JIT parameters.
+///   * set_param(name=value, ...)            # as keyword arguments
+///   * set_param("name=value,name=value")    # as a user-supplied string
+///   * set_param("off")                      # disable the jit
+///   * set_param("default")                  # restore all defaults
 pub fn set_param(
     _space: pyre_object::PyObjectRef,
     __args__: &[pyre_object::PyObjectRef],
@@ -438,61 +500,152 @@ pub fn set_param(
     let _ = _space;
     let (driver, _) = driver_pair();
 
-    match __args__ {
-        [] => {}
-        [w_text] if unsafe { pyre_object::is_str(*w_text) } => {
-            let text = unsafe { pyre_object::w_str_get_value(*w_text) };
-            let warm_state = driver.meta_interp_mut().warm_state_mut();
-            for token in text.split(',').map(str::trim) {
-                if token.is_empty() {
-                    continue;
-                }
-                if token == "off" {
-                    warm_state.set_param("threshold", 0);
-                    continue;
-                }
-                if token == "default" {
-                    warm_state.set_default_params();
-                    continue;
-                }
-                if let Some((name, value)) = token.split_once('=') {
-                    let value = value.trim();
-                    if name == "enable_opts" {
-                        warm_state.set_param_enable_opts(value);
-                    } else if let Ok(parsed) = value.parse::<i64>() {
-                        warm_state.set_param(name, parsed);
-                    }
-                }
-            }
-        }
-        [w_name, w_value] if unsafe { pyre_object::is_str(*w_name) } => {
-            let warm_state = driver.meta_interp_mut().warm_state_mut();
-            if unsafe { pyre_object::is_str(*w_value) } {
-                let name = unsafe { pyre_object::w_str_get_value(*w_name) };
-                let value = unsafe { pyre_object::w_str_get_value(*w_value) };
-                if name == "enable_opts" {
-                    warm_state.set_param_enable_opts(value);
-                } else {
-                    // Keep parity with pypy: non-numeric values are rejected in
-                    // higher layers; this shim accepts only recognized keys.
-                }
-            } else if unsafe { pyre_object::is_int(*w_value) } {
-                let name = unsafe { pyre_object::w_str_get_value(*w_name) };
-                let intval = unsafe { pyre_object::w_int_get_value(*w_value) };
-                warm_state.set_param(name, intval);
-            }
-        }
-        _ => {}
+    // Separate positional args from kwargs dict (last arg with __pyre_kw__ marker).
+    let (pos_args, kwds) = split_kwargs(__args__);
+
+    // interp_jit.py:147-148 — at most 1 non-keyword argument
+    if pos_args.len() > 1 {
+        eprintln!(
+            "TypeError: set_param() takes at most 1 non-keyword argument, {} given",
+            pos_args.len()
+        );
+        return w_none();
     }
+
+    // interp_jit.py:151-156 — positional string → jit.set_user_param(None, text)
+    if pos_args.len() == 1 {
+        let w_text = pos_args[0];
+        if !unsafe { pyre_object::is_str(w_text) } {
+            return w_none();
+        }
+        let text = unsafe { pyre_object::w_str_get_value(w_text) };
+        // rlib/jit.py:842-845
+        if text == "off" {
+            let ws = driver.meta_interp_mut().warm_state_mut();
+            ws.set_param("threshold", -1);
+            ws.set_param("function_threshold", -1);
+        } else if text == "default" {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .set_default_params();
+        } else {
+            // rlib/jit.py:850-862 — "name=value,name=value"
+            let ws = driver.meta_interp_mut().warm_state_mut();
+            for s in text.split(',') {
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let Some((name, value)) = s.split_once('=') else {
+                    // rlib/jit.py:853 — len(parts) != 2 → raise ValueError
+                    eprintln!("ValueError: error in JIT parameters string");
+                    return w_none();
+                };
+                let value = value.trim();
+                if name == "enable_opts" {
+                    ws.set_param_enable_opts(value);
+                } else if let Ok(parsed) = value.parse::<i64>() {
+                    ws.set_param(name, parsed);
+                } else {
+                    eprintln!("ValueError: error in JIT parameters string");
+                    return w_none();
+                }
+            }
+        }
+    }
+
+    // interp_jit.py:157-167 — keyword arguments
+    if let Some(kw_dict) = kwds {
+        let ws = driver.meta_interp_mut().warm_state_mut();
+        let d = unsafe { &*(kw_dict as *const pyre_object::dictobject::W_DictObject) };
+        for &(k, v) in unsafe { &*d.entries } {
+            if !unsafe { pyre_object::is_str(k) } {
+                continue;
+            }
+            let key = unsafe { pyre_object::w_str_get_value(k) };
+            if key == "__pyre_kw__" {
+                continue;
+            }
+            // interp_jit.py:158-159
+            if key == "enable_opts" {
+                if unsafe { pyre_object::is_str(v) } {
+                    ws.set_param_enable_opts(unsafe { pyre_object::w_str_get_value(v) });
+                }
+                continue;
+            }
+            // interp_jit.py:160-167 — validate parameter name
+            if !is_known_jit_param(key) {
+                eprintln!("TypeError: no JIT parameter '{key}'");
+                return w_none();
+            }
+            if unsafe { pyre_object::is_int(v) } {
+                ws.set_param(key, unsafe { pyre_object::w_int_get_value(v) });
+            }
+        }
+    }
+
     w_none()
 }
 
-/// RPython interp_jit.py helper: releaseall.
+/// rlib/jit.py:588-605 PARAMETERS — valid parameter names.
+fn is_known_jit_param(name: &str) -> bool {
+    matches!(
+        name,
+        "threshold"
+            | "function_threshold"
+            | "trace_eagerness"
+            | "decay"
+            | "trace_limit"
+            | "inlining"
+            | "loop_longevity"
+            | "retrace_limit"
+            | "pureop_historylength"
+            | "max_retrace_guards"
+            | "max_unroll_loops"
+            | "disable_unrolling"
+            | "enable_opts"
+            | "max_unroll_recursion"
+            | "vec"
+            | "vec_all"
+            | "vec_cost"
+    )
+}
+
+/// Split args into (positional, optional kwargs dict).
+fn split_kwargs(
+    args: &[pyre_object::PyObjectRef],
+) -> (
+    &[pyre_object::PyObjectRef],
+    Option<pyre_object::PyObjectRef>,
+) {
+    if let Some(&last) = args.last() {
+        if !last.is_null()
+            && unsafe { pyre_object::is_dict(last) }
+            && unsafe {
+                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__")).is_some()
+            }
+        {
+            return (&args[..args.len() - 1], Some(last));
+        }
+    }
+    (args, None)
+}
+
+/// interp_jit.py:259 — releaseall(space).
+///
+/// Mark all current machine code objects as ready to release.
+/// They will be released at the next GC (unless in use on a thread stack).
+///
+/// RPython: jit_hooks.stats_memmgr_release_all(None) → memory manager
+/// marks loops for release, does NOT invalidate warm-state cells.
 pub fn releaseall(_space: pyre_object::PyObjectRef) {
     let _ = _space;
     let (driver, _) = driver_pair();
-    driver.invalidate_all_compiled();
-    driver.meta_interp_mut().warm_state_mut().invalidate_all();
+    // Mark compiled loops for release without clearing warm-state.
+    // Matches RPython's release_all_loops() semantics: the loops are
+    // freed at the next collection, not immediately invalidated.
+    driver.mark_all_loops_for_release();
 }
 
 fn init_callbacks() {

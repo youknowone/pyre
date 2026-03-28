@@ -172,23 +172,32 @@ pub use crate::memmgr::LoopAging;
 /// The interpreter calls `maybe_compile()` at loop headers;
 /// WarmEnterState decides whether to start tracing, continue interpreting,
 /// or dispatch to compiled code.
-/// Default number of guard failures before triggering bridge compilation.
-/// PyPy default: trace_eagerness = 200
-const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
-const DEFAULT_THRESHOLD: u32 = 200;
+/// rlib/jit.py:588-605 PARAMETERS defaults.
+/// DEFAULT_ constants must match RPython exactly.
 
-/// PyPy default: function_threshold = 1619 (prime, above threshold)
+/// rlib/jit.py:588 threshold = 1039 (just above 1024, prime)
+const DEFAULT_THRESHOLD: u32 = 1039;
+
+/// rlib/jit.py:589 function_threshold = 1619
 const DEFAULT_FUNCTION_THRESHOLD: u32 = 1619;
 
-/// PyPy default: max_unroll_recursion = 7
-const DEFAULT_MAX_INLINE_DEPTH: u32 = 3;
+/// rlib/jit.py:590 trace_eagerness = 200
+const DEFAULT_BRIDGE_THRESHOLD: u32 = 200;
 
-/// PyPy default: trace_limit = 6000
+/// rlib/jit.py:601 max_unroll_recursion = 7
+const DEFAULT_MAX_UNROLL_RECURSION: u32 = 7;
+
+/// rlib/jit.py:593 inlining = 1 (max_inline_depth derived)
+const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
+
+/// rlib/jit.py:592 trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 
-/// Maximum number of retrace attempts before forcing jump_to_preamble.
-/// RPython default from warmspot.py: retrace_limit = 5.
-const DEFAULT_RETRACE_LIMIT: u32 = 5;
+/// rlib/jit.py:595 retrace_limit = 0
+const DEFAULT_RETRACE_LIMIT: u32 = 0;
+
+/// rlib/jit.py:599 disable_unrolling = 200
+const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -838,21 +847,21 @@ impl WarmEnterState {
         }
     }
 
-    /// Restore warm-state parameters to default values.
+    /// Restore warm-state parameters to rlib/jit.py:588-605 PARAMETERS defaults.
     pub fn set_default_params(&mut self) {
-        self.set_threshold(DEFAULT_THRESHOLD);
-        self.set_bridge_threshold(DEFAULT_BRIDGE_THRESHOLD);
-        self.set_trace_limit(DEFAULT_TRACE_LIMIT);
-        self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD);
-        self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH);
-        self.inlining = true;
-        self.disable_unrolling_threshold = 0;
+        self.set_threshold(DEFAULT_THRESHOLD); // 1039
+        self.set_bridge_threshold(DEFAULT_BRIDGE_THRESHOLD); // 200
+        self.set_trace_limit(DEFAULT_TRACE_LIMIT); // 6000
+        self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD); // 1619
+        self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH); // 7
+        self.inlining = true; // inlining = 1
+        self.disable_unrolling_threshold = DEFAULT_DISABLE_UNROLLING; // 200
         self.pureop_historylength = 16;
         self.decay = 40;
         self.max_retrace_guards = 15;
         self.max_unroll_loops = 0;
-        self.retrace_limit = DEFAULT_RETRACE_LIMIT;
-        self.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
+        self.retrace_limit = DEFAULT_RETRACE_LIMIT; // 0
+        self.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION; // 7
         self.loop_longevity = 1000;
         self.vec_cost = 0;
         self.vectorize = false;
@@ -1105,21 +1114,25 @@ impl WarmEnterState {
     ///
     /// RPython warmstate.py: all `set_param_*` methods unified.
     pub fn set_param(&mut self, name: &str, value: i64) {
+        // counter.py:124 — threshold <= 0 → compute_threshold returns 0.0
+        // (JIT off). Negative i64 must clamp to 0, not wrap to u32::MAX.
+        let as_u32 = if value < 0 { 0u32 } else { value as u32 };
         match name {
-            "threshold" => self.set_threshold(value as u32),
-            "trace_limit" => self.trace_limit = value as u32,
-            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = value as u32,
-            "function_threshold" => self.function_threshold = value as u32,
-            "max_inline_depth" => self.max_inline_depth = value as u32,
-            "retrace_limit" => self.retrace_limit = value as u32,
-            "max_retrace_guards" => self.max_retrace_guards = value as u32,
-            "max_unroll_loops" => self.max_unroll_loops = value as u32,
-            "max_unroll_recursion" => self.max_unroll_recursion = value as u32,
-            "loop_longevity" => self.loop_longevity = value as u32,
-            "vectorize" => self.vectorize = value != 0,
-            "vec_cost" => self.vec_cost = value as u32,
+            "threshold" => self.set_threshold(as_u32),
+            "trace_limit" => self.trace_limit = as_u32,
+            "trace_eagerness" | "bridge_threshold" => self.bridge_threshold = as_u32,
+            "function_threshold" => self.function_threshold = as_u32,
+            "max_inline_depth" => self.max_inline_depth = as_u32,
+            "retrace_limit" => self.retrace_limit = as_u32,
+            "max_retrace_guards" => self.max_retrace_guards = as_u32,
+            "max_unroll_loops" => self.max_unroll_loops = as_u32,
+            "max_unroll_recursion" => self.max_unroll_recursion = as_u32,
+            "loop_longevity" => self.loop_longevity = as_u32,
+            // rlib/jit.py:602-604 — vec, vec_all, vec_cost
+            "vec" | "vec_all" => self.vectorize = value != 0,
+            "vec_cost" => self.vec_cost = as_u32,
             "inlining" => self.inlining = value != 0,
-            "disable_unrolling" => self.disable_unrolling_threshold = value as u32,
+            "disable_unrolling" => self.disable_unrolling_threshold = as_u32,
             "pureop_historylength" => self.pureop_historylength = value as u32,
             "decay" => self.decay = value as u32,
             "enable_opts" => {} // string param, handled by set_param_enable_opts
