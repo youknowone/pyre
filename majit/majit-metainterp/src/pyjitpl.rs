@@ -1926,6 +1926,7 @@ impl<M: Clone> MetaInterp<M> {
         // (ctx.emit → number_guard_inline) rather than post-assembly.
 
         let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
 
         // Use pre-allocated token number if available (for self-recursion
@@ -1980,7 +1981,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
+                    compile::build_guard_metadata(
+                        &inputargs,
+                        &optimized_ops,
+                        green_key,
+                        &compiled_constants,
+                        &compiled_constant_types,
+                    );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -2423,7 +2430,7 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
-        unroll_opt.constant_types = constant_types;
+        unroll_opt.constant_types = constant_types.clone();
         unroll_opt.snapshot_boxes = snapshot_map_from_trace_snapshots(&trace.snapshots);
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
@@ -2504,6 +2511,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
 
         let token_num = self.warm_state.alloc_token_number();
@@ -2537,7 +2545,13 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &combined_ops, green_key);
+                    compile::build_guard_metadata(
+                        &inputargs,
+                        &combined_ops,
+                        green_key,
+                        &compiled_constants,
+                        &compiled_constant_types,
+                    );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -2840,6 +2854,7 @@ impl<M: Clone> MetaInterp<M> {
         // rd_numb produced inline during optimization (number_guard_inline).
 
         let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         token.green_key = green_key;
 
@@ -2849,7 +2864,13 @@ impl<M: Clone> MetaInterp<M> {
         {
             Ok(_) => {
                 let (resume_data, guard_op_indices, mut exit_layouts) =
-                    compile::build_guard_metadata(&inputargs, &optimized_ops, green_key);
+                    compile::build_guard_metadata(
+                        &inputargs,
+                        &optimized_ops,
+                        green_key,
+                        &compiled_constants,
+                        &compiled_constant_types,
+                    );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
@@ -4350,7 +4371,7 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
-        optimizer.constant_types = constant_types;
+        optimizer.constant_types = constant_types.clone();
         optimizer.snapshot_boxes = snapshot_boxes;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
@@ -4462,6 +4483,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
         let bridge_trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -4512,7 +4534,13 @@ impl<M: Clone> MetaInterp<M> {
                             copied_from: None,
                         });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
-                        compile::build_guard_metadata(bridge_inputargs, &optimized_ops, green_key);
+                        compile::build_guard_metadata(
+                            bridge_inputargs,
+                            &optimized_ops,
+                            green_key,
+                            &compiled_constants,
+                            &compiled_constant_types,
+                        );
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
@@ -6097,7 +6125,7 @@ mod tests {
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
         let (mut resume_data, guard_op_indices, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key);
+            compile::build_guard_metadata(inputargs, &ops, green_key, &constants, &HashMap::new());
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
