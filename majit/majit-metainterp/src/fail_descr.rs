@@ -1,5 +1,5 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use majit_ir::{AccumVectorInfo, DescrRef, FailDescr, Type};
@@ -34,8 +34,13 @@ struct MetaFailDescr {
     fail_index: u32,
     types: Vec<Type>,
     /// schedule.py:654: vector accumulation info attached during vectorization.
-    vector_info: Mutex<Vec<AccumVectorInfo>>,
+    /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
+    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
 }
+
+// Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
+unsafe impl Send for MetaFailDescr {}
+unsafe impl Sync for MetaFailDescr {}
 
 impl majit_ir::Descr for MetaFailDescr {
     fn index(&self) -> u32 {
@@ -54,10 +59,10 @@ impl FailDescr for MetaFailDescr {
         &self.types
     }
     fn attach_vector_info(&self, info: AccumVectorInfo) {
-        self.vector_info.lock().unwrap().push(info);
+        unsafe { &mut *self.vector_info.get() }.push(info);
     }
     fn vector_info(&self) -> Vec<AccumVectorInfo> {
-        self.vector_info.lock().unwrap().clone()
+        unsafe { &mut *self.vector_info.get() }.clone()
     }
 }
 
@@ -72,8 +77,12 @@ struct ResumeGuardDescr {
     fail_index: u32,
     types: Vec<Type>,
     resume_data: ResumeData,
-    vector_info: Mutex<Vec<AccumVectorInfo>>,
+    /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
+    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
 }
+
+unsafe impl Send for ResumeGuardDescr {}
+unsafe impl Sync for ResumeGuardDescr {}
 
 impl majit_ir::Descr for ResumeGuardDescr {
     fn index(&self) -> u32 {
@@ -92,10 +101,10 @@ impl FailDescr for ResumeGuardDescr {
         &self.types
     }
     fn attach_vector_info(&self, info: AccumVectorInfo) {
-        self.vector_info.lock().unwrap().push(info);
+        unsafe { &mut *self.vector_info.get() }.push(info);
     }
     fn vector_info(&self) -> Vec<AccumVectorInfo> {
-        self.vector_info.lock().unwrap().clone()
+        unsafe { &mut *self.vector_info.get() }.clone()
     }
 }
 
@@ -116,7 +125,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -129,7 +138,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
     Arc::new(MetaFailDescr {
         fail_index,
         types: vec![Type::Int; num_live],
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -138,7 +147,7 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types,
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -147,7 +156,7 @@ pub fn make_fail_descr_typed_with_index(fail_index: u32, types: Vec<Type>) -> De
     Arc::new(MetaFailDescr {
         fail_index,
         types,
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -163,7 +172,7 @@ pub fn make_resume_guard_descr(num_live: usize, resume_data: ResumeData) -> Desc
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
         resume_data,
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -178,7 +187,7 @@ pub fn make_resume_guard_descr_with_index(
         fail_index,
         types: vec![Type::Int; num_live],
         resume_data,
-        vector_info: Mutex::new(Vec::new()),
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
