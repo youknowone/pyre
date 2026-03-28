@@ -4312,6 +4312,24 @@ impl<M: Clone> MetaInterp<M> {
         (fired, owning_key)
     }
 
+    /// compile.py:786-795: start_compiling / done_compiling — set/clear
+    /// ST_BUSY_FLAG on a guard's GuardFailureInfo.
+    pub fn set_guard_compiling(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        compiling: bool,
+    ) {
+        let owning_key = self.find_owning_key(green_key, trace_id);
+        if let Some(compiled) = self.compiled_loops.get_mut(&owning_key) {
+            let tid = Self::normalize_trace_id(compiled, trace_id);
+            if let Some(info) = compiled.guard_failures.get_mut(&(tid, fail_index)) {
+                info.compiling = compiling;
+            }
+        }
+    }
+
     /// Find the compiled_loops key that owns a given trace_id.
     fn find_owning_key(&self, green_key: u64, trace_id: u64) -> u64 {
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
