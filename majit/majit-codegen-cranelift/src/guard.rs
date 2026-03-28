@@ -12,8 +12,9 @@ use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_root
 use majit_codegen::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
 use majit_ir::{FailDescr, GcRef, Type};
+use std::cell::UnsafeCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 /// Compiled bridge data attached to a guard's fail descriptor.
 ///
@@ -49,7 +50,9 @@ pub struct BridgeData {
     /// Whether any guard in this bridge uses FORCE_TOKEN slots.
     pub needs_force_frame: bool,
     /// Static terminal-exit layouts within the bridge trace.
-    pub terminal_exit_layouts: Mutex<Vec<TerminalExitLayout>>,
+    /// Write-once during bridge compilation, read-only after.
+    /// No lock needed — RPython ResumeGuardDescr has no lock (GIL).
+    pub terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     /// When true, a bridge Finish with matching arity should re-enter
     /// the parent loop instead of returning to the interpreter.
     /// Set for bridges that reach the loop's merge_point.
@@ -64,6 +67,18 @@ pub struct BridgeData {
 unsafe impl Send for BridgeData {}
 unsafe impl Sync for BridgeData {}
 
+impl BridgeData {
+    #[inline]
+    pub fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
+        unsafe { &*self.terminal_exit_layouts.get() }
+    }
+
+    #[inline]
+    pub fn terminal_exit_layouts_mut(&self) -> &mut Vec<TerminalExitLayout> {
+        unsafe { &mut *self.terminal_exit_layouts.get() }
+    }
+}
+
 impl std::fmt::Debug for BridgeData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeData")
@@ -76,10 +91,9 @@ impl std::fmt::Debug for BridgeData {
             .field("gc_runtime_id", &self.gc_runtime_id)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)
-            .field(
-                "terminal_exit_layouts",
-                &self.terminal_exit_layouts.lock().unwrap().clone(),
-            )
+            .field("terminal_exit_layouts", unsafe {
+                &*self.terminal_exit_layouts.get()
+            })
             .finish()
     }
 }
@@ -102,12 +116,17 @@ pub struct CraneliftFailDescr {
     pub gc_map: GcMap,
     pub is_finish: bool,
     pub force_token_slots: Vec<usize>,
-    pub trace_info: Mutex<Option<CompiledTraceInfo>>,
-    pub recovery_layout: Mutex<Option<ExitRecoveryLayout>>,
+    /// Write-once during compilation, read-only after.
+    /// No lock — RPython ResumeGuardDescr has no lock (GIL).
+    pub trace_info: UnsafeCell<Option<CompiledTraceInfo>>,
+    /// Write-once during bridge compilation, read-only after.
+    pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
     /// Number of times this guard has failed (for bridge compilation heuristics).
     pub fail_count: AtomicU32,
     /// Compiled bridge attached to this guard, if any.
-    pub bridge: Mutex<Option<BridgeData>>,
+    /// Write-once when bridge is compiled, read-only after.
+    /// No lock — RPython compile.py attach_bridge has no lock (GIL).
+    pub bridge: UnsafeCell<Option<BridgeData>>,
     /// Atomic cache of bridge code_ptr for lock-free dispatch.
     pub bridge_code_ptr_cache: std::sync::atomic::AtomicUsize,
 }
@@ -122,16 +141,20 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("gc_map", &self.gc_map)
             .field("is_finish", &self.is_finish)
             .field("force_token_slots", &self.force_token_slots)
-            .field("trace_info", &self.trace_info.lock().unwrap().clone())
-            .field(
-                "recovery_layout",
-                &self.recovery_layout.lock().unwrap().clone(),
-            )
+            .field("trace_info", unsafe { &*self.trace_info.get() })
+            .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
             .field("fail_count", &self.fail_count.load(Ordering::Relaxed))
-            .field("has_bridge", &self.bridge.lock().unwrap().is_some())
+            .field("has_bridge", &unsafe { &*self.bridge.get() }.is_some())
             .finish()
     }
 }
+
+// Safety: CraneliftFailDescr is accessed from a single thread (the JIT thread).
+// UnsafeCell fields (bridge, trace_info, recovery_layout) are write-once during
+// compilation and read-only thereafter. RPython's ResumeGuardDescr has no locks
+// (GIL-protected). pyre is single-threaded (no-GIL, single thread).
+unsafe impl Send for CraneliftFailDescr {}
+unsafe impl Sync for CraneliftFailDescr {}
 
 impl CraneliftFailDescr {
     fn gc_map_for_types(fail_arg_types: &[Type], force_token_slots: &[usize]) -> GcMap {
@@ -202,12 +225,30 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             force_token_slots,
-            trace_info: Mutex::new(None),
-            recovery_layout: Mutex::new(recovery_layout),
+            trace_info: UnsafeCell::new(None),
+            recovery_layout: UnsafeCell::new(recovery_layout),
             fail_count: AtomicU32::new(0),
-            bridge: Mutex::new(None),
+            bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    // UnsafeCell accessor helpers — single-threaded, no lock needed.
+    // RPython ResumeGuardDescr fields are plain attributes (GIL-protected).
+
+    #[inline]
+    pub fn bridge_ref(&self) -> &Option<BridgeData> {
+        unsafe { &*self.bridge.get() }
+    }
+
+    #[inline]
+    pub fn trace_info_ref(&self) -> &Option<CompiledTraceInfo> {
+        unsafe { &*self.trace_info.get() }
+    }
+
+    #[inline]
+    pub fn recovery_layout_ref(&self) -> &Option<ExitRecoveryLayout> {
+        unsafe { &*self.recovery_layout.get() }
     }
 
     /// Increment the failure counter and return the new value.
@@ -236,13 +277,13 @@ impl CraneliftFailDescr {
     /// Attach a compiled bridge to this guard.
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
-        *self.bridge.lock().unwrap() = Some(bridge);
+        unsafe { *self.bridge.get() = Some(bridge) };
         self.bridge_code_ptr_cache
             .store(code_ptr, std::sync::atomic::Ordering::Release);
     }
 
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
-        *self.recovery_layout.lock().unwrap() = Some(recovery_layout);
+        unsafe { *self.recovery_layout.get() = Some(recovery_layout) };
     }
 
     pub fn set_source_op_index(&mut self, source_op_index: usize) {
@@ -250,7 +291,7 @@ impl CraneliftFailDescr {
     }
 
     pub fn set_trace_info(&self, trace_info: CompiledTraceInfo) {
-        *self.trace_info.lock().unwrap() = Some(trace_info);
+        unsafe { *self.trace_info.get() = Some(trace_info) };
     }
 
     pub fn gc_map(&self) -> &GcMap {
@@ -272,13 +313,13 @@ impl CraneliftFailDescr {
             .enumerate()
             .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
             .collect();
-        let recovery = self.recovery_layout.lock().unwrap().clone();
+        let recovery = unsafe { &*self.recovery_layout.get() }.clone();
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
         FailDescrLayout {
             fail_index: self.fail_index,
             source_op_index: self.source_op_index,
             trace_id: self.trace_id,
-            trace_info: self.trace_info.lock().unwrap().clone(),
+            trace_info: unsafe { &*self.trace_info.get() }.clone(),
             fail_arg_types: self.fail_arg_types.clone(),
             is_finish: self.is_finish,
             gc_ref_slots,
