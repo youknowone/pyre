@@ -218,3 +218,128 @@ impl IndexMut<usize> for PyObjectArray {
         }
     }
 }
+
+// ─── GcArray: RPython GC array allocation + setarrayitem parity ──────────
+//
+// resume.py:1444-1537 ResumeDataDirectReader:
+//   allocate_array(length, arraydescr, clear) → GCREF
+//   setarrayitem_ref(array, index, fieldnum, arraydescr) → write decoded ref
+//   setarrayitem_int(array, index, fieldnum, arraydescr) → write decoded int
+//   setarrayitem_float(array, index, fieldnum, arraydescr) → write decoded float
+//
+// In pyre, GcArray is a boxed PyObjectArray on the heap. The returned
+// pointer is a raw `*mut PyObjectArray` cast to usize for GcRef.
+
+// ─── GcTypedArray: RPython typed GC array ────────────────────────────
+//
+// llmodel.py:788-789: bh_new_array / bh_new_array_clear
+// llmodel.py:607-619: bh_setarrayitem_gc_r/i/f, bh_getarrayitem_gc_r/i/f
+// resume.py:1444-1537: ResumeDataDirectReader allocate_array + setarrayitem_*
+//
+// RPython GC arrays are typed: ref[], int[], float[]. Each slot stores
+// a raw value of the corresponding type. pyre's GcTypedArray preserves
+// this distinction.
+
+/// RPython typed GC array — descr.py:273 ArrayDescr.flag parity.
+pub enum GcTypedArray {
+    /// FLAG_POINTER: each slot is a PyObjectRef (GCREF).
+    Ref(Vec<PyObjectRef>),
+    /// FLAG_SIGNED/FLAG_UNSIGNED: each slot is a raw i64.
+    Int(Vec<i64>),
+    /// FLAG_FLOAT: each slot is a raw f64.
+    Float(Vec<f64>),
+}
+
+/// Array element kind — resume.py:656 arraydescr.is_array_of_* parity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayKind {
+    Ref,
+    Int,
+    Float,
+}
+
+/// llmodel.py:788 bh_new_array / bh_new_array_clear parity.
+/// Allocate a typed GC array. `clear=true` → zero-initialized.
+pub fn allocate_array(length: usize, kind: ArrayKind, clear: bool) -> *mut GcTypedArray {
+    let arr = match kind {
+        ArrayKind::Ref => {
+            let fill = if clear { PY_NULL } else { PY_NULL }; // both zero
+            GcTypedArray::Ref(vec![fill; length])
+        }
+        ArrayKind::Int => GcTypedArray::Int(vec![0i64; length]),
+        ArrayKind::Float => GcTypedArray::Float(vec![0.0f64; length]),
+    };
+    Box::into_raw(Box::new(arr))
+}
+
+/// llmodel.py:607-609 bh_setarrayitem_gc_r parity.
+pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectRef) {
+    if array.is_null() {
+        return;
+    }
+    let arr = unsafe { &mut *array };
+    if let GcTypedArray::Ref(v) = arr {
+        if index < v.len() {
+            v[index] = value;
+        }
+    }
+}
+
+/// llmodel.py:613-615 bh_setarrayitem_gc_i parity.
+/// Write a raw i64 to an int array slot.
+pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
+    if array.is_null() {
+        return;
+    }
+    let arr = unsafe { &mut *array };
+    match arr {
+        GcTypedArray::Int(v) => {
+            if index < v.len() {
+                v[index] = value;
+            }
+        }
+        // Fallback: box as W_IntObject into ref array
+        GcTypedArray::Ref(v) => {
+            if index < v.len() {
+                v[index] = crate::intobject::w_int_new(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// llmodel.py:618-619 bh_setarrayitem_gc_f parity.
+/// Write a raw f64 to a float array slot.
+pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
+    if array.is_null() {
+        return;
+    }
+    let arr = unsafe { &mut *array };
+    match arr {
+        GcTypedArray::Float(v) => {
+            if index < v.len() {
+                v[index] = value;
+            }
+        }
+        // Fallback: box as W_FloatObject into ref array
+        GcTypedArray::Ref(v) => {
+            if index < v.len() {
+                v[index] = crate::floatobject::w_float_new(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resume parity: get the length of a GcTypedArray.
+pub fn gcarray_len(array: *const GcTypedArray) -> usize {
+    if array.is_null() {
+        return 0;
+    }
+    let arr = unsafe { &*array };
+    match arr {
+        GcTypedArray::Ref(v) => v.len(),
+        GcTypedArray::Int(v) => v.len(),
+        GcTypedArray::Float(v) => v.len(),
+    }
+}
