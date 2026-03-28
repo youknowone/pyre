@@ -1873,11 +1873,10 @@ fn materialize_virtual_from_rd(
                     rd_virtuals_info,
                     virtuals_cache,
                 );
-                match &v {
-                    None if *clear => items.push(w_none()), // clear array: zero-init
-                    None => items.push(std::ptr::null_mut()), // not clear: skip
-                    _ => items.push(box_opt_value(&v)),
-                }
+                // resume.py:659: skip UNINITIALIZED (already zero when clear).
+                // Both clear=true and clear=false: UNINITIALIZED → null (zero).
+                // RPython's clear means zero-init at allocation, not Python None.
+                items.push(box_opt_value(&v));
             }
             return Value::Ref(majit_ir::GcRef(
                 pyre_object::listobject::w_list_new(items) as usize
@@ -2342,13 +2341,37 @@ fn rebuild_typed_from_rd_numb(
     let (_num_failargs, frames) = rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
-    let mut typed = Vec::new();
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
 
     // resume.py:988: _prepare_virtuals — initialize virtuals_cache.
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
-    // resume.py:1017-1026 _prepare_next_section: decode each frame's slots.
+    // Multi-frame guard recovery: when a guard fires inside an inlined callee,
+    // the rd_numb encodes [callee_frame, ..., caller_frame]. The interpreter
+    // resumes at the outermost (last) frame. For single-frame, decode normally.
+    if frames.len() > 1 {
+        let caller_frame = frames.last().unwrap();
+        let mut typed = Vec::new();
+        _prepare_next_section(
+            caller_frame,
+            raw_values,
+            &dead_frame_typed,
+            exit_layout,
+            &mut typed,
+            &mut virtuals_cache,
+        );
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit] guard-fail: rd_numb decoded {} slots from last of {} frame(s)",
+                typed.len(),
+                frames.len()
+            );
+        }
+        return typed;
+    }
+
+    // Single-frame: decode all frames (typically just one).
+    let mut typed = Vec::new();
     for frame in &frames {
         _prepare_next_section(
             frame,
@@ -2706,13 +2729,13 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 materialized.push(obj);
             }
             majit_codegen::ExitVirtualLayout::Array { clear, items, .. } => {
-                // resume.py:650-670: allocate_array + setarrayitem_*
+                // resume.py:650-670: allocate_array(len, arraydescr, clear)
+                // clear=true → zero-init (null ptrs). Unresolved → 0 (null).
+                let _ = clear; // pyre: w_list_new always takes explicit items
                 let item_ptrs: Vec<pyre_object::PyObjectRef> = items
                     .iter()
-                    .map(|src| match resolve_value(src, &materialized) {
-                        Some(v) => v as pyre_object::PyObjectRef,
-                        None if *clear => w_none(),
-                        None => std::ptr::null_mut(),
+                    .map(|src| {
+                        resolve_value(src, &materialized).unwrap_or(0) as pyre_object::PyObjectRef
                     })
                     .collect();
                 materialized.push(pyre_object::listobject::w_list_new(item_ptrs) as usize);

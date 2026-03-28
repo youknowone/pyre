@@ -180,6 +180,9 @@ pub struct Optimizer {
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Propagated to OptContext for number_guard_inline.
     pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
+    /// Per-frame box counts for multi-frame snapshots.
+    /// Propagated to OptContext for number_guard_inline multi-frame encoding.
+    pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -779,6 +782,7 @@ impl Optimizer {
             constant_fold_alloc: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
             snapshot_boxes: std::collections::HashMap::new(),
+            snapshot_frame_sizes: std::collections::HashMap::new(),
         }
     }
 
@@ -1332,6 +1336,7 @@ impl Optimizer {
         // to OptContext so emit() can call store_final_boxes_in_guard inline
         // at each guard emission (not post-assembly).
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
+        ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)
         // into constant_types_for_numbering. These override Int → Ref for

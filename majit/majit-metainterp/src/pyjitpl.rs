@@ -179,24 +179,28 @@ impl StoredExitLayout {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[majit_trace::recorder::Snapshot],
-) -> std::collections::HashMap<i32, Vec<majit_ir::OpRef>> {
-    trace_snapshots
-        .iter()
-        .enumerate()
-        .map(|(id, snap)| {
-            use majit_trace::recorder::SnapshotTagged;
-            let boxes: Vec<majit_ir::OpRef> = snap
-                .frames
-                .iter()
-                .flat_map(|f| f.boxes.iter())
-                .map(|t| match t {
-                    SnapshotTagged::Box(n) | SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
-                    SnapshotTagged::Const(_) => majit_ir::OpRef::NONE,
-                })
-                .collect();
-            (id as i32, boxes)
-        })
-        .collect()
+) -> (
+    std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    std::collections::HashMap<i32, Vec<usize>>,
+) {
+    let mut box_map = std::collections::HashMap::new();
+    let mut size_map = std::collections::HashMap::new();
+    for (id, snap) in trace_snapshots.iter().enumerate() {
+        use majit_trace::recorder::SnapshotTagged;
+        let boxes: Vec<majit_ir::OpRef> = snap
+            .frames
+            .iter()
+            .flat_map(|f| f.boxes.iter())
+            .map(|t| match t {
+                SnapshotTagged::Box(n) | SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+                SnapshotTagged::Const(_) => majit_ir::OpRef::NONE,
+            })
+            .collect();
+        let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
+        box_map.insert(id as i32, boxes);
+        size_map.insert(id as i32, frame_sizes);
+    }
+    (box_map, size_map)
 }
 
 fn normalize_root_loop_entry_contract(
@@ -1749,26 +1753,10 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let snapshot_map: std::collections::HashMap<i32, Vec<majit_ir::OpRef>> = trace_snapshots
-            .iter()
-            .enumerate()
-            .map(|(id, snap)| {
-                use majit_trace::recorder::SnapshotTagged;
-                let boxes: Vec<majit_ir::OpRef> = snap
-                    .frames
-                    .iter()
-                    .flat_map(|f| f.boxes.iter())
-                    .map(|t| match t {
-                        SnapshotTagged::Box(n) => majit_ir::OpRef(*n),
-                        SnapshotTagged::Const(_) | SnapshotTagged::Virtual(_) => {
-                            majit_ir::OpRef::NONE
-                        }
-                    })
-                    .collect();
-                (id as i32, boxes)
-            })
-            .collect();
+        let (snapshot_map, snapshot_frame_size_map) =
+            snapshot_map_from_trace_snapshots(&trace_snapshots);
         unroll_opt.snapshot_boxes = snapshot_map.clone();
+        unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -1814,6 +1802,7 @@ impl<M: Clone> MetaInterp<M> {
                         let mut simple_opt = Optimizer::default_pipeline();
                         simple_opt.constant_types = constant_types.clone();
                         simple_opt.snapshot_boxes = snapshot_map.clone();
+                        simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
@@ -2301,7 +2290,8 @@ impl<M: Clone> MetaInterp<M> {
         let constants = ctx.constants.snapshot();
         let constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
-        let snapshot_boxes = snapshot_map_from_trace_snapshots(&trace_snapshots);
+        let (snapshot_boxes, snapshot_frame_sizes) =
+            snapshot_map_from_trace_snapshots(&trace_snapshots);
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2341,6 +2331,7 @@ impl<M: Clone> MetaInterp<M> {
                     constants,
                     constant_types,
                     snapshot_boxes,
+                    snapshot_frame_sizes,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2368,6 +2359,7 @@ impl<M: Clone> MetaInterp<M> {
                     constants,
                     constant_types,
                     snapshot_boxes,
+                    snapshot_frame_sizes,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2492,7 +2484,10 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.numbering_type_overrides = numbering_overrides;
-        unroll_opt.snapshot_boxes = snapshot_map_from_trace_snapshots(&trace.snapshots);
+        let (retrace_snapshot_boxes, retrace_snapshot_frame_sizes) =
+            snapshot_map_from_trace_snapshots(&trace.snapshots);
+        unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
+        unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
@@ -4526,6 +4521,7 @@ impl<M: Clone> MetaInterp<M> {
         constants: HashMap<u32, i64>,
         constant_types: HashMap<u32, Type>,
         snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
+        snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -4536,6 +4532,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         optimizer.snapshot_boxes = snapshot_boxes;
+        optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
@@ -7593,6 +7590,7 @@ mod tests {
             bridge_constants,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -7675,6 +7673,7 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -7796,6 +7795,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -7868,6 +7868,7 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -7970,6 +7971,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -8057,6 +8059,7 @@ mod tests {
             &fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
