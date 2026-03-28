@@ -3059,28 +3059,22 @@ impl MIFrame {
         }
 
         // goto_if_not (pyjitpl.py:514) parity:
-        //   RPython: generate_guard(resumepc=orgpc) → re-executes compound
-        //            goto_if_not on guard failure, which naturally takes the
-        //            other branch.
+        //   RPython: generate_guard(resumepc=orgpc) → capture_resumedata
+        //            unconditionally (pyjitpl.py:2579).
         //   pyre:    COMPARE_OP + POP_JUMP_IF are separate opcodes, so we
-        //            cannot re-execute — the comparison result is already
-        //            consumed.  Instead we record other_target (the branch
-        //            NOT taken) as the resume PC directly.
+        //            use other_target (the branch NOT taken) as the resume PC.
         //
-        // fail_args use post-pop stack state (comparison result already
-        // consumed by POP_JUMP_IF), NOT the pre_opcode snapshot.
-        // flush_to_frame_for_guard is intentionally NOT called here —
-        // its orgpc + pre_opcode_vsd would be wrong for branch guards.
+        // Post-pop state: comparison result already consumed by POP_JUMP_IF.
         let other_target = self.sym().pending_branch_other_target;
         let (
             frame,
-            next_instr,
             nlocals,
             local_values,
             local_types,
             stack_values,
             stack_types,
             stack_depth,
+            resume_pc,
         ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
@@ -3088,17 +3082,53 @@ impl MIFrame {
                 other_target.unwrap_or(s.pending_next_instr.unwrap_or(self.fallthrough_pc));
             (
                 s.frame,
-                ctx.const_int(resume_pc as i64),
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 s.symbolic_local_types.clone(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
                 s.valuestackdepth,
+                resume_pc,
             )
         };
+        let next_instr = ctx.const_int(resume_pc as i64);
+        let vsd_opref = ctx.const_int(stack_depth as i64);
 
-        let mut fail_args = vec![frame, next_instr, ctx.const_int(stack_depth as i64)];
+        // pyjitpl.py:2579: capture_resumedata unconditionally.
+        // Snapshot boxes = active boxes (no header), using raw symbolic OpRefs.
+        let mut active_boxes: Vec<OpRef> =
+            Vec::with_capacity(local_values.len() + stack_values.len());
+        active_boxes.extend_from_slice(&local_values);
+        active_boxes.extend_from_slice(&stack_values);
+        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+
+        // pyjitpl.py:2588: vable_array = virtualizable_boxes.
+        // [ni, vsd, locals..., stack..., frame_ptr]
+        let mut vable_boxes = Vec::with_capacity(2 + local_values.len() + stack_values.len() + 1);
+        vable_boxes.push(Self::opref_to_snapshot_tagged(next_instr, ctx));
+        vable_boxes.push(Self::opref_to_snapshot_tagged(vsd_opref, ctx));
+        for &local in &local_values {
+            vable_boxes.push(Self::opref_to_snapshot_tagged(local, ctx));
+        }
+        for &stack_val in &stack_values {
+            vable_boxes.push(Self::opref_to_snapshot_tagged(stack_val, ctx));
+        }
+        vable_boxes.push(Self::opref_to_snapshot_tagged(frame, ctx));
+
+        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
+        let snapshot = majit_trace::recorder::Snapshot {
+            frames: vec![majit_trace::recorder::SnapshotFrame {
+                jitcode_index: 0, // single jitcode
+                pc: resume_pc as u32,
+                boxes: snapshot_boxes,
+            }],
+            vable_boxes,
+            vref_boxes,
+        };
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+
+        // fail_args for Cranelift deadframe: header + materialized active boxes.
+        let mut fail_args = vec![frame, next_instr, vsd_opref];
         for (idx, slot) in local_values.into_iter().enumerate() {
             let slot_type = local_types.get(idx).copied().unwrap_or(Type::Ref);
             fail_args.push(self.materialize_fail_arg_slot(ctx, slot, slot_type, idx));
@@ -3116,6 +3146,7 @@ impl MIFrame {
         let fail_arg_types =
             virtualizable_fail_arg_types(local_types.into_iter().chain(stack_types));
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
+        ctx.set_last_guard_resume_position(snapshot_id);
     }
 
     /// RPython registers[idx] parity: read concrete value from Box arrays.

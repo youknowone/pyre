@@ -2560,12 +2560,62 @@ fn rebuild_typed_from_rd_numb(
     // resume.py:988: _prepare_virtuals — initialize virtuals_cache.
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
+    // resume.py:1045 consume_vref_and_vable parity:
+    // Reconstruct header [frame_ptr, py_pc, vsd] from vable_values.
+    // vable_array layout: [ni, vsd, locals..., stack..., frame_ptr]
+    // pyre header layout: [frame_ptr, py_pc, vsd]
+    // Decode a vable RebuiltValue to a concrete Value.
+    fn decode_vable_value(
+        rv: &majit_ir::resumedata::RebuiltValue,
+        dead_frame_typed: &[Value],
+        exit_layout: &CompiledExitLayout,
+        virtuals_cache: &mut HashMap<usize, Value>,
+    ) -> Value {
+        use majit_ir::resumedata::RebuiltValue;
+        match rv {
+            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Int(i) => Value::Int(*i as i64),
+            RebuiltValue::Const(c, tp) => match tp {
+                majit_ir::Type::Int => Value::Int(*c),
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                _ => Value::Int(*c),
+            },
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                exit_layout.exit_types.len() as i32,
+                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
+                exit_layout.rd_virtuals_info.as_deref(),
+                virtuals_cache,
+            ),
+            _ => Value::Int(0),
+        }
+    }
+    let header: Vec<Value> = if !vable_values.is_empty() {
+        // frame_ptr = last element, py_pc = first, vsd = second
+        let frame_val = vable_values
+            .last()
+            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
+            .unwrap_or(Value::Int(0));
+        let py_pc_val = vable_values
+            .first()
+            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
+            .unwrap_or(Value::Int(0));
+        let vsd_val = vable_values
+            .get(1)
+            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
+            .unwrap_or(Value::Int(0));
+        vec![frame_val, py_pc_val, vsd_val]
+    } else {
+        Vec::new()
+    };
+
     // Multi-frame guard recovery: when a guard fires inside an inlined callee,
     // the rd_numb encodes [callee_frame, ..., caller_frame]. The interpreter
     // resumes at the outermost (last) frame. For single-frame, decode normally.
     if frames.len() > 1 {
         let caller_frame = frames.last().unwrap();
-        let mut typed = Vec::new();
+        let mut typed = header.clone();
         _prepare_next_section(
             caller_frame,
             raw_values,
@@ -2585,7 +2635,7 @@ fn rebuild_typed_from_rd_numb(
     }
 
     // Single-frame: decode all frames (typically just one).
-    let mut typed = Vec::new();
+    let mut typed = header;
     for frame in &frames {
         _prepare_next_section(
             frame,
@@ -2618,11 +2668,63 @@ fn build_resumed_frames(
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
-    let (_num_failargs, _vable_values, _vref_values, frames) =
+    let (_num_failargs, vable_values, _vref_values, frames) =
         rebuild_from_numbering(rd_numb, rd_consts);
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
+
+    // resume.py:1045 consume_vref_and_vable parity:
+    // Reconstruct header [frame_ptr, ni, vsd] from vable_values.
+    fn resolve_rebuilt_value(
+        rv: &majit_ir::resumedata::RebuiltValue,
+        dead_frame_typed: &[Value],
+        exit_layout: &CompiledExitLayout,
+        virtuals_cache: &mut HashMap<usize, Value>,
+    ) -> Value {
+        use majit_ir::resumedata::RebuiltValue;
+        match rv {
+            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Int(i) => Value::Int(*i as i64),
+            RebuiltValue::Const(c, tp) => match tp {
+                majit_ir::Type::Int => Value::Int(*c),
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                _ => Value::Int(*c),
+            },
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                exit_layout.exit_types.len() as i32,
+                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
+                exit_layout.rd_virtuals_info.as_deref(),
+                virtuals_cache,
+            ),
+            _ => Value::Int(0),
+        }
+    }
+    let header: Vec<Value> = if vable_values.len() >= 3 {
+        let frame_val = resolve_rebuilt_value(
+            vable_values.last().unwrap(),
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let ni_val = resolve_rebuilt_value(
+            &vable_values[0],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let vsd_val = resolve_rebuilt_value(
+            &vable_values[1],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        vec![frame_val, ni_val, vsd_val]
+    } else {
+        Vec::new()
+    };
 
     // resume.py:924-926 _prepare parity: resolve ALL frames' values first,
     // then apply _prepare_virtuals + _prepare_pendingfields ONCE before
@@ -2630,7 +2732,7 @@ fn build_resumed_frames(
     // before the while-loop in blackhole_from_resumedata (resume.py:1320).
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
-        let mut values = Vec::new();
+        let mut values = header.clone();
         _prepare_next_section(
             frame,
             raw_values,
