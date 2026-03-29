@@ -349,7 +349,9 @@ impl TreeLoop {
             new_ops.push(new_op);
         }
 
-        TreeLoop::new(new_inputargs, new_ops)
+        // opencoder.py parity: carry snapshots through cut_trace_from.
+        // Without snapshots, guards fall back to fail_args-only rd_numb.
+        TreeLoop::with_snapshots(new_inputargs, new_ops, self.snapshots.clone())
     }
 }
 

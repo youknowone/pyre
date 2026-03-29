@@ -2184,11 +2184,17 @@ impl Optimizer {
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
         // JUMP args (live_arg_boxes from compile_trace / deadframe values).
+        // unroll.py:207: skip preamble (target_tokens[0]), try body targets.
+        let body_tokens = if front_target_tokens.len() > 1 {
+            &mut front_target_tokens[1..]
+        } else {
+            &mut front_target_tokens[..]
+        };
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
-            front_target_tokens,
+            body_tokens,
             self,
             &mut ctx,
             false,
@@ -2451,28 +2457,17 @@ impl Optimizer {
                 // bridgeopt.py:74-88: collect known classes for bridge
                 // deserialization. RPython iterates liveboxes (= fail_args)
                 // and calls getptrinfo(box).get_known_class() for Ref boxes.
-                // In pyre, follow box replacement (forwarding) to find the
-                // optimizer's PtrInfo for each fail_arg.
+                // Follow box replacement (forwarding) to find PtrInfo.
                 let mut known_classes = Vec::new();
                 if let Some(ref fa) = op.fail_args {
                     for &farg in fa {
                         if farg.is_none() {
                             continue;
                         }
-                        // Follow forwarding — the optimizer may have
-                        // replaced this OpRef via SameAs/forwarding.
                         let resolved = ctx.get_box_replacement(farg);
                         if let Some(info) = ctx.get_ptr_info(resolved) {
                             if let Some(class_ptr) = info.get_known_class() {
                                 known_classes.push((farg, *class_ptr));
-                            }
-                        }
-                        // Also check the original (unforwarded) OpRef.
-                        if let Some(info) = ctx.get_ptr_info(farg) {
-                            if let Some(class_ptr) = info.get_known_class() {
-                                if !known_classes.iter().any(|(r, _)| *r == farg) {
-                                    known_classes.push((farg, *class_ptr));
-                                }
                             }
                         }
                     }

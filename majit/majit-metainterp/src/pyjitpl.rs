@@ -443,6 +443,14 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    /// Cross-loop cut alias map: inner_key → outer_key.
+    ///
+    /// RPython uses a single green key per function (code object identity)
+    /// and stores all entry points as target_tokens within one JitCellToken.
+    /// Pyre uses (code, pc) green keys, creating distinct keys per loop header.
+    /// When a cross-loop cut stores an entry under the outer key, this map
+    /// allows inner back-edge lookups (inner_key) to find the outer key's entry.
+    pub(crate) compiled_loop_aliases: HashMap<u64, u64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -763,6 +771,7 @@ impl<M: Clone> MetaInterp<M> {
             jitcodes: HashMap::new(),
             jitcode_next_index: 0,
             pending_preamble_tokens: HashMap::new(),
+            compiled_loop_aliases: HashMap::new(),
         }
     }
 
@@ -1690,9 +1699,8 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // pyjitpl.py:2993-3007: if partial_trace is set (from bridge
-        // retrace_needed or loop InvalidLoop), compile_retrace handles it.
-        // Clear the bridge flag — partial_trace is the authoritative state.
+        // Clear bridge retrace flag — partial_trace is the authoritative
+        // state for compile_retrace dispatch.
         if self.retrace_after_bridge {
             self.retrace_after_bridge = false;
         }
@@ -1718,13 +1726,6 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
         let green_key = ctx.green_key;
-
-        // compile.py:269-270: extract cross-loop cut data before consuming
-        // the recorder. When the trace closes at a different loop header
-        // than where it started, cut the trace to begin at that header.
-        // RPython pyjitpl.py:3160 strips green args: original_boxes[num_green_args:].
-        // In pyre, green key is a u64 (not in original_boxes), so original_boxes
-        // is already red-only — no stripping needed.
         let cut_inner_green_key = ctx.cut_inner_green_key;
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
@@ -2260,6 +2261,17 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state
                     .attach_procedure_to_interp(green_key, install_token);
 
+                // Register inner_key → outer_key alias for cross-loop cuts.
+                if let Some(inner_key) = cut_inner_green_key {
+                    self.compiled_loop_aliases.insert(inner_key, green_key);
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] alias registered: inner_key={} → outer_key={}",
+                            inner_key, green_key,
+                        );
+                    }
+                }
+
                 self.stats.loops_compiled += 1;
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -2331,6 +2343,10 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py: has_compiled_targets — check if a green key has
     /// compiled target tokens that a bridge can jump to.
     pub fn has_compiled_targets(&self, green_key: u64) -> bool {
+        // Consistent with has_compiled_loop: direct key only, no alias.
+        // Both functions must see the same view — otherwise tracing sees
+        // "targets exist" while execution sees "no compiled loop", causing
+        // wasted compile/trace churn in nested loops.
         self.compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.front_target_tokens.is_empty())
@@ -3221,9 +3237,17 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// RPython parity: green_key is used directly for all lookups.
-    /// No alias resolution — RPython uses target_tokens within the
-    /// same JitCellToken rather than cross-key aliases.
+    /// Resolve cross-loop cut alias: inner_key → outer_key.
+    ///
+    /// If the key has its own direct entry, use it — alias only applies
+    /// when no direct entry exists. This prevents cross-loop cut aliases
+    /// from shadowing independently compiled inner loop entries.
+    ///
+    /// NOTE: currently disabled in all callers (returns green_key) because
+    /// enabling alias resolution without target_tokens dispatch causes
+    /// merge_pc mismatch → guard failure → churn in nested loops.
+    /// The infrastructure (compiled_loop_aliases HashMap) is preserved
+    /// for when target_tokens dispatch is implemented.
     #[inline]
     pub fn resolve_alias(&self, green_key: u64) -> u64 {
         green_key
@@ -4124,14 +4148,12 @@ impl<M: Clone> MetaInterp<M> {
     /// compiled code will fail at GUARD_NOT_INVALIDATED and fall back to
     /// the interpreter.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        let key = self.resolve_alias(green_key);
-        if let Some(compiled) = self.compiled_loops.get(&key) {
+        // Do NOT follow aliases. Invalidating inner_key should NOT destroy
+        // the outer entry — it may be shared with other back-edges.
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
             compiled.token.invalidate();
             if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] invalidated loop at key={} (resolved={})",
-                    green_key, key
-                );
+                eprintln!("[jit] invalidated loop at key={}", green_key);
             }
         }
     }
@@ -4300,8 +4322,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Check whether a compiled loop exists for a given green key.
-    /// Follows cross-loop cut aliases (inner_key → outer_key).
     /// Check whether a compiled loop exists for a given green key.
+    /// Follows cross-loop cut aliases (inner_key → outer_key).
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.compiled_loops

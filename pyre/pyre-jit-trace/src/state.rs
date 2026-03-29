@@ -2281,6 +2281,14 @@ impl MIFrame {
     }
 
     pub(crate) fn close_loop_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
+        self.close_loop_args_at(ctx, None)
+    }
+
+    pub(crate) fn close_loop_args_at(
+        &mut self,
+        ctx: &mut TraceCtx,
+        target_pc: Option<usize>,
+    ) -> Vec<OpRef> {
         // RPython parity: loop-carried live state comes from the current
         // virtualizable frame state at the merge point. If symbolic stack
         // accounting drifted during tracing, resync depth/shape from the
@@ -2310,6 +2318,12 @@ impl MIFrame {
             }
         }
         self.flush_to_frame(ctx);
+        // pyjitpl.py:2973: at a merge point, next_instr should be the TARGET
+        // PC, not the last bytecode's orgpc. flush_to_frame sets
+        // vable_next_instr from orgpc; override it here.
+        if let Some(pc) = target_pc {
+            self.sym_mut().vable_next_instr = ctx.const_int(pc as i64);
+        }
         // If nlocals was lost (e.g., inline tracing reset symbolic_initialized),
         // re-derive from concrete frame. RPython keeps virtualizable_boxes in
         // sync across all frames; pyre needs this fallback.
