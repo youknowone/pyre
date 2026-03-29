@@ -2461,10 +2461,13 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 if bridge_descr.is_finish() {
-                    let num_outputs = bridge_descr.fail_arg_types().len();
-                    current_inputs = (0..num_outputs)
-                        .map(|i| get_int_from_deadframe(&bridge_frame, i).unwrap_or(0))
-                        .collect();
+                    current_inputs = raw_values_from_deadframe_typed(
+                        &bridge_frame,
+                        bridge_descr.fail_arg_types(),
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("bridge loop-reentry deadframe decode failed: {err}")
+                    });
                     continue; // re-enter loop
                 }
                 return bridge_frame;
@@ -2566,11 +2569,26 @@ extern "C" fn call_assembler_guard_failure(
     // failure point using the blackhole interpreter. The blackhole reads
     // values from the outputs buffer (deadframe) and executes the remaining
     // IR ops from guard+1 to Finish, returning the result directly.
-    let num_outputs = fail_descr.fail_arg_types.len();
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.header_pc;
         let trace_id = target.trace_id;
-        if let Some(result) = bh_fn(green_key, trace_id, fail_index, outputs_ptr, num_outputs) {
+        // resume.py:1312 parity: materialize virtuals before blackhole.
+        let raw_num = fail_descr.fail_arg_types.len();
+        let mut bh_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) }.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            raw_num,
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
             return result;
         }
     }
@@ -2599,6 +2617,13 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     if fail_descr.has_bridge() {
         return true;
     }
+    // Base case bridge is only for FINISH exits, not guard failures.
+    // Guard failures need the blackhole/interpreter to compute the correct
+    // result; returning a fail_arg value directly would be wrong (e.g.,
+    // returning n instead of fib(n) for a recursive function).
+    if !fail_descr.is_finish() {
+        return false;
+    }
     let fail_arg_types = fail_descr.fail_arg_types();
 
     // Find the value to return in the bridge.
@@ -2617,19 +2642,14 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     let num_inputs = fail_arg_types.len() as u32;
 
     if let Some(ref_idx) = ref_idx {
-        // Boxed int: GetfieldGcI(n_boxed, intval_offset) → Finish(raw_n)
-        let n_boxed = OpRef(ref_idx as u32);
-        let intval_descr = majit_ir::make_field_descr(8, 8, Type::Int, true);
-        let unboxed = OpRef(num_inputs);
-        let mut getfield = Op::with_descr(OpCode::GetfieldGcI, &[n_boxed], intval_descr);
-        getfield.pos = unboxed;
-        bridge_ops.push(getfield);
-
+        // compile.py:649 DoneWithThisFrameDescrRef.get_result:
+        // cpu.get_ref_value(deadframe, 0) → return Ref as-is.
+        let boxed = OpRef(ref_idx as u32);
         let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs + 1, vec![Type::Int], true),
+            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs, vec![Type::Ref], true),
         );
-        let mut finish_op = Op::with_descr(OpCode::Finish, &[unboxed], finish_descr);
-        finish_op.pos = OpRef(num_inputs + 1);
+        let mut finish_op = Op::with_descr(OpCode::Finish, &[boxed], finish_descr);
+        finish_op.pos = OpRef(num_inputs);
         bridge_ops.push(finish_op);
     } else if let Some(int_idx) = int_idx {
         // Raw int: Finish(raw_value) directly
@@ -2849,6 +2869,37 @@ fn call_assembler_fast_path(
     drop(bridge_guard);
 
     release_force_token(handle);
+
+    // RPython compile.py handle_fail parity: after a guard failure with no
+    // attached bridge, resume from the deadframe in blackhole mode before
+    // falling back to force_fn re-execution.
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        // resume.py:1312 blackhole_from_resumedata parity: materialize
+        // virtuals from recovery_layout before passing to blackhole.
+        let mut bh_outputs = outputs.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            fail_descr.fail_arg_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+    }
 
     // RPython assembler_call_helper: force_fn receives the callee frame.
     // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
