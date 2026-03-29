@@ -964,6 +964,7 @@ pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize)
 pub(crate) fn infer_terminal_exit_layout(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
+    owning_key: u64,
     trace_id: u64,
     op_index: usize,
 ) -> Option<CompiledExitLayout> {
@@ -999,7 +1000,7 @@ pub(crate) fn infer_terminal_exit_layout(
         })
         .collect();
     Some(CompiledExitLayout {
-        rd_loop_token: 0, // set by caller from token.green_key
+        rd_loop_token: owning_key, // compile.py:186
         trace_id,
         fail_index,
         source_op_index: Some(op_index),
@@ -1024,7 +1025,7 @@ pub(crate) fn build_terminal_exit_layouts(
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
         }
-        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, op_index) {
+        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, 0, op_index) {
             layouts.insert(
                 op_index,
                 StoredExitLayout {
@@ -1047,21 +1048,23 @@ pub(crate) fn build_terminal_exit_layouts(
 
 pub(crate) fn terminal_exit_layout_for_trace(
     trace: &CompiledTrace,
+    owning_key: u64,
     trace_id: u64,
     op_index: usize,
 ) -> Option<CompiledExitLayout> {
     if let Some(layout) = trace.terminal_exit_layouts.get(&op_index) {
         return Some(layout.public(
+            owning_key,
             trace_id,
             find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
         ));
     }
     if let Some(fail_index) = find_fail_index_for_exit_op(&trace.ops, op_index) {
         if let Some(layout) = trace.exit_layouts.get(&fail_index) {
-            return Some(layout.public(trace_id, fail_index));
+            return Some(layout.public(owning_key, trace_id, fail_index));
         }
     }
-    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, trace_id, op_index)
+    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
 
 pub(crate) fn decode_values_with_layout(

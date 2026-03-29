@@ -124,6 +124,11 @@ pub struct Optimizer {
     /// Types of constant OpRefs from ConstantPool.constant_types.
     /// Used to distinguish Ref constants from Int in guard fail_args.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// Short preamble constants imported during inline_short_preamble.
+    /// RPython parity: these are Const objects embedded in short preamble ops
+    /// that survive across compilations. In pyre, they must be merged into
+    /// the bridge's constant pool after optimize_bridge returns.
+    pub bridge_preamble_constants: std::collections::HashMap<u32, (i64, majit_ir::Type)>,
     /// RPython parity: GcRef constants (ob_type etc.) recorded as const_int
     /// need Ref type for resume data but must NOT trigger Cranelift GC root.
     pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
@@ -775,6 +780,7 @@ impl Optimizer {
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
+            bridge_preamble_constants: std::collections::HashMap::new(),
             numbering_type_overrides: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
@@ -2419,6 +2425,7 @@ impl Optimizer {
 
             // resume.py:570-574: _add_optimizer_sections captures the
             // optimizer's knowledge AT THIS GUARD POINT.
+            // bridgeopt.py:74-88: known classes from ptr_info.
             {
                 let mut heap_fields = Vec::new();
                 for pass in &self.passes {
@@ -2428,12 +2435,41 @@ impl Optimizer {
                         break;
                     }
                 }
-                if !heap_fields.is_empty() {
+                // bridgeopt.py:74-88: collect known classes for bridge
+                // deserialization. RPython iterates liveboxes (= fail_args)
+                // and calls getptrinfo(box).get_known_class() for Ref boxes.
+                // In pyre, follow box replacement (forwarding) to find the
+                // optimizer's PtrInfo for each fail_arg.
+                let mut known_classes = Vec::new();
+                if let Some(ref fa) = op.fail_args {
+                    for &farg in fa {
+                        if farg.is_none() {
+                            continue;
+                        }
+                        // Follow forwarding — the optimizer may have
+                        // replaced this OpRef via SameAs/forwarding.
+                        let resolved = ctx.get_box_replacement(farg);
+                        if let Some(info) = ctx.get_ptr_info(resolved) {
+                            if let Some(class_ptr) = info.get_known_class() {
+                                known_classes.push((farg, *class_ptr));
+                            }
+                        }
+                        // Also check the original (unforwarded) OpRef.
+                        if let Some(info) = ctx.get_ptr_info(farg) {
+                            if let Some(class_ptr) = info.get_known_class() {
+                                if !known_classes.iter().any(|(r, _)| *r == farg) {
+                                    known_classes.push((farg, *class_ptr));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !heap_fields.is_empty() || !known_classes.is_empty() {
                     self.per_guard_knowledge.push((
                         op.pos,
                         OptimizerKnowledge {
                             heap_fields,
-                            known_classes: Vec::new(),
+                            known_classes,
                             loopinvariant_results: Vec::new(),
                         },
                     ));

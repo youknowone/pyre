@@ -94,6 +94,8 @@ pub(crate) struct CompiledTrace {
     pub(crate) ops: Vec<majit_ir::Op>,
     /// Constant pool paired with `ops` for blackhole fallback.
     pub(crate) constants: HashMap<u32, i64>,
+    /// Constant types for the constant pool entries.
+    pub(crate) constant_types: HashMap<u32, Type>,
     /// Mapping from backend fail_index to the corresponding guard op index.
     pub(crate) guard_op_indices: HashMap<u32, usize>,
     /// Static exit metadata for each guard/finish in this trace.
@@ -158,9 +160,16 @@ pub(crate) struct StoredExitLayout {
 }
 
 impl StoredExitLayout {
-    pub(crate) fn public(&self, trace_id: u64, fail_index: u32) -> CompiledExitLayout {
+    /// compile.py:186: rd_loop_token = original_jitcell_token.
+    /// `owning_key` is the green_key of the compiled loop that owns this guard.
+    pub(crate) fn public(
+        &self,
+        owning_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> CompiledExitLayout {
         CompiledExitLayout {
-            rd_loop_token: trace_id,
+            rd_loop_token: owning_key,
             trace_id,
             fail_index,
             source_op_index: self.source_op_index,
@@ -515,22 +524,25 @@ impl<M: Clone> MetaInterp<M> {
 
     fn compiled_exit_layout_from_trace(
         trace: &CompiledTrace,
+        owning_key: u64,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<CompiledExitLayout> {
         trace
             .exit_layouts
             .get(&fail_index)
-            .map(|layout| layout.public(trace_id, fail_index))
+            .map(|layout| layout.public(owning_key, trace_id, fail_index))
     }
 
     fn terminal_exit_layout_from_trace(
         trace: &CompiledTrace,
+        owning_key: u64,
         trace_id: u64,
         op_index: usize,
     ) -> Option<CompiledExitLayout> {
         trace.terminal_exit_layouts.get(&op_index).map(|layout| {
             layout.public(
+                owning_key,
                 trace_id,
                 compile::find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
             )
@@ -540,6 +552,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compiled_exit_layout_from_backend(
         &self,
         compiled: &CompiledEntry<M>,
+        owning_key: u64,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<CompiledExitLayout> {
@@ -549,7 +562,7 @@ impl<M: Clone> MetaInterp<M> {
             .into_iter()
             .find(|layout| layout.fail_index == fail_index)
             .map(|layout| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: owning_key, // compile.py:186
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: layout.source_op_index,
@@ -568,6 +581,7 @@ impl<M: Clone> MetaInterp<M> {
     fn terminal_exit_layout_from_backend(
         &self,
         compiled: &CompiledEntry<M>,
+        owning_key: u64,
         trace_id: u64,
         op_index: usize,
     ) -> Option<CompiledExitLayout> {
@@ -577,7 +591,7 @@ impl<M: Clone> MetaInterp<M> {
             .into_iter()
             .find(|layout| layout.op_index == op_index)
             .map(|layout| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: owning_key, // compile.py:186
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: Some(layout.op_index),
@@ -596,6 +610,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compiled_trace_layout_for_trace(
         &self,
         compiled: &CompiledEntry<M>,
+        owning_key: u64,
         trace_id: u64,
     ) -> Option<CompiledTraceLayout> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
@@ -604,7 +619,9 @@ impl<M: Clone> MetaInterp<M> {
                 let mut layouts: Vec<_> = trace
                     .exit_layouts
                     .iter()
-                    .map(|(&fail_index, layout)| layout.public(resolved_trace_id, fail_index))
+                    .map(|(&fail_index, layout)| {
+                        layout.public(owning_key, resolved_trace_id, fail_index)
+                    })
                     .collect();
                 layouts.sort_by_key(|layout| layout.fail_index);
                 layouts
@@ -623,7 +640,7 @@ impl<M: Clone> MetaInterp<M> {
                 merged.insert(
                     layout.fail_index,
                     CompiledExitLayout {
-                        rd_loop_token: trace_id, // from trace context
+                        rd_loop_token: owning_key, // compile.py:186
                         trace_id,
                         fail_index: layout.fail_index,
                         source_op_index: layout.source_op_index,
@@ -653,6 +670,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|(&op_index, layout)| CompiledTerminalExitLayout {
                         op_index,
                         exit_layout: layout.public(
+                            owning_key,
                             resolved_trace_id,
                             compile::find_fail_index_for_exit_op(&trace.ops, op_index)
                                 .unwrap_or(u32::MAX),
@@ -678,7 +696,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTerminalExitLayout {
                         op_index: layout.op_index,
                         exit_layout: CompiledExitLayout {
-                            rd_loop_token: trace_id, // from trace context
+                            rd_loop_token: owning_key, // compile.py:186
                             trace_id,
                             fail_index: layout.fail_index,
                             source_op_index: Some(layout.op_index),
@@ -2187,6 +2205,7 @@ impl<M: Clone> MetaInterp<M> {
                         resume_data,
                         ops: optimized_ops,
                         constants: compiled_constants,
+                        constant_types: compiled_constant_types.clone(),
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
@@ -2780,6 +2799,7 @@ impl<M: Clone> MetaInterp<M> {
                         resume_data,
                         ops: combined_ops,
                         constants: compiled_constants,
+                        constant_types: compiled_constant_types.clone(),
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
@@ -3124,6 +3144,7 @@ impl<M: Clone> MetaInterp<M> {
                         resume_data,
                         ops: optimized_ops,
                         constants: compiled_constants,
+                        constant_types: compiled_constant_types.clone(),
                         guard_op_indices,
                         exit_layouts,
                         terminal_exit_layouts,
@@ -3403,7 +3424,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             });
         let exit_layout = result
             .exit_layout
@@ -3419,7 +3440,7 @@ impl<M: Clone> MetaInterp<M> {
                     &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
-                    rd_loop_token: trace_id, // from trace context
+                    rd_loop_token: green_key, // compile.py:186
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout
@@ -3441,7 +3462,7 @@ impl<M: Clone> MetaInterp<M> {
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: green_key, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3534,7 +3555,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             });
         let exit_layout = result
             .exit_layout
@@ -3550,7 +3571,7 @@ impl<M: Clone> MetaInterp<M> {
                     &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
-                    rd_loop_token: trace_id, // from trace context
+                    rd_loop_token: green_key, // compile.py:186
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout
@@ -3572,7 +3593,7 @@ impl<M: Clone> MetaInterp<M> {
             })
             .or(trace_layout)
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
+                rd_loop_token: green_key, // from trace context
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3698,10 +3719,10 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let exit_layout = Self::trace_for_exit(compiled, trace_id)
             .and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id,
+                rd_loop_token: green_key,
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -3845,10 +3866,10 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let exit_layout = Self::trace_for_exit(compiled, trace_id)
             .and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
+                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id,
+                rd_loop_token: green_key,
                 trace_id,
                 fail_index,
                 source_op_index: None,
@@ -4045,8 +4066,9 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompiledExitLayout> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-        Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
-            .or_else(|| self.compiled_exit_layout_from_backend(compiled, trace_id, fail_index))
+        Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index).or_else(
+            || self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index),
+        )
     }
 
     /// Get the full static layout for a terminal FINISH/JUMP op in the root trace.
@@ -4068,8 +4090,9 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompiledExitLayout> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-        Self::terminal_exit_layout_from_trace(trace, trace_id, op_index)
-            .or_else(|| self.terminal_exit_layout_from_backend(compiled, trace_id, op_index))
+        Self::terminal_exit_layout_from_trace(trace, green_key, trace_id, op_index).or_else(|| {
+            self.terminal_exit_layout_from_backend(compiled, green_key, trace_id, op_index)
+        })
     }
 
     /// Get the full static layout for a compiled trace in the root trace.
@@ -4085,7 +4108,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
     ) -> Option<CompiledTraceLayout> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        self.compiled_trace_layout_for_trace(compiled, trace_id)
+        self.compiled_trace_layout_for_trace(compiled, green_key, trace_id)
     }
 
     /// Invalidate a compiled loop (e.g., due to GUARD_NOT_INVALIDATED).
@@ -4425,6 +4448,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             });
         // compile.py:750-751: ST_BUSY_FLAG + stack_almost_full
+        // RPython only uses ST_BUSY_FLAG — no permanent bridge failure seal.
         if info.compiling || Self::stack_almost_full() {
             return (false, owning_key);
         }
@@ -4579,6 +4603,17 @@ impl<M: Clone> MetaInterp<M> {
         self.close_bridge(green_key, trace_id, fail_index, finish_args)
     }
 
+    /// Record a constant Ref value in the active trace context.
+    /// Returns the OpRef for the constant.
+    pub fn record_bridge_const_ref(&mut self, value: i64) -> majit_ir::OpRef {
+        let ctx = self
+            .tracing
+            .as_mut()
+            .expect("record_bridge_const_ref requires active trace");
+        ctx.constants
+            .get_or_insert_typed(value, majit_ir::Type::Ref)
+    }
+
     /// pyjitpl.py:3198-3220: compile_done_with_this_frame — bridge that
     /// exits via return. Calls compile_trace with ends_with_jump=false (FINISH).
     pub fn compile_done_with_this_frame(
@@ -4692,7 +4727,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
-        constant_types: HashMap<u32, Type>,
+        mut constant_types: HashMap<u32, Type>,
         snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
         snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
         snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
@@ -4763,6 +4798,11 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
         };
+        // RPython bridgeopt.py:133-146 deserialize_optimizer_knowledge:
+        // known_classes are restored from the per-guard bitfield that was
+        // serialized at guard compile time (bridgeopt.py:69-88). Only
+        // classes that were known at the guard point are restored —
+        // runtime class inspection is NOT used here.
         let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
             bridge_ops,
             &mut constants,
@@ -4773,6 +4813,65 @@ impl<M: Clone> MetaInterp<M> {
             retrace_limit,
             bridge_knowledge.as_ref(),
         );
+        // RPython parity: merge short preamble constants into bridge pool.
+        // inline_short_preamble registered them in optimizer.bridge_preamble_constants.
+        for (&idx, &(val, tp)) in &optimizer.bridge_preamble_constants {
+            constants.entry(idx).or_insert(val);
+            constant_types.entry(idx).or_insert(tp);
+        }
+        // Also merge any remaining missing constants from the source trace's
+        // constant pool (for non-short-preamble references).
+        {
+            let source_trace_id = {
+                let tid = fail_descr.trace_id();
+                if tid == 0 {
+                    compiled.root_trace_id
+                } else {
+                    tid
+                }
+            };
+            // Collect all defined OpRefs (inputargs + op results)
+            let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for i in 0..bridge_inputargs.len() {
+                defined.insert(i as u32);
+            }
+            for op in &optimized_ops {
+                if !op.pos.is_none() {
+                    defined.insert(op.pos.0);
+                }
+            }
+            // For any referenced OpRef that's not defined and not already a
+            // constant, check the source trace's constant pool.
+            if let Some(source_trace) = compiled.traces.get(&source_trace_id) {
+                let mut missing: Vec<u32> = Vec::new();
+                for op in &optimized_ops {
+                    for &arg in &op.args {
+                        let idx = arg.0;
+                        if !defined.contains(&idx) && !constants.contains_key(&idx) {
+                            missing.push(idx);
+                        }
+                    }
+                    if let Some(ref fa) = op.fail_args {
+                        for &arg in fa {
+                            let idx = arg.0;
+                            if !defined.contains(&idx) && !constants.contains_key(&idx) {
+                                missing.push(idx);
+                            }
+                        }
+                    }
+                }
+                for idx in missing {
+                    if let Some(&val) = source_trace.constants.get(&idx) {
+                        constants.insert(idx, val);
+                        // Also merge the type so Cranelift uses the correct
+                        // register class (Int vs Ref vs Float).
+                        if let Some(&tp) = source_trace.constant_types.get(&idx) {
+                            constant_types.insert(idx, tp);
+                        }
+                    }
+                }
+            }
+        }
         if retrace_requested {
             // compile.py:1079-1086 parity: optimizer found no matching
             // target token. Add a new target token from the exported state,
@@ -4935,6 +5034,7 @@ impl<M: Clone> MetaInterp<M> {
                             resume_data,
                             ops: optimized_ops,
                             constants: compiled_constants,
+                            constant_types: compiled_constant_types,
                             guard_op_indices,
                             exit_layouts,
                             terminal_exit_layouts,
@@ -4952,6 +5052,9 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
+                // RPython compile.py:701-717: bridge compilation failure
+                // is not permanent — the counter resets and may fire again.
+                // RPython uses ST_BUSY_FLAG only (cleared by done_compiling).
                 let msg = format!("Bridge compilation failed: {e}");
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] {msg}");
@@ -5063,7 +5166,7 @@ impl<M: Clone> MetaInterp<M> {
         let norm_tid = Self::normalize_trace_id(compiled, trace_id);
         if let Some((_, trace)) = Self::trace_for_exit(compiled, norm_tid) {
             if let Some(exit_layout) =
-                Self::compiled_exit_layout_from_trace(trace, norm_tid, fail_index)
+                Self::compiled_exit_layout_from_trace(trace, green_key, norm_tid, fail_index)
             {
                 // resume.py:1347: ResumeDataDirectReader + force_all_virtuals
                 // Use reconstruct_state to materialize virtuals from rd_numb.
@@ -5183,34 +5286,35 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
 
-        let exit_layout = Self::compiled_exit_layout_from_trace(trace, trace_id, fail_index)
-            .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: trace_id, // from trace context
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: typed_fail_values
-                    .map(|values| values.iter().map(Value::get_type).collect())
-                    .unwrap_or_default(),
-                is_finish: false,
-                gc_ref_slots: typed_fail_values
-                    .map(|values| {
-                        values
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(slot, value)| {
-                                (value.get_type() == Type::Ref).then_some(slot)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                force_token_slots: Vec::new(),
-                recovery_layout: None,
-                resume_layout: None,
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals_info: None,
-            });
+        let exit_layout =
+            Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
+                .unwrap_or_else(|| CompiledExitLayout {
+                    rd_loop_token: green_key, // from trace context
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types: typed_fail_values
+                        .map(|values| values.iter().map(Value::get_type).collect())
+                        .unwrap_or_default(),
+                    is_finish: false,
+                    gc_ref_slots: typed_fail_values
+                        .map(|values| {
+                            values
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(slot, value)| {
+                                    (value.get_type() == Type::Ref).then_some(slot)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    force_token_slots: Vec::new(),
+                    recovery_layout: None,
+                    resume_layout: None,
+                    rd_numb: None,
+                    rd_consts: None,
+                    rd_virtuals_info: None,
+                });
         let reconstructed_state = exit_layout
             .resume_layout
             .as_ref()
@@ -5499,7 +5603,12 @@ impl<M: Clone> MetaInterp<M> {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                    compile::terminal_exit_layout_for_trace(
+                        trace,
+                        green_key,
+                        terminal_trace_id,
+                        op_index,
+                    )
                 };
                 let typed_values = exit_layout
                     .as_ref()
@@ -5518,7 +5627,12 @@ impl<M: Clone> MetaInterp<M> {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                    compile::terminal_exit_layout_for_trace(
+                        trace,
+                        green_key,
+                        terminal_trace_id,
+                        op_index,
+                    )
                 };
                 let typed_values = exit_layout
                     .as_ref()
@@ -5566,8 +5680,12 @@ impl<M: Clone> MetaInterp<M> {
                                 .resolve_pending_field_writes(&fail_values)
                         })
                         .unwrap_or_default();
-                    let exit_layout =
-                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let exit_layout = Self::compiled_exit_layout_from_trace(
+                        trace,
+                        green_key,
+                        trace_id,
+                        fallback_fail_index,
+                    );
                     let typed_fail_values = exit_layout
                         .as_ref()
                         .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
@@ -5618,8 +5736,12 @@ impl<M: Clone> MetaInterp<M> {
                         .iter()
                         .find_map(|(&idx, &op_index)| (op_index == guard_index).then_some(idx))
                         .unwrap_or(fail_index);
-                    let exit_layout =
-                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let exit_layout = Self::compiled_exit_layout_from_trace(
+                        trace,
+                        green_key,
+                        trace_id,
+                        fallback_fail_index,
+                    );
                     let typed_fail_values = exit_layout
                         .as_ref()
                         .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
@@ -5738,7 +5860,12 @@ impl<M: Clone> MetaInterp<M> {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                    compile::terminal_exit_layout_for_trace(
+                        trace,
+                        green_key,
+                        terminal_trace_id,
+                        op_index,
+                    )
                 };
                 let typed_values = exit_layout
                     .as_ref()
@@ -5757,7 +5884,12 @@ impl<M: Clone> MetaInterp<M> {
                 let exit_layout = {
                     let compiled = self.compiled_loops.get(&green_key)?;
                     let (terminal_trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-                    compile::terminal_exit_layout_for_trace(trace, terminal_trace_id, op_index)
+                    compile::terminal_exit_layout_for_trace(
+                        trace,
+                        green_key,
+                        terminal_trace_id,
+                        op_index,
+                    )
                 };
                 let typed_values = exit_layout
                     .as_ref()
@@ -5805,8 +5937,12 @@ impl<M: Clone> MetaInterp<M> {
                                 .resolve_pending_field_writes(&fail_values)
                         })
                         .unwrap_or_default();
-                    let exit_layout =
-                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let exit_layout = Self::compiled_exit_layout_from_trace(
+                        trace,
+                        green_key,
+                        trace_id,
+                        fallback_fail_index,
+                    );
                     let typed_fail_values = exit_layout
                         .as_ref()
                         .map(|layout| compile::decode_values_with_layout(&fail_values, layout));
@@ -5857,8 +5993,12 @@ impl<M: Clone> MetaInterp<M> {
                         .iter()
                         .find_map(|(&idx, &op_index)| (op_index == guard_index).then_some(idx))
                         .unwrap_or(fail_index);
-                    let exit_layout =
-                        Self::compiled_exit_layout_from_trace(trace, trace_id, fallback_fail_index);
+                    let exit_layout = Self::compiled_exit_layout_from_trace(
+                        trace,
+                        green_key,
+                        trace_id,
+                        fallback_fail_index,
+                    );
                     let typed_fail_values = exit_layout
                         .as_ref()
                         .map(|layout| compile::decode_values_with_layout(&fail_values, layout));

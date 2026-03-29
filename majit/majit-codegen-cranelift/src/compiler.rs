@@ -4963,7 +4963,6 @@ impl CraneliftBackend {
             let fail_count = fail_descr.get_fail_count();
 
             // If a bridge is attached to this guard, execute it.
-            // Uses lock-free bridge_ref() (main's Mutex removal parity).
             let bridge_guard = fail_descr.bridge_ref();
             if let Some(ref bridge) = *bridge_guard {
                 release_force_token(handle);
@@ -5056,6 +5055,32 @@ impl CraneliftBackend {
         }
 
         let fail_descr = &bridge.fail_descrs[fail_index as usize];
+
+        // RPython parity: FINISH exits in bridges return directly,
+        // just like in execute_with_inputs. Without this, the FINISH
+        // bridge's exit is misinterpreted as a guard failure.
+        if fail_descr.is_finish {
+            let saved_data = if let Some(ref ff) = force_frame {
+                take_force_frame_saved_data(ff)
+            } else {
+                None
+            };
+            let (exception_class, exception) = take_pending_jit_exception_state();
+            if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
+                release_force_token(handle);
+            }
+            return DeadFrame {
+                data: Box::new(FrameData::new_with_savedata_and_exception(
+                    outputs,
+                    fail_descr.clone(),
+                    bridge.gc_runtime_id,
+                    saved_data,
+                    exception_class,
+                    (!exception.is_null()).then_some(exception),
+                )),
+            };
+        }
+
         fail_descr.increment_fail_count();
 
         // Check for chained bridges (RPython: bridge-on-bridge).
@@ -9429,9 +9454,6 @@ impl majit_codegen::Backend for CraneliftBackend {
         ops: &[Op],
         original_token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
-        // compile.py:186: record_loop_or_bridge sets descr.rd_loop_token = clt
-        // on ALL guards. Bridges share the parent loop's invalidation flag.
-        // We clone the Arc to keep the flag alive as long as the bridge exists.
         let invalidated_arc = original_token.invalidated.clone();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
@@ -9452,8 +9474,10 @@ impl majit_codegen::Backend for CraneliftBackend {
             source_trace_id,
             fail_descr.fail_index(),
         );
-        // Entry bridge (fail_index=0): no source guard — graceful skip.
-        if source_descr.is_none() && fail_descr.fail_index() != 0 {
+        if source_descr.is_none() {
+            // RPython compile.py:569: send_bridge_to_backend always has a
+            // valid faildescr. If source_descr is not found, the bridge
+            // cannot be attached — return error for all fail_indices.
             return Err(BackendError::CompilationFailed(format!(
                 "source fail descr not found for trace {} fail {}",
                 source_trace_id,
@@ -9795,9 +9819,12 @@ impl majit_codegen::Backend for CraneliftBackend {
             .compiled
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
-            descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
-        })?;
+        // Use recursive search to find fail_descrs nested inside bridges.
+        let source_descr = find_fail_descr_in_fail_descrs(
+            &original_compiled.fail_descrs,
+            source_trace_id,
+            source_fail_index,
+        )?;
         let bridge = source_descr.bridge_ref();
         let bridge = bridge.as_ref()?;
         Some(

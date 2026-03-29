@@ -526,7 +526,6 @@ impl<S: JitState> JitDriver<S> {
                 {
                     let has_targets = self.meta.has_compiled_targets(bridge_key);
                     if has_targets {
-                        self.bridge_info.take(); // consume
                         if crate::majit_log_enabled() {
                             eprintln!(
                                 "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
@@ -543,14 +542,19 @@ impl<S: JitState> JitDriver<S> {
                             );
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                    self.bridge_info.take();
                                     self.sym = None;
                                     self.trace_meta = None;
                                     return;
                                 }
-                                // RetraceNeeded: fall through to compile_loop
-                                // (pyjitpl.py:2983 → 3014-3017 parity).
-                                crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {}
+                                // pyjitpl.py:2999-3005: RetraceNeeded →
+                                // partial_trace preserved → next
+                                // reached_loop_header calls compile_retrace.
+                                crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                    self.bridge_info.take();
+                                }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
+                                    self.bridge_info.take();
                                     self.meta.abort_trace(false);
                                     self.sym = None;
                                     self.trace_meta = None;
@@ -558,13 +562,14 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                         } else {
+                            self.bridge_info.take();
                             self.meta.abort_trace(false);
                             self.sym = None;
                             self.trace_meta = None;
                             return;
                         }
                     }
-                    // No targets or RetraceNeeded: fall through to
+                    // No targets: consume bridge_info, fall through to
                     // compile_loop (pyjitpl.py:3014-3017).
                     self.bridge_info = None;
                 }
@@ -592,16 +597,10 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
-                    // RPython pyjitpl.py:3000-3009 parity: if partial_trace
-                    // is set from a previous InvalidLoop, clear it and do a
-                    // fresh compile_loop. The new trace has different runtime
-                    // values (e.g. sign=1 vs sign=-1), so Phase 2 succeeds.
-                    if self.meta.has_partial_trace() {
-                        if crate::majit_log_enabled() {
-                            eprintln!("[jit] clearing partial_trace for fresh compile_loop");
-                        }
-                        self.meta.clear_retrace_state();
-                    }
+                    // pyjitpl.py:2993-3007: compile_loop checks
+                    // has_partial_trace internally and dispatches to
+                    // compile_retrace when appropriate. Do NOT clear
+                    // partial_trace here — bridge retrace depends on it.
                     let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -627,7 +626,6 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or(bridge_key);
                     let has_targets = self.meta.has_compiled_targets(target_key);
                     if has_targets {
-                        self.bridge_info.take();
                         let result = self.meta.close_bridge(
                             target_key,
                             bridge_trace_id,
@@ -636,12 +634,18 @@ impl<S: JitState> JitDriver<S> {
                         );
                         match result {
                             crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                self.bridge_info.take();
                                 self.sym = None;
                                 self.trace_meta = None;
                                 return;
                             }
-                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {}
+                            // pyjitpl.py:2999-3005: RetraceNeeded →
+                            // partial_trace preserved → compile_retrace.
+                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                self.bridge_info.take();
+                            }
                             crate::pyjitpl::BridgeCompileResult::Failed => {
+                                self.bridge_info.take();
                                 self.meta.abort_trace(false);
                                 self.sym = None;
                                 self.trace_meta = None;
@@ -649,6 +653,7 @@ impl<S: JitState> JitDriver<S> {
                             }
                         }
                     }
+                    // No targets: consume bridge_info, fall through.
                     self.bridge_info = None;
                 }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
@@ -671,16 +676,10 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
-                    // RPython pyjitpl.py:3000-3009 parity: if partial_trace
-                    // is set from a previous InvalidLoop, clear it and do a
-                    // fresh compile_loop. The new trace has different runtime
-                    // values (e.g. sign=1 vs sign=-1), so Phase 2 succeeds.
-                    if self.meta.has_partial_trace() {
-                        if crate::majit_log_enabled() {
-                            eprintln!("[jit] clearing partial_trace for fresh compile_loop");
-                        }
-                        self.meta.clear_retrace_state();
-                    }
+                    // pyjitpl.py:2993-3007: compile_loop checks
+                    // has_partial_trace internally and dispatches to
+                    // compile_retrace when appropriate. Do NOT clear
+                    // partial_trace here — bridge retrace depends on it.
                     let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -712,6 +711,9 @@ impl<S: JitState> JitDriver<S> {
                         &finish_args,
                         finish_arg_types,
                     );
+                    // RPython parity: DoneWithThisFrame exits _interpret().
+                    // Explicitly end the trace so is_tracing() sees false.
+                    self.meta.abort_trace(false);
                     return;
                 }
                 let meta = self.trace_meta.take().unwrap();

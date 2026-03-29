@@ -1478,7 +1478,10 @@ impl OptUnroll {
                         );
                         if let Some(builder) = ctx.take_active_short_preamble_producer() {
                             target_token.short_preamble =
-                                Some(builder.build_short_preamble_struct());
+                                Some(builder.build_short_preamble_struct(
+                                    &HashMap::new(),
+                                    &optimizer.constant_types,
+                                ));
                             target_token.short_preamble_producer = Some(builder);
                         }
                     } else {
@@ -1526,6 +1529,32 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
+        // RPython parity: in RPython, short preamble ops embed Const objects
+        // (ConstPtr/ConstInt) that carry their own value and are GC-tracked.
+        // _map_args skips Const args — they're always valid because the GC
+        // keeps referenced objects alive via JitCellToken → TargetToken →
+        // short_preamble → ResOperation → ConstPtr chain.
+        //
+        // In pyre, short preamble ops use OpRef indices from the loop's
+        // constant pool. These OpRefs aren't in the bridge's context.
+        // Register them as constants in the bridge's OptContext so the ops
+        // can reference them correctly.
+        for (&idx, &(val, tp)) in &short_preamble.constants {
+            let value = match tp {
+                majit_ir::Type::Int => majit_ir::Value::Int(val),
+                majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(val as usize)),
+                majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(val as u64)),
+                majit_ir::Type::Void => majit_ir::Value::Int(val),
+            };
+            ctx.make_constant(majit_ir::OpRef(idx), value);
+            optimizer.constant_types.entry(idx).or_insert(tp);
+            // Store for compile_bridge to merge into Cranelift's constants map.
+            optimizer
+                .bridge_preamble_constants
+                .entry(idx)
+                .or_insert((val, tp));
+        }
+
         let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
 
         for (i, &short_inputarg) in short_preamble.inputargs.iter().enumerate() {
