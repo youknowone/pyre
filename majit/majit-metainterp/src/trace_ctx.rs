@@ -192,13 +192,12 @@ impl TraceCtx {
         self.heap_cache.is_likely_virtual(obj)
     }
 
-    /// virtualref.py: virtual_ref_during_tracing — create a virtual
-    /// reference wrapper for an object. Returns the VirtualRef OpRef.
+    /// pyjitpl.py:1805-1806: record VIRTUAL_REF(box, cindex).
+    /// `cindex` = ConstInt(len(virtualref_boxes) // 2) — pair index.
     /// The optimizer can later eliminate the vref if the object stays virtual.
-    pub fn virtual_ref(&mut self, obj: OpRef) -> OpRef {
-        let token = self.recorder.record_op(OpCode::ForceToken, &[]);
-        let result = self.recorder.record_op(OpCode::VirtualRefR, &[obj, token]);
-        // Track the vref allocation as unescaped
+    pub fn virtual_ref(&mut self, obj: OpRef, cindex: OpRef) -> OpRef {
+        let result = self.recorder.record_op(OpCode::VirtualRefR, &[obj, cindex]);
+        // pyjitpl.py:1807: heapcache.new(resbox)
         self.heap_cache.new_object(result);
         result
     }
@@ -1831,17 +1830,19 @@ impl TraceCtx {
     /// Record VIRTUAL_REF_R: create a virtual reference (ref-typed result).
     ///
     /// `virtual_obj` is the real object being wrapped.
-    /// `force_token` is the force token for the current JIT frame.
+    /// `cindex` = ConstInt(len(virtualref_boxes) // 2) — pair index
+    /// (pyjitpl.py:1805-1806 parity).
     ///
     /// The optimizer replaces this with a virtual struct, so if the vref
     /// never escapes, no allocation happens.
-    pub fn virtual_ref_r(&mut self, virtual_obj: OpRef, force_token: OpRef) -> OpRef {
-        self.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token])
+    pub fn virtual_ref_r(&mut self, virtual_obj: OpRef, cindex: OpRef) -> OpRef {
+        self.record_op(OpCode::VirtualRefR, &[virtual_obj, cindex])
     }
 
     /// Record VIRTUAL_REF_I: create a virtual reference (int-typed result).
-    pub fn virtual_ref_i(&mut self, virtual_obj: OpRef, force_token: OpRef) -> OpRef {
-        self.record_op(OpCode::VirtualRefI, &[virtual_obj, force_token])
+    /// `cindex` = ConstInt(len(virtualref_boxes) // 2) — pair index.
+    pub fn virtual_ref_i(&mut self, virtual_obj: OpRef, cindex: OpRef) -> OpRef {
+        self.record_op(OpCode::VirtualRefI, &[virtual_obj, cindex])
     }
 
     /// Record VIRTUAL_REF_FINISH: finalize a virtual reference.

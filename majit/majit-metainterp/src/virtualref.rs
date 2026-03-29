@@ -13,6 +13,27 @@
 //!
 //! Mirrors `rpython/jit/metainterp/virtualref.py`.
 
+/// rpython/rlib/jit.py JitVirtualRef: heap-allocated virtual reference.
+/// Contains a force token (active JIT frame) and a forced pointer
+/// (materialized object, initially null).
+#[repr(C)]
+pub struct JitVirtualRef {
+    pub virtual_token: i64,
+    pub forced: *mut u8,
+}
+
+/// Allocate a concrete JitVirtualRef on the heap.
+/// virtualref.py:85-91: virtual_ref_during_tracing(real_object).
+/// Initializes virtual_token = TOKEN_NONE, forced = real_object.
+/// Returns raw pointer; caller owns the allocation.
+pub fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
+    let vref = Box::new(JitVirtualRef {
+        virtual_token: TOKEN_NONE,
+        forced: real_object,
+    });
+    Box::into_raw(vref) as *mut u8
+}
+
 /// Token value indicating no JIT frame is active.
 pub const TOKEN_NONE: i64 = 0;
 
@@ -108,12 +129,12 @@ impl VirtualRefInfo {
 
     /// Create a virtual reference during tracing.
     ///
-    /// virtualref.py: `virtual_ref_during_tracing()`
+    /// virtualref.py:85-91: `virtual_ref_during_tracing(real_object)`
     ///
-    /// Returns (virtual_token_opref, forced_opref) that the tracer should
-    /// record in the virtual ref's fields.
-    pub fn virtual_ref_during_tracing(&self, force_token: i64) -> (i64, i64) {
-        (force_token, 0) // (active token, null forced)
+    /// Allocates a concrete JitVirtualRef on the heap with
+    /// virtual_token = TOKEN_NONE, forced = real_object.
+    pub fn virtual_ref_during_tracing(&self, real_object: *mut u8) -> *mut u8 {
+        alloc_virtual_ref(real_object)
     }
 
     /// Mark a virtual ref as "in residual call" before a non-JIT call.

@@ -1537,20 +1537,22 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
-    /// Creates concrete vref via virtual_ref_during_tracing(), records
-    /// VIRTUAL_REF(virtual_obj, force_token), pushes [virtualbox, vrefbox].
+    /// Creates concrete vref via virtual_ref_during_tracing(real_object),
+    /// records VIRTUAL_REF(box, cindex), pushes [virtualbox, vrefbox].
     pub fn opimpl_virtual_ref(&mut self, virtual_obj: OpRef, virtual_obj_ptr: usize) -> OpRef {
         let Some(ctx) = self.tracing.as_mut() else {
             return OpRef::NONE;
         };
-        // pyjitpl.py:1804: virtual_ref_during_tracing
+        // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
         let vref_info = crate::virtualref::VirtualRefInfo::new();
-        let force_token = ctx.force_token();
-        let (token, _forced) = vref_info.virtual_ref_during_tracing(force_token.0 as i64);
-        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token]);
+        let vref_ptr = vref_info.virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
+        // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
+        let cindex = ctx.const_int((self.virtualref_boxes.len() / 2) as i64);
+        // pyjitpl.py:1806: record VIRTUAL_REF(box, cindex)
+        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, cindex]);
         // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
         self.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-        self.virtualref_boxes.push((vref, token as usize));
+        self.virtualref_boxes.push((vref, vref_ptr as usize));
         vref
     }
 

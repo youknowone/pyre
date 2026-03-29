@@ -30,37 +30,56 @@ use pyre_object::{
     w_str_get_value, w_tuple_len,
 };
 
-/// codewriter.py:JitDriverStaticData.jitcodes parity.
+/// MetaInterpStaticData.jitcodes (warmspot.py:282) parity.
 ///
-/// RPython's codewriter creates JitCode objects for each function
-/// reachable from the portal and assigns sequential indices via
-/// `jitcodes.append(jitcode); jitcode.index = len(jitcodes) - 1`.
+/// RPython: codewriter.make_jitcodes() creates all JitCode objects
+/// and assigns `jitcode.index = len(all_jitcodes)` at compile-time.
+/// The list is stored in MetaInterpStaticData.jitcodes and used for
+/// both snapshot encoding (opencoder.py:776/810) and resume
+/// restoration (resume.py:1051: `jitcodes[jitcode_pos]`).
 ///
-/// pyre assigns indices to CodeObject pointers as they're encountered
-/// during tracing — same sequential assignment, different timing
-/// (trace-time vs compile-time). The first function traced (portal)
-/// gets index 0, subsequent inline callees get 1, 2, etc.
-///
-/// opencoder.py:776/810: frame.jitcode.index used in snapshot.
-fn jitcode_index_for(code: *const CodeObject) -> i32 {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    thread_local! {
-        /// JitDriverStaticData.jitcodes equivalent: CodeObject → index.
-        static JITCODES: RefCell<(HashMap<usize, i32>, i32)> =
-            RefCell::new((HashMap::new(), 0));
+/// pyre: no codewriter phase — CodeObjects already exist as Python
+/// bytecode. Indices are assigned lazily at trace-time, same
+/// sequential semantics. Portal gets 0, inline callees get 1, 2, ….
+struct MetaInterpJitCodes {
+    /// codewriter.py:80: CodeObject* → jitcode.index.
+    by_code: std::collections::HashMap<usize, i32>,
+    /// resume.py:1051: jitcode_pos → CodeObject* (reverse lookup).
+    by_index: Vec<usize>,
+}
+
+impl MetaInterpJitCodes {
+    fn new() -> Self {
+        Self {
+            by_code: std::collections::HashMap::new(),
+            by_index: Vec::new(),
+        }
     }
-    let key = code as usize;
-    JITCODES.with(|r| {
-        let mut r = r.borrow_mut();
-        if let Some(&idx) = r.0.get(&key) {
+
+    /// codewriter.py:68: jitcode.index = index (assign or lookup).
+    fn index_for(&mut self, code: *const CodeObject) -> i32 {
+        let key = code as usize;
+        if let Some(&idx) = self.by_code.get(&key) {
             return idx;
         }
-        let idx = r.1;
-        r.1 += 1;
-        r.0.insert(key, idx);
+        let idx = self.by_index.len() as i32;
+        self.by_code.insert(key, idx);
+        self.by_index.push(key);
         idx
-    })
+    }
+}
+
+use std::cell::RefCell;
+
+thread_local! {
+    /// MetaInterpStaticData.jitcodes equivalent (per-thread for no-GIL).
+    static JITCODES: RefCell<MetaInterpJitCodes> =
+        RefCell::new(MetaInterpJitCodes::new());
+}
+
+/// opencoder.py:776/810: frame.jitcode.index used in snapshot.
+fn jitcode_index_for(code: *const CodeObject) -> i32 {
+    JITCODES.with(|r| r.borrow_mut().index_for(code))
 }
 
 /// codewriter/liveness.py parity: bytecode liveness analysis.
@@ -469,6 +488,10 @@ pub struct PyreSym {
     /// Frame metadata extracted at trace start — avoids stale snapshot reads.
     /// RPython MIFrame.jitcode parity.
     pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
+    /// RPython MIFrame.jitcode.index: sequential index assigned by
+    /// codewriter (JitDriverStaticData.jitcodes list position).
+    /// Used in opencoder.py:776/810 for snapshot frame metadata.
+    pub(crate) jitcode_index: i32,
     /// Namespace for global lookups.
     pub(crate) concrete_namespace: *mut pyre_interpreter::PyNamespace,
     /// Execution context pointer (for creating callee frames).
@@ -1373,6 +1396,7 @@ impl PyreSym {
             concrete_stack: Vec::new(),
             // concrete_code and concrete_namespace initialized below
             concrete_code: std::ptr::null(),
+            jitcode_index: -1, // assigned by jitcode_index_for on init
             concrete_namespace: std::ptr::null_mut(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
@@ -1496,6 +1520,7 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.concrete_code = frame.code;
+            self.jitcode_index = jitcode_index_for(frame.code);
             self.concrete_namespace = frame.namespace;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
@@ -1556,6 +1581,61 @@ impl PyreSym {
 
     pub(crate) fn concrete_pyobj_at(&self, abs_idx: usize) -> PyObjectRef {
         self.concrete_value_at(abs_idx).to_pyobj()
+    }
+}
+
+/// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
+/// Creates a concrete JitVirtualRef via virtual_ref_during_tracing(),
+/// records VIRTUAL_REF(box, cindex), and pushes
+/// [virtualbox, vrefbox] onto virtualref_boxes.
+///
+/// Called from metainterp push_inline_frame (executioncontext.enter parity).
+pub(crate) fn opimpl_virtual_ref(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    virtual_obj: OpRef,
+    virtual_obj_ptr: usize,
+) -> OpRef {
+    // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
+    let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
+    let vref_ptr = vref_info.virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
+    // pyjitpl.py:1805: cindex = ConstInt(len(virtualref_boxes) // 2)
+    let cindex = ctx.const_int((sym.virtualref_boxes.len() / 2) as i64);
+    // pyjitpl.py:1806: record VIRTUAL_REF(box, cindex)
+    let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, cindex]);
+    // pyjitpl.py:1807: heapcache.new(resbox)
+    ctx.heap_cache_mut().new_box(vref);
+    // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
+    sym.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
+    sym.virtualref_boxes.push((vref, vref_ptr as usize));
+    vref
+}
+
+/// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
+/// Pops vrefbox and lastbox from virtualref_boxes (LIFO),
+/// asserts `box == lastbox`, records VIRTUAL_REF_FINISH if still virtual.
+///
+/// Called from metainterp finishframe_inline/exception (executioncontext.leave parity).
+pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, virtual_obj: OpRef) {
+    if sym.virtualref_boxes.len() < 2 {
+        return;
+    }
+    // pyjitpl.py:1821: vrefbox = virtualref_boxes.pop()
+    let (vref_opref, vref_ptr) = sym.virtualref_boxes.pop().unwrap();
+    // pyjitpl.py:1822: lastbox = virtualref_boxes.pop()
+    let (lastbox_opref, _lastbox_ptr) = sym.virtualref_boxes.pop().unwrap();
+    // pyjitpl.py:1823: assert box.getref_base() == lastbox.getref_base()
+    debug_assert_eq!(
+        virtual_obj, lastbox_opref,
+        "opimpl_virtual_ref_finish: leaving frame box != top virtualref box"
+    );
+    // pyjitpl.py:1831: if is_virtual_ref(vref) → record VIRTUAL_REF_FINISH
+    let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
+    let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
+    if is_vref {
+        // pyjitpl.py:1832: VIRTUAL_REF_FINISH(vrefbox, nullbox)
+        let null = ctx.const_int(0);
+        let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, null]);
     }
 }
 
@@ -2166,13 +2246,13 @@ impl MIFrame {
         self.virtualref_before_residual_call();
     }
 
-    fn sync_standard_virtualizable_after_residual_call(&self) -> bool {
+    fn sync_standard_virtualizable_after_residual_call(&mut self, ctx: &mut TraceCtx) -> bool {
         let info = build_pyframe_virtualizable_info();
         let obj_ptr = self.sym().concrete_vable_ptr;
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
         // pyjitpl.py:3400 parity: check if any virtualref was forced
         // during the residual call.
-        self.virtualref_after_residual_call();
+        self.virtualref_after_residual_call(ctx);
         vable_forced
     }
 
@@ -2198,33 +2278,38 @@ impl MIFrame {
         }
     }
 
-    /// pyjitpl.py:3400 parity: after residual call, check if any
-    /// virtualref was forced and handle continue_tracing.
-    fn virtualref_after_residual_call(&self) {
-        let vref_boxes = &self.sym().virtualref_boxes;
-        if vref_boxes.is_empty() {
+    /// pyjitpl.py:3337-3347 vrefs_after_residual_call parity:
+    /// after residual call, check if any virtualref was forced.
+    /// If forced, call stop_tracking_virtualref(i) to record
+    /// VIRTUAL_REF_FINISH and replace odd slot with CONST_NULL.
+    fn virtualref_after_residual_call(&mut self, ctx: &mut TraceCtx) {
+        let sym = unsafe { &mut *self.sym };
+        if sym.virtualref_boxes.is_empty() {
             return;
         }
-        // pyjitpl.py:3409: for each pair, check if vrefbox (odd slot) was forced.
         let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-        for pair in vref_boxes.chunks(2) {
-            if let Some(&(_vref_sym, vref_ptr)) = pair.get(1) {
-                if vref_ptr != 0 {
-                    let original_token = majit_metainterp::virtualref::TOKEN_TRACING_RESCALL;
-                    let forced = unsafe {
-                        vref_info.tracing_after_residual_call(vref_ptr as *mut u8, original_token)
-                    };
-                    if forced {
-                        // pyjitpl.py:3414: continue_tracing(vrefbox, virtualbox)
-                        if let Some(&(_virt_sym, virt_ptr)) = pair.first() {
-                            unsafe {
-                                vref_info
-                                    .continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
-                            }
-                        }
-                    }
+        let len = sym.virtualref_boxes.len();
+        let mut i = 0;
+        while i < len {
+            let (vref_opref, vref_ptr) = sym.virtualref_boxes[i + 1];
+            if vref_ptr != 0 {
+                let forced = unsafe {
+                    vref_info.tracing_after_residual_call(
+                        vref_ptr as *mut u8,
+                        majit_metainterp::virtualref::TOKEN_TRACING_RESCALL,
+                    )
+                };
+                if forced {
+                    // pyjitpl.py:3371-3378: stop_tracking_virtualref(i)
+                    let virt_opref = sym.virtualref_boxes[i].0;
+                    // record VIRTUAL_REF_FINISH(vrefbox, virtualbox)
+                    let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref_opref, virt_opref]);
+                    // virtualref_boxes[i+1] = CONST_NULL
+                    let null_opref = ctx.const_int(0);
+                    sym.virtualref_boxes[i + 1] = (null_opref, 0);
                 }
             }
+            i += 2;
         }
     }
 
@@ -2446,7 +2531,7 @@ impl MIFrame {
 
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
-                jitcode_index: jitcode_index_for(self.sym().concrete_code) as u32,
+                jitcode_index: self.sym().jitcode_index as u32,
                 pc: self.orgpc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes),
             }];
@@ -2518,7 +2603,7 @@ impl MIFrame {
         // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
         let vable_boxes = Self::build_virtualizable_boxes(self.sym());
         // opencoder.py:776: frame.jitcode.index
-        let jitcode_index = jitcode_index_for(self.sym().concrete_code) as u32;
+        let jitcode_index = self.sym().jitcode_index as u32;
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index,
@@ -2577,68 +2662,6 @@ impl MIFrame {
                 }
             })
             .collect()
-    }
-
-    /// pyjitpl.py:1789-1814 opimpl_virtual_ref parity.
-    /// Creates a concrete JitVirtualRef via virtual_ref_during_tracing(),
-    /// records VIRTUAL_REF(virtual_obj, force_token), and pushes
-    /// [virtualbox, vrefbox] onto virtualref_boxes.
-    #[allow(dead_code)]
-    pub(crate) fn opimpl_virtual_ref(
-        &mut self,
-        ctx: &mut TraceCtx,
-        virtual_obj: OpRef,
-        virtual_obj_ptr: usize,
-    ) -> OpRef {
-        // pyjitpl.py:1804: virtual_ref_during_tracing(virtual_obj)
-        // Creates concrete vref with force_token from JIT frame.
-        let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-        let force_token_val = ctx.force_token();
-        let (token, _forced) = vref_info.virtual_ref_during_tracing(force_token_val.0 as i64);
-        // pyjitpl.py:1806: record VIRTUAL_REF(virtual_obj, force_token)
-        let vref = ctx.record_op(OpCode::VirtualRefR, &[virtual_obj, force_token_val]);
-        // pyjitpl.py:1807: heapcache.new(resbox) — marks vref as new allocation.
-        // In RPython this informs the tracing-time heapcache. In pyre, the
-        // optimizer's OptHeap handles new-allocation tracking during optimization.
-        ctx.heap_cache_mut().mark_likely_virtual(vref);
-        // pyjitpl.py:1814: virtualref_boxes += [virtualbox, vrefbox]
-        // RPython stores concrete vref pointer in odd slot for
-        // tracing_before/after_residual_call hooks.
-        let s = self.sym_mut();
-        s.virtualref_boxes.push((virtual_obj, virtual_obj_ptr));
-        // Concrete vref pointer: token value serves as identifier
-        // (RPython allocates a GC JitVirtualRef struct here).
-        s.virtualref_boxes.push((vref, token as usize));
-        vref
-    }
-
-    /// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
-    /// Checks is_virtual_ref() before recording VirtualRefFinish.
-    /// If the vref was already forced (not virtual anymore),
-    /// VirtualRefFinish is skipped.
-    #[allow(dead_code)]
-    pub(crate) fn opimpl_virtual_ref_finish(
-        &mut self,
-        ctx: &mut TraceCtx,
-        vref: OpRef,
-        virtual_obj: OpRef,
-    ) {
-        let s = self.sym_mut();
-        // pyjitpl.py:1827: vrefbox = virtualref_boxes[i+1] (odd slot)
-        let vref_ptr = s.virtualref_boxes.last().map(|&(_, ptr)| ptr).unwrap_or(0);
-        // pyjitpl.py:1831: if is_virtual_ref(vref) → record VIRTUAL_REF_FINISH
-        let vref_info = majit_metainterp::virtualref::VirtualRefInfo::new();
-        let is_vref = vref_ptr != 0 && unsafe { vref_info.is_virtual_ref(vref_ptr as *const u8) };
-        if is_vref {
-            // pyjitpl.py:3371: VIRTUAL_REF_FINISH(vrefbox, NULL)
-            let null = ctx.const_int(0);
-            let _ = ctx.record_op(OpCode::VirtualRefFinish, &[vref, null]);
-        }
-        // pyjitpl.py:1819: pop pair
-        if s.virtualref_boxes.len() >= 2 {
-            s.virtualref_boxes.pop();
-            s.virtualref_boxes.pop();
-        }
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
@@ -4766,6 +4789,7 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.concrete_code = code_ptr;
+            sym.jitcode_index = jitcode_index_for(code_ptr);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (vable_next_instr, vable_valuestackdepth) =
@@ -4826,6 +4850,7 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.concrete_code = code_ptr;
+            sym.jitcode_index = jitcode_index_for(code_ptr);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
@@ -4854,7 +4879,7 @@ impl MIFrame {
         });
         let my_fail_arg_types = self.build_single_frame_fail_arg_types();
         // opencoder.py:810: parent frame's jitcode.index.
-        let my_jitcode_index = jitcode_index_for(self.sym().concrete_code);
+        let my_jitcode_index = self.sym().jitcode_index;
         // opencoder.py:819-834 parity: accumulate full parent chain.
         // Current frame becomes the newest parent; existing parents follow.
         let mut parent_frames = vec![(
@@ -4980,8 +5005,8 @@ impl MIFrame {
                     // (call_assembler_fast_path). No GuardNotForced needed,
                     // but virtualizable token must be cleaned up.
                     if ca_token.is_some() {
-                        this.sync_standard_virtualizable_after_residual_call();
-                    } else if !this.sync_standard_virtualizable_after_residual_call() {
+                        this.sync_standard_virtualizable_after_residual_call(ctx);
+                    } else if !this.sync_standard_virtualizable_after_residual_call(ctx) {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -4996,7 +5021,7 @@ impl MIFrame {
                         &[this.frame(), callable, args[0]],
                         &[Type::Ref, Type::Ref, Type::Ref],
                     );
-                    if !this.sync_standard_virtualizable_after_residual_call() {
+                    if !this.sync_standard_virtualizable_after_residual_call(ctx) {
                         this.push_call_replay_stack(ctx, callable, args, call_pc);
                         this.record_guard(ctx, OpCode::GuardNotForced, &[]);
                         ctx.heap_cache_mut().invalidate_caches_for_escaped();
@@ -5014,7 +5039,7 @@ impl MIFrame {
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 this.sync_standard_virtualizable_before_residual_call(ctx);
                 let result = ctx.call_may_force_ref_typed(force_fn, &[callee_frame], &[Type::Ref]);
-                if !this.sync_standard_virtualizable_after_residual_call() {
+                if !this.sync_standard_virtualizable_after_residual_call(ctx) {
                     // GuardNotForced fail → interpreter must re-execute CALL.
                     this.push_call_replay_stack(ctx, callable, args, call_pc);
                     this.record_guard(ctx, OpCode::GuardNotForced, &[]);

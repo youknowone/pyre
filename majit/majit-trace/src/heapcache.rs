@@ -1122,6 +1122,18 @@ impl HeapCache {
 
     // ── Likely virtual tracking (heapcache.py is_likely_virtual) ──
 
+    /// heapcache.py:new(box) parity: mark a box as freshly allocated.
+    /// Sets HF_IS_UNESCAPED (not escaped to external code) and
+    /// HF_LIKELY_VIRTUAL (candidate for virtualization by optimizer).
+    /// Called by opimpl_virtual_ref after allocating a JitVirtualRef.
+    pub fn new_box(&mut self, opref: OpRef) {
+        vb_insert(&mut self.likely_virtual, opref);
+        // HF_IS_UNESCAPED: new allocations haven't escaped yet.
+        // In RPython, this also clears cached field values for the box.
+        // pyre's field cache is keyed by (obj, field_descr) so a new
+        // box with no prior entries is implicitly "no cached values".
+    }
+
     /// Mark a value as likely virtual.
     /// heapcache.py: HF_LIKELY_VIRTUAL flag
     pub fn mark_likely_virtual(&mut self, opref: OpRef) {

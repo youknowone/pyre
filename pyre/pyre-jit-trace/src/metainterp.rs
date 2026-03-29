@@ -306,6 +306,14 @@ impl PyreMetaInterp {
         let mut owned_cf = Box::new(pending.concrete_frame);
         let cf_addr = &*owned_cf as *const pyre_interpreter::pyframe::PyFrame as usize;
 
+        // executioncontext.py:76 / pyjitpl.py:1789: virtual_ref for callee frame.
+        if let Some(frame_opref) = pending.drop_frame_opref {
+            if let Some(caller) = self.framestack.last() {
+                let caller_sym = unsafe { &mut *caller.sym };
+                super::state::opimpl_virtual_ref(ctx, caller_sym, frame_opref, cf_addr);
+            }
+        }
+
         let frame = MetaInterpFrame {
             sym: sym_ptr,
             owned_sym: Some(owned_sym),
@@ -341,6 +349,14 @@ impl PyreMetaInterp {
         let popped = self.framestack.pop().unwrap();
         self.portal_call_depth -= 1;
         ctx.pop_inline_trace_position();
+
+        // executioncontext.py:89 / pyjitpl.py:1819: virtual_ref_finish for callee frame.
+        if let Some(frame_opref) = popped.drop_frame_opref {
+            if let Some(parent) = self.framestack.last() {
+                let parent_sym = unsafe { &mut *parent.sym };
+                super::state::opimpl_virtual_ref_finish(ctx, parent_sym, frame_opref);
+            }
+        }
 
         // Drop callee frame in trace
         if let Some(frame_opref) = popped.drop_frame_opref {
@@ -566,6 +582,14 @@ impl PyreMetaInterp {
                 let popped = self.framestack.pop().unwrap();
                 self.portal_call_depth -= 1;
                 ctx.pop_inline_trace_position();
+
+                // executioncontext.py:89 / pyjitpl.py:1819: virtual_ref_finish on exception leave.
+                if let Some(frame_opref) = popped.drop_frame_opref {
+                    if let Some(parent) = self.framestack.last() {
+                        let parent_sym = unsafe { &mut *parent.sym };
+                        super::state::opimpl_virtual_ref_finish(ctx, parent_sym, frame_opref);
+                    }
+                }
 
                 // Drop callee frame in trace
                 if let Some(frame_opref) = popped.drop_frame_opref {
