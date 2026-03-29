@@ -195,17 +195,26 @@ fn snapshot_map_from_trace_snapshots(
     std::collections::HashMap<i32, Vec<usize>>,
     std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    std::collections::HashMap<i32, Vec<Option<(i64, majit_ir::Type)>>>,
 ) {
     let mut box_map = std::collections::HashMap::new();
     let mut size_map = std::collections::HashMap::new();
     let mut vable_map = std::collections::HashMap::new();
     let mut pc_map = std::collections::HashMap::new();
+    let mut const_map = std::collections::HashMap::new();
     for (id, snap) in trace_snapshots.iter().enumerate() {
         use majit_trace::recorder::SnapshotTagged;
         let tagged_to_opref = |t: &SnapshotTagged| -> majit_ir::OpRef {
             match t {
                 SnapshotTagged::Box(n) | SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
-                SnapshotTagged::Const(_) => majit_ir::OpRef::NONE,
+                SnapshotTagged::Const(..) => majit_ir::OpRef::NONE,
+            }
+        };
+        // resume.py:157: Const carries its actual type (INT/REF/FLOAT).
+        let tagged_to_const = |t: &SnapshotTagged| -> Option<(i64, majit_ir::Type)> {
+            match t {
+                SnapshotTagged::Const(v, tp) => Some((*v, *tp)),
+                _ => None,
             }
         };
         let boxes: Vec<majit_ir::OpRef> = snap
@@ -214,11 +223,15 @@ fn snapshot_map_from_trace_snapshots(
             .flat_map(|f| f.boxes.iter())
             .map(&tagged_to_opref)
             .collect();
+        let consts: Vec<Option<(i64, majit_ir::Type)>> = snap
+            .frames
+            .iter()
+            .flat_map(|f| f.boxes.iter())
+            .map(&tagged_to_const)
+            .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
-        // pyjitpl.py:2588-2590: virtualizable_boxes
         let vable_boxes: Vec<majit_ir::OpRef> =
             snap.vable_boxes.iter().map(&tagged_to_opref).collect();
-        // opencoder.py:776,806: per-frame (jitcode_index, pc)
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
@@ -226,11 +239,12 @@ fn snapshot_map_from_trace_snapshots(
             .collect();
         let id = id as i32;
         box_map.insert(id, boxes);
+        const_map.insert(id, consts);
         size_map.insert(id, frame_sizes);
         vable_map.insert(id, vable_boxes);
         pc_map.insert(id, frame_pcs);
     }
-    (box_map, size_map, vable_map, pc_map)
+    (box_map, size_map, vable_map, pc_map, const_map)
 }
 
 fn normalize_root_loop_entry_contract(
@@ -443,14 +457,6 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
-    /// Cross-loop cut alias map: inner_key → outer_key.
-    ///
-    /// RPython uses a single green key per function (code object identity)
-    /// and stores all entry points as target_tokens within one JitCellToken.
-    /// Pyre uses (code, pc) green keys, creating distinct keys per loop header.
-    /// When a cross-loop cut stores an entry under the outer key, this map
-    /// allows inner back-edge lookups (inner_key) to find the outer key's entry.
-    pub(crate) compiled_loop_aliases: HashMap<u64, u64>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -771,7 +777,6 @@ impl<M: Clone> MetaInterp<M> {
             jitcodes: HashMap::new(),
             jitcode_next_index: 0,
             pending_preamble_tokens: HashMap::new(),
-            compiled_loop_aliases: HashMap::new(),
         }
     }
 
@@ -1727,8 +1732,11 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
-        let green_key = ctx.green_key;
         let cut_inner_green_key = ctx.cut_inner_green_key;
+        // pyjitpl.py:3158: greenkey = original_boxes[:num_green_args]
+        // RPython uses the green key at the CLOSE point (reached_loop_header).
+        // For cross-loop cuts, this is the inner loop's key, not the outer.
+        let green_key = cut_inner_green_key.unwrap_or(ctx.green_key);
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position.ops_len > 0)
@@ -1866,9 +1874,15 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
-            snapshot_map_from_trace_snapshots(&trace_snapshots);
+        let (
+            snapshot_map,
+            snapshot_frame_size_map,
+            snapshot_vable_map,
+            snapshot_pc_map,
+            snapshot_consts,
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots);
         unroll_opt.snapshot_boxes = snapshot_map.clone();
+        unroll_opt.snapshot_consts = snapshot_consts.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
@@ -2263,17 +2277,6 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state
                     .attach_procedure_to_interp(green_key, install_token);
 
-                // Register inner_key → outer_key alias for cross-loop cuts.
-                if let Some(inner_key) = cut_inner_green_key {
-                    self.compiled_loop_aliases.insert(inner_key, green_key);
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] alias registered: inner_key={} → outer_key={}",
-                            inner_key, green_key,
-                        );
-                    }
-                }
-
                 self.stats.loops_compiled += 1;
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -2430,8 +2433,13 @@ impl<M: Clone> MetaInterp<M> {
         let constants = ctx.constants.snapshot();
         let constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
-        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs) =
-            snapshot_map_from_trace_snapshots(&trace_snapshots);
+        let (
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_frame_pcs,
+            _snapshot_consts,
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots);
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2636,8 +2644,10 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_frame_sizes,
             retrace_snapshot_vable_boxes,
             retrace_snapshot_frame_pcs,
+            retrace_snapshot_consts,
         ) = snapshot_map_from_trace_snapshots(&trace.snapshots);
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
+        unroll_opt.snapshot_consts = retrace_snapshot_consts;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
@@ -4150,8 +4160,6 @@ impl<M: Clone> MetaInterp<M> {
     /// compiled code will fail at GUARD_NOT_INVALIDATED and fall back to
     /// the interpreter.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        // Do NOT follow aliases. Invalidating inner_key should NOT destroy
-        // the outer entry — it may be shared with other back-edges.
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
             compiled.token.invalidate();
             if crate::majit_log_enabled() {
@@ -4841,6 +4849,7 @@ impl<M: Clone> MetaInterp<M> {
         // serialized at guard compile time (bridgeopt.py:69-88). Only
         // classes that were known at the guard point are restored —
         // runtime class inspection is NOT used here.
+        let loop_num_inputs = compiled.num_inputs;
         let (optimized_ops, retrace_requested) = optimizer.optimize_bridge(
             bridge_ops,
             &mut constants,
@@ -4850,6 +4859,7 @@ impl<M: Clone> MetaInterp<M> {
             retraced_count,
             retrace_limit,
             bridge_knowledge.as_ref(),
+            Some(loop_num_inputs),
         );
         // RPython parity: merge short preamble constants into bridge pool.
         // inline_short_preamble registered them in optimizer.bridge_preamble_constants.

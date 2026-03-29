@@ -63,8 +63,10 @@ pub struct SnapshotFrame {
 pub enum SnapshotTagged {
     /// Value from deadframe fail_args slot.
     Box(u32),
-    /// Compile-time constant value.
-    Const(i64),
+    /// Compile-time constant value with type.
+    /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
+    /// for correct TAGINT/TAGCONST encoding in rd_numb.
+    Const(i64, majit_ir::Type),
     /// Virtual object to be materialized.
     Virtual(u32),
 }
