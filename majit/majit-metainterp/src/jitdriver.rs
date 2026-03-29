@@ -2222,10 +2222,12 @@ impl<S: JitState> JitDriver<S> {
         let key_hash = crate::green_key_hash(green_values);
 
         if !self.has_compiled_loop(key_hash) {
-            // RPython parity: cold fast path — counter_would_fire is
-            // read-only (no tick). The real tick happens inside
-            // back_edge_structured → maybe_start_tracing.
+            // warmstate.py:446,465: cold fast path — check would_fire without
+            // ticking to skip GreenKey allocation and build_meta for cold keys.
+            // Advance counter via counter_tick which respects cell state
+            // (DONT_TRACE_HERE, DontTraceHere — warmstate.py:484).
             if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
+                self.meta.warm_state_mut().counter_tick(key_hash);
                 return None;
             }
             let green_key = GreenKey::new(green_values.to_vec());

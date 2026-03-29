@@ -139,6 +139,10 @@ pub struct Optimizer {
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
     pub imported_virtuals: Vec<ImportedVirtual>,
+    /// Types of the original trace inputargs (from LABEL or inputarg_types).
+    /// RPython Boxes carry type intrinsically; we store it here so
+    /// export_state can propagate to ExportedState.renamed_inputarg_types.
+    pub trace_inputarg_types: Vec<majit_ir::Type>,
     /// RPython unroll.py: export_state — exported optimizer facts at the end
     /// of the preamble, adapted to majit's slot-based inputarg model.
     pub exported_loop_state: Option<crate::optimizeopt::unroll::ExportedState>,
@@ -784,6 +788,7 @@ impl Optimizer {
             numbering_type_overrides: std::collections::HashMap::new(),
             exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
+            trace_inputarg_types: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
             imported_short_sources: Vec::new(),
@@ -1755,6 +1760,22 @@ impl Optimizer {
                 Some(&exported_int_bounds),
             )
         });
+        // Populate renamed_inputarg_types from trace_inputarg_types.
+        // RPython Box objects carry type intrinsically; we store it separately.
+        if let Some(ref mut es) = self.exported_loop_state {
+            if es.renamed_inputarg_types.is_empty() && !self.trace_inputarg_types.is_empty() {
+                es.renamed_inputarg_types = es
+                    .renamed_inputargs
+                    .iter()
+                    .map(|&opref| {
+                        self.trace_inputarg_types
+                            .get(opref.0 as usize)
+                            .copied()
+                            .unwrap_or(Type::Int)
+                    })
+                    .collect();
+            }
+        }
         self.exported_jump_virtuals = exported_jump_virtuals;
 
         // RPython export_state() flushes force artifacts into the preamble
@@ -2192,13 +2213,26 @@ impl Optimizer {
             return (optimized_ops, true);
         }
 
-        // unroll.py:220-230: retrace limit reached.
-        // RPython tries force_boxes=true then falls back to jump_to_preamble.
-        // TODO: implement force_boxes with correct arity (RPython
-        // virtualstate.py:655-683 make_inputargs parity).
+        // unroll.py:220-230: retrace limit reached, try force_boxes=true.
+        ctx.clear_newoperations();
+        let vs2 = opt_unroll.jump_to_existing_trace(
+            &jump_args,
+            None,
+            front_target_tokens,
+            self,
+            &mut ctx,
+            true, // force_boxes
+            Some(&pre_opt_jump_args),
+        );
+
+        if vs2.is_none() {
+            // unroll.py:226-227: matched with forced boxes
+            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
+            result.extend(ctx.new_operations.drain(..));
+            return (result, false);
+        }
 
         // unroll.py:228-229: jump_to_preamble fallback.
-        // RPython only changes descr, keeps arglist intact.
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!("[jit] Retrace count reached, jumping to preamble");
         }

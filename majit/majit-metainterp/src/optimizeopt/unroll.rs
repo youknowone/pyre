@@ -52,16 +52,11 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
-    /// RPython compile.py:278-284 parity: Phase 1 results saved for
-    /// retrace_needed when Phase 2 raises InvalidLoop.
-    /// RPython: Phase 1 and Phase 2 are separate calls, so Phase 1
-    /// results are naturally accessible. pyre: Phase 1 runs inside
-    /// optimize_phase1() before catch_unwind, so results are directly
-    /// available on the caller's stack.
-    pub phase1_exported_state: Option<ExportedState>,
-    /// Phase 1 preamble ops (terminal JUMP excluded by optimizer).
-    /// RPython compile.py:279: partial_trace.operations.
-    pub phase1_preamble_ops: Option<Vec<Op>>,
+    // RPython compile.py:278-284: Phase 1 results for retrace_needed.
+    // In RPython, Phase 1 and Phase 2 are separate calls, so Phase 1
+    // results are naturally accessible. In pyre, Phase 1 results are
+    // returned via the phase1_out output parameter to the caller's
+    // stack frame (survives Phase 2 panic).
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
@@ -94,8 +89,6 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
-            phase1_exported_state: None,
-            phase1_preamble_ops: None,
             snapshot_boxes: std::collections::HashMap::new(),
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
@@ -264,7 +257,7 @@ impl UnrollOptimizer {
             let p1_ni = opt_p1.final_num_inputs();
             let jv = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
-            match opt_p1.exported_loop_state.clone() {
+            match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
                     // Determine types of end_args from Phase 1's output ops.
                     {
@@ -338,18 +331,21 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        opt_p2.imported_loop_state = Some(exported_state.clone());
-        // RPython compile.py:278-284 parity: save Phase 1 results.
-        // If Phase 2 raises InvalidLoop, compile_loop uses these for
-        // retrace_needed (RPython partial_trace.operations + exported_state).
-        self.phase1_exported_state = Some(exported_state.clone());
-        self.phase1_preamble_ops = Some(p1_ops.clone());
-        // Output parameter: write Phase 1 results to caller's stack frame
-        // BEFORE Phase 2 starts. This survives Phase 2 panic because it's
-        // on the caller's stack, not inside the UnrollOptimizer.
+        // gcreftracer.py parity: root GcRef values on the shadow stack.
+        // RPython: single Python object — GC traces automatically.
+        // Rust: LIFO shadow stack requires longer-lived roots at lower depth.
+        //
+        // Order: (1) phase1_out clone rooted first (survives beyond this
+        // function for retrace — pyre-specific panic safety backup).
+        // (2) original rooted second (lives until opt_p2 drops at Phase 2
+        // end — shorter-lived, higher depth, dropped first).
         if let Some(out) = phase1_out {
-            *out = Some((p1_ops.clone(), exported_state.clone()));
+            let mut backup = exported_state.clone();
+            backup.root_all_gcrefs();
+            *out = Some((p1_ops.clone(), backup));
         }
+        exported_state.root_all_gcrefs();
+        opt_p2.imported_loop_state = Some(exported_state);
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
         let imported = build_imported_virtuals(&jump_virtuals);
@@ -444,17 +440,47 @@ impl UnrollOptimizer {
         let imported_short_sources = opt_p2.imported_short_sources.clone();
 
         // finalize_short_preamble: create TargetToken for this loop version
+        // RPython parity: short preamble ops reference constant OpRefs from
+        // the loop's constant pool. Pass consts_p1 so the ShortPreamble
+        // captures (value, type) for each constant, enabling bridges to
+        // re-register them in their own pool (RPython embeds Const objects
+        // directly in op args; majit uses separate constant pool indices).
+        // RPython parity: read back from the same ExportedState that
+        // import_state used (Python reference semantics — one object).
+        // exported_state was moved into opt_p2.imported_loop_state.
+        // Extract needed fields before opt_p2 is borrowed mutably below.
+        let (
+            exported_vs,
+            exported_end_args,
+            exported_short_inputargs,
+            exported_short_boxes,
+            exported_renamed_inputargs,
+        ) = {
+            let es = opt_p2
+                .imported_loop_state
+                .as_ref()
+                .expect("imported_loop_state must survive Phase 2");
+            (
+                es.virtual_state.clone(),
+                es.end_args.clone(),
+                es.short_inputargs.clone(),
+                es.exported_short_boxes.clone(),
+                es.renamed_inputargs.clone(),
+            )
+        };
         let initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
             crate::optimizeopt::shortpreamble::build_short_preamble_from_exported_boxes(
-                &exported_state.end_args,
-                &exported_state.short_inputargs,
-                &exported_state.exported_short_boxes,
+                &exported_end_args,
+                &exported_short_inputargs,
+                &exported_short_boxes,
+                &consts_p1,
+                &self.constant_types,
             )
         });
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             self.target_tokens.len() as u64,
-            exported_state.virtual_state.clone(),
+            exported_vs,
             initial_sp.clone(),
             imported_short_preamble_builder.as_ref(),
         );
@@ -655,7 +681,7 @@ impl UnrollOptimizer {
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
-            let preamble_arity = exported_state.renamed_inputargs.len();
+            let preamble_arity = exported_renamed_inputargs.len();
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
                 // Truncate Jump args to match preamble start Label arity.
@@ -684,7 +710,7 @@ impl UnrollOptimizer {
             &body_ops,
             &label_args,
             opt_p2.imported_label_source_slots.as_deref().unwrap_or(&[]),
-            &exported_state.renamed_inputargs,
+            &exported_renamed_inputargs,
             &sp.used_boxes,
             &sp.jump_args,
             p2_ni,
@@ -803,7 +829,11 @@ impl Default for UnrollOptimizer {
 ///
 /// Contains the virtual state, short preamble boxes, arg mappings,
 /// and exported infos needed to resume optimization after peeling.
-#[derive(Clone, Debug)]
+///
+/// gcreftracer.py parity: GcRef values in exported_infos are rooted on
+/// the shadow stack. ExportedState persists between Phase 1 (preamble)
+/// and Phase 2 (body), during which GC can run and move objects.
+#[derive(Debug)]
 pub struct ExportedState {
     /// Label args at the end of the preamble (after forcing).
     pub end_args: Vec<OpRef>,
@@ -834,8 +864,16 @@ pub struct ExportedState {
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
     pub renamed_inputargs: Vec<OpRef>,
+    /// Types of renamed_inputargs. RPython Box objects carry type
+    /// intrinsically; majit stores it separately.
+    pub renamed_inputarg_types: Vec<Type>,
     /// Short inputargs for the short preamble.
     pub short_inputargs: Vec<OpRef>,
+    /// Shadow stack rooting for GcRef values in exported_infos.
+    /// (OpRef key, field kind, shadow stack index).
+    rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
+    /// Shadow stack depth at creation. release_roots pops to here.
+    shadow_stack_base: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -858,6 +896,26 @@ pub struct ExportedValueInfo {
     pub nonnull: bool,
     /// Lower bound learned for this integer slot.
     pub int_lower_bound: Option<i64>,
+}
+
+/// Identifies which GcRef-bearing field inside an ExportedState
+/// is rooted at a particular shadow stack slot.
+#[derive(Clone, Copy, Debug)]
+enum ExportedGcRefField {
+    /// exported_infos[OpRef].known_class
+    InfoKnownClass,
+    /// exported_infos[OpRef].constant (Value::Ref)
+    InfoConstantRef,
+    /// exported_infos[OpRef].ptr_info = PtrInfo::Constant(GcRef)
+    InfoPtrInfoConstant,
+    /// exported_infos[OpRef].ptr_info = PtrInfo::KnownClass { class_ptr }
+    InfoPtrInfoKnownClass,
+    /// virtual_state.state[index] = KnownClass { class_ptr }
+    VirtualStateKnownClass(usize),
+    /// virtual_state.state[index] = Virtual { known_class }
+    VirtualStateVirtualClass(usize),
+    /// virtual_state.state[index] = Constant(Value::Ref)
+    VirtualStateConstantRef(usize),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -935,6 +993,7 @@ impl ExportedState {
         exported_short_ops: Vec<ExportedShortOp>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
+        renamed_inputarg_types: Vec<Type>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
         ExportedState {
@@ -948,13 +1007,203 @@ impl ExportedState {
             exported_short_boxes,
             short_preamble: None,
             renamed_inputargs,
+            renamed_inputarg_types,
             short_inputargs,
+            rooted_refs: Vec::new(),
+            shadow_stack_base: majit_gc::shadow_stack::depth(),
+        }
+        // gcreftracer.py parity: RPython ExportedState is a Python object
+        // whose GcRef fields are automatically traced by the GC. In Rust,
+        // root_all_gcrefs() must be called at each storage site in LIFO
+        // order (longer-lived copy rooted first → lower shadow stack depth).
+        // new() does NOT auto-root because the LIFO ordering depends on
+        // the caller's storage pattern.
+    }
+
+    /// Push all GcRef values from exported_infos and virtual_state to
+    /// shadow stack. gcreftracer.py parity: GC can run between Phase 1
+    /// and Phase 2, and between Phase 1 and retrace.
+    ///
+    /// Must be called explicitly after construction — not auto-called in
+    /// new(). This enables LIFO-correct rooting: root the longer-lived
+    /// copy first (lower shadow stack depth), then the shorter-lived copy.
+    pub fn root_all_gcrefs(&mut self) {
+        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::virtualstate::VirtualStateInfo;
+        self.shadow_stack_base = majit_gc::shadow_stack::depth();
+        // ── exported_infos GcRef fields ──
+        let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
+        keys.sort_by_key(|k| k.0);
+        for key in keys {
+            let info = &self.exported_infos[&key];
+            if let Some(gcref) = info.known_class {
+                if !gcref.is_null() {
+                    let ss_idx = majit_gc::shadow_stack::push(gcref);
+                    self.rooted_refs
+                        .push((key, ExportedGcRefField::InfoKnownClass, ss_idx));
+                }
+            }
+            if let Some(Value::Ref(gcref)) = info.constant {
+                if !gcref.is_null() {
+                    let ss_idx = majit_gc::shadow_stack::push(gcref);
+                    self.rooted_refs
+                        .push((key, ExportedGcRefField::InfoConstantRef, ss_idx));
+                }
+            }
+            if let Some(ref pi) = info.ptr_info {
+                match pi {
+                    PtrInfo::Constant(gcref) if !gcref.is_null() => {
+                        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                        self.rooted_refs.push((
+                            key,
+                            ExportedGcRefField::InfoPtrInfoConstant,
+                            ss_idx,
+                        ));
+                    }
+                    PtrInfo::KnownClass { class_ptr, .. } if !class_ptr.is_null() => {
+                        let ss_idx = majit_gc::shadow_stack::push(*class_ptr);
+                        self.rooted_refs.push((
+                            key,
+                            ExportedGcRefField::InfoPtrInfoKnownClass,
+                            ss_idx,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // ── virtual_state GcRef fields ──
+        // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
+        let dummy_key = OpRef(u32::MAX);
+        for (i, entry) in self.virtual_state.state.iter().enumerate() {
+            match entry {
+                VirtualStateInfo::KnownClass { class_ptr } if !class_ptr.is_null() => {
+                    let ss_idx = majit_gc::shadow_stack::push(*class_ptr);
+                    self.rooted_refs.push((
+                        dummy_key,
+                        ExportedGcRefField::VirtualStateKnownClass(i),
+                        ss_idx,
+                    ));
+                }
+                VirtualStateInfo::Virtual {
+                    known_class: Some(gcref),
+                    ..
+                } if !gcref.is_null() => {
+                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                    self.rooted_refs.push((
+                        dummy_key,
+                        ExportedGcRefField::VirtualStateVirtualClass(i),
+                        ss_idx,
+                    ));
+                }
+                VirtualStateInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
+                    let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                    self.rooted_refs.push((
+                        dummy_key,
+                        ExportedGcRefField::VirtualStateConstantRef(i),
+                        ss_idx,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Update GcRef values from shadow stack — GC may have moved objects.
+    pub fn refresh_from_gc(&mut self) {
+        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::virtualstate::VirtualStateInfo;
+        for &(key, ref field, ss_idx) in &self.rooted_refs {
+            let updated = majit_gc::shadow_stack::get(ss_idx);
+            match field {
+                ExportedGcRefField::InfoKnownClass => {
+                    if let Some(info) = self.exported_infos.get_mut(&key) {
+                        info.known_class = Some(updated);
+                    }
+                }
+                ExportedGcRefField::InfoConstantRef => {
+                    if let Some(info) = self.exported_infos.get_mut(&key) {
+                        info.constant = Some(Value::Ref(updated));
+                    }
+                }
+                ExportedGcRefField::InfoPtrInfoConstant => {
+                    if let Some(info) = self.exported_infos.get_mut(&key) {
+                        info.ptr_info = Some(PtrInfo::Constant(updated));
+                    }
+                }
+                ExportedGcRefField::InfoPtrInfoKnownClass => {
+                    if let Some(info) = self.exported_infos.get_mut(&key) {
+                        if let Some(PtrInfo::KnownClass { class_ptr, .. }) = &mut info.ptr_info {
+                            *class_ptr = updated;
+                        }
+                    }
+                }
+                ExportedGcRefField::VirtualStateKnownClass(i) => {
+                    if let Some(VirtualStateInfo::KnownClass { class_ptr }) =
+                        self.virtual_state.state.get_mut(*i)
+                    {
+                        *class_ptr = updated;
+                    }
+                }
+                ExportedGcRefField::VirtualStateVirtualClass(i) => {
+                    if let Some(VirtualStateInfo::Virtual { known_class, .. }) =
+                        self.virtual_state.state.get_mut(*i)
+                    {
+                        *known_class = Some(updated);
+                    }
+                }
+                ExportedGcRefField::VirtualStateConstantRef(i) => {
+                    if let Some(entry) = self.virtual_state.state.get_mut(*i) {
+                        *entry = VirtualStateInfo::Constant(Value::Ref(updated));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Release shadow stack roots.
+    fn release_roots(&mut self) {
+        if !self.rooted_refs.is_empty() {
+            majit_gc::shadow_stack::pop_to(self.shadow_stack_base);
+            self.rooted_refs.clear();
         }
     }
 
     /// unroll.py: final() — ExportedState is never final (loop continues).
     pub fn is_final(&self) -> bool {
         false
+    }
+}
+
+impl Clone for ExportedState {
+    /// Pure data clone — no shadow stack side effects.
+    ///
+    /// RPython has no clone (single Python object shared by reference).
+    /// When a Rust clone is stored long-term (across potential GC points),
+    /// the caller must call root_all_gcrefs() explicitly.
+    fn clone(&self) -> Self {
+        ExportedState {
+            end_args: self.end_args.clone(),
+            next_iteration_args: self.next_iteration_args.clone(),
+            end_arg_types: self.end_arg_types.clone(),
+            preamble_heap_cache: self.preamble_heap_cache.clone(),
+            virtual_state: self.virtual_state.clone(),
+            exported_infos: self.exported_infos.clone(),
+            exported_short_ops: self.exported_short_ops.clone(),
+            exported_short_boxes: self.exported_short_boxes.clone(),
+            short_preamble: self.short_preamble.clone(),
+            renamed_inputargs: self.renamed_inputargs.clone(),
+            renamed_inputarg_types: self.renamed_inputarg_types.clone(),
+            short_inputargs: self.short_inputargs.clone(),
+            rooted_refs: Vec::new(),
+            shadow_stack_base: majit_gc::shadow_stack::depth(),
+        }
+    }
+}
+
+impl Drop for ExportedState {
+    fn drop(&mut self) {
+        self.release_roots();
     }
 }
 
@@ -1226,6 +1475,8 @@ impl OptUnroll {
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
         // create_state cache + make_inputargs' position_in_notvirtuals dedup.
+        // Types are populated by the caller from Optimizer.trace_inputarg_types
+        // after export_state returns. Initialize empty here.
         ExportedState::new(
             label_args.clone(),
             end_args,
@@ -1234,6 +1485,7 @@ impl OptUnroll {
             exported_short_ops,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
+            Vec::new(), // populated by caller
             short_args,
         )
     }
