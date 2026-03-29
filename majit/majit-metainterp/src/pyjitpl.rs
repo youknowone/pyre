@@ -4201,6 +4201,11 @@ impl<M: Clone> MetaInterp<M> {
                     })
             })
             .unwrap_or_default();
+        let before = if crate::majit_log_enabled() {
+            Some(values.clone())
+        } else {
+            None
+        };
         for (i, tp) in types.iter().enumerate() {
             if i >= values.len() {
                 break;
@@ -4213,6 +4218,12 @@ impl<M: Clone> MetaInterp<M> {
                     values[i] = Value::Int(ptr as i64);
                 }
             }
+        }
+        if let Some(before) = before {
+            eprintln!(
+                "[jit][adapt-live] key={} types={:?} before={:?} after={:?}",
+                green_key, types, before, values
+            );
         }
         values
     }
