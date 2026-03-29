@@ -4479,9 +4479,6 @@ fn run_compiled_code(
         let gcref = with_gc_runtime(runtime_id, |gc| {
             gc.alloc_nursery_no_collect_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
         });
-        // jitframe_allocate: frame.jf_frame_info = frame_info (skipped —
-        // we don't have frame_info). Write the jf_frame_length field so
-        // copy_nursery_object can compute the varsize total.
         unsafe {
             *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
         }
