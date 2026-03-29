@@ -1007,12 +1007,12 @@ fn maybe_compile_and_run(
     if driver.is_tracing() {
         return None;
     }
-    // warmstate.py:482-509: compiled procedure_token exists.
-    // RPython enters via target_tokens dispatch. Until target_tokens
-    // is implemented, check merge_pc compatibility. Incompatible entries
-    // fall through to counter to allow independent inner loop compilation.
-    // TODO: when target_tokens dispatch is implemented, return None for
-    // incompatible entries (RPython warmstate.py:482 parity).
+    // warmstate.py:482-511: compiled procedure_token exists.
+    // RPython enters the assembler unconditionally — target_tokens
+    // dispatch (compile.py:288) selects the right entry point.
+    // Pyre doesn't have target_tokens yet. For compatible entries,
+    // enter the assembler normally. For incompatible: fall through
+    // to counter path so the inner loop can get its own trace.
     if driver.has_compiled_loop(green_key) {
         let compatible = driver
             .get_compiled_meta(green_key)
@@ -1020,8 +1020,8 @@ fn maybe_compile_and_run(
         if compatible {
             return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
         }
-        // Incompatible entry — fall through to counter so independent
-        // traces at the correct back-edge can be compiled.
+        // Incompatible merge_pc: let counter tick so inner loop
+        // can eventually get its own independent trace.
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
@@ -1287,12 +1287,11 @@ fn execute_assembler(
                             return None;
                         }
                         // RPython compile.py:710: blackhole resume succeeds.
-                        // RPython does NOT invalidate — rd_numb is always
-                        // complete, so re-entry + guard failure is safe.
-                        // Pyre workaround: rd_numb can be incomplete, so
-                        // re-entry hits a different guard whose rd_numb
-                        // fails → SEGFAULT. Invalidate until rd_numb is
-                        // complete for all guards.
+                        // RPython does NOT invalidate — entry stays valid,
+                        // guard failure counter accumulates, eventually
+                        // triggers bridge compilation. Pyre workaround:
+                        // bridge guard rd_numb still incomplete for some
+                        // benchmarks. Invalidate until rd_numb is complete.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
