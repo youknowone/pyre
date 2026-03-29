@@ -6186,7 +6186,8 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 let (driver, _) = crate::driver::driver_pair();
                 let bridge_origin = driver.bridge_origin();
                 if driver.meta_interp().has_compiled_targets(root_key) {
-                    let jump_args = MIFrame::close_loop_args(this, ctx);
+                    // pyjitpl.py:1572: self.pc = orgpc before reached_loop_header
+                    let jump_args = MIFrame::close_loop_args_at(this, ctx, Some(target));
                     let outcome = driver
                         .meta_interp_mut()
                         .compile_trace(root_key, &jump_args, bridge_origin);
@@ -6238,8 +6239,9 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
                 return Ok(None);
             }
+            // pyjitpl.py:1572: self.pc = orgpc sets merge point PC before boxes
             MIFrame::set_next_instr(this, ctx, target);
-            let oprefs = MIFrame::close_loop_args(this, ctx);
+            let oprefs = MIFrame::close_loop_args_at(this, ctx, Some(target));
             Ok(Some(
                 oprefs.into_iter().map(FrontendOp::opref_only).collect(),
             ))
