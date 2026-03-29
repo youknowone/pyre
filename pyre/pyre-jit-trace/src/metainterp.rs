@@ -153,8 +153,6 @@ impl PyreMetaInterp {
                 .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
             top.pc = next_pc;
             let result_idx = sym.stack_only_depth().checked_sub(1);
-            // Root frame: don't pop from owned_concrete_frame — interpreter
-            // drives concrete execution separately. Only sync PC.
             if let Some(ref mut cf) = top.owned_concrete_frame {
                 cf.next_instr = next_pc;
             }
