@@ -526,6 +526,11 @@ impl TraceCtx {
         self.recorder.is_too_long()
     }
 
+    /// Current trace limit (for diagnostics).
+    pub fn trace_limit(&self) -> usize {
+        self.recorder.trace_limit()
+    }
+
     /// The green key hash (loop header PC) for this trace.
     pub fn green_key(&self) -> u64 {
         self.green_key

@@ -360,8 +360,14 @@ impl Trace {
     }
 
     /// Whether the trace has exceeded the maximum allowed length.
+    /// pyjitpl.py:2791: length > warmrunnerstate.trace_limit
     pub fn is_too_long(&self) -> bool {
-        self.ops.len() >= self.trace_limit
+        self.ops.len() > self.trace_limit
+    }
+
+    /// Current trace limit (for diagnostics).
+    pub fn trace_limit(&self) -> usize {
+        self.trace_limit
     }
 
     /// Whether the recorder has been finalized.
@@ -595,9 +601,10 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
         assert!(!rec.is_too_long());
 
-        // Record operations up to the limit
+        // Record operations exceeding the limit
+        // pyjitpl.py:2791: length > trace_limit (strictly greater)
         let mut last = i0;
-        for _ in 0..DEFAULT_TRACE_LIMIT {
+        for _ in 0..=DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
@@ -607,25 +614,25 @@ mod tests {
 
     #[test]
     fn test_is_too_long_boundary() {
-        // Verify exact boundary: DEFAULT_TRACE_LIMIT-1 ops is not too long,
-        // DEFAULT_TRACE_LIMIT ops is too long.
+        // pyjitpl.py:2791: length > warmrunnerstate.trace_limit
+        // Exactly trace_limit ops is NOT too long; trace_limit+1 IS.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for _ in 0..(DEFAULT_TRACE_LIMIT - 1) {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(
             !rec.is_too_long(),
-            "DEFAULT_TRACE_LIMIT - 1 ops should not be too long"
+            "DEFAULT_TRACE_LIMIT ops should not be too long (> not >=)"
         );
 
-        // One more op pushes it to the limit.
+        // One more op exceeds the limit.
         let _over = rec.record_op(OpCode::IntAdd, &[last, i0]);
         assert!(
             rec.is_too_long(),
-            "DEFAULT_TRACE_LIMIT ops should be too long"
+            "DEFAULT_TRACE_LIMIT + 1 ops should be too long"
         );
     }
 
@@ -637,7 +644,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for _ in 0..DEFAULT_TRACE_LIMIT {
+        for _ in 0..=DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());
@@ -1431,7 +1438,7 @@ mod tests {
 
         // Fill rec_b past the limit
         let mut last_b = b0;
-        for _ in 0..DEFAULT_TRACE_LIMIT {
+        for _ in 0..=DEFAULT_TRACE_LIMIT {
             last_b = rec_b.record_op(OpCode::IntAdd, &[last_b, b0]);
         }
         assert!(rec_b.is_too_long());
@@ -1452,13 +1459,14 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let mut last = i0;
-        for idx in 0..(DEFAULT_TRACE_LIMIT / 2) {
+        // (DEFAULT_TRACE_LIMIT / 2) + 1 iterations × 2 ops = DEFAULT_TRACE_LIMIT + 2
+        for idx in 0..=(DEFAULT_TRACE_LIMIT / 2) {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
             let descr = make_fail_descr(idx as u32);
             rec.record_guard(OpCode::GuardTrue, &[last], descr);
         }
 
-        // Each iteration adds 2 ops (IntAdd + GuardTrue), total = DEFAULT_TRACE_LIMIT
+        // pyjitpl.py:2791: length > trace_limit
         assert!(
             rec.is_too_long(),
             "guards should count toward trace limit: num_ops={}",
@@ -1475,20 +1483,20 @@ mod tests {
         assert!(!rec.is_too_long());
         assert_eq!(rec.num_ops(), 0);
 
-        // The retrace recorder can record up to DEFAULT_TRACE_LIMIT ops
+        // pyjitpl.py:2791: length > trace_limit (strictly greater)
         let mut last = OpRef(0);
-        for _ in 0..(DEFAULT_TRACE_LIMIT - 1) {
+        for _ in 0..DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
         }
         assert!(
             !rec.is_too_long(),
-            "retrace with DEFAULT_TRACE_LIMIT-1 ops should not be too long"
+            "retrace with exactly DEFAULT_TRACE_LIMIT ops should not be too long (> not >=)"
         );
 
         let _ = rec.record_op(OpCode::IntAdd, &[last, OpRef(1)]);
         assert!(
             rec.is_too_long(),
-            "retrace with DEFAULT_TRACE_LIMIT ops should be too long"
+            "retrace with DEFAULT_TRACE_LIMIT+1 ops should be too long"
         );
     }
 
@@ -1504,7 +1512,7 @@ mod tests {
 
         let i0 = OpRef(0);
         let mut last = i0;
-        for _ in 0..DEFAULT_TRACE_LIMIT {
+        for _ in 0..=DEFAULT_TRACE_LIMIT {
             last = rec.record_op(OpCode::IntAdd, &[last, i0]);
         }
         assert!(rec.is_too_long());

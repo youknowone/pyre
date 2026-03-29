@@ -885,6 +885,14 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     }
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
                     __sym.trace_started = true;
+                    // pyjitpl.py:2843 blackhole_if_trace_too_long — check
+                    // AFTER executing the step (RPython _interpret loop order).
+                    if __ctx.is_too_long() {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!("[jit] trace too long, aborting");
+                        }
+                        return majit_metainterp::TraceAction::Abort;
+                    }
                     __result
                 });
             }
@@ -921,6 +929,15 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     }
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
                     __sym.trace_started = true;
+                    // pyjitpl.py:2843 blackhole_if_trace_too_long — check
+                    // AFTER executing the step (RPython _interpret loop order).
+                    if __ctx.is_too_long() {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!("[jit] trace too long ({} ops, limit {}), aborting",
+                                __ctx.num_ops(), __ctx.trace_limit());
+                        }
+                        return majit_metainterp::TraceAction::Abort;
+                    }
                     __result
                 });
             }

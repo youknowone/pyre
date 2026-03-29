@@ -972,8 +972,24 @@ where
                 }
                 return action;
             }
+            // pyjitpl.py:2843 blackhole_if_trace_too_long — check AFTER
+            // executing the step, matching RPython's _interpret() loop:
+            //   self.framestack[-1].run_one_step()
+            //   self.blackhole_if_trace_too_long()
+            if ctx.is_too_long() {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] trace_jitcode aborting: trace too long at portal pc={}",
+                        portal_pc
+                    );
+                }
+                sym.abort_portal_op();
+                return TraceAction::Abort;
+            }
         }
 
+        // Post-loop overflow check: the jitcode ran to completion (all
+        // frames empty) but may have exceeded the limit on the last step.
         if ctx.is_too_long() {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -982,7 +998,7 @@ where
                 );
             }
             sym.abort_portal_op();
-            TraceAction::AbortPermanent
+            TraceAction::Abort
         } else {
             sym.commit_portal_op();
             TraceAction::Continue
@@ -991,14 +1007,7 @@ where
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         if self.frames.is_empty() {
-            return if ctx.is_too_long() {
-                if crate::majit_log_enabled() {
-                    eprintln!("[jit] trace_jitcode aborting: trace too long with empty frame");
-                }
-                TraceAction::AbortPermanent
-            } else {
-                TraceAction::Continue
-            };
+            return TraceAction::Continue;
         }
 
         let finished = {
