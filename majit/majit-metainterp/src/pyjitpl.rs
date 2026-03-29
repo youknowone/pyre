@@ -3454,6 +3454,55 @@ impl<M: Clone> MetaInterp<M> {
         Some((result.typed_outputs, &compiled.meta))
     }
 
+    /// Run compiled code and report whether it finished (FINISH) or exited
+    /// via guard failure. Returns (typed_outputs, is_finish, meta).
+    pub fn run_compiled_with_values_detailed(
+        &mut self,
+        green_key: u64,
+        live_values: &[Value],
+    ) -> Option<(Vec<Value>, bool, &M)> {
+        let key = self.resolve_alias(green_key);
+        let compiled = self.compiled_loops.get(&key)?;
+
+        Self::prepare_compiled_run_io();
+        let result = self.backend.execute_token_raw(&compiled.token, live_values);
+        Self::finish_compiled_run_io(result.is_finish);
+
+        let fail_index = result.fail_index;
+        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
+
+        if !result.is_finish {
+            let compiled = self.compiled_loops.get_mut(&key).unwrap();
+            let info = compiled
+                .guard_failures
+                .entry((trace_id, fail_index))
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: self.warm_state.fetch_next_hash(),
+                    compiling: false,
+                    per_value: None,
+                    copied_from: None,
+                });
+            self.warm_state.tick_guard_failure(info.guard_hash);
+
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] guard failure at key={}, guard={}",
+                    green_key, fail_index
+                );
+            }
+
+            self.stats.guard_failures += 1;
+            self.warm_state.log_guard_failure(fail_index);
+
+            if let Some(ref hook) = self.hooks.on_guard_failure {
+                hook(green_key, fail_index, 0);
+            }
+        }
+
+        let compiled = self.compiled_loops.get(&key).unwrap();
+        Some((result.typed_outputs, result.is_finish, &compiled.meta))
+    }
+
     /// Run compiled code through the raw fast path and return detailed exit metadata.
     ///
     /// This is the lightweight counterpart to [`run_compiled_detailed`]: it avoids
