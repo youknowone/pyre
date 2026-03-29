@@ -7223,8 +7223,11 @@ impl JitState for PyreJitState {
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
         // resume.py:1042: bridge inputargs = rebuild_from_resumedata output.
-        // Adjust meta to match fail_arg_types shape, not interpreter frame.
-        // Layout: [frame(Ref), next_instr(Int), valuestackdepth(Int), slots...]
+        // Adjust meta to match fail_arg_types shape so bridge trace inputargs
+        // match the guard's fail_args count. The Cranelift dispatch only
+        // provides fail_args values; bridge code must not expect more.
+        // TODO: when rd_frame_info_list chaining makes full frame available
+        // at dispatch time, remove this truncation.
         if fail_arg_types.len() >= 3 {
             let n_slots = fail_arg_types.len() - 3;
             let nlocals = meta.num_locals.min(n_slots);

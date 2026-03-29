@@ -1632,6 +1632,10 @@ pub fn trace_and_compile_from_bridge(
     // resume.py:1042: for bridge guards, adjust jit_state to match
     // fail_arg_types shape. Don't modify the real frame — only the
     // jit_state that controls trace_meta construction.
+    // resume.py:1042: adjust jit_state to match fail_arg_types shape.
+    // Bridge trace inputargs must match guard fail_args count because
+    // Cranelift dispatch only provides fail_args values.
+    // TODO: remove when rd_frame_info_list makes full frame available.
     let bridge_adjusted_vsd;
     {
         let (driver, _) = crate::eval::driver_pair();
