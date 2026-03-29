@@ -128,8 +128,8 @@ impl UnrollOptimizer {
     /// the body JUMP goes back to the preamble for the next iteration.
     /// This ensures the preamble guard provides loop exit.
     ///
-    /// Returns modified body ops with JUMP retargeted to the preamble.
-    /// RPython keeps the arglist intact and only changes the jump target.
+    /// unroll.py:238-242: redirect the closing JUMP to the preamble entry.
+    /// RPython only changes the descriptor, keeping arglist intact.
     pub fn jump_to_preamble(body_ops: &[Op], preamble_target: &TargetToken) -> Vec<Op> {
         assert!(
             preamble_target.virtual_state.is_none(),

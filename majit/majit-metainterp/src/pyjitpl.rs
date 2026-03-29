@@ -1690,10 +1690,21 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        // After bridge retrace, abort immediately — do NOT create a new
+        // entry that resets retraced_count. Let guard failure counter fire
+        // again; the next bridge attempt uses the SAME compiled entry.
+        if self.retrace_after_bridge {
+            self.retrace_after_bridge = false;
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_loop: abort after bridge retrace (preserve retraced_count)"
+                );
+            }
+            self.abort_trace(false);
+            return CompileOutcome::Aborted;
+        }
         // pyjitpl.py:3162: has_compiled_targets(ptoken) →
         // raise SwitchToBlackhole(ABORT_BAD_LOOP).
-        // RPython switches to blackhole execution (not silent cancel).
-        // Return Aborted so the caller knows to resume via blackhole.
         if let Some(ctx) = self.tracing.as_ref() {
             let gk = ctx.green_key;
             if self.has_compiled_targets(gk) {
@@ -4585,7 +4596,10 @@ impl<M: Clone> MetaInterp<M> {
         match outcome {
             CompileOutcome::Compiled { .. } => BridgeCompileResult::Compiled,
             _ if self.retrace_after_bridge => {
-                self.retrace_after_bridge = false;
+                // Keep retrace_after_bridge=true so compile_loop can
+                // detect bridge retrace and abort early (preserve
+                // retraced_count). pyjitpl.py:3000 partial_trace check
+                // is before 3162 has_compiled_targets.
                 BridgeCompileResult::RetraceNeeded
             }
             _ => BridgeCompileResult::Failed,
@@ -4922,12 +4936,26 @@ impl<M: Clone> MetaInterp<M> {
 
         let result = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            self.backend.compile_bridge(
-                fail_descr,
-                bridge_inputargs,
-                &optimized_ops,
-                &compiled.token,
-            )
+            // compile.py:701-717: bridge failure → blackhole resume.
+            // Catch Cranelift panics to prevent crashing the process.
+            let token = &compiled.token;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backend
+                    .compile_bridge(fail_descr, bridge_inputargs, &optimized_ops, token)
+            })) {
+                Ok(r) => r,
+                Err(_) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] bridge compile_bridge panicked key={} guard={}",
+                            green_key, fail_index
+                        );
+                    }
+                    Err(majit_codegen::BackendError::CompilationFailed(
+                        "Cranelift panic during bridge compilation".to_string(),
+                    ))
+                }
+            }
         };
 
         match result {
