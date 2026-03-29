@@ -1355,40 +1355,15 @@ impl OptVirtualize {
     fn prepare_guard_fail_arg(&mut self, resolved: OpRef, ctx: &mut OptContext) -> OpRef {
         // RPython parity: virtualize.py does NOT force virtuals in fail_args.
         // Virtual fail_args stay as OpRef::NONE placeholders, and
-        // RPython parity: virtualize.py does NOT force virtuals in fail_args.
-        // TODO: When bridge compilation handles always-failing guards,
-        // remove this force and use TAGVIRTUAL lazy materialization instead.
-        // Currently, forcing prevents repeated guard-fail → blackhole cycles
-        // that cause TIMEOUT. The force puts type pointers in frame locals,
-        // but blackhole EXCEPTION → invalidate → interpreter fallback is
-        // faster than repeated blackhole resume cycles.
+        // store_final_boxes_in_guard / number_guard_inline encodes them as
+        // TAGVIRTUAL for lazy materialization at guard failure time.
         let Some(info) = ctx.get_ptr_info(resolved).cloned() else {
             return resolved;
         };
         match info {
-            PtrInfo::Virtual(vinfo) => {
-                if Self::guard_virtual_fields_require_concrete_fallback(
-                    &vinfo.fields,
-                    &vinfo.field_descrs,
-                    ctx,
-                ) {
-                    let forced = self.force_virtual(resolved, ctx);
-                    ctx.get_box_replacement(forced)
-                } else {
-                    resolved
-                }
-            }
-            PtrInfo::VirtualStruct(vinfo) => {
-                if Self::guard_virtual_fields_require_concrete_fallback(
-                    &vinfo.fields,
-                    &vinfo.field_descrs,
-                    ctx,
-                ) {
-                    let forced = self.force_virtual(resolved, ctx);
-                    ctx.get_box_replacement(forced)
-                } else {
-                    resolved
-                }
+            PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) => {
+                // Keep as virtual — TAGVIRTUAL encoding at emit time.
+                resolved
             }
             PtrInfo::Virtualizable(_) => resolved,
             other if other.is_virtual() => {

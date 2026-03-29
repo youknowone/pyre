@@ -970,9 +970,9 @@ impl OptContext {
     pub fn build_active_short_preamble(
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
-        self.active_short_preamble_producer
-            .as_ref()
-            .map(|builder| builder.build_short_preamble_struct())
+        self.active_short_preamble_producer.as_ref().map(|builder| {
+            builder.build_short_preamble_struct(&HashMap::new(), &self.constant_types_for_numbering)
+        })
     }
 
     pub fn take_active_short_preamble_producer(
@@ -986,7 +986,12 @@ impl OptContext {
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
         self.imported_short_preamble_builder
             .as_ref()
-            .map(|builder| builder.build_short_preamble_struct())
+            .map(|builder| {
+                builder.build_short_preamble_struct(
+                    &HashMap::new(),
+                    &self.constant_types_for_numbering,
+                )
+            })
     }
 
     pub fn used_imported_short_aliases(&self) -> Vec<ImportedShortAlias> {
@@ -2109,21 +2114,70 @@ impl OptContext {
         Some(())
     }
 
-    /// executor.py:555: execute_nonspec_const — execute a pure op with
-    /// constant args via CPU dispatch. RPython calls bh_getfield_gc_i/r/f.
-    /// Only safe for GcRef from the constant pool (OpRef >= CONST_BASE) —
-    /// these are program-lifetime stable pointers. Trace-computed GcRefs
-    /// may be stale after GC.
-    /// executor.py:555: execute_nonspec_const — execute a pure op with
-    /// constant args via CPU dispatch. RPython calls bh_getfield_gc_i/r/f.
+    /// executor.py:555 execute_nonspec_const → _execute_arglist →
+    /// do_getfield_gc_i → cpu.bh_getfield_gc_i → llmodel.py:467
+    /// read_int_at_mem → llop.raw_load(TYPE, gcref, ofs).
     ///
-    /// Disabled: direct memory dereference is unsafe even for constant pool
-    /// GcRefs — the optimizer may propagate Ref constants from heap cache
-    /// or PtrInfo that are not in the constant pool. RPython's CPU backend
-    /// has a safe execution path; majit needs an equivalent (e.g., registered
-    /// safe-to-read addresses or GC cooperation).
-    fn execute_nonspec_const(&self, _op: &Op) -> Option<Value> {
-        None
+    /// RPython's constant_fold is ultimately a direct memory read.
+    /// Safety is ensured by protect_speculative_operation (null + type
+    /// check) BEFORE this function is called.
+    ///
+    /// GC safety: Ref constants are rooted on the shadow stack via
+    /// ConstantPool (gcreftracer.py parity). GC updates shadow stack
+    /// entries in place; refresh_from_gc propagates to the HashMap
+    /// before optimization reads them. Constants are live during
+    /// optimization (no Python allocations trigger GC).
+    fn execute_nonspec_const(&self, op: &Op) -> Option<Value> {
+        if !op.opcode.is_getfield() {
+            return None;
+        }
+        // TODO: activate after verifying GcRef root parity for all
+        // constant sources (ConstantPool, preamble export PtrInfo, etc.)
+        return None;
+        #[allow(unreachable_code)]
+        let arg0 = op.arg(0);
+        let resolved = self.get_box_replacement(arg0);
+        if !resolved.is_constant() {
+            return None;
+        }
+        let gcref = match self.get_constant_box(arg0)? {
+            Value::Ref(r) => r,
+            _ => return None,
+        };
+        if gcref.is_null() {
+            return None;
+        }
+        let descr = op.descr.as_ref()?;
+        let fd = descr.as_field_descr()?;
+        let addr = gcref.0 + fd.offset();
+        // llmodel.py:467-478 read_int_at_mem / read_ref_at_mem dispatch.
+        match (fd.field_type(), fd.field_size()) {
+            (majit_ir::Type::Int, 8) => Some(Value::Int(unsafe { *(addr as *const i64) })),
+            (majit_ir::Type::Int, 4) => {
+                if fd.is_field_signed() {
+                    Some(Value::Int(unsafe { *(addr as *const i32) as i64 }))
+                } else {
+                    Some(Value::Int(unsafe { *(addr as *const u32) as i64 }))
+                }
+            }
+            (majit_ir::Type::Int, 2) => {
+                if fd.is_field_signed() {
+                    Some(Value::Int(unsafe { *(addr as *const i16) as i64 }))
+                } else {
+                    Some(Value::Int(unsafe { *(addr as *const u16) as i64 }))
+                }
+            }
+            (majit_ir::Type::Int, 1) => Some(Value::Int(unsafe { *(addr as *const u8) as i64 })),
+            (majit_ir::Type::Float, 8) => {
+                let bits = unsafe { *(addr as *const u64) };
+                Some(Value::Float(f64::from_bits(bits)))
+            }
+            (majit_ir::Type::Ref, _) => {
+                let ptr = unsafe { *(addr as *const usize) };
+                Some(Value::Ref(majit_ir::GcRef(ptr)))
+            }
+            _ => None,
+        }
     }
 
     /// RPython box.type parity: find the result type of the operation

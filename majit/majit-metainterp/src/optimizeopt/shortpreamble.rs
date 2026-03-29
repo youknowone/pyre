@@ -80,6 +80,12 @@ pub struct ShortPreamble {
     /// The exported virtual state at the loop header (from the preamble's exit).
     /// Used to check bridge compatibility and generate additional guards.
     pub exported_state: Option<VirtualState>,
+    /// RPython parity: constant values referenced by short preamble ops.
+    /// In RPython, short preamble ops embed Const objects (GC-tracked) that
+    /// survive across compilations. In pyre, OpRef indices reference the
+    /// loop's constant pool. This map captures (value, type) for each
+    /// constant OpRef so bridges can re-register them in their own pool.
+    pub constants: HashMap<u32, (i64, majit_ir::Type)>,
 }
 
 impl ShortPreamble {
@@ -91,6 +97,7 @@ impl ShortPreamble {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
+            constants: HashMap::new(),
         }
     }
 
@@ -280,6 +287,7 @@ impl CollectedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
+            constants: HashMap::new(),
         }
     }
 }
@@ -833,6 +841,7 @@ impl CollectedExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
+            constants: HashMap::new(),
         }
     }
 }
@@ -1047,12 +1056,24 @@ fn build_short_preamble_struct_from_ops(
     ops: &[Op],
     used_boxes: &[OpRef],
     jump_args: &[OpRef],
+    loop_constants: &HashMap<u32, i64>,
+    loop_constant_types: &HashMap<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let short_inputarg_positions: HashMap<OpRef, usize> = short_inputargs
         .iter()
         .enumerate()
         .map(|(idx, &arg)| (arg, idx))
         .collect();
+    // Collect all OpRefs defined by the short preamble ops (as results).
+    let mut defined_by_ops: HashSet<u32> = HashSet::new();
+    for ia in short_inputargs {
+        defined_by_ops.insert(ia.0);
+    }
+    for op in ops {
+        if !op.pos.is_none() {
+            defined_by_ops.insert(op.pos.0);
+        }
+    }
     let entries = ops
         .iter()
         .cloned()
@@ -1091,12 +1112,56 @@ fn build_short_preamble_struct_from_ops(
             }
         })
         .collect();
+    // RPython parity: capture constant values referenced by short preamble ops.
+    // In RPython, Const objects are stored in op args and are GC-tracked. Here,
+    // we snapshot the loop's constant pool entries for any OpRef referenced by
+    // short preamble ops that isn't defined by the ops themselves.
+    let mut constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
+    for op in ops {
+        for &arg in &op.args {
+            if !defined_by_ops.contains(&arg.0) {
+                if let Some(&val) = loop_constants.get(&arg.0) {
+                    let tp = loop_constant_types
+                        .get(&arg.0)
+                        .copied()
+                        .unwrap_or(majit_ir::Type::Int);
+                    constants.insert(arg.0, (val, tp));
+                }
+            }
+        }
+        if let Some(ref fa) = op.fail_args {
+            for &arg in fa {
+                if !defined_by_ops.contains(&arg.0) {
+                    if let Some(&val) = loop_constants.get(&arg.0) {
+                        let tp = loop_constant_types
+                            .get(&arg.0)
+                            .copied()
+                            .unwrap_or(majit_ir::Type::Int);
+                        constants.insert(arg.0, (val, tp));
+                    }
+                }
+            }
+        }
+    }
+    // Also check jump_args for constants
+    for &arg in jump_args {
+        if !defined_by_ops.contains(&arg.0) {
+            if let Some(&val) = loop_constants.get(&arg.0) {
+                let tp = loop_constant_types
+                    .get(&arg.0)
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int);
+                constants.insert(arg.0, (val, tp));
+            }
+        }
+    }
     ShortPreamble {
         ops: entries,
         inputargs: short_inputargs.to_vec(),
         used_boxes: used_boxes.to_vec(),
         jump_args: jump_args.to_vec(),
         exported_state: None,
+        constants,
     }
 }
 
@@ -1203,7 +1268,11 @@ impl ShortPreambleBuilder {
         result
     }
 
-    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
+    pub fn build_short_preamble_struct(
+        &self,
+        loop_constants: &HashMap<u32, i64>,
+        loop_constant_types: &HashMap<u32, majit_ir::Type>,
+    ) -> ShortPreamble {
         let jump_args: Vec<OpRef> = self
             .state
             .short_preamble_jump
@@ -1215,6 +1284,8 @@ impl ShortPreambleBuilder {
             &self.state.short,
             &self.state.used_boxes,
             &jump_args,
+            loop_constants,
+            loop_constant_types,
         )
     }
 
@@ -1355,7 +1426,11 @@ impl ExtendedShortPreambleBuilder {
         &self.short_inputargs
     }
 
-    pub fn build_short_preamble_struct(&self) -> ShortPreamble {
+    pub fn build_short_preamble_struct(
+        &self,
+        loop_constants: &HashMap<u32, i64>,
+        loop_constant_types: &HashMap<u32, majit_ir::Type>,
+    ) -> ShortPreamble {
         let mut ops = self.base_short_ops.clone();
         ops.extend(self.extra_state.short.iter().cloned());
         let inputargs = if self.label_args.is_empty() {
@@ -1368,6 +1443,8 @@ impl ExtendedShortPreambleBuilder {
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
+            loop_constants,
+            loop_constant_types,
         )
     }
 
@@ -1530,6 +1607,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         used_boxes: Vec::new(),
         jump_args: Vec::new(),
         exported_state: None,
+        constants: HashMap::new(),
     }
 }
 
@@ -1576,7 +1654,7 @@ pub fn build_short_preamble_from_exported_boxes(
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
-    builder.build_short_preamble_struct()
+    builder.build_short_preamble_struct(&HashMap::new(), &HashMap::new())
 }
 
 #[cfg(test)]

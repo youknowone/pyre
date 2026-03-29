@@ -866,7 +866,12 @@ impl OpCode {
     pub fn is_getfield(self) -> bool {
         matches!(
             self,
-            OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
+            OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldGcPureI
+                | OpCode::GetfieldGcPureR
+                | OpCode::GetfieldGcPureF
         )
     }
 
@@ -3073,8 +3078,10 @@ mod tests {
         assert!(OpCode::GetfieldGcI.is_getfield());
         assert!(OpCode::GetfieldGcR.is_getfield());
         assert!(OpCode::GetfieldGcF.is_getfield());
+        assert!(OpCode::GetfieldGcPureI.is_getfield());
+        assert!(OpCode::GetfieldGcPureR.is_getfield());
+        assert!(OpCode::GetfieldGcPureF.is_getfield());
         assert!(!OpCode::GetfieldRawI.is_getfield());
-        assert!(!OpCode::GetfieldGcPureI.is_getfield());
         assert!(!OpCode::IntAdd.is_getfield());
     }
 

@@ -1622,6 +1622,13 @@ pub fn trace_and_compile_from_bridge(
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
+
+    // NOTE: guard resume_pc pointing to LOAD_CONST + RETURN_VALUE does NOT
+    // mean the guard is a loop-exit guard. It means the blackhole resume
+    // path leads to function return. RPython handles this correctly via
+    // blackhole resume → interpreter runs remaining code → natural return.
+    // Direct FINISH bridges are WRONG here — they skip the remaining loop
+    // body that the blackhole should execute.
     // resume.py:1042: for bridge guards, adjust jit_state to match
     // fail_arg_types shape. Don't modify the real frame — only the
     // jit_state that controls trace_meta construction.

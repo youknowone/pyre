@@ -1,19 +1,28 @@
-//! No direct RPython equivalent — Rust-specific constant deduplication
-//! for OpRef indices (RPython manages constants implicitly in Trace).
+//! Constant pool for trace recording with GC root tracking.
+//!
+//! RPython manages constants implicitly in Trace — ConstPtr boxes are
+//! GC-managed objects, so GC can update them when objects move.
+//!
+//! majit stores Ref constants as raw i64 in a HashMap, invisible to GC.
+//! To achieve RPython parity, Ref constants are rooted on the shadow
+//! stack (gcreftracer.py:GCREFTRACER parity). GC's walk_roots updates
+//! shadow stack entries in place; refresh_from_gc copies updated values
+//! back to the HashMap before consumption.
 
 use std::collections::HashMap;
 
-use majit_ir::{OpRef, Type};
+use majit_gc::shadow_stack;
+use majit_ir::{GcRef, OpRef, Type};
 
 /// Constant pool for trace recording.
 ///
 /// Manages the mapping from OpRef (>= 10_000) to i64 values.
-/// Automatically deduplicates identical values.
+/// Deduplicates identical values within the same type.
 ///
-/// RPython manages constants implicitly in Trace with full type info.
-/// pyre's ConstantPool stores types separately so the optimizer and
-/// backend can distinguish Ref constants (function pointers, object
-/// addresses) from Int constants.
+/// gcreftracer.py parity: Ref-typed constants are pushed onto the GC
+/// shadow stack so that GC can trace and update them if objects move.
+/// On consumption (into_inner / snapshot), the HashMap is refreshed
+/// from the shadow stack to pick up any GC-updated pointers.
 pub struct ConstantPool {
     constants: HashMap<u32, i64>,
     /// Type of each constant OpRef. Populated by `get_or_insert_typed`.
@@ -23,6 +32,12 @@ pub struct ConstantPool {
     /// for resume data encoding without triggering GC root tracking.
     numbering_type_overrides: HashMap<u32, Type>,
     next_ref: u32,
+    /// gcreftracer.py parity: (OpRef key, shadow stack index) for each
+    /// rooted Ref constant. walk_roots updates shadow stack entries;
+    /// refresh_from_gc copies values back to `constants`.
+    rooted_refs: Vec<(u32, usize)>,
+    /// Shadow stack depth at pool creation. release_roots pops to here.
+    shadow_stack_base: usize,
 }
 
 impl ConstantPool {
@@ -32,15 +47,22 @@ impl ConstantPool {
             constant_types: HashMap::new(),
             numbering_type_overrides: HashMap::new(),
             next_ref: 10_000,
+            rooted_refs: Vec::new(),
+            shadow_stack_base: shadow_stack::depth(),
         }
     }
 
     /// Get or create a constant OpRef for a given i64 value.
+    /// Only matches Int-typed or untyped entries (not Ref/Float).
     /// Returns the same OpRef for the same value (deduplication).
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         for (&idx, &v) in &self.constants {
             if v == value {
-                return OpRef(idx);
+                // Skip Ref-typed entries — Int/Ref must not alias.
+                match self.constant_types.get(&idx) {
+                    Some(&Type::Ref) | Some(&Type::Float) => continue,
+                    _ => return OpRef(idx),
+                }
             }
         }
         let opref = OpRef(self.next_ref);
@@ -50,9 +72,33 @@ impl ConstantPool {
     }
 
     /// Get or create a typed constant OpRef.
+    /// gcreftracer.py parity: Ref constants are rooted on the shadow
+    /// stack so GC can update them when objects move.
     pub fn get_or_insert_typed(&mut self, value: i64, tp: Type) -> OpRef {
-        let opref = self.get_or_insert(value);
+        // Refresh Ref constants from shadow stack before dedup —
+        // GC may have moved objects, changing their addresses.
+        if tp == Type::Ref {
+            self.refresh_from_gc();
+        }
+        // Type-aware dedup: only match entries with matching type.
+        for (&idx, &v) in &self.constants {
+            if v == value {
+                match self.constant_types.get(&idx) {
+                    Some(&existing_tp) if existing_tp == tp => return OpRef(idx),
+                    None if tp == Type::Int => return OpRef(idx),
+                    _ => continue,
+                }
+            }
+        }
+        let opref = OpRef(self.next_ref);
+        self.next_ref += 1;
+        self.constants.insert(opref.0, value);
         self.constant_types.insert(opref.0, tp);
+        // Root non-null Ref constants on shadow stack.
+        if tp == Type::Ref && value != 0 {
+            let ss_idx = shadow_stack::push(GcRef(value as usize));
+            self.rooted_refs.push((opref.0, ss_idx));
+        }
         opref
     }
 
@@ -72,14 +118,38 @@ impl ConstantPool {
         self.numbering_type_overrides.insert(opref.0, tp);
     }
 
-    /// Consume the pool and return the constants map and type map.
-    pub fn into_inner(self) -> HashMap<u32, i64> {
-        self.constants
+    /// Update HashMap from shadow stack — GC may have moved Ref objects.
+    /// gcreftracer.py:gcrefs_trace parity.
+    fn refresh_from_gc(&mut self) {
+        for &(opref_key, ss_idx) in &self.rooted_refs {
+            let current = shadow_stack::get(ss_idx);
+            self.constants.insert(opref_key, current.0 as i64);
+        }
+    }
+
+    /// Release shadow stack roots.
+    fn release_roots(&mut self) {
+        if !self.rooted_refs.is_empty() {
+            shadow_stack::pop_to(self.shadow_stack_base);
+            self.rooted_refs.clear();
+        }
+    }
+
+    /// Consume the pool and return the constants map.
+    pub fn into_inner(mut self) -> HashMap<u32, i64> {
+        self.refresh_from_gc();
+        let constants = std::mem::take(&mut self.constants);
+        self.release_roots();
+        constants
     }
 
     /// Consume the pool, returning both value and type maps.
-    pub fn into_inner_with_types(self) -> (HashMap<u32, i64>, HashMap<u32, Type>) {
-        (self.constants, self.constant_types)
+    pub fn into_inner_with_types(mut self) -> (HashMap<u32, i64>, HashMap<u32, Type>) {
+        self.refresh_from_gc();
+        let constants = std::mem::take(&mut self.constants);
+        let types = std::mem::take(&mut self.constant_types);
+        self.release_roots();
+        (constants, types)
     }
 
     /// Get numbering type overrides (for resume data only, not Cranelift).
@@ -98,9 +168,9 @@ impl ConstantPool {
     }
 
     /// Clone the constants map without consuming the pool.
-    /// Used by compile_trace which needs a copy for compilation
-    /// while keeping the pool alive for potential continued tracing.
-    pub fn snapshot(&self) -> HashMap<u32, i64> {
+    /// Refreshes from GC first to pick up moved Ref pointers.
+    pub fn snapshot(&mut self) -> HashMap<u32, i64> {
+        self.refresh_from_gc();
         self.constants.clone()
     }
 
@@ -113,5 +183,11 @@ impl ConstantPool {
 impl Default for ConstantPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ConstantPool {
+    fn drop(&mut self) {
+        self.release_roots();
     }
 }
