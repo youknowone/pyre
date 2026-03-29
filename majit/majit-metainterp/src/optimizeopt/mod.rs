@@ -262,6 +262,8 @@ pub struct OptContext {
     pub snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    /// resume.py:123,186: per-snapshot Const values for TAGCONST/TAGINT.
+    pub snapshot_consts: HashMap<i32, Vec<Option<(i64, majit_ir::Type)>>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
@@ -436,6 +438,7 @@ impl OptContext {
             snapshot_frame_sizes: HashMap::new(),
             snapshot_vable_boxes: HashMap::new(),
             snapshot_frame_pcs: HashMap::new(),
+            snapshot_consts: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
             last_guard_idx: None,
         }
@@ -485,6 +488,7 @@ impl OptContext {
             snapshot_frame_sizes: HashMap::new(),
             snapshot_vable_boxes: HashMap::new(),
             snapshot_frame_pcs: HashMap::new(),
+            snapshot_consts: HashMap::new(),
             constant_types_for_numbering: HashMap::new(),
             last_guard_idx: None,
         }

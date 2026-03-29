@@ -2627,7 +2627,7 @@ impl MIFrame {
         let stack_only = sym.stack_only_depth();
         let opref_to_tag = |opref: OpRef| -> majit_trace::recorder::SnapshotTagged {
             if opref.is_none() {
-                majit_trace::recorder::SnapshotTagged::Const(0)
+                majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
             } else {
                 majit_trace::recorder::SnapshotTagged::Box(opref.0)
             }
@@ -2656,7 +2656,7 @@ impl MIFrame {
             .iter()
             .map(|&(opref, _concrete)| {
                 if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0)
+                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
                 } else {
                     majit_trace::recorder::SnapshotTagged::Box(opref.0)
                 }
@@ -2675,7 +2675,7 @@ impl MIFrame {
             .iter()
             .map(|&opref| {
                 if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0)
+                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
                 } else {
                     majit_trace::recorder::SnapshotTagged::Box(opref.0)
                 }
