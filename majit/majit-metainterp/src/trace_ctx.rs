@@ -520,6 +520,12 @@ impl TraceCtx {
         self.call_int_typed(func_ptr, args, &arg_types)
     }
 
+    /// Record a FINISH op with a single result value.
+    /// pyjitpl.py:1637 history.record1(rop.FINISH, ..., descr=token)
+    pub fn record_finish(&mut self, result: OpRef, _tp: Type) {
+        self.recorder.record_op(OpCode::Finish, &[result]);
+    }
+
     /// Whether the trace has exceeded the maximum allowed length.
     pub fn is_too_long(&self) -> bool {
         self.recorder.is_too_long()

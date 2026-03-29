@@ -3260,6 +3260,289 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// compile.py:216-249 compile_simple_loop parity.
+    ///
+    /// Compiles the trace with simple optimizer (no preamble peeling),
+    /// prepends a LABEL (via front_target_tokens) for bridge attachment.
+    /// Called from _create_segmented_trace_and_blackhole when
+    /// force_finish_trace is active and trace reaches 80% of limit.
+    pub fn compile_simple_loop(&mut self, meta: M) {
+        let vable_config = self.current_virtualizable_optimizer_config();
+        self.forced_virtualizable = None;
+        self.force_finish_trace = false;
+        let mut ctx = match self.tracing.take() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        ctx.apply_replacements();
+        let green_key = ctx.green_key;
+
+        let mut recorder = ctx.recorder;
+        // The trace already has GUARD_ALWAYS_FAILS + FINISH ops recorded
+        // by jitdriver.rs segmenting. Mark recorder as finalized so
+        // get_trace() succeeds.
+        recorder.mark_finalized();
+        let trace = recorder.get_trace();
+        let trace_snapshots = trace.snapshots.clone();
+
+        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
+
+        let trace_ops = compile::fold_box_into_create_frame(
+            trace.ops.clone(),
+            &mut constants,
+            &self.raw_int_box_helpers,
+            &self.create_frame_raw_map,
+        );
+        let trace_ops = compile::elide_create_frame_for_call_assembler(
+            trace_ops,
+            &constants,
+            &self.create_frame_raw_map,
+        );
+
+        if crate::majit_log_enabled() {
+            eprintln!("--- simple loop trace (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+        }
+
+        let num_ops_before = trace_ops.len();
+        let num_trace_inputargs = trace.inputargs.len();
+
+        // Simple optimizer — no unrolling (compile.py:222-226 SimpleCompileData).
+        let mut optimizer = if let Some(config) = vable_config {
+            Optimizer::default_pipeline_with_virtualizable(config)
+        } else {
+            Optimizer::default_pipeline()
+        };
+        optimizer.constant_types = constant_types.clone();
+        optimizer.numbering_type_overrides = numbering_overrides;
+
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
+        optimizer.snapshot_boxes = snapshot_map;
+        optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
+        optimizer.snapshot_vable_boxes = snapshot_vable_map;
+        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+
+        let mut updated_constant_types = constant_types.clone();
+        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = optimizer.optimize_with_constants_and_inputs(
+                &trace_ops,
+                &mut constants,
+                num_trace_inputargs,
+            );
+            for (k, v) in &optimizer.constant_types {
+                updated_constant_types.entry(*k).or_insert(*v);
+            }
+            result
+        }));
+        constant_types = updated_constant_types;
+        let optimized_ops = match optimize_result {
+            Ok(ops) => ops,
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] compile_simple_loop: InvalidLoop at key={}",
+                            green_key
+                        );
+                    }
+                }
+                self.warm_state.abort_tracing(green_key, false);
+                self.warm_state.reset_function_counts();
+                return;
+            }
+        };
+
+        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
+
+        let num_ops_after = optimized_ops.len();
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_simple_loop: key={}, ops_before={}, ops_after={}",
+                green_key, num_ops_before, num_ops_after
+            );
+            eprintln!("--- simple loop trace (after opt) ---");
+            eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
+        }
+
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+
+        // Allocate token and compile.
+        let token_num = self.warm_state.alloc_token_number();
+        let mut token = JitCellToken::new(token_num);
+        let trace_id = self.alloc_trace_id();
+        self.backend.set_next_trace_id(trace_id);
+        self.backend.set_next_header_pc(green_key);
+
+        let final_num_inputs = optimizer.final_num_inputs();
+        let mut inputargs = trace.inputargs.clone();
+        while inputargs.len() < final_num_inputs {
+            inputargs.push(majit_ir::InputArg {
+                tp: majit_ir::Type::Int,
+                index: inputargs.len() as u32,
+            });
+        }
+
+        let compiled_constants = constants.clone();
+        let compiled_constant_types = constant_types.clone();
+        self.backend.set_constants(constants);
+        token.green_key = green_key;
+
+        match self
+            .backend
+            .compile_loop(&inputargs, &optimized_ops, &mut token)
+        {
+            Ok(_) => {
+                let (resume_data, guard_op_indices, mut exit_layouts) =
+                    compile::build_guard_metadata(
+                        &inputargs,
+                        &optimized_ops,
+                        green_key,
+                        &compiled_constants,
+                        &compiled_constant_types,
+                    );
+                let mut terminal_exit_layouts =
+                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
+                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                }
+                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                    compile::merge_backend_terminal_exit_layouts(
+                        &mut terminal_exit_layouts,
+                        &backend_layouts,
+                    );
+                }
+                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let mut resume_data = resume_data;
+                compile::enrich_guard_resume_layouts_for_trace(
+                    &mut resume_data,
+                    &mut exit_layouts,
+                    trace_id,
+                    &trace.inputargs,
+                    trace_info.as_ref(),
+                );
+                compile::patch_backend_guard_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut exit_layouts,
+                );
+                compile::patch_backend_terminal_recovery_layouts_for_trace(
+                    &mut self.backend,
+                    &token,
+                    trace_id,
+                    &mut terminal_exit_layouts,
+                );
+                let per_guard_knowledge = {
+                    let pos_to_fail: HashMap<u32, u32> = guard_op_indices
+                        .iter()
+                        .filter_map(|(&fi, &op_idx)| {
+                            optimized_ops.get(op_idx).map(|op| (op.pos.0, fi))
+                        })
+                        .collect();
+                    let mut result: HashMap<u32, OptimizerKnowledge> = HashMap::new();
+                    for (guard_pos, knowledge) in &optimizer.per_guard_knowledge {
+                        if let Some(&fi) = pos_to_fail.get(&guard_pos.0) {
+                            result.insert(fi, knowledge.clone());
+                        }
+                    }
+                    let end_knowledge = optimizer
+                        .final_ctx
+                        .as_ref()
+                        .map(|c| optimizer.serialize_optimizer_knowledge(c))
+                        .unwrap_or_default();
+                    for (_, k) in result.iter_mut() {
+                        if k.known_classes.is_empty() {
+                            k.known_classes = end_knowledge.known_classes.clone();
+                        }
+                        if k.loopinvariant_results.is_empty() {
+                            k.loopinvariant_results = end_knowledge.loopinvariant_results.clone();
+                        }
+                    }
+                    for &fi in guard_op_indices.keys() {
+                        result.entry(fi).or_insert_with(|| end_knowledge.clone());
+                    }
+                    result
+                };
+                let mut traces = HashMap::new();
+                traces.insert(
+                    trace_id,
+                    CompiledTrace {
+                        snapshots: Vec::new(),
+                        inputargs: trace.inputargs.clone(),
+                        resume_data,
+                        ops: optimized_ops,
+                        constants: compiled_constants,
+                        constant_types: compiled_constant_types,
+                        guard_op_indices,
+                        exit_layouts,
+                        terminal_exit_layouts,
+                        optimizer_knowledge: per_guard_knowledge,
+                        jitcode: None,
+                    },
+                );
+                // compile.py:236-245 parity: create TargetToken with
+                // front_target_tokens so has_compiled_targets() returns true.
+                // This is the LABEL that bridges can close back to.
+                let target_token = crate::optimizeopt::unroll::TargetToken::new_preamble(token_num);
+                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    previous_tokens.push(old_entry.token);
+                    previous_tokens.extend(old_entry.previous_tokens);
+                }
+                self.compiled_loops.insert(
+                    green_key,
+                    CompiledEntry {
+                        token,
+                        num_inputs: inputargs.len(),
+                        meta,
+                        front_target_tokens: vec![target_token],
+                        retraced_count: 0,
+                        root_trace_id: trace_id,
+                        guard_failures: HashMap::new(),
+                        traces,
+                        previous_tokens,
+                    },
+                );
+                // pyjitpl.py:1662 attach_procedure_to_interp
+                let install_num = self.warm_state.alloc_token_number();
+                let install_token = JitCellToken::new(install_num);
+                self.warm_state
+                    .attach_procedure_to_interp(green_key, install_token);
+                self.warm_state.reset_function_counts();
+                self.stats.loops_compiled += 1;
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_simple_loop: compiled segmented trace key={}, trace_id={}",
+                        green_key, trace_id
+                    );
+                }
+                if let Some(ref hook) = self.hooks.on_compile_loop {
+                    hook(green_key, num_ops_before, num_ops_after);
+                }
+            }
+            Err(e) => {
+                self.stats.loops_aborted += 1;
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_simple_loop: compile FAILED key={}: {:?}",
+                        green_key, e
+                    );
+                }
+                self.warm_state.abort_tracing(green_key, false);
+                self.warm_state.reset_function_counts();
+            }
+        }
+    }
+
     /// Resolve cross-loop cut alias: inner_key → outer_key.
     ///
     /// If the key has its own direct entry, use it — alias only applies

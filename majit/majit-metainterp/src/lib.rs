@@ -104,6 +104,11 @@ pub enum TraceAction {
         finish_args: Vec<OpRef>,
         finish_arg_types: Vec<Type>,
     },
+    /// Close and compile a segmented loop (force_finish_trace).
+    /// pyjitpl.py:1622 _create_segmented_trace_and_blackhole parity.
+    /// The trace has GUARD_ALWAYS_FAILS + unreachable FINISH appended.
+    /// compile_simple_loop inserts a LABEL at entry for bridge attachment.
+    SegmentedLoop,
     /// Abort the current trace (recoverable — may retry later).
     Abort,
     /// Abort the current trace permanently (never trace this location again).

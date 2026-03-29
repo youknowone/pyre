@@ -526,27 +526,38 @@ impl<S: JitState> JitDriver<S> {
         // We emit GUARD_ALWAYS_FAILS + unreachable FINISH, then let the
         // normal finish_and_compile path handle compilation.
         // TODO: compile_simple_loop with Label for bridge closure parity.
+        // pyjitpl.py:1618 force_finish_trace segmenting check.
+        // When force_finish_trace is set and trace reaches 80% of limit,
+        // _create_segmented_trace_and_blackhole: emit GUARD_ALWAYS_FAILS +
+        // unreachable FINISH, then compile_simple_loop with Label for
+        // bridge closure.
         if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
             if let Some(ctx) = self.meta.trace_ctx() {
                 let limit = ctx.trace_limit();
                 let length = ctx.num_ops();
                 if length > limit * 4 / 5 {
-                    // 1. GUARD_ALWAYS_FAILS — always fails at runtime.
-                    ctx.record_guard(majit_ir::OpCode::GuardAlwaysFails, &[], 0);
-                    // 2. Unreachable FINISH (dead code after the guard).
-                    //    RPython uses exception_descr; we use a dummy Int(0).
+                    // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
+                    // Record with inputargs as fail_args for bridge recovery.
+                    let num_inputs = ctx.num_inputs();
+                    let inputarg_oprefs: Vec<OpRef> = (0..num_inputs as u32).map(OpRef).collect();
+                    let inputarg_types = ctx.inputarg_types();
+                    ctx.record_guard_typed_with_fail_args(
+                        majit_ir::OpCode::GuardAlwaysFails,
+                        &[],
+                        inputarg_types,
+                        &inputarg_oprefs,
+                    );
+                    // pyjitpl.py:1637 unreachable FINISH (dead code after guard).
                     let dummy = ctx.const_int(0);
+                    ctx.record_finish(dummy, majit_ir::Type::Int);
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] force_finish_trace: segmenting at {} ops (limit {})",
                             length, limit
                         );
                     }
-                    // 3/4. Finish → compile, then blackhole back to interpreter.
-                    action = TraceAction::Finish {
-                        finish_args: vec![dummy],
-                        finish_arg_types: vec![majit_ir::Type::Int],
-                    };
+                    // pyjitpl.py:1658 compile_simple_loop
+                    action = TraceAction::SegmentedLoop;
                 }
             }
         }
@@ -761,6 +772,14 @@ impl<S: JitState> JitDriver<S> {
                 let meta = self.trace_meta.take().unwrap();
                 self.meta
                     .finish_and_compile(&finish_args, finish_arg_types, meta);
+                self.sym = None;
+            }
+            TraceAction::SegmentedLoop => {
+                // pyjitpl.py:1658 compile_simple_loop(patch_jumpop_at_end=False)
+                // Compile the segmented trace with a LABEL at entry for
+                // bridge closure. Then return to interpreter (blackhole).
+                let meta = self.trace_meta.take().unwrap();
+                self.meta.compile_simple_loop(meta);
                 self.sym = None;
             }
             TraceAction::Abort => {
