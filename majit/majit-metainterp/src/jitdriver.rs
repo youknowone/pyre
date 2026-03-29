@@ -515,6 +515,42 @@ impl<S: JitState> JitDriver<S> {
             trace_fn(ctx, sym)
         }; // ctx and sym references dropped here
 
+        // pyjitpl.py:1618 force_finish_trace segmenting check.
+        //
+        // pyjitpl.py:1622 _create_segmented_trace_and_blackhole:
+        //   1. generate_guard(GUARD_ALWAYS_FAILS)
+        //   2. unreachable FINISH(exception_descr)
+        //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
+        //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
+        //
+        // We emit GUARD_ALWAYS_FAILS + unreachable FINISH, then let the
+        // normal finish_and_compile path handle compilation.
+        // TODO: compile_simple_loop with Label for bridge closure parity.
+        if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
+            if let Some(ctx) = self.meta.trace_ctx() {
+                let limit = ctx.trace_limit();
+                let length = ctx.num_ops();
+                if length > limit * 4 / 5 {
+                    // 1. GUARD_ALWAYS_FAILS — always fails at runtime.
+                    ctx.record_guard(majit_ir::OpCode::GuardAlwaysFails, &[], 0);
+                    // 2. Unreachable FINISH (dead code after the guard).
+                    //    RPython uses exception_descr; we use a dummy Int(0).
+                    let dummy = ctx.const_int(0);
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] force_finish_trace: segmenting at {} ops (limit {})",
+                            length, limit
+                        );
+                    }
+                    // 3/4. Finish → compile, then blackhole back to interpreter.
+                    action = TraceAction::Finish {
+                        finish_args: vec![dummy],
+                        finish_arg_types: vec![majit_ir::Type::Int],
+                    };
+                }
+            }
+        }
+
         // Phase 2: handle trace result with full access to self
         match action {
             TraceAction::Continue => {}
@@ -730,6 +766,23 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::Abort => {
                 if crate::majit_log_enabled() && self.bridge_info.is_some() {
                     eprintln!("[bridge] Abort during bridge tracing");
+                }
+                // pyjitpl.py:2793-2806 blackhole_if_trace_too_long parity.
+                if let Some(ctx) = self.meta.trace_ctx() {
+                    if ctx.is_too_long() {
+                        let green_key = ctx.green_key();
+                        // pyjitpl.py:2793: find_biggest_function — if an
+                        // inlined function caused the bloat, disable just
+                        // that function instead of segmenting the loop.
+                        if let Some(huge_fn_key) = ctx.find_biggest_inline_function() {
+                            self.meta
+                                .warm_state
+                                .disable_noninlinable_function(huge_fn_key);
+                        } else {
+                            // pyjitpl.py:2806: no inlinable function found.
+                            self.meta.warm_state.prepare_trace_segmenting(green_key);
+                        }
+                    }
                 }
                 self.meta.abort_trace(false);
                 self.sym = None;
@@ -969,14 +1022,18 @@ impl<S: JitState> JitDriver<S> {
 
             pre_run();
 
-            if let Some((new_values, run_meta)) =
-                self.meta.run_compiled_with_values(green_key, &live_values)
+            if let Some((new_values, is_finish, run_meta)) = self
+                .meta
+                .run_compiled_with_values_detailed(green_key, &live_values)
             {
                 let run_meta = run_meta.clone();
                 state.restore_values(&run_meta, &new_values);
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
                 self.sync_after(state, &run_meta, run_descriptor.as_ref());
-                return true;
+                // RPython: guard failure → blackhole → interpreter resumes
+                // at the *current* pc (not the back-edge target). Return false
+                // so the caller does not jump to target_pc.
+                return is_finish;
             }
             return false;
         }

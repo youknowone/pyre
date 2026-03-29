@@ -196,6 +196,10 @@ const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 /// rlib/jit.py:595 retrace_limit = 0
 const DEFAULT_RETRACE_LIMIT: u32 = 0;
 
+/// pyjitpl.py:2806 prepare_trace_segmenting parity: after this many
+/// consecutive too-long aborts, disable tracing for the green key.
+const MAX_TRACE_TOO_LONG_ABORTS: u32 = 3;
+
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
@@ -564,22 +568,36 @@ impl WarmEnterState {
     pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
         if let Some(cell) = self.cells.get_mut(&green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
-            if disable_noninlinable_function {
-                cell.state = BaseJitCellState::NotHot;
-            } else {
-                cell.abort_count += 1;
-                cell.state = BaseJitCellState::NotHot;
-            }
+            cell.abort_count += 1;
+            cell.state = BaseJitCellState::NotHot;
         }
 
         if disable_noninlinable_function {
-            // RPython only marks the location DONT_TRACE_HERE for explicit
-            // "disable_noninlinable_function" style aborts.
             self.disable_noninlinable_function(green_key_hash);
         }
         if let Some(log) = &mut self.jitlog {
             log.log_abort();
         }
+    }
+
+    /// pyjitpl.py:2809 prepare_trace_segmenting — called when a trace is
+    /// too long and no inlinable function was found. Marks the green key
+    /// for force-finish on the next tracing attempt.
+    ///
+    /// RPython flow:
+    /// 1. trace_next_iteration(greenkey)     — boost counter
+    /// 2. mark_force_finish_tracing(greenkey) — set JC_FORCE_FINISH
+    /// 3. dont_trace_here(greenkey)           — set JC_DONT_TRACE_HERE
+    ///
+    /// Next tracing run sees FORCE_FINISH, segments the trace at 80% of
+    /// trace_limit via _create_segmented_trace_and_blackhole (GUARD_ALWAYS_FAILS).
+    pub fn prepare_trace_segmenting(&mut self, green_key_hash: u64) {
+        // warmstate.py:2819: trace_next_iteration
+        self.trace_next_iteration(green_key_hash);
+        // warmstate.py:2820: mark_force_finish_tracing
+        self.mark_force_finish_tracing(green_key_hash);
+        // warmstate.py:2822: dont_trace_here
+        self.disable_noninlinable_function(green_key_hash);
     }
 
     /// Install a compiled loop token for a green key.
