@@ -2995,6 +2995,33 @@ fn call_assembler_fast_path_heap(
 
     release_force_token(handle);
 
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        // resume.py:1312 parity: materialize virtuals before blackhole.
+        let mut bh_outputs = outputs.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            fail_descr.fail_arg_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+    }
+
     // RPython assembler_call_helper: force_fn receives the callee frame.
     // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
     // but force_fn needs the callee frame which is inputs[0].
@@ -3066,8 +3093,19 @@ extern "C" fn call_assembler_shim(
     // the guard failure point instead of re-executing from scratch.
     let fail_index = descr.fail_index();
     let fail_types = descr.fail_arg_types();
-    let fail_values: Vec<i64> = (0..fail_types.len())
-        .map(|i| get_int_from_deadframe(&frame, i).unwrap_or(0))
+    let fail_values: Vec<i64> = fail_types
+        .iter()
+        .enumerate()
+        .map(|(i, tp)| match tp {
+            Type::Int => get_int_from_deadframe(&frame, i).unwrap_or(0),
+            Type::Ref => get_ref_from_deadframe(&frame, i)
+                .map(|value| value.0 as i64)
+                .unwrap_or(0),
+            Type::Float => get_float_from_deadframe(&frame, i)
+                .map(|value| value.to_bits() as i64)
+                .unwrap_or(0),
+            Type::Void => 0,
+        })
         .collect();
     if std::env::var_os("MAJIT_LOG").is_some() {
         eprintln!(
@@ -3077,12 +3115,25 @@ extern "C" fn call_assembler_shim(
         );
     }
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        // resume.py:1312 parity: materialize virtuals before blackhole.
+        let mut bh_outputs = fail_values;
+        let recovery = target
+            .fail_descrs
+            .get(fail_index as usize)
+            .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            fail_types,
+            recovery.as_ref(),
+            fail_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
             target.header_pc,
             target.trace_id,
             fail_index,
-            fail_values.as_ptr(),
-            fail_values.len(),
+            bh_outputs.as_ptr(),
+            num_outputs,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -3573,6 +3624,9 @@ fn build_ref_root_slots(
     for input in inputargs {
         if input.tp == Type::Ref && !force_tokens.contains(&input.index) && seen.insert(input.index)
         {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!("[ref-root] inputarg idx={} tp={:?}", input.index, input.tp);
+            }
             slots.push((input.index, slots.len()));
         }
     }
@@ -3581,6 +3635,12 @@ fn build_ref_root_slots(
         if op.result_type() == Type::Ref {
             let vi = op_var_index(op, op_idx, inputargs.len()) as u32;
             if !force_tokens.contains(&vi) && seen.insert(vi) {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[ref-root] op idx={} opcode={:?} vi={}",
+                        op_idx, op.opcode, vi
+                    );
+                }
                 slots.push((vi, slots.len()));
             }
         }
@@ -4511,6 +4571,16 @@ fn run_compiled_code(
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let frame_depth = depth + num_ref_roots;
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[jf-alloc] frame_depth={} depth={} max_output={} inputs={} ref_roots={}",
+            frame_depth,
+            depth,
+            max_output_slots,
+            inputs.len(),
+            num_ref_roots
+        );
+    }
     let jf_total = header_words + frame_depth;
     let payload_bytes = jf_total * 8;
 
@@ -5028,13 +5098,14 @@ impl CraneliftBackend {
                     let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
-                        let num_outputs = bridge_descr.fail_arg_types().len();
-                        current_inputs.clear();
-                        current_inputs.reserve(num_outputs);
-                        for i in 0..num_outputs {
-                            current_inputs
-                                .push(get_int_from_deadframe(&bridge_frame, i).unwrap_or(0));
-                        }
+                        // RPython llmodel.py: cpu.get_{int,ref,float}_value by type
+                        current_inputs = raw_values_from_deadframe_typed(
+                            &bridge_frame,
+                            bridge_descr.fail_arg_types(),
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!("bridge loop-reentry deadframe decode failed: {err}")
+                        });
                         continue;
                     }
                     return bridge_frame;
@@ -5275,6 +5346,14 @@ impl CraneliftBackend {
         // are live at each GC point (regalloc.py get_gcmap).
         let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
         let per_call_gcmap = compute_per_call_gcmap(max_output_slots, ref_root_slots.len());
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[codegen] per_call_gcmap={:#x} max_output={} ref_roots={}",
+                per_call_gcmap,
+                max_output_slots,
+                ref_root_slots.len()
+            );
+        }
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
 
         let label_indices: Vec<usize> = ops
@@ -6545,6 +6624,8 @@ impl CraneliftBackend {
                             runtime_finish_descr,
                             unknown_sentinel,
                         );
+                        // assembler.py:call_assembler() parity:
+                        // CMP + conditional branch: null/unknown → shim, else → direct call.
                         let cant_direct = builder.ins().bor(is_null, finish_unknown);
                         let direct_call_block = builder.create_block();
                         let shim_fallback_block = builder.create_block();
@@ -6556,12 +6637,12 @@ impl CraneliftBackend {
                             &[],
                         );
 
+                        // ── Direct call to compiled code ──
+                        // assembler.py:_call_assembler_emit_call
                         builder.switch_to_block(direct_call_block);
                         builder.seal_block(direct_call_block);
 
-                        // Save input[0] (frame_ptr) before call — callee
-                        // overwrites args_slot with fail_args on guard exit.
-                        // Needed by force_fn/shim fallback (cold path only).
+                        // Save input[0] for shim
                         let saved_frame_ptr = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
@@ -6612,7 +6693,10 @@ impl CraneliftBackend {
                             &[],
                         );
 
-                        // ── Path B: finish — load result from jf_frame[0] ──
+                        // ── Path B: finish — load result from frame[0] ──
+                        // assembler.py:2303 _call_assembler_load_result:
+                        //   MOV eax, [eax + ofs]  — load from callee's frame array[0]
+                        // args_ptr IS the callee's jitframe (passed as argument).
                         builder.switch_to_block(direct_finish_block);
                         builder.seal_block(direct_finish_block);
                         let direct_result = builder.ins().load(
@@ -6665,6 +6749,7 @@ impl CraneliftBackend {
                                 &[args_ptr],
                             );
                             let _bridge_jf = builder.inst_results(bridge_call)[0];
+                            // load result from shared frame (args_ptr)
                             let bridge_result = builder.ins().load(
                                 cl_types::I64,
                                 MemFlags::trusted(),
@@ -9327,24 +9412,21 @@ fn collect_guards(
             }
         }
         let recovery_layout = Some(recovery_layout);
-        // get_gcmap (regalloc.py:1092-1108) parity:
-        // val = loc.position + JITFRAME_FIXED_SIZE  (#1106)
+        // Guard gcmap: bit i ⟺ fail_args[i] is Ref, stored at jf_frame[i].
+        // No JITFRAME_FIXED_SIZE offset needed because fail_args start at
+        // jf_frame[0] (not jf_frame[JITFRAME_FIXED_SIZE]).
         let gcmap = {
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
-                    // TEMPORARY WORKAROUND: RPython never puts constants in
-                    // fail_args (regalloc.py:1206 asserts this). Once the
-                    // consumer switchover (number()+finish() producing
-                    // rd_numb+liveboxes) is active, constants will be in
-                    // rd_consts instead, and this check becomes unnecessary.
+                    // Skip constants in fail_args (regalloc.py:1206).
                     let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
                     if constants.contains_key(&opref_id) {
-                        continue; // constant — not a GC root
+                        continue;
                     }
-                    let val = i as u32 + JITFRAME_FIXED_SIZE;
-                    if val < 64 {
-                        bits |= 1u64 << val;
+                    // Guard gcmap: bit = slot index (fail_args at jf_frame[i]).
+                    if (i as u32) < 64 {
+                        bits |= 1u64 << i;
                     }
                 }
             }
