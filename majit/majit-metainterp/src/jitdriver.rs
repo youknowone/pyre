@@ -767,7 +767,7 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() && self.bridge_info.is_some() {
                     eprintln!("[bridge] Abort during bridge tracing");
                 }
-                // pyjitpl.py:2793-2806 blackhole_if_trace_too_long parity.
+                // pyjitpl.py:2788-2807 blackhole_if_trace_too_long parity.
                 if let Some(ctx) = self.meta.trace_ctx() {
                     if ctx.is_too_long() {
                         let green_key = ctx.green_key();
@@ -775,9 +775,13 @@ impl<S: JitState> JitDriver<S> {
                         // inlined function caused the bloat, disable just
                         // that function instead of segmenting the loop.
                         if let Some(huge_fn_key) = ctx.find_biggest_inline_function() {
+                            // pyjitpl.py:2797: disable the huge callee.
                             self.meta
                                 .warm_state
                                 .disable_noninlinable_function(huge_fn_key);
+                            // pyjitpl.py:2804: boost the current loop so it
+                            // retraces soon (without the disabled callee).
+                            self.meta.warm_state.trace_next_iteration(green_key);
                         } else {
                             // pyjitpl.py:2806: no inlinable function found.
                             self.meta.warm_state.prepare_trace_segmenting(green_key);
@@ -993,31 +997,36 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // warmstate.py:482-501: compiled procedure_token → assembler entry.
+        //
+        // compile.py:711 / blackhole.py:1782: guard failure should go
+        // through resume_in_blackhole to continue from resume_pc. The
+        // blackhole infrastructure exists (run_compiled_with_blackhole_
+        // fallback_keyed) but aheui's JitState::restore_guard_failure_*
+        // does not yet correctly reconstruct mid-loop state from resume
+        // data. Until that is fixed, guard failure falls through to the
+        // interpreter which re-executes the full iteration.
         if self.meta.has_compiled_loop(green_key) {
             let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
-            let live_values = {
-                if !state.is_compatible(&compiled_meta) {
-                    self.meta.invalidate_loop(green_key);
-                    return false;
-                }
-                if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
-                    return false;
-                }
-                let live_values = state.extract_live_values(&compiled_meta);
-                if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-                    return false;
-                }
-                let Some(live_values) = self.extend_compiled_live_values(
-                    green_key,
-                    state,
-                    &compiled_meta,
-                    descriptor.as_ref(),
-                    live_values,
-                ) else {
-                    return false;
-                };
-                live_values
+            if !state.is_compatible(&compiled_meta) {
+                self.meta.invalidate_loop(green_key);
+                return false;
+            }
+            if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
+                return false;
+            }
+            let live_values = state.extract_live_values(&compiled_meta);
+            if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
+                return false;
+            }
+            let Some(live_values) = self.extend_compiled_live_values(
+                green_key,
+                state,
+                &compiled_meta,
+                descriptor.as_ref(),
+                live_values,
+            ) else {
+                return false;
             };
 
             pre_run();
@@ -1026,14 +1035,17 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .run_compiled_with_values_detailed(green_key, &live_values)
             {
-                let run_meta = run_meta.clone();
-                state.restore_values(&run_meta, &new_values);
-                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                self.sync_after(state, &run_meta, run_descriptor.as_ref());
-                // RPython: guard failure → blackhole → interpreter resumes
-                // at the *current* pc (not the back-edge target). Return false
-                // so the caller does not jump to target_pc.
-                return is_finish;
+                if is_finish {
+                    let run_meta = run_meta.clone();
+                    state.restore_values(&run_meta, &new_values);
+                    let run_descriptor = self.driver_descriptor_for(state, &run_meta);
+                    self.sync_after(state, &run_meta, run_descriptor.as_ref());
+                    return true;
+                }
+                // Guard failure: don't restore mid-loop state. The
+                // interpreter re-executes the full iteration. I/O from
+                // compiled code is committed via io_buffer_commit.
+                return false;
             }
             return false;
         }
