@@ -193,6 +193,10 @@ impl ResumeDataLoopMemo {
     }
 
     fn getconst_ref(&mut self, val: i64) -> i16 {
+        // resume.py:174-176: null ref → NULLREF
+        if val == 0 {
+            return NULLREF;
+        }
         if let Some(&t) = self.refs.get(&val) {
             return t;
         }

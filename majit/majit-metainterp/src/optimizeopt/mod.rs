@@ -262,8 +262,6 @@ pub struct OptContext {
     pub snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
-    /// resume.py:123,186: per-snapshot Const values for TAGCONST/TAGINT.
-    pub snapshot_consts: HashMap<i32, Vec<Option<(i64, majit_ir::Type)>>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
@@ -438,7 +436,7 @@ impl OptContext {
             snapshot_frame_sizes: HashMap::new(),
             snapshot_vable_boxes: HashMap::new(),
             snapshot_frame_pcs: HashMap::new(),
-            snapshot_consts: HashMap::new(),
+
             constant_types_for_numbering: HashMap::new(),
             last_guard_idx: None,
         }
@@ -488,7 +486,7 @@ impl OptContext {
             snapshot_frame_sizes: HashMap::new(),
             snapshot_vable_boxes: HashMap::new(),
             snapshot_frame_pcs: HashMap::new(),
-            snapshot_consts: HashMap::new(),
+
             constant_types_for_numbering: HashMap::new(),
             last_guard_idx: None,
         }
@@ -1628,18 +1626,10 @@ impl OptContext {
                 repl
             }
             fn is_const(&self, opref: OpRef) -> bool {
-                if self.ctx.is_constant(opref) {
-                    // RPython parity: null Ref (GcRef(0)) is not a valid
-                    // constant for resume data — would produce null Ref
-                    // at runtime via TAGCONST(0, Ref).
-                    if let Some(Value::Ref(r)) = self.ctx.get_constant(opref) {
-                        if r.0 == 0 {
-                            return false;
-                        }
-                    }
-                    return true;
-                }
-                false
+                // resume.py:204: isinstance(box, Const)
+                // RPython: null Ref IS a Const (ConstPtr(null)).
+                // getconst_ref(0) returns NULLREF.
+                self.ctx.is_constant(opref)
             }
             fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
                 if let Some(val) = self.ctx.get_constant(opref) {
