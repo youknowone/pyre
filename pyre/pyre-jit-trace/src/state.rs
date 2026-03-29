@@ -697,8 +697,9 @@ fn root_trace_green_key(state: &mut MIFrame) -> u64 {
     state.with_ctx(|_, ctx| ctx.root_green_key())
 }
 
+/// pyjitpl.py:3514 find_biggest_function
 fn biggest_inline_trace_key(state: &mut MIFrame) -> Option<u64> {
-    state.with_ctx(|_, ctx| ctx.find_biggest_inline_function())
+    state.with_ctx(|_, ctx| ctx.find_biggest_function())
 }
 
 fn note_root_trace_too_long(green_key: u64) {

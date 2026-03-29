@@ -522,10 +522,6 @@ impl<S: JitState> JitDriver<S> {
         //   2. unreachable FINISH(exception_descr)
         //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
         //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-        //
-        // We emit GUARD_ALWAYS_FAILS + unreachable FINISH, then let the
-        // normal finish_and_compile path handle compilation.
-        // TODO: compile_simple_loop with Label for bridge closure parity.
         // pyjitpl.py:1618 force_finish_trace segmenting check.
         // When force_finish_trace is set and trace reaches 80% of limit,
         // _create_segmented_trace_and_blackhole: emit GUARD_ALWAYS_FAILS +
@@ -775,17 +771,21 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
             }
             TraceAction::SegmentedLoop => {
-                // pyjitpl.py:1658 compile_simple_loop(patch_jumpop_at_end=False)
+                // pyjitpl.py:1658-1663 _create_segmented_trace_and_blackhole:
+                //   target_token = compile.compile_simple_loop(...)
+                //   warmstate.attach_procedure_to_interp(greenkey, token)
                 // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-                //
-                // Compile the segmented trace with a LABEL at entry for
-                // bridge closure, then clean up tracing state. The
-                // interpreter resumes normally (= blackhole transition).
                 let meta = self.trace_meta.take().unwrap();
-                self.meta.compile_simple_loop(meta);
-                // compile_simple_loop already called tracing.take() and
-                // abort_tracing internally. Ensure all driver state is
-                // cleared for clean blackhole transition.
+                if let Some(green_key) = self.meta.compile_simple_loop(meta) {
+                    // pyjitpl.py:1662-1663
+                    let install_num = self.meta.warm_state.alloc_token_number();
+                    let install_token = majit_codegen::JitCellToken::new(install_num);
+                    self.meta
+                        .warm_state
+                        .attach_procedure_to_interp(green_key, install_token);
+                }
+                self.meta.warm_state.reset_function_counts();
+                // Blackhole transition: clear all driver tracing state.
                 self.sym = None;
                 self.trace_meta = None;
                 self.bridge_info = None;
@@ -801,7 +801,7 @@ impl<S: JitState> JitDriver<S> {
                         // pyjitpl.py:2793: find_biggest_function — if an
                         // inlined function caused the bloat, disable just
                         // that function instead of segmenting the loop.
-                        if let Some(huge_fn_key) = ctx.find_biggest_inline_function() {
+                        if let Some(huge_fn_key) = ctx.find_biggest_function() {
                             // pyjitpl.py:2797: disable the huge callee.
                             self.meta
                                 .warm_state
@@ -1093,30 +1093,53 @@ impl<S: JitState> JitDriver<S> {
                 &raw_values,
             );
 
-            // compile.py:711 resume_in_blackhole parity: RPython decodes
-            // resume data (rd_numb + rd_consts) to reconstruct each
-            // frame's local variables. This requires the full blackhole
-            // interpreter, which is not yet available in the proc-macro
-            // path. For now, do NOT restore mid-loop state — fall back
-            // to the loop header (target_pc). I/O from compiled code is
-            // already committed via io_buffer_commit.
+            // compile.py:711 resume_in_blackhole parity.
             //
-            // TODO: decode rd_numb resume data for mid-loop resume.
-            let resume_pc = target_pc;
+            // Guard fail_args are in extract_live order:
+            //   [stacksize, pool_ptr, selected, selected_ref, ..., pc]
+            // The last value is the bytecode pc at the guard point.
+            let num_inputs = self.meta.compiled_num_inputs(green_key);
+            let guard_resume_pc = if raw_values.len() > num_inputs {
+                // Extra trailing value = bytecode pc appended by jitcode.
+                raw_values[raw_values.len() - 1] as usize
+            } else {
+                // GUARD_ALWAYS_FAILS: fail_args = inputargs only (no pc).
+                target_pc
+            };
+
+            // RPython resume_in_blackhole decodes rd_numb to
+            // reconstruct each frame's local variables — a complete
+            // independent snapshot of interpreter state. In aheui,
+            // compiled code mutates storages in-place (shared mutable
+            // reference), so the storage contents at guard failure are
+            // the ACTUAL current storage state. Restoring only scalar
+            // fields (stacksize, selected) from fail_args would
+            // desynchronise them from the already-mutated storage.
+            //
+            // Until rd_numb-style value-level resume is available, the
+            // interpreter re-enters at target_pc (loop header) where it
+            // re-reads stacksize/selected from the live storage. bridge
+            // tracing receives the real guard_resume_pc.
 
             if should_bridge {
                 let bridge_ok = self.start_bridge_tracing(
-                    green_key, trace_id, fail_index, state, env, resume_pc, target_pc,
+                    green_key,
+                    trace_id,
+                    fail_index,
+                    state,
+                    env,
+                    guard_resume_pc,
+                    target_pc,
                 );
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
-                        green_key, trace_id, fail_index, resume_pc, bridge_ok
+                        green_key, trace_id, fail_index, guard_resume_pc, bridge_ok
                     );
                 }
             }
 
-            return Some(resume_pc);
+            return Some(target_pc);
         }
 
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
