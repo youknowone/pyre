@@ -2116,7 +2116,7 @@ impl Optimizer {
         retraced_count: u32,
         retrace_limit: u32,
         bridge_knowledge: Option<&OptimizerKnowledge>,
-        loop_num_inputs: Option<usize>,
+        _loop_num_inputs: Option<usize>,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
@@ -2182,22 +2182,28 @@ impl Optimizer {
             .map(|&a| ctx.get_box_replacement(a))
             .collect();
 
-        // unroll.py:207: jump_to_existing_trace(force_boxes=False)
-        // RPython iterates ALL target_tokens; preamble is skipped
-        // via virtual_state is None check (unroll.py:327-328).
+        // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
+        // RPython iterates ALL target_tokens; preamble (virtual_state=None)
+        // is skipped inside jump_to_existing_trace (unroll.py:327-328).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
-        let vs = opt_unroll.jump_to_existing_trace(
+        let vs = match Self::try_jump_to_existing_trace(
+            &opt_unroll,
             &jump_args,
-            None,
             front_target_tokens,
             self,
             &mut ctx,
             false,
-            Some(&pre_opt_jump_args),
-        );
+            &pre_opt_jump_args,
+        ) {
+            Ok(vs) => vs,
+            // unroll.py:209-210: except InvalidLoop → jump_to_preamble
+            Err(()) => {
+                return Self::do_jump_to_preamble(&optimized_ops, front_target_tokens);
+            }
+        };
 
+        // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
-            // unroll.py:212-213: matched → JUMP redirected
             let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
             result.extend(ctx.new_operations.drain(..));
             return (result, false);
@@ -2208,46 +2214,95 @@ impl Optimizer {
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit] Retracing ({}/{})", retraced_count + 1, retrace_limit);
             }
-            // unroll.py:231-236: export_state for new specialization.
-            // The caller uses self.exported_loop_state (populated by
-            // optimize_with_constants_and_inputs) to create a new target_token.
             return (optimized_ops, true);
         }
 
-        // unroll.py:220-230: retrace limit reached, try force_boxes=true.
+        // unroll.py:220-227: retrace limit reached, try force_boxes=True
         ctx.clear_newoperations();
-        let vs2 = opt_unroll.jump_to_existing_trace(
+        let vs2 = match Self::try_jump_to_existing_trace(
+            &opt_unroll,
             &jump_args,
-            None,
             front_target_tokens,
             self,
             &mut ctx,
-            true, // force_boxes
-            Some(&pre_opt_jump_args),
-        );
+            true,
+            &pre_opt_jump_args,
+        ) {
+            Ok(vs) => vs,
+            // unroll.py:224-225: except InvalidLoop: pass
+            // vs (from first attempt) is still not None → falls through
+            // to jump_to_preamble below.
+            Err(()) => vs,
+        };
 
+        // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
-            // unroll.py:226-227: matched with forced boxes
             let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
             result.extend(ctx.new_operations.drain(..));
             return (result, false);
         }
 
-        // unroll.py:228-229: jump_to_preamble fallback.
+        // unroll.py:228-229: jump_to_preamble fallback
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!("[jit] Retrace count reached, jumping to preamble");
         }
+        Self::do_jump_to_preamble(&optimized_ops, front_target_tokens)
+    }
+
+    /// Wrapper: call jump_to_existing_trace, catch only InvalidLoop panics.
+    /// Returns Ok(vs) on normal return, Err(()) on InvalidLoop.
+    /// Non-InvalidLoop panics are re-raised.
+    fn try_jump_to_existing_trace(
+        opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
+        jump_args: &[OpRef],
+        front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        optimizer: &mut Self,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+        pre_opt_jump_args: &[OpRef],
+    ) -> Result<Option<crate::optimizeopt::virtualstate::VirtualState>, ()> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            opt_unroll.jump_to_existing_trace(
+                jump_args,
+                None,
+                front_target_tokens,
+                optimizer,
+                ctx,
+                force_boxes,
+                Some(pre_opt_jump_args),
+            )
+        })) {
+            Ok(vs) => Ok(vs),
+            Err(payload) => {
+                if payload
+                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .is_some()
+                {
+                    Err(())
+                } else {
+                    // Not InvalidLoop — re-raise
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    /// unroll.py:238-242: jump_to_preamble fallback (extract helper).
+    fn do_jump_to_preamble(
+        optimized_ops: &[Op],
+        front_target_tokens: &[crate::optimizeopt::unroll::TargetToken],
+    ) -> (Vec<Op>, bool) {
         if let Some(preamble_token) = front_target_tokens.first() {
-            return (
+            (
                 crate::optimizeopt::unroll::UnrollOptimizer::jump_to_preamble(
-                    &optimized_ops,
+                    optimized_ops,
                     preamble_token,
                 ),
                 false,
-            );
+            )
+        } else {
+            (optimized_ops.to_vec(), false)
         }
-
-        (optimized_ops, false)
     }
 
     fn collect_exported_int_bounds(

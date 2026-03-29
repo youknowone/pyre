@@ -115,14 +115,11 @@ impl UnrollOptimizer {
         optimizer.optimize(ops)
     }
 
-    /// unroll.py:238-242: jump_to_preamble — redirect body JUMP to preamble.
+    /// unroll.py:238-242: jump_to_preamble(cell_token, jump_op).
     ///
-    /// When jump_to_existing_trace fails (no compatible target_token),
-    /// the body JUMP goes back to the preamble for the next iteration.
-    /// This ensures the preamble guard provides loop exit.
-    ///
-    /// unroll.py:238-242: redirect the closing JUMP to the preamble entry.
-    /// RPython only changes the descriptor, keeping arglist intact.
+    /// Redirect the closing JUMP to the preamble entry token
+    /// (target_tokens[0], virtual_state=None). Only changes the
+    /// descriptor, keeping arglist intact — RPython parity.
     pub fn jump_to_preamble(body_ops: &[Op], preamble_target: &TargetToken) -> Vec<Op> {
         assert!(
             preamble_target.virtual_state.is_none(),
@@ -1596,17 +1593,22 @@ impl OptUnroll {
         runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         optimizer.disable_guard_replacement();
-        let result = self.jump_to_existing_trace_impl(
-            jump_args,
-            current_label_args,
-            target_tokens,
-            optimizer,
-            ctx,
-            force_boxes,
-            runtime_boxes,
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.jump_to_existing_trace_impl(
+                jump_args,
+                current_label_args,
+                target_tokens,
+                optimizer,
+                ctx,
+                force_boxes,
+                runtime_boxes,
+            )
+        }));
         optimizer.enable_guard_replacement();
-        result
+        match result {
+            Ok(vs) => vs,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn jump_to_existing_trace_impl(
