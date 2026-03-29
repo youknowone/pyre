@@ -776,11 +776,19 @@ impl<S: JitState> JitDriver<S> {
             }
             TraceAction::SegmentedLoop => {
                 // pyjitpl.py:1658 compile_simple_loop(patch_jumpop_at_end=False)
+                // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
+                //
                 // Compile the segmented trace with a LABEL at entry for
-                // bridge closure. Then return to interpreter (blackhole).
+                // bridge closure, then clean up tracing state. The
+                // interpreter resumes normally (= blackhole transition).
                 let meta = self.trace_meta.take().unwrap();
                 self.meta.compile_simple_loop(meta);
+                // compile_simple_loop already called tracing.take() and
+                // abort_tracing internally. Ensure all driver state is
+                // cleared for clean blackhole transition.
                 self.sym = None;
+                self.trace_meta = None;
+                self.bridge_info = None;
             }
             TraceAction::Abort => {
                 if crate::majit_log_enabled() && self.bridge_info.is_some() {
@@ -843,13 +851,15 @@ impl<S: JitState> JitDriver<S> {
     ///     }
     /// }
     /// ```
+    /// Returns `Some(resume_pc)` when compiled code ran (FINISH or guard
+    /// failure with blackhole resume). Returns `None` otherwise.
     pub fn back_edge(
         &mut self,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> bool {
+    ) -> Option<usize> {
         self.back_edge_internal(target_pc as u64, None, target_pc, state, env, pre_run)
     }
 
@@ -860,12 +870,10 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> bool {
+    ) -> Option<usize> {
         self.back_edge_internal(green_key, None, target_pc, state, env, pre_run)
     }
 
-    #[cold]
-    #[inline(never)]
     #[cold]
     #[inline(never)]
     pub fn back_edge_structured(
@@ -875,7 +883,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> bool {
+    ) -> Option<usize> {
         let key = green_key.hash_u64();
         self.back_edge_internal(key, Some(green_key), target_pc, state, env, pre_run)
     }
@@ -997,11 +1005,17 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> Result<bool, &'static str> {
+    ) -> Result<Option<usize>, &'static str> {
         let green_key = D::green_key(green_values)?;
         Ok(self.back_edge_structured(green_key, target_pc, state, env, pre_run))
     }
 
+    /// RPython warmstate.py:482-501 / compile.py:711 parity.
+    ///
+    /// Returns `Some(pc)` when compiled code ran:
+    /// - FINISH → `Some(target_pc)` (loop completed, re-enter at header)
+    /// - Guard failure → `Some(resume_pc)` (resume from failure point)
+    /// Returns `None` when no compiled code exists or tracing started.
     fn back_edge_internal(
         &mut self,
         green_key: u64,
@@ -1010,33 +1024,24 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> bool {
+    ) -> Option<usize> {
         if self.meta.is_tracing() || !state.can_trace() {
-            return false;
+            return None;
         }
 
-        // warmstate.py:482-501: compiled procedure_token → assembler entry.
-        //
-        // compile.py:711 / blackhole.py:1782: guard failure should go
-        // through resume_in_blackhole to continue from resume_pc. The
-        // blackhole infrastructure exists (run_compiled_with_blackhole_
-        // fallback_keyed) but aheui's JitState::restore_guard_failure_*
-        // does not yet correctly reconstruct mid-loop state from resume
-        // data. Until that is fixed, guard failure falls through to the
-        // interpreter which re-executes the full iteration.
         if self.meta.has_compiled_loop(green_key) {
             let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
-                return false;
+                return None;
             }
             if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
-                return false;
+                return None;
             }
             let live_values = state.extract_live_values(&compiled_meta);
             if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
-                return false;
+                return None;
             }
             let Some(live_values) = self.extend_compiled_live_values(
                 green_key,
@@ -1045,32 +1050,77 @@ impl<S: JitState> JitDriver<S> {
                 descriptor.as_ref(),
                 live_values,
             ) else {
-                return false;
+                return None;
             };
 
             pre_run();
 
-            if let Some((new_values, is_finish, run_meta)) = self
+            let Some(result) = self
                 .meta
-                .run_compiled_with_values_detailed(green_key, &live_values)
-            {
-                if is_finish {
-                    let run_meta = run_meta.clone();
-                    state.restore_values(&run_meta, &new_values);
-                    let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                    self.sync_after(state, &run_meta, run_descriptor.as_ref());
-                    return true;
-                }
-                // Guard failure: don't restore mid-loop state. The
-                // interpreter re-executes the full iteration. I/O from
-                // compiled code is committed via io_buffer_commit.
-                return false;
+                .run_compiled_detailed_with_values(green_key, &live_values)
+            else {
+                return None;
+            };
+
+            if result.is_finish {
+                let run_meta = result.meta.clone();
+                state.restore_values(&run_meta, &result.typed_values);
+                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
+                self.sync_after(state, &run_meta, run_descriptor.as_ref());
+                return Some(target_pc);
             }
-            return false;
+
+            // compile.py:711 guard failure → resume_in_blackhole parity.
+            // Restore interpreter state from guard's fail_args and resume
+            // at the guard's resume_pc (mid-loop), not the loop header.
+            let fail_index = result.fail_index;
+            let trace_id = result.trace_id;
+            let exit_layout = result.exit_layout.clone();
+            let raw_values = result.values.clone();
+            let exit_meta = result.meta.clone();
+            drop(result);
+
+            // must_compile tick for bridge threshold counting.
+            let guard_loop_key = if exit_layout.rd_loop_token != 0 {
+                exit_layout.rd_loop_token
+            } else {
+                green_key
+            };
+            let (should_bridge, _owning_key) = self.meta.must_compile_with_values(
+                guard_loop_key,
+                trace_id,
+                fail_index,
+                &raw_values,
+            );
+
+            // compile.py:711 resume_in_blackhole parity: RPython decodes
+            // resume data (rd_numb + rd_consts) to reconstruct each
+            // frame's local variables. This requires the full blackhole
+            // interpreter, which is not yet available in the proc-macro
+            // path. For now, do NOT restore mid-loop state — fall back
+            // to the loop header (target_pc). I/O from compiled code is
+            // already committed via io_buffer_commit.
+            //
+            // TODO: decode rd_numb resume data for mid-loop resume.
+            let resume_pc = target_pc;
+
+            if should_bridge {
+                let bridge_ok = self.start_bridge_tracing(
+                    green_key, trace_id, fail_index, state, env, resume_pc, target_pc,
+                );
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
+                        green_key, trace_id, fail_index, resume_pc, bridge_ok
+                    );
+                }
+            }
+
+            return Some(resume_pc);
         }
 
         self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
-        false
+        None
     }
 
     fn back_edge_or_run_compiled_internal(
@@ -2325,8 +2375,9 @@ impl<S: JitState> JitDriver<S> {
                 return None;
             }
             let green_key = GreenKey::new(green_values.to_vec());
-            let ran = self.back_edge_structured(green_key, target_pc, state, env, pre_run);
-            return ran.then_some(target_pc);
+            // Preserve resume_pc from back_edge_structured (guard
+            // failure returns the guard's pc, not the loop header).
+            return self.back_edge_structured(green_key, target_pc, state, env, pre_run);
         }
 
         let meta = self.meta.get_compiled_meta(key_hash)?;

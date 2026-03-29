@@ -1997,6 +1997,37 @@ impl OptContext {
         // resume.py:447,450-451: patch and store.
         numb_state.patch(1, liveboxes.len() as i32);
         op.store_final_boxes(liveboxes);
+        // Consumer switchover: recompute fail_arg_types on final liveboxes.
+        // resume.py:447 — after store_final_boxes, liveboxes = fail_args.
+        if virtual_slots.is_empty() {
+            if let Some(ref fa) = op.fail_args {
+                op.fail_arg_types = Some(
+                    fa.iter()
+                        .map(|opref| {
+                            if opref.is_none() {
+                                majit_ir::Type::Ref
+                            } else if self.is_constant(*opref) {
+                                let tp = self.constant_types_for_numbering.get(&opref.0).copied();
+                                match self.get_constant(*opref) {
+                                    Some(majit_ir::Value::Ref(_)) => majit_ir::Type::Ref,
+                                    Some(majit_ir::Value::Float(_)) => majit_ir::Type::Float,
+                                    Some(majit_ir::Value::Int(_)) => {
+                                        tp.unwrap_or(majit_ir::Type::Int)
+                                    }
+                                    _ => majit_ir::Type::Int,
+                                }
+                            } else {
+                                self.new_operations
+                                    .iter()
+                                    .find(|o| o.pos == *opref)
+                                    .map(|o| o.result_type())
+                                    .unwrap_or(majit_ir::Type::Int)
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
         // Store rd_virtuals_info (indexed by vidx, RPython parity).
         // rd_virtuals_info is the authoritative source for virtual
         // materialization, indexed consistently with TAGVIRTUAL in rd_numb.

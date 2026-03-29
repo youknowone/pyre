@@ -1200,20 +1200,23 @@ fn rewrite_body(
                                 let sel = sel_expr.as_ref().expect("storage selector expr");
                                 quote! { #stacksize_expr = #pool.get(#sel).len() as i32; }
                             };
+                            // compile.py:711 parity: back_edge returns
+                            // Some(resume_pc) on guard failure (blackhole
+                            // resume) or FINISH (loop header re-entry).
                             let back_edge: TokenStream = if let Some(green_key) =
                                 green_key_expr(target_expr, &greens)
                             {
                                 quote! {
-                                    if #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
-                                        #pc_expr = #target_expr;
+                                    if let Some(__resume_pc) = #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
+                                        #pc_expr = __resume_pc;
                                         #stacksize_update
                                         continue;
                                     }
                                 }
                             } else {
                                 quote! {
-                                    if #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
-                                        #pc_expr = #target_expr;
+                                    if let Some(__resume_pc) = #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr) {
+                                        #pc_expr = __resume_pc;
                                         #stacksize_update
                                         continue;
                                     }
