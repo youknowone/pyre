@@ -3048,11 +3048,14 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // Re-enable raw-int terminal finishes when the trace ends in an
-        // obvious int boxing pattern. Top-level exits re-box in pyre-jit,
-        // while recursive call boundaries can consume the raw int directly.
-        let (optimized_ops, finish_unboxed) =
-            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
+        // unbox_finish_result: only when result_type == Int.
+        // When result_type == Ref, FINISH stays as Ref
+        // (matching DoneWithThisFrameDescrRef contract).
+        let (optimized_ops, finish_unboxed) = if self.result_type == Type::Int {
+            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers)
+        } else {
+            (optimized_ops, false)
+        };
         let optimized_ops = compile::unbox_call_assembler_results(optimized_ops);
         let optimized_ops = if finish_unboxed {
             compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
@@ -4762,6 +4765,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
+    /// result_type == INT.
     pub fn has_raw_int_finish(&self, _green_key: u64) -> bool {
         self.result_type == Type::Int
     }
@@ -5070,11 +5074,6 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Return the merge point PC for blackhole resume from a guard exit.
     ///
-    /// Multi-frame (call_assembler with caller prefix): returns the
-    /// outermost (caller) frame's header_pc — the caller's trace entry.
-    /// Single-frame: returns the innermost frame's header_pc — the
-    /// callee's trace entry (jit_merge_point position).
-    ///
     /// Producer invariant: after build_guard_metadata + backend merge,
     /// every guard has recovery_layout with header_pc on all frames.
     /// Returns None only if the (green_key, trace_id, fail_index) lookup
@@ -5308,8 +5307,11 @@ impl<M: Clone> MetaInterp<M> {
         // RPython parity: unbox the Finish result in bridges too.
         // Without this, bridges return boxed pointers while the caller
         // (call_assembler_fast_path) expects raw ints for [Type::Int] Finish.
-        let (optimized_ops, bridge_finish_unboxed) =
-            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers);
+        let (optimized_ops, bridge_finish_unboxed) = if self.result_type == Type::Int {
+            compile::unbox_finish_result(optimized_ops, &constants, &self.raw_int_box_helpers)
+        } else {
+            (optimized_ops, false)
+        };
         let optimized_ops = if bridge_finish_unboxed {
             compile::unbox_raw_force_results(optimized_ops, &constants, &self.raw_int_force_helpers)
         } else {
