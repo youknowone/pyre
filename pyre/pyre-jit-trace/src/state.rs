@@ -7222,12 +7222,14 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        // resume.py:1042: bridge inputargs = rebuild_from_resumedata output.
-        // Adjust meta to match fail_arg_types shape so bridge trace inputargs
-        // match the guard's fail_args count. The Cranelift dispatch only
-        // provides fail_args values; bridge code must not expect more.
-        // TODO: when rd_frame_info_list chaining makes full frame available
-        // at dispatch time, remove this truncation.
+        // DIFFERS FROM UPSTREAM: RPython rebuild_from_resumedata
+        // (resume.py:1042, pyjitpl.py:3400) restores the complete
+        // frame stack from rd_numb before bridge tracing starts.
+        // pyre truncates meta to fail_arg_types count because the
+        // Cranelift dispatch only passes fail_args to bridge code.
+        // This limits bridge guard snapshots to the truncated view.
+        // Fix: port rebuild_from_resumedata so bridge tracing sees
+        // the complete frame stack + vref/vable state (resume.py:1049).
         if fail_arg_types.len() >= 3 {
             let n_slots = fail_arg_types.len() - 3;
             let nlocals = meta.num_locals.min(n_slots);

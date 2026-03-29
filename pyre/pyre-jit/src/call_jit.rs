@@ -1629,13 +1629,12 @@ pub fn trace_and_compile_from_bridge(
     // blackhole resume → interpreter runs remaining code → natural return.
     // Direct FINISH bridges are WRONG here — they skip the remaining loop
     // body that the blackhole should execute.
-    // resume.py:1042: for bridge guards, adjust jit_state to match
-    // fail_arg_types shape. Don't modify the real frame — only the
-    // jit_state that controls trace_meta construction.
-    // resume.py:1042: adjust jit_state to match fail_arg_types shape.
-    // Bridge trace inputargs must match guard fail_args count because
-    // Cranelift dispatch only provides fail_args values.
-    // TODO: remove when rd_frame_info_list makes full frame available.
+    // DIFFERS FROM UPSTREAM: RPython rebuild_from_resumedata
+    // (pyjitpl.py:2901,3400) restores the complete frame stack before
+    // bridge tracing. pyre truncates jit_state.valuestackdepth to
+    // fail_arg count because bridge inputargs = guard fail_args.
+    // Fix: port rebuild_from_resumedata so bridge tracing sees
+    // the complete frame stack + vref/vable state (resume.py:1049).
     let bridge_adjusted_vsd;
     {
         let (driver, _) = crate::eval::driver_pair();
