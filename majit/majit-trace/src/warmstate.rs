@@ -196,10 +196,6 @@ const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 /// rlib/jit.py:595 retrace_limit = 0
 const DEFAULT_RETRACE_LIMIT: u32 = 0;
 
-/// pyjitpl.py:2806 prepare_trace_segmenting parity: after this many
-/// consecutive too-long aborts, disable tracing for the green key.
-const MAX_TRACE_TOO_LONG_ABORTS: u32 = 3;
-
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
