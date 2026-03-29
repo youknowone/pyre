@@ -702,6 +702,12 @@ impl<S: JitState> JitDriver<S> {
                 if let Some((bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
                     self.bridge_info.take()
                 {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][bridge-finish] key={} trace={} fail={}",
+                            bridge_key, bridge_trace_id, bridge_fail_index
+                        );
+                    }
                     self.sym = None;
                     self.trace_meta = None;
                     self.meta.compile_done_with_this_frame(

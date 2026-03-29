@@ -1287,10 +1287,12 @@ fn execute_assembler(
                             return None;
                         }
                         // RPython compile.py:710: blackhole resume succeeds.
-                        // RPython does NOT invalidate here, but pyre needs to
-                        // until bridge compilation is robust. Without invalidation,
-                        // re-entry accumulates guard failures → bridge threshold
-                        // → bridge compile → Cranelift assertion (incomplete bridge).
+                        // RPython does NOT invalidate — rd_numb is always
+                        // complete, so re-entry + guard failure is safe.
+                        // Pyre workaround: rd_numb can be incomplete, so
+                        // re-entry hits a different guard whose rd_numb
+                        // fails → SEGFAULT. Invalidate until rd_numb is
+                        // complete for all guards.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
