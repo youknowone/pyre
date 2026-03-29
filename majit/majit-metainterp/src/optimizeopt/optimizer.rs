@@ -2186,20 +2186,14 @@ impl Optimizer {
             .map(|&a| ctx.get_box_replacement(a))
             .collect();
 
-        // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
-        // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
-        // JUMP args (live_arg_boxes from compile_trace / deadframe values).
-        // unroll.py:207: skip preamble (target_tokens[0]), try body targets.
-        let body_tokens = if front_target_tokens.len() > 1 {
-            &mut front_target_tokens[1..]
-        } else {
-            &mut front_target_tokens[..]
-        };
+        // unroll.py:207: jump_to_existing_trace(force_boxes=False)
+        // RPython iterates ALL target_tokens; preamble is skipped
+        // via virtual_state is None check (unroll.py:327-328).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
-            body_tokens,
+            front_target_tokens,
             self,
             &mut ctx,
             false,
