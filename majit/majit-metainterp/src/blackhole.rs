@@ -136,6 +136,7 @@ pub enum BlackholeResult {
     Finish {
         op_index: usize,
         values: Vec<i64>,
+        /// Types from the FINISH op's descr (e.g. [Type::Int] or [Type::Ref]).
         value_types: Vec<majit_ir::Type>,
     },
     /// Reached a Jump — loop back to header with these values.
