@@ -2163,19 +2163,11 @@ impl Optimizer {
         // unroll.py:207-208: jump_to_existing_trace(force_boxes=False)
         // RPython compile.py:1057 parity: runtime_boxes = pre-optimization
         // JUMP args (live_arg_boxes from compile_trace / deadframe values).
-        // RPython unroll.py:207: jump_to_existing_trace skips preamble
-        // (target_tokens[0]) and tries body targets (target_tokens[1:]).
-        // Preamble is for initial loop entry; bridge should go to body.
-        let body_tokens = if front_target_tokens.len() > 1 {
-            &mut front_target_tokens[1..]
-        } else {
-            &mut front_target_tokens[..]
-        };
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = opt_unroll.jump_to_existing_trace(
             &jump_args,
             None,
-            body_tokens,
+            front_target_tokens,
             self,
             &mut ctx,
             false,
@@ -2200,26 +2192,13 @@ impl Optimizer {
             return (optimized_ops, true);
         }
 
-        // unroll.py:220-230: retrace limit reached, try force_boxes=true
-        ctx.clear_newoperations();
-        let vs2 = opt_unroll.jump_to_existing_trace(
-            &jump_args,
-            None,
-            front_target_tokens,
-            self,
-            &mut ctx,
-            true, // force_boxes
-            Some(&pre_opt_jump_args),
-        );
+        // unroll.py:220-230: retrace limit reached.
+        // RPython tries force_boxes=true then falls back to jump_to_preamble.
+        // TODO: implement force_boxes with correct arity (RPython
+        // virtualstate.py:655-683 make_inputargs parity).
 
-        if vs2.is_none() {
-            // unroll.py:226-227: matched with forced boxes
-            let mut result = optimized_ops[..optimized_ops.len() - 1].to_vec();
-            result.extend(ctx.new_operations.drain(..));
-            return (result, false);
-        }
-
-        // unroll.py:228-229: jump_to_preamble fallback
+        // unroll.py:228-229: jump_to_preamble fallback.
+        // RPython only changes descr, keeps arglist intact.
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!("[jit] Retrace count reached, jumping to preamble");
         }
