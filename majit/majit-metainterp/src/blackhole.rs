@@ -532,7 +532,24 @@ pub(crate) fn blackhole_execute_with_state(
     drop(merged);
     let mut exc_state = initial_exception;
 
-    for op_idx in start_index..ops.len() {
+    // RPython _run_forever parity: find the Label op (loop header) so
+    // that Jump can loop back. The trace is [Label, ..., Jump(→Label)].
+    let label_index = ops
+        .iter()
+        .position(|op| op.opcode == OpCode::Label)
+        .unwrap_or(0);
+    // Label's args define the loop's inputargs (their OpRef positions).
+    let label_inputarg_positions: Vec<u32> = ops
+        .get(label_index)
+        .map(|op| op.args.iter().map(|a| a.0).collect())
+        .unwrap_or_default();
+
+    let mut op_idx = start_index;
+    // Limit iterations to prevent infinite loops in buggy traces.
+    let mut iterations = 0usize;
+    const MAX_BLACKHOLE_ITERATIONS: usize = 100_000;
+
+    while op_idx < ops.len() && iterations < MAX_BLACKHOLE_ITERATIONS {
         let op = &ops[op_idx];
         let result = execute_one(op, &tv, &mut exc_state);
 
@@ -561,14 +578,15 @@ pub(crate) fn blackhole_execute_with_state(
                 );
             }
             OpResult::Jump(args) => {
+                // RPython _run_forever parity: Jump loops back to Label.
+                // Map jump args → label inputargs and restart from label+1.
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                return (
-                    BlackholeResult::Jump {
-                        op_index: op_idx,
-                        values: vals,
-                    },
-                    exc_state,
-                );
+                for (pos, val) in label_inputarg_positions.iter().zip(vals.iter()) {
+                    tv.set(*pos, *val);
+                }
+                op_idx = label_index + 1;
+                iterations += 1;
+                continue;
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
@@ -588,6 +606,14 @@ pub(crate) fn blackhole_execute_with_state(
                 return (BlackholeResult::Abort(msg), exc_state);
             }
         }
+        op_idx += 1;
+    }
+
+    if iterations >= MAX_BLACKHOLE_ITERATIONS {
+        return (
+            BlackholeResult::Abort("blackhole iteration limit reached".to_string()),
+            exc_state,
+        );
     }
 
     (

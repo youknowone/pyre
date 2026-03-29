@@ -74,9 +74,7 @@ pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
 }
 
 pub fn majit_log_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("MAJIT_LOG").is_ok());
-    *ENABLED
+    std::env::var_os("MAJIT_LOG").is_some()
 }
 
 /// Result of tracing a single instruction.
