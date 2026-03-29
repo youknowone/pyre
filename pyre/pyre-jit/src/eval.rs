@@ -2413,17 +2413,9 @@ fn restore_guard_failure_for_loop(
                     frame_end
                 );
             }
-            // Workaround for incomplete rd_virtuals_info materialization:
-            // remove the compiled entry so both has_compiled_loop and
-            // has_compiled_targets return false. WarmState JC_COMPILED
-            // cell prevents infinite retrace (force_start_tracing →
-            // RunCompiled). Use rd_loop_token (= root green key) which
-            // correctly identifies the owning loop even from bridge guards.
-            // When blackhole resume is complete (RPython compile.py:701
-            // handle_fail parity), this should be replaced with proper
-            // blackhole execution.
-            let (driver, _) = driver_pair();
-            driver.invalidate_compiled_trace(exit_layout.trace_id);
+            // RPython compile.py:701: guard failure → bridge or blackhole,
+            // no invalidation. Null Refs are from incomplete rd_virtuals
+            // materialization (pyre limitation). Skip this guard recovery.
             return None;
         }
     }
