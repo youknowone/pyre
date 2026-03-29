@@ -255,9 +255,10 @@ impl Trace {
         self.finalized = true;
     }
 
-    /// Mark the recorder as finalized without adding any ops.
-    /// Used when ops (e.g. FINISH) were added via record_op() directly.
-    pub fn mark_finalized(&mut self) {
+    /// opencoder.py: tracing_done() — finalize the trace.
+    /// Called when the trace has been closed by external means
+    /// (e.g. FINISH recorded via record_op directly).
+    pub fn tracing_done(&mut self) {
         self.finalized = true;
     }
 

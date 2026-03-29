@@ -367,7 +367,8 @@ impl TraceCtx {
         self.inline_trace_positions.truncate(depth);
     }
 
-    pub fn find_biggest_inline_function(&self) -> Option<u64> {
+    /// pyjitpl.py:3514 find_biggest_function
+    pub fn find_biggest_function(&self) -> Option<u64> {
         let current_pos = self.recorder.num_ops();
         self.inline_trace_positions
             .iter()

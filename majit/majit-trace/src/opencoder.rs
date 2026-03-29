@@ -646,23 +646,6 @@ impl SnapshotStorage {
             self.rooted_ref_indices.clear();
         }
     }
-
-    /// Clone the storage data without rooting — for consumption after
-    /// the trace is finalized. Refreshes from GC first.
-    /// RPython: Trace._refs is consumed as a plain list after tracing_done().
-    pub fn snapshot_unrooted(&mut self) -> SnapshotStorage {
-        self.refresh_from_gc();
-        SnapshotStorage {
-            snapshots: self.snapshots.clone(),
-            top_snapshots: self.top_snapshots.clone(),
-            const_refs: self.const_refs.clone(),
-            const_bigints: self.const_bigints.clone(),
-            const_floats: self.const_floats.clone(),
-            // Unrooted copy — no shadow stack tracking.
-            rooted_ref_indices: Vec::new(),
-            shadow_stack_base: majit_gc::shadow_stack::depth(),
-        }
-    }
 }
 
 impl Drop for SnapshotStorage {

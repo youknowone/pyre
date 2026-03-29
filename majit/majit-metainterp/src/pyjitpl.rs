@@ -3267,15 +3267,15 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
     /// prepends a LABEL (via front_target_tokens) for bridge attachment.
-    /// Called from _create_segmented_trace_and_blackhole when
-    /// force_finish_trace is active and trace reaches 80% of limit.
-    pub fn compile_simple_loop(&mut self, meta: M) {
+    /// Returns the green_key on success (caller must call
+    /// attach_procedure_to_interp), None on failure.
+    pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
         let vable_config = self.current_virtualizable_optimizer_config();
         self.forced_virtualizable = None;
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
-            None => return,
+            None => return None,
         };
         ctx.apply_replacements();
         let green_key = ctx.green_key;
@@ -3284,7 +3284,7 @@ impl<M: Clone> MetaInterp<M> {
         // The trace already has GUARD_ALWAYS_FAILS + FINISH ops recorded
         // by jitdriver.rs segmenting. Mark recorder as finalized so
         // get_trace() succeeds.
-        recorder.mark_finalized();
+        recorder.tracing_done();
         let trace = recorder.get_trace();
         let trace_snapshots = trace.snapshots.clone();
 
@@ -3347,20 +3347,20 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
-                    .is_some()
-                {
-                    if crate::majit_log_enabled() {
+                if crate::majit_log_enabled() {
+                    if payload
+                        .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                        .is_some()
+                    {
                         eprintln!(
                             "[jit] compile_simple_loop: InvalidLoop at key={}",
                             green_key
                         );
                     }
                 }
+                // compile.py:228-230: trace.cut_at(cut_at); return None
                 self.warm_state.abort_tracing(green_key, false);
-                self.warm_state.reset_function_counts();
-                return;
+                return None;
             }
         };
 
@@ -3515,12 +3515,6 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                     },
                 );
-                // pyjitpl.py:1662 attach_procedure_to_interp
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = JitCellToken::new(install_num);
-                self.warm_state
-                    .attach_procedure_to_interp(green_key, install_token);
-                self.warm_state.reset_function_counts();
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -3531,6 +3525,8 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after);
                 }
+                // compile.py:249: return target_token
+                return Some(green_key);
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -3541,7 +3537,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.warm_state.abort_tracing(green_key, false);
-                self.warm_state.reset_function_counts();
+                return None;
             }
         }
     }
@@ -4696,6 +4692,13 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops
             .get(&green_key)
             .map_or(false, |c| !c.token.is_invalidated())
+    }
+
+    /// Number of inputargs for a compiled loop (0 if not compiled).
+    pub fn compiled_num_inputs(&self, green_key: u64) -> usize {
+        self.compiled_loops
+            .get(&green_key)
+            .map_or(0, |c| c.num_inputs)
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
