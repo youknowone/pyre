@@ -255,6 +255,12 @@ impl Trace {
         self.finalized = true;
     }
 
+    /// Mark the recorder as finalized without adding any ops.
+    /// Used when ops (e.g. FINISH) were added via record_op() directly.
+    pub fn mark_finalized(&mut self) {
+        self.finalized = true;
+    }
+
     /// Apply OpRef replacements to all recorded ops.
     /// Used by inline callee returns to replace placeholder OpRefs
     /// with actual result OpRefs throughout the trace.
