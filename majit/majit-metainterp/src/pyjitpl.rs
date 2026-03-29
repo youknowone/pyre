@@ -187,51 +187,67 @@ impl StoredExitLayout {
 }
 
 /// opencoder.py:819 parity: extract per-snapshot box maps from trace snapshots.
-/// Returns (active_boxes, frame_sizes, vable_boxes, frame_pcs).
+///
+/// opencoder.py:603 _encode: Const boxes are registered in the constant pool
+/// and returned as pool OpRefs so the optimizer's BoxEnv can resolve them
+/// via is_const/get_const (resume.py:157 getconst parity).
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[majit_trace::recorder::Snapshot],
+    constants: &mut std::collections::HashMap<u32, i64>,
+    constant_types: &mut std::collections::HashMap<u32, majit_ir::Type>,
 ) -> (
     std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     std::collections::HashMap<i32, Vec<usize>>,
     std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    std::collections::HashMap<i32, Vec<Option<(i64, majit_ir::Type)>>>,
 ) {
     let mut box_map = std::collections::HashMap::new();
     let mut size_map = std::collections::HashMap::new();
     let mut vable_map = std::collections::HashMap::new();
     let mut pc_map = std::collections::HashMap::new();
-    let mut const_map = std::collections::HashMap::new();
+    let mut next_const_idx = constants.keys().copied().max().unwrap_or(10_000) + 1;
+    // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
+    let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
+        match t {
+            majit_trace::recorder::SnapshotTagged::Box(n)
+            | majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+            majit_trace::recorder::SnapshotTagged::Const(val, tp) => {
+                // resume.py:173-176: null Ref → NULLREF via getconst.
+                // Register in pool so is_const → true, get_const → (0, Ref),
+                // getconst → NULLREF. Do NOT short-circuit to OpRef::NONE.
+                // resume.py:157 getconst: find or allocate pool entry.
+                let existing = constants
+                    .iter()
+                    .find(|(k, v)| {
+                        **v == *val
+                            && constant_types
+                                .get(k)
+                                .copied()
+                                .unwrap_or(majit_ir::Type::Int)
+                                == *tp
+                    })
+                    .map(|(k, _)| *k);
+                let key = existing.unwrap_or_else(|| {
+                    let k = next_const_idx;
+                    next_const_idx += 1;
+                    constants.insert(k, *val);
+                    constant_types.insert(k, *tp);
+                    k
+                });
+                majit_ir::OpRef(key)
+            }
+        }
+    };
     for (id, snap) in trace_snapshots.iter().enumerate() {
-        use majit_trace::recorder::SnapshotTagged;
-        let tagged_to_opref = |t: &SnapshotTagged| -> majit_ir::OpRef {
-            match t {
-                SnapshotTagged::Box(n) | SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
-                SnapshotTagged::Const(..) => majit_ir::OpRef::NONE,
-            }
-        };
-        // resume.py:157: Const carries its actual type (INT/REF/FLOAT).
-        let tagged_to_const = |t: &SnapshotTagged| -> Option<(i64, majit_ir::Type)> {
-            match t {
-                SnapshotTagged::Const(v, tp) => Some((*v, *tp)),
-                _ => None,
-            }
-        };
         let boxes: Vec<majit_ir::OpRef> = snap
             .frames
             .iter()
             .flat_map(|f| f.boxes.iter())
-            .map(&tagged_to_opref)
-            .collect();
-        let consts: Vec<Option<(i64, majit_ir::Type)>> = snap
-            .frames
-            .iter()
-            .flat_map(|f| f.boxes.iter())
-            .map(&tagged_to_const)
+            .map(&mut tagged_to_opref)
             .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
         let vable_boxes: Vec<majit_ir::OpRef> =
-            snap.vable_boxes.iter().map(&tagged_to_opref).collect();
+            snap.vable_boxes.iter().map(&mut tagged_to_opref).collect();
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
@@ -239,12 +255,11 @@ fn snapshot_map_from_trace_snapshots(
             .collect();
         let id = id as i32;
         box_map.insert(id, boxes);
-        const_map.insert(id, consts);
         size_map.insert(id, frame_sizes);
         vable_map.insert(id, vable_boxes);
         pc_map.insert(id, frame_pcs);
     }
-    (box_map, size_map, vable_map, pc_map, const_map)
+    (box_map, size_map, vable_map, pc_map)
 }
 
 fn normalize_root_loop_entry_contract(
@@ -1732,11 +1747,8 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
+        let green_key = ctx.green_key;
         let cut_inner_green_key = ctx.cut_inner_green_key;
-        // pyjitpl.py:3158: greenkey = original_boxes[:num_green_args]
-        // RPython uses the green key at the CLOSE point (reached_loop_header).
-        // For cross-loop cuts, this is the inner loop's key, not the outer.
-        let green_key = cut_inner_green_key.unwrap_or(ctx.green_key);
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position.ops_len > 0)
@@ -1874,15 +1886,13 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (
-            snapshot_map,
-            snapshot_frame_size_map,
-            snapshot_vable_map,
-            snapshot_pc_map,
-            snapshot_consts,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots);
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
         unroll_opt.snapshot_boxes = snapshot_map.clone();
-        unroll_opt.snapshot_consts = snapshot_consts.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
@@ -2430,16 +2440,15 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        let constants = ctx.constants.snapshot();
-        let constant_types = ctx.constants.constant_types_snapshot();
+        let mut constants = ctx.constants.snapshot();
+        let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
-        let (
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_frame_pcs,
-            _snapshot_consts,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots);
+        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2644,10 +2653,12 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_frame_sizes,
             retrace_snapshot_vable_boxes,
             retrace_snapshot_frame_pcs,
-            retrace_snapshot_consts,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots);
+        ) = snapshot_map_from_trace_snapshots(
+            &trace.snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
-        unroll_opt.snapshot_consts = retrace_snapshot_consts;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;

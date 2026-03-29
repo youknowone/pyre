@@ -2533,7 +2533,7 @@ impl MIFrame {
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: self.sym().jitcode_index as u32,
                 pc: self.orgpc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes),
+                boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes, ctx),
             }];
             // fail_args = header + materialized active_boxes (for Cranelift deadframe).
             let materialized = self.materialize_active_boxes(ctx, &callee_active_boxes);
@@ -2551,7 +2551,7 @@ impl MIFrame {
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes(parent_active),
+                    boxes: Self::fail_args_to_snapshot_boxes(parent_active, ctx),
                 });
                 fail_args.extend_from_slice(pfa);
                 let pt = if pfa_types.is_empty() {
@@ -2561,9 +2561,9 @@ impl MIFrame {
                 };
                 types.extend_from_slice(&pt);
             }
-            let vable_boxes = Self::build_virtualizable_boxes(self.sym());
+            let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
             // pyjitpl.py:2597: self.virtualref_boxes
-            let vref_boxes = Self::build_virtualref_boxes(self.sym());
+            let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
             let snapshot = majit_trace::recorder::Snapshot {
                 frames,
                 vable_boxes,
@@ -2597,11 +2597,11 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes);
+        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
         // opencoder.py:776-778: top snapshot uses frame.jitcode.index
         // and frame.pc (= resumepc set by capture_resumedata).
         // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
-        let vable_boxes = Self::build_virtualizable_boxes(self.sym());
+        let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         // opencoder.py:776: frame.jitcode.index
         let jitcode_index = self.sym().jitcode_index as u32;
         let snapshot = majit_trace::recorder::Snapshot {
@@ -2612,7 +2612,7 @@ impl MIFrame {
             }],
             vable_boxes,
             // pyjitpl.py:2597: self.virtualref_boxes
-            vref_boxes: Self::build_virtualref_boxes(self.sym()),
+            vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
 
@@ -2623,44 +2623,58 @@ impl MIFrame {
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
     /// [static_fields..., array_items..., virtualizable_ptr].
     /// pyjitpl.py:2586: self.virtualizable_boxes → vable_array.
-    fn build_virtualizable_boxes(sym: &PyreSym) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    /// opencoder.py:603 _encode parity: encode OpRef as SnapshotTagged.
+    /// Const OpRefs (>=10000) → Const(value, type) from pool.
+    /// NONE → Const(0, Ref). Regular → Box.
+    fn opref_to_snapshot_tagged(
+        opref: OpRef,
+        ctx: &majit_metainterp::TraceCtx,
+    ) -> majit_trace::recorder::SnapshotTagged {
+        if opref.is_none() {
+            majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+        } else if opref.0 >= 10_000 {
+            let val = ctx.constant_value(opref).unwrap_or(0);
+            let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+            majit_trace::recorder::SnapshotTagged::Const(val, tp)
+        } else {
+            majit_trace::recorder::SnapshotTagged::Box(opref.0)
+        }
+    }
+
+    fn build_virtualizable_boxes(
+        sym: &PyreSym,
+        ctx: &majit_metainterp::TraceCtx,
+    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
         let stack_only = sym.stack_only_depth();
-        let opref_to_tag = |opref: OpRef| -> majit_trace::recorder::SnapshotTagged {
-            if opref.is_none() {
-                majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
-            } else {
-                majit_trace::recorder::SnapshotTagged::Box(opref.0)
-            }
-        };
         let mut boxes = Vec::new();
         // Static fields: next_instr, valuestackdepth
-        boxes.push(opref_to_tag(sym.vable_next_instr));
-        boxes.push(opref_to_tag(sym.vable_valuestackdepth));
+        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
+        boxes.push(Self::opref_to_snapshot_tagged(
+            sym.vable_valuestackdepth,
+            ctx,
+        ));
         // Array field: locals_cells_stack_w items
         for &local in &sym.symbolic_locals {
-            boxes.push(opref_to_tag(local));
+            boxes.push(Self::opref_to_snapshot_tagged(local, ctx));
         }
         for &stack_val in &sym.symbolic_stack[..stack_only.min(sym.symbolic_stack.len())] {
-            boxes.push(opref_to_tag(stack_val));
+            boxes.push(Self::opref_to_snapshot_tagged(stack_val, ctx));
         }
         // virtualizable.py:139: last element = virtualizable itself
-        boxes.push(opref_to_tag(sym.frame));
+        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
         boxes
     }
 
     /// pyjitpl.py:2597 virtualref_boxes parity.
     /// pyjitpl.py:2597 virtualref_boxes parity.
     /// Returns pairs of (jit_virtual, real_vref) as SnapshotTagged.
-    fn build_virtualref_boxes(sym: &PyreSym) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    fn build_virtualref_boxes(
+        sym: &PyreSym,
+        ctx: &majit_metainterp::TraceCtx,
+    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
         sym.virtualref_boxes
             .iter()
-            .map(|&(opref, _concrete)| {
-                if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
-                } else {
-                    majit_trace::recorder::SnapshotTagged::Box(opref.0)
-                }
-            })
+            .map(|&(opref, _concrete)| Self::opref_to_snapshot_tagged(opref, ctx))
             .collect()
     }
 
@@ -2670,16 +2684,11 @@ impl MIFrame {
     /// deduplicates via liveboxes HashMap (same OpRef → same tag).
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
+        ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
         fail_args
             .iter()
-            .map(|&opref| {
-                if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
-                } else {
-                    majit_trace::recorder::SnapshotTagged::Box(opref.0)
-                }
-            })
+            .map(|&opref| Self::opref_to_snapshot_tagged(opref, ctx))
             .collect()
     }
 
@@ -6186,8 +6195,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 let (driver, _) = crate::driver::driver_pair();
                 let bridge_origin = driver.bridge_origin();
                 if driver.meta_interp().has_compiled_targets(root_key) {
-                    // pyjitpl.py:1572: self.pc = orgpc before reached_loop_header
-                    let jump_args = MIFrame::close_loop_args_at(this, ctx, Some(target));
+                    let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
                         .compile_trace(root_key, &jump_args, bridge_origin);
@@ -6239,9 +6247,8 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
                 return Ok(None);
             }
-            // pyjitpl.py:1572: self.pc = orgpc sets merge point PC before boxes
             MIFrame::set_next_instr(this, ctx, target);
-            let oprefs = MIFrame::close_loop_args_at(this, ctx, Some(target));
+            let oprefs = MIFrame::close_loop_args(this, ctx);
             Ok(Some(
                 oprefs.into_iter().map(FrontendOp::opref_only).collect(),
             ))

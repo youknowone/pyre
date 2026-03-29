@@ -2999,8 +2999,17 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for &raw_opref in boxes {
+            // Dead slots (no box at this position) → NULLREF.
+            if raw_opref.is_none() {
+                numb_state.append_short(NULLREF);
+                continue;
+            }
             // resume.py:201-202: box = iter.get(item); box = box.get_box_replacement()
             let opref = env.get_box_replacement(raw_opref);
+            if opref.is_none() {
+                numb_state.append_short(NULLREF);
+                continue;
+            }
 
             // resume.py:204-205: isinstance(box, Const) → self.getconst(box)
             if env.is_const(opref) {

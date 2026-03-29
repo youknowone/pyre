@@ -203,8 +203,6 @@ pub struct Optimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    /// resume.py:123,186: per-snapshot Const values for TAGCONST/TAGINT encoding.
-    pub snapshot_consts: std::collections::HashMap<i32, Vec<Option<(i64, majit_ir::Type)>>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -811,7 +809,6 @@ impl Optimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
-            snapshot_consts: std::collections::HashMap::new(),
         }
     }
 
@@ -1371,7 +1368,6 @@ impl Optimizer {
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        ctx.snapshot_consts = self.snapshot_consts.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)
         // into constant_types_for_numbering. These override Int → Ref for
