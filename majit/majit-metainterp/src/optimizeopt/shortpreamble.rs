@@ -1615,6 +1615,8 @@ pub fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
+    loop_constants: &HashMap<u32, i64>,
+    loop_constant_types: &HashMap<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let inputarg_map: HashMap<OpRef, OpRef> = label_args
         .iter()
@@ -1654,7 +1656,7 @@ pub fn build_short_preamble_from_exported_boxes(
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
-    builder.build_short_preamble_struct(&HashMap::new(), &HashMap::new())
+    builder.build_short_preamble_struct(loop_constants, loop_constant_types)
 }
 
 #[cfg(test)]
@@ -2063,6 +2065,8 @@ mod tests {
             &[OpRef(0), OpRef(1)],
             &[OpRef(10), OpRef(11)],
             &exported,
+            &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
@@ -2097,7 +2101,13 @@ mod tests {
             },
         ];
 
-        let sp = build_short_preamble_from_exported_boxes(&label_args, &short_inputargs, &exported);
+        let sp = build_short_preamble_from_exported_boxes(
+            &label_args,
+            &short_inputargs,
+            &exported,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let opcodes: Vec<OpCode> = sp.ops.iter().map(|entry| entry.op.opcode).collect();
         assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow]);
     }

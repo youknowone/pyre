@@ -1690,18 +1690,11 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // After bridge retrace, abort immediately — do NOT create a new
-        // entry that resets retraced_count. Let guard failure counter fire
-        // again; the next bridge attempt uses the SAME compiled entry.
+        // pyjitpl.py:2993-3007: if partial_trace is set (from bridge
+        // retrace_needed or loop InvalidLoop), compile_retrace handles it.
+        // Clear the bridge flag — partial_trace is the authoritative state.
         if self.retrace_after_bridge {
             self.retrace_after_bridge = false;
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] compile_loop: abort after bridge retrace (preserve retraced_count)"
-                );
-            }
-            self.abort_trace(false);
-            return CompileOutcome::Aborted;
         }
         // pyjitpl.py:3162: has_compiled_targets(ptoken) →
         // raise SwitchToBlackhole(ABORT_BAD_LOOP).
@@ -2555,10 +2548,13 @@ impl<M: Clone> MetaInterp<M> {
             Some(p) => p,
             None => return false,
         };
-        let start_state = match self.exported_state.take() {
+        let mut start_state = match self.exported_state.take() {
             Some(s) => s,
             None => return false,
         };
+        // gcreftracer.py parity: GC may have moved objects between Phase 1
+        // and Phase 2. Refresh GcRef values from shadow stack before use.
+        start_state.refresh_from_gc();
         // Consume retracing_from (position); green_key comes from tracing ctx.
         self.retracing_from = None;
         let green_key = match self.tracing.as_ref() {
@@ -4812,6 +4808,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
         };
+        // Store bridge inputarg types so export_state can propagate them
+        // to ExportedState.renamed_inputarg_types (RPython Box type parity).
+        optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+
         // RPython bridgeopt.py:133-146 deserialize_optimizer_knowledge:
         // known_classes are restored from the per-guard bitfield that was
         // serialized at guard compile time (bridgeopt.py:69-88). Only
@@ -4887,21 +4887,41 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         if retrace_requested {
-            // compile.py:1079-1086 parity: optimizer found no matching
-            // target token. Add a new target token from the exported state,
-            // signal retrace needed so the caller continues tracing.
+            // compile.py:1079: metainterp.retrace_needed(new_trace, info)
+            // Save partial trace + exported state so the next loop-header's
+            // compile_loop → compile_retrace can produce a new specialization.
             compiled.retraced_count += 1;
-            if let Some(exported) = optimizer.exported_loop_state.take() {
-                let mut new_token = crate::optimizeopt::unroll::TargetToken::new_preamble(
-                    compiled.front_target_tokens.len() as u64,
-                );
-                new_token.virtual_state = Some(exported.virtual_state);
-                compiled.front_target_tokens.push(new_token);
-            }
+            let exported = optimizer.exported_loop_state.take();
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] bridge retrace needed: key={} — continue tracing",
-                    green_key
+                    "[jit] bridge retrace needed: key={} exported={}",
+                    green_key,
+                    exported.is_some(),
+                );
+            }
+            if let Some(es) = exported {
+                // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
+                // Types come from ExportedState.renamed_inputarg_types, populated
+                // by Optimizer from trace_inputarg_types (RPython Box type parity).
+                let renamed_inputargs: Vec<InputArg> = es
+                    .renamed_inputargs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &opref)| {
+                        let tp = es
+                            .renamed_inputarg_types
+                            .get(i)
+                            .copied()
+                            .unwrap_or(Type::Int);
+                        InputArg::from_type(tp, opref.0)
+                    })
+                    .collect();
+                self.retrace_needed(
+                    green_key,
+                    optimized_ops.clone(),
+                    renamed_inputargs,
+                    constants,
+                    es,
                 );
             }
             self.retrace_after_bridge = true;

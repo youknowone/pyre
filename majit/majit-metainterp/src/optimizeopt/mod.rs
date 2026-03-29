@@ -2131,10 +2131,6 @@ impl OptContext {
         if !op.opcode.is_getfield() {
             return None;
         }
-        // TODO: activate after verifying GcRef root parity for all
-        // constant sources (ConstantPool, preamble export PtrInfo, etc.)
-        return None;
-        #[allow(unreachable_code)]
         let arg0 = op.arg(0);
         let resolved = self.get_box_replacement(arg0);
         if !resolved.is_constant() {

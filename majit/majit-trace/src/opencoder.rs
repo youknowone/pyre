@@ -542,18 +542,43 @@ impl<'a> Iterator for TopDownSnapshotIterator<'a> {
 
 /// Snapshot storage for a trace.
 /// opencoder.py: Trace._snapshot_data, _snapshot_array_data
-#[derive(Clone, Debug, Default)]
+///
+/// gcreftracer.py parity: const_refs entries are GC references stored as
+/// raw u64. They are rooted on the shadow stack so GC can update them
+/// when objects move. refresh_from_gc() copies updated values back.
+#[derive(Debug)]
 pub struct SnapshotStorage {
     /// All snapshots in this trace, indexed by position.
     pub snapshots: Vec<Snapshot>,
     /// Top snapshots corresponding to guard operations.
     pub top_snapshots: Vec<TopSnapshot>,
     /// Constant pool: GC references (pointers).
+    /// opencoder.py: Trace._refs
     pub const_refs: Vec<u64>,
     /// Constant pool: big integers (>28-bit).
     pub const_bigints: Vec<i64>,
     /// Constant pool: float values.
     pub const_floats: Vec<f64>,
+    /// (const_refs index, shadow stack index) for each rooted entry.
+    /// gcreftracer.py parity: GC's walk_roots updates shadow stack;
+    /// refresh_from_gc copies values back to const_refs.
+    rooted_ref_indices: Vec<(usize, usize)>,
+    /// Shadow stack depth at creation. release_roots pops to here.
+    shadow_stack_base: usize,
+}
+
+impl Default for SnapshotStorage {
+    fn default() -> Self {
+        SnapshotStorage {
+            snapshots: Vec::new(),
+            top_snapshots: Vec::new(),
+            const_refs: Vec::new(),
+            const_bigints: Vec::new(),
+            const_floats: Vec::new(),
+            rooted_ref_indices: Vec::new(),
+            shadow_stack_base: majit_gc::shadow_stack::depth(),
+        }
+    }
 }
 
 impl SnapshotStorage {
@@ -576,10 +601,15 @@ impl SnapshotStorage {
     }
 
     /// Add a GC reference constant and return its pool index.
+    /// gcreftracer.py parity: non-null refs are rooted on shadow stack.
     pub fn add_const_ref(&mut self, ptr: u64) -> u32 {
-        let idx = self.const_refs.len() as u32;
+        let cr_idx = self.const_refs.len();
         self.const_refs.push(ptr);
-        idx
+        if ptr != 0 {
+            let ss_idx = majit_gc::shadow_stack::push(majit_ir::GcRef(ptr as usize));
+            self.rooted_ref_indices.push((cr_idx, ss_idx));
+        }
+        cr_idx as u32
     }
 
     /// Add a big integer constant and return its pool index.
@@ -599,6 +629,45 @@ impl SnapshotStorage {
     /// Total number of snapshots.
     pub fn num_snapshots(&self) -> usize {
         self.snapshots.len()
+    }
+
+    /// Update const_refs from shadow stack — GC may have moved objects.
+    /// gcreftracer.py:gcrefs_trace parity.
+    pub fn refresh_from_gc(&mut self) {
+        for &(cr_idx, ss_idx) in &self.rooted_ref_indices {
+            self.const_refs[cr_idx] = majit_gc::shadow_stack::get(ss_idx).0 as u64;
+        }
+    }
+
+    /// Release shadow stack roots.
+    fn release_roots(&mut self) {
+        if !self.rooted_ref_indices.is_empty() {
+            majit_gc::shadow_stack::pop_to(self.shadow_stack_base);
+            self.rooted_ref_indices.clear();
+        }
+    }
+
+    /// Clone the storage data without rooting — for consumption after
+    /// the trace is finalized. Refreshes from GC first.
+    /// RPython: Trace._refs is consumed as a plain list after tracing_done().
+    pub fn snapshot_unrooted(&mut self) -> SnapshotStorage {
+        self.refresh_from_gc();
+        SnapshotStorage {
+            snapshots: self.snapshots.clone(),
+            top_snapshots: self.top_snapshots.clone(),
+            const_refs: self.const_refs.clone(),
+            const_bigints: self.const_bigints.clone(),
+            const_floats: self.const_floats.clone(),
+            // Unrooted copy — no shadow stack tracking.
+            rooted_ref_indices: Vec::new(),
+            shadow_stack_base: majit_gc::shadow_stack::depth(),
+        }
+    }
+}
+
+impl Drop for SnapshotStorage {
+    fn drop(&mut self) {
+        self.release_roots();
     }
 }
 
