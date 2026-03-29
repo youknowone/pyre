@@ -505,12 +505,13 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
     func_frame.fix_array_ptrs();
 
-    pyre_interpreter::call::register_eval_override(pyre_interpreter::eval::eval_frame_plain);
+    // warmspot.py:1021 assembler_call_helper: execute callee in
+    // plain interpreter. Do NOT change EVAL_OVERRIDE — it's a global
+    // OnceLock that must stay as eval_with_jit for all other calls.
     let result = match pyre_interpreter::eval::eval_frame_plain(&mut func_frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
     };
-    pyre_interpreter::call::register_eval_override(crate::eval::eval_with_jit);
 
     match protocol {
         FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
