@@ -324,14 +324,17 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
                 let frame_lgt =
                     *((obj_addr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize);
                 if (index as isize) >= frame_lgt {
-                    eprintln!(
-                        "[GC] bogus frame field: index={} frame_lgt={} no={} bitindex={} gcmap_lgt={} obj_addr={:#x}",
-                        index, frame_lgt, no, bitindex, gcmap_lgt, obj_addr as usize
+                    // jitframe.py:130 — ll_assert(index < frame_lgt, "bogus ...")
+                    // RPython ll_assert is no-op in translated builds.
+                    // Skip this slot: gcmap refers to a slot beyond the
+                    // current frame_lgt, which can happen when the jitframe
+                    // was partially copied by GC (varsize copy truncation).
+                    debug_assert!(
+                        false,
+                        "bogus frame field get: index={index} >= frame_lgt={frame_lgt}"
                     );
-                    panic!(
-                        "bogus frame field get: index={} >= frame_lgt={}",
-                        index, frame_lgt
-                    );
+                    bitindex += 1;
+                    continue;
                 }
                 // jitframe.py:131-133 — trace the slot
                 let slot_addr = (obj_addr as *mut u8)
@@ -365,6 +368,26 @@ unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir
 /// jitframe.py:48-52 — the `jitframe_allocate` function registers
 /// the custom trace hook on first call. In pyre, the TypeInfo is
 /// registered once with `gc.register_type(jitframe_type_info())`.
+/// jitframe.py:48-52 — JITFRAME is a GcStruct with a trailing Array(Signed).
+/// GC must know the varsize layout to copy the full object (header + array).
+///
+/// Layout: [JitFrame header (56 bytes)] [length: Signed] [items: Signed...]
+/// - base_size = JITFRAME_FIXED_SIZE (56) — the fixed header
+/// - item_size = SIZEOFSIGNED (8) — each jf_frame slot is one Signed
+/// - length_offset = JITFRAME_FIXED_SIZE (56) from obj start
 pub fn jitframe_type_info() -> majit_gc::trace::TypeInfo {
-    majit_gc::trace::TypeInfo::with_custom_trace(JITFRAME_FIXED_SIZE, jitframe_custom_trace)
+    majit_gc::trace::TypeInfo::varsize_with_custom_trace(
+        JITFRAME_FIXED_SIZE, // base_size
+        SIZEOFSIGNED,        // item_size: each array slot is 8 bytes
+        JITFRAME_FIXED_SIZE, // length_offset: jf_frame.length at header end
+        jitframe_custom_trace,
+    )
+}
+
+/// Allocate-in-oldgen flag: jitframe should NOT be nursery-allocated
+/// when possible, to avoid the cost of copying the (potentially large)
+/// trailing array during minor collection. When this returns true,
+/// the allocator should use `alloc_external` or similar.
+pub fn jitframe_prefer_oldgen() -> bool {
+    true
 }

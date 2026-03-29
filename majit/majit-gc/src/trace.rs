@@ -95,7 +95,7 @@ impl TypeInfo {
         }
     }
 
-    /// Create a type info with a custom trace hook.
+    /// Create a type info with a custom trace hook (fixed-size).
     ///
     /// RPython parity: `rgc.register_custom_trace_hook(TYPE, trace_fn)`.
     pub fn with_custom_trace(size: usize, trace_fn: CustomTraceFn) -> Self {
@@ -110,10 +110,35 @@ impl TypeInfo {
         }
     }
 
-    /// Compute the total size of an instance (excluding header).
+    /// Create a varsize type info with a custom trace hook.
+    ///
+    /// RPython parity: `rgc.register_custom_trace_hook` on a
+    /// `GcStruct(..., Array(Signed))` — e.g. JITFRAME.
+    pub fn varsize_with_custom_trace(
+        base_size: usize,
+        item_size: usize,
+        length_offset: usize,
+        trace_fn: CustomTraceFn,
+    ) -> Self {
+        TypeInfo {
+            size: base_size,
+            has_gc_ptrs: true,
+            gc_ptr_offsets: Vec::new(),
+            item_size,
+            length_offset,
+            items_have_gc_ptrs: false, // custom_trace handles ref tracing
+            custom_trace: Some(trace_fn),
+        }
+    }
+
+    /// Compute the total size of an instance (excluding GC header).
+    /// For varsize: base_size + length_field_size + item_size * length.
+    /// RPython: ofs_length + WORD + itemsize * length (lltypelayout.py).
     pub fn total_instance_size(&self, length: usize) -> usize {
         if self.item_size > 0 {
-            self.size + self.item_size * length
+            // base_size includes everything up to the length field.
+            // After the length field: items array.
+            self.size + std::mem::size_of::<usize>() + self.item_size * length
         } else {
             self.size
         }
