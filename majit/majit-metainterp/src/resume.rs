@@ -306,18 +306,20 @@ const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 ///
 /// The semantic `ResumeData` view is still exposed separately, but
 /// reconstruction goes through this encoded representation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EncodedResumeData {
     /// Flat encoded numbering section.
     pub code: Vec<i64>,
     /// Shared constant pool for CONST-tagged entries.
     pub consts: Vec<i64>,
-    /// Number of compact fail-arg slots referenced by the encoded section.
-    pub num_fail_args: usize,
-    /// Mapping from compact fail-arg numbering back to the raw guard fail-arg slots.
-    pub fail_arg_positions: Vec<usize>,
+
     /// Pending field/array writes that must be replayed on resume.
     pub pending_fields: Vec<EncodedPendingFieldWrite>,
+    /// compile.py:858 rd_virtuals — live VirtualInfo objects, never serialized.
+    /// RPython stores rd_virtuals as a list of live Python objects on
+    /// ResumeGuardDescr, separate from rd_numb. We mirror that: virtuals
+    /// are NOT encoded into `code[]` but stored directly here.
+    pub rd_virtuals: Vec<VirtualInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,7 +341,7 @@ pub enum ResumeValueKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeValueLayoutSummary {
     pub kind: ResumeValueKind,
-    pub fail_arg_index: Option<usize>,
+    pub fail_arg_index: usize,
     pub raw_fail_arg_position: Option<usize>,
     pub constant: Option<i64>,
     pub virtual_index: Option<usize>,
@@ -433,31 +435,23 @@ pub struct ResumeLayoutSummary {
     pub num_virtuals: usize,
     pub virtual_kinds: Vec<ResumeVirtualKind>,
     pub virtual_layouts: Vec<ResumeVirtualLayoutSummary>,
-    pub num_fail_args: usize,
-    pub fail_arg_positions: Vec<usize>,
+
     pub pending_field_count: usize,
     pub pending_field_layouts: Vec<PendingFieldLayoutSummary>,
     pub const_pool_size: usize,
 }
 
 impl ResumeValueLayoutSummary {
-    pub(crate) fn raw_fail_arg_position(&self, fail_arg_positions: &[usize]) -> usize {
+    pub(crate) fn raw_fail_arg_position(&self) -> usize {
         if let Some(position) = self.raw_fail_arg_position {
             return position;
         }
-        let compact_index = self
-            .fail_arg_index
-            .expect("resume layout missing fail-arg index for FailArg source");
-        *fail_arg_positions
-            .get(compact_index)
-            .expect("resume layout compact fail-arg index out of bounds")
+        self.fail_arg_index
     }
 
-    fn to_resume_source(&self, fail_arg_positions: &[usize]) -> ResumeValueSource {
+    fn to_resume_source(&self) -> ResumeValueSource {
         match self.kind {
-            ResumeValueKind::FailArg => {
-                ResumeValueSource::FailArg(self.raw_fail_arg_position(fail_arg_positions))
-            }
+            ResumeValueKind::FailArg => ResumeValueSource::FailArg(self.raw_fail_arg_position()),
             ResumeValueKind::Constant => {
                 ResumeValueSource::Constant(self.constant.expect("missing constant value"))
             }
@@ -469,14 +463,10 @@ impl ResumeValueLayoutSummary {
         }
     }
 
-    fn to_exit_source(
-        &self,
-        fail_arg_positions: &[usize],
-        virtual_offset: usize,
-    ) -> ExitValueSourceLayout {
+    fn to_exit_source(&self, virtual_offset: usize) -> ExitValueSourceLayout {
         match self.kind {
             ResumeValueKind::FailArg => {
-                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position(fail_arg_positions))
+                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position())
             }
             ResumeValueKind::Constant => {
                 ExitValueSourceLayout::Constant(self.constant.expect("missing constant value"))
@@ -491,22 +481,18 @@ impl ResumeValueLayoutSummary {
 }
 
 impl ResumeFrameLayoutSummary {
-    fn to_frame_info(&self, fail_arg_positions: &[usize]) -> FrameInfo {
+    fn to_frame_info(&self) -> FrameInfo {
         FrameInfo {
             pc: self.pc,
             slot_map: self
                 .slot_layouts
                 .iter()
-                .map(|slot| slot.to_resume_source(fail_arg_positions))
+                .map(|slot| slot.to_resume_source())
                 .collect(),
         }
     }
 
-    fn to_exit_frame_layout(
-        &self,
-        fail_arg_positions: &[usize],
-        virtual_offset: usize,
-    ) -> ExitFrameLayout {
+    fn to_exit_frame_layout(&self, virtual_offset: usize) -> ExitFrameLayout {
         ExitFrameLayout {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
@@ -515,7 +501,7 @@ impl ResumeFrameLayoutSummary {
             slots: self
                 .slot_layouts
                 .iter()
-                .map(|slot| slot.to_exit_source(fail_arg_positions, virtual_offset))
+                .map(|slot| slot.to_exit_source(virtual_offset))
                 .collect(),
             slot_types: self.slot_types.clone(),
         }
@@ -551,35 +537,35 @@ impl ResumeValueLayoutSummary {
         match source {
             ExitValueSourceLayout::ExitValue(index) => Self {
                 kind: ResumeValueKind::FailArg,
-                fail_arg_index: Some(*index),
+                fail_arg_index: *index,
                 raw_fail_arg_position: Some(*index),
                 constant: None,
                 virtual_index: None,
             },
             ExitValueSourceLayout::Constant(value) => Self {
                 kind: ResumeValueKind::Constant,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: Some(*value),
                 virtual_index: None,
             },
             ExitValueSourceLayout::Virtual(index) => Self {
                 kind: ResumeValueKind::Virtual,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: Some(*index),
             },
             ExitValueSourceLayout::Uninitialized => Self {
                 kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: None,
             },
             ExitValueSourceLayout::Unavailable => Self {
                 kind: ResumeValueKind::Unavailable,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: None,
@@ -589,7 +575,7 @@ impl ResumeValueLayoutSummary {
 }
 
 impl ResumeVirtualLayoutSummary {
-    fn to_virtual_info(&self, fail_arg_positions: &[usize]) -> VirtualInfo {
+    fn to_virtual_info(&self) -> VirtualInfo {
         match self {
             ResumeVirtualLayoutSummary::Object {
                 descr,
@@ -604,7 +590,7 @@ impl ResumeVirtualLayoutSummary {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(fd, src)| (*fd, src.to_resume_source(fail_arg_positions)))
+                    .map(|(fd, src)| (*fd, src.to_resume_source()))
                     .collect(),
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -622,7 +608,7 @@ impl ResumeVirtualLayoutSummary {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(fd, src)| (*fd, src.to_resume_source(fail_arg_positions)))
+                    .map(|(fd, src)| (*fd, src.to_resume_source()))
                     .collect(),
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -631,7 +617,7 @@ impl ResumeVirtualLayoutSummary {
                 descr_index: *descr_index,
                 items: items
                     .iter()
-                    .map(|source| source.to_resume_source(fail_arg_positions))
+                    .map(|source| source.to_resume_source())
                     .collect(),
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
@@ -645,9 +631,7 @@ impl ResumeVirtualLayoutSummary {
                     .map(|fields| {
                         fields
                             .iter()
-                            .map(|(field_descr, source)| {
-                                (*field_descr, source.to_resume_source(fail_arg_positions))
-                            })
+                            .map(|(field_descr, source)| (*field_descr, source.to_resume_source()))
                             .collect()
                     })
                     .collect(),
@@ -657,22 +641,14 @@ impl ResumeVirtualLayoutSummary {
                 entries: entries
                     .iter()
                     .map(|(offset, size_in_bytes, source)| {
-                        (
-                            *offset,
-                            *size_in_bytes,
-                            source.to_resume_source(fail_arg_positions),
-                        )
+                        (*offset, *size_in_bytes, source.to_resume_source())
                     })
                     .collect(),
             },
         }
     }
 
-    fn to_exit_virtual_layout(
-        &self,
-        fail_arg_positions: &[usize],
-        virtual_offset: usize,
-    ) -> ExitVirtualLayout {
+    fn to_exit_virtual_layout(&self, virtual_offset: usize) -> ExitVirtualLayout {
         match self {
             ResumeVirtualLayoutSummary::Object {
                 descr,
@@ -687,7 +663,7 @@ impl ResumeVirtualLayoutSummary {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(fd, src)| (*fd, src.to_exit_source(fail_arg_positions, virtual_offset)))
+                    .map(|(fd, src)| (*fd, src.to_exit_source(virtual_offset)))
                     .collect(),
                 target_slot: None,
                 fielddescrs: fielddescrs.clone(),
@@ -707,10 +683,7 @@ impl ResumeVirtualLayoutSummary {
                 fields: fields
                     .iter()
                     .map(|(field_descr, source)| {
-                        (
-                            *field_descr,
-                            source.to_exit_source(fail_arg_positions, virtual_offset),
-                        )
+                        (*field_descr, source.to_exit_source(virtual_offset))
                     })
                     .collect(),
                 target_slot: None,
@@ -723,7 +696,7 @@ impl ResumeVirtualLayoutSummary {
                 kind: 0, // default ref
                 items: items
                     .iter()
-                    .map(|source| source.to_exit_source(fail_arg_positions, virtual_offset))
+                    .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
@@ -742,10 +715,7 @@ impl ResumeVirtualLayoutSummary {
                         fields
                             .iter()
                             .map(|(field_descr, source)| {
-                                (
-                                    *field_descr,
-                                    source.to_exit_source(fail_arg_positions, virtual_offset),
-                                )
+                                (*field_descr, source.to_exit_source(virtual_offset))
                             })
                             .collect()
                     })
@@ -760,7 +730,7 @@ impl ResumeVirtualLayoutSummary {
                             (
                                 *offset,
                                 *size_in_bytes,
-                                source.to_exit_source(fail_arg_positions, virtual_offset),
+                                source.to_exit_source(virtual_offset),
                             )
                         })
                         .collect(),
@@ -771,30 +741,22 @@ impl ResumeVirtualLayoutSummary {
 }
 
 impl PendingFieldLayoutSummary {
-    fn to_pending_field_info(&self, fail_arg_positions: &[usize]) -> PendingFieldInfo {
+    fn to_pending_field_info(&self) -> PendingFieldInfo {
         PendingFieldInfo {
             descr_index: self.descr_index,
-            target: self.target.to_resume_source(fail_arg_positions),
-            value: self.value.to_resume_source(fail_arg_positions),
+            target: self.target.to_resume_source(),
+            value: self.value.to_resume_source(),
             item_index: self.item_index,
         }
     }
 
-    fn to_exit_pending_field_layout(
-        &self,
-        fail_arg_positions: &[usize],
-        virtual_offset: usize,
-    ) -> ExitPendingFieldLayout {
+    fn to_exit_pending_field_layout(&self, virtual_offset: usize) -> ExitPendingFieldLayout {
         ExitPendingFieldLayout {
             descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.is_array_item,
-            target: self
-                .target
-                .to_exit_source(fail_arg_positions, virtual_offset),
-            value: self
-                .value
-                .to_exit_source(fail_arg_positions, virtual_offset),
+            target: self.target.to_exit_source(virtual_offset),
+            value: self.value.to_exit_source(virtual_offset),
             field_offset: 0,
             field_size: 0,
             field_type: majit_ir::Type::Int,
@@ -808,17 +770,17 @@ impl ResumeLayoutSummary {
             frames: self
                 .frame_layouts
                 .iter()
-                .map(|frame| frame.to_frame_info(&self.fail_arg_positions))
+                .map(|frame| frame.to_frame_info())
                 .collect(),
             virtuals: self
                 .virtual_layouts
                 .iter()
-                .map(|virt| virt.to_virtual_info(&self.fail_arg_positions))
+                .map(|virt| virt.to_virtual_info())
                 .collect(),
             pending_fields: self
                 .pending_field_layouts
                 .iter()
-                .map(|pending| pending.to_pending_field_info(&self.fail_arg_positions))
+                .map(|pending| pending.to_pending_field_info())
                 .collect(),
         }
     }
@@ -866,16 +828,18 @@ impl ResumeLayoutSummary {
         frames.extend(
             self.frame_layouts
                 .iter()
-                .map(|frame| frame.to_exit_frame_layout(&self.fail_arg_positions, virtual_offset)),
+                .map(|frame| frame.to_exit_frame_layout(virtual_offset)),
         );
         virtual_layouts.extend(
             self.virtual_layouts
                 .iter()
-                .map(|virt| virt.to_exit_virtual_layout(&self.fail_arg_positions, virtual_offset)),
+                .map(|virt| virt.to_exit_virtual_layout(virtual_offset)),
         );
-        pending_field_layouts.extend(self.pending_field_layouts.iter().map(|pending| {
-            pending.to_exit_pending_field_layout(&self.fail_arg_positions, virtual_offset)
-        }));
+        pending_field_layouts.extend(
+            self.pending_field_layouts
+                .iter()
+                .map(|pending| pending.to_exit_pending_field_layout(virtual_offset)),
+        );
 
         ExitRecoveryLayout {
             frames,
@@ -903,10 +867,7 @@ impl ResumeLayoutSummary {
                     .slot_layouts
                     .iter()
                     .map(|slot| {
-                        ResumeData::resolve_frame_slot_source(
-                            &slot.to_resume_source(&self.fail_arg_positions),
-                            fail_values,
-                        )
+                        ResumeData::resolve_frame_slot_source(&slot.to_resume_source(), fail_values)
                     })
                     .collect(),
             })
@@ -939,10 +900,7 @@ impl ResumeLayoutSummary {
                 .slot_layouts
                 .iter()
                 .map(|slot| {
-                    ResumeData::resolve_frame_slot_source(
-                        &slot.to_resume_source(&self.fail_arg_positions),
-                        fail_values,
-                    )
+                    ResumeData::resolve_frame_slot_source(&slot.to_resume_source(), fail_values)
                 })
                 .collect(),
         })
@@ -958,35 +916,6 @@ impl ResumeLayoutSummary {
     ) -> Vec<ResolvedPendingFieldWrite> {
         let resume_data = self.to_resume_data();
         ResumeData::resolve_pending_field_writes(&resume_data.pending_fields, fail_values)
-    }
-
-    pub fn compact_fail_values(&self, raw_fail_values: &[i64]) -> Vec<i64> {
-        self.fail_arg_positions
-            .iter()
-            .map(|&raw_index| raw_fail_values.get(raw_index).copied().unwrap_or(0))
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncodedVirtualKind {
-    VirtualObj = 0,
-    VStruct = 1,
-    VArray = 2,
-    VArrayStruct = 3,
-    VRawBuffer = 4,
-}
-
-impl EncodedVirtualKind {
-    fn from_word(word: i64) -> Self {
-        match word {
-            0 => EncodedVirtualKind::VirtualObj,
-            1 => EncodedVirtualKind::VStruct,
-            2 => EncodedVirtualKind::VArray,
-            3 => EncodedVirtualKind::VArrayStruct,
-            4 => EncodedVirtualKind::VRawBuffer,
-            other => panic!("unknown encoded virtual kind {other}"),
-        }
     }
 }
 
@@ -1088,39 +1017,39 @@ impl ResumeValueSource {
         }
     }
 
-    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> ResumeValueLayoutSummary {
+    pub fn layout_summary(&self) -> ResumeValueLayoutSummary {
         match self {
             ResumeValueSource::FailArg(index) => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::FailArg,
-                fail_arg_index: fail_arg_positions.iter().position(|pos| pos == index),
+                fail_arg_index: *index,
                 raw_fail_arg_position: Some(*index),
                 constant: None,
                 virtual_index: None,
             },
             ResumeValueSource::Constant(value) => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Constant,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: Some(*value),
                 virtual_index: None,
             },
             ResumeValueSource::Virtual(index) => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Virtual,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: Some(*index),
             },
             ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: None,
             },
             ResumeValueSource::Unavailable => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Unavailable,
-                fail_arg_index: None,
+                fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
                 virtual_index: None,
@@ -1301,7 +1230,7 @@ impl VirtualInfo {
         }
     }
 
-    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> ResumeVirtualLayoutSummary {
+    pub fn layout_summary(&self) -> ResumeVirtualLayoutSummary {
         match self {
             VirtualInfo::VirtualObj {
                 descr,
@@ -1316,7 +1245,7 @@ impl VirtualInfo {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary(fail_arg_positions)))
+                    .map(|(fd, src)| (*fd, src.layout_summary()))
                     .collect(),
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -1334,17 +1263,14 @@ impl VirtualInfo {
                 descr_index: *descr_index,
                 fields: fields
                     .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary(fail_arg_positions)))
+                    .map(|(fd, src)| (*fd, src.layout_summary()))
                     .collect(),
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
             },
             VirtualInfo::VArray { descr_index, items } => ResumeVirtualLayoutSummary::Array {
                 descr_index: *descr_index,
-                items: items
-                    .iter()
-                    .map(|source| source.layout_summary(fail_arg_positions))
-                    .collect(),
+                items: items.iter().map(|source| source.layout_summary()).collect(),
             },
             VirtualInfo::VArrayStruct {
                 descr_index,
@@ -1360,7 +1286,7 @@ impl VirtualInfo {
                             fields
                                 .iter()
                                 .map(|(field_descr, source)| {
-                                    (*field_descr, source.layout_summary(fail_arg_positions))
+                                    (*field_descr, source.layout_summary())
                                 })
                                 .collect()
                         })
@@ -1372,11 +1298,7 @@ impl VirtualInfo {
                 entries: entries
                     .iter()
                     .map(|(offset, size_in_bytes, source)| {
-                        (
-                            *offset,
-                            *size_in_bytes,
-                            source.layout_summary(fail_arg_positions),
-                        )
+                        (*offset, *size_in_bytes, source.layout_summary())
                     })
                     .collect(),
             },
@@ -1403,6 +1325,180 @@ impl VirtualInfo {
 /// Source of a virtual object's field value.
 pub type VirtualFieldSource = ResumeValueSource;
 
+/// Convert a tagged fieldnum (i16, resume.py encoding) to a VirtualFieldSource.
+///
+/// resume.py:1552-1596 decode_int/decode_ref: tagged values encode where
+/// each field value comes from at resume time.
+///
+/// `consts` is the rd_consts array. `count` is the number of fail_args
+/// (used for negative TAGBOX indices). Both come from the containing
+/// ResumeGuardDescr / EncodedResumeData.
+pub fn tagged_to_source(tagged: i16, consts: &[i64], count: i32) -> VirtualFieldSource {
+    if tagged_eq(tagged, UNASSIGNED) {
+        return ResumeValueSource::Unavailable;
+    }
+    if tagged_eq(tagged, UNINITIALIZED_TAG) {
+        return ResumeValueSource::Uninitialized;
+    }
+    if tagged_eq(tagged, NULLREF) {
+        return ResumeValueSource::Constant(0);
+    }
+    let (num, tag_bits) = untag(tagged);
+    match tag_bits {
+        TAGCONST => {
+            let idx = (num - TAG_CONST_OFFSET) as usize;
+            if idx < consts.len() {
+                ResumeValueSource::Constant(consts[idx])
+            } else {
+                ResumeValueSource::Constant(0)
+            }
+        }
+        TAGINT => ResumeValueSource::Constant(num as i64),
+        TAGBOX => {
+            let mut idx = num;
+            if idx < 0 {
+                idx += count;
+            }
+            ResumeValueSource::FailArg(idx as usize)
+        }
+        TAGVIRTUAL => ResumeValueSource::Virtual(num as usize),
+        _ => ResumeValueSource::Unavailable,
+    }
+}
+
+/// Convert an `RdVirtualInfo` (IR-level, from compile.rs/pyjitpl.rs)
+/// to a `VirtualInfo` (resume-level, used by ResumeDataDirectReader).
+///
+/// `consts` and `count` are needed to decode tagged fieldnums.
+pub fn rd_virtual_to_virtual_info(
+    rd: &majit_ir::RdVirtualInfo,
+    consts: &[i64],
+    count: i32,
+) -> VirtualInfo {
+    match rd {
+        majit_ir::RdVirtualInfo::Instance {
+            descr,
+            descr_index,
+            fielddescrs,
+            fieldnums,
+            descr_size,
+            ..
+        } => {
+            let fields = fielddescrs
+                .iter()
+                .zip(fieldnums.iter())
+                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count)))
+                .collect();
+            VirtualInfo::VirtualObj {
+                descr: descr.clone(),
+                type_id: 0,
+                descr_index: *descr_index,
+                fields,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
+            }
+        }
+        majit_ir::RdVirtualInfo::Struct {
+            typedescr,
+            type_id,
+            descr_index,
+            fielddescrs,
+            fieldnums,
+            descr_size,
+        } => {
+            let fields = fielddescrs
+                .iter()
+                .zip(fieldnums.iter())
+                .map(|(fd, &tagged)| (fd.index, tagged_to_source(tagged, consts, count)))
+                .collect();
+            VirtualInfo::VStruct {
+                typedescr: typedescr.clone(),
+                type_id: *type_id,
+                descr_index: *descr_index,
+                fields,
+                fielddescrs: fielddescrs.clone(),
+                descr_size: *descr_size,
+            }
+        }
+        majit_ir::RdVirtualInfo::Array {
+            descr_index,
+            fieldnums,
+            ..
+        } => {
+            let items = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VArray {
+                descr_index: *descr_index,
+                items,
+            }
+        }
+        majit_ir::RdVirtualInfo::ArrayStruct {
+            descr_index,
+            size,
+            fielddescr_indices,
+            fieldnums,
+            ..
+        } => {
+            let num_fields = fielddescr_indices.len().max(1);
+            let mut element_fields = Vec::new();
+            for chunk in fieldnums.chunks(num_fields) {
+                let elem: Vec<(u32, VirtualFieldSource)> = fielddescr_indices
+                    .iter()
+                    .zip(chunk.iter())
+                    .map(|(&fd_idx, &tagged)| (fd_idx, tagged_to_source(tagged, consts, count)))
+                    .collect();
+                element_fields.push(elem);
+            }
+            if element_fields.is_empty() {
+                for _ in 0..*size {
+                    element_fields.push(vec![]);
+                }
+            }
+            VirtualInfo::VArrayStruct {
+                descr_index: *descr_index,
+                element_fields,
+            }
+        }
+        majit_ir::RdVirtualInfo::RawBuffer {
+            size,
+            offsets,
+            entry_sizes,
+            fieldnums,
+        } => {
+            let entries = offsets
+                .iter()
+                .zip(entry_sizes.iter())
+                .zip(fieldnums.iter())
+                .map(|((&off, &sz), &tagged)| (off, sz, tagged_to_source(tagged, consts, count)))
+                .collect();
+            VirtualInfo::VRawBuffer {
+                size: *size,
+                entries,
+            }
+        }
+        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+            let parent = fieldnums
+                .first()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .unwrap_or(ResumeValueSource::Unavailable);
+            VirtualInfo::VRawSlice {
+                offset: *offset as i64,
+                parent,
+            }
+        }
+        majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
+            descr: None,
+            type_id: 0,
+            descr_index: 0,
+            fields: vec![],
+            fielddescrs: vec![],
+            descr_size: 0,
+        },
+    }
+}
+
 /// Deferred heap write to replay during resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFieldInfo {
@@ -1417,15 +1513,15 @@ pub struct PendingFieldInfo {
 }
 
 impl PendingFieldInfo {
-    pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> PendingFieldLayoutSummary {
+    pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
         PendingFieldLayoutSummary {
             descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.item_index.is_some(),
             target_kind: self.target.kind(),
             value_kind: self.value.kind(),
-            target: self.target.layout_summary(fail_arg_positions),
-            value: self.value.layout_summary(fail_arg_positions),
+            target: self.target.layout_summary(),
+            value: self.value.layout_summary(),
         }
     }
 }
@@ -1465,67 +1561,35 @@ impl EncodedResumeData {
         let mut code = vec![0, 0, encode_len(frames.len())];
         let mut consts = Vec::new();
         let mut const_indices = HashMap::new();
-        let mut num_fail_args = 0usize;
-        let mut fail_arg_positions = Vec::new();
-        let mut fail_arg_indices = HashMap::new();
+
         for frame in frames {
             code.push(encode_u64(frame.pc));
             code.push(encode_len(frame.slot_map.len()));
             for source in &frame.slot_map {
-                let encoded = Self::encode_source(
-                    source,
-                    &mut consts,
-                    &mut const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
-                );
+                let encoded = Self::encode_source(source, &mut consts, &mut const_indices);
                 code.push(encoded);
             }
         }
-        code.push(encode_len(virtuals.len()));
-        for virtual_info in virtuals {
-            Self::encode_virtual(
-                virtual_info,
-                &mut code,
-                &mut consts,
-                &mut const_indices,
-                &mut num_fail_args,
-                &mut fail_arg_positions,
-                &mut fail_arg_indices,
-            );
-        }
+        // compile.py:858 rd_virtuals — stored as live objects, not serialized.
+        // RPython keeps VirtualInfo/VStructInfo on ResumeGuardDescr.rd_virtuals
+        // as direct Python objects. We do the same: clone into rd_virtuals field.
+        let rd_virtuals = virtuals.to_vec();
         let pending_fields = pending_fields
             .iter()
             .map(|pending| EncodedPendingFieldWrite {
                 descr_index: pending.descr_index,
-                target: Self::encode_source(
-                    &pending.target,
-                    &mut consts,
-                    &mut const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
-                ),
-                value: Self::encode_source(
-                    &pending.value,
-                    &mut consts,
-                    &mut const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
-                ),
+                target: Self::encode_source(&pending.target, &mut consts, &mut const_indices),
+                value: Self::encode_source(&pending.value, &mut consts, &mut const_indices),
                 item_index: pending.item_index,
             })
             .collect();
         code[0] = encode_len(code.len());
-        code[1] = encode_len(num_fail_args);
         EncodedResumeData {
             code,
             consts,
-            num_fail_args,
-            fail_arg_positions,
+
             pending_fields,
+            rd_virtuals,
         }
     }
 
@@ -1533,20 +1597,9 @@ impl EncodedResumeData {
         source: &ResumeValueSource,
         consts: &mut Vec<i64>,
         const_indices: &mut HashMap<i64, usize>,
-        num_fail_args: &mut usize,
-        fail_arg_positions: &mut Vec<usize>,
-        fail_arg_indices: &mut HashMap<usize, usize>,
     ) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => {
-                let compact_index = *fail_arg_indices.entry(*index).or_insert_with(|| {
-                    let next_index = fail_arg_positions.len();
-                    fail_arg_positions.push(*index);
-                    next_index
-                });
-                *num_fail_args = fail_arg_positions.len();
-                tag_value(encode_len(compact_index), LEGACY_TAGBOX)
-            }
+            ResumeValueSource::FailArg(index) => tag_value(encode_len(*index), LEGACY_TAGBOX),
             ResumeValueSource::Constant(value) if can_inline_tagged(*value) => {
                 tag_value(*value, LEGACY_TAGINT)
             }
@@ -1564,169 +1617,6 @@ impl EncodedResumeData {
         }
     }
 
-    fn encode_virtual(
-        virtual_info: &VirtualInfo,
-        code: &mut Vec<i64>,
-        consts: &mut Vec<i64>,
-        const_indices: &mut HashMap<i64, usize>,
-        num_fail_args: &mut usize,
-        fail_arg_positions: &mut Vec<usize>,
-        fail_arg_indices: &mut HashMap<usize, usize>,
-    ) {
-        match virtual_info {
-            VirtualInfo::VirtualObj {
-                descr,
-                type_id,
-                descr_index,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => {
-                code.push(EncodedVirtualKind::VirtualObj as i64);
-                code.push(i64::from(*type_id));
-                code.push(i64::from(*descr_index));
-                // resume.py:615 descr.vtable — encode for round-trip reconstruction.
-                let vtable = descr
-                    .as_ref()
-                    .and_then(|d| d.as_size_descr())
-                    .map(|sd| sd.vtable())
-                    .unwrap_or(0);
-                code.push(vtable as i64);
-                code.push(encode_len(fields.len()));
-                for (field_index, source) in fields {
-                    code.push(i64::from(*field_index));
-                    code.push(Self::encode_source(
-                        source,
-                        consts,
-                        const_indices,
-                        num_fail_args,
-                        fail_arg_positions,
-                        fail_arg_indices,
-                    ));
-                }
-                // Encode fielddescrs + descr_size
-                code.push(encode_len(fielddescrs.len()));
-                for fd in fielddescrs {
-                    code.push(i64::from(fd.index));
-                    code.push(fd.offset as i64);
-                    code.push(match fd.field_type {
-                        majit_ir::Type::Void => 0,
-                        majit_ir::Type::Int => 1,
-                        majit_ir::Type::Ref => 2,
-                        majit_ir::Type::Float => 3,
-                    });
-                    code.push(fd.field_size as i64);
-                }
-                code.push(*descr_size as i64);
-            }
-            VirtualInfo::VStruct {
-                type_id,
-                descr_index,
-                fields,
-                fielddescrs,
-                descr_size,
-                ..
-            } => {
-                code.push(EncodedVirtualKind::VStruct as i64);
-                code.push(i64::from(*type_id));
-                code.push(i64::from(*descr_index));
-                code.push(encode_len(fields.len()));
-                for (field_index, source) in fields {
-                    code.push(i64::from(*field_index));
-                    code.push(Self::encode_source(
-                        source,
-                        consts,
-                        const_indices,
-                        num_fail_args,
-                        fail_arg_positions,
-                        fail_arg_indices,
-                    ));
-                }
-                code.push(encode_len(fielddescrs.len()));
-                for fd in fielddescrs {
-                    code.push(i64::from(fd.index));
-                    code.push(fd.offset as i64);
-                    code.push(match fd.field_type {
-                        majit_ir::Type::Void => 0,
-                        majit_ir::Type::Int => 1,
-                        majit_ir::Type::Ref => 2,
-                        majit_ir::Type::Float => 3,
-                    });
-                    code.push(fd.field_size as i64);
-                }
-                code.push(*descr_size as i64);
-            }
-            VirtualInfo::VArray { descr_index, items } => {
-                code.push(EncodedVirtualKind::VArray as i64);
-                code.push(i64::from(*descr_index));
-                code.push(encode_len(items.len()));
-                for source in items {
-                    code.push(Self::encode_source(
-                        source,
-                        consts,
-                        const_indices,
-                        num_fail_args,
-                        fail_arg_positions,
-                        fail_arg_indices,
-                    ));
-                }
-            }
-            VirtualInfo::VArrayStruct {
-                descr_index,
-                element_fields,
-            } => {
-                code.push(EncodedVirtualKind::VArrayStruct as i64);
-                code.push(i64::from(*descr_index));
-                code.push(encode_len(element_fields.len()));
-                for element in element_fields {
-                    code.push(encode_len(element.len()));
-                    for (field_index, source) in element {
-                        code.push(i64::from(*field_index));
-                        code.push(Self::encode_source(
-                            source,
-                            consts,
-                            const_indices,
-                            num_fail_args,
-                            fail_arg_positions,
-                            fail_arg_indices,
-                        ));
-                    }
-                }
-            }
-            VirtualInfo::VRawBuffer { size, entries } => {
-                code.push(EncodedVirtualKind::VRawBuffer as i64);
-                code.push(encode_len(*size));
-                code.push(encode_len(entries.len()));
-                for (offset, size_in_bytes, source) in entries {
-                    code.push(encode_len(*offset));
-                    code.push(encode_len(*size_in_bytes));
-                    code.push(Self::encode_source(
-                        source,
-                        consts,
-                        const_indices,
-                        num_fail_args,
-                        fail_arg_positions,
-                        fail_arg_indices,
-                    ));
-                }
-            }
-            // String/unicode/raw-slice virtuals: encode as empty struct
-            // (reconstruction uses the VirtualInfo directly, not encoded form)
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => {
-                code.push(EncodedVirtualKind::VStruct as i64);
-                code.push(0); // type_id
-                code.push(0); // descr_index
-                code.push(0); // num fields
-            }
-        }
-    }
-
     fn decode_layout(&self) -> DecodedResumeLayout {
         let mut cursor = 0usize;
         let encoded_items = self.next_word(&mut cursor);
@@ -1735,17 +1625,7 @@ impl EncodedResumeData {
             self.code.len(),
             "resume item count mismatch"
         );
-        let encoded_fail_args = self.next_word(&mut cursor);
-        assert_eq!(
-            decode_len(encoded_fail_args),
-            self.num_fail_args,
-            "resume fail-arg count mismatch"
-        );
-        assert_eq!(
-            self.fail_arg_positions.len(),
-            self.num_fail_args,
-            "resume fail-arg position map mismatch"
-        );
+        let _reserved = self.next_word(&mut cursor);
 
         let num_frames = decode_len(self.next_word(&mut cursor));
         let mut frames = Vec::with_capacity(num_frames);
@@ -1759,11 +1639,8 @@ impl EncodedResumeData {
             frames.push(FrameInfo { pc, slot_map });
         }
 
-        let num_virtuals = decode_len(self.next_word(&mut cursor));
-        let mut virtuals = Vec::with_capacity(num_virtuals);
-        for _ in 0..num_virtuals {
-            virtuals.push(self.decode_virtual(&mut cursor));
-        }
+        // compile.py:858 rd_virtuals — live objects, not deserialized from code[].
+        let virtuals = self.rd_virtuals.clone();
 
         assert_eq!(cursor, self.code.len(), "resume decoder left trailing data");
         let pending_fields = self
@@ -1797,14 +1674,7 @@ impl EncodedResumeData {
         let (value, tag) = untag_value(encoded);
         match tag {
             LEGACY_TAGINT => ResumeValueSource::Constant(value),
-            LEGACY_TAGBOX => {
-                let compact_index = decode_len(value);
-                let raw_index = *self
-                    .fail_arg_positions
-                    .get(compact_index)
-                    .expect("resume fail-arg position out of bounds");
-                ResumeValueSource::FailArg(raw_index)
-            }
+            LEGACY_TAGBOX => ResumeValueSource::FailArg(decode_len(value)),
             LEGACY_TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
             LEGACY_TAGCONST => match value {
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
@@ -1818,161 +1688,6 @@ impl EncodedResumeData {
                 other => panic!("unknown CONST-tagged resume sentinel {other}"),
             },
             other => panic!("unknown resume tag {other}"),
-        }
-    }
-
-    fn decode_virtual(&self, cursor: &mut usize) -> VirtualInfo {
-        let kind = EncodedVirtualKind::from_word(self.next_word(cursor));
-        match kind {
-            EncodedVirtualKind::VirtualObj => {
-                let type_id = u32::try_from(self.next_word(cursor)).expect("negative type_id");
-                let descr_index =
-                    u32::try_from(self.next_word(cursor)).expect("negative descr_index");
-                let vtable = self.next_word(cursor) as usize;
-                let field_count = decode_len(self.next_word(cursor));
-                let mut fields = Vec::with_capacity(field_count);
-                for _ in 0..field_count {
-                    let field_index =
-                        u32::try_from(self.next_word(cursor)).expect("negative field index");
-                    let source = self.decode_source(self.next_word(cursor));
-                    fields.push((field_index, source));
-                }
-                let fd_count = decode_len(self.next_word(cursor));
-                let mut fielddescrs = Vec::with_capacity(fd_count);
-                for _ in 0..fd_count {
-                    let idx = u32::try_from(self.next_word(cursor)).unwrap_or(0);
-                    let offset = self.next_word(cursor) as usize;
-                    let ft = match self.next_word(cursor) as u8 {
-                        0 => majit_ir::Type::Void,
-                        1 => majit_ir::Type::Int,
-                        2 => majit_ir::Type::Ref,
-                        3 => majit_ir::Type::Float,
-                        _ => majit_ir::Type::Int,
-                    };
-                    let fs = self.next_word(cursor) as usize;
-                    fielddescrs.push(majit_ir::FieldDescrInfo {
-                        index: idx,
-                        offset,
-                        field_type: ft,
-                        field_size: fs,
-                    });
-                }
-                let descr_size = self.next_word(cursor) as usize;
-                // resume.py:615 reconstruct self.descr from encoded size/type_id/vtable.
-                let descr = if descr_size > 0 || type_id > 0 || vtable > 0 {
-                    Some(majit_ir::make_size_descr_with_vtable(
-                        descr_index,
-                        descr_size,
-                        type_id,
-                        vtable,
-                    ))
-                } else {
-                    None
-                };
-                VirtualInfo::VirtualObj {
-                    descr,
-                    type_id,
-                    descr_index,
-                    fields,
-                    fielddescrs,
-                    descr_size,
-                }
-            }
-            EncodedVirtualKind::VStruct => {
-                let type_id = u32::try_from(self.next_word(cursor)).expect("negative type_id");
-                let descr_index =
-                    u32::try_from(self.next_word(cursor)).expect("negative descr_index");
-                let field_count = decode_len(self.next_word(cursor));
-                let mut fields = Vec::with_capacity(field_count);
-                for _ in 0..field_count {
-                    let field_index =
-                        u32::try_from(self.next_word(cursor)).expect("negative field index");
-                    let source = self.decode_source(self.next_word(cursor));
-                    fields.push((field_index, source));
-                }
-                let fd_count = decode_len(self.next_word(cursor));
-                let mut fielddescrs = Vec::with_capacity(fd_count);
-                for _ in 0..fd_count {
-                    let idx = u32::try_from(self.next_word(cursor)).unwrap_or(0);
-                    let offset = self.next_word(cursor) as usize;
-                    let ft = match self.next_word(cursor) as u8 {
-                        0 => majit_ir::Type::Void,
-                        1 => majit_ir::Type::Int,
-                        2 => majit_ir::Type::Ref,
-                        3 => majit_ir::Type::Float,
-                        _ => majit_ir::Type::Int,
-                    };
-                    let fs = self.next_word(cursor) as usize;
-                    fielddescrs.push(majit_ir::FieldDescrInfo {
-                        index: idx,
-                        offset,
-                        field_type: ft,
-                        field_size: fs,
-                    });
-                }
-                let descr_size = self.next_word(cursor) as usize;
-                // resume.py:631 reconstruct self.typedescr from encoded size/type_id.
-                let typedescr = if descr_size > 0 || type_id > 0 {
-                    Some(majit_ir::make_size_descr_full(
-                        descr_index,
-                        descr_size,
-                        type_id,
-                    ))
-                } else {
-                    None
-                };
-                VirtualInfo::VStruct {
-                    typedescr,
-                    type_id,
-                    descr_index,
-                    fields,
-                    fielddescrs,
-                    descr_size,
-                }
-            }
-            EncodedVirtualKind::VArray => {
-                let descr_index =
-                    u32::try_from(self.next_word(cursor)).expect("negative descr_index");
-                let item_count = decode_len(self.next_word(cursor));
-                let mut items = Vec::with_capacity(item_count);
-                for _ in 0..item_count {
-                    items.push(self.decode_source(self.next_word(cursor)));
-                }
-                VirtualInfo::VArray { descr_index, items }
-            }
-            EncodedVirtualKind::VArrayStruct => {
-                let descr_index =
-                    u32::try_from(self.next_word(cursor)).expect("negative descr_index");
-                let element_count = decode_len(self.next_word(cursor));
-                let mut element_fields = Vec::with_capacity(element_count);
-                for _ in 0..element_count {
-                    let field_count = decode_len(self.next_word(cursor));
-                    let mut fields = Vec::with_capacity(field_count);
-                    for _ in 0..field_count {
-                        let field_index =
-                            u32::try_from(self.next_word(cursor)).expect("negative field index");
-                        let source = self.decode_source(self.next_word(cursor));
-                        fields.push((field_index, source));
-                    }
-                    element_fields.push(fields);
-                }
-                VirtualInfo::VArrayStruct {
-                    descr_index,
-                    element_fields,
-                }
-            }
-            EncodedVirtualKind::VRawBuffer => {
-                let size = decode_len(self.next_word(cursor));
-                let entry_count = decode_len(self.next_word(cursor));
-                let mut entries = Vec::with_capacity(entry_count);
-                for _ in 0..entry_count {
-                    let offset = decode_len(self.next_word(cursor));
-                    let size_in_bytes = decode_len(self.next_word(cursor));
-                    let source = self.decode_source(self.next_word(cursor));
-                    entries.push((offset, size_in_bytes, source));
-                }
-                VirtualInfo::VRawBuffer { size, entries }
-            }
         }
     }
 
@@ -2009,7 +1724,7 @@ impl EncodedResumeData {
                     slot_layouts: frame
                         .slot_map
                         .iter()
-                        .map(|source| source.layout_summary(&self.fail_arg_positions))
+                        .map(|source| source.layout_summary())
                         .collect(),
                     slot_types: None,
                 })
@@ -2019,15 +1734,14 @@ impl EncodedResumeData {
             virtual_layouts: layout
                 .virtuals
                 .iter()
-                .map(|virt| virt.layout_summary(&self.fail_arg_positions))
+                .map(|virt| virt.layout_summary())
                 .collect(),
-            num_fail_args: self.num_fail_args,
-            fail_arg_positions: self.fail_arg_positions.clone(),
+
             pending_field_count: layout.pending_fields.len(),
             pending_field_layouts: layout
                 .pending_fields
                 .iter()
-                .map(|pending| pending.layout_summary(&self.fail_arg_positions))
+                .map(|pending| pending.layout_summary())
                 .collect(),
             const_pool_size: self.consts.len(),
         }
@@ -2081,14 +1795,6 @@ impl EncodedResumeData {
     ) -> Vec<ResolvedPendingFieldWrite> {
         let layout = self.decode_layout();
         ResumeData::resolve_pending_field_writes(&layout.pending_fields, fail_values)
-    }
-
-    /// Project raw backend fail values down to the compact numbering used by this snapshot.
-    pub fn compact_fail_values(&self, raw_fail_values: &[i64]) -> Vec<i64> {
-        self.fail_arg_positions
-            .iter()
-            .map(|&raw_index| raw_fail_values.get(raw_index).copied().unwrap_or(0))
-            .collect()
     }
 }
 
@@ -3580,10 +3286,6 @@ impl ResumeDataLoopMemo {
     /// across all guards encoded through this memo.
     pub fn encode_shared(&mut self, rd: &ResumeData) -> EncodedResumeData {
         let mut code = vec![0, 0, encode_len(rd.frames.len())];
-        let mut num_fail_args = 0usize;
-        let mut fail_arg_positions = Vec::new();
-        let mut fail_arg_indices = HashMap::new();
-
         for frame in &rd.frames {
             code.push(encode_u64(frame.pc));
             code.push(encode_len(frame.slot_map.len()));
@@ -3592,25 +3294,11 @@ impl ResumeDataLoopMemo {
                     source,
                     &mut self.legacy_consts,
                     &mut self.const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
                 );
                 code.push(encoded);
             }
         }
-        code.push(encode_len(rd.virtuals.len()));
-        for vinfo in &rd.virtuals {
-            EncodedResumeData::encode_virtual(
-                vinfo,
-                &mut code,
-                &mut self.legacy_consts,
-                &mut self.const_indices,
-                &mut num_fail_args,
-                &mut fail_arg_positions,
-                &mut fail_arg_indices,
-            );
-        }
+        let rd_virtuals = rd.virtuals.clone();
         let pending_fields = rd
             .pending_fields
             .iter()
@@ -3620,30 +3308,21 @@ impl ResumeDataLoopMemo {
                     &pending.target,
                     &mut self.legacy_consts,
                     &mut self.const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
                 ),
                 value: EncodedResumeData::encode_source(
                     &pending.value,
                     &mut self.legacy_consts,
                     &mut self.const_indices,
-                    &mut num_fail_args,
-                    &mut fail_arg_positions,
-                    &mut fail_arg_indices,
                 ),
                 item_index: pending.item_index,
             })
             .collect();
         code[0] = encode_len(code.len());
-        code[1] = encode_len(num_fail_args);
-
         EncodedResumeData {
             code,
             consts: self.legacy_consts.clone(),
-            num_fail_args,
-            fail_arg_positions,
             pending_fields,
+            rd_virtuals,
         }
     }
 
@@ -4785,14 +4464,14 @@ mod tests {
                         },
                         ResumeValueLayoutSummary {
                             kind: ResumeValueKind::Constant,
-                            fail_arg_index: None,
+                            fail_arg_index: 0,
                             raw_fail_arg_position: None,
                             constant: Some(77),
                             virtual_index: None,
                         },
                         ResumeValueLayoutSummary {
                             kind: ResumeValueKind::Virtual,
-                            fail_arg_index: None,
+                            fail_arg_index: 0,
                             raw_fail_arg_position: None,
                             constant: None,
                             virtual_index: Some(0),
@@ -4812,14 +4491,14 @@ mod tests {
                     slot_layouts: vec![
                         ResumeValueLayoutSummary {
                             kind: ResumeValueKind::Unavailable,
-                            fail_arg_index: None,
+                            fail_arg_index: 0,
                             raw_fail_arg_position: None,
                             constant: None,
                             virtual_index: None,
                         },
                         ResumeValueLayoutSummary {
                             kind: ResumeValueKind::Uninitialized,
-                            fail_arg_index: None,
+                            fail_arg_index: 0,
                             raw_fail_arg_position: None,
                             constant: None,
                             virtual_index: None,
@@ -4860,7 +4539,7 @@ mod tests {
                 },
                 value: ResumeValueLayoutSummary {
                     kind: ResumeValueKind::Constant,
-                    fail_arg_index: None,
+                    fail_arg_index: 0,
                     raw_fail_arg_position: None,
                     constant: Some(88),
                     virtual_index: None,
@@ -5018,7 +4697,7 @@ mod tests {
                 slot_sources: vec![ResumeValueKind::Virtual],
                 slot_layouts: vec![ResumeValueLayoutSummary {
                     kind: ResumeValueKind::Virtual,
-                    fail_arg_index: None,
+                    fail_arg_index: 0,
                     raw_fail_arg_position: None,
                     constant: None,
                     virtual_index: Some(0),
@@ -5048,7 +4727,7 @@ mod tests {
                 value_kind: ResumeValueKind::FailArg,
                 target: ResumeValueLayoutSummary {
                     kind: ResumeValueKind::Virtual,
-                    fail_arg_index: None,
+                    fail_arg_index: 0,
                     raw_fail_arg_position: None,
                     constant: None,
                     virtual_index: Some(0),

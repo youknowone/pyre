@@ -245,12 +245,12 @@ acceptable structural difference since pyre generates the JitCode.
 
 ### Remaining gaps
 
-- **`setposition` constants_r/constants_f copy** — ✅ blackhole.rs
-- **JitCode.is_portal** — ✅ jitcode/mod.rs
-- **LivenessInfo.live_r_regs/live_f_regs** — ✅ jitcode/mod.rs + data.rs
-- **`_handle_jitexception_in_portal` full impl** — stub only (needs jitdriver_sd infra)
-- **codewriter liveness emit for r/f regs** — blocked on full-function JitCode
+- **`_handle_jitexception_in_portal`** — ✅ implemented (DoneWithThisFrame*, ExitFrameWithException, ContinueRunningNormally→void)
+- **`RdVirtualInfo` → `VirtualInfo` conversion** — ✅ `rd_virtual_to_virtual_info()` in resume.rs, wired into both jitdriver.rs paths
+- **Liveness-based resume filling** — analysis done, safe to enable but not needed (positional filling works). `use_liveness=false` in call_jit.rs:889
+- **Loop invalidation after blackhole** — cannot remove yet. SEGFAULT on fannkuch/spectral_norm without it. Root cause: rd_numb incomplete (stale frame slots)
 - **`ResumeGuardCopiedDescr`** — not ported (guard copy shares resume storage)
+- **codewriter liveness emit for r/f regs** — blocked on full-function JitCode
 
 ---
 

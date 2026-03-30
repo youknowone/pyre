@@ -750,6 +750,11 @@ pub struct ResumedFrame {
     pub code: *const pyre_bytecode::CodeObject,
     /// resume.py:1050 pc (Python bytecode PC for blackhole setposition).
     pub py_pc: usize,
+    /// Raw frame.pc from rd_numb (= orgpc from snapshot).
+    /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
+    ///   pc=0 is valid (function start / loop header at bytecode 0).
+    /// None: no-snapshot guard (rd_numb pc=-1), positional fallback.
+    pub rd_numb_pc: Option<usize>,
     /// Frame pointer for this stack frame.
     pub frame_ptr: *mut PyFrame,
     /// resume.py:928-931 consume_one_section: resolved values.
@@ -852,6 +857,9 @@ pub fn resume_in_blackhole(
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
         // Set merge_point on the OUTERMOST (last = caller) blackhole.
+        // When the blackhole reaches this PC, it exits with
+        // ContinueRunningNormally so the JIT dispatch can re-enter
+        // compiled code.
         if sec_idx == frames.len() - 1 {
             if let Some(merge_jitcode_pc) =
                 crate::jit::codewriter::jitcode_pc_for_loop_header(&pyjitcode.pc_map, merge_py_pc)
@@ -872,21 +880,51 @@ pub fn resume_in_blackhole(
         }
 
         // resume.py:1381 consume_one_section → 1017 _prepare_next_section
-        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
-        // → liveness.py:170 LivenessIterator: compact values consumed
-        //   in liveness order. Dead registers keep setposition() defaults.
-        //
-        // TODO: activate liveness-based filling once ALL guards have
-        // snapshot with correct orgpc (encoder-decoder liveness parity).
-        for i in 0..nlocals {
-            if let Some(val) = section.values.get(3 + i) {
-                bh.setarg_r(i, materialize_virtual(val));
+        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_i, cb_r, cb_f)
+        // → liveness.py:170 LivenessIterator: iterate ONLY live registers.
+        // rd_numb_pc = Some(orgpc): snapshot guard, liveness-safe.
+        // rd_numb_pc = None: no-snapshot guard, positional fallback.
+        // TODO: liveness-based filling requires the encoder
+        // (get_list_of_active_boxes) to use the SAME liveness data.
+        // Currently the encoder's liveness may differ from the decoder's
+        // (different CodeObject pointer due to CPython specialization),
+        // so liveness filtering is disabled until encoder parity is verified.
+        let use_liveness = false;
+        if use_liveness {
+            let live = pyre_jit_trace::state::liveness_for(section.code);
+            let live_pc = section.rd_numb_pc.unwrap(); // = encoder's orgpc
+            let mut val_idx = 3; // skip [frame, ni, vsd] header
+            for i in 0..nlocals {
+                if live.is_local_live(live_pc, i) {
+                    if let Some(val) = section.values.get(val_idx) {
+                        bh.setarg_r(i, materialize_virtual(val));
+                    }
+                    val_idx += 1;
+                }
             }
-        }
-        let stack_only = vsd.saturating_sub(nlocals);
-        for i in 0..stack_only {
-            if let Some(val) = section.values.get(3 + nlocals + i) {
-                bh.runtime_stack_push(0, materialize_virtual(val));
+            let max_stack = vsd.saturating_sub(nlocals);
+            for i in 0..max_stack {
+                if live.is_stack_live(live_pc, i) {
+                    if let Some(val) = section.values.get(val_idx) {
+                        bh.runtime_stack_push(0, materialize_virtual(val));
+                    }
+                    val_idx += 1;
+                }
+            }
+        } else {
+            // Positional filling: values[3+i] → register[i].
+            // Valid when encoder included all locals (no liveness filtering)
+            // or when all locals happen to be live (common in loops).
+            for i in 0..nlocals {
+                if let Some(val) = section.values.get(3 + i) {
+                    bh.setarg_r(i, materialize_virtual(val));
+                }
+            }
+            let stack_only = vsd.saturating_sub(nlocals);
+            for i in 0..stack_only {
+                if let Some(val) = section.values.get(3 + nlocals + i) {
+                    bh.runtime_stack_push(0, materialize_virtual(val));
+                }
             }
         }
         // pyre convention: frame pointer in int register 3 for writeback.
@@ -918,18 +956,26 @@ pub fn resume_in_blackhole(
         bh.run();
 
         if bh.reached_merge_point {
-            // RPython bhimpl_jit_merge_point:
-            // if nextblackholeinterp is None → ContinueRunningNormally
             // Write back to the frame that owns this merge point.
             let frame_ptr = bh.registers_i.get(3).copied().unwrap_or(0) as *mut PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &mut *frame_ptr };
                 let code = unsafe { &*frame.code };
                 let nlocals = code.varnames.len();
+                // Only write back locals that the blackhole actually
+                // has valid values for. rd_numb may not cover all locals,
+                // leaving some registers at 0 (null). Writing null over
+                // a valid PyObjectRef causes SEGFAULT on re-entry.
+                // RPython avoids this because rd_numb always covers all
+                // live values, so all registers are correctly filled.
                 for i in 0..nlocals {
                     if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
-                        frame.locals_cells_stack_w[i] =
-                            bh.registers_r[i] as pyre_object::PyObjectRef;
+                        let bh_val = bh.registers_r[i] as pyre_object::PyObjectRef;
+                        if !bh_val.is_null() {
+                            frame.locals_cells_stack_w[i] = bh_val;
+                        }
+                        // If bh_val is null, keep the existing frame value.
+                        // This preserves locals that rd_numb didn't cover.
                     }
                 }
                 let stack = bh.runtime_stack_drain(0);
@@ -941,9 +987,6 @@ pub fn resume_in_blackhole(
                     }
                 }
                 frame.next_instr = merge_py_pc;
-                // RPython parity: blackhole writeback succeeds unconditionally.
-                // The blackhole interpreter produces correct values by
-                // construction (all operations are concrete Python calls).
             }
             builder.release_interp(bh);
             return BlackholeResult::ContinueRunningNormally;

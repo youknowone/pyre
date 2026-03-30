@@ -1331,9 +1331,9 @@ fn execute_assembler(
                         // valid and guard failure counter accumulates for
                         // bridge compilation.
                         //
-                        // TODO(parity): remove when guard recovery produces
-                        // fully correct frame state. Currently needed to
-                        // prevent SEGFAULT on re-entry with subtly wrong state.
+                        // Pyre: invalidate until rd_numb snapshot uses
+                        // get_list_of_active_boxes (issue #2) and liveness-
+                        // based filling is enabled (issue #4).
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
@@ -2511,6 +2511,7 @@ fn restore_guard_failure_for_loop(
             vec![crate::call_jit::ResumedFrame {
                 code,
                 py_pc,
+                rd_numb_pc: None, // empty rd_numb: no orgpc available
                 frame_ptr,
                 values: typed.clone(),
             }]
@@ -2785,6 +2786,13 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
+            // frame.pc >= 0: orgpc from snapshot (liveness-safe).
+            // frame.pc < 0 (== -1): no-snapshot guard (positional only).
+            rd_numb_pc: if frame.pc >= 0 {
+                Some(frame.pc as usize)
+            } else {
+                None
+            },
             frame_ptr,
             values,
         });

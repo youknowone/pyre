@@ -62,10 +62,7 @@ pub struct SnapshotFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotTagged {
     /// Value from deadframe fail_args slot.
-    /// RPython: InputArgRef/InputArgInt carry type ('r'/'i'/'f').
-    /// The Type field preserves this for correct virtual detection
-    /// in _number_boxes (resume.py:210-216: box.type == 'r' vs 'i').
-    Box(u32, majit_ir::Type),
+    Box(u32),
     /// Compile-time constant value with type.
     /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.

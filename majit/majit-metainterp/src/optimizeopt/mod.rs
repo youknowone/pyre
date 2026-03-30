@@ -264,10 +264,6 @@ pub struct OptContext {
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
-    /// RPython box.type parity: each snapshot Box carries its type.
-    /// Used by InlineBoxEnv.get_type() to avoid fallback to Int for
-    /// unresolved OpRefs (resume.py:210 box.type == 'r' vs 'i').
-    pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
     /// compile.rs value_types parity: OpRef → Type for all defined values
     /// (inputargs + operation results). Used by store_final_boxes_in_guard
     /// to infer fail_arg types correctly for OpRefs from earlier phases.
@@ -447,7 +443,6 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            snapshot_box_types: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -500,7 +495,6 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            snapshot_box_types: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1780,10 +1774,6 @@ impl OptContext {
                     return val.get_type();
                 }
                 if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
-                    return tp;
-                }
-                // RPython box.type parity: snapshot Box carries its type.
-                if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
                     return tp;
                 }
                 let resolved = self.ctx.get_box_replacement(opref);

@@ -1160,6 +1160,19 @@ impl<S: JitState> JitDriver<S> {
                     .map(|c| c.iter().map(|(v, _)| *v).collect())
                     .unwrap_or_default();
 
+                // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
+                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
+                    exit_layout.rd_virtuals_info.as_ref().map(|rd_virts| {
+                        let count = raw_values.len() as i32;
+                        rd_virts
+                            .iter()
+                            .map(|rd| {
+                                crate::resume::rd_virtual_to_virtual_info(rd, &rd_consts_i64, count)
+                            })
+                            .collect()
+                    });
+                let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
                 let resolve_jitcode = |_pos: i32, pc: i32| -> Option<crate::jitcode::JitCode> {
                     let factory = self.jitcode_factory.as_ref()?;
@@ -1179,18 +1192,25 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
-                    None,                                    // rd_virtuals
-                    None,                                    // rd_pendingfields (PendingFieldInfo)
+                    rd_virtuals_slice,
+                    None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
-                    None,                                    // vrefinfo
-                    None,                                    // vinfo
-                    None,                                    // ginfo
+                    None, // vrefinfo
+                    None, // vinfo
+                    None, // ginfo
                     allocator,
                 );
                 if let Some(bh) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
-                    let _jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    let jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    // compile.py:716 assert 0, "unreachable"
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bh] back_edge_internal: run_forever completed with {:?}",
+                            jit_exc
+                        );
+                    }
                     return Some(target_pc);
                 }
             }
@@ -2592,16 +2612,25 @@ impl<S: JitState> JitDriver<S> {
             }
 
             // compile.py:711 resume_in_blackhole
-            //
-            // RPython: resume_in_blackhole(metainterp_sd, jitdriver_sd, resumedescr, deadframe)
-            // Uses rd_numb/rd_consts to build blackhole frame chain.
-            // After blackhole completes, does NOT restore shared state.
             if let Some(rd_numb) = exit_layout.rd_numb.as_ref() {
                 let rd_consts_i64: Vec<i64> = exit_layout
                     .rd_consts
                     .as_ref()
                     .map(|c| c.iter().map(|(v, _)| *v).collect())
                     .unwrap_or_default();
+
+                // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
+                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
+                    exit_layout.rd_virtuals_info.as_ref().map(|rd_virts| {
+                        let count = raw_values.len() as i32;
+                        rd_virts
+                            .iter()
+                            .map(|rd| {
+                                crate::resume::rd_virtual_to_virtual_info(rd, &rd_consts_i64, count)
+                            })
+                            .collect()
+                    });
+                let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
                 let jitcode_factory_ref = self.jitcode_factory.as_ref();
@@ -2623,20 +2652,25 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
-                    None,                                    // rd_virtuals
-                    None,                                    // rd_pendingfields (PendingFieldInfo)
+                    rd_virtuals_slice,
+                    None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
-                    None,                                    // vrefinfo
-                    None,                                    // vinfo
-                    None,                                    // ginfo
+                    None, // vrefinfo
+                    None, // vinfo
+                    None, // ginfo
                     allocator,
                 );
                 if let Some(bh) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
-                    let _jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
-                    // RPython: resume_in_blackhole completes via JitException.
-                    // No shared-state restoration after blackhole.
+                    let jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    // compile.py:716 assert 0, "unreachable"
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bh] run_back_edge_generic: run_forever completed with {:?}",
+                            jit_exc
+                        );
+                    }
                     return Some(target_pc);
                 }
             }
