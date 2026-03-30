@@ -236,9 +236,8 @@ impl ResumeDataLoopMemo {
             // resume.py:201-202
             let opref = env.get_box_replacement(raw_opref);
 
-            // resume.py:131 UNINITIALIZED parity: if replacement resolves
-            // to NONE (virtual object forwarded away), encode as NULLREF.
-            // RPython: _gettagged(None) → UNINITIALIZED tag.
+            // Defensive: RPython's get_box_replacement never returns None
+            // for non-None input. If it somehow does, encode as NULLREF.
             if opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;

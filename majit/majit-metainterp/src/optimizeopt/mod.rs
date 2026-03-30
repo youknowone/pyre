@@ -344,18 +344,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if self.ctx.get_ptr_info(opref).is_some() {
             return majit_ir::Type::Ref;
         }
-        // info.py: ConstPtrInfo → Ref
-        if let Some(crate::optimizeopt::info::PtrInfo::Constant(_)) = self.ctx.get_ptr_info(opref) {
-            return majit_ir::Type::Ref;
-        }
         majit_ir::Type::Int
     }
 
     fn is_virtual_ref(&self, opref: OpRef) -> bool {
-        matches!(
-            self.ctx.get_ptr_info(opref),
-            Some(PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_))
-        )
+        // resume.py:210-216: info = getptrinfo(box); is_virtual = info.is_virtual()
+        self.ctx
+            .get_ptr_info(opref)
+            .is_some_and(|info| info.is_virtual())
     }
 
     fn is_virtual_raw(&self, _opref: OpRef) -> bool {
@@ -1091,7 +1087,14 @@ impl OptContext {
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        self.forwarded[idx] = Forwarded::Op(new);
+        // RPython: _forwarded = None means "no forwarding" (terminal).
+        // Forwarded::Op(OpRef::NONE) would break get_box_replacement.
+        // Treat NONE target as clearing the forwarding.
+        if new.is_none() {
+            self.forwarded[idx] = Forwarded::None;
+        } else {
+            self.forwarded[idx] = Forwarded::Op(new);
+        }
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
@@ -1126,7 +1129,11 @@ impl OptContext {
     /// resoperation.py:57-68 get_box_replacement: follow the forwarding
     /// chain (op._forwarded) until we reach a terminal. RPython: walks
     /// op → op._forwarded → ... until None or Info instance.
-    /// In majit: forwarding[idx] == NONE means terminal.
+    ///
+    /// RPython invariant: get_box_replacement NEVER returns None.
+    /// `_forwarded = None` means "no forwarding" (terminal), NOT
+    /// "forwarded to None". Forwarded::Op(OpRef::NONE) is treated
+    /// as terminal — the chain stops at the current opref.
     ///
     /// NEVER consults mapping dicts — RPython's get_box_replacement only
     /// follows the _forwarded chain on the box itself.
@@ -1138,7 +1145,7 @@ impl OptContext {
                 return opref;
             }
             match &self.forwarded[idx] {
-                Forwarded::Op(next) => opref = *next,
+                Forwarded::Op(next) if !next.is_none() => opref = *next,
                 _ => return opref,
             }
         }
@@ -1677,61 +1684,64 @@ impl OptContext {
         impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
             fn get_box_replacement(&self, opref: OpRef) -> OpRef {
                 // resume.py:201-202 box.get_box_replacement()
-                let repl = self.ctx.get_box_replacement(opref);
-                if repl.is_none() && !opref.is_none() {
-                    return opref;
-                }
-                repl
+                self.ctx.get_box_replacement(opref)
             }
             fn is_const(&self, opref: OpRef) -> bool {
                 // resume.py:204: isinstance(box, Const)
-                // RPython: null Ref IS a Const (ConstPtr(null)).
-                // getconst_ref(0) returns NULLREF.
-                self.ctx.is_constant(opref)
+                if self.ctx.is_constant(opref) {
+                    return true;
+                }
+                // info.py: ConstPtrInfo.is_constant() → True
+                matches!(
+                    self.ctx.get_ptr_info(opref),
+                    Some(crate::optimizeopt::info::PtrInfo::Constant(_))
+                )
             }
             fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
-                if let Some(val) = self.ctx.get_constant(opref) {
-                    match val {
-                        Value::Int(i) => (*i, majit_ir::Type::Int),
-                        Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
-                        Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                        Value::Void => (0, majit_ir::Type::Void),
+                // resume.py:204-205: box as Const → getconst(box)
+                // ob_type constants: Value::Int(ptr) with true type Ref.
+                let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
+                match self.ctx.get_constant(opref) {
+                    Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
+                    Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
+                    Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
+                    _ => {
+                        // info.py: ConstPtrInfo — GcRef constant in PtrInfo
+                        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
+                            self.ctx.get_ptr_info(opref)
+                        {
+                            (gcref.0 as i64, majit_ir::Type::Ref)
+                        } else {
+                            (0, majit_ir::Type::Int)
+                        }
                     }
-                } else {
-                    (0, majit_ir::Type::Int)
                 }
             }
             fn get_type(&self, opref: OpRef) -> majit_ir::Type {
+                // RPython: box.type — intrinsic property of each Box.
                 if let Some(val) = self.ctx.get_constant(opref) {
-                    return match val {
-                        Value::Int(_) => majit_ir::Type::Int,
-                        Value::Float(_) => majit_ir::Type::Float,
-                        Value::Ref(_) => majit_ir::Type::Ref,
-                        Value::Void => majit_ir::Type::Void,
-                    };
+                    return val.get_type();
                 }
+                if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
+                    return tp;
+                }
+                let resolved = self.ctx.get_box_replacement(opref);
                 for o in &self.ctx.new_operations {
-                    if o.pos == opref {
+                    if o.pos == resolved {
                         return o.result_type();
                     }
                 }
-                majit_ir::Type::Ref
+                if self.ctx.get_ptr_info(opref).is_some() {
+                    return majit_ir::Type::Ref;
+                }
+                majit_ir::Type::Int
             }
             fn is_virtual_ref(&self, opref: OpRef) -> bool {
                 // resume.py:210-216: info = getptrinfo(box)
                 //                    is_virtual = (info is not None and info.is_virtual())
-                // RPython uses ONLY PtrInfo.is_virtual() — no fallback.
-                // virtual_oprefs hint (from fail_args NONE) is checked only
-                // when PtrInfo confirms virtual. This prevents placeholder
-                // rd_virtuals entries (RPython resume.py:498 asserts
-                // info.is_virtual() for every virtual in _number_virtuals).
-                matches!(
-                    self.ctx.get_ptr_info(opref),
-                    Some(
-                        crate::optimizeopt::info::PtrInfo::Virtual(_)
-                            | crate::optimizeopt::info::PtrInfo::VirtualStruct(_),
-                    )
-                )
+                self.ctx
+                    .get_ptr_info(opref)
+                    .is_some_and(|info| info.is_virtual())
             }
             fn is_virtual_raw(&self, _opref: OpRef) -> bool {
                 false
@@ -1803,10 +1813,15 @@ impl OptContext {
                 if resolved_val.is_none() {
                     return resumedata::UNINITIALIZED_TAG;
                 }
+                // resume.py:563-564: isinstance(box, Const) → getconst
                 if self.is_constant(resolved_val) {
                     if let Some(val) = self.get_constant(resolved_val) {
+                        let type_override = self
+                            .constant_types_for_numbering
+                            .get(&resolved_val.0)
+                            .copied();
                         let (c, tp) = match val {
-                            Value::Int(i) => (*i, majit_ir::Type::Int),
+                            Value::Int(i) => (*i, type_override.unwrap_or(majit_ir::Type::Int)),
                             Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
                             Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
                             Value::Void => (0, majit_ir::Type::Void),
@@ -1814,6 +1829,12 @@ impl OptContext {
                         return memo.getconst(c, tp);
                     }
                     return resumedata::NULLREF;
+                }
+                // info.py: ConstPtrInfo — GcRef constant in PtrInfo
+                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
+                    self.get_ptr_info(resolved_val)
+                {
+                    return memo.getconst(gcref.0 as i64, majit_ir::Type::Ref);
                 }
                 if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
                     return existing_tag;
