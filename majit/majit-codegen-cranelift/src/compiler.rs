@@ -867,6 +867,9 @@ thread_local! {
     /// RPython's GC has no lock on allocator lookup (GIL-protected).
     static GC_RUNTIMES: RefCell<HashMap<u64, Box<dyn GcAllocator>>> =
         RefCell::new(HashMap::new());
+    /// Currently active GC runtime for virtual materialization during guard failure.
+    /// Set by compiled code exit handler, read by materialize_virtual_recursive.
+    static ACTIVE_GC_RUNTIME_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 fn register_gc_runtime(gc: Box<dyn GcAllocator>) -> u64 {
@@ -988,12 +991,14 @@ fn rebuild_state_after_failure(
             // Keep materialized pointers indexed by vidx for pending fields.
             let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
             // resume.py:951 getvirtual_ptr parity: recursive materialization.
+            let gc_rt = ACTIVE_GC_RUNTIME_ID.with(|c| c.get());
             let materialize = |vidx: usize, materialized: &mut Vec<Option<i64>>| -> i64 {
                 materialize_virtual_recursive(
                     vidx,
                     &recovery.virtual_layouts,
                     outputs,
                     materialized,
+                    gc_rt,
                 )
             };
 
@@ -1113,6 +1118,7 @@ fn materialize_virtual_recursive(
     virtual_layouts: &[majit_codegen::ExitVirtualLayout],
     outputs: &[i64],
     materialized: &mut Vec<Option<i64>>,
+    gc_runtime_id: Option<u64>,
 ) -> i64 {
     if let Some(ptr) = materialized.get(vidx).copied().flatten() {
         return ptr;
@@ -1123,13 +1129,8 @@ fn materialize_virtual_recursive(
 
     // Phase 1: allocate (without setfields)
     let ptr = match vl {
+        // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable.
         majit_codegen::ExitVirtualLayout::Object {
-            fields,
-            fielddescrs,
-            descr_size,
-            ..
-        }
-        | majit_codegen::ExitVirtualLayout::Struct {
             fields,
             fielddescrs,
             descr_size,
@@ -1162,25 +1163,64 @@ fn materialize_virtual_recursive(
                 }
             }
 
-            // General path: allocate zeroed memory
+            // llmodel.py:778 bh_new_with_vtable: gc_malloc + set vtable.
             if fielddescrs.is_empty() && *descr_size == 0 {
                 return 0;
             }
             let size = if *descr_size > 0 { *descr_size } else { 16 };
-            let layout = match std::alloc::Layout::from_size_align(size, 8) {
-                Ok(l) => l,
-                Err(_) => return 0,
+            let ptr = if ob_type != 0 {
+                if let Some(rt_id) = gc_runtime_id {
+                    let p = with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64);
+                    if p != 0 {
+                        unsafe { *(p as *mut i64) = ob_type };
+                    }
+                    p
+                } else {
+                    let layout = match std::alloc::Layout::from_size_align(size, 8) {
+                        Ok(l) => l,
+                        Err(_) => return 0,
+                    };
+                    let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+                    if p.is_null() {
+                        return 0;
+                    }
+                    unsafe { *(p as *mut i64) = ob_type };
+                    p as i64
+                }
+            } else {
+                let layout = match std::alloc::Layout::from_size_align(size, 8) {
+                    Ok(l) => l,
+                    Err(_) => return 0,
+                };
+                let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+                if p.is_null() {
+                    return 0;
+                }
+                p as i64
             };
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-            if ptr.is_null() {
+            ptr
+        }
+        // resume.py:634-637 VStructInfo.allocate → allocate_struct(typedescr).
+        majit_codegen::ExitVirtualLayout::Struct {
+            type_id,
+            fielddescrs,
+            descr_size,
+            ..
+        } => {
+            if fielddescrs.is_empty() && *descr_size == 0 {
                 return 0;
             }
-            if ob_type != 0 {
-                unsafe {
-                    *(ptr as *mut i64) = ob_type;
-                }
+            let size = if *descr_size > 0 { *descr_size } else { 16 };
+            // gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
+            if let Some(rt_id) = gc_runtime_id {
+                with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(*type_id, size).0 as i64)
+            } else {
+                let layout = match std::alloc::Layout::from_size_align(size, 8) {
+                    Ok(l) => l,
+                    Err(_) => return 0,
+                };
+                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
             }
-            ptr as i64
         }
         _ => return 0,
     };
@@ -1223,6 +1263,7 @@ fn materialize_virtual_recursive(
                                     virtual_layouts,
                                     outputs,
                                     materialized,
+                                    gc_runtime_id,
                                 )
                             } else {
                                 0
@@ -2439,6 +2480,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 
         let fail_descr = &target.fail_descrs[fail_index as usize];
         let fail_count = fail_descr.increment_fail_count();
+        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
@@ -2808,6 +2850,7 @@ fn call_assembler_fast_path(
 
     // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
+    ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
 
     // If a bridge is attached, execute it instead of calling force_fn.
     let bridge_guard = fail_descr.bridge_ref();
@@ -4986,6 +5029,7 @@ impl CraneliftBackend {
             // Increment guard failure count.
             fail_descr.increment_fail_count();
             let fail_count = fail_descr.get_fail_count();
+            ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
             // If a bridge is attached to this guard, execute it.
             let bridge_guard = fail_descr.bridge_ref();
@@ -9225,6 +9269,7 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::Struct {
+                            type_id,
                             descr_index,
                             fielddescrs,
                             fieldnums,
@@ -9232,7 +9277,7 @@ fn collect_guards(
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Struct {
-                                type_id: 0,
+                                type_id: *type_id,
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
@@ -10091,6 +10136,40 @@ impl majit_codegen::Backend for CraneliftBackend {
     fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.number);
         self.registered_call_assembler_tokens.remove(&token.number);
+    }
+
+    /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
+    /// gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
+    fn bh_new(&self, size: usize, type_id: u32) -> i64 {
+        let Some(runtime_id) = self.gc_runtime_id else {
+            // No GC configured — fall back to raw allocation.
+            let layout = std::alloc::Layout::from_size_align(size, 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>());
+            return unsafe { std::alloc::alloc_zeroed(layout) as i64 };
+        };
+        with_gc_runtime(runtime_id, |gc| {
+            gc.alloc_nursery_typed(type_id, size).0 as i64
+        })
+    }
+
+    /// llmodel.py:778 bh_new_with_vtable(sizedescr).
+    /// gc_malloc(sizedescr) + write vtable at vtable_offset.
+    fn bh_new_with_vtable(&self, size: usize, vtable: usize) -> i64 {
+        let Some(runtime_id) = self.gc_runtime_id else {
+            let layout = std::alloc::Layout::from_size_align(size, 8)
+                .unwrap_or(std::alloc::Layout::new::<u8>());
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut usize };
+            if !ptr.is_null() {
+                unsafe { *ptr = vtable };
+            }
+            return ptr as i64;
+        };
+        // Allocate via GC — type_id 0 for vtable objects (type tracked by vtable).
+        let ptr = with_gc_runtime(runtime_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64);
+        if ptr != 0 {
+            unsafe { *(ptr as *mut usize) = vtable };
+        }
+        ptr
     }
 }
 

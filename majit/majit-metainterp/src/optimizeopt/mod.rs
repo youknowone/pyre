@@ -1514,9 +1514,11 @@ impl OptContext {
                                 Some(PtrInfo::VirtualStruct(ref vi)) => {
                                     let (fdinfo, fns) =
                                         build_fieldnums(&vi.fields, &vi.field_descrs);
-                                    let ds =
-                                        vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                                    let sd = vi.descr.as_size_descr();
+                                    let ds = sd.map(|s| s.size()).unwrap_or(0);
+                                    let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                                     majit_ir::RdVirtualInfo::Struct {
+                                        type_id: tid,
                                         descr_index: vi.descr.index(),
                                         fielddescrs: fdinfo,
                                         fieldnums: fns,
@@ -1529,9 +1531,11 @@ impl OptContext {
                                 Some(PtrInfo::Struct(ref si)) => {
                                     let (fdinfo, fns) =
                                         build_fieldnums(&si.fields, &si.field_descrs);
-                                    let ds =
-                                        si.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                                    let sd = si.descr.as_size_descr();
+                                    let ds = sd.map(|s| s.size()).unwrap_or(0);
+                                    let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                                     majit_ir::RdVirtualInfo::Struct {
+                                        type_id: tid,
                                         descr_index: si.descr.index(),
                                         fielddescrs: fdinfo,
                                         fieldnums: fns,
@@ -1895,8 +1899,11 @@ impl OptContext {
                                 .unwrap_or(8)
                         })
                         .collect();
-                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                    let sd = vi.descr.as_size_descr();
+                    let descr_size = sd.map(|s| s.size()).unwrap_or(0);
+                    let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Struct {
+                        type_id: tid,
                         descr_index: vi.descr.index(),
                         fielddescrs: fielddescr_indices
                             .iter()

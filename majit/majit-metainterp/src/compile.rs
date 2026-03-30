@@ -341,6 +341,7 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::Struct {
+                                    type_id,
                                     descr_index,
                                     fielddescrs,
                                     fieldnums,
@@ -349,7 +350,7 @@ pub(crate) fn build_guard_metadata(
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
                                     majit_codegen::ExitVirtualLayout::Struct {
-                                        type_id: 0,
+                                        type_id: *type_id,
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
