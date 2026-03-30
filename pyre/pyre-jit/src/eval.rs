@@ -1086,9 +1086,9 @@ fn handle_fail(
                     .set_guard_compiling(owning_key, trace_id, fail_index, true);
             }
             // compile.py:706-708: _trace_and_compile_from_bridge(deadframe, ...)
-            // RPython creates a fresh MetaInterp and passes deadframe to
-            // handle_guard_failure. We extract resume_pc from state restoration,
-            // then pass it to trace_and_compile_from_bridge.
+            // RPython passes deadframe to MetaInterp.handle_guard_failure
+            // which calls rebuild_from_resumedata internally. pyre restores
+            // the live frame before bridge tracing (architectural difference).
             let meta = {
                 let (driver, _) = driver_pair();
                 driver.meta_interp().get_compiled_meta(owning_key).cloned()
@@ -1329,9 +1329,9 @@ fn execute_assembler(
                         // valid and guard failure counter accumulates for
                         // bridge compilation.
                         //
-                        // pyre: still invalidate — rd_numb can produce frame
-                        // state that passes validation but causes SEGFAULT on
-                        // re-entry. Remove when rd_numb fully covers all slots.
+                        // TODO(parity): remove when guard recovery produces
+                        // fully correct frame state. Currently needed to
+                        // prevent SEGFAULT on re-entry with subtly wrong state.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
