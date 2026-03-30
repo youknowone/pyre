@@ -1250,13 +1250,13 @@ impl OptContext {
             self.last_guard_idx = None;
         }
 
-        // optimizer.py:672-683: _copy_resume_data_from vs store_final_boxes_in_guard.
-        // RPython: `self._last_guard_op and guard_op.getdescr() is None`
-        // getdescr() is None only for optimizer-created guards with no
-        // snapshot (no descr from tracing, no patchguardop assignment).
-        // rd_resume_position < 0 after patchguardop assignment means the
-        // guard truly has no snapshot — only these can share.
-        // GUARD_NOT_FORCED never shares (compile.py:926 assert).
+        // optimizer.py:672: `self._last_guard_op and guard_op.getdescr() is None`
+        // getdescr() is None only for optimizer-created guards (no descr
+        // from tracing, no ResumeAtPositionDescr from unroll).
+        // rd_resume_position < 0 ≡ getdescr() is None.
+        // rd_numb.is_none() ≡ resume.py:395 `assert not storage.rd_numb`.
+        // compile.py:925-926: GUARD_NOT_FORCED* must never share —
+        // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
             && op.rd_resume_position < 0
             && op.rd_numb.is_none()

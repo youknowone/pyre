@@ -610,6 +610,7 @@ impl ResumeVirtualLayoutSummary {
                 fielddescrs,
                 descr_size,
             } => VirtualInfo::VStruct {
+                typedescr: None, // Reconstructed from summary — no live DescrRef available.
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -1128,7 +1129,7 @@ pub type FrameSlotSource = ResumeValueSource;
 /// - VArrayInfo (NEW_ARRAY)
 /// - VArrayStructInfo (array of structs with interior fields)
 /// - VRawBufferInfo (raw memory buffer)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum VirtualInfo {
     /// Virtual object with vtable (from NEW_WITH_VTABLE).
     VirtualObj {
@@ -1138,7 +1139,10 @@ pub enum VirtualInfo {
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
+    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
     VStruct {
+        /// resume.py:631 self.typedescr — the full SizeDescr.
+        typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
@@ -1207,6 +1211,61 @@ pub enum VirtualInfo {
     },
 }
 
+// PartialEq/Eq: compare by data fields only, skip typedescr (Arc<dyn Descr>).
+// RPython VStructInfo is never equality-compared; we need Eq only for test asserts.
+impl PartialEq for VirtualInfo {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                VirtualInfo::VirtualObj {
+                    type_id: a1,
+                    descr_index: a2,
+                    fields: a3,
+                    fielddescrs: a4,
+                    descr_size: a5,
+                },
+                VirtualInfo::VirtualObj {
+                    type_id: b1,
+                    descr_index: b2,
+                    fields: b3,
+                    fielddescrs: b4,
+                    descr_size: b5,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            (
+                VirtualInfo::VStruct {
+                    type_id: a1,
+                    descr_index: a2,
+                    fields: a3,
+                    fielddescrs: a4,
+                    descr_size: a5,
+                    ..
+                },
+                VirtualInfo::VStruct {
+                    type_id: b1,
+                    descr_index: b2,
+                    fields: b3,
+                    fielddescrs: b4,
+                    descr_size: b5,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            (
+                VirtualInfo::VArray {
+                    descr_index: a1,
+                    items: a2,
+                },
+                VirtualInfo::VArray {
+                    descr_index: b1,
+                    items: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            _ => false,
+        }
+    }
+}
+impl Eq for VirtualInfo {}
+
 impl VirtualInfo {
     pub fn kind(&self) -> ResumeVirtualKind {
         match self {
@@ -1250,6 +1309,7 @@ impl VirtualInfo {
                 fields,
                 fielddescrs,
                 descr_size,
+                ..
             } => ResumeVirtualLayoutSummary::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -1537,6 +1597,7 @@ impl EncodedResumeData {
                 fields,
                 fielddescrs,
                 descr_size,
+                ..
             } => {
                 code.push(EncodedVirtualKind::VStruct as i64);
                 code.push(i64::from(*type_id));
@@ -1810,6 +1871,7 @@ impl EncodedResumeData {
                 }
                 let descr_size = self.next_word(cursor) as usize;
                 VirtualInfo::VStruct {
+                    typedescr: None, // Decoded from encoded form — no live DescrRef.
                     type_id,
                     descr_index,
                     fields,
@@ -2580,6 +2642,7 @@ impl ResumeDataVirtualAdder {
     /// Convenience: add a virtual struct (NEW).
     pub fn add_virtual_struct(
         &mut self,
+        typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
@@ -2587,6 +2650,7 @@ impl ResumeDataVirtualAdder {
         descr_size: usize,
     ) -> usize {
         self.add_virtual(VirtualInfo::VStruct {
+            typedescr,
             type_id,
             descr_index,
             fields,
@@ -3998,9 +4062,12 @@ mod tests {
                 ],
             }],
             virtuals: vec![VirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 1,
                 descr_index: 10,
                 fields: vec![(0, VirtualFieldSource::FailArg(1))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: Vec::new(),
         };
@@ -4155,9 +4222,12 @@ mod tests {
             virtuals: vec![
                 // Inner virtual (index 0)
                 VirtualInfo::VStruct {
+                    typedescr: None,
                     type_id: 1,
                     descr_index: 10,
                     fields: vec![(0, VirtualFieldSource::FailArg(0))],
+                    fielddescrs: vec![],
+                    descr_size: 0,
                 },
                 // Outer virtual (index 1), references inner via Virtual(0)
                 VirtualInfo::VirtualObj {
@@ -4326,9 +4396,12 @@ mod tests {
                 ],
             }],
             virtuals: vec![VirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 1,
                 descr_index: 10,
                 fields: vec![(0, VirtualFieldSource::FailArg(1))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: Vec::new(),
         };
@@ -4373,9 +4446,12 @@ mod tests {
                 ],
             }],
             virtuals: vec![VirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 1,
                 descr_index: 9,
                 fields: vec![(0, VirtualFieldSource::FailArg(7))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: vec![PendingFieldInfo {
                 descr_index: 12,
@@ -4526,9 +4602,12 @@ mod tests {
                 ],
             }],
             virtuals: vec![VirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 1,
                 descr_index: 10,
                 fields: vec![(0, VirtualFieldSource::FailArg(1))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: Vec::new(),
         };
@@ -4755,12 +4834,15 @@ mod tests {
             ],
             virtuals: vec![
                 VirtualInfo::VStruct {
+                    typedescr: None,
                     type_id: 3,
                     descr_index: 10,
                     fields: vec![
                         (0, VirtualFieldSource::FailArg(2)),
                         (1, VirtualFieldSource::Constant(123)),
                     ],
+                    fielddescrs: vec![],
+                    descr_size: 0,
                 },
                 VirtualInfo::VArray {
                     descr_index: 11,
@@ -5192,6 +5274,29 @@ mod tests {
 use crate::blackhole::BlackholeInterpreter;
 use crate::resumecode::Reader;
 
+/// RPython virtualref_info interface for resume data consumption.
+///
+/// Corresponds to `metainterp_sd.virtualref_info` (VirtualRefInfo).
+pub trait VRefInfo {
+    /// resume.py:1397 vrefinfo.continue_tracing(vref, virtual)
+    fn continue_tracing(&self, vref: i64, virtual_ref: i64);
+}
+
+/// RPython virtualizable_info interface for resume data consumption.
+///
+/// Corresponds to `jitdriver_sd.virtualizable_info` (VirtualizableInfo).
+pub trait VirtualizableInfo {
+    /// resume.py:1408 vinfo.write_from_resume_data_partial(virtualizable, self)
+    ///
+    /// Read one field from the resume reader and write it into the virtualizable.
+    fn write_field_from_resume(&self, reader: &mut ResumeDataDirectReader);
+}
+
+/// RPython greenfield_info interface for resume data consumption.
+///
+/// Corresponds to `jitdriver_sd.greenfield_info`.
+pub trait GreenfieldInfo {}
+
 /// resume.py:1354 ResumeDataDirectReader
 ///
 /// Reads encoded resume data (rd_numb) and fills blackhole interpreter
@@ -5226,12 +5331,6 @@ pub struct ResumeDataDirectReader<'a> {
     // resume.py:910 virtuals_cache — lazy-allocated virtual objects
     virtuals_cache_ptr: Vec<i64>,
     virtuals_cache_int: Vec<i64>,
-
-    // Internal: reference to blackhole interp being filled
-    // resume.py:1382 self.blackholeinterp
-    blackholeinterp_registers_i: Vec<i64>,
-    blackholeinterp_registers_r: Vec<i64>,
-    blackholeinterp_registers_f: Vec<i64>,
 }
 
 impl<'a> ResumeDataDirectReader<'a> {
@@ -5252,9 +5351,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             rd_virtuals: None,
             virtuals_cache_ptr: Vec::new(),
             virtuals_cache_int: Vec::new(),
-            blackholeinterp_registers_i: Vec::new(),
-            blackholeinterp_registers_r: Vec::new(),
-            blackholeinterp_registers_f: Vec::new(),
         }
     }
 
@@ -5315,57 +5411,145 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py:1381 consume_one_section
     ///
     /// Read one resume frame section and fill the blackhole interpreter's
-    /// registers. Uses liveness info from the jitcode to know which
-    /// registers are live at the current PC.
+    /// registers. Uses liveness info from the jitcode to determine which
+    /// registers of each type (int/ref/float) are live at the current PC.
+    ///
+    /// RPython:
+    ///   self.blackholeinterp = blackholeinterp
+    ///   info = blackholeinterp.get_current_position_info()
+    ///   self._prepare_next_section(info)
     pub fn consume_one_section(&mut self, bh: &mut BlackholeInterpreter) {
         // resume.py:1382-1384
-        // info = blackholeinterp.get_current_position_info()
-        // self._prepare_next_section(info)
-
-        // Get liveness info for current position
         if let Some(info) = bh.get_current_position_info().cloned() {
             // resume.py:1017-1026 _prepare_next_section
-            // enumerate_vars: for each live register, decode and write
+            // jitcode.py:146-167 enumerate_vars(info, all_liveness,
+            //     callback_i, callback_r, callback_f, unique_id)
+
+            // resume.py:1028-1030 _callback_i
             for &reg_idx in &info.live_i_regs {
-                // resume.py:1028-1030 _callback_i
                 let value = self.next_int();
+                // resume.py:1590-1591 write_an_int
                 bh.setarg_i(reg_idx as usize, value);
             }
-            // TODO: live_r_regs, live_f_regs when LivenessInfo supports them
+            // resume.py:1032-1034 _callback_r
+            for &reg_idx in &info.live_r_regs {
+                let value = self.next_ref();
+                // resume.py:1593-1594 write_a_ref
+                bh.setarg_r(reg_idx as usize, value);
+            }
+            // resume.py:1036-1038 _callback_f
+            for &reg_idx in &info.live_f_regs {
+                let value = self.next_float();
+                // resume.py:1596-1597 write_a_float
+                bh.setarg_f(reg_idx as usize, value);
+            }
         } else {
-            // No liveness info: read all registers sequentially.
-            // This is a fallback for jitcodes without precise liveness.
+            // No liveness info at this PC. Fall back to reading all
+            // registers sequentially — handles jitcodes generated
+            // without precise liveness (e.g. the proc-macro path).
             let num_i = bh.jitcode.num_regs_i() as usize;
+            let num_r = bh.jitcode.num_regs_r() as usize;
+            let num_f = bh.jitcode.num_regs_f() as usize;
             for i in 0..num_i {
                 if self.done_reading() {
                     break;
                 }
-                let value = self.next_int();
-                bh.setarg_i(i, value);
+                bh.setarg_i(i, self.next_int());
+            }
+            for i in 0..num_r {
+                if self.done_reading() {
+                    break;
+                }
+                bh.setarg_r(i, self.next_ref());
+            }
+            for i in 0..num_f {
+                if self.done_reading() {
+                    break;
+                }
+                bh.setarg_f(i, self.next_float());
             }
         }
     }
 
+    /// resume.py:1386 consume_virtualref_info
+    ///
+    /// Decode a list of references containing (virtual, vref) pairs.
+    /// In RPython, vrefinfo.continue_tracing(vref, virtual) is called
+    /// for each pair to store the virtual inside the vref.
+    pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
+        // resume.py:1389
+        let size = self.resumecodereader.next_item();
+        if size == 0 {
+            return;
+        }
+        match vrefinfo {
+            None => {
+                // resume.py:1390 — assert size == 0
+                debug_assert_eq!(size, 0, "vrefinfo is None but size != 0");
+            }
+            Some(info) => {
+                // resume.py:1393-1397
+                for _i in 0..size {
+                    let virtual_ref = self.next_ref();
+                    let vref = self.next_ref();
+                    info.continue_tracing(vref, virtual_ref);
+                }
+            }
+        }
+    }
+
+    /// resume.py:1399 consume_vable_info
+    ///
+    /// Load the virtualizable from resume data and restore its fields.
+    pub fn consume_vable_info(&mut self, vinfo: &dyn VirtualizableInfo, vable_size: i32) {
+        // resume.py:1403
+        debug_assert!(vable_size > 0);
+        // resume.py:1404
+        let _virtualizable = self.next_ref();
+        // resume.py:1406-1408
+        // vinfo.reset_token_gcref(virtualizable)
+        // vinfo.write_from_resume_data_partial(virtualizable, self)
+        //
+        // Read the remaining vable_size - 1 items (the virtualizable
+        // itself was item #1, the fields are items #2..vable_size).
+        for _i in 0..(vable_size - 1) {
+            // Read and apply each field. The exact dispatch depends
+            // on the virtualizable layout.
+            vinfo.write_field_from_resume(self);
+        }
+    }
+
     /// resume.py:1424 consume_vref_and_vable
-    pub fn consume_vref_and_vable(&mut self) {
+    ///
+    /// Consume the virtualizable, greenfield, and virtualref sections
+    /// from the resume data. Called before the per-frame sections.
+    pub fn consume_vref_and_vable(
+        &mut self,
+        vrefinfo: Option<&dyn VRefInfo>,
+        vinfo: Option<&dyn VirtualizableInfo>,
+        ginfo: Option<&dyn GreenfieldInfo>,
+    ) {
         // resume.py:1425
         let vable_size = self.resumecodereader.next_item();
+
         if self.resume_after_guard_not_forced != 2 {
-            // resume.py:1427-1431
-            // Skip virtualizable info (vable_size items)
-            if vable_size > 0 {
-                // TODO: consume_vable_info when virtualizable is supported
+            // resume.py:1427-1428
+            if let Some(vi) = vinfo {
+                if vable_size > 0 {
+                    self.consume_vable_info(vi, vable_size);
+                }
+            } else if vable_size > 0 {
+                // No vinfo but vable_size > 0: skip the items
                 self.resumecodereader.jump(vable_size as usize);
             }
-            // TODO: ginfo support
-            // consume_virtualref_info
-            let vref_size = self.resumecodereader.next_item();
-            if vref_size > 0 {
-                // Skip vref pairs (virtual, vref)
-                self.resumecodereader.jump(vref_size as usize * 2);
+            // resume.py:1429-1430
+            if ginfo.is_some() {
+                let _ginfo_item = self.resumecodereader.next_item();
             }
+            // resume.py:1431
+            self.consume_virtualref_info(vrefinfo);
         } else {
-            // resume.py:1433-1435
+            // resume.py:1433-1435 — GUARD_NOT_FORCED path: skip all
             self.resumecodereader.jump(vable_size as usize);
             let vref_size = self.resumecodereader.next_item();
             self.resumecodereader.jump(vref_size as usize * 2);
@@ -5483,13 +5667,18 @@ pub fn blackhole_from_resumedata(
     rd_consts: &[i64],
     deadframe: &[i64],
     rd_virtuals: Option<&[VirtualInfo]>,
+    vrefinfo: Option<&dyn VRefInfo>,
+    vinfo: Option<&dyn VirtualizableInfo>,
+    ginfo: Option<&dyn GreenfieldInfo>,
 ) -> Option<BlackholeInterpreter> {
-    // resume.py:1320-1321
+    // resume.py:1317-1321
     let mut resumereader = ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe);
 
-    // resume.py:1324-1325
+    // resume.py:1324
     resumereader.prepare(rd_virtuals);
-    resumereader.consume_vref_and_vable();
+
+    // resume.py:1325
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
 
     // resume.py:1332-1343
     // Build chain bottom-up: first frame acquired is the outermost.
@@ -5508,8 +5697,31 @@ pub fn blackhole_from_resumedata(
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh);
 
+        // resume.py:1342 — handle_rvmprof_enter (not applicable in majit)
+
         curbh = Some(Box::new(nextbh));
     }
 
     curbh.map(|b| *b)
+}
+
+/// resume.py:1345 force_from_resumedata
+///
+/// Force all virtuals from resume data without running a blackhole.
+/// Used for GUARD_NOT_FORCED handling.
+pub fn force_from_resumedata<'a>(
+    rd_numb: &'a [u8],
+    rd_consts: &'a [i64],
+    deadframe: &'a [i64],
+    vrefinfo: Option<&dyn VRefInfo>,
+    vinfo: Option<&dyn VirtualizableInfo>,
+    ginfo: Option<&dyn GreenfieldInfo>,
+) -> ResumeDataDirectReader<'a> {
+    // resume.py:1347-1348
+    let mut resumereader = ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe);
+    resumereader.handling_async_forcing();
+    // resume.py:1350
+    resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+    // resume.py:1351 — caller can call force_all_virtuals() on the returned reader
+    resumereader
 }

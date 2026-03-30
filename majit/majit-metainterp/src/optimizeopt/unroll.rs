@@ -1986,10 +1986,17 @@ impl OptUnroll {
                         *arg = mapped;
                     }
                 }
-                // unroll.py:405-411: copy_and_change only copies args, NOT fail_args.
-                // store_final_boxes_in_guard rebuilds fail_args from the snapshot.
+                // unroll.py:405-411: copy_and_change creates a fresh guard
+                // with only args copied. RPython's fresh guard has no descr,
+                // no fail_args, no rd_numb/rd_consts/rd_virtuals_info.
+                // store_final_boxes_in_guard rebuilds these from the snapshot.
                 if new_op.opcode.is_guard() {
                     new_op.fail_args = None;
+                    new_op.rd_numb = None;
+                    new_op.rd_consts = None;
+                    new_op.rd_virtuals_info = None;
+                    new_op.rd_pendingfields = None;
+                    new_op.fail_arg_types = None;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {

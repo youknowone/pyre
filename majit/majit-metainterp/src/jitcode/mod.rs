@@ -92,10 +92,19 @@ pub(crate) const BC_RAISE: u8 = 77;
 pub(crate) const BC_RERAISE: u8 = 78;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
+/// GC liveness metadata at a specific bytecode PC.
+///
+/// RPython liveness.py: `[len_i][len_r][len_f][bitset_i][bitset_r][bitset_f]`
+/// Tracks which registers of each type (int/ref/float) are live at a given PC.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LivenessInfo {
     pub pc: u16,
+    /// Live integer register indices at this PC.
     pub live_i_regs: Vec<u16>,
+    /// Live reference register indices at this PC.
+    pub live_r_regs: Vec<u16>,
+    /// Live float register indices at this PC.
+    pub live_f_regs: Vec<u16>,
 }
 
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
