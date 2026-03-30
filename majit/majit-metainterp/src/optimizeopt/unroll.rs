@@ -1975,11 +1975,7 @@ impl OptUnroll {
                 };
                 let mut new_op = sp_op.clone();
                 // unroll.py:404: _map_args(mapping, sop.getarglist())
-                // RPython contract: Const passes through, non-Const uses
-                // mapping[box]. Known divergence: our produced_short_boxes
-                // has key != preamble_op.pos for some entries, causing some
-                // non-Const args to miss the mapping. Strict lookup requires
-                // fixing the key/pos identity invariant in create_short_boxes.
+                // Const passes through unchanged, non-Const must be in mapping.
                 for arg in &mut new_op.args {
                     if short_preamble.constants.contains_key(&arg.0)
                         || ctx.get_constant(*arg).is_some()
