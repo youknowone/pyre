@@ -68,6 +68,9 @@ pub struct TraceCtx {
     /// Tracks field/array values, allocations, escape status, and class/nullity
     /// knowledge during tracing to avoid recording redundant operations.
     heap_cache: HeapCache,
+    /// pyjitpl.py:2411 force_finish_trace: when True, trace is segmented
+    /// at 80% of limit via _create_segmented_trace_and_blackhole.
+    force_finish: bool,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -245,6 +248,7 @@ impl TraceCtx {
                 header_pc: 0,
             }],
             heap_cache: HeapCache::new(),
+            force_finish: false,
         }
     }
 
@@ -281,6 +285,7 @@ impl TraceCtx {
                 header_pc: 0,
             }],
             heap_cache: HeapCache::new(),
+            force_finish: false,
         }
     }
 
@@ -535,6 +540,39 @@ impl TraceCtx {
     /// Current trace limit (for diagnostics).
     pub fn trace_limit(&self) -> usize {
         self.recorder.trace_limit()
+    }
+
+    /// pyjitpl.py:1618 force_finish_trace flag.
+    pub fn force_finish_trace(&self) -> bool {
+        self.force_finish
+    }
+
+    /// Set force_finish_trace flag.
+    pub fn set_force_finish(&mut self, val: bool) {
+        self.force_finish = val;
+    }
+
+    /// Get the result type of an OpRef from the recorded trace.
+    /// RPython parity: boxes carry their own type. Here we check
+    /// inputargs, constant pool (constant_type + numbering overrides),
+    /// and recorded ops to determine the type.
+    pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
+        if (opref.0 as usize) < self.recorder.num_inputargs() {
+            return Some(self.recorder.inputarg_types()[opref.0 as usize]);
+        }
+        // ConstantPool: check constant_type first, then numbering
+        // type overrides (mark_type for resume-data-only Ref constants).
+        if opref.is_constant() {
+            if let Some(tp) = self.constants.constant_type(opref) {
+                return Some(tp);
+            }
+            if let Some(&tp) = self.constants.numbering_type_overrides().get(&opref.0) {
+                return Some(tp);
+            }
+        }
+        self.recorder
+            .get_op_by_pos(opref)
+            .map(|op| op.result_type())
     }
 
     /// The green key hash (loop header PC) for this trace.

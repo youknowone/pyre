@@ -528,20 +528,41 @@ impl<S: JitState> JitDriver<S> {
         // unreachable FINISH, then compile_simple_loop with Label for
         // bridge closure.
         if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
-            if let Some(ctx) = self.meta.trace_ctx() {
-                let limit = ctx.trace_limit();
-                let length = ctx.num_ops();
-                if length > limit * 4 / 5 {
-                    // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
-                    // Record with inputargs as fail_args for bridge recovery.
-                    let num_inputs = ctx.num_inputs();
-                    let inputarg_oprefs: Vec<OpRef> = (0..num_inputs as u32).map(OpRef).collect();
-                    let inputarg_types = ctx.inputarg_types();
+            // pyjitpl.py:1618-1620 force_finish_trace + 80% limit check.
+            let should_segment = self
+                .meta
+                .trace_ctx()
+                .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
+                .unwrap_or(false);
+            if should_segment {
+                // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
+                // + capture_resumedata: fail_args = current live boxes
+                // (guard point values, NOT inputargs/entry values).
+                // RPython captures the current frame's boxes so
+                // resume_in_blackhole can reconstruct mid-loop state.
+                // pyjitpl.py:1626+2579 capture_resumedata parity:
+                // fail_args = collect_jump_args + pc (matching macro path).
+                let mut current_live = self
+                    .sym
+                    .as_ref()
+                    .map(|sym| S::collect_jump_args(sym))
+                    .unwrap_or_default();
+                if let Some(ctx) = self.meta.trace_ctx() {
+                    let limit = ctx.trace_limit();
+                    let length = ctx.num_ops();
+                    // Append bytecode pc as trailing Int (same contract
+                    // as macro path and guard_resume_pc extraction).
+                    let pc_opref = ctx.const_int(ctx.header_pc as i64);
+                    current_live.push(pc_opref);
+                    let live_types: Vec<majit_ir::Type> = current_live
+                        .iter()
+                        .map(|opref| ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
+                        .collect();
                     ctx.record_guard_typed_with_fail_args(
                         majit_ir::OpCode::GuardAlwaysFails,
                         &[],
-                        inputarg_types,
-                        &inputarg_oprefs,
+                        live_types,
+                        &current_live,
                     );
                     // pyjitpl.py:1637 unreachable FINISH (dead code after guard).
                     let dummy = ctx.const_int(0);
@@ -552,9 +573,8 @@ impl<S: JitState> JitDriver<S> {
                             length, limit
                         );
                     }
-                    // pyjitpl.py:1658 compile_simple_loop
-                    action = TraceAction::SegmentedLoop;
                 }
+                action = TraceAction::SegmentedLoop;
             }
         }
 
@@ -1094,32 +1114,26 @@ impl<S: JitState> JitDriver<S> {
             );
 
             // compile.py:711 resume_in_blackhole parity.
-            //
-            // Guard fail_args are in extract_live order:
-            //   [stacksize, pool_ptr, selected, selected_ref, ..., pc]
-            // The last value is the bytecode pc at the guard point.
+            // Guard fail_args = collect_jump_args + pc (appended by
+            // jitcode or force_finish_trace segmenting). The last Int
+            // value is the bytecode pc at the guard point.
             let num_inputs = self.meta.compiled_num_inputs(green_key);
             let guard_resume_pc = if raw_values.len() > num_inputs {
-                // Extra trailing value = bytecode pc appended by jitcode.
                 raw_values[raw_values.len() - 1] as usize
             } else {
-                // GUARD_ALWAYS_FAILS: fail_args = inputargs only (no pc).
                 target_pc
             };
 
-            // RPython resume_in_blackhole decodes rd_numb to
-            // reconstruct each frame's local variables — a complete
-            // independent snapshot of interpreter state. In aheui,
-            // compiled code mutates storages in-place (shared mutable
-            // reference), so the storage contents at guard failure are
-            // the ACTUAL current storage state. Restoring only scalar
-            // fields (stacksize, selected) from fail_args would
-            // desynchronise them from the already-mutated storage.
+            // resume_in_blackhole parity limitation: aheui compiled code
+            // mutates storages in-place (SetfieldGc = real memory write).
+            // Mid-loop resume would see already-mutated storage +
+            // interpreter executing the remaining bytecodes = double
+            // mutation. RPython avoids this because BlackholeInterpreter
+            // uses its own register set (not shared storage).
             //
-            // Until rd_numb-style value-level resume is available, the
-            // interpreter re-enters at target_pc (loop header) where it
-            // re-reads stacksize/selected from the live storage. bridge
-            // tracing receives the real guard_resume_pc.
+            // Fall back to target_pc (loop header restart). The
+            // can_enter_jit expansion re-reads stacksize from the live
+            // storage, so scalars sync automatically.
 
             if should_bridge {
                 let bridge_ok = self.start_bridge_tracing(

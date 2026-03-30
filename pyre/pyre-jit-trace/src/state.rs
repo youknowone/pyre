@@ -30,71 +30,97 @@ use pyre_object::{
     w_str_get_value, w_tuple_len,
 };
 
-/// MetaInterpStaticData.jitcodes (warmspot.py:282) parity.
-///
-/// RPython: codewriter.make_jitcodes() creates all JitCode objects
-/// and assigns `jitcode.index = len(all_jitcodes)` at compile-time.
-/// The list is stored in MetaInterpStaticData.jitcodes and used for
-/// both snapshot encoding (opencoder.py:776/810) and resume
-/// restoration (resume.py:1051: `jitcodes[jitcode_pos]`).
-///
-/// pyre: no codewriter phase — CodeObjects already exist as Python
-/// bytecode. Indices are assigned lazily at trace-time, same
-/// sequential semantics. Portal gets 0, inline callees get 1, 2, ….
-struct MetaInterpJitCodes {
-    /// codewriter.py:80: CodeObject* → jitcode.index.
-    by_code: std::collections::HashMap<usize, i32>,
-    /// resume.py:1051: jitcode_pos → CodeObject* (reverse lookup).
-    by_index: Vec<usize>,
+/// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
+/// RPython creates JitCode objects with codewriter; pyre wraps
+/// CodeObject pointers with the same sequential index.
+// SAFETY: JitCode is only written once (during creation) and then
+// read-only. The code pointer is stable for the program lifetime.
+unsafe impl Sync for JitCode {}
+
+pub(crate) struct JitCode {
+    /// The Python CodeObject (RPython: jitcode.code = bytecode).
+    pub code: *const CodeObject,
+    /// codewriter.py:68: jitcode.index = len(all_jitcodes).
+    pub index: i32,
 }
 
-impl MetaInterpJitCodes {
+/// warmspot.py:148-282: MetaInterpStaticData — per-driver compile-time data.
+///
+/// RPython: created by WarmRunnerDesc, holds jitcodes list populated
+/// by codewriter.make_jitcodes(). Accessed as MetaInterp.staticdata.
+///
+/// pyre: per-thread equivalent (no-GIL runtime). Indices assigned
+/// lazily at trace-time (no codewriter phase). Portal gets 0,
+/// inline callees get 1, 2, ….
+struct MetaInterpStaticData {
+    /// codewriter.py:80: CodeObject* → index into jitcodes vec.
+    by_code: std::collections::HashMap<usize, usize>,
+    /// warmspot.py:282: self.metainterp_sd.jitcodes = jitcodes.
+    /// Box<JitCode> for address stability across vec growth.
+    jitcodes: Vec<Box<JitCode>>,
+}
+
+impl MetaInterpStaticData {
     fn new() -> Self {
         Self {
             by_code: std::collections::HashMap::new(),
-            by_index: Vec::new(),
+            jitcodes: Vec::new(),
         }
     }
 
-    /// codewriter.py:68: jitcode.index = index (assign or lookup).
-    fn index_for(&mut self, code: *const CodeObject) -> i32 {
+    /// codewriter.py:68: get or create JitCode for a CodeObject.
+    /// Returns a stable pointer (Box ensures no reallocation moves).
+    fn jitcode_for(&mut self, code: *const CodeObject) -> *const JitCode {
         let key = code as usize;
         if let Some(&idx) = self.by_code.get(&key) {
-            return idx;
+            return &*self.jitcodes[idx] as *const JitCode;
         }
-        let idx = self.by_index.len() as i32;
-        self.by_code.insert(key, idx);
-        self.by_index.push(key);
-        idx
+        let index = self.jitcodes.len() as i32;
+        let jitcode = Box::new(JitCode { code, index });
+        let ptr = &*jitcode as *const JitCode;
+        self.by_code.insert(key, self.jitcodes.len());
+        self.jitcodes.push(jitcode);
+        ptr
     }
 }
 
 use std::cell::RefCell;
 
 thread_local! {
-    /// MetaInterpStaticData.jitcodes equivalent (per-thread for no-GIL).
-    static JITCODES: RefCell<MetaInterpJitCodes> =
-        RefCell::new(MetaInterpJitCodes::new());
+    /// warmspot.py:282: MetaInterp.staticdata (per-thread for no-GIL).
+    static METAINTERP_SD: RefCell<MetaInterpStaticData> =
+        RefCell::new(MetaInterpStaticData::new());
 }
 
-/// opencoder.py:776/810: frame.jitcode.index used in snapshot.
-fn jitcode_index_for(code: *const CodeObject) -> i32 {
-    JITCODES.with(|r| r.borrow_mut().index_for(code))
+/// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
+/// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
+fn jitcode_for(code: *const CodeObject) -> *const JitCode {
+    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
+
+/// Sentinel null JitCode for uninitialized PyreSym.
+static NULL_JITCODE: JitCode = JitCode {
+    code: std::ptr::null(),
+    index: -1,
+};
 
 /// codewriter/liveness.py parity: bytecode liveness analysis.
 /// For each bytecode PC, tracks which locals are live (may be read
-/// on some path before being reassigned).
+/// on some path before being reassigned) and the operand stack depth.
 ///
 /// RPython computes this from JitCode (register bytecodes) via
-/// backward dataflow analysis. pyre computes from Python bytecodes
-/// using the same algorithm.
+/// backward dataflow. pyre computes from Python bytecodes using the
+/// same algorithm, with stack depth tracked via forward analysis.
 struct LiveVars {
-    /// Bitvector per PC: bit i = local i is live at this position.
-    live_at: Vec<u64>,
-    /// Stack depth at each PC (computed by forward analysis).
-    /// RPython JitCode treats stack registers same as locals in liveness.
-    /// For Python bytecodes, stack depth determines which stack slots are live.
+    /// Flat multi-word bitvector for local liveness.
+    /// `live_bits[pc * words_per_pc + w]` = word w of bitvector at PC.
+    /// No 64-slot cap: supports `words_per_pc * 64` locals.
+    live_bits: Vec<u64>,
+    /// Number of u64 words per PC (ceil(nlocals / 64)).
+    words_per_pc: usize,
+    /// Stack depth at each PC (forward analysis).
+    /// RPython JitCode treats stack as registers with liveness.
+    /// For Python bytecodes, stack depth determines which slots are live.
     stack_depth_at: Vec<usize>,
 }
 
@@ -106,12 +132,20 @@ impl LiveVars {
         let n = code.instructions.len();
         if n == 0 {
             return LiveVars {
-                live_at: Vec::new(),
+                live_bits: Vec::new(),
+                words_per_pc: 0,
                 stack_depth_at: Vec::new(),
             };
         }
-        let mut live_at = vec![0u64; n + 1];
-        // Fixed-point iteration for backward analysis.
+        let nlocals = code.varnames.len().max(1);
+        let words_per_pc = (nlocals + 63) / 64;
+        let total = (n + 1) * words_per_pc;
+        let mut live_bits = vec![0u64; total];
+
+        // Temporary per-PC bitvector for the inner loop.
+        let mut live = vec![0u64; words_per_pc];
+
+        // Fixed-point backward analysis for local liveness.
         let mut changed = true;
         while changed {
             changed = false;
@@ -120,7 +154,11 @@ impl LiveVars {
                 else {
                     continue;
                 };
-                let mut live = live_at.get(pc + 1).copied().unwrap_or(0);
+                // Start with successor's live set.
+                let next_base = (pc + 1) * words_per_pc;
+                for w in 0..words_per_pc {
+                    live[w] = live_bits[next_base + w];
+                }
                 // Branch targets: union with target's live set.
                 let target: Option<usize> = match instr {
                     Instruction::JumpForward { delta } => {
@@ -142,8 +180,11 @@ impl LiveVars {
                     _ => None,
                 };
                 if let Some(tgt) = target {
-                    if tgt < live_at.len() {
-                        live |= live_at[tgt];
+                    let tgt_base = tgt * words_per_pc;
+                    if tgt_base + words_per_pc <= live_bits.len() {
+                        for w in 0..words_per_pc {
+                            live[w] |= live_bits[tgt_base + w];
+                        }
                     }
                 }
                 // GEN/KILL for locals.
@@ -152,49 +193,84 @@ impl LiveVars {
                     | Instruction::LoadFastBorrow { var_num }
                     | Instruction::LoadFastCheck { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
-                        if i < 64 {
-                            live |= 1 << i;
+                        let word = i / 64;
+                        if word < words_per_pc {
+                            live[word] |= 1u64 << (i % 64);
                         }
                     }
-                    Instruction::StoreFast { var_num } => {
+                    Instruction::StoreFast { var_num } | Instruction::DeleteFast { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
-                        if i < 64 {
-                            live &= !(1 << i);
-                        }
-                    }
-                    Instruction::DeleteFast { var_num } => {
-                        let i = var_num.get(op_arg).as_usize();
-                        if i < 64 {
-                            live &= !(1 << i);
+                        let word = i / 64;
+                        if word < words_per_pc {
+                            live[word] &= !(1u64 << (i % 64));
                         }
                     }
                     _ => {}
                 }
-                if live_at[pc] != live {
-                    live_at[pc] = live;
+                let base = pc * words_per_pc;
+                if (0..words_per_pc).any(|w| live_bits[base + w] != live[w]) {
+                    for w in 0..words_per_pc {
+                        live_bits[base + w] = live[w];
+                    }
                     changed = true;
                 }
             }
         }
-        // Stack depth at each PC: RPython JitCode treats stack slots as
-        // registers with liveness. For Python bytecodes, the operand stack
-        // depth at each PC determines which stack slots are live.
-        // Conservative: all slots below runtime depth are live.
-        let stack_depth_at = vec![usize::MAX; n + 1];
+
+        // Forward stack depth analysis.
+        let mut stack_depth_at = vec![usize::MAX; n + 1];
+        stack_depth_at[0] = 0;
+        let mut sd_changed = true;
+        while sd_changed {
+            sd_changed = false;
+            for pc in 0..n {
+                let d = stack_depth_at[pc];
+                if d == usize::MAX {
+                    continue;
+                }
+                let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc)
+                else {
+                    // Unknown instruction: propagate same depth.
+                    if stack_depth_at[pc + 1] == usize::MAX {
+                        stack_depth_at[pc + 1] = d;
+                        sd_changed = true;
+                    }
+                    continue;
+                };
+                let (ft_d, br_d) = stack_effects(&instr, op_arg, d);
+                // Fall-through.
+                if !is_unconditional_jump(&instr) && ft_d < stack_depth_at[pc + 1] {
+                    stack_depth_at[pc + 1] = ft_d;
+                    sd_changed = true;
+                }
+                // Branch target.
+                if let Some(tgt) = target_pc(&instr, pc, op_arg) {
+                    if tgt <= n && br_d < stack_depth_at[tgt] {
+                        stack_depth_at[tgt] = br_d;
+                        sd_changed = true;
+                    }
+                }
+            }
+        }
+
         LiveVars {
-            live_at,
+            live_bits,
+            words_per_pc,
             stack_depth_at,
         }
     }
 
     /// codewriter/liveness.py _live_vars(pc) parity — local registers.
+    /// No slot-count cap: supports arbitrary number of locals.
     fn is_local_live(&self, pc: usize, local_idx: usize) -> bool {
-        if local_idx >= 64 {
-            return true; // conservative for >64 locals
+        let word = local_idx / 64;
+        let bit = local_idx % 64;
+        if word >= self.words_per_pc {
+            return false; // index beyond tracked locals
         }
-        self.live_at
-            .get(pc)
-            .map_or(true, |bits| (bits >> local_idx) & 1 != 0)
+        self.live_bits
+            .get(pc * self.words_per_pc + word)
+            .map_or(true, |w| (w >> bit) & 1 != 0)
     }
 
     /// codewriter/liveness.py parity — stack registers.
@@ -203,6 +279,174 @@ impl LiveVars {
         self.stack_depth_at
             .get(pc)
             .map_or(true, |&depth| stack_idx < depth)
+    }
+}
+
+/// Stack effects: (fallthrough_depth, branch_depth).
+/// Returns new absolute stack depths after the instruction.
+fn stack_effects(
+    instr: &pyre_bytecode::bytecode::Instruction,
+    op_arg: pyre_bytecode::OpArg,
+    depth: usize,
+) -> (usize, usize) {
+    use pyre_bytecode::bytecode::Instruction;
+    let d = depth as i32;
+    let (ft, br) = match instr {
+        // No-ops
+        Instruction::Nop
+        | Instruction::Resume { .. }
+        | Instruction::Cache
+        | Instruction::NotTaken
+        | Instruction::ExtendedArg => (d, d),
+        // Push one
+        Instruction::LoadConst { .. }
+        | Instruction::LoadFast { .. }
+        | Instruction::LoadFastBorrow { .. }
+        | Instruction::LoadFastCheck { .. }
+        | Instruction::LoadFastAndClear { .. }
+        | Instruction::LoadName { .. }
+        | Instruction::LoadGlobal { .. }
+        | Instruction::LoadDeref { .. }
+        | Instruction::LoadLocals
+        | Instruction::LoadBuildClass
+        | Instruction::PushNull
+        | Instruction::Copy { .. }
+        | Instruction::PushExcInfo => (d + 1, d + 1),
+        // Pop one
+        Instruction::PopTop
+        | Instruction::StoreFast { .. }
+        | Instruction::StoreName { .. }
+        | Instruction::StoreGlobal { .. }
+        | Instruction::StoreDeref { .. }
+        | Instruction::YieldValue { .. }
+        | Instruction::EndSend
+        | Instruction::PopExcept => (d - 1, d - 1),
+        // Pop 0, push 0 (identity stack effect)
+        Instruction::DeleteFast { .. }
+        | Instruction::DeleteName { .. }
+        | Instruction::DeleteGlobal { .. }
+        | Instruction::DeleteDeref { .. }
+        | Instruction::ListAppend { .. }
+        | Instruction::SetAdd { .. }
+        | Instruction::MapAdd { .. }
+        | Instruction::ListExtend { .. }
+        | Instruction::SetUpdate { .. }
+        | Instruction::DictUpdate { .. }
+        | Instruction::DictMerge { .. }
+        | Instruction::Swap { .. }
+        | Instruction::CopyFreeVars { .. } => (d, d),
+        // Pop 1 push 1 (net 0)
+        Instruction::UnaryNegative
+        | Instruction::UnaryNot
+        | Instruction::UnaryInvert
+        | Instruction::GetIter
+        | Instruction::GetYieldFromIter
+        | Instruction::GetAIter
+        | Instruction::GetLen
+        | Instruction::MatchMapping
+        | Instruction::MatchSequence
+        | Instruction::ImportName { .. }
+        | Instruction::ImportFrom { .. }
+        | Instruction::LoadAttr { .. }
+        | Instruction::CheckExcMatch
+        | Instruction::GetAwaitable { .. }
+        | Instruction::LoadSuperAttr { .. } => (d, d),
+        // Pop 2 push 1 (net -1)
+        Instruction::BinaryOp { .. }
+        | Instruction::CompareOp { .. }
+        | Instruction::IsOp { .. }
+        | Instruction::ContainsOp { .. } => (d - 1, d - 1),
+        // Pop 2
+        Instruction::StoreAttr { .. }
+        | Instruction::DeleteAttr { .. }
+        | Instruction::StoreSubscr => (d - 2, d - 2),
+        // Pop 3
+        Instruction::StoreSlice | Instruction::DeleteSubscr => (d - 3, d - 3),
+        // Unconditional jumps
+        Instruction::JumpForward { .. }
+        | Instruction::JumpBackward { .. }
+        | Instruction::JumpBackwardNoInterrupt { .. } => (d, d),
+        // Conditional pop-and-jump: pop 1 on both paths
+        Instruction::PopJumpIfTrue { .. }
+        | Instruction::PopJumpIfFalse { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. } => (d - 1, d - 1),
+        // ForIter: fallthrough pushes TOS_next (+1); branch pops iterator (-1)
+        Instruction::ForIter { .. } => (d + 1, d - 1),
+        // Return
+        Instruction::ReturnValue => (d - 1, d - 1),
+        // Build collections: pop count, push 1
+        Instruction::BuildTuple { count } => {
+            let s = count.get(op_arg) as usize as i32;
+            (d - s + 1, d - s + 1)
+        }
+        Instruction::BuildList { count } => {
+            let s = count.get(op_arg) as usize as i32;
+            (d - s + 1, d - s + 1)
+        }
+        Instruction::BuildSet { count } => {
+            let s = count.get(op_arg) as usize as i32;
+            (d - s + 1, d - s + 1)
+        }
+        Instruction::BuildMap { count } => {
+            let s = (count.get(op_arg) as usize * 2) as i32;
+            (d - s + 1, d - s + 1)
+        }
+        Instruction::BuildString { count } => {
+            let s = count.get(op_arg) as usize as i32;
+            (d - s + 1, d - s + 1)
+        }
+        // CALL: pop callable + args, push result
+        Instruction::Call { argc } => {
+            let n = argc.get(op_arg) as usize as i32;
+            (d - n - 1, d - n - 1)
+        }
+        // Unpack
+        Instruction::UnpackSequence { count } => {
+            let s = count.get(op_arg) as usize as i32;
+            (d - 1 + s, d - 1 + s)
+        }
+        // MatchClass: pop 2 push 1 (net -1)
+        Instruction::MatchClass { .. } => (d - 1, d - 1),
+        // Raise: conservative, keep depth
+        Instruction::Reraise { .. } | Instruction::RaiseVarargs { .. } => (d, d),
+        // Default: conservative, keep same depth
+        _ => (d, d),
+    };
+    (ft.max(0) as usize, br.max(0) as usize)
+}
+
+/// Is the instruction an unconditional jump (no fallthrough)?
+fn is_unconditional_jump(instr: &pyre_bytecode::bytecode::Instruction) -> bool {
+    use pyre_bytecode::bytecode::Instruction;
+    matches!(
+        instr,
+        Instruction::JumpForward { .. }
+            | Instruction::JumpBackward { .. }
+            | Instruction::JumpBackwardNoInterrupt { .. }
+            | Instruction::ReturnValue
+            | Instruction::Reraise { .. }
+    )
+}
+
+/// Branch target PC for branching instructions.
+fn target_pc(
+    instr: &pyre_bytecode::bytecode::Instruction,
+    pc: usize,
+    op_arg: pyre_bytecode::OpArg,
+) -> Option<usize> {
+    use pyre_bytecode::bytecode::Instruction;
+    match instr {
+        Instruction::JumpForward { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+        Instruction::JumpBackward { delta } | Instruction::JumpBackwardNoInterrupt { delta } => {
+            Some(pc.saturating_sub(delta.get(op_arg).as_usize()))
+        }
+        Instruction::PopJumpIfTrue { delta }
+        | Instruction::PopJumpIfFalse { delta }
+        | Instruction::PopJumpIfNone { delta }
+        | Instruction::PopJumpIfNotNone { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+        Instruction::ForIter { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+        _ => None,
     }
 }
 
@@ -485,13 +729,9 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
-    /// Frame metadata extracted at trace start — avoids stale snapshot reads.
-    /// RPython MIFrame.jitcode parity.
-    pub(crate) concrete_code: *const pyre_bytecode::CodeObject,
-    /// RPython MIFrame.jitcode.index: sequential index assigned by
-    /// codewriter (JitDriverStaticData.jitcodes list position).
-    /// Used in opencoder.py:776/810 for snapshot frame metadata.
-    pub(crate) jitcode_index: i32,
+    /// pyjitpl.py:74: frame.jitcode — JitCode reference.
+    /// Provides both .code (CodeObject*) and .index (snapshot encoding).
+    pub(crate) jitcode: *const JitCode,
     /// Namespace for global lookups.
     pub(crate) concrete_namespace: *mut pyre_interpreter::PyNamespace,
     /// Execution context pointer (for creating callee frames).
@@ -1395,9 +1635,8 @@ impl PyreSym {
             transient_value_types: std::collections::HashMap::new(),
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
-            // concrete_code and concrete_namespace initialized below
-            concrete_code: std::ptr::null(),
-            jitcode_index: -1, // assigned by jitcode_index_for on init
+            // jitcode and concrete_namespace initialized below
+            jitcode: &NULL_JITCODE as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
@@ -1520,8 +1759,7 @@ impl PyreSym {
         // Extract frame metadata pointers for use without concrete_frame
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
-            self.concrete_code = frame.code;
-            self.jitcode_index = jitcode_index_for(frame.code);
+            self.jitcode = jitcode_for(frame.code);
             self.concrete_namespace = frame.namespace;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
@@ -1655,7 +1893,7 @@ impl MIFrame {
     }
 
     fn next_instruction_consumes_comparison_truth(&self) -> bool {
-        let code = unsafe { &*self.sym().concrete_code };
+        let code = unsafe { &*(*self.sym().jitcode).code };
         // RPython optimize_goto_if_not works on the semantic successor,
         // not on bytecode trivia like EXTENDED_ARG/NOT_TAKEN/CACHE.
         let mut pc = self.fallthrough_pc;
@@ -1738,17 +1976,17 @@ impl MIFrame {
     /// Returns register boxes: [locals..., stack...].
     /// Does NOT include frame/ni/vsd (stored in virtualizable_boxes).
     ///
-    /// codewriter/liveness.py: uses bytecode liveness table to determine
-    /// which registers are live at the current PC.
-    ///   after_residual_call=true  → all registers are live
-    ///   after_residual_call=false → only liveness-table live registers
+    /// pyjitpl.py:194: `in_a_call` or `after_residual_call` → use
+    /// post-call PC (self.pc in RPython = self.fallthrough_pc in pyre).
+    /// Otherwise → use pre-instruction PC (self.orgpc).
     /// Dead slots are OpRef::NONE (→ UNINITIALIZED_TAG in rd_numb).
     fn get_list_of_active_boxes(
         &mut self,
         _ctx: &mut TraceCtx,
+        in_a_call: bool,
         after_residual_call: bool,
     ) -> Vec<OpRef> {
-        let (nlocals, local_values, stack_values, pc, code_ptr) = {
+        let (nlocals, local_values, stack_values, code_ptr) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
@@ -1756,13 +1994,9 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            (
-                s.nlocals,
-                s.symbolic_locals.clone(),
-                stack_values,
-                self.orgpc,
-                s.concrete_code,
-            )
+            (s.nlocals, s.symbolic_locals.clone(), stack_values, unsafe {
+                (*s.jitcode).code
+            })
         };
         // codewriter/liveness.py _live_vars(pc) parity.
         let live = if !code_ptr.is_null() {
@@ -1770,9 +2004,14 @@ impl MIFrame {
         } else {
             None
         };
-        // pyjitpl.py:194: after_residual_call uses liveness at the
-        // NEXT instruction (PC after the CALL returns), not "all live".
-        let live_pc = if after_residual_call { pc + 1 } else { pc };
+        // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
+        // (RPython self.pc = post-instruction = pyre fallthrough_pc).
+        // Otherwise → self.pc - SIZE_LIVE_OP (= pyre orgpc).
+        let live_pc = if in_a_call || after_residual_call {
+            self.fallthrough_pc
+        } else {
+            self.orgpc
+        };
         let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
         // pyjitpl.py:214 parity: only live registers in compact array.
         // Dead registers are skipped entirely (not NONE-filled).
@@ -2497,7 +2736,7 @@ impl MIFrame {
     /// separately via _ensure_parent_resumedata (opencoder.py:819).
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
-        let active_boxes = self.get_list_of_active_boxes(ctx, false);
+        let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
         let materialized = self.materialize_active_boxes(ctx, &active_boxes);
         let s = self.sym();
         let mut fa = vec![s.frame, s.vable_next_instr, s.vable_valuestackdepth];
@@ -2527,12 +2766,13 @@ impl MIFrame {
             // pyjitpl.py:2593-2596: top frame pc = resumepc (orgpc)
             self.flush_to_frame_for_guard(ctx);
             // pyjitpl.py:177: active boxes = registers only (no header).
-            let callee_active_boxes = self.get_list_of_active_boxes(ctx, after_residual_call);
+            let callee_active_boxes =
+                self.get_list_of_active_boxes(ctx, false, after_residual_call);
             let callee_types = self.build_single_frame_fail_arg_types();
 
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
-                jitcode_index: self.sym().jitcode_index as u32,
+                jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: self.orgpc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes, ctx),
             }];
@@ -2587,7 +2827,7 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         let fail_arg_types = self.build_single_frame_fail_arg_types();
         // pyjitpl.py:177: active boxes = registers only (no header).
-        let active_boxes = self.get_list_of_active_boxes(ctx, after_residual_call);
+        let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
         // fail_args = header + materialized active_boxes (for Cranelift deadframe).
         let materialized = self.materialize_active_boxes(ctx, &active_boxes);
         let fail_args = {
@@ -2604,7 +2844,7 @@ impl MIFrame {
         // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         // opencoder.py:776: frame.jitcode.index
-        let jitcode_index = self.sym().jitcode_index as u32;
+        let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index,
@@ -4278,7 +4518,7 @@ impl MIFrame {
                 // should_inline() to bless a helper-boundary inline.
                 let root_trace_green_key = root_trace_green_key(self);
                 let current_function_key =
-                    crate::driver::make_green_key(self.sym().concrete_code, 0);
+                    crate::driver::make_green_key(unsafe { (*self.sym().jitcode).code }, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = !self.parent_frames.is_empty();
@@ -4756,7 +4996,7 @@ impl MIFrame {
             }
         }
 
-        let caller_code = self.sym().concrete_code;
+        let caller_code = unsafe { (*self.sym().jitcode).code };
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let code_ptr = unsafe { function_get_code(concrete_callable) } as *const CodeObject;
@@ -4798,8 +5038,7 @@ impl MIFrame {
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
-            sym.concrete_code = code_ptr;
-            sym.jitcode_index = jitcode_index_for(code_ptr);
+            sym.jitcode = jitcode_for(code_ptr);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (vable_next_instr, vable_valuestackdepth) =
@@ -4859,8 +5098,7 @@ impl MIFrame {
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
-            sym.concrete_code = code_ptr;
-            sym.jitcode_index = jitcode_index_for(code_ptr);
+            sym.jitcode = jitcode_for(code_ptr);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
@@ -4878,7 +5116,9 @@ impl MIFrame {
             s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
         });
         // pyjitpl.py:177: active boxes for parent frame.
-        let my_active_boxes = self.with_ctx(|this, ctx| this.get_list_of_active_boxes(ctx, false));
+        // pyjitpl.py:177: parent frame is in_a_call=True (opencoder.py:806).
+        let my_active_boxes =
+            self.with_ctx(|this, ctx| this.get_list_of_active_boxes(ctx, true, false));
         // fail_args = header + materialized active_boxes (for Cranelift deadframe).
         let my_fail_args = self.with_ctx(|this, ctx| {
             let materialized = this.materialize_active_boxes(ctx, &my_active_boxes);
@@ -4889,7 +5129,7 @@ impl MIFrame {
         });
         let my_fail_arg_types = self.build_single_frame_fail_arg_types();
         // opencoder.py:810: parent frame's jitcode.index.
-        let my_jitcode_index = self.sym().jitcode_index;
+        let my_jitcode_index = unsafe { (*self.sym().jitcode).index };
         // opencoder.py:819-834 parity: accumulate full parent chain.
         // Current frame becomes the newest parent; existing parents follow.
         let mut parent_frames = vec![(
@@ -4936,8 +5176,8 @@ impl MIFrame {
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
-                    let is_self_recursive =
-                        callee_key == crate::driver::make_green_key(this.sym().concrete_code, 0);
+                    let is_self_recursive = callee_key
+                        == crate::driver::make_green_key(unsafe { (*this.sym().jitcode).code }, 0);
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper
@@ -5463,7 +5703,7 @@ impl MIFrame {
             let guard_op = self.with_ctx(|this, ctx| {
                 this.flush_to_frame_for_guard(ctx);
                 let fail_arg_types = this.build_single_frame_fail_arg_types();
-                let active_boxes = this.get_list_of_active_boxes(ctx, false);
+                let active_boxes = this.get_list_of_active_boxes(ctx, false, false);
                 let materialized = this.materialize_active_boxes(ctx, &active_boxes);
                 let fail_args = {
                     let s = this.sym();
@@ -6183,7 +6423,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
             // RPython reached_loop_header (pyjitpl.py:2973-3036):
-            let code_ptr = this.sym().concrete_code;
+            let code_ptr = unsafe { (*this.sym().jitcode).code };
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
@@ -8468,7 +8708,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
-        sym.concrete_code = code_ref;
+        sym.jitcode = jitcode_for(code_ref);
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
@@ -8551,7 +8791,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
-        sym.concrete_code = code_ref;
+        sym.jitcode = jitcode_for(code_ref);
         sym.transient_value_types.insert(lhs, Type::Int);
         sym.transient_value_types.insert(rhs, Type::Int);
 
@@ -8644,7 +8884,7 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_initialized = true;
         sym.valuestackdepth = 0;
-        sym.concrete_code = code_ref;
+        sym.jitcode = jitcode_for(code_ref);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -9041,6 +9281,7 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test(1);
         let frame_ref = OpRef(0);
+        let code_ref = frame.code;
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.symbolic_initialized = true;
         sym.nlocals = 1;
@@ -9051,6 +9292,7 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![OpRef::NONE];
         sym.symbolic_stack_types = vec![Type::Int];
+        sym.jitcode = jitcode_for(code_ref);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -9060,13 +9302,14 @@ mod tests {
             parent_frames: Vec::new(),
             pending_inline_frame: None,
             orgpc: 0,
-            concrete_frame_addr: 0,
+            concrete_frame_addr: frame_ptr,
         };
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
 
-        // fail_args: [frame, pc_const, vsd_const, local_const, stack_const]
-        assert_eq!(fail_args.len(), 5);
+        // fail_args: [frame, pc_const, vsd_const, live_slots...]
+        // Liveness-based: only slots live at orgpc are included.
+        assert!(fail_args.len() >= 3, "must have frame + ni + vsd header");
         assert_eq!(fail_args[0], frame_ref);
         assert!(
             fail_args.iter().all(|arg| !arg.is_none()),

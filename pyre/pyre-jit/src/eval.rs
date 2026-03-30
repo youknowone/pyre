@@ -1247,8 +1247,9 @@ fn execute_assembler(
                     return None;
                 }
                 // Fall through to blackhole resume below.
-                // Validate restored frame state before blackhole dispatch.
-                // Incomplete rd_numb may restore invalid ni/vsd.
+                // DIFFERS FROM UPSTREAM: RPython's rd_numb always fully
+                // covers the frame, so this validation is unnecessary.
+                // pyre's rd_numb can be incomplete — detect and fail early.
                 let code = unsafe { &*frame.code };
                 let code_len = code.instructions.len();
                 let frame_size = frame.locals_cells_stack_w.len();
@@ -1286,10 +1287,10 @@ fn execute_assembler(
             if let Some(ref vals) = typed {
                 match crate::call_jit::resume_in_blackhole(frame, vals, entry_pc) {
                     crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                        // RPython parity: blackhole reached merge point and
-                        // wrote back frame state. Validate the restored state
-                        // to catch incomplete rd_numb (wrong pc, vsd, or null
-                        // locals from missing snapshot coverage).
+                        // DIFFERS FROM UPSTREAM: RPython always produces
+                        // complete rd_numb, so blackhole writeback is correct
+                        // by construction. pyre's rd_numb can be incomplete,
+                        // so detect invalid writeback and invalidate.
                         let code = unsafe { &*frame.code };
                         let nlocals = code.varnames.len();
                         let code_len = code.instructions.len();
@@ -1323,14 +1324,16 @@ fn execute_assembler(
                             frame.fix_array_ptrs();
                             return None;
                         }
-                        // RPython compile.py:710: blackhole resume succeeds.
-                        // RPython does NOT invalidate — entry stays valid,
-                        // guard failure counter accumulates, eventually
-                        // triggers bridge compilation.
+                        // compile.py:710: blackhole resume succeeds.
+                        // RPython does NOT invalidate — compiled entry stays
+                        // valid and guard failure counter accumulates for
+                        // bridge compilation.
                         //
-                        // WORKAROUND: some guards still have resume_pos=-1
-                        // (no snapshot). Remove when all Phase 2 guards and
-                        // called-function guards have valid snapshot positions.
+                        // DIFFERS FROM UPSTREAM: pyre invalidates because
+                        // incomplete rd_numb can produce subtly wrong frame
+                        // state that passes validation but causes SEGFAULT
+                        // on re-entry to compiled code. Remove when rd_numb
+                        // fully covers all frame slots.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
