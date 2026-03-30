@@ -203,6 +203,16 @@ pub struct Optimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    /// RPython Box type parity: in RPython each Box carries its type
+    /// intrinsically. In majit, OpRef is an untyped u32, so we track
+    /// types in value_types. Phase 1 value_types are preserved here
+    /// so Phase 2 can resolve types for carried-over OpRefs.
+    pub prev_phase_value_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// RPython Box type parity: position→type for ALL original trace ops.
+    /// snapshot_boxes reference original trace positions, but the optimizer
+    /// receives transformed ops (after fold_box/elide). This map covers
+    /// positions that were removed during trace transformation.
+    pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -809,6 +819,8 @@ impl Optimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
+            prev_phase_value_types: std::collections::HashMap::new(),
+            original_trace_op_types: std::collections::HashMap::new(),
         }
     }
 
@@ -1361,8 +1373,26 @@ impl Optimizer {
             ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
         }
 
-        // Seed value_types with inputarg types so store_final_boxes_in_guard
-        // can correctly infer types for inputarg OpRefs (compile.rs parity).
+        // RPython Box type parity: in RPython each Box carries its type
+        // intrinsically (InputArgInt, InputArgRef, etc.). In majit, OpRef
+        // is an untyped u32. Seed value_types from ALL sources, lowest
+        // priority first (later entries override earlier):
+        // 1. Original trace ops (pre-transformation positions for snapshots)
+        for (&k, &v) in &self.original_trace_op_types {
+            ctx.value_types.insert(k, v);
+        }
+        // 2. Transformed trace ops (optimizer input)
+        for op in ops {
+            if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
+                ctx.value_types.insert(op.pos.0, op.result_type());
+            }
+        }
+        // 3. Previous phase's emitted op types (Phase 1 → Phase 2 carry)
+        for (&k, &v) in &self.prev_phase_value_types {
+            ctx.value_types.insert(k, v);
+        }
+        // 4. Inputarg types (from recorder — RPython InputArgInt/Ref/Float)
+        //    Highest priority — override all others.
         for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
             ctx.value_types.insert(i as u32, tp);
         }
@@ -1473,6 +1503,12 @@ impl Optimizer {
                     seen_targets.insert(target, i);
                     if needs_fresh {
                         let fresh = ctx.alloc_op_position();
+                        // RPython Box type parity: fresh OpRef inherits the
+                        // source's type. RPython Box objects carry type
+                        // intrinsically; fresh majit OpRefs need explicit copy.
+                        if let Some(&tp) = ctx.value_types.get(&source.0) {
+                            ctx.value_types.insert(fresh.0, tp);
+                        }
                         ctx.replace_op(source, fresh);
                         fresh
                     } else {
@@ -1538,7 +1574,12 @@ impl Optimizer {
                             let fresh_info = match info {
                                 crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                     for field in &mut vinfo.fields {
+                                        let old_field = field.1;
                                         let fresh = ctx.alloc_op_position();
+                                        // RPython Box type parity: copy type
+                                        if let Some(&tp) = ctx.value_types.get(&old_field.0) {
+                                            ctx.value_types.insert(fresh.0, tp);
+                                        }
                                         field.1 = fresh;
                                     }
                                     crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
@@ -1621,6 +1662,11 @@ impl Optimizer {
         // RPython parity: store_final_boxes_in_guard in ctx.emit() handles
         // virtual tagging inline at each guard emit. No post-pass rescan.
 
+        // RPython Box type parity: preserve value_types from this phase
+        // so the next phase can resolve types for carried-over OpRefs.
+        self.prev_phase_value_types
+            .extend(ctx.value_types.iter().map(|(&k, &v)| (k, v)));
+
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
@@ -1677,6 +1723,10 @@ impl Optimizer {
                                         let orig_field = field.1;
                                         let ff = ctx.alloc_op_position();
                                         ctx.replace_op(ff, orig_field);
+                                        // RPython Box type parity: copy type
+                                        if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
+                                            ctx.value_types.insert(ff.0, tp);
+                                        }
                                         if let Some(val) =
                                             ctx.get_constant(orig_field).cloned()
                                         {

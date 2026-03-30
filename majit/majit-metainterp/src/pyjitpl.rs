@@ -463,12 +463,6 @@ pub struct MetaInterp<M: Clone> {
     /// pyjitpl.py:3317 virtualref_boxes: pairs of (symbolic OpRef, concrete ptr).
     /// Managed by opimpl_virtual_ref/opimpl_virtual_ref_finish.
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
-    /// codewriter.py JitDriverStaticData.jitcodes parity.
-    /// Maps CodeObject pointer → sequential index. RPython populates during
-    /// codewriter assembly; pyre populates during tracing. Portal function
-    /// gets index 0, inline callees get 1, 2, etc.
-    pub(crate) jitcodes: HashMap<usize, i32>,
-    jitcode_next_index: i32,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
@@ -789,8 +783,6 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
-            jitcodes: HashMap::new(),
-            jitcode_next_index: 0,
             pending_preamble_tokens: HashMap::new(),
         }
     }
@@ -1043,6 +1035,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.forced_virtualizable = None;
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
+                ctx.set_force_finish(self.force_finish_trace);
                 let num_inputs = ctx.recorder.num_inputargs();
                 let input_types = ctx.inputarg_types();
                 self.tracing = Some(ctx);
@@ -1167,6 +1160,9 @@ impl<M: Clone> MetaInterp<M> {
 
         self.forced_virtualizable = None;
         self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
+        // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
+        // so the proc-macro merge_fn closure can read it.
+        ctx.set_force_finish(self.force_finish_trace);
         self.tracing = Some(ctx);
         let pending_num = self.warm_state.alloc_token_number();
         self.pending_token = Some((green_key, pending_num));
@@ -1617,18 +1613,6 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|ctx| ctx.green_key == green_key || ctx.root_green_key() == green_key)
     }
 
-    /// codewriter.py parity: get or assign sequential jitcode index.
-    /// opencoder.py:776/810: frame.jitcode.index in snapshot.
-    pub fn jitcode_index_for(&mut self, code_ptr: usize) -> i32 {
-        if let Some(&idx) = self.jitcodes.get(&code_ptr) {
-            return idx;
-        }
-        let idx = self.jitcode_next_index;
-        self.jitcode_next_index += 1;
-        self.jitcodes.insert(code_ptr, idx);
-        idx
-    }
-
     /// Finish the current active trace without optimizing or compiling it.
     ///
     /// This is a semantic-seam helper for parity tests: it lets callers
@@ -1804,6 +1788,16 @@ impl<M: Clone> MetaInterp<M> {
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 
+        // RPython Box type parity: build type index from the FULL uncut
+        // trace. snapshot_boxes reference positions from the original trace;
+        // cut_trace_from removes early ops. Must capture types before cut.
+        let pre_cut_trace_op_types: std::collections::HashMap<u32, majit_ir::Type> = trace
+            .ops
+            .iter()
+            .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
+            .map(|op| (op.pos.0, op.result_type()))
+            .collect();
+
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
         // the new header PC so meta.merge_pc can be updated after insert.
@@ -1882,6 +1876,13 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.numbering_type_overrides = numbering_overrides.clone();
+        // RPython Box type parity: each InputArg carries its type from
+        // tracing. Propagate to optimizer so value_types covers inputargs.
+        unroll_opt.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        // RPython Box type parity: snapshot_boxes reference positions from
+        // the original uncut trace. The optimizer sees transformed+cut ops.
+        // Use the pre-cut type index to cover all referenced positions.
+        unroll_opt.original_trace_op_types = pre_cut_trace_op_types;
 
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in

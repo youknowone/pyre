@@ -76,6 +76,19 @@ pub struct UnrollOptimizer {
     )>,
     /// RPython parity: GcRef constants that need Ref type for resume data.
     pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
+    /// RPython Box type parity: trace inputarg types from recorder.
+    /// Each RPython Box carries its type; in majit OpRef is untyped u32.
+    /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputarg_types
+    /// so value_types covers inputarg OpRefs.
+    pub trace_inputarg_types: Vec<majit_ir::Type>,
+    /// RPython Box type parity: position→type for ALL original trace ops.
+    /// snapshot_boxes reference original trace positions, but the optimizer
+    /// receives transformed ops (fold_box/elide). This map covers the gap.
+    pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// RPython Box type parity: Phase 1's emitted op types.
+    /// Phase 2 references Phase 1 OpRefs via imported_label_args (NONE
+    /// resolution). These OpRefs may not exist in Phase 2's input ops.
+    phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
 }
 
 impl UnrollOptimizer {
@@ -94,6 +107,9 @@ impl UnrollOptimizer {
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
+            trace_inputarg_types: Vec::new(),
+            original_trace_op_types: std::collections::HashMap::new(),
+            phase1_value_types: std::collections::HashMap::new(),
         }
     }
 
@@ -242,6 +258,8 @@ impl UnrollOptimizer {
             };
             opt_p1.constant_types = self.constant_types.clone();
             opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
+            opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
+            opt_p1.original_trace_op_types = self.original_trace_op_types.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
@@ -271,6 +289,10 @@ impl UnrollOptimizer {
                     }
                     // Export Phase 1's heap cache for Phase 2.
                     state.preamble_heap_cache = opt_p1.export_all_cached_fields();
+                    // RPython Box type parity: Phase 1's emitted op types
+                    // must be accessible to Phase 2 (imported_label_args
+                    // reference Phase 1 OpRefs). Save Phase 1 value_types.
+                    self.phase1_value_types = opt_p1.prev_phase_value_types.clone();
                     // resume.py:570-574: collect Phase 1 per-guard knowledge.
                     self.per_guard_knowledge
                         .extend(opt_p1.per_guard_knowledge.drain(..));
@@ -324,6 +346,11 @@ impl UnrollOptimizer {
         };
         opt_p2.constant_types = self.constant_types.clone();
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
+        opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
+        opt_p2.original_trace_op_types = self.original_trace_op_types.clone();
+        // Phase 1's emitted op types: Phase 2 references these via
+        // imported_label_args (NONE resolution in store_final_boxes_in_guard).
+        opt_p2.prev_phase_value_types = self.phase1_value_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();

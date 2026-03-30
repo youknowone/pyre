@@ -929,8 +929,42 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     }
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
                     __sym.trace_started = true;
-                    // pyjitpl.py:2843 blackhole_if_trace_too_long — check
-                    // AFTER executing the step (RPython _interpret loop order).
+                    // RPython order: debug_merge_point (force_finish) runs
+                    // INSIDE run_one_step, BEFORE blackhole_if_trace_too_long
+                    // in the _interpret() loop. So segmenting must be checked
+                    // first — if we abort instead of segmenting, the trace is
+                    // lost and prepare_trace_segmenting must start over.
+                    //
+                    // pyjitpl.py:1618 force_finish_trace segmenting (FIRST).
+                    if __ctx.force_finish_trace()
+                        && __ctx.num_ops() > __ctx.trace_limit() * 4 / 5
+                    {
+                        // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
+                        // + capture_resumedata(frame.pc): fail_args = current
+                        // live boxes + bytecode pc (resume_in_blackhole needs
+                        // pc to resume at the guard point).
+                        let mut __live_args = <#state_type as majit_metainterp::JitState>::collect_jump_args(__sym);
+                        let __pc_opref = __ctx.const_int(__pc as i64);
+                        __live_args.push(__pc_opref);
+                        let __live_types: Vec<majit_ir::Type> = __live_args
+                            .iter()
+                            .map(|opref| __ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
+                            .collect();
+                        __ctx.record_guard_typed_with_fail_args(
+                            majit_ir::OpCode::GuardAlwaysFails,
+                            &[],
+                            __live_types,
+                            &__live_args,
+                        );
+                        let __dummy = __ctx.const_int(0);
+                        __ctx.record_finish(__dummy, majit_ir::Type::Int);
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!("[jit] force_finish_trace: segmenting at {} ops (limit {})",
+                                __ctx.num_ops(), __ctx.trace_limit());
+                        }
+                        return majit_metainterp::TraceAction::SegmentedLoop;
+                    }
+                    // pyjitpl.py:2843 blackhole_if_trace_too_long (SECOND).
                     if __ctx.is_too_long() {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!("[jit] trace too long ({} ops, limit {}), aborting",

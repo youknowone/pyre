@@ -2038,13 +2038,37 @@ impl OptContext {
                                     _ => majit_ir::Type::Int,
                                 }
                             } else {
-                                // compile.rs value_types parity: check the
-                                // value_types map first (covers inputargs +
-                                // all emitted operations from all phases).
-                                self.value_types
-                                    .get(&opref.0)
-                                    .copied()
-                                    .unwrap_or(majit_ir::Type::Int)
+                                // RPython Box type parity: each Box carries
+                                // its type. value_types is seeded from trace
+                                // ops + inputargs + emitted ops. On miss,
+                                // search new_operations (the emitted ops list)
+                                // for the producing op's result_type.
+                                if let Some(&tp) = self.value_types.get(&opref.0) {
+                                    tp
+                                } else {
+                                    // Fallback: search emitted ops for this
+                                    // position. Equivalent to Box.type lookup.
+                                    self.new_operations
+                                        .iter()
+                                        .find(|op| op.pos == *opref)
+                                        .map(|op| op.result_type())
+                                        .unwrap_or_else(|| {
+                                            // Last resort: check forwarding chain
+                                            let fwd = self.get_box_replacement(*opref);
+                                            if fwd != *opref {
+                                                if let Some(&tp) = self.value_types.get(&fwd.0) {
+                                                    return tp;
+                                                }
+                                            }
+                                            if crate::optimizeopt::majit_log_enabled() {
+                                                eprintln!(
+                                                    "[jit][value_types] MISS: opref={:?} fwd={:?} not in value_types/new_ops/chain",
+                                                    opref, fwd
+                                                );
+                                            }
+                                            majit_ir::Type::Int
+                                        })
+                                }
                             }
                         })
                         .collect(),
