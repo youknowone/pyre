@@ -9546,6 +9546,9 @@ fn collect_guards(
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
                     // regalloc.py:1206 — assert not isinstance(arg, Const)
+                    // Cannot promote to assert!: constant OpRefs (>=10000)
+                    // still appear in fail_args due to optimizer constant/
+                    // variable collision (see callmayforce_optimizer_bug.md).
                     let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
                     debug_assert!(
                         !constants.contains_key(&opref_id),

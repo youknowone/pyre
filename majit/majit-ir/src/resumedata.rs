@@ -406,9 +406,11 @@ pub fn rebuild_from_numbering(
 
     // resume.py:1042-1057: per-frame decode.
     // Per-frame: jitcode_index, pc, [tagged_values...].
-    // RPython uses jitcode.position_info to determine value count.
-    // Without liveness info, read all remaining items as one frame
-    // (single-frame decode — covers all current production guards).
+    // RPython uses jitcode.get_live_vars_info(pc) to determine value
+    // count per frame. This function lacks liveness info, so it reads
+    // all remaining items as a single frame. Multi-frame rd_numb
+    // requires liveness-based decode (consume_one_section in
+    // blackhole_from_resumedata).
     let mut frames = Vec::new();
     if reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
