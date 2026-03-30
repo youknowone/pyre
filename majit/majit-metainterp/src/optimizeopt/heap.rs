@@ -435,6 +435,21 @@ impl OptHeap {
 
     /// Register a cached value in the per-descr CachedField.
     /// RPython: cf.register_info(structop, info)
+    /// Keep nonnull knowledge only for boxes known to be allocated in this trace.
+    /// RPython: per-box flag on PtrInfo — nonnull survives calls only for
+    /// objects whose allocation we saw.
+    fn retain_nonnull_for_allocations(&mut self) {
+        if self.seen_allocation.iter().any(|&v| v) {
+            for i in 0..self.known_nonnull.len() {
+                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
+                    self.known_nonnull[i] = false;
+                }
+            }
+        } else {
+            self.known_nonnull.clear();
+        }
+    }
+
     fn cache_field(&mut self, obj: OpRef, field_idx: u32, value: OpRef, descr: Option<&DescrRef>) {
         let cf = self
             .field_cache
@@ -724,18 +739,7 @@ impl OptHeap {
             self.array_min_lengths.clear();
         }
 
-        // Nullity: allocated objects are permanently non-null.
-        // Other nonnull knowledge is invalidated conservatively.
-        // RPython: per-box flag — keep nonnull only for seen_allocation boxes.
-        if self.seen_allocation.iter().any(|&v| v) {
-            for i in 0..self.known_nonnull.len() {
-                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
-                    self.known_nonnull[i] = false;
-                }
-            }
-        } else {
-            self.known_nonnull.clear();
-        }
+        self.retain_nonnull_for_allocations();
     }
 
     /// Invalidate field caches affected by a write to `obj` for field `field_idx`.
@@ -888,15 +892,7 @@ impl OptHeap {
                 }
                 self.cached_arrayitems_var
                     .retain(|&(obj, _, _), _| vb_get(&self.unescaped, obj.0));
-                if self.seen_allocation.iter().any(|&v| v) {
-                    for i in 0..self.known_nonnull.len() {
-                        if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
-                            self.known_nonnull[i] = false;
-                        }
-                    }
-                } else {
-                    self.known_nonnull.clear();
-                }
+                self.retain_nonnull_for_allocations();
             }
             // Zero bitstrings + CannotRaise/CanRaise: call doesn't touch
             // any tracked heap fields → cache survives (RPython parity).
@@ -952,16 +948,7 @@ impl OptHeap {
             .retain(|&(_, descr_idx, _), _| !ei.check_write_descr_array(descr_idx));
 
         // Remaining lazy sets for unaffected fields stay lazy.
-        // Nonnull tracking: keep for allocated objects only.
-        if self.seen_allocation.iter().any(|&v| v) {
-            for i in 0..self.known_nonnull.len() {
-                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
-                    self.known_nonnull[i] = false;
-                }
-            }
-        } else {
-            self.known_nonnull.clear();
-        }
+        self.retain_nonnull_for_allocations();
     }
 
     // ── Handlers for specific opcodes ──
