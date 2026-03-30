@@ -28,7 +28,7 @@ Status legend:
 | RPython method | Line | majit symbol | Line | Status | Gap |
 |----------------|------|--------------|------|--------|-----|
 | `__init__(builder)` | 284 | `BlackholeInterpreter::new()` | 849 | PARTIAL | No builder ref; no CPU link |
-| `setposition(jitcode, position)` | 312 | `setposition(jitcode, position)` | 875 | PARTIAL | Allocates registers but doesn't call `copy_constants` from resume path |
+| `setposition(jitcode, position)` | 312 | `setposition(jitcode, position)` | 875 | OK | Allocates all 3 register arrays with constants_i/r/f copy |
 | `setarg_i(index, value)` | 339 | `setarg_i(index, value)` | 905 | OK | |
 | `setarg_r(index, value)` | 343 | `setarg_r(index, value)` | 910 | OK | |
 | `setarg_f(index, value)` | 347 | `setarg_f(index, value)` | 915 | OK | |
@@ -37,14 +37,14 @@ Status legend:
 | `get_tmpreg_r()` | 366 | `get_tmpreg_r()` | 926 | OK | |
 | `get_tmpreg_f()` | 374 | `get_tmpreg_f()` | 930 | OK | |
 | `_final_result_anytype()` | 377 | — | — | MISSING | Return value by return_type |
-| `cleanup_registers()` | 385 | — | — | MISSING | Clear refs to avoid GC retention |
-| `get_current_position_info()` | 393 | — | — | MISSING | Liveness info at current PC for resume data |
+| `cleanup_registers()` | 385 | `cleanup_registers()` | 960 | OK | Clears ref registers and exception_last_value |
+| `get_current_position_info()` | 393 | `get_current_position_info()` | 975 | OK | Searches jitcode.liveness for matching PC |
 | `handle_exception_in_frame(e)` | 396 | `handle_exception_in_frame(exc)` | 1024 | PARTIAL | Exception table lookup exists but handler dispatch may differ |
 | `handle_rvmprof_enter()` | 424 | — | — | N/A | rvmprof not applicable |
 | `copy_constants(regs, consts, idx)` | 441 | — | — | PARTIAL | setposition does register alloc but constant copy from jitcode not fully wired |
-| `_resume_mainloop(current_exc)` | 1612 | `resume_mainloop(current_exc)` | 1708 | PARTIAL | Exists but not yet wired as primary guard-failure path |
-| `_prepare_resume_from_failure(df)` | 1647 | — | — | MISSING | Extract exception from CPU deadframe |
-| `_handle_jitexception_in_portal(e)` | 1684 | — | — | MISSING | Recursive portal JIT exception routing |
+| `_resume_mainloop(current_exc)` | 1612 | `resume_mainloop(current_exc)` | 1061 | OK | Handles exception propagation, return value passing, JitException |
+| `_prepare_resume_from_failure(df)` | 1647 | `prepare_resume_from_failure(exc)` | 1055 | OK | Static method, extracts exception value |
+| `_handle_jitexception_in_portal(e)` | 1684 | — | — | PARTIAL | handle_jitexception walks chain, stub at portal level |
 | `_copy_data_from_miframe(frame)` | 1711 | `copy_data_from_miframe(miframe)` | 937 | PARTIAL | Exists but used for convert_and_run path, not guard-failure |
 | `dispatch_loop(code, position)` | 83 | `dispatch_one(opcode)` | 1141 | PARTIAL | Hand-written match vs generated unrolled loop |
 
@@ -63,10 +63,10 @@ acceptable structural difference since pyre generates the JitCode.
 
 | RPython function | Line | majit symbol | Line | Status | Gap |
 |------------------|------|--------------|------|--------|-----|
-| `_run_forever(bh, exc)` | 1752 | `run_forever(bh, exc)` | 1773 | PARTIAL | Structure matches but not yet primary guard-failure path |
-| `_handle_jitexception(bh, exc)` | 1762 | — | — | MISSING | JitException routing through frame chain |
-| `resume_in_blackhole(sd, jd, rd, df)` | 1782 | `resume_in_blackhole(...)` | 1825 | PARTIAL | Exists but calls blackhole_from_resumedata stub, not full RPython flow |
-| `convert_and_run_from_pyjitpl(mi)` | 1799 | `convert_and_run_from_pyjitpl(...)` | 1803 | PARTIAL | Frame chain conversion exists |
+| `_run_forever(bh, exc)` | 1752 | `run_forever(builder, bh, exc)` | 1980 | OK | Loops frames, integrates handle_jitexception, returns JitException |
+| `_handle_jitexception(bh, exc)` | 1762 | `handle_jitexception(builder, bh, exc)` | 1930 | OK | Walks chain to portal, propagates at bottommost |
+| `resume_in_blackhole(sd, jd, rd, df)` | 1782 | `resume_in_blackhole(builder, jitcodes, data, exc)` | 2058 | OK | Calls blackhole_from_resumedata + run_forever |
+| `convert_and_run_from_pyjitpl(mi)` | 1799 | `convert_and_run_from_pyjitpl(builder, fs, exc, raising)` | 2022 | OK | Frame chain conversion + run_forever |
 
 ---
 
@@ -125,13 +125,13 @@ acceptable structural difference since pyre generates the JitCode.
 
 | RPython method | Line | majit symbol | Line | Status | Gap |
 |----------------|------|--------------|------|--------|-----|
-| `__init__(sd, storage, df, virts)` | 1364 | — | — | MISSING | No DirectReader class |
-| `consume_one_section(bh)` | 1381 | — | — | **MISSING** | **Critical**: writes directly into BH registers |
-| `consume_virtualref_info(vrefinfo)` | 1386 | — | — | MISSING | Virtualref restoration |
-| `consume_vable_info(vinfo, size)` | 1399 | — | — | MISSING | Virtualizable restoration |
-| `consume_vref_and_vable(vref, vinfo, ginfo)` | 1424 | — | — | MISSING | Combined vref+vable consumption |
-| `decode_int/ref/float(tagged)` | 1552-1580 | `resolve_frame_slot_source()` | 2117 | PARTIAL | Function exists but returns i64, not written to BH register |
-| `write_an_int/ref/float(idx, val)` | 1590-1596 | — | — | **MISSING** | **Critical**: writes to `bh.registers_i/r/f[idx]` |
+| `__init__(sd, storage, df, virts)` | 1364 | `ResumeDataDirectReader::new(numb, consts, df)` | 5238 | OK | |
+| `consume_one_section(bh)` | 1381 | `consume_one_section(bh)` | 5320 | OK | Uses LivenessInfo for i/r/f regs |
+| `consume_virtualref_info(vrefinfo)` | 1386 | `consume_virtualref_info(vrefinfo)` | 5397 | OK | VRefInfo trait |
+| `consume_vable_info(vinfo, size)` | 1399 | `consume_vable_info(vinfo, size)` | 5419 | OK | VirtualizableInfo trait |
+| `consume_vref_and_vable(vref, vinfo, ginfo)` | 1424 | `consume_vref_and_vable(vref, vinfo, ginfo)` | 5446 | OK | Full impl with all 3 info types |
+| `decode_int/ref/float(tagged)` | 1552-1580 | `decode_int/ref/float(tagged)` | 5457-5569 | OK | Tag-based decode from deadframe |
+| `write_an_int/ref/float(idx, val)` | 1590-1596 | via `bh.setarg_i/r/f()` in consume_one_section | 5349 | OK | |
 | `allocate_with_vtable(descr)` | 1437 | — | — | MISSING | Virtual allocation during resume |
 | `allocate_struct(typedescr)` | 1441 | — | — | MISSING | |
 | `allocate_array(len, descr, clear)` | 1444 | — | — | MISSING | |
@@ -142,8 +142,8 @@ acceptable structural difference since pyre generates the JitCode.
 
 | RPython function | Line | majit symbol | Line | Status | Gap |
 |------------------|------|--------------|------|--------|-----|
-| `blackhole_from_resumedata(builder, jitcodes, jd, storage, df)` | 1312 | — | — | **MISSING** | **Critical**: builds entire BH frame chain from resume data |
-| `force_from_resumedata(sd, storage, df)` | 1345 | — | — | MISSING | Force all virtuals without running BH |
+| `blackhole_from_resumedata(builder, jitcodes, jd, storage, df)` | 1312 | `blackhole_from_resumedata(builder, jitcodes, numb, consts, df, virts, vref, vinfo, ginfo)` | 5584 | OK | Builds BH frame chain |
+| `force_from_resumedata(sd, storage, df)` | 1345 | `force_from_resumedata(numb, consts, df, vref, vinfo, ginfo)` | 5624 | OK | Returns reader for force_all_virtuals |
 
 ### 2.7 VirtualInfo hierarchy (resume.py:576-867)
 
@@ -215,53 +215,42 @@ acceptable structural difference since pyre generates the JitCode.
 
 ---
 
-## 5. Critical Missing Pieces (Ordered by Priority)
+## 5. Implementation Status (Updated 2026-03-30)
 
-### P0: Blockers for vertical slice
+### P0: Vertical Slice — ALL DONE
 
-1. **`blackhole_from_resumedata()`** (resume.py:1312)
-   - Builds BH frame chain from resume data + deadframe
-   - Without this, no RPython-style guard recovery possible
+1. **`blackhole_from_resumedata()`** — ✅ resume.rs
+2. **`ResumeDataDirectReader.consume_one_section()`** — ✅ resume.rs (int/ref/float)
+3. **`write_an_int/ref/float()`** — ✅ via setarg_i/r/f in consume_one_section
+4. **Guard failure path redirect** — ✅ jitdriver.rs back_edge_internal + run_back_edge_generic
+   - pyre: handle_fail → call_jit::resume_in_blackhole (end-to-end verified)
+   - aheui: blackhole_resume_jitcode in back_edge_internal
 
-2. **`ResumeDataDirectReader.consume_one_section()`** (resume.py:1381)
-   - Reads encoded tags → decodes → writes to `bh.registers_i/r/f`
-   - The "last mile" that connects resume data to BH execution
+### P1: Correctness — ALL DONE
 
-3. **`write_an_int/ref/float()`** (resume.py:1590-1596)
-   - Direct register writes into BlackholeInterpreter
-   - Must bypass shared state entirely
+5. **`get_current_position_info()`** — ✅ blackhole.rs
+6. **`_prepare_resume_from_failure(deadframe)`** — ✅ blackhole.rs
+7. **`consume_vref_and_vable()`** — ✅ resume.rs with VRefInfo/VirtualizableInfo traits
 
-4. **Guard failure path redirect** (compile.py:711 → jitdriver.rs:1088)
-   - Currently: `restore_guard_failure()` → shared state
-   - Target: `resume_in_blackhole()` → BH chain → `_run_forever()`
+### P2: Full Parity — MOSTLY DONE
 
-### P1: Required for correctness
+8. **`_handle_jitexception()`** — ✅ blackhole.rs (portal walk + propagation)
+   - `_handle_jitexception_in_portal`: stub (recursive portal JitExc handling)
+9. **`ResumeGuardDescr.status`** — ✅ pyjitpl.rs GuardFailureInfo
+   - busy flag: `info.compiling`
+   - counter hash: `info.guard_hash`
+   - per-value: `info.per_value` (GUARD_VALUE)
+   - `start_compiling`/`done_compiling`: `set_guard_compiling`
+10. **`consume_vref_and_vable` sections** — ✅ resume.rs (trait-based)
 
-5. **`get_current_position_info()`** (blackhole.py:393)
-   - Liveness info at current PC — determines which registers to fill
-   - Without this, consume_one_section reads wrong number of values
+### Remaining gaps
 
-6. **`_prepare_resume_from_failure(deadframe)`** (blackhole.py:1647)
-   - Exception extraction from CPU deadframe
-   - Required for exception guards
-
-7. **`consume_vref_and_vable()`** (resume.py:1424)
-   - Virtualizable and virtualref state restoration
-   - Required for any trace with virtualizable objects
-
-### P2: Required for full parity
-
-8. **`_handle_jitexception_in_portal()`** (blackhole.py:1684)
-   - Recursive portal exception routing
-   - Required for recursive JIT (fib_recursive)
-
-9. **`ResumeGuardDescr.status`** (compile.py:853)
-   - Busy flag prevents double-compilation of same guard
-   - Counter hash for bridge threshold
-
-10. **`blackhole_from_resumedata` virtualref/greenfield sections**
-    - Full vref continuation, greenfield info consumption
-    - Required for complete resume data decoding
+- **`setposition` constants_r/constants_f copy** — ✅ blackhole.rs
+- **JitCode.is_portal** — ✅ jitcode/mod.rs
+- **LivenessInfo.live_r_regs/live_f_regs** — ✅ jitcode/mod.rs + data.rs
+- **`_handle_jitexception_in_portal` full impl** — stub only (needs jitdriver_sd infra)
+- **codewriter liveness emit for r/f regs** — blocked on full-function JitCode
+- **`ResumeGuardCopiedDescr`** — not ported (guard copy shares resume storage)
 
 ---
 

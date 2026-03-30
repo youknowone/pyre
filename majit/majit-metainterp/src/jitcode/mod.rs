@@ -115,8 +115,12 @@ pub struct JitCode {
     pub code: Vec<u8>,
     /// Number of registers by kind: int/ref/float.
     pub num_regs: [u16; 3],
-    /// Integer constant pool.
+    /// RPython: `jitcode.constants_i` — integer constant pool.
     pub constants_i: Vec<i64>,
+    /// RPython: `jitcode.constants_r` — reference constant pool.
+    pub constants_r: Vec<i64>,
+    /// RPython: `jitcode.constants_f` — float constant pool (bits as i64).
+    pub constants_f: Vec<i64>,
     /// Liveness metadata for GC / deopt expansion.
     pub liveness: Vec<LivenessInfo>,
     /// Pool of majit IR opcodes referenced from the bytecode stream.
@@ -127,6 +131,10 @@ pub struct JitCode {
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
     assembler_targets: Vec<JitCallAssemblerTarget>,
+    /// RPython: `jitcode.jitdriver_sd is not None` — true if this jitcode
+    /// is a portal (entry point for a jit driver). Used by
+    /// `_handle_jitexception` to find the portal level in the BH chain.
+    pub is_portal: bool,
     /// blackhole.py handle_exception_in_frame: exception handler table.
     /// Pre-computed from Python's code.exceptiontable during compilation.
     pub exception_handlers: Vec<JitExceptionHandler>,
@@ -199,6 +207,16 @@ impl JitCode {
     /// RPython: `JitCode.num_regs_and_consts_i()`
     pub fn num_regs_and_consts_i(&self) -> usize {
         self.num_regs[0] as usize + self.constants_i.len()
+    }
+
+    /// RPython: `JitCode.num_regs_and_consts_r()`
+    pub fn num_regs_and_consts_r(&self) -> usize {
+        self.num_regs[1] as usize + self.constants_r.len()
+    }
+
+    /// RPython: `JitCode.num_regs_and_consts_f()`
+    pub fn num_regs_and_consts_f(&self) -> usize {
+        self.num_regs[2] as usize + self.constants_f.len()
     }
 
     /// RPython: `JitCode.follow_jump(position)` -- follow a label at position.

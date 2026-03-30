@@ -923,6 +923,8 @@ impl JitCodeBuilder {
             code: self.code,
             num_regs: [self.num_regs_i, self.num_regs_r, self.num_regs_f],
             constants_i: self.constants_i,
+            constants_r: Vec::new(),
+            constants_f: Vec::new(),
             liveness: Vec::new(),
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
@@ -931,6 +933,7 @@ impl JitCodeBuilder {
             exception_handlers: Vec::new(),
             jit_to_py_pc: Vec::new(),
             has_abort: self.has_abort,
+            is_portal: false,
         }
     }
 

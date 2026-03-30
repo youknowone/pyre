@@ -870,27 +870,55 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// Initialize register arrays for a jitcode and set the position.
+    /// blackhole.py:312 setposition
     ///
-    /// RPython: `BlackholeInterpreter.setposition(jitcode, position)`
+    /// Initialize register arrays for a jitcode and set the position.
+    /// Allocates registers sized to hold both working regs and constants,
+    /// then copies constants into the upper portion of each register array.
     pub fn setposition(&mut self, jitcode: JitCode, position: usize) {
-        let num_i = jitcode.num_regs_and_consts_i();
-        let num_r = jitcode.num_regs_r() as usize;
-        let num_f = jitcode.num_regs_f() as usize;
+        // blackhole.py:313-315
+        let num_regs_and_consts_i = jitcode.num_regs_and_consts_i();
+        let num_regs_and_consts_r = jitcode.num_regs_and_consts_r();
+        let num_regs_and_consts_f = jitcode.num_regs_and_consts_f();
 
-        self.registers_i.clear();
-        self.registers_i.resize(num_i, 0);
-        self.registers_r.clear();
-        self.registers_r.resize(num_r, 0);
-        self.registers_f.clear();
-        self.registers_f.resize(num_f, 0);
-
-        // Copy constants into upper register indices
-        let reg_base = jitcode.num_regs_i() as usize;
-        for (i, &c) in jitcode.constants_i.iter().enumerate() {
-            self.registers_i[reg_base + i] = c;
+        // blackhole.py:324-327
+        if num_regs_and_consts_i > 0 {
+            self.registers_i.clear();
+            self.registers_i.resize(num_regs_and_consts_i, 0);
+            // blackhole.py:441-449 copy_constants
+            let target_index = jitcode.num_regs_i() as usize;
+            for (i, &c) in jitcode.constants_i.iter().enumerate() {
+                self.registers_i[target_index + i] = c;
+            }
+        } else {
+            self.registers_i.clear();
         }
 
+        // blackhole.py:328-331
+        if num_regs_and_consts_r > 0 {
+            self.registers_r.clear();
+            self.registers_r.resize(num_regs_and_consts_r, 0);
+            let target_index = jitcode.num_regs_r() as usize;
+            for (i, &c) in jitcode.constants_r.iter().enumerate() {
+                self.registers_r[target_index + i] = c;
+            }
+        } else {
+            self.registers_r.clear();
+        }
+
+        // blackhole.py:332-335
+        if num_regs_and_consts_f > 0 {
+            self.registers_f.clear();
+            self.registers_f.resize(num_regs_and_consts_f, 0);
+            let target_index = jitcode.num_regs_f() as usize;
+            for (i, &c) in jitcode.constants_f.iter().enumerate() {
+                self.registers_f[target_index + i] = c;
+            }
+        } else {
+            self.registers_f.clear();
+        }
+
+        // blackhole.py:336-337
         self.jitcode = jitcode;
         self.position = position;
         self.aborted = false;
@@ -1899,6 +1927,53 @@ impl BlackholeInterpBuilder {
     }
 }
 
+/// blackhole.py:1762 _handle_jitexception
+///
+/// Route a JitException through the blackhole frame chain.
+/// Walks up the chain until a portal frame is found. If the portal
+/// is the bottommost frame, the exception propagates out. Otherwise
+/// it's handled at the recursive portal level.
+fn handle_jitexception(
+    builder: &mut BlackholeInterpBuilder,
+    mut bh: BlackholeInterpreter,
+    exc: JitException,
+) -> Result<(BlackholeInterpreter, i64), JitException> {
+    // blackhole.py:1764-1766: skip non-portal frames
+    while !bh.jitcode.is_portal {
+        let next = bh.nextblackholeinterp.take();
+        builder.release_interp(bh);
+        match next.map(|b| *b) {
+            Some(caller) => bh = caller,
+            None => return Err(exc), // no portal found
+        }
+    }
+
+    // blackhole.py:1767-1769
+    if bh.nextblackholeinterp.is_none() {
+        // Bottommost entry: exception goes through
+        builder.release_interp(bh);
+        return Err(exc);
+    }
+
+    // blackhole.py:1770-1780: recursive portal level.
+    // _handle_jitexception_in_portal would call jd.handle_jitexc_from_bh.
+    // For now, we propagate the JitException — full recursive portal
+    // handling requires jitdriver_sd.handle_jitexc_from_bh infrastructure.
+    //
+    // In RPython:
+    //   try:
+    //       blackholeinterp._handle_jitexception_in_portal(exc)
+    //   except Exception as e:
+    //       lle = get_llexception(...)
+    //   else:
+    //       lle = NULL
+    //   return blackholeinterp, lle
+    //
+    // Until recursive portal support is added, treat as bottommost:
+    builder.release_interp(bh);
+    Err(exc)
+}
+
 /// blackhole.py:1752 _run_forever
 ///
 /// Execute a blackhole frame chain to completion.
@@ -1919,11 +1994,19 @@ pub fn run_forever(
                 current_exc = exc;
             }
             Err(jit_exc) => {
-                // blackhole.py:1756-1758: JitException handling.
-                // TODO: _handle_jitexception for recursive portals.
-                // For now, propagate immediately.
-                builder.release_interp(bh);
-                return jit_exc;
+                // blackhole.py:1756-1758
+                match handle_jitexception(builder, bh, jit_exc) {
+                    Ok((new_bh, exc)) => {
+                        // Handled at recursive portal level — continue
+                        bh = new_bh;
+                        current_exc = exc;
+                        continue;
+                    }
+                    Err(propagated_exc) => {
+                        // Bottommost or unhandled — propagate out
+                        return propagated_exc;
+                    }
+                }
             }
         }
 
