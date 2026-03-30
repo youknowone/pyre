@@ -16,6 +16,17 @@ pub fn bhimpl_int_add(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
+/// executor.py:282 do_int_add_ovf: ovfcheck(a + b)
+pub fn bhimpl_int_add_ovf(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
+    match (a.getint(), b.getint()) {
+        (Some(x), Some(y)) => match x.checked_add(y) {
+            Some(z) => ConcreteValue::Int(z),
+            None => ConcreteValue::Null,
+        },
+        _ => ConcreteValue::Null,
+    }
+}
+
 pub fn bhimpl_int_sub(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) => ConcreteValue::Int(x.wrapping_sub(y)),
@@ -23,9 +34,31 @@ pub fn bhimpl_int_sub(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
+/// executor.py:292 do_int_sub_ovf: ovfcheck(a - b)
+pub fn bhimpl_int_sub_ovf(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
+    match (a.getint(), b.getint()) {
+        (Some(x), Some(y)) => match x.checked_sub(y) {
+            Some(z) => ConcreteValue::Int(z),
+            None => ConcreteValue::Null,
+        },
+        _ => ConcreteValue::Null,
+    }
+}
+
 pub fn bhimpl_int_mul(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) => ConcreteValue::Int(x.wrapping_mul(y)),
+        _ => ConcreteValue::Null,
+    }
+}
+
+/// executor.py:303 do_int_mul_ovf: ovfcheck(a * b)
+pub fn bhimpl_int_mul_ovf(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
+    match (a.getint(), b.getint()) {
+        (Some(x), Some(y)) => match x.checked_mul(y) {
+            Some(z) => ConcreteValue::Int(z),
+            None => ConcreteValue::Null,
+        },
         _ => ConcreteValue::Null,
     }
 }
@@ -70,7 +103,18 @@ pub fn bhimpl_int_xor(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
 
 pub fn bhimpl_int_lshift(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
-        (Some(x), Some(y)) => ConcreteValue::Int(x.wrapping_shl(y as u32)),
+        (Some(x), Some(y)) => {
+            let shift = y as u32;
+            if shift >= 64 {
+                return ConcreteValue::Null;
+            }
+            let result = x.wrapping_shl(shift);
+            // intobject.py:207 ovfcheck(a << b): reversibility check
+            if result.wrapping_shr(shift) != x {
+                return ConcreteValue::Null;
+            }
+            ConcreteValue::Int(result)
+        }
         _ => ConcreteValue::Null,
     }
 }
@@ -236,23 +280,47 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> Concr
     use majit_ir::OpCode;
     match opcode {
         // Integer arithmetic
-        OpCode::IntAdd | OpCode::IntAddOvf => {
+        OpCode::IntAdd => {
             if args.len() >= 2 {
                 bhimpl_int_add(args[0], args[1])
             } else {
                 ConcreteValue::Null
             }
         }
-        OpCode::IntSub | OpCode::IntSubOvf => {
+        // executor.py:282 do_int_add_ovf: ovfcheck(a + b), ovf_flag on overflow
+        OpCode::IntAddOvf => {
+            if args.len() >= 2 {
+                bhimpl_int_add_ovf(args[0], args[1])
+            } else {
+                ConcreteValue::Null
+            }
+        }
+        OpCode::IntSub => {
             if args.len() >= 2 {
                 bhimpl_int_sub(args[0], args[1])
             } else {
                 ConcreteValue::Null
             }
         }
-        OpCode::IntMul | OpCode::IntMulOvf => {
+        // executor.py:292 do_int_sub_ovf: ovfcheck(a - b), ovf_flag on overflow
+        OpCode::IntSubOvf => {
+            if args.len() >= 2 {
+                bhimpl_int_sub_ovf(args[0], args[1])
+            } else {
+                ConcreteValue::Null
+            }
+        }
+        OpCode::IntMul => {
             if args.len() >= 2 {
                 bhimpl_int_mul(args[0], args[1])
+            } else {
+                ConcreteValue::Null
+            }
+        }
+        // executor.py:303 do_int_mul_ovf: ovfcheck(a * b), ovf_flag on overflow
+        OpCode::IntMulOvf => {
+            if args.len() >= 2 {
+                bhimpl_int_mul_ovf(args[0], args[1])
             } else {
                 ConcreteValue::Null
             }

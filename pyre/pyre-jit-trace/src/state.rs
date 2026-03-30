@@ -2126,15 +2126,10 @@ impl MIFrame {
         } else {
             s.stack_only_depth()
         };
-        // RPython resume.py parity: virtualizable fail_args always use Ref
-        // for locals/stack slots. Virtual objects are represented as TAGVIRTUAL
-        // (null Ref) with field values in trailing slots. The optimizer unboxes
-        // to Int internally, but fail_args maintain Ref for correct bridge
-        // inputarg types after materialization.
-        if s.vable_array_base.is_some() {
-            let total_slots = s.symbolic_local_types.len() + stack_only;
-            virtualizable_fail_arg_types(std::iter::repeat_n(Type::Ref, total_slots))
-        } else if let Some(ref pre_types) = s.pre_opcode_stack_types {
+        // RPython Box.type parity: each box carries its own immutable type
+        // (boxes_i/boxes_r/boxes_f). Use the actual symbolic types for each
+        // slot, regardless of whether a virtualizable is present.
+        if let Some(ref pre_types) = s.pre_opcode_stack_types {
             let slot_types = s
                 .symbolic_local_types
                 .iter()
@@ -3687,13 +3682,19 @@ impl MIFrame {
             BinaryOperator::Or | BinaryOperator::InplaceOr => OpCode::IntOr,
             BinaryOperator::Xor | BinaryOperator::InplaceXor => OpCode::IntXor,
             BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                let Some((_lhs, rhs)) = concrete else {
+                let Some((lhs, rhs)) = concrete else {
                     return self.trace_binary_value(a, b, op);
                 };
                 let Ok(shift) = u32::try_from(rhs) else {
                     return self.trace_binary_value(a, b, op);
                 };
                 if shift >= i64::BITS {
+                    return self.trace_binary_value(a, b, op);
+                }
+                // intobject.py:207 ovfcheck(a << b): if the shift overflows
+                // i64 range, fall back to interpreter for long promotion.
+                let result = lhs.wrapping_shl(shift);
+                if result.wrapping_shr(shift) != lhs {
                     return self.trace_binary_value(a, b, op);
                 }
                 OpCode::IntLshift
