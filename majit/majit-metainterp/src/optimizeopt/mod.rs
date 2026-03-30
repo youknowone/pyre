@@ -1528,11 +1528,16 @@ impl OptContext {
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
                 // resume.py:251-253: single frame.
-                // No-snapshot guards lack orgpc; encode pc=-1 to signal
-                // "unknown orgpc". pc=0 is a valid opcode position
-                // (function start / loop header), not usable as sentinel.
+                // resume.py:251-253: jitcode_index + pc from snapshot frame.
+                // No-snapshot fallback: extract resume PC from fail_args[1]
+                // (next_instr in pyre's virtualizable layout [frame, ni, vsd, ...]).
                 ns.append_int(0); // jitcode_index
-                ns.append_int(-1); // pc (-1 = no orgpc)
+                let resume_pc = fa
+                    .get(1)
+                    .and_then(|&ni| self.getconst(ni))
+                    .map(|(v, _)| v as i32)
+                    .unwrap_or(-1);
+                ns.append_int(resume_pc); // pc
                 ns.append_int(fa.len() as i32); // box_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
