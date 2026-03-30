@@ -72,6 +72,8 @@ pub struct CompiledExitLayout {
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object blueprints.
     pub rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
+    /// resume.py:858 rd_pendingfields — deferred heap writes.
+    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 /// Typed result from running compiled code.
@@ -246,11 +248,11 @@ pub(crate) fn build_guard_metadata(
             resume_layout = None;
         }
 
-        // Store rd_numb/rd_consts/rd_virtuals_info for guard failure recovery.
+        // Store rd_numb/rd_consts/rd_virtuals_info/rd_pendingfields for guard failure recovery.
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
-        // resume.py parity: rd_virtuals_info produced by store_final_boxes_in_guard_impl.
         let rd_virtuals_info = op.rd_virtuals_info.clone();
+        let rd_pendingfields = op.rd_pendingfields.clone();
 
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
@@ -560,6 +562,7 @@ pub(crate) fn build_guard_metadata(
                 rd_numb,
                 rd_consts,
                 rd_virtuals_info,
+                rd_pendingfields,
             },
         );
         fail_index += 1;
@@ -616,6 +619,7 @@ pub(crate) fn merge_backend_exit_layouts(
                     rd_numb: None,
                     rd_consts: None,
                     rd_virtuals_info: None,
+                    rd_pendingfields: None,
                 });
         entry.source_op_index = layout.source_op_index;
         entry.exit_types = layout.fail_arg_types.clone();
@@ -865,6 +869,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             });
         entry.source_op_index = Some(layout.op_index);
         entry.exit_types = layout.exit_types.clone();
@@ -1018,6 +1023,7 @@ pub(crate) fn infer_terminal_exit_layout(
         rd_numb: None,
         rd_consts: None,
         rd_virtuals_info: None,
+        rd_pendingfields: None,
     })
 }
 
@@ -1044,6 +1050,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     rd_numb: None,
                     rd_consts: None,
                     rd_virtuals_info: None,
+                    rd_pendingfields: None,
                 },
             );
         }

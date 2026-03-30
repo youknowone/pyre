@@ -5449,14 +5449,20 @@ pub trait BlackholeAllocator {
     fn setrawbuffer_item(&self, buffer: i64, offset: usize, value: i64, descr: u32) {
         let _ = (buffer, offset, value, descr);
     }
-    /// resume.py:1509 setfield dispatch — write field value based on descr type.
-    /// Default delegates to setfield; override if descr-based type dispatch needed.
-    fn setfield_typed(&self, struct_ptr: i64, fieldnum_value: i64, descr: u32) {
-        self.setfield(struct_ptr, descr, fieldnum_value);
+    /// resume.py:1509-1528 setfield — write field value at known offset.
+    fn setfield_typed(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        descr: u32,
+        field_offset: usize,
+        field_size: usize,
+    ) {
+        let _ = (field_offset, field_size);
+        self.setfield(struct_ptr, descr, value);
     }
     /// resume.py:1009-1015 setarrayitem dispatch by descr type.
     fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
-        // Default: int. Override in concrete allocator for ref/float dispatch.
         self.setarrayitem_int(array, index, value, descr);
     }
 }
@@ -5604,11 +5610,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         &mut self,
         rd_virtuals: Option<&'a [VirtualInfo]>,
         rd_pendingfields: Option<&[PendingFieldInfo]>,
+        rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     ) {
         // resume.py:925
         self.prepare_virtuals(rd_virtuals);
         // resume.py:926
-        self.prepare_pendingfields(rd_pendingfields);
+        if rd_pendingfields.is_some() {
+            self.prepare_pendingfields(rd_pendingfields);
+        } else if let Some(guard_pf) = rd_guard_pendingfields {
+            self.prepare_guard_pendingfields(guard_pf);
+        }
     }
 
     /// resume.py:993 _prepare_pendingfields
@@ -5636,7 +5647,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                         _ => 0,
                     };
                     self.allocator
-                        .setfield_typed(struct_ptr, value, pf.descr_index);
+                        .setfield_typed(struct_ptr, value, pf.descr_index, 0, 0);
                 }
                 Some(item_index) => {
                     // resume.py:1007: self.setarrayitem(struct, itemindex, fieldnum, descr)
@@ -5654,6 +5665,73 @@ impl<'a> ResumeDataDirectReader<'a> {
                         pf.descr_index,
                     );
                 }
+            }
+        }
+    }
+
+    /// resume.py:993 _prepare_pendingfields — variant for GuardPendingFieldEntry.
+    ///
+    /// RPython encodes pendingfield target/value as tagged values (TAGBOX/
+    /// TAGCONST/TAGVIRTUAL) via _gettagged in _add_pending_fields
+    /// (resume.py:548-549). At restore time, decode_ref(num) resolves
+    /// the tagged value to a concrete pointer.
+    ///
+    /// When target_tagged/value_tagged are not UNASSIGNED, we use the
+    /// RPython tagged path (decode_ref/decode_int). When they are
+    /// UNASSIGNED (not yet tagged), we use field_offset for direct
+    /// memory writes via the allocator.
+    fn prepare_guard_pendingfields(&mut self, pendingfields: &[majit_ir::GuardPendingFieldEntry]) {
+        for pf in pendingfields {
+            // resume.py:1002-1007
+            let (struct_ptr, value) = if pf.target_tagged != UNASSIGNED
+                && pf.value_tagged != UNASSIGNED
+            {
+                // RPython tagged path: decode_ref(num) for target,
+                // then dispatch by field type for value.
+                // resume.py:1002: struct = self.decode_ref(num)
+                let s = self.decode_ref(pf.target_tagged);
+                // resume.py:1004-1007: setfield/setarrayitem dispatch by descr type
+                let v = match pf.field_type {
+                    majit_ir::Type::Ref => self.decode_ref(pf.value_tagged),
+                    majit_ir::Type::Float => self.decode_float(pf.value_tagged),
+                    _ => self.decode_int(pf.value_tagged),
+                };
+                (s, v)
+            } else {
+                // Legacy path: direct memory write via field_offset.
+                // The Cranelift backend materializes pending fields as
+                // raw stores at known offsets, so we delegate to the
+                // allocator which knows the concrete memory layout.
+                let s = if !pf.target.is_none() && (pf.target.0 as usize) < self.deadframe.len() {
+                    self.deadframe[pf.target.0 as usize]
+                } else {
+                    0
+                };
+                let v = if !pf.value.is_none() && (pf.value.0 as usize) < self.deadframe.len() {
+                    self.deadframe[pf.value.0 as usize]
+                } else {
+                    0
+                };
+                (s, v)
+            };
+
+            if pf.item_index < 0 {
+                // resume.py:1005: self.setfield(struct, fieldnum, descr)
+                self.allocator.setfield_typed(
+                    struct_ptr,
+                    value,
+                    pf.descr_index,
+                    pf.field_offset,
+                    pf.field_size,
+                );
+            } else {
+                // resume.py:1007: self.setarrayitem(struct, itemindex, fieldnum, descr)
+                self.allocator.setarrayitem_typed(
+                    struct_ptr,
+                    pf.item_index as usize,
+                    value,
+                    pf.descr_index,
+                );
             }
         }
     }
@@ -6037,6 +6115,7 @@ pub fn blackhole_from_resumedata<'a>(
     deadframe: &'a [i64],
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_pendingfields: Option<&[PendingFieldInfo]>,
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
@@ -6047,7 +6126,7 @@ pub fn blackhole_from_resumedata<'a>(
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
 
     // resume.py:1324
-    resumereader.prepare(rd_virtuals, rd_pendingfields);
+    resumereader.prepare(rd_virtuals, rd_pendingfields, rd_guard_pendingfields);
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

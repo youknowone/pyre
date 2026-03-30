@@ -15,6 +15,7 @@ pub const TAGBOX: u8 = 2;
 pub const TAGVIRTUAL: u8 = 3;
 const TAGMASK: u8 = 3;
 
+pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;
 pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;

@@ -1424,21 +1424,12 @@ impl OptContext {
                 ns.append_int(0); // num_failargs (patched after encoding)
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
-                // resume.py:251-253: extract jitcode_index/pc from fail_args
-                // where possible. fail_args[1] = next_instr (Int constant)
-                // in pyre's virtualizable layout [frame, ni, vsd, slots...].
-                let resume_pc = if fa.len() >= 2 {
-                    self.get_constant(fa[1])
-                        .and_then(|v| match v {
-                            Value::Int(i) => Some(*i as i32),
-                            _ => None,
-                        })
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                ns.append_int(0); // jitcode_index (single jitcode in pyre)
-                ns.append_int(resume_pc); // pc from fail_args next_instr
+                // resume.py:251-253: single frame.
+                // No-snapshot guards lack orgpc; encode pc=-1 to signal
+                // "unknown orgpc". pc=0 is a valid opcode position
+                // (function start / loop header), not usable as sentinel.
+                ns.append_int(0); // jitcode_index
+                ns.append_int(-1); // pc (-1 = no orgpc)
                 ns.append_int(fa.len() as i32); // box_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
@@ -2191,9 +2182,49 @@ impl OptContext {
             op.rd_virtuals_info = Some(rd_virt_info);
         }
 
+        // resume.py:520-558 _add_pending_fields: tag pendingfield target/value
+        // using the same liveboxes numbering as _number_boxes.
+        // resume.py:548-549: num = self._gettagged(box), fieldnum = self._gettagged(fieldbox)
+        if let Some(ref mut pf_entries) = op.rd_pendingfields {
+            for pf in pf_entries.iter_mut() {
+                pf.target_tagged =
+                    self.gettagged_for_pending(pf.target, &numb_state.liveboxes, &mut memo);
+                pf.value_tagged =
+                    self.gettagged_for_pending(pf.value, &numb_state.liveboxes, &mut memo);
+            }
+        }
+
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         op.rd_numb = Some(numb_state.create_numbering());
         op.rd_consts = Some(memo.consts().to_vec());
+    }
+
+    /// resume.py:560-568 _gettagged — tag an OpRef for pendingfield encoding.
+    ///
+    /// Mirrors RPython's _gettagged: liveboxes lookup → Const → UNINITIALIZED.
+    /// Uses memo.getconst() for large ints and non-zero refs (TAGCONST pool).
+    fn gettagged_for_pending(
+        &self,
+        opref: OpRef,
+        liveboxes: &std::collections::HashMap<u32, i16>,
+        memo: &mut majit_ir::resumedata::ResumeDataLoopMemo,
+    ) -> i16 {
+        use majit_ir::resumedata;
+        let resolved = self.get_box_replacement(opref);
+        // resume.py:561-562: box is None → UNINITIALIZED
+        if resolved.is_none() {
+            return resumedata::UNINITIALIZED_TAG;
+        }
+        // resume.py:563-564: isinstance(box, Const) → memo.getconst(box)
+        if let Some((raw, tp)) = self.getconst(resolved) {
+            return memo.getconst(raw, tp);
+        }
+        // resume.py:566-568: liveboxes[box]
+        if let Some(&tagged) = liveboxes.get(&resolved.0) {
+            return tagged;
+        }
+        // Unresolvable — RPython would raise KeyError here.
+        resumedata::UNASSIGNED
     }
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.

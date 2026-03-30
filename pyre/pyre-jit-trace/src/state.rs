@@ -111,7 +111,7 @@ static NULL_JITCODE: JitCode = JitCode {
 /// RPython computes this from JitCode (register bytecodes) via
 /// backward dataflow. pyre computes from Python bytecodes using the
 /// same algorithm, with stack depth tracked via forward analysis.
-struct LiveVars {
+pub struct LiveVars {
     /// Flat multi-word bitvector for local liveness.
     /// `live_bits[pc * words_per_pc + w]` = word w of bitvector at PC.
     /// No 64-slot cap: supports `words_per_pc * 64` locals.
@@ -262,7 +262,7 @@ impl LiveVars {
 
     /// codewriter/liveness.py _live_vars(pc) parity — local registers.
     /// No slot-count cap: supports arbitrary number of locals.
-    fn is_local_live(&self, pc: usize, local_idx: usize) -> bool {
+    pub fn is_local_live(&self, pc: usize, local_idx: usize) -> bool {
         let word = local_idx / 64;
         let bit = local_idx % 64;
         if word >= self.words_per_pc {
@@ -275,7 +275,7 @@ impl LiveVars {
 
     /// codewriter/liveness.py parity — stack registers.
     /// Stack slot is live if index < stack_depth_at[pc].
-    fn is_stack_live(&self, pc: usize, stack_idx: usize) -> bool {
+    pub fn is_stack_live(&self, pc: usize, stack_idx: usize) -> bool {
         self.stack_depth_at
             .get(pc)
             .map_or(true, |&depth| stack_idx < depth)
@@ -451,7 +451,8 @@ fn target_pc(
 }
 
 /// Cache liveness info per CodeObject pointer.
-fn liveness_for(code: *const CodeObject) -> &'static LiveVars {
+/// codewriter/liveness.py parity: thread-local cache of computed liveness.
+pub fn liveness_for(code: *const CodeObject) -> &'static LiveVars {
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {

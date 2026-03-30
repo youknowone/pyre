@@ -83,6 +83,8 @@ thread_local! {
             crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
             crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
         );
+        // resume.py:1367 — BlackholeAllocator for virtual materialization.
+        d.register_blackhole_allocator(PyreBlackholeAllocator);
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
         // warmstate.py:259 trace_eagerness=200 (RPython default).
@@ -2509,6 +2511,7 @@ fn restore_guard_failure_for_loop(
             vec![crate::call_jit::ResumedFrame {
                 code,
                 py_pc,
+                rd_numb_pc: None, // empty rd_numb: no orgpc available
                 frame_ptr,
                 values: typed.clone(),
             }]
@@ -2765,13 +2768,13 @@ fn build_resumed_frames(
         };
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).
-        // For no-snapshot guards (finalize_guard_resume_data hardcodes
-        // pc=0), fall back to vable next_instr from the resolved values.
-        let py_pc = if frame.pc > 0 {
+        // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
+        let py_pc = if frame.pc >= 0 {
             frame.pc as usize
         } else {
+            // No-snapshot guard: fall back to values[1] (ni).
             match values.get(1) {
-                Some(Value::Int(v)) if *v > 0 => *v as usize,
+                Some(Value::Int(v)) if *v >= 0 => *v as usize,
                 _ => 0,
             }
         };
@@ -2783,6 +2786,13 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
+            // frame.pc >= 0: orgpc from snapshot (liveness-safe).
+            // frame.pc < 0 (== -1): no-snapshot guard (positional only).
+            rd_numb_pc: if frame.pc >= 0 {
+                Some(frame.pc as usize)
+            } else {
+                None
+            },
             frame_ptr,
             values,
         });
@@ -3298,6 +3308,59 @@ fn sync_jit_state_to_frame(
     }
     frame.next_instr = jit_state.next_instr;
     frame.valuestackdepth = jit_state.valuestackdepth;
+}
+
+/// resume.py:1437-1541 — BlackholeAllocator for pyre's object model.
+///
+/// Used by ResumeDataDirectReader during guard failure blackhole resume
+/// to allocate virtual objects and replay pending field writes.
+/// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
+struct PyreBlackholeAllocator;
+
+impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
+    fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
+        // resume.py:1437-1439 allocate_with_vtable
+        // pyre objects are GC-managed; allocation requires type_id → gc.alloc.
+        // Delegate to GC allocator when available.
+        let _ = descr_index;
+        0 // TODO: gc.alloc_with_type_id(descr_index)
+    }
+
+    fn setfield_typed(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        _descr: u32,
+        field_offset: usize,
+        field_size: usize,
+    ) {
+        // resume.py:1509-1528 setfield — write field at byte offset
+        if struct_ptr != 0 && field_offset > 0 {
+            unsafe {
+                let ptr = (struct_ptr as *mut u8).add(field_offset);
+                match field_size {
+                    8 => (ptr as *mut i64).write(value),
+                    4 => (ptr as *mut i32).write(value as i32),
+                    2 => (ptr as *mut i16).write(value as i16),
+                    1 => ptr.write(value as u8),
+                    _ => (ptr as *mut i64).write(value),
+                }
+            }
+        }
+    }
+
+    fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, _descr: u32) {
+        // resume.py:1009-1015 setarrayitem dispatch by type
+        if array != 0 {
+            // pyre list items are PyObjectRef (pointer-sized)
+            let item_size = std::mem::size_of::<usize>();
+            unsafe {
+                let base = array as *mut u8;
+                let ptr = base.add(index * item_size) as *mut i64;
+                ptr.write(value);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -170,6 +170,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
     pub(crate) rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub(crate) rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 impl StoredExitLayout {
@@ -195,6 +196,7 @@ impl StoredExitLayout {
             rd_numb: self.rd_numb.clone(),
             rd_consts: self.rd_consts.clone(),
             rd_virtuals_info: self.rd_virtuals_info.clone(),
+            rd_pendingfields: self.rd_pendingfields.clone(),
         }
     }
 }
@@ -611,6 +613,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             })
     }
 
@@ -640,6 +643,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             })
     }
 
@@ -691,6 +695,7 @@ impl<M: Clone> MetaInterp<M> {
                         rd_numb: None,
                         rd_consts: None,
                         rd_virtuals_info: None,
+                        rd_pendingfields: None,
                     },
                 );
             }
@@ -747,6 +752,7 @@ impl<M: Clone> MetaInterp<M> {
                             rd_numb: None,
                             rd_consts: None,
                             rd_virtuals_info: None,
+                            rd_pendingfields: None,
                         },
                     },
                 );
@@ -3833,6 +3839,8 @@ impl<M: Clone> MetaInterp<M> {
                     rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
                     rd_virtuals_info: trace_layout_ref
                         .and_then(|layout| layout.rd_virtuals_info.clone()),
+                    rd_pendingfields: trace_layout_ref
+                        .and_then(|layout| layout.rd_pendingfields.clone()),
                 }
             })
             .or(trace_layout)
@@ -3855,6 +3863,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -3964,6 +3973,8 @@ impl<M: Clone> MetaInterp<M> {
                     rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
                     rd_virtuals_info: trace_layout_ref
                         .and_then(|layout| layout.rd_virtuals_info.clone()),
+                    rd_pendingfields: trace_layout_ref
+                        .and_then(|layout| layout.rd_pendingfields.clone()),
                 }
             })
             .or(trace_layout)
@@ -3986,6 +3997,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -4114,6 +4126,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -4272,6 +4285,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
@@ -5764,6 +5778,7 @@ impl<M: Clone> MetaInterp<M> {
                     rd_numb: None,
                     rd_consts: None,
                     rd_virtuals_info: None,
+                    rd_pendingfields: None,
                 });
         let reconstructed_state = exit_layout
             .resume_layout
@@ -7613,6 +7628,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
         let mut traces = HashMap::new();
@@ -7810,6 +7826,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
 
@@ -7864,6 +7881,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
 
@@ -9015,6 +9033,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
         let mut terminal_exit_layouts = HashMap::new();
@@ -9031,6 +9050,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
         let mut traces = HashMap::new();
@@ -9695,6 +9715,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
 
@@ -9797,6 +9818,7 @@ mod tests {
                 rd_numb: None,
                 rd_consts: None,
                 rd_virtuals_info: None,
+                rd_pendingfields: None,
             },
         );
 
