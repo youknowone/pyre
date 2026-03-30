@@ -620,11 +620,12 @@ impl<S: JitState> JitDriver<S> {
                                     self.trace_meta = None;
                                     return;
                                 }
-                                // pyjitpl.py:2999-3005: RetraceNeeded →
-                                // partial_trace preserved → next
-                                // reached_loop_header calls compile_retrace.
+                                // pyjitpl.py:2993-3007: after retrace_needed(),
+                                // partial_trace is set on MetaInterp. Fall through
+                                // to compile_loop → compile_retrace in same call.
                                 crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
                                     self.bridge_info.take();
+                                    // Fall through — do NOT return.
                                 }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
                                     self.bridge_info.take();
@@ -672,8 +673,7 @@ impl<S: JitState> JitDriver<S> {
                     };
                     // pyjitpl.py:2993-3007: compile_loop checks
                     // has_partial_trace internally and dispatches to
-                    // compile_retrace when appropriate. Do NOT clear
-                    // partial_trace here — bridge retrace depends on it.
+                    // compile_retrace when appropriate.
                     let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -712,10 +712,12 @@ impl<S: JitState> JitDriver<S> {
                                 self.trace_meta = None;
                                 return;
                             }
-                            // pyjitpl.py:2999-3005: RetraceNeeded →
-                            // partial_trace preserved → compile_retrace.
+                            // pyjitpl.py:2993-3007: after retrace_needed(),
+                            // partial_trace is set on MetaInterp. Fall through
+                            // to compile_loop → compile_retrace in same call.
                             crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
                                 self.bridge_info.take();
+                                // Fall through — do NOT return.
                             }
                             crate::pyjitpl::BridgeCompileResult::Failed => {
                                 self.bridge_info.take();
@@ -751,8 +753,7 @@ impl<S: JitState> JitDriver<S> {
                     };
                     // pyjitpl.py:2993-3007: compile_loop checks
                     // has_partial_trace internally and dispatches to
-                    // compile_retrace when appropriate. Do NOT clear
-                    // partial_trace here — bridge retrace depends on it.
+                    // compile_retrace when appropriate.
                     let _outcome = self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
@@ -777,8 +778,8 @@ impl<S: JitState> JitDriver<S> {
                 {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit][bridge-finish] key={} trace={} fail={}",
-                            bridge_key, bridge_trace_id, bridge_fail_index
+                            "[jit][bridge-finish] compile_done_with_this_frame key={} trace={} fail={} args={:?}",
+                            bridge_key, bridge_trace_id, bridge_fail_index, finish_args
                         );
                     }
                     self.sym = None;

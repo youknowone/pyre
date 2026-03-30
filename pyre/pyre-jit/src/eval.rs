@@ -1352,7 +1352,6 @@ fn execute_assembler(
                             );
                         }
                         driver.invalidate_loop(green_key);
-                        // Restore pre-entry frame state.
                         frame.next_instr = saved_ni;
                         frame.valuestackdepth = saved_vsd;
                         let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
