@@ -1571,30 +1571,9 @@ pub fn trace_and_compile_from_bridge(
     // blackhole resume → interpreter runs remaining code → natural return.
     // Direct FINISH bridges are WRONG here — they skip the remaining loop
     // body that the blackhole should execute.
-    // DIFFERS FROM UPSTREAM: RPython rebuild_from_resumedata
-    // (pyjitpl.py:2901,3400) restores the complete frame stack before
-    // bridge tracing. pyre truncates jit_state.valuestackdepth to
-    // fail_arg count because bridge inputargs = guard fail_args.
-    // Fix: port rebuild_from_resumedata so bridge tracing sees
-    // the complete frame stack + vref/vable state (resume.py:1049).
-    let bridge_adjusted_vsd;
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        let n_fail_args = driver
-            .meta_interp_mut()
-            .fail_arg_count_for(green_key, trace_id, fail_index);
-        if n_fail_args >= 3 {
-            let n_slots = n_fail_args - 3;
-            let nlocals = frame.nlocals();
-            let new_vsd = nlocals + n_slots.saturating_sub(nlocals);
-            if new_vsd < jit_state.valuestackdepth {
-                jit_state.valuestackdepth = new_vsd;
-            }
-            bridge_adjusted_vsd = Some(new_vsd);
-        } else {
-            bridge_adjusted_vsd = None;
-        }
-    }
+    // RPython rebuild_from_resumedata (pyjitpl.py:2901,3400)
+    // restores the complete frame stack before bridge tracing.
+    // Bridge tracing sees the full frame layout — no truncation.
     let loop_header_pc = 0; // not used by start_bridge_tracing
 
     if majit_metainterp::majit_log_enabled() {
@@ -1651,12 +1630,6 @@ pub fn trace_and_compile_from_bridge(
     // pyjitpl.py:2841 interpret(): trace bytecodes from guard failure PC
     // until the bridge path terminates (Finish or CloseLoop).
     let mut trace_frame = Box::new(frame.snapshot_for_tracing());
-    // resume.py:1042: adjust snapshot's valuestackdepth to match fail_arg_types.
-    if let Some(vsd) = bridge_adjusted_vsd {
-        if vsd < trace_frame.valuestackdepth {
-            trace_frame.valuestackdepth = vsd;
-        }
-    }
     let max_bridge_ops = 200;
 
     for step in 0..max_bridge_ops {

@@ -7514,23 +7514,11 @@ impl JitState for PyreJitState {
         meta.merge_pc = new_pc;
     }
 
-    fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        // DIFFERS FROM UPSTREAM: RPython rebuild_from_resumedata
-        // (resume.py:1042, pyjitpl.py:3400) restores the complete
-        // frame stack from rd_numb before bridge tracing starts.
-        // pyre truncates meta to fail_arg_types count because the
-        // Cranelift dispatch only passes fail_args to bridge code.
-        // This limits bridge guard snapshots to the truncated view.
-        // Fix: port rebuild_from_resumedata so bridge tracing sees
-        // the complete frame stack + vref/vable state (resume.py:1049).
-        if fail_arg_types.len() >= 3 {
-            let n_slots = fail_arg_types.len() - 3;
-            let nlocals = meta.num_locals.min(n_slots);
-            let stack_only = n_slots.saturating_sub(nlocals);
-            meta.num_locals = nlocals;
-            meta.valuestackdepth = nlocals + stack_only;
-            meta.slot_types = fail_arg_types[3..].to_vec();
-        }
+    fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {
+        // RPython rebuild_from_resumedata (resume.py:1042, pyjitpl.py:3400)
+        // restores the complete frame stack from rd_numb before bridge
+        // tracing starts. The meta (num_locals, valuestackdepth, slot_types)
+        // remains unchanged — bridge tracing sees the full frame layout.
     }
 
     fn meta_merge_pc(meta: &Self::Meta) -> usize {
@@ -7736,32 +7724,19 @@ impl JitState for PyreJitState {
             return self.refresh_from_frame();
         }
 
-        // RPython resume.py rebuilds guard-failure state from the typed
-        // INT/REF/FLOAT streams carried by resumedata instead of reusing the
-        // trace-entry slot kinds.  Virtualizable guards in pyre can likewise
-        // exit with more precise slot kinds than `meta.slot_types`
-        // (e.g. raw loop indices), so restore from the runtime value kind.
+        // virtualizable.py:126-133: write static fields from resumedata.
+        // FIELDTYPE for next_instr = Signed, valuestackdepth = Signed.
         self.next_instr = values.get(1).map(value_to_usize).unwrap_or(self.next_instr);
-        // RPython parity: blackhole creates a fresh frame from resumedata.
-        // In pyre we reuse the same frame, so clamp valuestackdepth to
-        // frame array capacity — extra fail_args from virtual materialization
-        // can inflate the count beyond bounds.
-        let arr_cap = self
-            .locals_cells_stack_array()
-            .map(|a| unsafe { (*a).len() })
-            .unwrap_or(usize::MAX);
         self.valuestackdepth = values
             .get(2)
             .map(value_to_usize)
-            .unwrap_or(self.valuestackdepth)
-            .min(arr_cap);
+            .unwrap_or(self.valuestackdepth);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
-        // virtualizable.py:126/139 parity: frame array items are always
-        // GCREF (interp_jit.py:25: locals_cells_stack_w[*] = ref type).
-        // The optimizer may unbox ints to Value::Int in fail_args, but
-        // the frame expects boxed Python objects. Re-box as needed.
+        // virtualizable.py:134-137: array items use declared ARRAYITEMTYPE.
+        // locals_cells_stack_w[*] ARRAYITEMTYPE = GCREF (interp_jit.py:27).
+        // Re-box Int/Float fail_args into Python objects for GCREF slots.
         let mut idx = 3;
         for local_idx in 0..nlocals {
             if let Some(value) = values.get(idx) {
