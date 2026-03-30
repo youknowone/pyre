@@ -2806,7 +2806,11 @@ impl MIFrame {
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: callee_live_pc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes, ctx),
+                boxes: Self::fail_args_to_snapshot_boxes_typed(
+                    &callee_active_boxes,
+                    &callee_types,
+                    ctx,
+                ),
             }];
             // fail_args = header + materialized active_boxes (for Cranelift deadframe).
             let materialized = self.materialize_active_boxes(ctx, &callee_active_boxes);
@@ -2824,7 +2828,7 @@ impl MIFrame {
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes(parent_active, ctx),
+                    boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, pfa_types, ctx),
                 });
                 fail_args.extend_from_slice(pfa);
                 let pt = if pfa_types.is_empty() {
@@ -2879,7 +2883,8 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+        let snapshot_boxes =
+            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &fail_arg_types, ctx);
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
@@ -2990,9 +2995,6 @@ impl MIFrame {
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
-    /// snapshot boxes from fail_args = [frame, ni, vsd, locals, stack].
-    /// ni/vsd are also in Snapshot.vable_array; _number_boxes
-    /// deduplicates via liveboxes HashMap (same OpRef → same tag).
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
         ctx: &majit_metainterp::TraceCtx,
@@ -3000,6 +3002,32 @@ impl MIFrame {
         fail_args
             .iter()
             .map(|&opref| Self::opref_to_snapshot_tagged(opref, ctx))
+            .collect()
+    }
+
+    /// snapshot boxes from active_boxes = [locals, stack].
+    /// RPython: each Box carries type ('r'/'i'/'f') — pyre passes types
+    /// explicitly so _number_boxes can detect virtual vs int correctly.
+    fn fail_args_to_snapshot_boxes_typed(
+        active_boxes: &[OpRef],
+        types: &[majit_ir::Type],
+        ctx: &majit_metainterp::TraceCtx,
+    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+        active_boxes
+            .iter()
+            .enumerate()
+            .map(|(i, &opref)| {
+                if opref.is_none() {
+                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+                } else if opref.0 >= 10_000 {
+                    let val = ctx.constant_value(opref).unwrap_or(0);
+                    let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+                    majit_trace::recorder::SnapshotTagged::Const(val, tp)
+                } else {
+                    let tp = types.get(i).copied().unwrap_or(majit_ir::Type::Ref);
+                    majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
+                }
+            })
             .collect()
     }
 
