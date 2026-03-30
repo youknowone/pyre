@@ -1500,8 +1500,8 @@ impl OptContext {
         if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
             // RPython resume.py:397: assert resume_position >= 0.
             // This fallback should not exist in RPython-parity code.
-            // Log which guards reach here so we can fix their source.
-            if crate::majit_log_enabled() {
+            // Always log — every occurrence needs investigation.
+            {
                 let has_descr = op.descr.is_some();
                 let has_patchguard = self.patchguardop.is_some();
                 let patch_pos = self.patchguardop.as_ref().map(|p| p.rd_resume_position);
