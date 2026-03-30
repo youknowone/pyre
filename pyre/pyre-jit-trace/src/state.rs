@@ -7940,23 +7940,34 @@ impl JitState for PyreJitState {
         self.sync_scalar_fields_to_frame()
     }
 
-    /// resume.py:1049 parity: frame value types for per-frame decode.
-    /// Returns None — slot restoration goes through restore_virtualizable_state
-    /// which handles the full [frame, ni, vsd, locals..., stack...] layout.
+    /// resume.py:1077 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
+    /// Return the type of each slot in the resumed frame section.
+    /// In pyre, all frame slots are PyObjectRef (GCREF), so every slot
+    /// is Ref. RPython uses typed registers (boxes_i/r/f) but pyre's
+    /// virtualizable array is uniformly Ref.
     fn reconstructed_frame_value_types(
         &self,
-        _meta: &Self::Meta,
+        meta: &Self::Meta,
         _frame_index: usize,
         _total_frames: usize,
         _frame_pc: u64,
     ) -> Option<Vec<Type>> {
-        None
+        // resume.py:1077: consume_boxes fills boxes_i/boxes_r/boxes_f.
+        // pyre frame slots (locals_cells_stack_w) are all GCREF (Ref).
+        let nlocals = meta.num_locals;
+        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        // Header [frame_ptr=Ref, ni=Int, vsd=Int] + all locals/stack as Ref.
+        let mut types = vec![Type::Ref, Type::Int, Type::Int];
+        types.extend(std::iter::repeat_n(Type::Ref, nlocals + stack_only));
+        Some(types)
     }
 
-    /// resume.py:1049 parity: restore frame register state.
-    /// For pyre, slot values are restored through restore_virtualizable_state
-    /// (the virtualizable mechanism handles the full frame layout).
-    /// This method handles the frame pointer + PC setup.
+    /// resume.py:1049 parity: restore frame register state from decoded values.
+    /// resume.py:1077 consume_boxes → _prepare_next_section → enumerate_vars:
+    /// each callback_r writes a ref value to the register at the given index.
+    /// In pyre, this writes values to the PyFrame's locals/stack via the
+    /// virtualizable mechanism (restore_virtualizable_state handles the
+    /// full [frame, ni, vsd, locals..., stack...] layout).
     fn restore_reconstructed_frame_values(
         &mut self,
         _meta: &Self::Meta,
@@ -7966,7 +7977,10 @@ impl JitState for PyreJitState {
         _values: &[Value],
         _exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
-        true // Slot restoration handled by restore_virtualizable_state.
+        // Slot restoration is handled by restore_virtualizable_state which
+        // is called from the guard failure path. This method returns true
+        // to indicate success.
+        true
     }
 
     /// blackhole.py:1800 parity: multi-frame support.
