@@ -225,10 +225,16 @@ pub struct GuardPendingFieldEntry {
     pub descr_index: u32,
     /// For SETARRAYITEM_GC: the constant array index. -1 for SETFIELD_GC.
     pub item_index: i32,
-    /// OpRef of the target struct/array (real object, in fail_args or constant).
+    /// OpRef of the target struct/array (compile-time SSA position).
     pub target: OpRef,
-    /// OpRef of the value being stored.
+    /// OpRef of the value being stored (compile-time SSA position).
     pub value: OpRef,
+    /// resume.py:554 — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
+    /// Set by store_final_boxes_in_guard when resume numbering is available.
+    /// Used by prepare_guard_pendingfields for RPython decode_ref parity.
+    pub target_tagged: i16,
+    /// resume.py:555 — tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
+    pub value_tagged: i16,
     /// Byte offset of the field on the struct (from FieldDescr/ArrayDescr).
     /// For array items: base_size + item_index * item_size (precomputed).
     pub field_offset: usize,

@@ -226,6 +226,9 @@ pub struct JitDriver<S: JitState> {
     /// Registered by #[jit_interp] macro at startup.
     jitcode_factory:
         Option<Box<dyn Fn(&S::Env, usize, u8) -> Option<crate::jitcode::JitCode> + Send>>,
+    /// resume.py:1367 — CPU allocation backend for virtual materialization
+    /// during blackhole resume. Registered by pyre/aheui at startup.
+    blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -266,6 +269,7 @@ impl<S: JitState> JitDriver<S> {
             epoch_qmut,
             _invalidation_thread: Some(invalidation_thread),
             jitcode_factory: None,
+            blackhole_allocator: None,
         }
     }
 
@@ -279,6 +283,16 @@ impl<S: JitState> JitDriver<S> {
         factory: impl Fn(&S::Env, usize, u8) -> Option<crate::jitcode::JitCode> + Send + 'static,
     ) {
         self.jitcode_factory = Some(Box::new(factory));
+    }
+
+    /// Register a BlackholeAllocator for virtual materialization during
+    /// guard failure blackhole resume. Without this, virtual objects
+    /// and raw buffers are allocated as null/zero.
+    pub fn register_blackhole_allocator(
+        &mut self,
+        allocator: impl crate::resume::BlackholeAllocator + Send + 'static,
+    ) {
+        self.blackhole_allocator = Some(Box::new(allocator));
     }
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
@@ -1152,20 +1166,26 @@ impl<S: JitState> JitDriver<S> {
                     factory(env, pc as usize, 0)
                 };
 
+                let fallback_alloc = crate::resume::NullAllocator;
+                let allocator: &dyn crate::resume::BlackholeAllocator = self
+                    .blackhole_allocator
+                    .as_deref()
+                    .unwrap_or(&fallback_alloc);
+
                 let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
-                let null_alloc = crate::resume::NullAllocator;
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &null_alloc,
+                    None,                                    // rd_virtuals
+                    None,                                    // rd_pendingfields (PendingFieldInfo)
+                    exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
+                    None,                                    // vrefinfo
+                    None,                                    // vinfo
+                    None,                                    // ginfo
+                    allocator,
                 );
                 if let Some(bh) = bh {
                     let exc =
@@ -2590,20 +2610,26 @@ impl<S: JitState> JitDriver<S> {
                     factory(env, pc as usize, 0)
                 };
 
+                let fallback_alloc = crate::resume::NullAllocator;
+                let allocator: &dyn crate::resume::BlackholeAllocator = self
+                    .blackhole_allocator
+                    .as_deref()
+                    .unwrap_or(&fallback_alloc);
+
                 let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
-                let null_alloc = crate::resume::NullAllocator;
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &null_alloc,
+                    None,                                    // rd_virtuals
+                    None,                                    // rd_pendingfields (PendingFieldInfo)
+                    exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
+                    None,                                    // vrefinfo
+                    None,                                    // vinfo
+                    None,                                    // ginfo
+                    allocator,
                 );
                 if let Some(bh) = bh {
                     let exc =

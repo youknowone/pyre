@@ -2645,6 +2645,11 @@ impl Optimizer {
                                 item_index,
                                 target: ctx.get_box_replacement(target),
                                 value: ctx.get_box_replacement(value),
+                                // resume.py:554-555: tagged encoding set during
+                                // resume numbering (_add_pending_fields).
+                                // UNASSIGNED means "not yet tagged".
+                                target_tagged: majit_ir::resumedata::UNASSIGNED,
+                                value_tagged: majit_ir::resumedata::UNASSIGNED,
                                 field_offset,
                                 field_size,
                                 field_type,
@@ -2744,6 +2749,10 @@ impl Optimizer {
             // exported_jump_virtuals and JUMP arg construction. Without this,
             // body loop loses virtual tracking → wrong computation.
             // RPython uses box identity (_forwarded chain) instead.
+            //
+            // TODO(rpython-parity): eliminate this by porting RPython's box
+            // identity model — PtrInfo attached to OpRef via set_forwarded,
+            // not in separate HashMap. Then finish() can handle everything.
             let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
             let mut extra_fail_args: Vec<OpRef> = Vec::new();
             let original_len = fail_args.len();
