@@ -9776,7 +9776,7 @@ mod tests {
             slot_sources: vec![ResumeValueKind::FailArg],
             slot_layouts: vec![ResumeValueLayoutSummary {
                 kind: ResumeValueKind::FailArg,
-                fail_arg_index: Some(0),
+                fail_arg_index: 0,
                 raw_fail_arg_position: Some(0),
                 constant: None,
                 virtual_index: None,
