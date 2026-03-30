@@ -86,6 +86,11 @@ pub struct ShortPreamble {
     /// loop's constant pool. This map captures (value, type) for each
     /// constant OpRef so bridges can re-register them in their own pool.
     pub constants: HashMap<u32, (i64, majit_ir::Type)>,
+    /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
+    /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
+    /// Used by inline_short_preamble to propagate PtrInfo to jump_args
+    /// so guards added by use_box are eliminated as redundant.
+    pub inputarg_infos: Vec<Option<crate::optimizeopt::info::PtrInfo>>,
     /// RPython parity: Phase 1 inputargs preserved across Extended rebuilds.
     /// In RPython, short ops reference renamed inputargs (new Box objects)
     /// that are stable across compilations. In majit, ops keep original
@@ -107,6 +112,7 @@ impl ShortPreamble {
             exported_state: None,
             constants: HashMap::new(),
             phase1_inputargs: None,
+            inputarg_infos: Vec::new(),
         }
     }
 
@@ -298,6 +304,7 @@ impl CollectedShortPreambleBuilder {
             exported_state,
             constants: HashMap::new(),
             phase1_inputargs: None,
+            inputarg_infos: Vec::new(),
         }
     }
 }
@@ -853,6 +860,7 @@ impl CollectedExtendedShortPreambleBuilder {
             exported_state,
             constants: HashMap::new(),
             phase1_inputargs: None,
+            inputarg_infos: Vec::new(),
         }
     }
 }
@@ -1186,6 +1194,7 @@ fn build_short_preamble_struct_from_ops(
         exported_state: None,
         constants,
         phase1_inputargs: None,
+        inputarg_infos: Vec::new(),
     }
 }
 
@@ -1832,6 +1841,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         exported_state: None,
         constants: HashMap::new(),
         phase1_inputargs: None,
+        inputarg_infos: Vec::new(),
     }
 }
 
