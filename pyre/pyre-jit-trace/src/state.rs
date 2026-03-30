@@ -98,6 +98,17 @@ fn jitcode_for(code: *const CodeObject) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 
+/// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
+/// Resolve jitcode_index (sequential int from snapshot numbering)
+/// to the corresponding CodeObject pointer.
+pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let idx = jitcode_index as usize;
+        sd.jitcodes.get(idx).map(|jc| jc.code)
+    })
+}
+
 /// Sentinel null JitCode for uninitialized PyreSym.
 static NULL_JITCODE: JitCode = JitCode {
     code: std::ptr::null(),

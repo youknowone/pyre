@@ -1511,11 +1511,15 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// Args: (green_key, trace_id, fail_index, fail_values_ptr, num_fail_values) → result i64.
 /// This reads the guard's resume data, restores state from fail_values (deadframe),
 /// and executes the remaining IR ops from the guard point to Finish.
-static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> Option<i64>> =
-    OnceLock::new();
+/// bh_fn(green_key, trace_id, fail_index, rebuilt_values, num_rebuilt, raw_deadframe, num_raw)
+static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
+    fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
+> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
-pub fn register_call_assembler_blackhole(f: fn(u64, u64, u32, *const i64, usize) -> Option<i64>) {
+pub fn register_call_assembler_blackhole(
+    f: fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
+) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
 
@@ -2657,6 +2661,8 @@ extern "C" fn call_assembler_guard_failure(
             fail_index,
             bh_outputs.as_ptr(),
             num_outputs,
+            outputs_ptr,
+            raw_num,
         ) {
             return result;
         }
@@ -2944,12 +2950,14 @@ fn call_assembler_fast_path(
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.header_pc;
         let trace_id = target.trace_id;
+        let raw_num = fail_descr.fail_arg_types.len();
+        let raw_outputs = outputs.to_vec(); // raw deadframe before rebuild
         let mut bh_outputs = outputs.to_vec();
         rebuild_state_after_failure(
             &mut bh_outputs,
             &fail_descr.fail_arg_types,
             fail_descr.recovery_layout_ref().as_ref(),
-            fail_descr.fail_arg_types.len(),
+            raw_num,
         );
         let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
@@ -2958,6 +2966,8 @@ fn call_assembler_fast_path(
             fail_index,
             bh_outputs.as_ptr(),
             num_outputs,
+            raw_outputs.as_ptr(),
+            raw_num,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -3065,12 +3075,14 @@ fn call_assembler_fast_path_heap(
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.header_pc;
         let trace_id = target.trace_id;
+        let raw_num = fail_descr.fail_arg_types.len();
+        let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
         rebuild_state_after_failure(
             &mut bh_outputs,
             &fail_descr.fail_arg_types,
             fail_descr.recovery_layout_ref().as_ref(),
-            fail_descr.fail_arg_types.len(),
+            raw_num,
         );
         let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
@@ -3079,6 +3091,8 @@ fn call_assembler_fast_path_heap(
             fail_index,
             bh_outputs.as_ptr(),
             num_outputs,
+            raw_outputs.as_ptr(),
+            raw_num,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -3182,17 +3196,14 @@ extern "C" fn call_assembler_shim(
     }
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         // resume.py:1312 blackhole_from_resumedata parity.
+        let raw_num = fail_types.len();
+        let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
         let recovery = target
             .fail_descrs
             .get(fail_index as usize)
             .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
-        rebuild_state_after_failure(
-            &mut bh_outputs,
-            fail_types,
-            recovery.as_ref(),
-            fail_types.len(),
-        );
+        rebuild_state_after_failure(&mut bh_outputs, fail_types, recovery.as_ref(), raw_num);
         let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
             target.header_pc,
@@ -3200,6 +3211,8 @@ extern "C" fn call_assembler_shim(
             fail_index,
             bh_outputs.as_ptr(),
             num_outputs,
+            raw_outputs.as_ptr(),
+            raw_num,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;

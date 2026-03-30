@@ -1111,6 +1111,59 @@ pub fn resume_in_blackhole(
     }
 }
 
+/// resume.py:1334-1343 blackhole_from_resumedata parity:
+/// Parse typed Value array into per-frame ResumedFrame sections.
+///
+/// Each section starts with [Ref(frame), Int(py_pc), Int(vsd)] header.
+/// Section length = 3 + vsd. Multi-frame resume data has consecutive
+/// sections (callee first, caller last).
+fn parse_resumed_frames(typed_values: &[majit_ir::Value]) -> Vec<ResumedFrame> {
+    use majit_ir::Value;
+    let mut frames = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 3 <= typed_values.len() {
+        // Section header: [Ref/Int(frame), Int(py_pc), Int(vsd)]
+        let has_header = matches!(typed_values[cursor], Value::Ref(_) | Value::Int(_))
+            && matches!(typed_values[cursor + 1], Value::Int(_))
+            && matches!(typed_values[cursor + 2], Value::Int(_));
+        if !has_header {
+            break;
+        }
+        let vsd = match typed_values[cursor + 2] {
+            Value::Int(v) if v >= 0 => v as usize,
+            _ => break,
+        };
+        let section_len = 3 + vsd;
+        if cursor + section_len > typed_values.len() {
+            break;
+        }
+        let section = &typed_values[cursor..cursor + section_len];
+        let frame_ptr = match section[0] {
+            Value::Ref(r) => r.as_usize() as *mut PyFrame,
+            Value::Int(v) => v as *mut PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        let py_pc = match section[1] {
+            Value::Int(v) => v as usize,
+            _ => 0,
+        };
+        let code = if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).code }
+        } else {
+            std::ptr::null()
+        };
+        frames.push(ResumedFrame {
+            code,
+            py_pc,
+            rd_numb_pc: None, // heuristic path: no rd_numb PC
+            frame_ptr,
+            values: section.to_vec(),
+        });
+        cursor += section_len;
+    }
+    frames
+}
+
 /// resume.py:945-956 decode_ref / getvirtual_ptr parity.
 ///
 /// Re-box optimizer-unboxed values back to PyObjectRef for the
@@ -1499,27 +1552,35 @@ pub fn install_jit_call_bridge() {
     });
 }
 
-/// RPython resume_in_blackhole parity: resume execution from the guard
-/// failure point using the IR-based blackhole interpreter.
+/// compile.py:701-716 handle_fail → resume_in_blackhole parity.
 ///
-/// RPython warmspot.py:1021 assembler_call_helper → handle_fail →
-/// resume_in_blackhole → BlackholeInterpreter.dispatch_loop from guard PC.
+/// RPython: guard failure always resumes via jitcode-level blackhole
+/// (blackhole_from_resumedata → _run_forever). There is no IR-level
+/// blackhole in RPython.
 ///
-/// In majit, this calls MetaInterp::blackhole_guard_failure which executes
-/// the remaining IR ops from guard+1 to Finish, returning the raw result.
+/// When rd_numb is available, uses ResumeDataDirectReader for exact
+/// frame decoding (resume.py:1312 parity). Falls back to heuristic
+/// parse_resumed_frames when rd_numb is absent.
 fn jit_blackhole_resume_from_guard(
     green_key: u64,
     trace_id: u64,
     fail_index: u32,
     fail_values_ptr: *const i64,
     num_fail_values: usize,
+    raw_deadframe_ptr: *const i64,
+    num_raw_deadframe: usize,
 ) -> Option<i64> {
+    use majit_ir::{Type, Value};
+
     if fail_values_ptr.is_null() || num_fail_values == 0 {
         return None;
     }
     let fail_values = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
-    // The green_key from the target may be 0 for function-entry traces.
-    // Recover the real green_key from the callee frame's code pointer.
+    let raw_deadframe = if !raw_deadframe_ptr.is_null() && num_raw_deadframe > 0 {
+        unsafe { std::slice::from_raw_parts(raw_deadframe_ptr, num_raw_deadframe) }
+    } else {
+        fail_values
+    };
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
         let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
         if !frame_ptr.is_null() {
@@ -1532,51 +1593,248 @@ fn jit_blackhole_resume_from_guard(
         green_key
     };
     let (driver, _) = crate::eval::driver_pair();
-    let exception = majit_metainterp::blackhole::ExceptionState::default();
+
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
-            actual_green_key,
-            trace_id,
-            fail_index,
-            fail_values.len(),
+            actual_green_key, trace_id, fail_index, num_fail_values,
         );
     }
-    // RPython _run_forever parity: blackhole may return Jump (loop back)
-    // or GuardFailed (nested guard failure). Keep running until Finish.
-    // Zero-copy: pass fail_values slice directly (from caller's jf_frame)
-    // on first iteration, avoiding heap Vec allocation.
-    let mut current_fail_index = fail_index;
-    let mut _owned_values: Option<Vec<i64>> = None;
-    let mut current_slice: &[i64] = fail_values;
+
+    // --- Path 1: rd_numb-based resume (resume.py:1312 exact parity) ---
+    // When rd_numb is present, use ResumeDataDirectReader to decode
+    // frame sections precisely, matching RPython blackhole_from_resumedata.
+    if let Some((rd_numb, rd_consts_typed)) =
+        driver.get_rd_numb(actual_green_key, trace_id, fail_index)
+    {
+        let rd_consts: Vec<i64> = rd_consts_typed.iter().map(|(v, _)| *v).collect();
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
+                rd_numb.len(),
+                rd_consts.len(),
+                raw_deadframe.len(),
+            );
+        }
+        // rd_numb TAGBOX indices reference the raw deadframe (before rebuild).
+        // blackhole_from_resumedata returns None (→ Failed) for pc=-1
+        // (no-snapshot) frames. Failed → None → force_fn fallback in
+        // the caller, which is faster than jitcode-level BH dispatch.
+        let result = blackhole_resume_via_rd_numb(&rd_numb, &rd_consts, raw_deadframe);
+        return handle_blackhole_result(result, fail_values);
+    }
+
+    // --- Path 2: heuristic fallback (no rd_numb) ---
+    let slot_types = match driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index) {
+        Some(st) if st.len() == fail_values.len() => st,
+        _ => return None,
+    };
+    let merge_py_pc = driver
+        .get_merge_point_pc(actual_green_key, trace_id, fail_index)
+        .unwrap_or(0) as usize;
+
+    let typed_values: Vec<Value> = slot_types
+        .iter()
+        .zip(fail_values.iter())
+        .map(|(tp, &raw)| match tp {
+            Type::Int => Value::Int(raw),
+            Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+            Type::Float => Value::Float(f64::from_bits(raw as u64)),
+            Type::Void => Value::Void,
+        })
+        .collect();
+
+    let frames = parse_resumed_frames(&typed_values);
+    if frames.is_empty() {
+        return None;
+    }
+    let callee_frame_ptr = frames[0].frame_ptr;
+    if callee_frame_ptr.is_null() {
+        return None;
+    }
+    let callee_frame = unsafe { &mut *callee_frame_ptr };
+    let bh_result = resume_in_blackhole(callee_frame, &frames, merge_py_pc);
+    handle_blackhole_result(bh_result, fail_values)
+}
+
+/// resume.py:1312 blackhole_from_resumedata parity:
+/// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
+/// run _run_forever.
+fn blackhole_resume_via_rd_numb(
+    rd_numb: &[u8],
+    rd_consts: &[i64],
+    deadframe: &[i64],
+) -> BlackholeResult {
+    use majit_metainterp::resume;
+
+    // Thread-local BH pool (RPython BlackholeInterpBuilder).
+    thread_local! {
+        static BH_BUILDER_RD: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
+            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
+    }
+    let builder = BH_BUILDER_RD.with(|cell| unsafe { &mut *cell.get() });
+
+    // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
+    // to a pyre JitCode via CodeWriter.
+    let writer = crate::jit::codewriter::CodeWriter::new(
+        bh_call_fn,
+        bh_load_global_fn,
+        bh_compare_fn,
+        bh_binary_op_fn,
+        bh_box_int_fn,
+        bh_truth_fn,
+        bh_load_const_fn,
+        bh_store_subscr_fn,
+        crate::call_jit::bh_build_list_fn,
+    );
+    // resume.py:1339 jitcodes[jitcode_pos]:
+    // jitcode_index is a sequential index into MetaInterpStaticData.jitcodes.
+    // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
+    let resolve_jitcode =
+        |jitcode_index: i32, pc: i32| -> Option<majit_metainterp::jitcode::JitCode> {
+            // pc=-1 means no-snapshot guard — consume_one_section cannot
+            // decode without liveness info. Return None to fall back to
+            // the heuristic path.
+            if pc < 0 {
+                return None;
+            }
+            let code_ptr = pyre_jit_trace::state::code_for_jitcode_index(jitcode_index)?;
+            if code_ptr.is_null() {
+                return None;
+            }
+            let code = unsafe { &*code_ptr };
+            let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
+            if pyjitcode.has_abort_opcode() {
+                return None;
+            }
+            Some(pyjitcode.jitcode.clone())
+        };
+
+    // resume.py:1312-1343 blackhole_from_resumedata:
+    // ResumeDataDirectReader decodes rd_numb, builds BH chain.
+    let allocator = resume::NullAllocator;
+    let bh = resume::blackhole_from_resumedata(
+        builder,
+        &resolve_jitcode,
+        rd_numb,
+        rd_consts,
+        deadframe,
+        None, // rd_virtuals
+        None, // rd_pendingfields
+        None, // rd_guard_pendingfields
+        None, // vrefinfo
+        None, // vinfo
+        None, // ginfo
+        &allocator,
+    );
+
+    let Some(mut bh) = bh else {
+        return BlackholeResult::Failed;
+    };
+
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
+    }
+
+    // blackhole.py:1752 _run_forever parity.
     loop {
-        let bh_opt = driver.blackhole_guard_failure(
-            actual_green_key,
-            trace_id,
-            current_fail_index,
-            current_slice,
-            exception.clone(),
-        );
-        let (bh_result, _bh_exc) = bh_opt?;
-        match bh_result {
-            majit_metainterp::blackhole::BlackholeResult::Finish { values, .. } => {
-                return values.first().copied();
+        bh.run();
+
+        if bh.reached_merge_point {
+            builder.release_interp(bh);
+            return BlackholeResult::ContinueRunningNormally;
+        }
+        if bh.aborted {
+            builder.release_interp(bh);
+            return BlackholeResult::Failed;
+        }
+        if bh.got_exception {
+            let exc_value = bh.exception_last_value;
+            let next = bh.nextblackholeinterp.take();
+            builder.release_interp(bh);
+            let Some(mut caller_bh) = next.map(|b| *b) else {
+                return BlackholeResult::DoneWithThisFrame(Err(pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::RuntimeError,
+                    "blackhole exception",
+                )));
+            };
+            caller_bh.last_opcode_position = caller_bh.position;
+            if caller_bh.handle_exception_in_frame(exc_value) {
+                bh = caller_bh;
+                continue;
             }
-            majit_metainterp::blackhole::BlackholeResult::Jump { values, .. } => {
-                // Loop back: re-enter from the loop header (fail_index=0)
-                current_fail_index = 0;
-                _owned_values = Some(values);
-                current_slice = _owned_values.as_ref().unwrap();
-                // Jump means re-enter the compiled code from the loop header.
-                // For now, fall back to force_fn since we don't have loop
-                // re-entry support in the blackhole yet.
+            caller_bh.exception_last_value = exc_value;
+            caller_bh.got_exception = true;
+            bh = caller_bh;
+            continue;
+        }
+
+        // DoneWithThisFrame: callee finished (RETURN_VALUE).
+        let return_value = bh.registers_r.get(0).copied().unwrap_or(0);
+        let next = bh.nextblackholeinterp.take();
+        builder.release_interp(bh);
+        let Some(mut caller_bh) = next.map(|b| *b) else {
+            return BlackholeResult::DoneWithThisFrame(
+                Ok(return_value as pyre_object::PyObjectRef),
+            );
+        };
+        caller_bh.runtime_stack_push(0, return_value);
+        bh = caller_bh;
+    }
+}
+
+/// Common result handling for both rd_numb and heuristic paths.
+fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> Option<i64> {
+    match bh_result {
+        BlackholeResult::DoneWithThisFrame(Ok(result)) => {
+            let raw = if !result.is_null() && unsafe { is_int(result) } {
+                unsafe { w_int_get_value(result) }
+            } else {
+                result as i64
+            };
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] DoneWithThisFrame result={}", raw);
+            }
+            Some(raw)
+        }
+        BlackholeResult::DoneWithThisFrame(Err(_)) => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] DoneWithThisFrame exception");
+            }
+            None
+        }
+        BlackholeResult::ContinueRunningNormally => {
+            // blackhole.py:1756 _run_forever → jitexc.ContinueRunningNormally:
+            // Blackhole reached merge point. Frame state already written back.
+            // Re-enter via eval_with_jit (RPython portal re-entry parity).
+            let callee_frame_ptr = fail_values[0] as *mut PyFrame;
+            if callee_frame_ptr.is_null() {
                 return None;
             }
-            majit_metainterp::blackhole::BlackholeResult::GuardFailed { fail_values, .. } => {
-                // Nested guard failure inside blackhole. Fall back.
-                return None;
+            let callee_frame = unsafe { &mut *callee_frame_ptr };
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[blackhole-resume] ContinueRunningNormally, re-enter from pc={}",
+                    callee_frame.next_instr,
+                );
             }
-            _ => return None,
+            match crate::eval::eval_with_jit(callee_frame) {
+                Ok(result) => {
+                    let raw = if !result.is_null() && unsafe { is_int(result) } {
+                        unsafe { w_int_get_value(result) }
+                    } else {
+                        result as i64
+                    };
+                    Some(raw)
+                }
+                Err(_) => None,
+            }
+        }
+        BlackholeResult::Failed => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] Failed");
+            }
+            None
         }
     }
 }

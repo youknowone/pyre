@@ -519,12 +519,36 @@ fn execute_one_with_memory(
 
 /// **Deprecated**: IR-based blackhole. Will be replaced by jitcode-based
 /// `resume_in_blackhole()` once pyre generates jitcode.
+/// blackhole.py:1095 bhimpl_recursive_call parity:
+/// Callback to execute a CallAssembler op during IR blackhole.
+/// Receives the callee frame pointer (args[0]) and returns the result.
+/// In RPython this is `portal_runner` via `cpu.bh_call_i`.
+pub type CallAssemblerFn = dyn Fn(i64) -> i64;
+
 pub(crate) fn blackhole_execute_with_state(
     ops: &[Op],
     constants: &HashMap<u32, i64>,
     initial_values: &HashMap<u32, i64>,
     start_index: usize,
     initial_exception: ExceptionState,
+) -> (BlackholeResult, ExceptionState) {
+    blackhole_execute_with_state_ca(
+        ops,
+        constants,
+        initial_values,
+        start_index,
+        initial_exception,
+        None,
+    )
+}
+
+pub(crate) fn blackhole_execute_with_state_ca(
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    initial_values: &HashMap<u32, i64>,
+    start_index: usize,
+    initial_exception: ExceptionState,
+    call_assembler_fn: Option<&CallAssemblerFn>,
 ) -> (BlackholeResult, ExceptionState) {
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
@@ -560,6 +584,18 @@ pub(crate) fn blackhole_execute_with_state(
                 }
             }
             OpResult::Void => {}
+            // blackhole.py:1095 bhimpl_recursive_call parity:
+            // CallAssembler ops invoke portal_runner via call_assembler_fn.
+            OpResult::Unsupported(_)
+                if call_assembler_fn.is_some() && op.opcode.is_call_assembler() =>
+            {
+                let ca_fn = call_assembler_fn.unwrap();
+                let frame_ptr = tv.resolve(op.args[0]);
+                let result = ca_fn(frame_ptr);
+                if !op.pos.is_none() {
+                    tv.set(op.pos.0, result);
+                }
+            }
             OpResult::Finish(args) => {
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
                 let vtypes = op
@@ -803,7 +839,9 @@ pub struct BlackholeInterpreter {
     /// Return type of this frame.
     pub return_type: BhReturnType,
     /// Runtime stacks indexed by `selected`.
-    runtime_stacks: HashMap<usize, Vec<i64>>,
+    /// RPython: BlackholeInterpreter has a single value stack.
+    /// pyre uses multiple stacks for selected storage (valuestackdepth).
+    runtime_stacks: Vec<Vec<i64>>,
     /// Current selected storage index.
     current_selected: usize,
     /// RPython bhimpl_jit_merge_point parity: when set, BC_JUMP targeting
@@ -859,7 +897,7 @@ impl BlackholeInterpreter {
             position: 0,
             nextblackholeinterp: None,
             return_type: BhReturnType::Void,
-            runtime_stacks: HashMap::new(),
+            runtime_stacks: Vec::new(),
             current_selected: 0,
             merge_point_jitcode_pc: None,
             reached_merge_point: false,
@@ -1147,30 +1185,39 @@ impl BlackholeInterpreter {
 
     // -- Runtime stack access --
 
+    fn ensure_stack(&mut self, selected: usize) {
+        if selected >= self.runtime_stacks.len() {
+            self.runtime_stacks.resize_with(selected + 1, Vec::new);
+        }
+    }
+
     fn runtime_stack_mut(&mut self, selected: usize) -> &mut Vec<i64> {
-        self.runtime_stacks.entry(selected).or_default()
+        self.ensure_stack(selected);
+        &mut self.runtime_stacks[selected]
     }
 
     fn runtime_stack_pop(&mut self, selected: usize) -> i64 {
-        self.runtime_stacks
-            .get_mut(&selected)
-            .and_then(|s| s.pop())
-            .unwrap_or(0)
+        if selected < self.runtime_stacks.len() {
+            self.runtime_stacks[selected].pop().unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     pub fn runtime_stack_push(&mut self, selected: usize, value: i64) {
-        self.runtime_stacks.entry(selected).or_default().push(value);
+        self.ensure_stack(selected);
+        self.runtime_stacks[selected].push(value);
     }
 
     fn runtime_stack_peek(&self, selected: usize, pos: usize) -> i64 {
         self.runtime_stacks
-            .get(&selected)
+            .get(selected)
             .and_then(|s| s.get(pos).copied())
             .unwrap_or(0)
     }
 
     fn runtime_stack_len(&self, selected: usize) -> usize {
-        self.runtime_stacks.get(&selected).map_or(0, |s| s.len())
+        self.runtime_stacks.get(selected).map_or(0, |s| s.len())
     }
 
     /// blackhole.py:396 handle_exception_in_frame: check if the current
@@ -1193,7 +1240,9 @@ impl BlackholeInterpreter {
         };
         let selected = self.current_selected;
         while self.runtime_stack_len(selected) > handler.stack_depth as usize {
-            self.runtime_stacks.get_mut(&selected).map(|s| s.pop());
+            if selected < self.runtime_stacks.len() {
+                self.runtime_stacks[selected].pop();
+            }
         }
         if handler.push_lasti {
             // last_opcode_position is already the faulting instruction's
@@ -1219,7 +1268,11 @@ impl BlackholeInterpreter {
     /// Drain the runtime stack for the given selected index, returning
     /// all values in order (bottom → top).
     pub fn runtime_stack_drain(&mut self, selected: usize) -> Vec<i64> {
-        self.runtime_stacks.remove(&selected).unwrap_or_default()
+        if selected < self.runtime_stacks.len() {
+            std::mem::take(&mut self.runtime_stacks[selected])
+        } else {
+            Vec::new()
+        }
     }
 
     // -- Call argument reading --
@@ -1403,7 +1456,8 @@ impl BlackholeInterpreter {
                 let selected = self.current_selected;
                 let pos = self.next_u16() as usize;
                 let value = self.runtime_stack_pop(selected);
-                if let Some(stack) = self.runtime_stacks.get_mut(&selected) {
+                if selected < self.runtime_stacks.len() {
+                    let stack = &mut self.runtime_stacks[selected];
                     if pos < stack.len() {
                         stack[pos] = value;
                     }
@@ -1606,9 +1660,7 @@ impl BlackholeInterpreter {
                 }
 
                 // Copy runtime stacks to callee
-                for (k, v) in &self.runtime_stacks {
-                    callee.runtime_stacks.insert(*k, v.clone());
-                }
+                callee.runtime_stacks = self.runtime_stacks.clone();
                 callee.current_selected = self.current_selected;
 
                 // Execute callee

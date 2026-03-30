@@ -370,6 +370,29 @@ impl<S: JitState> JitDriver<S> {
             .blackhole_guard_failure(green_key, trace_id, fail_index, fail_values, exception)
     }
 
+    /// Like `blackhole_guard_failure` but with a CallAssembler callback.
+    pub fn blackhole_guard_failure_ca(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        exception: crate::blackhole::ExceptionState,
+        call_assembler_fn: Option<&crate::blackhole::CallAssemblerFn>,
+    ) -> Option<(
+        crate::blackhole::BlackholeResult,
+        crate::blackhole::ExceptionState,
+    )> {
+        self.meta.blackhole_guard_failure_ca(
+            green_key,
+            trace_id,
+            fail_index,
+            fail_values,
+            exception,
+            call_assembler_fn,
+        )
+    }
+
     /// RPython resume_in_blackhole parity: resume from guard failure using
     /// the jitcode-based BlackholeInterpreter.
     ///
@@ -406,6 +429,41 @@ impl<S: JitState> JitDriver<S> {
         bh.run();
 
         Some(bh)
+    }
+
+    /// resume.py:1312 blackhole_from_resumedata parity: get the
+    /// recovery slot types for building typed Value array from raw fail_values.
+    pub fn get_recovery_slot_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        self.meta
+            .get_recovery_slot_types(green_key, trace_id, fail_index)
+    }
+
+    /// resume.py:1312 blackhole_from_resumedata parity: get rd_numb and
+    /// rd_consts for ResumeDataDirectReader-based blackhole resume.
+    pub fn get_rd_numb(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(Vec<u8>, Vec<(i64, Type)>)> {
+        self.meta.get_rd_numb(green_key, trace_id, fail_index)
+    }
+
+    /// compile.py:710 recovery_layout header_pc parity: get the merge point
+    /// PC for blackhole resume from a guard exit.
+    pub fn get_merge_point_pc(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<u64> {
+        self.meta
+            .get_merge_point_pc(green_key, trace_id, fail_index)
     }
 
     /// Register an interpreter boxing helper for the raw-int finish protocol.

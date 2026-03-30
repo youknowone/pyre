@@ -1534,6 +1534,7 @@ impl OptContext {
                 // resume.py:251-253: jitcode_index + pc from snapshot frame.
                 // No-snapshot fallback: extract resume PC from fail_args[1]
                 // (next_instr in pyre's virtualizable layout [frame, ni, vsd, ...]).
+                // resume.py:249-253: no box_count in RPython format.
                 ns.append_int(0); // jitcode_index
                 let resume_pc = fa
                     .get(1)
@@ -1541,7 +1542,6 @@ impl OptContext {
                     .map(|(v, _)| v as i32)
                     .unwrap_or(-1);
                 ns.append_int(resume_pc); // pc
-                ns.append_int(fa.len() as i32); // box_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         let vidx = virtual_slots.iter().position(|(idx, _)| *idx == i);
