@@ -7521,6 +7521,60 @@ impl JitState for PyreJitState {
         // remains unchanged — bridge tracing sees the full frame layout.
     }
 
+    /// resume.py:1042-1057 rebuild_from_resumedata parity.
+    ///
+    /// RPython: ResumeDataBoxReader reads rd_numb sequentially:
+    ///   1. consume_vref_and_vable_boxes(vinfo, ginfo)
+    ///   2. while not done: read jitcode_pos, pc → newframe → consume_boxes
+    ///   3. return (liveboxes, virtualizable_boxes, virtualref_boxes)
+    fn rebuild_from_resumedata(
+        _meta: &mut Self::Meta,
+        _fail_arg_types: &[Type],
+        rd_numb: Option<&[u8]>,
+        rd_consts: Option<&[(i64, Type)]>,
+    ) -> Option<majit_metainterp::ResumeDataResult> {
+        use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+
+        let rd_numb = rd_numb?;
+        let rd_consts = rd_consts.unwrap_or(&[]);
+
+        // resume.py:1044: ResumeDataBoxReader.__init__ + _init + _prepare
+        let (_num_failargs, vable_values, vref_values, frames) =
+            rebuild_from_numbering(rd_numb, rd_consts);
+
+        if frames.is_empty() {
+            return None;
+        }
+
+        // Rust-specific: allocate constant OpRefs for TAGCONST/TAGINT
+        // entries so the optimizer can fold them. RPython uses ConstBox
+        // objects natively; Rust needs explicit constant pool entries.
+        let mut constants = Vec::new();
+        let mut const_idx = 10_000u32;
+        for frame in &frames {
+            for value in &frame.values {
+                match value {
+                    RebuiltValue::Const(raw, tp) => {
+                        constants.push((const_idx, *raw, *tp));
+                        const_idx += 1;
+                    }
+                    RebuiltValue::Int(v) => {
+                        constants.push((const_idx, *v as i64, Type::Int));
+                        const_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Some(majit_metainterp::ResumeDataResult {
+            frames,
+            virtualizable_values: vable_values,
+            virtualref_values: vref_values,
+            constants,
+        })
+    }
+
     fn meta_merge_pc(meta: &Self::Meta) -> usize {
         meta.merge_pc
     }
