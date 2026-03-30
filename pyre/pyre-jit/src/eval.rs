@@ -2411,6 +2411,51 @@ pub(crate) fn decode_and_restore_guard_failure(
     rebuild_state_after_failure_with_exit_layout(&mut typed, raw_values, exit_layout);
     replay_pending_fields(&typed, exit_layout);
 
+    // resume.py:1312 blackhole_from_resumedata parity:
+    // Build per-frame ResumedFrame chain from rd_numb decoded frames.
+    let resumed_frames = {
+        let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+        let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+        if !rd_numb.is_empty() {
+            build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+        } else {
+            // Fallback for guards with empty rd_numb: single frame from typed.
+            // typed still has old format [frame, ni, vsd, locals..., stack...]
+            let frame_ptr = match typed.first() {
+                Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+                Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+                _ => std::ptr::null_mut(),
+            };
+            let py_pc = match typed.get(1) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
+            let vsd = match typed.get(2) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
+            let code = if !frame_ptr.is_null() {
+                unsafe { (*frame_ptr).code }
+            } else {
+                std::ptr::null()
+            };
+            let slot_values = if typed.len() > 3 {
+                typed[3..].to_vec()
+            } else {
+                Vec::new()
+            };
+            vec![crate::call_jit::ResumedFrame {
+                code,
+                py_pc,
+                rd_numb_pc: None,
+                frame_ptr,
+                vsd,
+                values: slot_values,
+            }]
+        }
+    };
+    LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
+
     // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -2468,12 +2513,23 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
     } else {
         std::ptr::null()
     };
+    // typed still has old format [frame, ni, vsd, ...]. Extract vsd and strip header.
+    let vsd = match typed.get(2) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let slot_values = if typed.len() > 3 {
+        typed[3..].to_vec()
+    } else {
+        Vec::new()
+    };
     vec![crate::call_jit::ResumedFrame {
         code,
         py_pc,
         rd_numb_pc: None,
         frame_ptr,
-        values: typed.to_vec(),
+        vsd,
+        values: slot_values,
     }]
 }
 
@@ -2628,7 +2684,9 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    let header: Vec<Value> = if vable_values.len() >= 3 {
+    // RPython parity: extract frame_ptr/ni/vsd from vable_values (snapshot).
+    // Per-frame values contain slot registers only (no header prepend).
+    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
         let frame_val = resolve_rebuilt_value(
             vable_values.last().unwrap(),
             &dead_frame_typed,
@@ -2647,9 +2705,22 @@ fn build_resumed_frames(
             exit_layout,
             &mut virtuals_cache,
         );
-        vec![frame_val, ni_val, vsd_val]
+        let fp = match &frame_val {
+            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        let ni = match &ni_val {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        };
+        let vsd = match &vsd_val {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        };
+        (fp, ni, vsd)
     } else {
-        Vec::new()
+        (std::ptr::null_mut(), 0, 0)
     };
 
     // resume.py:1312-1343 blackhole_from_resumedata parity:
@@ -2665,6 +2736,7 @@ fn build_resumed_frames(
     // _prepare: materialize virtuals + replay pending fields ONCE.
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
+        // RPython parity: no header prepend. Values = slot registers only.
         let mut values = Vec::new();
         _prepare_next_section(
             frame,
@@ -2680,18 +2752,10 @@ fn build_resumed_frames(
         rebuild_state_after_failure_with_exit_layout(values, raw_values, exit_layout);
     }
     // resume.py:993 _prepare_pendingfields: apply ONCE for the whole reader.
-    let combined_for_pending: Vec<Value> = header
-        .iter()
-        .chain(
-            all_values
-                .first()
-                .map(|v| v.as_slice())
-                .unwrap_or(&[])
-                .iter(),
-        )
-        .cloned()
-        .collect();
-    replay_pending_fields(&combined_for_pending, exit_layout);
+    // No header — values = slot registers only.
+    if let Some(first_values) = all_values.first() {
+        replay_pending_fields(first_values, exit_layout);
+    }
 
     // resume.py:1334-1342 frame loop: each frame gets its own values.
     // The outermost frame (last in chain) gets the vable header prepended.
@@ -2699,37 +2763,49 @@ fn build_resumed_frames(
     // resume.py:1399 consume_vable_info: extract frame_ptr from vable header.
     // This is the virtualizable (outermost) frame pointer, shared by all
     // blackhole interpreters in the chain.
-    let vable_frame_ptr: *mut pyre_interpreter::pyframe::PyFrame = match header.first() {
-        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-        Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-        _ => std::ptr::null_mut(),
+    // resume.py:1045 consume_vref_and_vable: extract vable fields.
+    // pyre vable_boxes = [ni, vsd, locals..., stack..., frame].
+    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
+        let frame_val = resolve_rebuilt_value(
+            vable_values.last().unwrap(),
+            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+        );
+        let ni_val = resolve_rebuilt_value(
+            &vable_values[0],
+            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+        );
+        let vsd_val = resolve_rebuilt_value(
+            &vable_values[1],
+            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+        );
+        let fp = match frame_val {
+            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+            Value::Int(v) => v as *mut pyre_interpreter::pyframe::PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        let ni = match ni_val { Value::Int(v) => v as usize, _ => 0 };
+        let vsd = match vsd_val { Value::Int(v) => v as usize, _ => 0 };
+        (fp, ni, vsd)
+    } else {
+        (std::ptr::null_mut(), 0, 0)
     };
 
     let mut result = Vec::with_capacity(frames.len());
-    for (fi, (frame, mut values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        let is_outermost = fi == frames.len() - 1;
-        // resume.py:1334-1342 parity: each frame gets its own section values.
-        // The outermost (virtualizable) frame gets the vable header prepended.
-        if is_outermost {
-            let mut full = header.clone();
-            full.append(&mut values);
-            values = full;
-        }
-        // resume.py:1340 setposition(jitcode, pc): each frame uses the
-        // virtualizable frame_ptr for writeback. Inner frames (callees)
-        // reference the same virtualizable object as the outermost.
-        let frame_ptr = vable_frame_ptr;
+    for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
+        // frame_ptr from vable for single-frame or outermost (caller).
+        let frame_ptr = if frames.len() == 1 || idx == frames.len() - 1 {
+            vable_frame_ptr
+        } else {
+            std::ptr::null_mut()
+        };
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
         let py_pc = if frame.pc >= 0 {
             frame.pc as usize
         } else {
-            // No-snapshot guard: fall back to values[1] (ni).
-            match values.get(1) {
-                Some(Value::Int(v)) if *v >= 0 => *v as usize,
-                _ => 0,
-            }
+            // No-snapshot guard: fall back to vable ni.
+            _vable_ni
         };
         let code = if !frame_ptr.is_null() {
             unsafe { (*frame_ptr).code }
@@ -2739,14 +2815,13 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
-            // frame.pc >= 0: orgpc from snapshot (liveness-safe).
-            // frame.pc < 0 (== -1): no-snapshot guard (positional only).
             rd_numb_pc: if frame.pc >= 0 {
                 Some(frame.pc as usize)
             } else {
                 None
             },
             frame_ptr,
+            vsd: vable_vsd,
             values,
         });
     }

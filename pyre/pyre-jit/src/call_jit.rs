@@ -757,8 +757,11 @@ pub struct ResumedFrame {
     pub rd_numb_pc: Option<usize>,
     /// Frame pointer for this stack frame.
     pub frame_ptr: *mut PyFrame,
+    /// valuestackdepth extracted from vable_values (snapshot).
+    pub vsd: usize,
     /// resume.py:928-931 consume_one_section: resolved values.
-    /// Structure: [Ref(frame_ptr), Int(ni), Int(vsd), live_registers...]
+    /// Structure: [live_registers...] — no [frame, ni, vsd] header.
+    /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
 }
 
@@ -833,13 +836,9 @@ pub fn resume_in_blackhole(
             return BlackholeResult::Failed;
         }
 
-        let vsd = match section.values.get(2) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => {
-                builder.release_chain(prev_bh);
-                return BlackholeResult::Failed;
-            }
-        };
+        // RPython parity: vsd from vable_values (snapshot), stored in
+        // ResumedFrame.vsd by build_resumed_frames.
+        let vsd = section.vsd;
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
@@ -893,18 +892,16 @@ pub fn resume_in_blackhole(
         // resume.py:1017-1026 _prepare_next_section: count BOTH
         // live locals AND live stack slots — the encoder (pyjitpl.py:177
         // get_list_of_active_boxes) compacts both in liveness order.
+        let max_stack = vsd.saturating_sub(nlocals);
         let n_live_locals = (0..nlocals)
             .filter(|&i| live.is_local_live(live_pc, i))
             .count();
-        let max_stack = vsd.saturating_sub(nlocals);
         let n_live_stack = (0..max_stack)
             .filter(|&i| live.is_stack_live(live_pc, i))
             .count();
         let n_live = n_live_locals + n_live_stack;
-        let n_vals = section.values.len().saturating_sub(3);
-        // resume.py:1381 parity: snapshot-path guards use liveness-compact
-        // encoding (n_live == n_vals). No-snapshot guards (finish_and_compile
-        // etc.) encode all fail_args positionally (n_live != n_vals).
+        // RPython parity: values = active boxes only (no header).
+        let n_vals = section.values.len();
         let use_liveness = n_live == n_vals;
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -921,8 +918,9 @@ pub fn resume_in_blackhole(
                 },
             );
         }
+        // RPython parity: values = slot registers only (no header offset).
         if use_liveness {
-            let mut val_idx = 3;
+            let mut val_idx = 0;
             for i in 0..nlocals {
                 if live.is_local_live(live_pc, i) {
                     if let Some(val) = section.values.get(val_idx) {
@@ -941,13 +939,13 @@ pub fn resume_in_blackhole(
             }
         } else {
             for i in 0..nlocals {
-                if let Some(val) = section.values.get(3 + i) {
+                if let Some(val) = section.values.get(i) {
                     bh.setarg_r(i, materialize_virtual(val));
                 }
             }
             let stack_only = vsd.saturating_sub(nlocals);
             for i in 0..stack_only {
-                if let Some(val) = section.values.get(3 + nlocals + i) {
+                if let Some(val) = section.values.get(nlocals + i) {
                     bh.runtime_stack_push(0, materialize_virtual(val));
                 }
             }
