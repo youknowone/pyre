@@ -380,6 +380,8 @@ pub enum ResumeVirtualKind {
 #[derive(Debug, Clone)]
 pub enum ResumeVirtualLayoutSummary {
     Object {
+        /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
@@ -590,12 +592,14 @@ impl ResumeVirtualLayoutSummary {
     fn to_virtual_info(&self, fail_arg_positions: &[usize]) -> VirtualInfo {
         match self {
             ResumeVirtualLayoutSummary::Object {
+                descr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => VirtualInfo::VirtualObj {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -676,6 +680,7 @@ impl ResumeVirtualLayoutSummary {
                 fields,
                 fielddescrs,
                 descr_size,
+                ..
             } => ExitVirtualLayout::Object {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -1135,8 +1140,10 @@ pub type FrameSlotSource = ResumeValueSource;
 /// - VRawBufferInfo (raw memory buffer)
 #[derive(Debug, Clone)]
 pub enum VirtualInfo {
-    /// Virtual object with vtable (from NEW_WITH_VTABLE).
+    /// resume.py:612 VirtualInfo(descr, fielddescrs).
     VirtualObj {
+        /// resume.py:615 self.descr — live SizeDescr.
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
@@ -1215,25 +1222,28 @@ pub enum VirtualInfo {
     },
 }
 
-// PartialEq/Eq: compare by data fields only, skip typedescr (Arc<dyn Descr>).
-// RPython VStructInfo is never equality-compared; we need Eq only for test asserts.
+// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
 impl PartialEq for VirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 VirtualInfo::VirtualObj {
+                    descr: None,
                     type_id: a1,
                     descr_index: a2,
                     fields: a3,
                     fielddescrs: a4,
                     descr_size: a5,
+                    ..
                 },
                 VirtualInfo::VirtualObj {
+                    descr: None,
                     type_id: b1,
                     descr_index: b2,
                     fields: b3,
                     fielddescrs: b4,
                     descr_size: b5,
+                    ..
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
@@ -1292,12 +1302,14 @@ impl VirtualInfo {
     pub fn layout_summary(&self, fail_arg_positions: &[usize]) -> ResumeVirtualLayoutSummary {
         match self {
             VirtualInfo::VirtualObj {
+                descr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => ResumeVirtualLayoutSummary::Object {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -1566,6 +1578,7 @@ impl EncodedResumeData {
                 fields,
                 fielddescrs,
                 descr_size,
+                ..
             } => {
                 code.push(EncodedVirtualKind::VirtualObj as i64);
                 code.push(i64::from(*type_id));
@@ -1836,6 +1849,7 @@ impl EncodedResumeData {
                 }
                 let descr_size = self.next_word(cursor) as usize;
                 VirtualInfo::VirtualObj {
+                    descr: None, // Decoded — no live DescrRef.
                     type_id,
                     descr_index,
                     fields,
@@ -2630,6 +2644,7 @@ impl ResumeDataVirtualAdder {
     /// Convenience: add a virtual object (NEW_WITH_VTABLE).
     pub fn add_virtual_obj(
         &mut self,
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
@@ -2637,6 +2652,7 @@ impl ResumeDataVirtualAdder {
         descr_size: usize,
     ) -> usize {
         self.add_virtual(VirtualInfo::VirtualObj {
+            descr,
             type_id,
             descr_index,
             fields,
@@ -4006,6 +4022,7 @@ mod tests {
             ],
             virtuals: vec![
                 VirtualInfo::VirtualObj {
+                    descr: None,
                     type_id: 1,
                     descr_index: 7,
                     fields: vec![
@@ -4157,6 +4174,7 @@ mod tests {
                 slot_map: vec![],
             }],
             virtuals: vec![VirtualInfo::VirtualObj {
+                descr: None,
                 type_id: 42,
                 descr_index: 1,
                 fields: vec![
@@ -4237,6 +4255,7 @@ mod tests {
                 },
                 // Outer virtual (index 1), references inner via Virtual(0)
                 VirtualInfo::VirtualObj {
+                    descr: None,
                     type_id: 2,
                     descr_index: 20,
                     fields: vec![
@@ -4507,6 +4526,7 @@ mod tests {
             }],
             virtuals: vec![
                 VirtualInfo::VirtualObj {
+                    descr: None,
                     type_id: 42,
                     descr_index: 1,
                     fields: vec![

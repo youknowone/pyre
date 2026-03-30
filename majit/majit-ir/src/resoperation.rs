@@ -43,8 +43,10 @@ pub struct FieldDescrInfo {
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
 #[derive(Clone, Debug)]
 pub enum RdVirtualInfo {
-    /// resume.py:612 VirtualInfo (NEW_WITH_VTABLE).
+    /// resume.py:612 VirtualInfo(descr, fielddescrs).
     Instance {
+        /// resume.py:615 self.descr — live SizeDescr reference.
+        descr: Option<crate::DescrRef>,
         descr_index: u32,
         known_class: Option<i64>,
         fielddescrs: Vec<FieldDescrInfo>,
@@ -98,7 +100,7 @@ pub enum RdVirtualInfo {
     Empty,
 }
 
-// PartialEq/Eq: compare by data fields, skip typedescr (Arc<dyn Descr>).
+// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
 impl PartialEq for RdVirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -109,6 +111,7 @@ impl PartialEq for RdVirtualInfo {
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
+                    ..
                 },
                 Self::Instance {
                     descr_index: b1,
@@ -116,6 +119,7 @@ impl PartialEq for RdVirtualInfo {
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
+                    ..
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
