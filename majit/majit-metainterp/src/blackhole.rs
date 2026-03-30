@@ -546,11 +546,9 @@ pub(crate) fn blackhole_execute_with_state(
         .unwrap_or_default();
 
     let mut op_idx = start_index;
-    // Limit iterations to prevent infinite loops in buggy traces.
-    let mut iterations = 0usize;
-    const MAX_BLACKHOLE_ITERATIONS: usize = 100_000;
 
-    while op_idx < ops.len() && iterations < MAX_BLACKHOLE_ITERATIONS {
+    // blackhole.py:1752 _run_forever: no iteration cap.
+    while op_idx < ops.len() {
         let op = &ops[op_idx];
         let result = execute_one(op, &tv, &mut exc_state);
 
@@ -586,7 +584,6 @@ pub(crate) fn blackhole_execute_with_state(
                     tv.set(*pos, *val);
                 }
                 op_idx = label_index + 1;
-                iterations += 1;
                 continue;
             }
             OpResult::GuardFailed => {
@@ -608,13 +605,6 @@ pub(crate) fn blackhole_execute_with_state(
             }
         }
         op_idx += 1;
-    }
-
-    if iterations >= MAX_BLACKHOLE_ITERATIONS {
-        return (
-            BlackholeResult::Abort("blackhole iteration limit reached".to_string()),
-            exc_state,
-        );
     }
 
     (
