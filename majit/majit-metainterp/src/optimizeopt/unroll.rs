@@ -511,7 +511,7 @@ impl UnrollOptimizer {
                 es.renamed_inputargs.clone(),
             )
         };
-        let initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
+        let mut initial_sp = opt_p2.imported_short_preamble.clone().unwrap_or_else(|| {
             crate::optimizeopt::shortpreamble::build_short_preamble_from_exported_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
@@ -520,6 +520,17 @@ impl UnrollOptimizer {
                 &self.constant_types,
             )
         });
+        // shortpreamble.py:414-425 parity: store PtrInfo for each inputarg.
+        // In RPython, preamble_op.set_forwarded(info) attaches PtrInfo to
+        // the short_inputarg Box. In majit, we extract from Phase 2 final_ctx
+        // so inline_short_preamble can propagate to jump_args.
+        if let Some(ref final_ctx) = opt_p2.final_ctx {
+            let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
+            for &inputarg in &initial_sp.inputargs {
+                infos.push(final_ctx.get_ptr_info(inputarg).cloned());
+            }
+            initial_sp.inputarg_infos = infos;
+        }
         let opt_unroll = OptUnroll::new();
         let target_token = opt_unroll.finalize_short_preamble(
             self.target_tokens.len() as u64,
@@ -1902,13 +1913,20 @@ impl OptUnroll {
                 // RPython: jump_arg Box inherits info via identity.
                 // In majit, propagate PtrInfo from short_inputarg (which
                 // has info from Phase 1 export) to the resolved jump_arg.
+                // shortpreamble.py:414-425 parity: propagate PtrInfo from
+                // Phase 1 export to jump_args so guards are redundant.
                 let resolved = ctx.get_box_replacement(jump_arg);
                 if ctx.get_ptr_info(resolved).is_none() {
-                    // Try jump_arg first, then short_inputarg as fallback
                     let info = ctx
                         .get_ptr_info(jump_arg)
                         .cloned()
-                        .or_else(|| ctx.get_ptr_info(short_inputarg).cloned());
+                        .or_else(|| ctx.get_ptr_info(short_inputarg).cloned())
+                        .or_else(|| {
+                            short_preamble
+                                .inputarg_infos
+                                .get(i)
+                                .and_then(|opt| opt.clone())
+                        });
                     if let Some(info) = info {
                         ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
                     }
@@ -2793,7 +2811,11 @@ impl OptUnroll {
                     //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
                     if let Some(einfo) = exported_state.exported_infos.get(&obj) {
                         if let Some(ref pinfo) = einfo.ptr_info {
-                            ctx.setinfo_from_preamble(obj_resolved, pinfo);
+                            ctx.setinfo_from_preamble(
+                                obj_resolved,
+                                pinfo,
+                                Some(&exported_state.exported_infos),
+                            );
                         } else if let Some(cls) = einfo.known_class {
                             ctx.ensure_ptr_info_preserve_forwarding(
                                 obj_resolved,

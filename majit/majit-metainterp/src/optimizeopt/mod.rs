@@ -812,10 +812,11 @@ impl OptContext {
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
             // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // TODO: connect guards — currently disabled because non-redundant
-            // GUARD_NONNULL in nbody's retrace context causes compiled code
-            // to hit guard failure loops. Needs PtrInfo propagation from
-            // import_state to inline_short_preamble jump_args.
+            // TODO: guard connection causes nbody infinite loop in compiled code.
+            // Guards are correctly generated and replayed, but compiled code
+            // enters an infinite loop. Likely cause: guard resume data
+            // (store_final_boxes_in_guard with patchguardop.rd_resume_position)
+            // produces incomplete state for inline_short_preamble guards.
             let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
@@ -830,9 +831,9 @@ impl OptContext {
             } else {
                 false
             };
-            // shortpreamble.py:401-404: setinfo_from_preamble(box, info)
+            // shortpreamble.py:404: setinfo_from_preamble(box, info, None)
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
-                self.setinfo_from_preamble(result, &info);
+                self.setinfo_from_preamble(result, &info, None);
             }
 
             // unroll.py:33-37: potential_extra_ops[op] = preamble_op
@@ -938,7 +939,14 @@ impl OptContext {
     }
 
     /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
-    fn setinfo_from_preamble(&mut self, op: OpRef, preamble_info: &PtrInfo) {
+    /// `exported_infos`: None from use_box path (shortpreamble.py:404),
+    /// Some from import_state path. When None, virtual branch does NOT recurse.
+    fn setinfo_from_preamble(
+        &mut self,
+        op: OpRef,
+        preamble_info: &PtrInfo,
+        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::unroll::ExportedValueInfo>>,
+    ) {
         let op = self.get_box_replacement(op);
         // unroll.py:55-56: if op.get_forwarded() is not None: return
         if self.get_ptr_info(op).is_some() || self.is_replaced(op) {
@@ -950,13 +958,38 @@ impl OptContext {
         }
         // unroll.py:59: isinstance(preamble_info, info.PtrInfo)
         match preamble_info {
-            // unroll.py:60-64: virtual — forward directly
-            PtrInfo::Virtual(..)
-            | PtrInfo::VirtualArray(..)
-            | PtrInfo::VirtualStruct(..)
-            | PtrInfo::VirtualArrayStruct(..) => {
+            // unroll.py:60-64: virtual — forward directly + recurse
+            PtrInfo::Virtual(vinfo) => {
                 self.set_ptr_info(op, preamble_info.clone());
-                // TODO: setinfo_from_preamble_list(all_items, exported_infos)
+                if let Some(infos) = exported_infos {
+                    let items: Vec<OpRef> = vinfo.fields.iter().map(|(_, r)| *r).collect();
+                    self.setinfo_from_preamble_list(&items, infos);
+                }
+            }
+            PtrInfo::VirtualArray(ainfo) => {
+                self.set_ptr_info(op, preamble_info.clone());
+                if let Some(infos) = exported_infos {
+                    let items: Vec<OpRef> = ainfo.items.iter().copied().collect();
+                    self.setinfo_from_preamble_list(&items, infos);
+                }
+            }
+            PtrInfo::VirtualStruct(sinfo) => {
+                self.set_ptr_info(op, preamble_info.clone());
+                if let Some(infos) = exported_infos {
+                    let items: Vec<OpRef> = sinfo.fields.iter().map(|(_, r)| *r).collect();
+                    self.setinfo_from_preamble_list(&items, infos);
+                }
+            }
+            PtrInfo::VirtualArrayStruct(asinfo) => {
+                self.set_ptr_info(op, preamble_info.clone());
+                if let Some(infos) = exported_infos {
+                    let items: Vec<OpRef> = asinfo
+                        .element_fields
+                        .iter()
+                        .flat_map(|row| row.iter().map(|(_, r)| *r))
+                        .collect();
+                    self.setinfo_from_preamble_list(&items, infos);
+                }
             }
             // unroll.py:65-68: constant
             PtrInfo::Constant(gcref) => {
@@ -1002,6 +1035,30 @@ impl OptContext {
                     self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
                 }
             }
+        }
+    }
+
+    /// unroll.py:41-51: setinfo_from_preamble_list(lst, infos)
+    /// Recursively propagate PtrInfo for virtual field items using
+    /// exported_infos as source of truth (not current OptContext).
+    fn setinfo_from_preamble_list(
+        &mut self,
+        items: &[OpRef],
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::unroll::ExportedValueInfo>,
+    ) {
+        for &item in items {
+            if item.is_none() {
+                continue;
+            }
+            // unroll.py:45-46: i = infos.get(item, None)
+            if let Some(info) = exported_infos.get(&item) {
+                // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
+                if let Some(ref ptr_info) = info.ptr_info {
+                    self.setinfo_from_preamble(item, ptr_info, Some(exported_infos));
+                }
+            }
+            // unroll.py:49: item.set_forwarded(None)
+            // If not in exported_infos, leave as-is (no info to propagate)
         }
     }
 
@@ -1111,25 +1168,42 @@ impl OptContext {
     }
 
     /// Record that `old` should be replaced by `new` wherever it appears.
-    /// RPython set_forwarded parity: setting forwarding REPLACES any Info.
+    /// RPython set_forwarded parity: setting forwarding from old → new.
+    /// RPython Box identity: when a Box is forwarded, its PtrInfo (if any)
+    /// lives on the terminal Box in the chain. In majit, when we overwrite
+    /// forwarded[old] from Info(X) or Op(→Info(X)) to Op(new), we must
+    /// propagate the existing PtrInfo to `new` so get_ptr_info(old) still
+    /// reaches it via the new chain old→new→...→Info.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
-        // resoperation.py:240: self._forwarded = forwarded_to
-        // Simple overwrite — old info is lost.
+        // Before overwriting, check if `old` carried PtrInfo (directly or
+        // through its forwarding chain). If so, propagate to `new`.
+        let old_info = self.get_ptr_info(old).cloned();
         let idx = old.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        // RPython: _forwarded = None means "no forwarding" (terminal).
-        // Forwarded::Op(OpRef::NONE) would break get_box_replacement.
-        // Treat NONE target as clearing the forwarding.
         if new.is_none() {
             self.forwarded[idx] = Forwarded::None;
         } else {
             self.forwarded[idx] = Forwarded::Op(new);
+        }
+        // RPython Box identity parity: propagate PtrInfo to the terminal
+        // of the new forwarding chain so get_ptr_info(old) reaches it.
+        if let Some(info) = old_info {
+            let terminal = self.get_box_replacement(new);
+            if self.get_ptr_info(terminal).is_none() {
+                let tidx = terminal.0 as usize;
+                if tidx >= self.forwarded.len() {
+                    self.forwarded.resize(tidx + 1, Forwarded::None);
+                }
+                if matches!(self.forwarded[tidx], Forwarded::None) {
+                    self.forwarded[tidx] = Forwarded::Info(info);
+                }
+            }
         }
     }
 
@@ -2491,11 +2565,14 @@ impl OptContext {
     }
 
     /// Set PtrInfo without clearing forwarding.
-    /// Used by setinfo_from_preamble where the OpRef may have an
-    /// active forwarding chain that must be preserved.
+    /// RPython parity: set PtrInfo at the terminal of opref's forwarding chain.
+    /// In RPython, `box.set_forwarded(info)` sets info on the Box directly.
+    /// `get_box_replacement(box)` then returns the terminal Box which has the info.
+    /// In majit, we follow the Op chain to the terminal OpRef and set Info there.
     fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
         use crate::optimizeopt::info::Forwarded;
-        let idx = opref.0 as usize;
+        let terminal = self.get_box_replacement(opref);
+        let idx = terminal.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }

@@ -1763,8 +1763,6 @@ impl Optimization for OptRewrite {
                     }
                 }
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
-                // make_nonnull(arg(0)) — only set if no existing PtrInfo.
-                // optimizer.py:437-448
                 if ctx.get_ptr_info(obj).is_none() {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
