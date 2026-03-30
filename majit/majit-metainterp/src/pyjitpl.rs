@@ -222,10 +222,17 @@ fn snapshot_map_from_trace_snapshots(
     let mut pc_map = std::collections::HashMap::new();
     let mut next_const_idx = constants.keys().copied().max().unwrap_or(10_000) + 1;
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
+    // resume.py:199,211,214: snapshot box types feed _number_boxes for
+    // TAGVIRTUAL/TAGBOX classification. Register them in constant_types
+    // which flows to constant_types_for_numbering in the optimizer.
     let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
-            majit_trace::recorder::SnapshotTagged::Box(n)
-            | majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+            majit_trace::recorder::SnapshotTagged::Box(n, tp) => {
+                // Register box type for _number_boxes parity.
+                constant_types.entry(*n).or_insert(*tp);
+                majit_ir::OpRef(*n)
+            }
+            majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
             majit_trace::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),

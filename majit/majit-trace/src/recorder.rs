@@ -62,7 +62,9 @@ pub struct SnapshotFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotTagged {
     /// Value from deadframe fail_args slot.
-    Box(u32),
+    /// RPython resume.py:211,214: box.type determines TAGVIRTUAL vs TAGBOX
+    /// encoding in _number_boxes. The Type field carries this information.
+    Box(u32, majit_ir::Type),
     /// Compile-time constant value with type.
     /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.

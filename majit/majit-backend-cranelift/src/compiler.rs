@@ -4643,13 +4643,20 @@ fn run_compiled_code(
         unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
     };
 
-    // llgraph/runner.py:1184 — bridge dispatch loop.
+    // llgraph/runner.py:1184-1191 — bridge dispatch.
+    //
     // If the guard's fail descriptor has a bridge attached, execute the
-    // bridge instead of returning to the interpreter. This is the
-    // Cranelift equivalent of llgraph's `raise Jump(descr._llgraph_bridge)`.
+    // bridge instead of returning to the interpreter. llgraph raises
+    // Jump(descr._llgraph_bridge, values) which the dispatch loop catches
+    // and continues with the bridge trace.
+    //
+    // Nested bridges: run_compiled_code is recursive — when a bridge's
+    // guard also has an attached bridge, the recursive call dispatches
+    // into it automatically. So this single dispatch call handles
+    // arbitrarily deep bridge chains.
     if jf_descr_raw != 0 && jf_descr_raw != CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-        let mut descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
-        while descr.has_bridge() {
+        let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+        if descr.has_bridge() {
             let bridge = descr.bridge_ref().as_ref().unwrap();
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
@@ -4658,12 +4665,14 @@ fn run_compiled_code(
                     bridge.trace_id
                 );
             }
-            // Read guard fail_args from current jf_frame as bridge inputs.
+            // llgraph/runner.py:1190: values = [v for v in values if v is not None]
             let bridge_inputs: Vec<i64> = (0..bridge.num_inputs)
                 .map(|i| unsafe { *result_jf.add(header_words + i) })
                 .collect();
 
-            // Execute bridge compiled code.
+            // llgraph/runner.py:1191: raise Jump(target, values)
+            // run_compiled_code handles nested bridges internally via
+            // its own bridge dispatch check (recursive).
             let (b_fi, b_out, _b_handle, _b_ff) = run_compiled_code(
                 bridge.code_ptr,
                 &bridge.fail_descrs,
@@ -4674,58 +4683,8 @@ fn run_compiled_code(
                 bridge.needs_force_frame,
             );
 
-            fail_index = b_fi;
-            // Update result_jf-equivalent: outputs come from bridge run.
-            // Overwrite outputs buffer below.
-            let new_depth = bridge.max_output_slots.max(bridge_inputs.len()).max(1);
-            let _ = new_depth; // used by output copy below
-
-            // Read the bridge result's jf_descr.
-            // run_compiled_code already returns fail_index from the bridge's jf.
-            // Check if this new fail_descr also has a bridge (nested bridges).
-            let b_descr_raw = b_fi;
-            if b_fi == CALL_ASSEMBLER_DEADFRAME_SENTINEL || b_fi == 0 {
-                // Finish or unknown — return bridge outputs.
-                let mut outputs = vec![0i64; bridge.max_output_slots.max(1)];
-                for (i, val) in b_out.iter().enumerate() {
-                    if i < outputs.len() {
-                        outputs[i] = *val;
-                    }
-                }
-                drop(_jitted_guard);
-                return (fail_index, outputs, handle, force_frame);
-            }
-            // Find the new fail descr in bridge's fail_descrs.
-            let new_descr = bridge.fail_descrs.iter().find(|d| d.fail_index() == b_fi);
-            match new_descr {
-                Some(d) => {
-                    // Copy bridge outputs for next iteration or return.
-                    let mut outputs = vec![0i64; bridge.max_output_slots.max(1)];
-                    for (i, val) in b_out.iter().enumerate() {
-                        if i < outputs.len() {
-                            outputs[i] = *val;
-                        }
-                    }
-                    if d.has_bridge() {
-                        // Nested bridge — continue loop.
-                        // We need a proper jf for reading, but run_compiled_code
-                        // already extracted outputs. Use the outputs directly.
-                        // For the next iteration, set up result_jf as a pseudo
-                        // pointer that read_call_args can use... but this is
-                        // complex. For now, return and let the outer loop retry.
-                        //
-                        // TODO: proper nested bridge dispatch. For now, fall
-                        // through to return the bridge guard failure.
-                    }
-                    drop(_jitted_guard);
-                    return (fail_index, outputs, handle, force_frame);
-                }
-                None => {
-                    // Descr not found in bridge — return bridge outputs as-is.
-                    drop(_jitted_guard);
-                    return (fail_index, b_out, handle, force_frame);
-                }
-            }
+            drop(_jitted_guard);
+            return (b_fi, b_out, handle, force_frame);
         }
     }
 

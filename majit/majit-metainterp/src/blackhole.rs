@@ -1909,12 +1909,50 @@ impl BlackholeInterpBuilder {
     }
 }
 
+/// warmspot.py:961 handle_jitexception parity.
+///
+/// Dispatches on JitException type and returns (return_type, value).
+/// For ContinueRunningNormally, calls portal_runner to re-enter the
+/// portal function. The portal_runner may itself raise a JitException,
+/// which is returned as Err for the caller to re-dispatch (while loop).
+fn handle_jitexception_dispatch(
+    exc: JitException,
+    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+) -> Result<(BhReturnType, i64), JitException> {
+    match exc {
+        // warmspot.py:986-987
+        JitException::DoneWithThisFrameVoid => Ok((BhReturnType::Void, 0)),
+        // warmspot.py:988-990
+        JitException::DoneWithThisFrameInt(result) => Ok((BhReturnType::Int, result)),
+        // warmspot.py:991-993
+        JitException::DoneWithThisFrameRef(result) => Ok((BhReturnType::Ref, result.0 as i64)),
+        // warmspot.py:994-996
+        JitException::DoneWithThisFrameFloat(result) => {
+            Ok((BhReturnType::Float, result.to_bits() as i64))
+        }
+        // warmspot.py:998-1005
+        JitException::ExitFrameWithExceptionRef(_) => Err(exc),
+        // warmspot.py:970-983
+        JitException::ContinueRunningNormally { .. } => {
+            if let Some(runner) = portal_runner {
+                // warmspot.py:976-978: result = portal_ptr(*args)
+                // May raise JitException → Err propagated for re-dispatch.
+                runner(&exc)
+            } else {
+                // No portal runner registered — treat as void return.
+                // This is a graceful degradation for non-pyre callers.
+                Ok((BhReturnType::Void, 0))
+            }
+        }
+    }
+}
+
 /// blackhole.py:1684 _handle_jitexception_in_portal +
 /// warmspot.py:1039 handle_jitexception_from_blackhole
 ///
 /// Handle a JitException at a recursive portal level.
-/// Extracts the result value from the JitException and stores it
-/// in the caller's return register via _setup_return_value_{i,r,f}.
+/// warmspot.py:1040: result = handle_jitexception(e)
+/// warmspot.py:1041-1050: bhcaller._setup_return_value_{i,r,f}(result)
 ///
 /// Returns Ok(()) on success (return value set in bhcaller),
 /// or Err(exc_value) if the exception should be propagated as a
@@ -1922,51 +1960,33 @@ impl BlackholeInterpBuilder {
 fn handle_jitexception_in_portal(
     bhcaller: &mut BlackholeInterpreter,
     exc: JitException,
+    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
 ) -> Result<(), i64> {
-    // warmspot.py:1040: result = handle_jitexception(e)
-    // warmspot.py:961-1007: handle_jitexception dispatches on JitException type.
-    //
-    // ContinueRunningNormally would call portal_runner recursively.
-    // In pyre, this means re-entering the interpreter. For the blackhole
-    // chain, we convert it to a void return (the caller will continue
-    // from the merge point and re-enter JIT naturally).
-    match exc {
-        // warmspot.py:986-996: DoneWithThisFrame{Void,Int,Ref,Float}
-        JitException::DoneWithThisFrameVoid => {
-            // warmspot.py:1041-1042: result_kind == 'void' → pass
-            Ok(())
-        }
-        JitException::DoneWithThisFrameInt(result) => {
-            // warmspot.py:1043-1044
-            bhcaller.setup_return_value_i(result);
-            Ok(())
-        }
-        JitException::DoneWithThisFrameRef(result) => {
-            // warmspot.py:1045-1046
-            bhcaller.setup_return_value_r(result.0 as i64);
-            Ok(())
-        }
-        JitException::DoneWithThisFrameFloat(result) => {
-            // warmspot.py:1047-1048
-            bhcaller.setup_return_value_f(result.to_bits() as i64);
-            Ok(())
-        }
-        // warmspot.py:998-1005: ExitFrameWithExceptionRef → raise
-        JitException::ExitFrameWithExceptionRef(exc_ref) => Err(exc_ref.0 as i64),
-        // warmspot.py:970-983: ContinueRunningNormally → call portal_runner.
-        // In Rust blackhole context, we cannot call the portal recursively.
-        // Propagate as exception so _run_forever handles it.
-        JitException::ContinueRunningNormally { .. } => {
-            // This is a limitation: RPython would call portal_runner
-            // recursively here. For now, treat as void return and let
-            // the interpreter re-enter naturally at the merge point.
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[bh] handle_jitexception_in_portal: ContinueRunningNormally \
-                     at recursive portal, treating as void return"
-                );
+    // warmspot.py:961 handle_jitexception: while True loop.
+    // ContinueRunningNormally → portal_runner → may raise JitException → loop.
+    let mut current_exc = exc;
+    loop {
+        match handle_jitexception_dispatch(current_exc, portal_runner) {
+            Ok((ret_type, result)) => {
+                // warmspot.py:1041-1050
+                match ret_type {
+                    BhReturnType::Void => {}
+                    BhReturnType::Int => bhcaller.setup_return_value_i(result),
+                    BhReturnType::Ref => bhcaller.setup_return_value_r(result),
+                    BhReturnType::Float => bhcaller.setup_return_value_f(result),
+                }
+                return Ok(());
             }
-            Ok(())
+            Err(JitException::ExitFrameWithExceptionRef(exc_ref)) => {
+                // warmspot.py:998-1005: raise as regular exception
+                return Err(exc_ref.0 as i64);
+            }
+            Err(next_exc) => {
+                // warmspot.py:967-968, 979-980: JitException from portal_runner
+                // or EnterJitAssembler → loop back in handle_jitexception
+                current_exc = next_exc;
+                continue;
+            }
         }
     }
 }
@@ -1981,6 +2001,7 @@ fn handle_jitexception(
     builder: &mut BlackholeInterpBuilder,
     mut bh: BlackholeInterpreter,
     exc: JitException,
+    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
     // blackhole.py:1764-1766: skip non-portal frames
     while !bh.jitcode.is_portal {
@@ -2010,7 +2031,7 @@ fn handle_jitexception(
     //
     // In Rust we can do this directly since JitException carries the result.
     let caller = bh.nextblackholeinterp.as_mut().unwrap();
-    let current_exc = match handle_jitexception_in_portal(caller, exc) {
+    let current_exc = match handle_jitexception_in_portal(caller, exc, portal_runner) {
         Ok(()) => 0,
         Err(regular_exc) => regular_exc,
     };
@@ -2031,6 +2052,21 @@ pub fn run_forever(
     mut bh: BlackholeInterpreter,
     mut current_exc: i64,
 ) -> JitException {
+    run_forever_with_portal(builder, bh, current_exc, None)
+}
+
+/// blackhole.py:1752 _run_forever with optional portal runner callback.
+///
+/// `portal_runner` is warmspot.py:961 handle_jitexception parity:
+/// when ContinueRunningNormally is raised at a recursive portal level,
+/// this callback re-enters the portal function with the exception's
+/// green/red args and returns the result.
+pub fn run_forever_with_portal(
+    builder: &mut BlackholeInterpBuilder,
+    mut bh: BlackholeInterpreter,
+    mut current_exc: i64,
+    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+) -> JitException {
     loop {
         // blackhole.py:1754-1755
         match bh.resume_mainloop(current_exc) {
@@ -2039,7 +2075,7 @@ pub fn run_forever(
             }
             Err(jit_exc) => {
                 // blackhole.py:1756-1758
-                match handle_jitexception(builder, bh, jit_exc) {
+                match handle_jitexception(builder, bh, jit_exc, portal_runner) {
                     Ok((new_bh, exc)) => {
                         // Handled at recursive portal level — continue
                         bh = new_bh;
