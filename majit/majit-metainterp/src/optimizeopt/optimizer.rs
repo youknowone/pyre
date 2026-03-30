@@ -2725,6 +2725,14 @@ impl Optimizer {
         use crate::optimizeopt::info::PtrInfo;
 
         let Some(ref mut fail_args) = op.fail_args else {
+            // RPython optimizer.py:722-752: store_final_boxes_in_guard
+            // calls modifier.finish() even when fail_args is initially None
+            // (e.g. Phase 2 guards from unroll copy_and_change). The snapshot
+            // provides the sole source of fail_args via _number_boxes.
+            if op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position)
+            {
+                ctx.finalize_guard_resume_data(&mut op, &[]);
+            }
             return op;
         };
 
