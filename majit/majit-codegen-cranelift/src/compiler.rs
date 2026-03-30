@@ -9267,6 +9267,7 @@ fn collect_guards(
                             fielddescrs,
                             fieldnums,
                             descr_size,
+                            ..
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Object {

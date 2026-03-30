@@ -1543,6 +1543,7 @@ impl OptContext {
                                         })
                                         .filter(|&v| v != 0);
                                     majit_ir::RdVirtualInfo::Instance {
+                                        descr: Some(vi.descr.clone()),
                                         descr_index: vi.descr.index(),
                                         known_class: kc,
                                         fielddescrs: fdinfo,
@@ -1601,6 +1602,7 @@ impl OptContext {
                                         })
                                         .filter(|&v| v != 0);
                                     majit_ir::RdVirtualInfo::Instance {
+                                        descr: ii.descr.clone(),
                                         descr_index: ii
                                             .descr
                                             .as_ref()
@@ -1879,6 +1881,7 @@ impl OptContext {
                         .collect();
                     let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Instance {
+                        descr: Some(vi.descr.clone()),
                         descr_index: vi.descr.index(),
                         // virtualize.py:208: known_class = descr.get_vtable()
                         known_class: vi

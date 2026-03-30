@@ -328,6 +328,7 @@ pub(crate) fn build_guard_metadata(
                                     fielddescrs,
                                     fieldnums,
                                     descr_size,
+                                    ..
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
