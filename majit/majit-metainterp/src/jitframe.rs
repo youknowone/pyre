@@ -323,19 +323,12 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
                 // jitframe.py:128-130 — sanity check
                 let frame_lgt =
                     *((obj_addr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize);
-                if (index as isize) >= frame_lgt {
-                    // jitframe.py:130 — ll_assert(index < frame_lgt, "bogus ...")
-                    // RPython ll_assert is no-op in translated builds.
-                    // Skip this slot: gcmap refers to a slot beyond the
-                    // current frame_lgt, which can happen when the jitframe
-                    // was partially copied by GC (varsize copy truncation).
-                    debug_assert!(
-                        false,
-                        "bogus frame field get: index={index} >= frame_lgt={frame_lgt}"
-                    );
-                    bitindex += 1;
-                    continue;
-                }
+                // jitframe.py:130 — ll_assert(index < frame_lgt, "bogus ...")
+                // RPython ll_assert = RPyAssert: real assertion, not no-op.
+                assert!(
+                    (index as isize) < frame_lgt,
+                    "bogus frame field get: index={index} >= frame_lgt={frame_lgt}"
+                );
                 // jitframe.py:131-133 — trace the slot
                 let slot_addr = (obj_addr as *mut u8)
                     .add(JF_FRAME_OFS + BASEITEMOFS + SIGN_SIZE * index)
