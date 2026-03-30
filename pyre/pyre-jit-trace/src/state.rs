@@ -474,6 +474,42 @@ pub fn liveness_for(code: *const CodeObject) -> &'static LiveVars {
     })
 }
 
+/// jitcode.py:147-167 enumerate_vars parity: expand compact (dead-skipped)
+/// values to dense positional layout using liveness analysis.
+///
+/// Encode side (`get_list_of_active_boxes`) skips dead registers, producing
+/// a compact array. This function reverses that: iterates register indices
+/// via liveness, pops the next compact value for each live index, and places
+/// `Value::Void` for dead indices.
+pub fn expand_compact_to_dense(
+    code: *const CodeObject,
+    py_pc: usize,
+    compact_values: &[majit_ir::Value],
+    nlocals: usize,
+    stack_depth: usize,
+) -> Vec<majit_ir::Value> {
+    let live = liveness_for(code);
+    let mut result = Vec::with_capacity(nlocals + stack_depth);
+    let mut compact_idx = 0;
+    for i in 0..nlocals {
+        if live.is_local_live(py_pc, i) && compact_idx < compact_values.len() {
+            result.push(compact_values[compact_idx].clone());
+            compact_idx += 1;
+        } else {
+            result.push(majit_ir::Value::Void);
+        }
+    }
+    for i in 0..stack_depth {
+        if live.is_stack_live(py_pc, i) && compact_idx < compact_values.len() {
+            result.push(compact_values[compact_idx].clone());
+            compact_idx += 1;
+        } else {
+            result.push(majit_ir::Value::Void);
+        }
+    }
+    result
+}
+
 /// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.
 ///
 /// Carries both the symbolic IR reference (OpRef) and the concrete

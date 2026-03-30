@@ -1042,11 +1042,12 @@ fn maybe_compile_and_run(
 }
 
 /// compile.py:701-717 handle_fail outcome.
+/// RPython's handle_fail always succeeds (bridge or blackhole).
 enum HandleFailOutcome {
     /// Bridge compiled successfully — continue in compiled code.
     BridgeCompiled,
     /// Resume in blackhole interpreter.
-    ResumeInBlackhole { restored: bool },
+    ResumeInBlackhole,
 }
 
 /// compile.py:701-717 handle_fail.
@@ -1059,8 +1060,9 @@ enum HandleFailOutcome {
 /// RPython: deadframe is passed to _trace_and_compile_from_bridge which
 /// creates a fresh MetaInterp (compile.py:730). No state restoration
 /// happens before the bridge/blackhole decision. Pyre differs: we call
-/// restore_guard_failure_for_loop to extract resume_pc, which also sets
-/// LAST_GUARD_FRAMES as a side-effect (cleared on bridge success).
+/// compile.py:701-717 handle_fail: pass deadframe directly to
+/// bridge or blackhole path. RPython does NO state restoration
+/// before the decision — each path restores internally.
 fn handle_fail(
     frame: &mut PyFrame,
     green_key: u64,
@@ -1070,7 +1072,6 @@ fn handle_fail(
     owning_key: u64,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
-    jit_state: &mut PyreJitState,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
     // compile.py:702-703: must_compile() AND not stack_almost_full()
@@ -1087,26 +1088,18 @@ fn handle_fail(
                     .meta_interp_mut()
                     .set_guard_compiling(owning_key, trace_id, fail_index, true);
             }
-            // compile.py:706-708: _trace_and_compile_from_bridge(deadframe, ...)
-            // RPython passes deadframe to MetaInterp.handle_guard_failure
-            // which calls rebuild_from_resumedata internally. pyre restores
-            // the live frame before bridge tracing (architectural difference).
-            let meta = {
-                let (driver, _) = driver_pair();
-                driver.meta_interp().get_compiled_meta(owning_key).cloned()
-            };
-            let resume_pc = if let Some(ref meta) = meta {
-                restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout)
-            } else {
-                None
-            };
-            let compiled = if let Some(pc) = resume_pc {
-                crate::call_jit::trace_and_compile_from_bridge(
-                    owning_key, trace_id, fail_index, frame, pc,
-                )
-            } else {
-                false
-            };
+            // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
+            // RPython passes deadframe directly — MetaInterp restores
+            // via rebuild_from_resumedata (resume.py:1042) inside
+            // handle_guard_failure (pyjitpl.py:2904).
+            let compiled = crate::call_jit::trace_and_compile_from_bridge(
+                owning_key,
+                trace_id,
+                fail_index,
+                frame,
+                raw_values,
+                exit_layout,
+            );
             // compile.py:709: done_compiling (clear ST_BUSY_FLAG)
             {
                 let (driver, _) = driver_pair();
@@ -1115,30 +1108,18 @@ fn handle_fail(
                     .set_guard_compiling(owning_key, trace_id, fail_index, false);
             }
             if compiled {
-                // Bridge compiled — clear blackhole payload that was stored
-                // during state restoration. RPython's bridge path never stores
-                // blackhole payload since it uses a fresh MetaInterp.
-                LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
                 return HandleFailOutcome::BridgeCompiled;
             }
-            // Bridge failed — state already restored, fall through to blackhole.
-            return HandleFailOutcome::ResumeInBlackhole {
-                restored: resume_pc.is_some(),
-            };
+            // Bridge failed → blackhole fallback (pyjitpl.py:2906
+            // SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
+            build_blackhole_frames_from_deadframe(raw_values, exit_layout);
+            return HandleFailOutcome::ResumeInBlackhole;
         }
     }
-    // compile.py:710-716: resume_in_blackhole
-    // Restore state from deadframe for blackhole path.
-    let meta = {
-        let (driver, _) = driver_pair();
-        driver.meta_interp().get_compiled_meta(owning_key).cloned()
-    };
-    let ok = if let Some(ref meta) = meta {
-        restore_guard_failure_for_loop(jit_state, meta, raw_values, exit_layout).is_some()
-    } else {
-        false
-    };
-    HandleFailOutcome::ResumeInBlackhole { restored: ok }
+    // compile.py:710-716: resume_in_blackhole(deadframe)
+    // Blackhole path: build frames directly from deadframe.
+    build_blackhole_frames_from_deadframe(raw_values, exit_layout);
+    HandleFailOutcome::ResumeInBlackhole
 }
 
 /// RPython warmstate.py:387-423 execute_assembler.
@@ -1156,15 +1137,11 @@ fn execute_assembler(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
-    // Pyre safety net: save frame state before compiled code entry.
-    // RPython does NOT do this — its resume data (rd_numb + rd_virtuals_info)
-    // is always complete, so blackhole always succeeds. Pyre's rd_numb
-    // can be incomplete, so guard recovery may fail. This snapshot allows
-    // fallback to the pre-entry frame state. Remove when rd_numb is complete.
-    let saved_locals: Vec<pyre_object::PyObjectRef> = {
-        let len = frame.locals_cells_stack_w.len();
-        (0..len).map(|i| frame.locals_cells_stack_w[i]).collect()
-    };
+    // TODO(parity): RPython does NOT snapshot frame state — its rd_numb
+    // is always complete so blackhole writeback never corrupts. Pyre's
+    // rd_numb can be incomplete, causing garbage writeback. This snapshot
+    // detects and recovers from corruption. Remove when rd_numb encoding
+    // reaches full parity with RPython's get_list_of_active_boxes.
     let saved_ni = frame.next_instr;
     let saved_vsd = frame.valuestackdepth;
 
@@ -1180,6 +1157,7 @@ fn execute_assembler(
         );
     }
 
+    // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = driver.run_compiled_detailed_with_bridge_keyed(
         green_key,
         entry_pc,
@@ -1201,17 +1179,55 @@ fn execute_assembler(
         );
     }
 
-    // compile.py:701-717 handle_fail: bridge/blackhole decision.
-    if let DetailedDriverRunOutcome::GuardFailure {
-        fail_index,
-        trace_id,
-        should_bridge,
-        owning_key,
-        ref raw_values,
-        ref exit_layout,
-    } = outcome
-    {
-        match handle_fail(
+    // warmstate.py:402-422 handle fail_descr outcome
+    match outcome {
+        // warmstate.py:402-415 fast path: DoneWithThisFrame
+        DetailedDriverRunOutcome::Finished {
+            typed_values,
+            raw_int_result,
+            ..
+        } => {
+            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
+                    green_key, raw_int_result, typed_values
+                );
+            }
+            let [value] = typed_values.as_slice() else {
+                return Some(LoopResult::Done(Err(
+                    pyre_interpreter::PyError::type_error(
+                        "compiled finish did not produce a single object return value",
+                    ),
+                )));
+            };
+            let result = match value {
+                majit_ir::Value::Int(raw) => {
+                    let _ = raw_int_result;
+                    pyre_object::intobject::w_int_new(*raw)
+                }
+                majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
+                majit_ir::Value::Float(f) => pyre_object::floatobject::w_float_new(*f),
+                majit_ir::Value::Void => {
+                    return Some(LoopResult::Done(Err(
+                        pyre_interpreter::PyError::type_error(
+                            "compiled finish produced a void return value",
+                        ),
+                    )));
+                }
+            };
+            Some(LoopResult::Done(Ok(result)))
+        }
+        // warmstate.py:416-422 general: handle_fail
+        // compile.py:701-717 → bridge or blackhole
+        DetailedDriverRunOutcome::GuardFailure {
+            fail_index,
+            trace_id,
+            should_bridge,
+            owning_key,
+            ref raw_values,
+            ref exit_layout,
+        } => match handle_fail(
             frame,
             green_key,
             trace_id,
@@ -1220,170 +1236,48 @@ fn execute_assembler(
             owning_key,
             exit_layout,
             raw_values,
-            &mut jit_state,
             info,
         ) {
-            HandleFailOutcome::BridgeCompiled => {
-                return Some(LoopResult::ContinueRunningNormally);
-            }
-            HandleFailOutcome::ResumeInBlackhole { restored } => {
-                // Repackage as the old outcome format for handle_jit_outcome
-                let repackaged = DetailedDriverRunOutcome::GuardFailure {
-                    fail_index,
-                    trace_id,
-                    should_bridge: false,
-                    owning_key,
-                    raw_values: raw_values.clone(),
-                    exit_layout: exit_layout.clone(),
-                };
-                if !restored {
-                    // Guard recovery failed — restore pre-entry frame.
-                    driver.invalidate_loop(green_key);
-                    frame.next_instr = saved_ni;
-                    frame.valuestackdepth = saved_vsd;
-                    let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
-                    for i in 0..restore_len {
-                        frame.locals_cells_stack_w[i] = saved_locals[i];
-                    }
-                    frame.fix_array_ptrs();
-                    return None;
-                }
-                // Fall through to blackhole resume below.
-                // DIFFERS FROM UPSTREAM: RPython's rd_numb always fully
-                // covers the frame, so this validation is unnecessary.
-                // pyre's rd_numb can be incomplete — detect and fail early.
-                let code = unsafe { &*frame.code };
-                let code_len = code.instructions.len();
-                let frame_size = frame.locals_cells_stack_w.len();
-                if frame.next_instr > code_len || frame.valuestackdepth > frame_size {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] guard restore invalid state for key={}: ni={} code_len={} vsd={} frame_size={}, restoring pre-entry",
-                            green_key,
-                            frame.next_instr,
-                            code_len,
-                            frame.valuestackdepth,
-                            frame_size
-                        );
-                    }
-                    driver.invalidate_loop(green_key);
-                    frame.next_instr = saved_ni;
-                    frame.valuestackdepth = saved_vsd;
-                    let restore_len = saved_locals.len().min(frame_size);
-                    for i in 0..restore_len {
-                        frame.locals_cells_stack_w[i] = saved_locals[i];
-                    }
-                    frame.fix_array_ptrs();
-                    return None;
-                }
-            }
-        }
-    }
-
-    // warmstate.py:410-421: no bridge → handle fail_descr outcomes (blackhole)
-    match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
-        JitAction::Return(result) => Some(LoopResult::Done(result)),
-        JitAction::ContinueRunningNormally => {
-            // compile.py:710 handle_fail → resume_in_blackhole
-            let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
-            if let Some(ref frames) = guard_frames {
-                match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
-                    crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                        // DIFFERS FROM UPSTREAM: RPython always produces
-                        // complete rd_numb, so blackhole writeback is correct
-                        // by construction. pyre's rd_numb can be incomplete,
-                        // so detect invalid writeback and invalidate.
-                        let code = unsafe { &*frame.code };
-                        let nlocals = code.varnames.len();
-                        let code_len = code.instructions.len();
-                        let frame_size = frame.locals_cells_stack_w.len();
-                        let has_null_local =
-                            (0..nlocals).any(|i| frame.locals_cells_stack_w[i].is_null());
-                        let ni_invalid = frame.next_instr > code_len;
-                        let vsd_invalid = frame.valuestackdepth > frame_size;
-                        if has_null_local || ni_invalid || vsd_invalid {
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] blackhole writeback invalid for key={}: null_local={} ni_invalid={} (ni={} code_len={}) vsd_invalid={} (vsd={} frame_size={}), restoring",
-                                    green_key,
-                                    has_null_local,
-                                    ni_invalid,
-                                    frame.next_instr,
-                                    code_len,
-                                    vsd_invalid,
-                                    frame.valuestackdepth,
-                                    frame_size
-                                );
+            HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
+            HandleFailOutcome::ResumeInBlackhole => {
+                // blackhole.py:1782 resume_in_blackhole →
+                // blackhole.py:1752 _run_forever
+                let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
+                if let Some(ref frames) = guard_frames {
+                    match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                            // TODO(parity): RPython does NOT invalidate or
+                            // validate here — blackhole writeback is correct
+                            // by construction (complete rd_numb). Remove both
+                            // validation and invalidation after rd_numb parity.
+                            let code = unsafe { &*frame.code };
+                            let code_len = code.instructions.len();
+                            let frame_size = frame.locals_cells_stack_w.len();
+                            if frame.next_instr > code_len || frame.valuestackdepth > frame_size {
+                                driver.invalidate_loop(green_key);
+                                frame.next_instr = saved_ni;
+                                frame.valuestackdepth = saved_vsd;
+                                return None;
                             }
+                            driver.invalidate_loop(green_key);
+                            Some(LoopResult::ContinueRunningNormally)
+                        }
+                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                            Some(LoopResult::Done(r))
+                        }
+                        crate::call_jit::BlackholeResult::Failed => {
                             driver.invalidate_loop(green_key);
                             frame.next_instr = saved_ni;
                             frame.valuestackdepth = saved_vsd;
-                            let restore_len =
-                                saved_locals.len().min(frame.locals_cells_stack_w.len());
-                            for i in 0..restore_len {
-                                frame.locals_cells_stack_w[i] = saved_locals[i];
-                            }
-                            frame.fix_array_ptrs();
-                            return None;
+                            None
                         }
-                        // compile.py:710: blackhole resume succeeds.
-                        // RPython does NOT invalidate — compiled entry stays
-                        // valid and guard failure counter accumulates for
-                        // bridge compilation.
-                        //
-                        // Pyre: invalidate until rd_numb snapshot uses
-                        // get_list_of_active_boxes (issue #2) and liveness-
-                        // based filling is enabled (issue #4).
-                        driver.invalidate_loop(green_key);
-                        Some(LoopResult::ContinueRunningNormally)
                     }
-                    crate::call_jit::BlackholeResult::DoneWithThisFrame(Ok(v)) => {
-                        Some(LoopResult::Done(Ok(v)))
-                    }
-                    crate::call_jit::BlackholeResult::DoneWithThisFrame(Err(_))
-                    | crate::call_jit::BlackholeResult::Failed => {
-                        // RPython parity: blackhole failure means incomplete
-                        // recovery (missing rd_numb slots, etc). Invalidate
-                        // and restore pre-entry frame state.
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!(
-                                "[jit] blackhole failed/error for key={}, invalidating",
-                                green_key
-                            );
-                        }
-                        driver.invalidate_loop(green_key);
-                        frame.next_instr = saved_ni;
-                        frame.valuestackdepth = saved_vsd;
-                        let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
-                        for i in 0..restore_len {
-                            frame.locals_cells_stack_w[i] = saved_locals[i];
-                        }
-                        frame.fix_array_ptrs();
-                        None
-                    }
+                } else {
+                    None
                 }
-            } else {
-                // RPython compile.py:701 handle_fail: blackhole resume
-                // always has payload. Missing typed values = recovery
-                // failure. Restore pre-entry frame and invalidate.
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] no typed values for key={}, recovery failure",
-                        green_key
-                    );
-                }
-                driver.invalidate_loop(green_key);
-                frame.next_instr = saved_ni;
-                frame.valuestackdepth = saved_vsd;
-                let restore_len = saved_locals.len().min(frame.locals_cells_stack_w.len());
-                for i in 0..restore_len {
-                    frame.locals_cells_stack_w[i] = saved_locals[i];
-                }
-                frame.fix_array_ptrs();
-                None
             }
-        }
-        JitAction::Continue => None,
+        },
+        DetailedDriverRunOutcome::Jump { .. } | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
 
@@ -1515,13 +1409,12 @@ fn bound_reached(
                 owning_key,
                 exit_layout,
                 raw_values,
-                &mut jit_state,
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
-                HandleFailOutcome::ResumeInBlackhole { restored: true } => {
+                HandleFailOutcome::ResumeInBlackhole => {
                     let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
                     if let Some(ref frames) = guard_frames {
                         match crate::call_jit::resume_in_blackhole(frame, frames, loop_header_pc) {
@@ -1535,7 +1428,6 @@ fn bound_reached(
                         }
                     }
                 }
-                HandleFailOutcome::ResumeInBlackhole { restored: false } => {}
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame, info, green_key) {
@@ -1649,14 +1541,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 owning_key,
                 exit_layout,
                 raw_values,
-                &mut jit_state,
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => {
                     frame.fix_array_ptrs();
                     return None;
                 }
-                HandleFailOutcome::ResumeInBlackhole { restored: true } => {
+                HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716: resume_in_blackhole
                     let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
                     if let Some(ref frames) = guard_frames {
@@ -1673,9 +1564,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             }
                         }
                     }
-                }
-                HandleFailOutcome::ResumeInBlackhole { restored: false } => {
-                    // Recovery failed — fall through to interpreter
                 }
             }
         } else {
@@ -2417,12 +2305,16 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
         .collect()
 }
 
-fn restore_guard_failure_for_loop(
+/// Phase A: decode rd_numb + materialize virtuals + restore frame state.
+/// RPython: this corresponds to rebuild_from_resumedata (resume.py:1042)
+/// which decodes the deadframe into typed values and writes them to the
+/// virtualizable/MIFrames. Returns typed values for Phase B and resume PC.
+pub(crate) fn decode_and_restore_guard_failure(
     jit_state: &mut PyreJitState,
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<usize> {
+) -> Option<(Vec<Value>, usize)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -2447,13 +2339,11 @@ fn restore_guard_failure_for_loop(
             slots.join(", ")
         );
     }
-    // resume.py parity: rd_numb decodes the full frame from compact
-    // numbering. TAGBOX(n)→raw_values[n], TAGCONST→constant, NULLREF→null.
+    // resume.py:1042 rebuild_from_resumedata: decode rd_numb into typed values.
     let mut typed = {
         let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
         let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
         if rd_numb.is_empty() {
-            // Safety fallback: guards with empty rd_numb (should not happen).
             decode_exit_layout_values(raw_values, exit_layout)
         } else {
             rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
@@ -2465,70 +2355,66 @@ fn restore_guard_failure_for_loop(
             typed.iter().take(6).collect::<Vec<_>>()
         );
     }
+    // resume.py:945/993: materialize virtuals + replay pending fields.
     rebuild_state_after_failure_with_exit_layout(&mut typed, raw_values, exit_layout);
-    // resume.py:993-1007 _prepare_pendingfields: replay deferred
-    // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
     replay_pending_fields(&typed, exit_layout);
-    // resume.py:945/993 parity: rd_virtuals/rd_pendingfields provide
-    // precise virtual materialization. No raw deadframe fallback,
-    // no heuristic pair decode, no w_none() safety fill.
-    // If null Ref remains after materialization, log and continue
-    // (RPython: assertion failure in debug, silent in release).
-    // RPython: guard failure counter tick is in handle_fail → must_compile
-    // (compile.py:783-784), called by jitdriver before this callback.
-    // Do NOT tick here — must_compile is the single tick point.
 
-    // resume.py:1312 blackhole_from_resumedata parity:
-    // Build per-frame ResumedFrame chain from rd_numb decoded frames.
-    // RPython: while not resumereader.done_reading() → read_jitcode_pos_pc
-    // → consume_one_section for EACH frame in the chain.
-    let resumed_frames = {
-        let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
-        let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-        if !rd_numb.is_empty() {
-            build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
-        } else {
-            // Fallback for guards with empty rd_numb: single frame from typed.
-            let frame_ptr = match typed.first() {
-                Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-                Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-                _ => std::ptr::null_mut(),
-            };
-            // resume.py:1338 read_jitcode_pos_pc parity:
-            // Extract py_pc from typed values (ni slot, already resolved
-            // from deadframe). Cannot use jit_state.next_instr here —
-            // restore_guard_failure_values hasn't been called yet.
-            let py_pc = match typed.get(1) {
-                Some(Value::Int(v)) => *v as usize,
-                _ => 0,
-            };
-            let code = if !frame_ptr.is_null() {
-                unsafe { (*frame_ptr).code }
-            } else {
-                std::ptr::null()
-            };
-            vec![crate::call_jit::ResumedFrame {
-                code,
-                py_pc,
-                rd_numb_pc: None, // empty rd_numb: no orgpc available
-                frame_ptr,
-                values: typed.clone(),
-            }]
-        }
-    };
-    LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
-
-    // Fallback: restore frame state for interpreter continuation.
+    // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
-        // Verify frame slots after restore.
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
             jit_state.next_instr, jit_state.valuestackdepth,
         );
     }
 
-    restored.then_some(jit_state.next_instr)
+    if restored {
+        Some((typed, jit_state.next_instr))
+    } else {
+        None
+    }
+}
+
+/// compile.py:710 resume_in_blackhole(deadframe) →
+/// resume.py:1312 blackhole_from_resumedata(deadframe) parity:
+/// Build LAST_GUARD_FRAMES directly from deadframe.
+/// RPython does NOT call rebuild_from_resumedata (guard restore)
+/// before the blackhole path — the blackhole chain consumes
+/// deadframe values directly via consume_one_section.
+fn build_blackhole_frames_from_deadframe(raw_values: &[i64], exit_layout: &CompiledExitLayout) {
+    let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    let resumed_frames = if !rd_numb.is_empty() {
+        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+    } else {
+        let typed = decode_exit_layout_values(raw_values, exit_layout);
+        build_blackhole_frames_fallback(&typed)
+    };
+    LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
+}
+
+fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
+    let frame_ptr = match typed.first() {
+        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+        Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+        _ => std::ptr::null_mut(),
+    };
+    let py_pc = match typed.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let code = if !frame_ptr.is_null() {
+        unsafe { (*frame_ptr).code }
+    } else {
+        std::ptr::null()
+    };
+    vec![crate::call_jit::ResumedFrame {
+        code,
+        py_pc,
+        rd_numb_pc: None,
+        frame_ptr,
+        values: typed.to_vec(),
+    }]
 }
 
 /// resume.py:1042-1057 rebuild_from_numbering: decode rd_numb to produce
@@ -2728,13 +2614,20 @@ fn build_resumed_frames(
         Vec::new()
     };
 
-    // resume.py:924-926 _prepare parity: resolve ALL frames' values first,
-    // then apply _prepare_virtuals + _prepare_pendingfields ONCE before
-    // the blackhole chain loop. RPython calls _prepare() in __init__,
-    // before the while-loop in blackhole_from_resumedata (resume.py:1320).
+    // resume.py:1312-1343 blackhole_from_resumedata parity:
+    // 1. consume_vref_and_vable ONCE before the frame loop (lines 1324-1325)
+    // 2. _prepare_virtuals + _prepare_pendingfields ONCE (lines 924-926)
+    // 3. Frame loop: read_jitcode_pos_pc + consume_one_section per frame
+    //
+    // The vable header (frame_ptr, ni, vsd) is consumed ONCE from
+    // vable_values and applies to the OUTERMOST frame only. Each frame
+    // section's locals/stack come from _prepare_next_section independently.
+    // RPython does NOT clone the vable header into every frame section.
+
+    // _prepare: materialize virtuals + replay pending fields ONCE.
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
-        let mut values = header.clone();
+        let mut values = Vec::new();
         _prepare_next_section(
             frame,
             raw_values,
@@ -2745,25 +2638,49 @@ fn build_resumed_frames(
         );
         all_values.push(values);
     }
-    // _prepare → _prepare_pendingfields: apply ONCE on the combined values.
-    // Virtual objects are shared across frames; pending field writes must
-    // happen exactly once (resume.py:993-1007).
     for values in &mut all_values {
         rebuild_state_after_failure_with_exit_layout(values, raw_values, exit_layout);
     }
-    // replay_pending_fields writes to materialized virtuals in-place.
-    // Apply once: the writes go to the objects themselves, not the arrays.
-    if let Some(first_values) = all_values.first() {
-        replay_pending_fields(first_values, exit_layout);
-    }
+    // resume.py:993 _prepare_pendingfields: apply ONCE for the whole reader.
+    let combined_for_pending: Vec<Value> = header
+        .iter()
+        .chain(
+            all_values
+                .first()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .iter(),
+        )
+        .cloned()
+        .collect();
+    replay_pending_fields(&combined_for_pending, exit_layout);
 
+    // resume.py:1334-1342 frame loop: each frame gets its own values.
+    // The outermost frame (last in chain) gets the vable header prepended.
+    // Inner frames use their own section values only.
     let mut result = Vec::with_capacity(frames.len());
-    for (frame, values) in frames.iter().zip(all_values.into_iter()) {
-        // Extract frame_ptr from the first value (Ref or Int).
-        let frame_ptr = match values.first() {
-            Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
+    let is_single_frame = frames.len() == 1;
+    for (fi, (frame, mut values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
+        let is_outermost = fi == frames.len() - 1;
+        // resume.py:1399 consume_vable_info: the virtualizable frame_ptr
+        // comes from vable_values (outermost frame only). Inner frames
+        // would have their own frame_ptr from their section encoding.
+        if is_outermost || is_single_frame {
+            // Prepend header for the outermost (virtualizable) frame.
+            let mut full = header.clone();
+            full.append(&mut values);
+            values = full;
+        }
+        let frame_ptr = if is_outermost || is_single_frame {
+            match values.first() {
+                Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+                Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+                _ => std::ptr::null_mut(),
+            }
+        } else {
+            // Inner frame: no vable header. frame_ptr would come from
+            // the frame's own encoding (not yet implemented for multi-frame).
+            std::ptr::null_mut()
         };
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).

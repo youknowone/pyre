@@ -23,7 +23,8 @@ fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
     if *opref == OpRef::NONE {
         Type::Ref
     } else {
-        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+        // resoperation.py Box.type parity: default to Ref (GCREF).
+        value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
     }
 }
 

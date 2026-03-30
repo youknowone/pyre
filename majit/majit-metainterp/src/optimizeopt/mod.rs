@@ -2236,47 +2236,36 @@ impl OptContext {
             })
             .collect();
         op.store_final_boxes(liveboxes);
-        // Recompute fail_arg_types on final liveboxes.
-        {
-            if let Some(ref fa) = op.fail_args {
-                op.fail_arg_types = Some(
-                    fa.iter()
-                        .map(|opref| {
-                            if opref.is_none() {
-                                majit_ir::Type::Ref
-                            } else if self.is_constant(*opref) {
-                                let tp = self.constant_types_for_numbering.get(&opref.0).copied();
-                                match self.get_constant(*opref) {
+        // resoperation.py Box.type parity: after store_final_boxes
+        // rewrites fail_args (forwarding chains), recompute types from
+        // each final OpRef's type. RPython Box.type is immutable, so
+        // get_box_replacement().type always gives the correct type.
+        // Default to Ref (GCREF) for unknown OpRefs.
+        if let Some(ref fa) = op.fail_args {
+            op.fail_arg_types = Some(
+                fa.iter()
+                    .map(|opref| {
+                        if opref.is_none() {
+                            majit_ir::Type::Ref
+                        } else if self.is_constant(*opref) {
+                            self.constant_types_for_numbering
+                                .get(&opref.0)
+                                .copied()
+                                .unwrap_or_else(|| match self.get_constant(*opref) {
                                     Some(majit_ir::Value::Ref(_)) => majit_ir::Type::Ref,
                                     Some(majit_ir::Value::Float(_)) => majit_ir::Type::Float,
-                                    Some(majit_ir::Value::Int(_)) => {
-                                        tp.unwrap_or(majit_ir::Type::Int)
-                                    }
-                                    _ => majit_ir::Type::Int,
-                                }
-                            } else {
-                                if let Some(&tp) = self.value_types.get(&opref.0) {
-                                    tp
-                                } else {
-                                    self.new_operations
-                                        .iter()
-                                        .find(|op| op.pos == *opref)
-                                        .map(|op| op.result_type())
-                                        .unwrap_or_else(|| {
-                                            let fwd = self.get_box_replacement(*opref);
-                                            if fwd != *opref {
-                                                if let Some(&tp) = self.value_types.get(&fwd.0) {
-                                                    return tp;
-                                                }
-                                            }
-                                            majit_ir::Type::Int
-                                        })
-                                }
-                            }
-                        })
-                        .collect(),
-                );
-            }
+                                    Some(majit_ir::Value::Int(_)) => majit_ir::Type::Int,
+                                    _ => majit_ir::Type::Ref,
+                                })
+                        } else {
+                            self.value_types
+                                .get(&opref.0)
+                                .copied()
+                                .unwrap_or(majit_ir::Type::Ref)
+                        }
+                    })
+                    .collect(),
+            );
         }
         // Store rd_virtuals_info (indexed by vidx, RPython parity).
         // rd_virtuals_info is the authoritative source for virtual
