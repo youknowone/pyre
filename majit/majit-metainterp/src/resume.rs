@@ -675,13 +675,14 @@ impl ResumeVirtualLayoutSummary {
     ) -> ExitVirtualLayout {
         match self {
             ResumeVirtualLayoutSummary::Object {
+                descr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
-                ..
             } => ExitVirtualLayout::Object {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -693,13 +694,14 @@ impl ResumeVirtualLayoutSummary {
                 descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Struct {
+                typedescr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
-                ..
             } => ExitVirtualLayout::Struct {
+                typedescr: typedescr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -1573,16 +1575,23 @@ impl EncodedResumeData {
     ) {
         match virtual_info {
             VirtualInfo::VirtualObj {
+                descr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
-                ..
             } => {
                 code.push(EncodedVirtualKind::VirtualObj as i64);
                 code.push(i64::from(*type_id));
                 code.push(i64::from(*descr_index));
+                // resume.py:615 descr.vtable — encode for round-trip reconstruction.
+                let vtable = descr
+                    .as_ref()
+                    .and_then(|d| d.as_size_descr())
+                    .map(|sd| sd.vtable())
+                    .unwrap_or(0);
+                code.push(vtable as i64);
                 code.push(encode_len(fields.len()));
                 for (field_index, source) in fields {
                     code.push(i64::from(*field_index));
@@ -1819,6 +1828,7 @@ impl EncodedResumeData {
                 let type_id = u32::try_from(self.next_word(cursor)).expect("negative type_id");
                 let descr_index =
                     u32::try_from(self.next_word(cursor)).expect("negative descr_index");
+                let vtable = self.next_word(cursor) as usize;
                 let field_count = decode_len(self.next_word(cursor));
                 let mut fields = Vec::with_capacity(field_count);
                 for _ in 0..field_count {
@@ -1848,8 +1858,19 @@ impl EncodedResumeData {
                     });
                 }
                 let descr_size = self.next_word(cursor) as usize;
+                // resume.py:615 reconstruct self.descr from encoded size/type_id/vtable.
+                let descr = if descr_size > 0 || type_id > 0 || vtable > 0 {
+                    Some(majit_ir::make_size_descr_with_vtable(
+                        descr_index,
+                        descr_size,
+                        type_id,
+                        vtable,
+                    ))
+                } else {
+                    None
+                };
                 VirtualInfo::VirtualObj {
-                    descr: None, // Decoded — no live DescrRef.
+                    descr,
                     type_id,
                     descr_index,
                     fields,
@@ -1890,8 +1911,18 @@ impl EncodedResumeData {
                     });
                 }
                 let descr_size = self.next_word(cursor) as usize;
+                // resume.py:631 reconstruct self.typedescr from encoded size/type_id.
+                let typedescr = if descr_size > 0 || type_id > 0 {
+                    Some(majit_ir::make_size_descr_full(
+                        descr_index,
+                        descr_size,
+                        type_id,
+                    ))
+                } else {
+                    None
+                };
                 VirtualInfo::VStruct {
-                    typedescr: None, // Decoded from encoded form — no live DescrRef.
+                    typedescr,
                     type_id,
                     descr_index,
                     fields,
@@ -5405,6 +5436,29 @@ pub trait BlackholeAllocator {
     fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: u32) {
         let _ = (array, index, value, descr);
     }
+    /// resume.py:1539 setarrayitem_float
+    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: u32) {
+        let _ = (array, index, value, descr);
+    }
+    /// resume.py:1452 allocate_raw_buffer
+    fn allocate_raw_buffer(&self, size: usize) -> i64 {
+        let _ = size;
+        0
+    }
+    /// resume.py:1543 setrawbuffer_item
+    fn setrawbuffer_item(&self, buffer: i64, offset: usize, value: i64, descr: u32) {
+        let _ = (buffer, offset, value, descr);
+    }
+    /// resume.py:1509 setfield dispatch — write field value based on descr type.
+    /// Default delegates to setfield; override if descr-based type dispatch needed.
+    fn setfield_typed(&self, struct_ptr: i64, fieldnum_value: i64, descr: u32) {
+        self.setfield(struct_ptr, descr, fieldnum_value);
+    }
+    /// resume.py:1009-1015 setarrayitem dispatch by descr type.
+    fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
+        // Default: int. Override in concrete allocator for ref/float dispatch.
+        self.setarrayitem_int(array, index, value, descr);
+    }
 }
 
 /// Default no-op allocator.
@@ -5464,7 +5518,8 @@ impl VirtualInfo {
                 decoder.virtuals_cache_ptr[index] = array;
                 for (i, source) in items.iter().enumerate() {
                     let value = decoder.decode_field_source(source);
-                    allocator.setarrayitem_int(array, i, value, *descr_index);
+                    // resume.py:656-676 — dispatch by arraydescr type
+                    allocator.setarrayitem_typed(array, i, value, *descr_index);
                 }
                 array
             }
@@ -5476,15 +5531,28 @@ impl VirtualInfo {
     }
 
     /// resume.py:701 VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
-    pub fn allocate_int(&self, decoder: &mut ResumeDataDirectReader, index: usize) -> i64 {
+    pub fn allocate_int(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64 {
         match self {
-            VirtualInfo::VRawBuffer { size, .. } => {
-                let buffer = *size as i64; // placeholder — real allocation needs CPU
+            VirtualInfo::VRawBuffer { size, entries, .. } => {
+                // resume.py:703
+                let buffer = allocator.allocate_raw_buffer(*size);
+                // resume.py:704
                 decoder.virtuals_cache_int[index] = buffer;
+                // resume.py:705-708
+                for (offset, _size_bytes, source) in entries {
+                    let value = decoder.decode_field_source(source);
+                    allocator.setrawbuffer_item(buffer, *offset, value, 0);
+                }
                 buffer
             }
             VirtualInfo::VRawSlice { offset, parent } => {
-                let parent_val = decoder.decode_field_source(parent);
+                // resume.py:723-725 — parent is an INT virtual (raw buffer)
+                let parent_val = decoder.decode_field_source_int(parent);
                 let result = parent_val + *offset;
                 decoder.virtuals_cache_int[index] = result;
                 result
@@ -5532,11 +5600,62 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:924 _prepare — init virtuals and pending fields.
-    pub fn prepare(&mut self, rd_virtuals: Option<&'a [VirtualInfo]>) {
+    pub fn prepare(
+        &mut self,
+        rd_virtuals: Option<&'a [VirtualInfo]>,
+        rd_pendingfields: Option<&[PendingFieldInfo]>,
+    ) {
         // resume.py:925
         self.prepare_virtuals(rd_virtuals);
-        // resume.py:926 _prepare_pendingfields
-        // TODO: implement when pendingfields are supported
+        // resume.py:926
+        self.prepare_pendingfields(rd_pendingfields);
+    }
+
+    /// resume.py:993 _prepare_pendingfields
+    fn prepare_pendingfields(&mut self, pendingfields: Option<&[PendingFieldInfo]>) {
+        let Some(pendingfields) = pendingfields else {
+            return;
+        };
+        // resume.py:995-1007
+        for pf in pendingfields {
+            // resume.py:1002: struct = self.decode_ref(num)
+            let struct_ptr = match &pf.target {
+                ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
+                ResumeValueSource::Constant(val) => *val,
+                ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
+                _ => 0,
+            };
+            // resume.py:1003-1007
+            match pf.item_index {
+                None => {
+                    // resume.py:1004-1005: self.setfield(struct, fieldnum, descr)
+                    let value = match &pf.value {
+                        ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
+                        ResumeValueSource::Constant(val) => *val,
+                        ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
+                        _ => 0,
+                    };
+                    self.allocator
+                        .setfield_typed(struct_ptr, value, pf.descr_index);
+                }
+                Some(item_index) => {
+                    // resume.py:1007: self.setarrayitem(struct, itemindex, fieldnum, descr)
+                    let value = match &pf.value {
+                        ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
+                        ResumeValueSource::Constant(val) => *val,
+                        ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
+                        _ => 0,
+                    };
+                    // resume.py:1009-1015 setarrayitem: dispatch by descr type
+                    self.allocator.setarrayitem_typed(
+                        struct_ptr,
+                        item_index,
+                        value,
+                        pf.descr_index,
+                    );
+                }
+            }
+        }
     }
 
     /// resume.py:1378 handling_async_forcing
@@ -5625,7 +5744,8 @@ impl<'a> ResumeDataDirectReader<'a> {
         let rd_virtuals_ptr = self.rd_virtuals.unwrap().as_ptr();
         let vinfo = unsafe { &*rd_virtuals_ptr.add(index) };
         assert!(vinfo.is_about_raw(), "getvirtual_int: not a raw virtual");
-        let v = vinfo.allocate_int(self, index);
+        let allocator = self.allocator as *const dyn BlackholeAllocator;
+        let v = vinfo.allocate_int(self, index, unsafe { &*allocator });
         debug_assert_eq!(v, self.virtuals_cache_int[index], "resume.py: bad cache");
         v
     }
@@ -5869,15 +5989,27 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Decode a VirtualFieldSource to a concrete i64 value.
+    /// Decode a VirtualFieldSource as a REF value (resume.py:1566 decode_ref).
     ///
-    /// This is used by VirtualInfo.allocate() to resolve field values
-    /// when materializing virtual objects.
+    /// Virtual sources go through getvirtual_ptr (REF virtuals).
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
             ResumeValueSource::FailArg(index) => self.deadframe[*index],
             ResumeValueSource::Constant(value) => *value,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
+            ResumeValueSource::Uninitialized => 0,
+            ResumeValueSource::Unavailable => 0,
+        }
+    }
+
+    /// Decode a VirtualFieldSource as an INT value (resume.py:1552 decode_int).
+    ///
+    /// Virtual sources go through getvirtual_int (INT/raw virtuals).
+    pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
+        match source {
+            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::Constant(value) => *value,
+            ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
         }
@@ -5904,6 +6036,7 @@ pub fn blackhole_from_resumedata<'a>(
     rd_consts: &'a [i64],
     deadframe: &'a [i64],
     rd_virtuals: Option<&'a [VirtualInfo]>,
+    rd_pendingfields: Option<&[PendingFieldInfo]>,
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
@@ -5914,7 +6047,7 @@ pub fn blackhole_from_resumedata<'a>(
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
 
     // resume.py:1324
-    resumereader.prepare(rd_virtuals);
+    resumereader.prepare(rd_virtuals, rd_pendingfields);
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

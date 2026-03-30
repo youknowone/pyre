@@ -1395,6 +1395,24 @@ impl OptContext {
         // virtual resolution (the fail_args are already final from
         // store_final_boxes_in_guard).
         if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
+            // RPython resume.py:397: assert resume_position >= 0.
+            // This fallback should not exist in RPython-parity code.
+            // Log which guards reach here so we can fix their source.
+            if crate::majit_log_enabled() {
+                let has_descr = op.descr.is_some();
+                let has_patchguard = self.patchguardop.is_some();
+                let patch_pos = self.patchguardop.as_ref().map(|p| p.rd_resume_position);
+                eprintln!(
+                    "[jit][WARN] no-snapshot guard {:?} pos={:?} resume_pos={} descr={} patchguard={} patch_pos={:?} fail_args={}",
+                    op.opcode,
+                    op.pos,
+                    op.rd_resume_position,
+                    has_descr,
+                    has_patchguard,
+                    patch_pos,
+                    op.fail_args.as_ref().map(|f| f.len()).unwrap_or(0)
+                );
+            }
             if let Some(ref fa) = op.fail_args {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
@@ -1409,9 +1427,21 @@ impl OptContext {
                 ns.append_int(0); // num_failargs (patched after encoding)
                 ns.append_int(0); // vable_array len
                 ns.append_int(0); // vref_array len
-                // resume.py:251-253: single frame with jitcode_index=0, pc=0.
-                ns.append_int(0); // jitcode_index
-                ns.append_int(0); // pc
+                // resume.py:251-253: extract jitcode_index/pc from fail_args
+                // where possible. fail_args[1] = next_instr (Int constant)
+                // in pyre's virtualizable layout [frame, ni, vsd, slots...].
+                let resume_pc = if fa.len() >= 2 {
+                    self.get_constant(fa[1])
+                        .and_then(|v| match v {
+                            Value::Int(i) => Some(*i as i32),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                ns.append_int(0); // jitcode_index (single jitcode in pyre)
+                ns.append_int(resume_pc); // pc from fail_args next_instr
                 ns.append_int(fa.len() as i32); // box_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
