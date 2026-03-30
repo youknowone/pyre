@@ -294,11 +294,13 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // RPython format: jitcode_index, pc, [tagged_values...] per frame.
-        // No slot_count — the reader uses total_size to bound decoding.
+        // Per-frame: jitcode_index, pc, box_count, [tagged_values x box_count].
+        // RPython uses position_info to determine box_count implicitly;
+        // pyre encodes it explicitly for correct multi-frame decode.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -396,10 +398,8 @@ pub fn rebuild_from_numbering(
         vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // resume.py:1042-1057: frames.
-    // RPython format: jitcode_index, pc, [tagged_values...] per frame.
-    // No slot_count — reader uses total_size to bound decoding.
-    // For single-frame (common case), all remaining items go into one frame.
+    // resume.py:1042-1057: per-frame decode.
+    // Per-frame: jitcode_index, pc, box_count, [tagged_values x box_count].
     let mut frames = Vec::new();
     while reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
@@ -407,10 +407,16 @@ pub fn rebuild_from_numbering(
             break;
         }
         let pc = reader.next_item();
-        // resume.py:928-931 read_jitcode_pos_pc then consume_one_section:
-        // read all tagged values until total_size boundary.
-        let mut values = Vec::new();
-        while reader.items_read < total_size as usize && reader.has_more() {
+        if reader.items_read >= total_size as usize || !reader.has_more() {
+            break;
+        }
+        let box_count = reader.next_item() as usize;
+        // resume.py:928-931 consume_one_section: read exactly box_count values.
+        let mut values = Vec::with_capacity(box_count);
+        for _ in 0..box_count {
+            if reader.items_read >= total_size as usize || !reader.has_more() {
+                break;
+            }
             let tagged = reader.next_item() as i16;
             values.push(decode_tagged(tagged, num_failargs, rd_consts));
         }

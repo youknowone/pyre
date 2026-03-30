@@ -269,6 +269,25 @@ impl UnrollOptimizer {
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
             // which breaks force_virtual.
             let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
+            // RPython parity: Phase 1 optimizer may discover new constants
+            // via make_constant (e.g., constant-folded heap reads, guard
+            // class pointers). These live in ctx.constants but not in
+            // consts_p1 (which was only seeded from the input constants).
+            // Merge them back so build_short_preamble_from_exported_boxes
+            // can capture all constants referenced by short preamble ops.
+            if let Some(ref final_ctx) = opt_p1.final_ctx {
+                for (idx, val) in final_ctx.constants.iter().enumerate() {
+                    if let Some(v) = val {
+                        let raw = match v {
+                            majit_ir::Value::Int(v) => *v,
+                            majit_ir::Value::Float(f) => f.to_bits() as i64,
+                            majit_ir::Value::Ref(r) => r.0 as i64,
+                            majit_ir::Value::Void => 0,
+                        };
+                        consts_p1.entry(idx as u32).or_insert(raw);
+                    }
+                }
+            }
             let p1_ni = opt_p1.final_num_inputs();
             let jv = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
@@ -531,6 +550,9 @@ impl UnrollOptimizer {
         // ── unroll.py:207-230: jump_to_existing_trace / retrace_limit ──
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[jit] post-finalize: entering jump_to_existing_trace section");
+        }
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
         let jump_to_self = {
@@ -1656,7 +1678,10 @@ impl OptUnroll {
             .collect();
         let mut first_target_attempt = true;
 
-        for target_token in target_tokens {
+        for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!("[jit][jump_to_existing] trying target_token #{tt_idx}");
+            }
             if !first_target_attempt {
                 // RPython unroll.py leaves bogus ops from failed target-token
                 // attempts at the end of the live trace, which is safe there.
@@ -1758,10 +1783,43 @@ impl OptUnroll {
                             ctx,
                         );
                         if let Some(builder) = ctx.take_active_short_preamble_producer() {
+                            // RPython parity: extract constant pool from
+                            // OptContext. In RPython, Const objects in short
+                            // preamble ops are GC-tracked and survive across
+                            // compilations. build_short_preamble_struct scans
+                            // all op args to capture referenced constants.
+                            let mut loop_constants: HashMap<u32, i64> = HashMap::new();
+                            let mut loop_constant_types: HashMap<u32, majit_ir::Type> =
+                                optimizer.constant_types.clone();
+                            for (i, v) in ctx.constants.iter().enumerate() {
+                                if let Some(val) = v {
+                                    let (raw, tp) = match val {
+                                        majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
+                                        majit_ir::Value::Float(f) => {
+                                            (f.to_bits() as i64, majit_ir::Type::Float)
+                                        }
+                                        majit_ir::Value::Ref(r) => {
+                                            (r.0 as i64, majit_ir::Type::Ref)
+                                        }
+                                        majit_ir::Value::Void => (0, majit_ir::Type::Void),
+                                    };
+                                    loop_constants.insert(i as u32, raw);
+                                    loop_constant_types.entry(i as u32).or_insert(tp);
+                                }
+                            }
+                            // Merge previous short preamble's constants.
+                            // RPython's Const objects survive across compilations
+                            // via GC tracing. In majit, we must carry forward
+                            // constants from the previous build that may not
+                            // exist in the current Phase 2 context.
+                            for (&k, &(v, tp)) in &sp.constants {
+                                loop_constants.entry(k).or_insert(v);
+                                loop_constant_types.entry(k).or_insert(tp);
+                            }
                             target_token.short_preamble =
                                 Some(builder.build_short_preamble_struct(
-                                    &HashMap::new(),
-                                    &optimizer.constant_types,
+                                    &loop_constants,
+                                    &loop_constant_types,
                                 ));
                             target_token.short_preamble_producer = Some(builder);
                         }
@@ -1858,6 +1916,19 @@ impl OptUnroll {
             }
         }
 
+        // RPython parity: also map Phase 1 inputargs → jump_args.
+        // Short ops may reference Phase 1 OpRefs (from produce_arg's
+        // label_arg_positions check) that aren't in the current inputargs.
+        // In RPython, renamed inputargs are stable across compilations,
+        // so this situation doesn't arise.
+        if let Some(ref phase1) = short_preamble.phase1_inputargs {
+            for (i, &phase1_inputarg) in phase1.iter().enumerate() {
+                if let Some(&jump_arg) = jump_args.get(i) {
+                    mapping.entry(phase1_inputarg).or_insert(jump_arg);
+                }
+            }
+        }
+
         let mut replay_index = 0;
 
         fn current_short_len(
@@ -1892,27 +1963,35 @@ impl OptUnroll {
                 .unwrap_or_else(|| short_preamble.jump_args.clone())
         }
 
-        // RPython unroll.py:397: "a fix-point loop, runs only once in
-        // almost all cases"
+        // unroll.py:398-427: fix-point loop, runs only once in almost all cases.
+        // No artificial iteration cap — RPython uses `while 1:` until convergence.
         loop {
+            // unroll.py:402: while i < len(short) - 1
+            // Use LIVE length — newly added ops (from use_box during
+            // send_extra_operation) are replayed in the same iteration.
             while replay_index < current_short_len(short_preamble, ctx) {
                 let Some(sp_op) = current_short_op(short_preamble, ctx, replay_index) else {
                     break;
                 };
                 let mut new_op = sp_op.clone();
-                // RPython unroll.py remaps raw short-preamble ops through the
-                // current mapping dict. When the active extended builder grows,
-                // the replay loop must see its live `short` list directly
-                // instead of a rebuilt snapshot.
+                // unroll.py:404: _map_args(mapping, sop.getarglist())
+                // RPython contract: Const passes through, non-Const uses
+                // mapping[box]. Known divergence: our produced_short_boxes
+                // has key != preamble_op.pos for some entries, causing some
+                // non-Const args to miss the mapping. Strict lookup requires
+                // fixing the key/pos identity invariant in create_short_boxes.
                 for arg in &mut new_op.args {
+                    if short_preamble.constants.contains_key(&arg.0)
+                        || ctx.get_constant(*arg).is_some()
+                    {
+                        continue; // Const: pass through (isinstance(box, Const))
+                    }
                     if let Some(&mapped) = mapping.get(arg) {
                         *arg = mapped;
                     }
                 }
-                // RPython unroll.py:405-409: copy_and_change only copies args,
-                // NOT fail_args. store_final_boxes_in_guard rebuilds fail_args
-                // from the snapshot later. Clear fail_args to prevent stale
-                // preamble-scope OpRefs from leaking into the body loop.
+                // unroll.py:405-411: copy_and_change only copies args, NOT fail_args.
+                // store_final_boxes_in_guard rebuilds fail_args from the snapshot.
                 if new_op.opcode.is_guard() {
                     new_op.fail_args = None;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
@@ -1922,42 +2001,59 @@ impl OptUnroll {
                         }
                     }
                 }
-                // unroll.py:405-414: all ops go through send_extra_operation.
-                // Guards get rd_resume_position from patchguardop. descr=None
-                // so emit_guard_operation uses _copy_resume_data_from path.
                 if new_op.opcode.is_guard() {
+                    // unroll.py:407-409: guard gets ResumeAtPositionDescr
                     if let Some(ref patch) = ctx.patchguardop {
                         new_op.rd_resume_position = patch.rd_resume_position;
+                    }
+                    // Re-register guard constant args (class pointers from
+                    // make_guards) that reference the preamble's constant pool.
+                    for &arg in &new_op.args {
+                        if let Some(&(val, tp)) = short_preamble.constants.get(&arg.0) {
+                            let value = match tp {
+                                majit_ir::Type::Int => majit_ir::Value::Int(val),
+                                majit_ir::Type::Ref => {
+                                    majit_ir::Value::Ref(majit_ir::GcRef(val as usize))
+                                }
+                                majit_ir::Type::Float => {
+                                    majit_ir::Value::Float(f64::from_bits(val as u64))
+                                }
+                                majit_ir::Type::Void => majit_ir::Value::Int(val),
+                            };
+                            ctx.make_constant(arg, value);
+                        }
                     }
                 }
                 let new_ref = ctx.alloc_op_position();
                 new_op.pos = new_ref;
-                // RPython unroll.py:413: send_extra_operation(op)
-                // For guards from use_box (make_guards), check redundancy
-                // before sending through optimizer to avoid force_box cascade
-                // on non-redundant guards in retrace context.
-                // RPython eliminates all such guards via PtrInfo (Box identity).
+                // unroll.py:414: send_extra_operation(op)
                 optimizer.send_extra_operation(&new_op, ctx);
-                // RPython: mapping[sop] = op
-                // Do NOT follow forwarding here. The mapping must use
-                // the new_ref allocated for this short preamble op,
-                // not the forwarded value from Phase 2's cache.
-                // RPython uses distinct Box objects that don't alias,
-                // so mapping[sop] = op is always unique.
+                // unroll.py:412: mapping[sop] = op
                 mapping.insert(sp_op.pos, new_ref);
                 replay_index += 1;
             }
 
+            // unroll.py:417-423: force all except virtuals.
+            // This can also add more arguments from the preamble.
             loop {
                 let short_jump_args = current_short_jump_args(short_preamble, ctx);
                 let num_short_jump_args = short_jump_args.len();
+                // unroll.py:420: _map_args(mapping, short_jump_args)
+                // Const passes through, non-Const requires mapping.
                 let mapped_jump_args: Vec<OpRef> = short_jump_args
                     .iter()
                     .map(|jump_arg| {
-                        let mapped = *mapping.get(jump_arg).unwrap_or(jump_arg);
+                        let mapped = if short_preamble.constants.contains_key(&jump_arg.0)
+                            || ctx.get_constant(*jump_arg).is_some()
+                        {
+                            *jump_arg
+                        } else {
+                            mapping[jump_arg]
+                        };
                         ctx.get_box_replacement(mapped)
                     })
                     .collect();
+                // unroll.py:419-421
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                     let _ = optimizer.force_box(arg, ctx);
                 }
@@ -1965,7 +2061,9 @@ impl OptUnroll {
                     break;
                 }
             }
+            // unroll.py:424
             optimizer.flush(ctx);
+            // unroll.py:426: done unless "short" has grown again
             if replay_index == current_short_len(short_preamble, ctx) {
                 break;
             }
@@ -5230,7 +5328,7 @@ mod tests {
         // The ovf op was already added to the short by force_op_from_preamble's
         // use_box_from_preamble call.
         let builder = ctx.active_short_preamble_producer_mut().unwrap();
-        let sp = builder.build_short_preamble_struct();
+        let sp = builder.build_short_preamble_struct(&HashMap::new(), &HashMap::new());
         assert!(sp.used_boxes.contains(&OpRef(20)));
         assert_eq!(extra, vec![OpRef(20)]);
     }

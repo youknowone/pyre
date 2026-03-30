@@ -86,6 +86,14 @@ pub struct ShortPreamble {
     /// loop's constant pool. This map captures (value, type) for each
     /// constant OpRef so bridges can re-register them in their own pool.
     pub constants: HashMap<u32, (i64, majit_ir::Type)>,
+    /// RPython parity: Phase 1 inputargs preserved across Extended rebuilds.
+    /// In RPython, short ops reference renamed inputargs (new Box objects)
+    /// that are stable across compilations. In majit, ops keep original
+    /// preamble OpRefs. When the Extended builder rebuilds with different
+    /// inputargs (Phase 2 label_args), ops may reference Phase 1 OpRefs
+    /// that aren't in the new inputargs. This field stores the original
+    /// Phase 1 inputargs so inline_short_preamble can map them to jump_args.
+    pub phase1_inputargs: Option<Vec<OpRef>>,
 }
 
 impl ShortPreamble {
@@ -98,6 +106,7 @@ impl ShortPreamble {
             jump_args: Vec::new(),
             exported_state: None,
             constants: HashMap::new(),
+            phase1_inputargs: None,
         }
     }
 
@@ -288,6 +297,7 @@ impl CollectedShortPreambleBuilder {
             jump_args: Vec::new(),
             exported_state,
             constants: HashMap::new(),
+            phase1_inputargs: None,
         }
     }
 }
@@ -842,6 +852,7 @@ impl CollectedExtendedShortPreambleBuilder {
             jump_args: Vec::new(),
             exported_state,
             constants: HashMap::new(),
+            phase1_inputargs: None,
         }
     }
 }
@@ -953,6 +964,9 @@ struct AbstractShortPreambleBuilderState {
     short_preamble_jump: Vec<Op>,
     extra_same_as: Vec<Op>,
     short_inputargs: Vec<OpRef>,
+    /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
+    /// check. In majit, constant OpRefs must be explicitly tracked.
+    known_constants: HashSet<OpRef>,
 }
 
 impl AbstractShortPreambleBuilderState {
@@ -1005,6 +1019,7 @@ impl AbstractShortPreambleBuilderState {
         produced: &ProducedShortOp,
         already_in_short: &HashSet<OpRef>,
         all_produced: &HashMap<OpRef, ProducedShortOp>,
+        pos_to_key: &HashMap<OpRef, OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) -> Op {
@@ -1019,11 +1034,19 @@ impl AbstractShortPreambleBuilderState {
             if self.short_results.contains(&arg)
                 || already_in_short.contains(&arg)
                 || self.short_inputargs.contains(&arg)
+                || self.known_constants.contains(&arg)
             {
                 continue;
             }
             // shortpreamble.py:393: self.short.append(arg)
-            if let Some(dep) = all_produced.get(&arg) {
+            // Look up dep by key first, then by preamble_op.pos reverse index.
+            // In RPython, Box identity makes this lookup trivial. In majit,
+            // produce_arg returns preamble_op.pos which may differ from the
+            // produced_short_boxes key.
+            let dep = all_produced
+                .get(&arg)
+                .or_else(|| pos_to_key.get(&arg).and_then(|key| all_produced.get(key)));
+            if let Some(dep) = dep {
                 let dep_canonical = dep.preamble_op.pos;
                 if !self.short_results.contains(&dep_canonical)
                     && !already_in_short.contains(&dep_canonical)
@@ -1162,6 +1185,7 @@ fn build_short_preamble_struct_from_ops(
         jump_args: jump_args.to_vec(),
         exported_state: None,
         constants,
+        phase1_inputargs: None,
     }
 }
 
@@ -1169,6 +1193,18 @@ fn build_short_preamble_struct_from_ops(
 ///
 /// Builds the replayable short preamble from exported short boxes, while also
 /// collecting `used_boxes`, `short_preamble_jump`, and `extra_same_as`.
+///
+/// Build reverse index: preamble_op.pos → key for entries where they differ.
+/// In RPython, Box identity makes this unnecessary. In majit, produce_arg
+/// returns preamble_op.pos which may differ from the key in produced_short_boxes.
+fn build_pos_to_key(produced: &HashMap<OpRef, ProducedShortOp>) -> HashMap<OpRef, OpRef> {
+    produced
+        .iter()
+        .filter(|(key, prod)| **key != prod.preamble_op.pos)
+        .map(|(key, prod)| (prod.preamble_op.pos, *key))
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
@@ -1196,6 +1232,10 @@ impl ShortPreambleBuilder {
         }
     }
 
+    pub fn note_known_constant(&mut self, opref: OpRef) {
+        self.state.known_constants.insert(opref);
+    }
+
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         let canonical_result = produced.preamble_op.pos;
@@ -1206,6 +1246,10 @@ impl ShortPreambleBuilder {
             return None;
         }
         for &arg in &produced.preamble_op.args {
+            // RPython: isinstance(arg, Const) → skip
+            if self.state.known_constants.contains(&arg) {
+                continue;
+            }
             if self.produced_short_boxes.contains_key(&arg) {
                 let _ = self.use_box_recursive(arg, visiting);
             }
@@ -1229,10 +1273,12 @@ impl ShortPreambleBuilder {
         result_guards: &[Op],
     ) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
+        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         Some(self.state.use_box(
             &produced,
             &HashSet::new(),
             &self.produced_short_boxes,
+            &pos_to_key,
             arg_guards,
             result_guards,
         ))
@@ -1319,6 +1365,12 @@ pub struct ExtendedShortPreambleBuilder {
     used_boxes: Vec<OpRef>,
     short_jump_args: Vec<OpRef>,
     pub target_token: u64,
+    /// RPython parity: remap Phase 1 preamble OpRefs → current inputarg OpRefs.
+    /// In RPython, produce_arg returns renamed inputargs (new Box objects), so
+    /// short ops always reference the renamed args. In majit, short ops keep
+    /// original preamble OpRefs. This map bridges the Phase 1 → current gap
+    /// when the Extended builder rebuilds with different inputargs.
+    phase1_to_inputarg: HashMap<OpRef, OpRef>,
 }
 
 impl ExtendedShortPreambleBuilder {
@@ -1339,14 +1391,39 @@ impl ExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             short_jump_args: Vec::new(),
             target_token,
+            phase1_to_inputarg: HashMap::new(),
         }
     }
 
     pub fn setup(&mut self, short_preamble: &ShortPreamble, label_args: &[OpRef]) {
+        // Build Phase 1 → current inputarg remap from arg_mapping.
+        // arg_mapping: (arg_position, label_arg_index) — maps op arg positions
+        // to inputarg indices. We invert this to get: Phase 1 OpRef → current inputarg.
+        self.phase1_to_inputarg.clear();
+        for entry in &short_preamble.ops {
+            for &(arg_pos, label_idx) in &entry.arg_mapping {
+                if let Some(&phase1_ref) = entry.op.args.get(arg_pos) {
+                    if let Some(&current_inputarg) = label_args.get(label_idx) {
+                        if phase1_ref != current_inputarg {
+                            self.phase1_to_inputarg.insert(phase1_ref, current_inputarg);
+                        }
+                    }
+                }
+            }
+        }
+        // Copy base_short_ops and apply Phase 1 → current remap
         self.base_short_ops = short_preamble
             .ops
             .iter()
-            .map(|entry| entry.op.clone())
+            .map(|entry| {
+                let mut op = entry.op.clone();
+                for arg in &mut op.args {
+                    if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
+                        *arg = remapped;
+                    }
+                }
+                op
+            })
             .collect();
         self.base_results = self.base_short_ops.iter().map(|op| op.pos).collect();
         self.extra_state.short.clear();
@@ -1357,7 +1434,26 @@ impl ExtendedShortPreambleBuilder {
         self.extra_state.short_inputargs = self.short_inputargs.clone();
         self.label_args = label_args.to_vec();
         self.used_boxes = short_preamble.used_boxes.clone();
-        self.short_jump_args = short_preamble.jump_args.clone();
+        // Also remap jump_args
+        self.short_jump_args = short_preamble
+            .jump_args
+            .iter()
+            .map(|arg| self.phase1_to_inputarg.get(arg).copied().unwrap_or(*arg))
+            .collect();
+        // Remap produced_short_boxes args: Phase 1 inputarg OpRefs → current
+        // inputarg OpRefs. This ensures use_box-added ops (extra short ops)
+        // also reference current inputargs, not stale Phase 1 OpRefs.
+        // Only inputarg refs change; op result refs (produced_short_boxes
+        // keys) are Phase 1 results, not inputargs, so lookup is unaffected.
+        if !self.phase1_to_inputarg.is_empty() {
+            for produced in self.produced_short_boxes.values_mut() {
+                for arg in &mut produced.preamble_op.args {
+                    if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
+                        *arg = remapped;
+                    }
+                }
+            }
+        }
     }
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
@@ -1409,10 +1505,12 @@ impl ExtendedShortPreambleBuilder {
         result_guards: &[Op],
     ) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
+        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         Some(self.extra_state.use_box(
             &produced,
             &self.base_results,
             &self.produced_short_boxes,
+            &pos_to_key,
             arg_guards,
             result_guards,
         ))
@@ -1424,6 +1522,21 @@ impl ExtendedShortPreambleBuilder {
 
     pub fn short_inputargs(&self) -> &[OpRef] {
         &self.short_inputargs
+    }
+
+    /// Debug: check for key/pos mismatches in produced_short_boxes.
+    #[allow(dead_code)]
+    pub fn debug_check_produced_parity(&self) {
+        for (&key, produced) in &self.produced_short_boxes {
+            if key != produced.preamble_op.pos {
+                eprintln!(
+                    "[debug] produced_short_boxes key={} != preamble_op.pos={} ({})",
+                    key.0,
+                    produced.preamble_op.pos.0,
+                    produced.preamble_op.opcode.name(),
+                );
+            }
+        }
     }
 
     pub fn build_short_preamble_struct(
@@ -1438,14 +1551,22 @@ impl ExtendedShortPreambleBuilder {
         } else {
             &self.label_args
         };
-        build_short_preamble_struct_from_ops(
+        let mut sp = build_short_preamble_struct_from_ops(
             inputargs,
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
             loop_constants,
             loop_constant_types,
-        )
+        );
+        // Preserve Phase 1 inputargs for inline_short_preamble mapping.
+        // RPython uses renamed inputargs that are stable across compilations.
+        // In majit, ops reference Phase 1 OpRefs, so we store Phase 1
+        // inputargs to ensure they're mapped even when current inputargs differ.
+        if inputargs != &self.short_inputargs {
+            sp.phase1_inputargs = Some(self.short_inputargs.clone());
+        }
+        sp
     }
 
     pub fn extra_same_as(&self) -> &[Op] {
@@ -1608,6 +1729,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         jump_args: Vec::new(),
         exported_state: None,
         constants: HashMap::new(),
+        phase1_inputargs: None,
     }
 }
 
@@ -1652,6 +1774,13 @@ pub fn build_short_preamble_from_exported_boxes(
         })
         .collect();
     let mut builder = ShortPreambleBuilder::new(label_args, &produced, short_inputargs);
+    // RPython parity: populate known_constants so produce_arg can resolve
+    // constant OpRefs (10000+ range) in short op args. Without this,
+    // add_op_to_short fails for ops like GetfieldGcPure(constant_ptr)
+    // because produce_arg(constant_ptr) returns None.
+    for &idx in loop_constants.keys() {
+        builder.note_known_constant(OpRef(idx));
+    }
     for (result, _) in &produced {
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);

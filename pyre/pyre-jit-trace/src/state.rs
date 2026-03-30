@@ -2894,12 +2894,43 @@ impl MIFrame {
             sym.vable_valuestackdepth,
             ctx,
         ));
-        // Array field: locals_cells_stack_w items
-        for &local in &sym.symbolic_locals {
-            boxes.push(Self::opref_to_snapshot_tagged(local, ctx));
-        }
-        for &stack_val in &sym.symbolic_stack[..stack_only.min(sym.symbolic_stack.len())] {
-            boxes.push(Self::opref_to_snapshot_tagged(stack_val, ctx));
+        // virtualizable.py:86/139 parity: full array length.
+        let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
+            Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
+        } else {
+            None
+        };
+        let full_array_len = concrete_frame
+            .map(|f| f.locals_cells_stack_w.len())
+            .unwrap_or(sym.symbolic_locals.len() + stack_only);
+        for i in 0..full_array_len {
+            let opref = if i < sym.symbolic_locals.len() {
+                sym.symbolic_locals[i]
+            } else {
+                let stack_idx = i - sym.nlocals;
+                if stack_idx < stack_only && stack_idx < sym.symbolic_stack.len() {
+                    sym.symbolic_stack[stack_idx]
+                } else {
+                    OpRef::NONE
+                }
+            };
+            if !opref.is_none() {
+                boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
+            } else if let Some(frame) = concrete_frame {
+                // virtualizable.py:86: read concrete value for non-active slots.
+                let val = frame
+                    .locals_cells_stack_w
+                    .as_slice()
+                    .get(i)
+                    .copied()
+                    .unwrap_or(pyre_object::PY_NULL);
+                boxes.push(majit_trace::recorder::SnapshotTagged::Const(
+                    val as i64,
+                    Type::Ref,
+                ));
+            } else {
+                boxes.push(Self::opref_to_snapshot_tagged(OpRef::NONE, ctx));
+            }
         }
         // virtualizable.py:139: last element = virtualizable itself
         boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
@@ -7790,25 +7821,29 @@ impl JitState for PyreJitState {
         _virtualizable: &str,
         _info: &VirtualizableInfo,
     ) -> Option<Vec<usize>> {
-        // RPython initializes virtualizable_boxes from the current trace-entry
-        // boxes.  Pyre's trace-entry live boxes only carry the active prefix of
-        // `locals_cells_stack_w` (locals/cells plus live stack items), so the
-        // fallback length must describe that live prefix instead of the full
-        // heap capacity.
-        Some(vec![self.valuestackdepth])
+        // virtualizable.py:86/139 parity: full array length.
+        self.locals_cells_stack_array().map(|arr| vec![arr.len()])
     }
 
     fn sync_virtualizable_before_jit(
         &mut self,
         _meta: &Self::Meta,
         _virtualizable: &str,
-        _info: &VirtualizableInfo,
+        info: &VirtualizableInfo,
     ) -> bool {
-        // RPython enters compiled code with the concrete virtualizable already
-        // authoritative.  PyreJitState does not maintain a detached copy of
-        // locals/stack, so importing resume-data back into the frame here
-        // would mutate the live PyFrame before the compiled trace runs.
-        self.refresh_from_frame()
+        // virtualizable.py:86 read_boxes parity: import heap state into
+        // jit_state scalars (next_instr, valuestackdepth) before JIT entry.
+        // RPython reads detached virtualizable_boxes; pyre reads from the
+        // concrete PyFrame (which IS the virtualizable).
+        if !self.refresh_from_frame() {
+            return false;
+        }
+        // virtualizable.py:170 force_token_before_residual_call parity:
+        // clear vable_token so the JIT knows the virtualizable is synced.
+        if let Some(frame_ptr) = self.frame_ptr() {
+            unsafe { info.reset_vable_token(frame_ptr) };
+        }
+        true
     }
 
     fn sync_virtualizable_after_jit(
@@ -7820,11 +7855,10 @@ impl JitState for PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return;
         };
-        // RPython writes detached virtualizable_boxes back here. Pyre keeps
-        // locals/stack in the concrete PyFrame throughout execution, so after
-        // restore_values() the heap frame is already authoritative. Replaying
-        // exported resume-data back into the frame would reinterpret those
-        // live slots as detached boxes and can corrupt normal Jump recovery.
+        // pyjitpl.py:3417 / virtualizable.py:101 write_boxes parity:
+        // write jit_state back to the virtualizable (PyFrame).
+        // RPython writes detached virtualizable_boxes; pyre writes
+        // scalars from jit_state to the concrete PyFrame.
         let _ = self.sync_scalar_fields_to_frame();
         unsafe {
             info.reset_vable_token(frame_ptr);
@@ -8382,11 +8416,22 @@ mod tests {
     }
 
     #[test]
-    fn test_virtualizable_array_lengths_use_live_prefix_depth() {
+    fn test_virtualizable_array_lengths_uses_full_array() {
+        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let full_len = frame.locals_cells_stack_w.len();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
         let mut state = empty_state();
-        state.valuestackdepth = 7;
+        state.frame = frame_ptr;
+        state.valuestackdepth = 2;
         let info = build_pyframe_virtualizable_info();
 
+        // virtualizable.py:86 parity: full array length, not valuestackdepth.
         assert_eq!(
             <PyreJitState as JitState>::virtualizable_array_lengths(
                 &state,
@@ -8394,7 +8439,7 @@ mod tests {
                 "frame",
                 &info,
             ),
-            Some(vec![7])
+            Some(vec![full_len])
         );
     }
 

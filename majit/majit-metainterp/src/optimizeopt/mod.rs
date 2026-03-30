@@ -1362,7 +1362,7 @@ impl OptContext {
                 // resume.py:251-253: single frame with jitcode_index=0, pc=0.
                 ns.append_int(0); // jitcode_index
                 ns.append_int(0); // pc
-                // resume.py:253: _number_boxes — tagged values, no slot_count.
+                ns.append_int(fa.len() as i32); // box_count
                 for (i, &opref) in fa.iter().enumerate() {
                     if opref.is_none() {
                         let vidx = virtual_slots.iter().position(|(idx, _)| *idx == i);
@@ -2101,7 +2101,6 @@ impl OptContext {
         None
     }
 
-    /// Create a new constant int OpRef.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
         let pos = self.alloc_op_position();
         self.make_constant(pos, Value::Int(value));

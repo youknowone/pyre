@@ -3104,14 +3104,12 @@ impl ResumeDataLoopMemo {
         numb_state.append_int((vref_len >> 1) as i32);
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
-        // resume.py:249-253: frame chain
-        // RPython does NOT encode slot_count per frame — it reads tagged
-        // values until the frame ends (using jitcode.position_info at
-        // rebuild time). For single-frame snapshots the reader simply
-        // consumes all remaining tagged values after jitcode_index + pc.
+        // resume.py:249-253: frame chain.
+        // Per-frame: jitcode_index, pc, box_count, [tagged_values x box_count].
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
