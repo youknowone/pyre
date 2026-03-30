@@ -3051,11 +3051,11 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, box_count, [tagged_values x box_count].
+        // Per-frame: jitcode_index, pc, [tagged_values...].
+        // RPython uses jitcode.position_info for value count; no box_count.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
-            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 

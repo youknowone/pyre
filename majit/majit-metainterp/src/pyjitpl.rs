@@ -10,7 +10,9 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
-use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state};
+use crate::blackhole::{
+    BlackholeResult, ExceptionState, blackhole_execute_with_state, blackhole_execute_with_state_ca,
+};
 use crate::compile;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
@@ -5126,6 +5128,24 @@ impl<M: Clone> MetaInterp<M> {
         recovery.frames.first()?.header_pc
     }
 
+    /// resume.py:1312 blackhole_from_resumedata parity:
+    /// Get rd_numb and rd_consts for a guard exit, for use with
+    /// ResumeDataDirectReader-based blackhole resume.
+    pub fn get_rd_numb(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(Vec<u8>, Vec<(i64, Type)>)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let rd_numb = exit_layout.rd_numb.as_ref()?.clone();
+        let rd_consts = exit_layout.rd_consts.as_ref()?.clone();
+        Some((rd_numb, rd_consts))
+    }
+
     /// Compile a bridge from a guard failure point.
     ///
     /// In RPython, when a guard fails frequently, the JIT compiles a
@@ -5993,6 +6013,28 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         exception: ExceptionState,
     ) -> Option<(BlackholeResult, ExceptionState)> {
+        self.blackhole_guard_failure_ca(
+            green_key,
+            trace_id,
+            fail_index,
+            fail_values,
+            exception,
+            None,
+        )
+    }
+
+    /// blackhole.py:1095 bhimpl_recursive_call parity:
+    /// Like `blackhole_guard_failure` but with a CallAssembler callback
+    /// so the IR blackhole can execute CallAssembler ops via portal_runner.
+    pub fn blackhole_guard_failure_ca(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        exception: ExceptionState,
+        call_assembler_fn: Option<&crate::blackhole::CallAssemblerFn>,
+    ) -> Option<(BlackholeResult, ExceptionState)> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let (_, trace) = Self::trace_for_exit(compiled, trace_id)?;
         let guard_op_index = *trace.guard_op_indices.get(&fail_index)?;
@@ -6004,12 +6046,13 @@ impl<M: Clone> MetaInterp<M> {
             initial_values.insert(arg.0, value);
         }
 
-        Some(blackhole_execute_with_state(
+        Some(blackhole_execute_with_state_ca(
             &trace.ops,
             &trace.constants,
             &initial_values,
             guard_op_index + 1,
             exception,
+            call_assembler_fn,
         ))
     }
 
