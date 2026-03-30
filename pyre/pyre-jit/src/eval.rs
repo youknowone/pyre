@@ -2565,31 +2565,9 @@ fn rebuild_typed_from_rd_numb(
         Vec::new()
     };
 
-    // Multi-frame guard recovery: when a guard fires inside an inlined callee,
-    // the rd_numb encodes [callee_frame, ..., caller_frame]. The interpreter
-    // resumes at the outermost (last) frame. For single-frame, decode normally.
-    if frames.len() > 1 {
-        let caller_frame = frames.last().unwrap();
-        let mut typed = header.clone();
-        _prepare_next_section(
-            caller_frame,
-            raw_values,
-            &dead_frame_typed,
-            exit_layout,
-            &mut typed,
-            &mut virtuals_cache,
-        );
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit] guard-fail: rd_numb decoded {} slots from last of {} frame(s)",
-                typed.len(),
-                frames.len()
-            );
-        }
-        return typed;
-    }
-
-    // Single-frame: decode all frames (typically just one).
+    // resume.py:1049 rebuild_from_resumedata parity:
+    // Decode ALL frame sections. RPython rebuilds every frame in the
+    // chain, not just the outermost. The vable header is prepended once.
     let mut typed = header;
     for frame in &frames {
         _prepare_next_section(
@@ -2725,30 +2703,29 @@ fn build_resumed_frames(
     // resume.py:1334-1342 frame loop: each frame gets its own values.
     // The outermost frame (last in chain) gets the vable header prepended.
     // Inner frames use their own section values only.
+    // resume.py:1399 consume_vable_info: extract frame_ptr from vable header.
+    // This is the virtualizable (outermost) frame pointer, shared by all
+    // blackhole interpreters in the chain.
+    let vable_frame_ptr: *mut pyre_interpreter::pyframe::PyFrame = match header.first() {
+        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+        Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+        _ => std::ptr::null_mut(),
+    };
+
     let mut result = Vec::with_capacity(frames.len());
-    let is_single_frame = frames.len() == 1;
     for (fi, (frame, mut values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
         let is_outermost = fi == frames.len() - 1;
-        // resume.py:1399 consume_vable_info: the virtualizable frame_ptr
-        // comes from vable_values (outermost frame only). Inner frames
-        // would have their own frame_ptr from their section encoding.
-        if is_outermost || is_single_frame {
-            // Prepend header for the outermost (virtualizable) frame.
+        // resume.py:1334-1342 parity: each frame gets its own section values.
+        // The outermost (virtualizable) frame gets the vable header prepended.
+        if is_outermost {
             let mut full = header.clone();
             full.append(&mut values);
             values = full;
         }
-        let frame_ptr = if is_outermost || is_single_frame {
-            match values.first() {
-                Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-                Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-                _ => std::ptr::null_mut(),
-            }
-        } else {
-            // Inner frame: no vable header. frame_ptr would come from
-            // the frame's own encoding (not yet implemented for multi-frame).
-            std::ptr::null_mut()
-        };
+        // resume.py:1340 setposition(jitcode, pc): each frame uses the
+        // virtualizable frame_ptr for writeback. Inner frames (callees)
+        // reference the same virtualizable object as the outermost.
+        let frame_ptr = vable_frame_ptr;
         // resume.py:1338 read_jitcode_pos_pc parity:
         // py_pc comes from rd_numb frame header (frame.pc = orgpc).
         // pc=0 is valid (function start). pc=-1 = no-snapshot sentinel.
@@ -2888,22 +2865,49 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
         if target_ptr == 0 {
             continue; // null target — skip
         }
-        // resume.py:1003-1007: setfield or setarrayitem on the target object.
-        // Raw pointer store at target + field_offset.
+        // resume.py:1003-1007 _prepare_pendingfields parity:
+        //   descr = cast_base_ptr_to_instance(AbstractDescr, lldescr)
+        //   struct = self.decode_ref(num)
+        //   if itemindex < 0:
+        //       self.setfield(struct, fieldnum, descr)
+        //   else:
+        //       self.setarrayitem(struct, itemindex, fieldnum, descr)
+        //
+        // resume.py:1509-1518 setfield parity:
+        //   descr.is_pointer_field() → bh_setfield_gc_r
+        //   descr.is_float_field()   → bh_setfield_gc_f
+        //   else                     → bh_setfield_gc_i
         let addr = target_ptr as usize + pf.field_offset;
         unsafe {
-            match pf.field_size {
-                8 => std::ptr::write(addr as *mut i64, value_raw),
-                4 => std::ptr::write(addr as *mut i32, value_raw as i32),
-                2 => std::ptr::write(addr as *mut i16, value_raw as i16),
-                1 => std::ptr::write(addr as *mut u8, value_raw as u8),
-                _ => {}
+            match pf.field_type {
+                majit_ir::Type::Ref => {
+                    // bh_setfield_gc_r: store pointer
+                    std::ptr::write(addr as *mut usize, value_raw as usize);
+                }
+                majit_ir::Type::Float => {
+                    // bh_setfield_gc_f: store f64
+                    std::ptr::write(addr as *mut u64, value_raw as u64);
+                }
+                majit_ir::Type::Int | majit_ir::Type::Void => {
+                    // bh_setfield_gc_i: store integer (size-aware)
+                    match pf.field_size {
+                        8 => std::ptr::write(addr as *mut i64, value_raw),
+                        4 => std::ptr::write(addr as *mut i32, value_raw as i32),
+                        2 => std::ptr::write(addr as *mut i16, value_raw as i16),
+                        1 => std::ptr::write(addr as *mut u8, value_raw as u8),
+                        _ => std::ptr::write(addr as *mut i64, value_raw),
+                    }
+                }
             }
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] replay_pending_field: offset={} size={} target={:#x} value={:#x}",
-                pf.field_offset, pf.field_size, target_ptr as usize, value_raw as usize
+                "[jit] replay_pending_field: type={:?} offset={} size={} target={:#x} value={:#x}",
+                pf.field_type,
+                pf.field_offset,
+                pf.field_size,
+                target_ptr as usize,
+                value_raw as usize
             );
         }
     }
