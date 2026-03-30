@@ -2575,7 +2575,9 @@ fn rebuild_typed_from_rd_numb(
         rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity:
-    // vable_values contains virtualizable field values [ni, vsd].
+    // vable_values contains virtualizable field values.
+    // pyre layout: [ni, vsd, locals..., stack..., frame_ptr].
+    // RPython: [frame_ptr, static_fields..., array_items...].
     if majit_metainterp::majit_log_enabled() && !vable_values.is_empty() {
         eprintln!(
             "[jit] guard-fail: vable_values={} items: {:?}",
@@ -2586,6 +2588,12 @@ fn rebuild_typed_from_rd_numb(
 
     // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+
+    // resume.py:1045 consume_vref_and_vable_boxes parity:
+    // vable_values encode virtualizable state (ni, vsd, array items).
+    // TODO(vable-parity): Apply vable values to typed prefix when
+    // snapshot path is used (requires separate vable OpRefs like
+    // RPython's read_boxes/wrap to avoid dedup with frame boxes).
 
     // resume.py:988: _prepare_virtuals — initialize virtuals_cache.
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
@@ -2662,6 +2670,7 @@ fn rebuild_typed_from_rd_numb(
             frames.len()
         );
     }
+
     typed
 }
 
