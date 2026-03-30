@@ -2915,7 +2915,9 @@ impl MIFrame {
             let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
-            majit_trace::recorder::SnapshotTagged::Box(opref.0)
+            // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
+            let tp = ctx.get_opref_type(opref).unwrap_or(majit_ir::Type::Int);
+            majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
         }
     }
 
