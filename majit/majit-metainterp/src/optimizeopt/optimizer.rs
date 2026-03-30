@@ -203,6 +203,8 @@ pub struct Optimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    /// RPython box.type parity: snapshot Box types.
+    pub snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython Box type parity: in RPython each Box carries its type
     /// intrinsically. In majit, OpRef is an untyped u32, so we track
     /// types in value_types. Phase 1 value_types are preserved here
@@ -819,6 +821,7 @@ impl Optimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
+            snapshot_box_types: std::collections::HashMap::new(),
             prev_phase_value_types: std::collections::HashMap::new(),
             original_trace_op_types: std::collections::HashMap::new(),
         }
@@ -1411,6 +1414,7 @@ impl Optimizer {
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
+        ctx.snapshot_box_types = self.snapshot_box_types.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)
         // into constant_types_for_numbering. These override Int → Ref for
@@ -2738,21 +2742,14 @@ impl Optimizer {
         let has_snapshot =
             op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
         if has_snapshot {
-            // optimizer.py:732-735 + resume.py:389-452:
-            // RPython's finish() handles numbering + virtual encoding +
-            // rd_virtuals in one pass. liveboxes are set via
-            // descr.store_final_boxes(op, newboxes).
-            //
-            // Majit deviation: virtual encoding (NONE + extra fields) runs
-            // here BEFORE finalize_guard_resume_data, because majit's Phase 2
-            // peeling uses fail_args NONE slots to track virtual state for
-            // exported_jump_virtuals and JUMP arg construction. Without this,
-            // body loop loses virtual tracking → wrong computation.
-            // RPython uses box identity (_forwarded chain) instead.
-            //
-            // TODO(rpython-parity): eliminate this by porting RPython's box
-            // identity model — PtrInfo attached to OpRef via set_forwarded,
-            // not in separate HashMap. Then finish() can handle everything.
+            // optimizer.py:732-748 + resume.py:389-452:
+            // RPython's finish() handles snapshot numbering + _number_virtuals.
+            // Majit still needs fail_args NONE encoding because Phase 2 peeling
+            // tracks virtuals through fail_args NONE slots (OpRef lacks box
+            // identity, unlike RPython's Box._forwarded chain).
+            // Deviation from RPython: collect_virtual_field_values forces
+            // nested virtuals. RPython's visitor_walk_recursive only collects
+            // them. This forcing is currently needed for correct JUMP args.
             let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
             let mut extra_fail_args: Vec<OpRef> = Vec::new();
             let original_len = fail_args.len();
