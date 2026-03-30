@@ -67,9 +67,6 @@ pub struct UnrollOptimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    /// RPython box.type parity: each snapshot Box carries its type from tracing.
-    /// Used by InlineBoxEnv.get_type() for correct _number_boxes virtual detection.
-    pub snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// resume.py:570-574 _add_optimizer_sections: per-guard optimizer
     /// knowledge collected during optimization. Propagated to CompiledTrace
     /// for bridge compilation.
@@ -109,7 +106,6 @@ impl UnrollOptimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
-            snapshot_box_types: std::collections::HashMap::new(),
             per_guard_knowledge: Vec::new(),
             trace_inputarg_types: Vec::new(),
             original_trace_op_types: std::collections::HashMap::new(),
@@ -148,39 +144,6 @@ impl UnrollOptimizer {
         let mut result = body_ops.to_vec();
         if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
             jump.descr = Some(preamble_target.as_jump_target_descr());
-        }
-        result
-    }
-
-    /// jump_to_preamble variant that replaces the JUMP args with
-    /// pre-optimization args (in original trace/preamble positional order).
-    ///
-    /// The optimizer reorders JUMP args during Phase 2, making them
-    /// incompatible with the preamble's positional layout. This variant
-    /// uses the original trace args which match the preamble's inputargs.
-    pub fn jump_to_preamble_with_args(
-        body_ops: &[Op],
-        preamble_target: &TargetToken,
-        pre_opt_args: &[OpRef],
-        loop_num_inputs: Option<usize>,
-    ) -> Vec<Op> {
-        assert!(
-            preamble_target.virtual_state.is_none(),
-            "jump_to_preamble expects the start/preamble target token"
-        );
-        let mut result = body_ops.to_vec();
-        if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
-            jump.descr = Some(preamble_target.as_jump_target_descr());
-            // Replace optimized args with pre-optimization args (preamble order).
-            let ni = loop_num_inputs.unwrap_or(pre_opt_args.len());
-            jump.args = pre_opt_args[..ni.min(pre_opt_args.len())].into();
-            if crate::optimizeopt::majit_log_enabled() {
-                eprintln!(
-                    "[jit] jump_to_preamble_with_args: {} pre_opt args → {} preamble args",
-                    pre_opt_args.len(),
-                    jump.args.len(),
-                );
-            }
         }
         result
     }
@@ -301,7 +264,6 @@ impl UnrollOptimizer {
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-            opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
             // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
             // that only skips the final cleanup flush — JUMP-time force_all_lazy
             // still runs. In majit skip_flush also prevents JUMP lazy_set emit
@@ -412,7 +374,6 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
         // gcreftracer.py parity: root GcRef values on the shadow stack.
         // RPython: single Python object — GC traces automatically.
         // Rust: LIFO shadow stack requires longer-lived roots at lower depth.

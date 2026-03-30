@@ -1372,12 +1372,6 @@ impl OptRewrite {
                 new_op.pos = op.pos;
                 new_op.descr = op.descr.clone();
                 new_op.fail_args = op.fail_args.clone();
-                new_op.fail_arg_types = op.fail_arg_types.clone();
-                new_op.rd_resume_position = op.rd_resume_position;
-                new_op.rd_numb = op.rd_numb.clone();
-                new_op.rd_consts = op.rd_consts.clone();
-                new_op.rd_virtuals_info = op.rd_virtuals_info.clone();
-                new_op.rd_pendingfields = op.rd_pendingfields.clone();
                 return OptimizationResult::Replace(new_op);
             }
             if expected == 1 {
@@ -1385,12 +1379,6 @@ impl OptRewrite {
                 new_op.pos = op.pos;
                 new_op.descr = op.descr.clone();
                 new_op.fail_args = op.fail_args.clone();
-                new_op.fail_arg_types = op.fail_arg_types.clone();
-                new_op.rd_resume_position = op.rd_resume_position;
-                new_op.rd_numb = op.rd_numb.clone();
-                new_op.rd_consts = op.rd_consts.clone();
-                new_op.rd_virtuals_info = op.rd_virtuals_info.clone();
-                new_op.rd_pendingfields = op.rd_pendingfields.clone();
                 return OptimizationResult::Replace(new_op);
             }
         }
@@ -1865,12 +1853,6 @@ impl Optimization for OptRewrite {
                         new_op.pos = op.pos;
                         new_op.descr = op.descr.clone();
                         new_op.fail_args = op.fail_args.clone();
-                        new_op.fail_arg_types = op.fail_arg_types.clone();
-                        new_op.rd_resume_position = op.rd_resume_position;
-                        new_op.rd_numb = op.rd_numb.clone();
-                        new_op.rd_consts = op.rd_consts.clone();
-                        new_op.rd_virtuals_info = op.rd_virtuals_info.clone();
-                        new_op.rd_pendingfields = op.rd_pendingfields.clone();
                         return OptimizationResult::Replace(new_op);
                     }
                 }

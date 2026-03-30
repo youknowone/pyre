@@ -215,25 +215,17 @@ fn snapshot_map_from_trace_snapshots(
     std::collections::HashMap<i32, Vec<usize>>,
     std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    std::collections::HashMap<u32, majit_ir::Type>, // snapshot_box_types
 ) {
     let mut box_map = std::collections::HashMap::new();
     let mut size_map = std::collections::HashMap::new();
     let mut vable_map = std::collections::HashMap::new();
     let mut pc_map = std::collections::HashMap::new();
-    // RPython box.type parity: each Box carries its type from tracing.
-    // Collected here so _number_boxes can detect virtual vs int correctly.
-    let mut snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type> =
-        std::collections::HashMap::new();
     let mut next_const_idx = constants.keys().copied().max().unwrap_or(10_000) + 1;
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
     let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
-            majit_trace::recorder::SnapshotTagged::Box(n, tp) => {
-                snapshot_box_types.insert(*n, *tp);
-                majit_ir::OpRef(*n)
-            }
-            majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+            majit_trace::recorder::SnapshotTagged::Box(n)
+            | majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
             majit_trace::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),
@@ -282,7 +274,7 @@ fn snapshot_map_from_trace_snapshots(
         vable_map.insert(id, vable_boxes);
         pc_map.insert(id, frame_pcs);
     }
-    (box_map, size_map, vable_map, pc_map, snapshot_box_types)
+    (box_map, size_map, vable_map, pc_map)
 }
 
 fn normalize_root_loop_entry_contract(
@@ -1890,7 +1882,7 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, sbt) =
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
                 &mut constants,
@@ -1900,7 +1892,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
-        unroll_opt.snapshot_box_types = sbt;
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -2448,8 +2439,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
-        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs, _sbt) =
-            snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &mut constant_types);
+        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2654,7 +2649,6 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_frame_sizes,
             retrace_snapshot_vable_boxes,
             retrace_snapshot_frame_pcs,
-            retrace_sbt,
         ) = snapshot_map_from_trace_snapshots(
             &trace.snapshots,
             &mut constants,
@@ -2664,7 +2658,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
-        unroll_opt.snapshot_box_types = retrace_sbt;
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
@@ -3323,7 +3316,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
 
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, _sbt) =
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
                 &mut constants,
@@ -3552,15 +3545,6 @@ impl<M: Clone> MetaInterp<M> {
     /// from shadowing independently compiled inner loop entries.
     ///
     /// NOTE: currently disabled in all callers (returns green_key) because
-    /// enabling alias resolution without target_tokens dispatch causes
-    /// merge_pc mismatch → guard failure → churn in nested loops.
-    /// The infrastructure (compiled_loop_aliases HashMap) is preserved
-    /// for when target_tokens dispatch is implemented.
-    #[inline]
-    pub fn resolve_alias(&self, green_key: u64) -> u64 {
-        green_key
-    }
-
     /// Get the metadata for a compiled loop without executing it.
     ///
     /// Allows the interpreter to check preconditions (e.g., whether the
@@ -3568,15 +3552,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `run_compiled`.
     /// Follows cross-loop cut aliases.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
-        let key = self.resolve_alias(green_key);
-        self.compiled_loops.get(&key).map(|e| &e.meta)
+        self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
     /// Get num_inputs of the compiled loop.
     /// Follows cross-loop cut aliases.
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
-        let key = self.resolve_alias(green_key);
-        self.compiled_loops.get(&key).map(|e| e.num_inputs)
+        self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
     }
 
     /// Run the compiled loop for the given green key.
@@ -3590,8 +3572,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns `None` if no compiled loop exists for this key.
     pub fn run_compiled(&mut self, green_key: u64, live_values: &[i64]) -> Option<(Vec<i64>, &M)> {
-        let key = self.resolve_alias(green_key);
-        let compiled = self.compiled_loops.get(&key)?;
+        let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self
@@ -3604,7 +3585,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // Track guard failures for bridge compilation decisions.
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3631,7 +3612,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&key).unwrap();
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
         Some((result.outputs, &compiled.meta))
     }
 
@@ -3645,8 +3626,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<(Vec<Value>, &M)> {
-        let key = self.resolve_alias(green_key);
-        let compiled = self.compiled_loops.get(&key)?;
+        let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self
@@ -3658,7 +3638,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3685,7 +3665,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&key).unwrap();
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
         Some((result.typed_outputs, &compiled.meta))
     }
 
@@ -3697,8 +3677,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<(Vec<Value>, &M)> {
-        let key = self.resolve_alias(green_key);
-        let compiled = self.compiled_loops.get(&key)?;
+        let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
@@ -3708,7 +3687,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3735,7 +3714,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&key).unwrap();
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
         Some((result.typed_outputs, &compiled.meta))
     }
 
@@ -3746,8 +3725,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<(Vec<Value>, bool, &M)> {
-        let key = self.resolve_alias(green_key);
-        let compiled = self.compiled_loops.get(&key)?;
+        let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
@@ -3757,7 +3735,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&key).unwrap();
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let info = compiled
                 .guard_failures
                 .entry((trace_id, fail_index))
@@ -3784,7 +3762,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let compiled = self.compiled_loops.get(&key).unwrap();
+        let compiled = self.compiled_loops.get(&green_key).unwrap();
         Some((result.typed_outputs, result.is_finish, &compiled.meta))
     }
 
@@ -3798,7 +3776,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<RawCompileResult<'_, M>> {
-        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -4072,7 +4049,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[i64],
     ) -> Option<CompileResult<'_, M>> {
-        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -4185,7 +4161,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         mut values: Vec<Value>,
     ) -> Vec<Value> {
-        let green_key = self.resolve_alias(green_key);
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return values;
         };
@@ -4240,7 +4215,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<CompileResult<'_, M>> {
-        let green_key = self.resolve_alias(green_key);
         let compiled = self.compiled_loops.get(&green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -9804,8 +9778,6 @@ mod tests {
             num_virtuals: 0,
             virtual_kinds: Vec::new(),
             virtual_layouts: Vec::new(),
-            num_fail_args: 1,
-            fail_arg_positions: vec![0],
             pending_field_count: 0,
             pending_field_layouts: Vec::new(),
             const_pool_size: 0,
