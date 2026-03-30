@@ -1755,53 +1755,9 @@ impl<M: Clone> MetaInterp<M> {
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED before the closing JUMP. fail_args = jump_args
         // so guard failure restores the same state as the JUMP target.
-        // pyjitpl.py:2969: GUARD_FUTURE_CONDITION is now emitted during
-        // tracing in close_loop_args_at (state.rs) via record_guard, which
-        // calls capture_resumedata with full framestack + vable + vref.
-        //
-        // heapcache.py:176: GUARD_NOT_INVALIDATED. In RPython this is
-        // emitted during tracing by heapcache. In pyre, add it here
-        // and share the GUARD_FUTURE_CONDITION's snapshot (same state).
-        {
-            let inputarg_types = recorder.inputarg_types();
-            let num_inputargs = recorder.num_inputargs() as u32;
-            let guard_fail_arg_types: Vec<majit_ir::Type> = jump_args
-                .iter()
-                .map(|&arg| {
-                    if arg.0 < num_inputargs {
-                        inputarg_types[arg.0 as usize]
-                    } else if let Some(op) = recorder.get_op_by_pos(arg) {
-                        op.result_type()
-                    } else if arg.0 >= 10_000 {
-                        ctx.constants.constant_type(arg).unwrap_or(Type::Int)
-                    } else {
-                        unreachable!(
-                            "jump_arg OpRef({}) is not inputarg, recorded op, or constant",
-                            arg.0
-                        )
-                    }
-                })
-                .collect();
-            let descr = crate::fail_descr::make_fail_descr_typed(guard_fail_arg_types);
-            recorder.record_guard_with_fail_args(
-                OpCode::GuardNotInvalidated,
-                &[],
-                descr,
-                jump_args,
-            );
-            // Share GUARD_FUTURE_CONDITION's snapshot (the guard just before).
-            // Both guards represent the same frame state (just before JUMP).
-            let gfc_snap = {
-                let ops = recorder.ops();
-                let gfc_idx = ops.len().saturating_sub(2);
-                ops.get(gfc_idx)
-                    .map(|op| op.rd_resume_position)
-                    .unwrap_or(-1)
-            };
-            if gfc_snap >= 0 {
-                recorder.set_last_op_resume_position(gfc_snap);
-            }
-        }
+        // pyjitpl.py:2969: GUARD_FUTURE_CONDITION and heapcache.py:176:
+        // GUARD_NOT_INVALIDATED are both emitted during tracing in
+        // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
         recorder.close_loop(jump_args);
         let trace = recorder.get_trace();
 

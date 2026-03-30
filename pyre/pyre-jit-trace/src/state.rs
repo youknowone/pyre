@@ -2746,6 +2746,9 @@ impl MIFrame {
         // capture_resumedata which captures the full framestack +
         // virtualizable_boxes + virtualref_boxes.
         self.record_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
+        // heapcache.py:176: GUARD_NOT_INVALIDATED. In RPython emitted by
+        // heapcache during tracing. Same frame state as GUARD_FUTURE_CONDITION.
+        self.record_guard(ctx, majit_ir::OpCode::GuardNotInvalidated, &[]);
         args
     }
 
