@@ -152,6 +152,39 @@ impl UnrollOptimizer {
         result
     }
 
+    /// jump_to_preamble variant that replaces the JUMP args with
+    /// pre-optimization args (in original trace/preamble positional order).
+    ///
+    /// The optimizer reorders JUMP args during Phase 2, making them
+    /// incompatible with the preamble's positional layout. This variant
+    /// uses the original trace args which match the preamble's inputargs.
+    pub fn jump_to_preamble_with_args(
+        body_ops: &[Op],
+        preamble_target: &TargetToken,
+        pre_opt_args: &[OpRef],
+        loop_num_inputs: Option<usize>,
+    ) -> Vec<Op> {
+        assert!(
+            preamble_target.virtual_state.is_none(),
+            "jump_to_preamble expects the start/preamble target token"
+        );
+        let mut result = body_ops.to_vec();
+        if let Some(jump) = result.iter_mut().rfind(|op| op.opcode == OpCode::Jump) {
+            jump.descr = Some(preamble_target.as_jump_target_descr());
+            // Replace optimized args with pre-optimization args (preamble order).
+            let ni = loop_num_inputs.unwrap_or(pre_opt_args.len());
+            jump.args = pre_opt_args[..ni.min(pre_opt_args.len())].into();
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!(
+                    "[jit] jump_to_preamble_with_args: {} pre_opt args → {} preamble args",
+                    pre_opt_args.len(),
+                    jump.args.len(),
+                );
+            }
+        }
+        result
+    }
+
     fn ensure_preamble_target_token(&mut self) {
         if self
             .target_tokens

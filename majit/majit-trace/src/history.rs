@@ -350,9 +350,11 @@ impl TreeLoop {
         }
 
         // opencoder.py parity: carry snapshots through cut_trace_from.
-        // RPython's CutTrace wraps the original trace preserving snapshot
-        // access for store_final_boxes_in_guard (resume.py). Without
-        // snapshots, guards fall back to fail_args-only rd_numb.
+        // RPython's CutTrace wraps the original trace and adjusts iteration
+        // start, preserving snapshot access for the optimizer's
+        // store_final_boxes_in_guard (resume.py:ResumeDataVirtualAdder.finish).
+        // Without snapshots, bridge/loop guards fall back to fail_args-only
+        // rd_numb (fewer slots than the full frame → SIGSEGV on recovery).
         TreeLoop::with_snapshots(new_inputargs, new_ops, self.snapshots.clone())
     }
 }
