@@ -229,6 +229,19 @@ pub struct JitDriver<S: JitState> {
     /// resume.py:1367 — CPU allocation backend for virtual materialization
     /// during blackhole resume. Registered by pyre/aheui at startup.
     blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
+    /// warmspot.py:961 handle_jitexception parity: portal runner callback.
+    /// Called when ContinueRunningNormally is raised at a recursive portal
+    /// level during blackhole execution. Re-enters the portal function
+    /// with green/red args and returns the result.
+    portal_runner: Option<
+        Box<
+            dyn Fn(
+                    &crate::jitexc::JitException,
+                )
+                    -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
+                + Send,
+        >,
+    >,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -270,7 +283,25 @@ impl<S: JitState> JitDriver<S> {
             _invalidation_thread: Some(invalidation_thread),
             jitcode_factory: None,
             blackhole_allocator: None,
+            portal_runner: None,
         }
+    }
+
+    /// Register a portal runner callback for blackhole ContinueRunningNormally.
+    ///
+    /// warmspot.py:1039 handle_jitexception_from_blackhole parity:
+    /// called when ContinueRunningNormally is raised at a recursive portal
+    /// level. The callback re-enters the portal function and returns the result.
+    pub fn register_portal_runner(
+        &mut self,
+        runner: impl Fn(
+            &crate::jitexc::JitException,
+        )
+            -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
+        + Send
+        + 'static,
+    ) {
+        self.portal_runner = Some(Box::new(runner));
     }
 
     /// Register a JitCode factory callback for blackhole resume.
@@ -1204,7 +1235,20 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(bh) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
-                    let jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    let jit_exc = crate::blackhole::run_forever_with_portal(
+                        &mut bh_builder,
+                        bh,
+                        exc,
+                        self.portal_runner.as_ref().map(|r| {
+                            r.as_ref()
+                                as &dyn Fn(
+                                    &crate::jitexc::JitException,
+                                ) -> Result<
+                                    (crate::blackhole::BhReturnType, i64),
+                                    crate::jitexc::JitException,
+                                >
+                        }),
+                    );
                     // compile.py:716 assert 0, "unreachable"
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -2664,7 +2708,20 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(bh) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
-                    let jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    let jit_exc = crate::blackhole::run_forever_with_portal(
+                        &mut bh_builder,
+                        bh,
+                        exc,
+                        self.portal_runner.as_ref().map(|r| {
+                            r.as_ref()
+                                as &dyn Fn(
+                                    &crate::jitexc::JitException,
+                                ) -> Result<
+                                    (crate::blackhole::BhReturnType, i64),
+                                    crate::jitexc::JitException,
+                                >
+                        }),
+                    );
                     // compile.py:716 assert 0, "unreachable"
                     if crate::majit_log_enabled() {
                         eprintln!(

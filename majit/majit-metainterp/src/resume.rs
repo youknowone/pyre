@@ -5840,6 +5840,7 @@ pub fn blackhole_from_resumedata<'a>(
 ///
 /// Force all virtuals from resume data without running a blackhole.
 /// Used for GUARD_NOT_FORCED handling.
+/// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache parity.
 pub fn force_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [i64],
@@ -5848,14 +5849,14 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-) -> ResumeDataDirectReader<'a> {
+) -> (Vec<i64>, Vec<i64>) {
     // resume.py:1347-1348
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
-    // resume.py:1351
-    resumereader.force_all_virtuals();
-    resumereader
+    // resume.py:1351: return resumereader.force_all_virtuals()
+    let (ptrs, ints) = resumereader.force_all_virtuals();
+    (ptrs.to_vec(), ints.to_vec())
 }
