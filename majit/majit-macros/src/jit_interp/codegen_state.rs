@@ -1498,21 +1498,6 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     );
                 }
 
-                /// compile.py:711 resume_in_blackhole parity.
-                /// Guard fail_args are in extract_live order:
-                ///   [stacksize, pool_ptr, selected, selected_ref, ..., pc]
-                /// Restore scalar fields only — storage contents were
-                /// already mutated in-place by compiled code (SetfieldGc).
-                fn restore_guard_failure_raw(
-                    &mut self,
-                    meta: &__JitMeta,
-                    _exit_types: &[majit_ir::Type],
-                    raw_values: &[i64],
-                ) {
-                    // Same scalar restore as restore() — just the first 4 slots.
-                    self.restore(meta, raw_values);
-                }
-
                 fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                     let stacksize = sym.current_stacksize_value.unwrap_or(majit_ir::OpRef::NONE);
                     let selected = sym.current_selected_value.unwrap_or(majit_ir::OpRef::NONE);
