@@ -522,37 +522,27 @@ impl<S: JitState> JitDriver<S> {
         //   2. unreachable FINISH(exception_descr)
         //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
         //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-        // pyjitpl.py:1618 force_finish_trace segmenting check.
-        // When force_finish_trace is set and trace reaches 80% of limit,
-        // _create_segmented_trace_and_blackhole: emit GUARD_ALWAYS_FAILS +
-        // unreachable FINISH, then compile_simple_loop with Label for
-        // bridge closure.
+        // pyjitpl.py:1618 force_finish_trace segmenting fallback.
+        // The proc-macro path handles this inside the closure (where __pc
+        // is captured). For non-macro consumers whose trace_fn doesn't
+        // emit SegmentedLoop, this fallback uses ctx.last_traced_pc
+        // (recorded by proc-macro or pyre trace_fn) as the guard-point pc.
         if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
-            // pyjitpl.py:1618-1620 force_finish_trace + 80% limit check.
             let should_segment = self
                 .meta
                 .trace_ctx()
                 .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
                 .unwrap_or(false);
             if should_segment {
-                // pyjitpl.py:1626 generate_guard(GUARD_ALWAYS_FAILS)
-                // + capture_resumedata: fail_args = current live boxes
-                // (guard point values, NOT inputargs/entry values).
-                // RPython captures the current frame's boxes so
-                // resume_in_blackhole can reconstruct mid-loop state.
-                // pyjitpl.py:1626+2579 capture_resumedata parity:
-                // fail_args = collect_jump_args + pc (matching macro path).
                 let mut current_live = self
                     .sym
                     .as_ref()
                     .map(|sym| S::collect_jump_args(sym))
                     .unwrap_or_default();
                 if let Some(ctx) = self.meta.trace_ctx() {
-                    let limit = ctx.trace_limit();
-                    let length = ctx.num_ops();
-                    // Append bytecode pc as trailing Int (same contract
-                    // as macro path and guard_resume_pc extraction).
-                    let pc_opref = ctx.const_int(ctx.header_pc as i64);
+                    // pyjitpl.py:2594: use last_traced_pc (= frame.pc at
+                    // the guard point), not header_pc.
+                    let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
                     current_live.push(pc_opref);
                     let live_types: Vec<majit_ir::Type> = current_live
                         .iter()
@@ -564,13 +554,14 @@ impl<S: JitState> JitDriver<S> {
                         live_types,
                         &current_live,
                     );
-                    // pyjitpl.py:1637 unreachable FINISH (dead code after guard).
                     let dummy = ctx.const_int(0);
                     ctx.record_finish(dummy, majit_ir::Type::Int);
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] force_finish_trace: segmenting at {} ops (limit {})",
-                            length, limit
+                            "[jit] force_finish_trace: segmenting at {} ops (limit {}) pc={}",
+                            ctx.num_ops(),
+                            ctx.trace_limit(),
+                            ctx.last_traced_pc
                         );
                     }
                 }
@@ -944,7 +935,7 @@ impl<S: JitState> JitDriver<S> {
     pub fn jit_merge_point_keyed<F>(
         &mut self,
         green_key: u64,
-        _target_pc: usize,
+        target_pc: usize,
         _state: &mut S,
         _env: &S::Env,
         _pre_run: impl FnOnce(),
@@ -991,6 +982,10 @@ impl<S: JitState> JitDriver<S> {
                         });
                     }
                 }
+            }
+            // pyjitpl.py:2594: record frame.pc for capture_resumedata.
+            if let Some(ctx) = self.meta.trace_ctx() {
+                ctx.last_traced_pc = target_pc;
             }
             self.merge_point(trace_fn);
         }
@@ -1124,16 +1119,26 @@ impl<S: JitState> JitDriver<S> {
                 target_pc
             };
 
-            // resume_in_blackhole parity limitation: aheui compiled code
-            // mutates storages in-place (SetfieldGc = real memory write).
-            // Mid-loop resume would see already-mutated storage +
-            // interpreter executing the remaining bytecodes = double
-            // mutation. RPython avoids this because BlackholeInterpreter
-            // uses its own register set (not shared storage).
+            // compile.py:711 resume_in_blackhole parity.
             //
-            // Fall back to target_pc (loop header restart). The
-            // can_enter_jit expansion re-reads stacksize from the live
-            // storage, so scalars sync automatically.
+            // STRUCTURAL LIMITATION: aheui compiled code mutates storage
+            // memory in-place via SetfieldGc. Mid-loop resume from
+            // guard_resume_pc would cause double mutation — compiled code
+            // already pushed/popped on the real storage, and the
+            // interpreter would repeat those operations.
+            //
+            // RPython avoids this because BlackholeInterpreter has its
+            // own register set (registers_i, registers_r) independent of
+            // heap memory. It runs bytecodes using those registers, so
+            // the already-mutated heap doesn't cause double effects.
+            //
+            // To achieve RPython parity here, the #[jit_interp] proc
+            // macro would need to generate a register-based blackhole
+            // interpreter (like RPython's BlackholeInterpreter) that
+            // doesn't share mutable storage with the main interpreter.
+            //
+            // guard_resume_pc is passed to start_bridge_tracing for
+            // correct bridge trace start position.
 
             if should_bridge {
                 let bridge_ok = self.start_bridge_tracing(

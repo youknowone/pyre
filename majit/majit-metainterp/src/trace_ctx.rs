@@ -71,6 +71,9 @@ pub struct TraceCtx {
     /// pyjitpl.py:2411 force_finish_trace: when True, trace is segmented
     /// at 80% of limit via _create_segmented_trace_and_blackhole.
     force_finish: bool,
+    /// pyjitpl.py:2594 frame.pc: last bytecode pc passed to trace_fn.
+    /// Used by force_finish_trace segmenting to record the guard-point pc.
+    pub last_traced_pc: usize,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -249,6 +252,7 @@ impl TraceCtx {
             }],
             heap_cache: HeapCache::new(),
             force_finish: false,
+            last_traced_pc: 0,
         }
     }
 
@@ -286,6 +290,7 @@ impl TraceCtx {
             }],
             heap_cache: HeapCache::new(),
             force_finish: false,
+            last_traced_pc: 0,
         }
     }
 

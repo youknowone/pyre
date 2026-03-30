@@ -5180,3 +5180,336 @@ mod tests {
         assert_eq!(rebuilt_frames[0].values[3], RebuiltValue::Box(1));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// resume.py:901-1039 AbstractResumeDataReader
+// resume.py:1354-1601 ResumeDataDirectReader
+//
+// Direct reader that decodes resume data and fills blackhole
+// interpreter registers with concrete values from the deadframe.
+// ═══════════════════════════════════════════════════════════════
+
+use crate::blackhole::BlackholeInterpreter;
+use crate::resumecode::Reader;
+
+/// resume.py:1354 ResumeDataDirectReader
+///
+/// Reads encoded resume data (rd_numb) and fills blackhole interpreter
+/// registers directly from the deadframe's fail_args values.
+///
+/// Combines AbstractResumeDataReader (resume.py:901) mixin with
+/// ResumeDataDirectReader (resume.py:1354) concrete class.
+pub struct ResumeDataDirectReader<'a> {
+    // AbstractResumeDataReader fields (resume.py:909-922)
+    /// resume.py:918 resumecodereader
+    pub resumecodereader: Reader<'a>,
+    /// resume.py:919 items_resume_section — total items in resume section
+    pub items_resume_section: i32,
+    /// resume.py:921 count — number of failargs
+    pub count: i32,
+    /// resume.py:922 consts — constant pool from rd_consts
+    pub consts: &'a [i64],
+
+    // ResumeDataDirectReader fields (resume.py:1364-1367)
+    /// resume.py:1366 deadframe — raw fail_args values
+    pub deadframe: &'a [i64],
+
+    // resume.py:1358 resume_after_guard_not_forced
+    //   0: not a GUARD_NOT_FORCED
+    //   1: in handle_async_forcing
+    //   2: resuming from the GUARD_NOT_FORCED
+    pub resume_after_guard_not_forced: u8,
+
+    // resume.py:909 rd_virtuals
+    rd_virtuals: Option<&'a [VirtualInfo]>,
+
+    // resume.py:910 virtuals_cache — lazy-allocated virtual objects
+    virtuals_cache_ptr: Vec<i64>,
+    virtuals_cache_int: Vec<i64>,
+
+    // Internal: reference to blackhole interp being filled
+    // resume.py:1382 self.blackholeinterp
+    blackholeinterp_registers_i: Vec<i64>,
+    blackholeinterp_registers_r: Vec<i64>,
+    blackholeinterp_registers_f: Vec<i64>,
+}
+
+impl<'a> ResumeDataDirectReader<'a> {
+    /// resume.py:1364 __init__
+    pub fn new(rd_numb: &'a [u8], rd_consts: &'a [i64], deadframe: &'a [i64]) -> Self {
+        // resume.py:915-922 _init
+        let mut resumecodereader = Reader::new(rd_numb);
+        let items_resume_section = resumecodereader.next_item();
+        let count = resumecodereader.next_item();
+
+        ResumeDataDirectReader {
+            resumecodereader,
+            items_resume_section,
+            count,
+            consts: rd_consts,
+            deadframe,
+            resume_after_guard_not_forced: 0,
+            rd_virtuals: None,
+            virtuals_cache_ptr: Vec::new(),
+            virtuals_cache_int: Vec::new(),
+            blackholeinterp_registers_i: Vec::new(),
+            blackholeinterp_registers_r: Vec::new(),
+            blackholeinterp_registers_f: Vec::new(),
+        }
+    }
+
+    /// resume.py:924 _prepare — init virtuals and pending fields.
+    pub fn prepare(&mut self, rd_virtuals: Option<&'a [VirtualInfo]>) {
+        self.prepare_virtuals(rd_virtuals);
+        // TODO: _prepare_pendingfields when pendingfields are supported
+    }
+
+    /// resume.py:1378 handling_async_forcing
+    pub fn handling_async_forcing(&mut self) {
+        self.resume_after_guard_not_forced = 1;
+    }
+
+    // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
+
+    /// resume.py:928 read_jitcode_pos_pc
+    pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
+        let jitcode_pos = self.resumecodereader.next_item();
+        let pc = self.resumecodereader.next_item();
+        (jitcode_pos, pc)
+    }
+
+    /// resume.py:933 next_int
+    pub fn next_int(&mut self) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.decode_int(tagged)
+    }
+
+    /// resume.py:936 next_ref
+    pub fn next_ref(&mut self) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.decode_ref(tagged)
+    }
+
+    /// resume.py:939 next_float
+    pub fn next_float(&mut self) -> i64 {
+        let tagged = self.resumecodereader.next_item() as i16;
+        self.decode_float(tagged)
+    }
+
+    /// resume.py:942 done_reading
+    pub fn done_reading(&self) -> bool {
+        self.resumecodereader.items_read >= self.items_resume_section as usize
+    }
+
+    /// resume.py:983 _prepare_virtuals
+    fn prepare_virtuals(&mut self, virtuals: Option<&'a [VirtualInfo]>) {
+        if let Some(v) = virtuals {
+            self.rd_virtuals = Some(v);
+            self.virtuals_cache_ptr = vec![0; v.len()];
+            self.virtuals_cache_int = vec![0; v.len()];
+        }
+    }
+
+    // ---- ResumeDataDirectReader methods (resume.py:1380-1601) ----
+
+    /// resume.py:1381 consume_one_section
+    ///
+    /// Read one resume frame section and fill the blackhole interpreter's
+    /// registers. Uses liveness info from the jitcode to know which
+    /// registers are live at the current PC.
+    pub fn consume_one_section(&mut self, bh: &mut BlackholeInterpreter) {
+        // resume.py:1382-1384
+        // info = blackholeinterp.get_current_position_info()
+        // self._prepare_next_section(info)
+
+        // Get liveness info for current position
+        if let Some(info) = bh.get_current_position_info().cloned() {
+            // resume.py:1017-1026 _prepare_next_section
+            // enumerate_vars: for each live register, decode and write
+            for &reg_idx in &info.live_i_regs {
+                // resume.py:1028-1030 _callback_i
+                let value = self.next_int();
+                bh.setarg_i(reg_idx as usize, value);
+            }
+            // TODO: live_r_regs, live_f_regs when LivenessInfo supports them
+        } else {
+            // No liveness info: read all registers sequentially.
+            // This is a fallback for jitcodes without precise liveness.
+            let num_i = bh.jitcode.num_regs_i() as usize;
+            for i in 0..num_i {
+                if self.done_reading() {
+                    break;
+                }
+                let value = self.next_int();
+                bh.setarg_i(i, value);
+            }
+        }
+    }
+
+    /// resume.py:1424 consume_vref_and_vable
+    pub fn consume_vref_and_vable(&mut self) {
+        // resume.py:1425
+        let vable_size = self.resumecodereader.next_item();
+        if self.resume_after_guard_not_forced != 2 {
+            // resume.py:1427-1431
+            // Skip virtualizable info (vable_size items)
+            if vable_size > 0 {
+                // TODO: consume_vable_info when virtualizable is supported
+                self.resumecodereader.jump(vable_size as usize);
+            }
+            // TODO: ginfo support
+            // consume_virtualref_info
+            let vref_size = self.resumecodereader.next_item();
+            if vref_size > 0 {
+                // Skip vref pairs (virtual, vref)
+                self.resumecodereader.jump(vref_size as usize * 2);
+            }
+        } else {
+            // resume.py:1433-1435
+            self.resumecodereader.jump(vable_size as usize);
+            let vref_size = self.resumecodereader.next_item();
+            self.resumecodereader.jump(vref_size as usize * 2);
+        }
+    }
+
+    /// resume.py:1552 decode_int
+    pub fn decode_int(&self, tagged: i16) -> i64 {
+        let (num, tag) = untag(tagged);
+        match tag {
+            TAGCONST => {
+                // resume.py:1555
+                let idx = (num - TAG_CONST_OFFSET) as usize;
+                self.consts.get(idx).copied().unwrap_or(0)
+            }
+            TAGINT => {
+                // resume.py:1557
+                num as i64
+            }
+            TAGVIRTUAL => {
+                // resume.py:1559
+                self.virtuals_cache_int
+                    .get(num as usize)
+                    .copied()
+                    .unwrap_or(0)
+            }
+            TAGBOX => {
+                // resume.py:1561-1564
+                let mut idx = num;
+                if idx < 0 {
+                    idx += self.count;
+                }
+                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+            }
+            _ => unreachable!("bad tag: {tag}"),
+        }
+    }
+
+    /// resume.py:1566 decode_ref
+    pub fn decode_ref(&self, tagged: i16) -> i64 {
+        let (num, tag) = untag(tagged);
+        match tag {
+            TAGCONST => {
+                // resume.py:1569-1571
+                if tagged_eq(tagged, NULLREF) {
+                    return 0; // null pointer
+                }
+                let idx = (num - TAG_CONST_OFFSET) as usize;
+                self.consts.get(idx).copied().unwrap_or(0)
+            }
+            TAGVIRTUAL => {
+                // resume.py:1573
+                self.virtuals_cache_ptr
+                    .get(num as usize)
+                    .copied()
+                    .unwrap_or(0)
+            }
+            TAGBOX => {
+                // resume.py:1575-1578
+                let mut idx = num;
+                if idx < 0 {
+                    idx += self.count;
+                }
+                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+            }
+            _ => {
+                // TAGINT not valid for refs
+                debug_assert!(false, "decode_ref: unexpected tag {tag}");
+                0
+            }
+        }
+    }
+
+    /// resume.py:1580 decode_float
+    pub fn decode_float(&self, tagged: i16) -> i64 {
+        let (num, tag) = untag(tagged);
+        match tag {
+            TAGCONST => {
+                // resume.py:1583
+                let idx = (num - TAG_CONST_OFFSET) as usize;
+                self.consts.get(idx).copied().unwrap_or(0)
+            }
+            TAGBOX => {
+                // resume.py:1586-1588
+                let mut idx = num;
+                if idx < 0 {
+                    idx += self.count;
+                }
+                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+            }
+            _ => {
+                debug_assert!(false, "decode_float: unexpected tag {tag}");
+                0
+            }
+        }
+    }
+
+    /// resume.py:1599 int_add_const
+    pub fn int_add_const(&self, base: i64, offset: i64) -> i64 {
+        base + offset
+    }
+}
+
+/// resume.py:1312 blackhole_from_resumedata
+///
+/// Build a chain of BlackholeInterpreters from encoded resume data.
+/// Returns the topmost (innermost) interpreter.
+///
+/// This is the primary entry point for reconstructing blackhole state
+/// from a guard failure's resume data.
+pub fn blackhole_from_resumedata(
+    builder: &mut crate::blackhole::BlackholeInterpBuilder,
+    jitcodes: &[crate::jitcode::JitCode],
+    rd_numb: &[u8],
+    rd_consts: &[i64],
+    deadframe: &[i64],
+    rd_virtuals: Option<&[VirtualInfo]>,
+) -> Option<BlackholeInterpreter> {
+    // resume.py:1320-1321
+    let mut resumereader = ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe);
+
+    // resume.py:1324-1325
+    resumereader.prepare(rd_virtuals);
+    resumereader.consume_vref_and_vable();
+
+    // resume.py:1332-1343
+    // Build chain bottom-up: first frame acquired is the outermost.
+    let mut curbh: Option<Box<BlackholeInterpreter>> = None;
+
+    while !resumereader.done_reading() {
+        // resume.py:1334-1336
+        let mut nextbh = builder.acquire_interp();
+        nextbh.nextblackholeinterp = curbh;
+
+        // resume.py:1338-1340
+        let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
+        let jitcode = jitcodes.get(jitcode_pos as usize)?.clone();
+        nextbh.setposition(jitcode, pc as usize);
+
+        // resume.py:1341
+        resumereader.consume_one_section(&mut nextbh);
+
+        curbh = Some(Box::new(nextbh));
+    }
+
+    curbh.map(|b| *b)
+}
