@@ -244,33 +244,6 @@ pub trait JitState: Sized {
         true
     }
 
-    /// compile.py:711 resume_in_blackhole parity.
-    /// Restore interpreter state from guard's raw fail_args.
-    ///
-    /// fail_args are the trace inputargs (extract_live order) plus an
-    /// optional trailing pc. Default: restore only scalar fields
-    /// (stacksize, selected) from the raw values in extract_live order.
-    /// Storage contents are already mutated in-place by compiled code.
-    fn restore_guard_failure_raw(
-        &mut self,
-        meta: &Self::Meta,
-        exit_types: &[Type],
-        raw_values: &[i64],
-    ) {
-        // Default: reconstruct Value vec and call restore_values.
-        // Subclasses may override if restore() expects a different format.
-        let typed: Vec<Value> = exit_types
-            .iter()
-            .zip(raw_values.iter())
-            .map(|(&tp, &raw)| match tp {
-                Type::Ref => Value::Ref(GcRef(raw as usize)),
-                Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                _ => Value::Int(raw),
-            })
-            .collect();
-        self.restore_values(meta, &typed);
-    }
-
     fn sync_virtualizable_before_jit(
         &mut self,
         meta: &Self::Meta,
