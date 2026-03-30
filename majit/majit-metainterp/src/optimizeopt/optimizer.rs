@@ -1367,6 +1367,13 @@ impl Optimizer {
             ctx.value_types.insert(i as u32, tp);
         }
 
+        // RPython optimizer.py:293 patchguardop parity: propagate to Phase 2
+        // OptContext so copy_and_change guards (unroll.py:409) can get
+        // rd_resume_position before GUARD_FUTURE_CONDITION is re-encountered.
+        if ctx.patchguardop.is_none() {
+            ctx.patchguardop = self.patchguardop.clone();
+        }
+
         // RPython resume.py parity: pass snapshot_boxes and constant_types
         // to OptContext so emit() can call store_final_boxes_in_guard inline
         // at each guard emission (not post-assembly).

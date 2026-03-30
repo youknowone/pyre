@@ -1327,10 +1327,9 @@ fn execute_assembler(
                         // guard failure counter accumulates, eventually
                         // triggers bridge compilation.
                         //
-                        // WORKAROUND: some called functions have guards with
-                        // fail_args/rd_numb slot count mismatch (resume_pos=-1
-                        // path). Invalidate until all guard resume data is
-                        // consistent.
+                        // WORKAROUND: some guards still have resume_pos=-1
+                        // (no snapshot). Remove when all Phase 2 guards and
+                        // called-function guards have valid snapshot positions.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
