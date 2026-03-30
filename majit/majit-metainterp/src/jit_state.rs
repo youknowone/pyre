@@ -387,13 +387,14 @@ pub trait JitState: Sized {
         Self::validate_close(sym, meta)
     }
 
-    /// Push a reconstructed caller frame onto the interpreter's call stack.
+    /// resume.py:1049 parity: push a reconstructed caller frame.
     /// Called during multi-frame deopt: innermost frame is current,
     /// outer frames are pushed in reverse order (outermost first).
     ///
     /// `frame_index`: 0 = outermost, N-1 = innermost (current)
     /// `values`: typed values for this frame's slots
     /// `pc`: the program counter / bytecode position for this frame
+    /// `jitcode_index`: JitCode index for CodeObject lookup
     ///
     /// Returns true if the frame was successfully pushed.
     fn push_caller_frame(
@@ -403,6 +404,7 @@ pub trait JitState: Sized {
         _total_frames: usize,
         _values: &[Value],
         _pc: u64,
+        _jitcode_index: i32,
     ) -> bool {
         false // Default: no multi-frame support
     }
@@ -944,7 +946,14 @@ pub trait JitState: Sized {
             else {
                 return false;
             };
-            if !self.push_caller_frame(meta, frame_index, total_frames, &values, frame.pc) {
+            if !self.push_caller_frame(
+                meta,
+                frame_index,
+                total_frames,
+                &values,
+                frame.pc,
+                frame.jitcode_index,
+            ) {
                 return false;
             }
         }
@@ -1641,6 +1650,7 @@ mod tests {
             total_frames: usize,
             values: &[Value],
             pc: u64,
+            _jitcode_index: i32,
         ) -> bool {
             self.pushed_caller_frames
                 .push((frame_index, total_frames, values.to_vec(), pc));

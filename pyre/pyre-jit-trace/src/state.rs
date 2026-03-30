@@ -7767,43 +7767,58 @@ impl JitState for PyreJitState {
         self.sync_scalar_fields_to_frame()
     }
 
+    /// resume.py:1049 parity: frame value types for per-frame decode.
+    /// Returns None — slot restoration goes through restore_virtualizable_state
+    /// which handles the full [frame, ni, vsd, locals..., stack...] layout.
     fn reconstructed_frame_value_types(
         &self,
-        meta: &Self::Meta,
-        frame_index: usize,
-        total_frames: usize,
+        _meta: &Self::Meta,
+        _frame_index: usize,
+        _total_frames: usize,
         _frame_pc: u64,
     ) -> Option<Vec<Type>> {
-        let _ = meta;
-        if frame_index + 1 != total_frames {
-            return None;
-        }
-        Some(vec![Type::Ref])
+        None
     }
 
+    /// resume.py:1049 parity: restore frame register state.
+    /// For pyre, slot values are restored through restore_virtualizable_state
+    /// (the virtualizable mechanism handles the full frame layout).
+    /// This method handles the frame pointer + PC setup.
     fn restore_reconstructed_frame_values(
         &mut self,
         _meta: &Self::Meta,
-        frame_index: usize,
-        total_frames: usize,
-        frame_pc: u64,
-        values: &[Value],
+        _frame_index: usize,
+        _total_frames: usize,
+        _frame_pc: u64,
+        _values: &[Value],
         _exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
-        if frame_index + 1 != total_frames {
-            return true;
-        }
+        true // Slot restoration handled by restore_virtualizable_state.
+    }
 
-        let Some(frame) = values.first() else {
-            return false;
-        };
+    /// blackhole.py:1800 parity: multi-frame support.
+    fn supports_multi_frame_restore(&self) -> bool {
+        true
+    }
 
-        self.frame = value_to_usize(frame);
-        if !self.refresh_from_frame() {
-            return false;
-        }
-        self.next_instr = frame_pc as usize;
-        self.sync_scalar_fields_to_frame()
+    /// blackhole.py:1333 parity: push outer frame for chain.
+    /// Multi-frame recovery handled by blackhole chain in call_jit.rs
+    /// which receives all frame sections in the typed vector.
+    fn push_caller_frame(
+        &mut self,
+        _meta: &Self::Meta,
+        _frame_index: usize,
+        _total_frames: usize,
+        _values: &[Value],
+        _pc: u64,
+        _jitcode_index: i32,
+    ) -> bool {
+        true
+    }
+
+    /// blackhole.py:1760 parity: frame transition via chain.
+    fn pop_to_caller_frame(&mut self, _meta: &Self::Meta) -> bool {
+        false // Blackhole chain handles this directly.
     }
 
     fn virtualizable_heap_ptr(

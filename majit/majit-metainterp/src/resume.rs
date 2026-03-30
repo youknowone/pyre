@@ -885,6 +885,7 @@ impl ResumeLayoutSummary {
                 header_pc: frame.header_pc,
                 source_guard: frame.source_guard,
                 pc: frame.pc,
+                jitcode_index: 0,
                 slot_types: frame.slot_types.clone(),
                 values: frame
                     .slot_layouts
@@ -920,6 +921,7 @@ impl ResumeLayoutSummary {
             header_pc: frame.header_pc,
             source_guard: frame.source_guard,
             pc: frame.pc,
+            jitcode_index: 0,
             slot_types: frame.slot_types.clone(),
             values: frame
                 .slot_layouts
@@ -1932,6 +1934,7 @@ impl EncodedResumeData {
                 header_pc: None,
                 source_guard: None,
                 pc: frame.pc,
+                jitcode_index: 0,
                 slot_types: None,
                 values: frame
                     .slot_map
@@ -2017,6 +2020,7 @@ impl ResumeData {
                     header_pc: None,
                     source_guard: None,
                     pc: frame.pc,
+                    jitcode_index: 0,
                     slot_types: None,
                     values,
                 }
@@ -2141,6 +2145,8 @@ pub struct ReconstructedFrame {
     pub source_guard: Option<(u64, u32)>,
     /// Program counter for this frame.
     pub pc: u64,
+    /// resume.py:1051: jitcode index for CodeObject lookup.
+    pub jitcode_index: i32,
     /// Typed layout of the reconstructed slots, when known.
     pub slot_types: Option<Vec<Type>>,
     /// Reconstructed values for each slot.
