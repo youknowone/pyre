@@ -2087,8 +2087,11 @@ fn materialize_virtual_from_rd(
     // Instance/Struct: extract fields for ob_type-based materialization.
     // resume.py:593 fielddescrs + fieldnums
     enum VirtualKind<'a> {
-        /// resume.py:612 VirtualInfo — allocate_with_vtable(descr).
-        Instance { known_class: Option<i64> },
+        /// resume.py:612 VirtualInfo — allocate_with_vtable(descr=self.descr).
+        Instance {
+            descr: &'a Option<majit_ir::DescrRef>,
+            known_class: Option<i64>,
+        },
         /// resume.py:628 VStructInfo — allocate_struct(self.typedescr).
         Struct {
             typedescr: &'a Option<majit_ir::DescrRef>,
@@ -2097,6 +2100,7 @@ fn materialize_virtual_from_rd(
     }
     let (kind, fielddescrs, fieldnums, descr_size) = match entry {
         majit_ir::RdVirtualInfo::Instance {
+            descr,
             known_class,
             fielddescrs,
             fieldnums,
@@ -2104,6 +2108,7 @@ fn materialize_virtual_from_rd(
             ..
         } => (
             VirtualKind::Instance {
+                descr,
                 known_class: *known_class,
             },
             fielddescrs.as_slice(),
@@ -2137,7 +2142,7 @@ fn materialize_virtual_from_rd(
     // Phase 1: allocate.
     let obj_ptr: usize = match kind {
         // resume.py:617-621: VirtualInfo.allocate(descr) → allocate_with_vtable.
-        VirtualKind::Instance { known_class } => {
+        VirtualKind::Instance { descr, known_class } => {
             let ob_type = known_class.unwrap_or(0);
             let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
             let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
@@ -2158,11 +2163,20 @@ fn materialize_virtual_from_rd(
                 });
                 Box::into_raw(obj) as usize
             } else if ob_type != 0 {
-                // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
-                debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
-                let size = if descr_size > 0 { descr_size } else { 16 };
-                let descr = majit_ir::make_size_descr_with_vtable(0, size, 0, ob_type as usize);
-                allocate_with_vtable(descr.as_size_descr().unwrap())
+                // resume.py:619: allocate_with_vtable(descr=self.descr).
+                if let Some(d) = descr {
+                    allocate_with_vtable(
+                        d.as_size_descr()
+                            .expect("VirtualInfo descr must be SizeDescr"),
+                    )
+                } else {
+                    // Fallback: no live descr (decoded from EncodedResumeData).
+                    debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
+                    let size = if descr_size > 0 { descr_size } else { 16 };
+                    let fallback =
+                        majit_ir::make_size_descr_with_vtable(0, size, 0, ob_type as usize);
+                    allocate_with_vtable(fallback.as_size_descr().unwrap())
+                }
             } else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -2202,7 +2216,7 @@ fn materialize_virtual_from_rd(
     // resume.py:596-603: for each fielddescr, decoder.setfield(struct, num, descr)
     let is_instance = matches!(kind, VirtualKind::Instance { .. });
     match kind {
-        VirtualKind::Instance { known_class }
+        VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
         {
             // W_IntObject fast path: fieldnums[0] = intval (offset 8)
@@ -2227,7 +2241,7 @@ fn materialize_virtual_from_rd(
                 }
             }
         }
-        VirtualKind::Instance { known_class }
+        VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
         {
             // W_FloatObject fast path: fieldnums[0] = floatval (offset 8)
@@ -2482,9 +2496,13 @@ fn restore_guard_failure_for_loop(
                 _ => std::ptr::null_mut(),
             };
             // resume.py:1338 read_jitcode_pos_pc parity:
-            // py_pc comes from the guard's resume PC, NOT from values[1]
-            // (which is the vable next_instr slot, not the resume PC).
-            let py_pc = jit_state.next_instr;
+            // Extract py_pc from typed values (ni slot, already resolved
+            // from deadframe). Cannot use jit_state.next_instr here —
+            // restore_guard_failure_values hasn't been called yet.
+            let py_pc = match typed.get(1) {
+                Some(Value::Int(v)) => *v as usize,
+                _ => 0,
+            };
             let code = if !frame_ptr.is_null() {
                 unsafe { (*frame_ptr).code }
             } else {
@@ -2608,7 +2626,11 @@ fn build_resumed_frames(
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
-    let mut result = Vec::with_capacity(frames.len());
+    // resume.py:924-926 _prepare parity: resolve ALL frames' values first,
+    // then apply _prepare_virtuals + _prepare_pendingfields ONCE before
+    // the blackhole chain loop. RPython calls _prepare() in __init__,
+    // before the while-loop in blackhole_from_resumedata (resume.py:1320).
+    let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
         let mut values = Vec::new();
         _prepare_next_section(
@@ -2619,13 +2641,22 @@ fn build_resumed_frames(
             &mut values,
             &mut virtuals_cache,
         );
+        all_values.push(values);
+    }
+    // _prepare → _prepare_pendingfields: apply ONCE on the combined values.
+    // Virtual objects are shared across frames; pending field writes must
+    // happen exactly once (resume.py:993-1007).
+    for values in &mut all_values {
+        rebuild_state_after_failure_with_exit_layout(values, raw_values, exit_layout);
+    }
+    // replay_pending_fields writes to materialized virtuals in-place.
+    // Apply once: the writes go to the objects themselves, not the arrays.
+    if let Some(first_values) = all_values.first() {
+        replay_pending_fields(first_values, exit_layout);
+    }
 
-        // resume.py:924-926 _prepare → _prepare_pendingfields parity:
-        // Apply deferred SETFIELD_GC/SETARRAYITEM_GC on materialized
-        // virtual objects BEFORE the blackhole reads them.
-        rebuild_state_after_failure_with_exit_layout(&mut values, raw_values, exit_layout);
-        replay_pending_fields(&values, exit_layout);
-
+    let mut result = Vec::with_capacity(frames.len());
+    for (frame, values) in frames.iter().zip(all_values.into_iter()) {
         // Extract frame_ptr from the first value (Ref or Int).
         let frame_ptr = match values.first() {
             Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
