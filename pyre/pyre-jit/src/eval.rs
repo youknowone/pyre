@@ -2574,36 +2574,25 @@ fn rebuild_typed_from_rd_numb(
     let (_num_failargs, vable_values, _vref_values, frames) =
         rebuild_from_numbering(rd_numb, rd_consts);
 
-    // resume.py:1045 consume_vref_and_vable_boxes parity:
-    // vable_values contains virtualizable field values.
-    // pyre layout: [ni, vsd, locals..., stack..., frame_ptr].
-    // RPython: [frame_ptr, static_fields..., array_items...].
+    // resume.py:1045 consume_vref_and_vable_boxes parity.
+    // vable_array format: [frame_ptr, ni, vsd, locals..., stack...]
+    // (opencoder.py:722 moves virtualizable_ptr to front).
     if majit_metainterp::majit_log_enabled() && !vable_values.is_empty() {
         eprintln!(
             "[jit] guard-fail: vable_values={} items: {:?}",
             vable_values.len(),
-            vable_values.iter().take(4).collect::<Vec<_>>()
+            vable_values.iter().take(6).collect::<Vec<_>>()
         );
     }
 
-    // resume.py:924-926 _prepare: decode rd_numb frame chain into typed values.
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
-
-    // resume.py:1045 consume_vref_and_vable_boxes parity:
-    // vable_values encode virtualizable state (ni, vsd, array items).
-    // TODO(vable-parity): Apply vable values to typed prefix when
-    // snapshot path is used (requires separate vable OpRefs like
-    // RPython's read_boxes/wrap to avoid dedup with frame boxes).
-
-    // resume.py:988: _prepare_virtuals — initialize virtuals_cache.
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
-    // resume.py:1045 consume_vref_and_vable parity:
-    // Reconstruct header [frame_ptr, py_pc, vsd] from vable_values.
-    // vable_array layout: [ni, vsd, locals..., stack..., frame_ptr]
-    // pyre header layout: [frame_ptr, py_pc, vsd]
-    // Decode a vable RebuiltValue to a concrete Value.
-    fn decode_vable_value(
+    // resume.py:1083 + pyjitpl.py:3400-3428 parity:
+    // Decode vable_values into typed prefix [frame_ptr, ni, vsd, locals..., stack...].
+    // In RPython, virtualizable_boxes are restored first, then synchronize_virtualizable
+    // writes them back to the actual frame object.
+    fn decode_rv(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
         exit_layout: &CompiledExitLayout,
@@ -2616,6 +2605,7 @@ fn rebuild_typed_from_rd_numb(
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
                 majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
                 _ => Value::Int(*c),
             },
             RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
@@ -2629,21 +2619,46 @@ fn rebuild_typed_from_rd_numb(
             _ => Value::Int(0),
         }
     }
-    let header: Vec<Value> = if !vable_values.is_empty() {
-        // frame_ptr = last element, py_pc = first, vsd = second
-        let frame_val = vable_values
-            .last()
-            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
-            .unwrap_or(Value::Int(0));
-        let py_pc_val = vable_values
-            .first()
-            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
-            .unwrap_or(Value::Int(0));
-        let vsd_val = vable_values
-            .get(1)
-            .map(|rv| decode_vable_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
-            .unwrap_or(Value::Int(0));
-        vec![frame_val, py_pc_val, vsd_val]
+    // resume.py:1042-1057 / pyjitpl.py:3428 synchronize_virtualizable parity:
+    // RPython recovery produces TWO streams: virtualizable_boxes (for
+    // synchronize_virtualizable → write_boxes) and frame registers (from
+    // frame section). In pyre the virtualizable IS the frame, so the
+    // vable section is the authoritative source for ALL state:
+    // [frame_ptr(0), ni(1), vsd(2), locals..., stack...].
+    //
+    // The encoding (record_guard_core / record_branch_guard) sets
+    // sym.vable_next_instr = resume_pc before build_virtualizable_boxes,
+    // so vable[1] == frame section pc (RPython capture_resumedata parity).
+
+    // Decode vable array items (locals + stack).
+    let vable_array_items: Vec<Value> = vable_values
+        .iter()
+        .skip(3)
+        .map(|rv| decode_rv(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
+        .collect();
+
+    // Decode vable header: [frame_ptr(0), ni(1), vsd(2)].
+    let header: Vec<Value> = if vable_values.len() >= 3 {
+        vec![
+            decode_rv(
+                &vable_values[0],
+                &dead_frame_typed,
+                exit_layout,
+                &mut virtuals_cache,
+            ),
+            decode_rv(
+                &vable_values[1],
+                &dead_frame_typed,
+                exit_layout,
+                &mut virtuals_cache,
+            ),
+            decode_rv(
+                &vable_values[2],
+                &dead_frame_typed,
+                exit_layout,
+                &mut virtuals_cache,
+            ),
+        ]
     } else {
         Vec::new()
     };
@@ -2651,23 +2666,29 @@ fn rebuild_typed_from_rd_numb(
     // resume.py:1049 rebuild_from_resumedata parity:
     // Decode ALL frame sections. RPython rebuilds every frame in the
     // chain, not just the outermost. The vable header is prepended once.
+    let has_vable = !vable_array_items.is_empty();
     let mut typed = header;
-    for frame in &frames {
-        _prepare_next_section(
-            frame,
-            raw_values,
-            &dead_frame_typed,
-            exit_layout,
-            &mut typed,
-            &mut virtuals_cache,
-        );
+    if has_vable {
+        typed.extend(vable_array_items);
+    } else {
+        for frame in &frames {
+            _prepare_next_section(
+                frame,
+                raw_values,
+                &dead_frame_typed,
+                exit_layout,
+                &mut typed,
+                &mut virtuals_cache,
+            );
+        }
     }
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] guard-fail: rd_numb decoded {} slots from {} frame(s)",
+            "[jit] guard-fail: rd_numb decoded {} slots from {} frame(s) vable={}",
             typed.len(),
-            frames.len()
+            frames.len(),
+            has_vable,
         );
     }
 
@@ -2728,12 +2749,45 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    // resume.py:1312-1343 blackhole_from_resumedata parity:
-    // 1. consume_vref_and_vable ONCE — writes locals/stack to virtualizable
-    // 2. _prepare_virtuals + _prepare_pendingfields ONCE
-    // 3. Frame loop: read_jitcode_pos_pc + consume_one_section per frame
+    // RPython parity: extract frame_ptr/ni/vsd from vable_values (snapshot).
+    // Per-frame values contain slot registers only (no header prepend).
+    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
+        let frame_val = resolve_rebuilt_value(
+            vable_values.last().unwrap(),
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let ni_val = resolve_rebuilt_value(
+            &vable_values[0],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let vsd_val = resolve_rebuilt_value(
+            &vable_values[1],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let fp = match &frame_val {
+            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        let ni = match &ni_val {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        };
+        let vsd = match &vsd_val {
+            Value::Int(v) => *v as usize,
+            _ => 0,
+        };
+        (fp, ni, vsd)
+    } else {
+        (std::ptr::null_mut(), 0, 0)
+    };
 
-    // _prepare: materialize virtuals + replay pending fields ONCE.
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
         // RPython parity: no header prepend. Values = slot registers only.
@@ -2757,44 +2811,38 @@ fn build_resumed_frames(
         replay_pending_fields(first_values, exit_layout);
     }
 
-    // resume.py:1334-1342 frame loop: each frame gets its own values.
-    // The outermost frame (last in chain) gets the vable header prepended.
-    // Inner frames use their own section values only.
-    // resume.py:1399 consume_vable_info: extract frame_ptr from vable header.
-    // This is the virtualizable (outermost) frame pointer, shared by all
-    // blackhole interpreters in the chain.
-    // resume.py:1045 consume_vref_and_vable: extract vable fields.
-    // pyre vable_boxes = [ni, vsd, locals..., stack..., frame].
+    // opencoder.py:722 _list_of_boxes_virtualizable: snapshot reorders
+    // virtualizable_ptr from end to front → [frame_ptr(0), ni(1), vsd(2), array...]
     let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
         let frame_val = resolve_rebuilt_value(
-            vable_values.last().unwrap(),
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
             &vable_values[0],
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
-        let vsd_val = resolve_rebuilt_value(
+        let ni_val = resolve_rebuilt_value(
             &vable_values[1],
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
-        let fp = match frame_val {
+        let vsd_val = resolve_rebuilt_value(
+            &vable_values[2],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let fp = match &frame_val {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Value::Int(v) => v as *mut pyre_interpreter::pyframe::PyFrame,
+            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
             _ => std::ptr::null_mut(),
         };
-        let ni = match ni_val {
-            Value::Int(v) => v as usize,
+        let ni = match &ni_val {
+            Value::Int(v) => *v as usize,
             _ => 0,
         };
-        let vsd = match vsd_val {
-            Value::Int(v) => v as usize,
+        let vsd = match &vsd_val {
+            Value::Int(v) => *v as usize,
             _ => 0,
         };
         (fp, ni, vsd)
