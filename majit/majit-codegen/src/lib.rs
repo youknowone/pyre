@@ -957,8 +957,9 @@ pub trait Backend: Send {
     fn bh_new(&self, _size: usize, _type_id: u32) -> i64 {
         0
     }
-    /// model.py: bh_new_with_vtable(descr)
-    fn bh_new_with_vtable(&self, _size: usize, _vtable: usize) -> i64 {
+    /// llmodel.py:778 bh_new_with_vtable(sizedescr).
+    /// gc_malloc(sizedescr) + write vtable at vtable_offset.
+    fn bh_new_with_vtable(&self, _size: usize, _type_id: u32, _vtable: usize) -> i64 {
         0
     }
     /// model.py: bh_new_array(length, descr)
