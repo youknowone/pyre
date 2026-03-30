@@ -47,6 +47,7 @@ pub use io_buffer::{
 };
 pub use jit_state::{
     DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
+    ResumeDataResult,
 };
 pub use jitcode::{
     ClosureRuntime, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, JitCodeMachine,
@@ -57,7 +58,7 @@ pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_codegen::CompiledTraceInfo;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
-    BackEdgeAction, BlackholeRunResult, CompileOutcome, CompiledExitLayout,
+    BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
     CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
     DriverRunOutcome, GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp,
     RawCompileResult,

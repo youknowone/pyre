@@ -90,6 +90,31 @@ impl DeoptMaterializationCache {
     }
 }
 
+/// resume.py:1042 rebuild_from_resumedata return value.
+///
+/// RPython returns `(liveboxes, virtualizable_boxes, virtualref_boxes)`.
+/// `liveboxes[i]` = InputArgBox for TAGBOX(i), None otherwise.
+/// Frame registers are filled with InputArgBox/ConstBox/VirtualBox mix.
+///
+/// Rust equivalent: `RebuiltFrame.values` carries per-slot RebuiltValue
+/// (Box/Const/Int/Virtual/Unassigned). `constants` holds constant OpRef
+/// entries for the optimizer constant pool (no RPython equivalent —
+/// RPython uses ConstBox objects natively in the trace recording).
+#[derive(Debug, Clone)]
+pub struct ResumeDataResult {
+    /// resume.py:1057: per-frame decoded values from rd_numb.
+    /// Each RebuiltValue::Box(i) → liveboxes[i] in RPython.
+    pub frames: Vec<majit_ir::resumedata::RebuiltFrame>,
+    /// resume.py:1045: virtualizable boxes (decoded from vable section).
+    pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
+    /// resume.py:1045: virtualref box pairs (decoded from vref section).
+    pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
+    /// Rust-specific: constant OpRef entries for the optimizer pool.
+    /// No RPython equivalent (RPython uses ConstBox natively).
+    /// Each entry: (OpRef index >= 10000, raw value, type).
+    pub constants: Vec<(u32, i64, Type)>,
+}
+
 /// Interpreter-specific JIT state contract.
 pub trait JitState: Sized {
     type Meta: Clone;
@@ -169,6 +194,23 @@ pub trait JitState: Sized {
     /// boxes matching fail_arg_types. The meta must describe this shape,
     /// not the interpreter frame's shape (which may have more live values).
     fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {}
+
+    /// resume.py:1042-1057 rebuild_from_resumedata: decode rd_numb to
+    /// reconstruct the complete frame state for bridge tracing.
+    ///
+    /// RPython creates ResumeDataBoxReader, consumes vable/vref/frame
+    /// sections, fills MIFrame registers with InputArgBox/ConstBox mix,
+    /// returns (liveboxes, virtualizable_boxes, virtualref_boxes).
+    ///
+    /// Returns None when rd_numb is not available (legacy path).
+    fn rebuild_from_resumedata(
+        _meta: &mut Self::Meta,
+        _fail_arg_types: &[Type],
+        _rd_numb: Option<&[u8]>,
+        _rd_consts: Option<&[(i64, Type)]>,
+    ) -> Option<ResumeDataResult> {
+        None
+    }
 
     /// pyjitpl.py:3158-3175 compile_loop parity: build final meta from
     /// the MergePoint that matched at close time, not from the trace start.

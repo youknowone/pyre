@@ -1792,6 +1792,11 @@ pub(crate) struct BridgeFailDescrProxy {
     pub(crate) gc_ref_slots: Vec<usize>,
     pub(crate) force_token_slots: Vec<usize>,
     pub(crate) is_finish: bool,
+    // resume.py:1042 rebuild_from_resumedata: rd_numb encodes the full
+    // frame layout (TAGBOX/TAGCONST/TAGINT per slot). Bridge tracing
+    // decodes this to reconstruct the complete frame, not just fail_args.
+    pub(crate) rd_numb: Option<Vec<u8>>,
+    pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
 }
 
 impl majit_ir::Descr for BridgeFailDescrProxy {

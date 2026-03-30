@@ -26,6 +26,19 @@ use crate::resume::{
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
+/// No direct RPython equivalent — Rust struct carrying data that RPython
+/// passes through internal method calls in handle_guard_failure
+/// (pyjitpl.py:2890). Fields correspond to:
+/// - `fail_types`: ResumeGuardDescr.fail_arg_types (compile.py:797)
+/// - `is_exception_guard`: isinstance(key, ResumeGuardExcDescr) (compile.py:932)
+/// - `rd_numb`/`rd_consts`: storage.rd_numb/rd_consts (resume.py:1042)
+pub struct BridgeRetraceResult {
+    pub is_exception_guard: bool,
+    pub fail_types: Vec<Type>,
+    pub rd_numb: Option<Vec<u8>>,
+    pub rd_consts: Option<Vec<(i64, Type)>>,
+}
+
 /// Result of checking a back-edge.
 pub enum BackEdgeAction {
     /// Not hot yet; keep interpreting.
@@ -4909,6 +4922,8 @@ impl<M: Clone> MetaInterp<M> {
             gc_ref_slots: exit_layout.gc_ref_slots.clone(),
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
+            rd_numb: None,
+            rd_consts: None,
         })
     }
 
@@ -5503,10 +5518,10 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         _fail_values: &[i64],
         _live_types: &[Type],
-    ) -> (bool, bool, Option<Vec<Type>>) {
+    ) -> Option<BridgeRetraceResult> {
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
-            None => return (false, false, None),
+            None => return None,
         };
 
         // RPython compile.py:932 invent_fail_descr_for_op:
@@ -5522,7 +5537,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let fail_descr = match Self::bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
             Some(descr) => descr,
-            None => return (false, false, None),
+            None => return None,
         };
 
         // compile.py:797-811 / resume.py:1042: bridge inputargs come from
@@ -5536,21 +5551,23 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
-        // RPython pyjitpl.py:3101 _prepare_exception_resumption:
-        // For exception guards, the caller should call
-        // emit_exception_bridge_prologue(exc_class, exc_value) to emit
-        // SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at trace start.
-
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
 
-        // Return fail_arg_types so the caller can adjust trace_meta
-        // to match the guard's shape (not the interpreter frame's shape).
-        // resume.py:1042: rebuild_from_resumedata produces boxes matching
-        // fail_arg_types — bridge tracing must use the same shape.
-        let fail_types = bridge_input_types.to_vec();
-        (true, is_exception_guard, Some(fail_types))
+        // resume.py:1042: retrieve rd_numb/rd_consts directly from exit_layout
+        // (not from BridgeFailDescrProxy, to avoid cloning on the hot path).
+        let (rd_numb, rd_consts) = Self::trace_for_exit(compiled, norm_tid)
+            .and_then(|(_, trace)| trace.exit_layouts.get(&fail_index))
+            .map(|layout| (layout.rd_numb.clone(), layout.rd_consts.clone()))
+            .unwrap_or((None, None));
+
+        Some(BridgeRetraceResult {
+            is_exception_guard,
+            fail_types: bridge_input_types.to_vec(),
+            rd_numb,
+            rd_consts,
+        })
     }
 
     /// compile.py:987-1000: handle_async_forcing — force all virtuals
@@ -5621,6 +5638,21 @@ impl<M: Clone> MetaInterp<M> {
         let class_op = ctx.record_op(OpCode::SaveExcClass, &[class_const]);
         let value_op = ctx.record_op(OpCode::SaveException, &[value_const]);
         ctx.record_op(OpCode::RestoreException, &[class_op, value_op]);
+    }
+
+    /// No RPython equivalent — RPython uses ConstBox natively in traces.
+    /// Rust needs explicit constant pool injection for TAGCONST/TAGINT
+    /// entries decoded from rd_numb by rebuild_from_resumedata.
+    pub fn inject_bridge_constants(&mut self, constants: &[(u32, i64, Type)]) {
+        let Some(ref mut ctx) = self.tracing else {
+            return;
+        };
+        for &(opref_idx, value, tp) in constants {
+            ctx.constants.as_mut().insert(opref_idx, value);
+            if tp != Type::Int {
+                ctx.constants.mark_type(OpRef(opref_idx), tp);
+            }
+        }
     }
 
     // ── Guard Failure Recovery ─────────────────────────────────
@@ -6485,7 +6517,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         };
         self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values, &[])
-            .0
+            .is_some()
     }
 
     // ── Inlining Support ──────────────────────────────────────

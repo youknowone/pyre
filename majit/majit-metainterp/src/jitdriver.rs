@@ -199,6 +199,10 @@ pub struct JitDriver<S: JitState> {
     /// code_ptr enables computing green_key for any PC via
     /// the same hash function used by make_green_key.
     bridge_info: Option<(u64, u64, u32, usize)>,
+    /// resume.py:1042: result of rebuild_from_resumedata for bridge tracing.
+    /// RPython stores this in MIFrame registers; pyre stores it here
+    /// for the caller to initialize PyreSym slot-to-OpRef mapping.
+    pub resume_data_result: Option<crate::jit_state::ResumeDataResult>,
     /// RPython pyjitpl.py:3101 parity: true when the current bridge
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
@@ -255,6 +259,7 @@ impl<S: JitState> JitDriver<S> {
             trace_meta: None,
             descriptor: None,
             bridge_info: None,
+            resume_data_result: None,
             last_bridge_is_exception_guard: false,
             entry_points: Vec::new(),
             is_recursive: false,
@@ -2347,24 +2352,41 @@ impl<S: JitState> JitDriver<S> {
         let live_values = state.extract_live(&trace_meta);
         let live_types = state.live_value_types(&trace_meta);
 
-        let (ok, is_exception_guard, fail_types) = self.meta.start_retrace_from_guard(
+        let retrace = match self.meta.start_retrace_from_guard(
             green_key,
             trace_id,
             fail_index,
             &live_values,
             &live_types,
-        );
-        if !ok {
-            return false;
-        }
+        ) {
+            Some(r) => r,
+            None => return false,
+        };
 
-        // resume.py:1042 parity: adjust meta to match fail_arg_types shape.
-        if let Some(ref ftypes) = fail_types {
-            S::update_meta_for_bridge(&mut trace_meta, ftypes);
+        // resume.py:1042 rebuild_from_resumedata parity: decode rd_numb
+        // to reconstruct the complete frame for bridge tracing.
+        // Falls back to update_meta_for_bridge (legacy truncation) when
+        // rd_numb is not available.
+        let resume_data_result = S::rebuild_from_resumedata(
+            &mut trace_meta,
+            &retrace.fail_types,
+            retrace.rd_numb.as_deref(),
+            retrace.rd_consts.as_deref(),
+        );
+        if resume_data_result.is_none() {
+            S::update_meta_for_bridge(&mut trace_meta, &retrace.fail_types);
         }
 
         self.sym = Some(S::create_sym(&trace_meta, resume_pc));
         self.trace_meta = Some(trace_meta);
+        // resume.py:1042: inject bridge frame constants into the trace's
+        // constant pool so the optimizer can fold them.
+        if let Some(ref bfm) = resume_data_result {
+            if !bfm.constants.is_empty() {
+                self.meta.inject_bridge_constants(&bfm.constants);
+            }
+        }
+        self.resume_data_result = resume_data_result;
         let code_ptr = state.code_ptr();
         self.bridge_info = Some((green_key, trace_id, fail_index, code_ptr));
         // RPython pyjitpl.py:2908 — bridge traces start with empty
@@ -2377,7 +2399,7 @@ impl<S: JitState> JitDriver<S> {
         // For exception guard bridges, the caller should emit
         // SAVE_EXC_CLASS + SAVE_EXCEPTION at the trace start.
         // Store the flag so it's accessible to the pyre-jit caller.
-        self.last_bridge_is_exception_guard = is_exception_guard;
+        self.last_bridge_is_exception_guard = retrace.is_exception_guard;
 
         true
     }
