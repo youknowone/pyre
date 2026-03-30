@@ -377,7 +377,7 @@ pub enum ResumeVirtualKind {
     UniSlice,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ResumeVirtualLayoutSummary {
     Object {
         type_id: u32,
@@ -387,6 +387,8 @@ pub enum ResumeVirtualLayoutSummary {
         descr_size: usize,
     },
     Struct {
+        /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
+        typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
@@ -420,7 +422,7 @@ pub struct PendingFieldLayoutSummary {
     pub value: ResumeValueLayoutSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResumeLayoutSummary {
     pub num_frames: usize,
     pub frame_pcs: Vec<u64>,
@@ -604,13 +606,14 @@ impl ResumeVirtualLayoutSummary {
                 descr_size: *descr_size,
             },
             ResumeVirtualLayoutSummary::Struct {
+                typedescr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => VirtualInfo::VStruct {
-                typedescr: None, // Reconstructed from summary — no live DescrRef available.
+                typedescr: typedescr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -690,6 +693,7 @@ impl ResumeVirtualLayoutSummary {
                 fields,
                 fielddescrs,
                 descr_size,
+                ..
             } => ExitVirtualLayout::Struct {
                 type_id: *type_id,
                 descr_index: *descr_index,
@@ -1304,13 +1308,14 @@ impl VirtualInfo {
                 descr_size: *descr_size,
             },
             VirtualInfo::VStruct {
+                typedescr,
                 type_id,
                 descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
-                ..
             } => ResumeVirtualLayoutSummary::Struct {
+                typedescr: typedescr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -1370,6 +1375,7 @@ impl VirtualInfo {
             | VirtualInfo::VUniPlain { .. }
             | VirtualInfo::VUniConcat { .. }
             | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
+                typedescr: None,
                 type_id: 0,
                 descr_index: 0,
                 fields: vec![],

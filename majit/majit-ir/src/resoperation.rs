@@ -41,7 +41,7 @@ pub struct FieldDescrInfo {
 }
 
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum RdVirtualInfo {
     /// resume.py:612 VirtualInfo (NEW_WITH_VTABLE).
     Instance {
@@ -51,9 +51,11 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
         descr_size: usize,
     },
-    /// resume.py:628 VStructInfo (NEW).
+    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
     Struct {
-        /// typedescr.tid — GC type identifier.
+        /// resume.py:631 self.typedescr — live SizeDescr reference.
+        typedescr: Option<crate::DescrRef>,
+        /// typedescr.tid — GC type identifier (cached for serialization).
         type_id: u32,
         descr_index: u32,
         fielddescrs: Vec<FieldDescrInfo>,
@@ -95,6 +97,120 @@ pub enum RdVirtualInfo {
     },
     Empty,
 }
+
+// PartialEq/Eq: compare by data fields, skip typedescr (Arc<dyn Descr>).
+impl PartialEq for RdVirtualInfo {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Instance {
+                    descr_index: a1,
+                    known_class: a2,
+                    fielddescrs: a3,
+                    fieldnums: a4,
+                    descr_size: a5,
+                },
+                Self::Instance {
+                    descr_index: b1,
+                    known_class: b2,
+                    fielddescrs: b3,
+                    fieldnums: b4,
+                    descr_size: b5,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            (
+                Self::Struct {
+                    type_id: a1,
+                    descr_index: a2,
+                    fielddescrs: a3,
+                    fieldnums: a4,
+                    descr_size: a5,
+                    ..
+                },
+                Self::Struct {
+                    type_id: b1,
+                    descr_index: b2,
+                    fielddescrs: b3,
+                    fieldnums: b4,
+                    descr_size: b5,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            (
+                Self::Array {
+                    descr_index: a1,
+                    clear: a2,
+                    kind: a3,
+                    fieldnums: a4,
+                },
+                Self::Array {
+                    descr_index: b1,
+                    clear: b2,
+                    kind: b3,
+                    fieldnums: b4,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            (
+                Self::ArrayStruct {
+                    descr_index: a1,
+                    size: a2,
+                    fielddescr_indices: a3,
+                    field_types: a4,
+                    item_size: a5,
+                    field_offsets: a6,
+                    field_sizes: a7,
+                    fieldnums: a8,
+                },
+                Self::ArrayStruct {
+                    descr_index: b1,
+                    size: b2,
+                    fielddescr_indices: b3,
+                    field_types: b4,
+                    item_size: b5,
+                    field_offsets: b6,
+                    field_sizes: b7,
+                    fieldnums: b8,
+                },
+            ) => {
+                a1 == b1
+                    && a2 == b2
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+                    && a6 == b6
+                    && a7 == b7
+                    && a8 == b8
+            }
+            (
+                Self::RawBuffer {
+                    size: a1,
+                    offsets: a2,
+                    entry_sizes: a3,
+                    fieldnums: a4,
+                },
+                Self::RawBuffer {
+                    size: b1,
+                    offsets: b2,
+                    entry_sizes: b3,
+                    fieldnums: b4,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            (
+                Self::RawSlice {
+                    offset: a1,
+                    fieldnums: a2,
+                },
+                Self::RawSlice {
+                    offset: b1,
+                    fieldnums: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            (Self::Empty, Self::Empty) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for RdVirtualInfo {}
 
 /// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
 /// where the stored value is virtual. Encoded into the guard's resume data

@@ -1557,6 +1557,7 @@ impl OptContext {
                                     let ds = sd.map(|s| s.size()).unwrap_or(0);
                                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                                     majit_ir::RdVirtualInfo::Struct {
+                                        typedescr: Some(vi.descr.clone()),
                                         type_id: tid,
                                         descr_index: vi.descr.index(),
                                         fielddescrs: fdinfo,
@@ -1574,6 +1575,7 @@ impl OptContext {
                                     let ds = sd.map(|s| s.size()).unwrap_or(0);
                                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                                     majit_ir::RdVirtualInfo::Struct {
+                                        typedescr: Some(si.descr.clone()),
                                         type_id: tid,
                                         descr_index: si.descr.index(),
                                         fielddescrs: fdinfo,
@@ -1942,6 +1944,7 @@ impl OptContext {
                     let descr_size = sd.map(|s| s.size()).unwrap_or(0);
                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
                     majit_ir::RdVirtualInfo::Struct {
+                        typedescr: Some(vi.descr.clone()),
                         type_id: tid,
                         descr_index: vi.descr.index(),
                         fielddescrs: fielddescr_indices

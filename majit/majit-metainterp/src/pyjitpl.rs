@@ -6787,7 +6787,7 @@ pub enum DriverRunOutcome {
     Abort { restored: bool, via_blackhole: bool },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum DetailedDriverRunOutcome {
     Finished {
         typed_values: Vec<Value>,

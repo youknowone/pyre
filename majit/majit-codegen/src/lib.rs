@@ -953,13 +953,12 @@ pub trait Backend: Send {
     fn bh_arraylen_gc(&self, _array_ptr: i64, _len_offset: usize) -> i64 {
         0
     }
-    /// model.py: bh_new(descr)
-    fn bh_new(&self, _size: usize, _type_id: u32) -> i64 {
+    /// llmodel.py:775 bh_new(sizedescr).
+    fn bh_new(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
         0
     }
     /// llmodel.py:778 bh_new_with_vtable(sizedescr).
-    /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, _size: usize, _type_id: u32, _vtable: usize) -> i64 {
+    fn bh_new_with_vtable(&self, _sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
         0
     }
     /// model.py: bh_new_array(length, descr)
