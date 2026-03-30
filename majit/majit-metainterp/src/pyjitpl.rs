@@ -1764,10 +1764,13 @@ impl<M: Clone> MetaInterp<M> {
         // RPython Box type parity: build type index from the FULL uncut
         // trace. snapshot_boxes reference positions from the original trace;
         // cut_trace_from removes early ops. Must capture types before cut.
+        // RPython Box type parity: every recorded op (including guards)
+        // has a position and a type. Include Void ops (guards) so that
+        // snapshot references to guard positions are covered.
         let pre_cut_trace_op_types: std::collections::HashMap<u32, majit_ir::Type> = trace
             .ops
             .iter()
-            .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
+            .filter(|op| !op.pos.is_none())
             .map(|op| (op.pos.0, op.result_type()))
             .collect();
 

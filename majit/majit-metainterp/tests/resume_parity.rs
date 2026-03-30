@@ -69,6 +69,8 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
                 (0, VirtualFieldSource::FailArg(1)),
                 (1, VirtualFieldSource::Constant(99)),
             ],
+            fielddescrs: vec![],
+            descr_size: 0,
         }],
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
             descr_index: 5,

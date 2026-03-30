@@ -1615,9 +1615,12 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(555);
     let virtual_index = resume.add_virtual_struct(
+        None,
         0,
         7,
         vec![(3, majit_metainterp::resume::ResumeValueSource::Constant(55))],
+        vec![],
+        0,
     );
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
@@ -1658,9 +1661,12 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(556);
     let inner = resume.add_virtual_struct(
+        None,
         0,
         10,
         vec![(0, majit_metainterp::resume::ResumeValueSource::Constant(77))],
+        vec![],
+        0,
     );
     let outer = resume.add_virtual_obj(
         0,
@@ -1709,8 +1715,8 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     let meta = TestMeta { header_pc: 557 };
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(557);
-    let parent = resume.add_virtual_struct(0, 30, vec![]);
-    let child = resume.add_virtual_struct(0, 31, vec![]);
+    let parent = resume.add_virtual_struct(None, 0, 30, vec![], vec![], 0);
+    let child = resume.add_virtual_struct(None, 0, 31, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);
     resume.set_slot_virtual(1, child);
     resume.add_pending_field_write(
@@ -1920,7 +1926,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(300);
-    let virtual_index = resume.add_virtual_struct(0, 55, vec![]);
+    let virtual_index = resume.add_virtual_struct(None, 0, 55, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, 1);
     resume.push_frame(400);
@@ -1982,7 +1988,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(500);
-    let virtual_index = resume.add_virtual_struct(0, 56, vec![]);
+    let virtual_index = resume.add_virtual_struct(None, 0, 56, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, 1);
     resume.push_frame(600);

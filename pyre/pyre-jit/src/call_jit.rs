@@ -742,21 +742,40 @@ pub enum BlackholeResult {
     Failed,
 }
 
+/// resume.py:1042 rebuild_from_numbering / read_jitcode_pos_pc output.
+/// Each decoded frame section from rd_numb.
+pub struct ResumedFrame {
+    /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
+    /// pyre: CodeObject pointer (resolved from jitcode_index).
+    pub code: *const pyre_bytecode::CodeObject,
+    /// resume.py:1050 pc (Python bytecode PC).
+    pub py_pc: usize,
+    /// Frame pointer for this stack frame.
+    pub frame_ptr: *mut PyFrame,
+    /// resume.py:928-931 consume_one_section: resolved values.
+    /// Structure: [Ref(frame_ptr), Int(ni), Int(vsd), live_registers...]
+    pub values: Vec<majit_ir::Value>,
+}
+
 /// RPython resume.py:1312 blackhole_from_resumedata +
 /// blackhole.py:1752 _run_forever parity.
 ///
-/// Multi-frame fail_args: [callee_section..., caller_section...]
-/// Each section: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+/// Takes rd_numb-decoded per-frame data (ResumedFrame) instead of a
+/// flat Value array. Frame boundaries come from rd_numb, not from
+/// heuristic header detection.
 ///
 /// Builds a blackhole chain (innermost first), then runs _run_forever:
 /// callee blackhole → RETURN_VALUE → caller blackhole → merge point.
-/// blackhole.py:1782 resume_in_blackhole parity.
 pub fn resume_in_blackhole(
     _caller_frame: &mut PyFrame,
-    typed_values: &[majit_ir::Value],
+    frames: &[ResumedFrame],
     merge_py_pc: usize,
 ) -> BlackholeResult {
     use majit_ir::Value;
+
+    if frames.is_empty() {
+        return BlackholeResult::Failed;
+    }
 
     let writer = crate::jit::codewriter::CodeWriter::new(
         bh_call_fn,
@@ -770,63 +789,30 @@ pub fn resume_in_blackhole(
         crate::call_jit::bh_build_list_fn,
     );
 
-    // RPython resume.py:1333-1343 blackhole_from_resumedata:
-    // Parse sections and build blackhole chain.
-    let sections = parse_fail_arg_sections(typed_values);
-    if sections.is_empty() {
-        return BlackholeResult::Failed;
-    }
-
     thread_local! {
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
     let builder = BH_BUILDER3.with(|cell| unsafe { &mut *cell.get() });
 
-    // Build chain bottom-up: first section = callee (innermost),
-    // last section = caller (outermost). Chain: callee.next = caller.
+    // resume.py:1333-1343 blackhole_from_resumedata:
+    // Build chain bottom-up. Process in reverse so the LAST acquired
+    // interp is the innermost (callee), with nextblackholeinterp
+    // pointing to the caller.
     let mut prev_bh: Option<majit_metainterp::blackhole::BlackholeInterpreter> = None;
 
-    // Process sections in REVERSE (caller first, then callee on top).
-    // RPython builds the chain so that the LAST acquired interp is the
-    // innermost (callee), with nextblackholeinterp pointing to the caller.
-    for (sec_idx, section) in sections.iter().enumerate().rev() {
-        let frame_ptr = match section.get(0) {
-            Some(Value::Ref(r)) => r.as_usize() as *mut PyFrame,
-            Some(Value::Int(v)) => *v as *mut PyFrame,
-            _ => {
-                builder.release_chain(prev_bh);
-                return BlackholeResult::Failed;
-            }
-        };
-        if frame_ptr.is_null() {
+    for (sec_idx, section) in frames.iter().enumerate().rev() {
+        if section.frame_ptr.is_null() || section.code.is_null() {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
         }
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][blackhole-section] idx={} frame_ptr={:#x} py_pc={:?} vsd={:?}",
-                sec_idx,
-                frame_ptr as usize,
-                section.get(1),
-                section.get(2),
-            );
-        }
-        let frame = unsafe { &*frame_ptr };
-        let code = unsafe { &*frame.code };
+        let code = unsafe { &*section.code };
         let nlocals = code.varnames.len();
+        let frame_ptr = section.frame_ptr;
 
-        let mut py_pc = match section.get(1) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => {
-                builder.release_chain(prev_bh);
-                return BlackholeResult::Failed;
-            }
-        };
-        // pyre-specific: the virtualizable's next_instr may land on a
-        // Cache code unit (CPython 3.13 inserts Cache after opcodes).
-        // RPython has no Cache concept. Scan backward to the actual opcode
-        // so the blackhole starts at the correct JitCode position.
+        // resume.py:1340 curbh.setposition(jitcode, pc)
+        let mut py_pc = section.py_pc;
+        // Skip Cache/ExtendedArg/NotTaken (CPython 3.13 pseudo-instructions).
         while py_pc > 0 {
             match pyre_interpreter::decode_instruction_at(code, py_pc) {
                 Some((pyre_bytecode::bytecode::Instruction::Cache, _))
@@ -837,14 +823,12 @@ pub fn resume_in_blackhole(
                 _ => break,
             }
         }
-        // RPython: resume data always encodes valid PCs within the
-        // frame's own code object. If py_pc is out of range, the
-        // resume data is invalid — fail cleanly.
         if py_pc >= code.instructions.len() {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
         }
-        let vsd = match section.get(2) {
+
+        let vsd = match section.values.get(2) {
             Some(Value::Int(v)) => *v as usize,
             _ => {
                 builder.release_chain(prev_bh);
@@ -854,9 +838,6 @@ pub fn resume_in_blackhole(
         let stack_only = vsd.saturating_sub(nlocals);
 
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
-        // Skip blackhole if jitcode has actual BC_ABORT opcodes (not just
-        // data bytes that happen to equal 13). Walk bytecodes properly
-        // to distinguish opcodes from operands.
         if pyjitcode.has_abort_opcode() {
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
@@ -868,42 +849,48 @@ pub fn resume_in_blackhole(
             return BlackholeResult::Failed;
         };
 
-        // RPython: curbh.setposition(jitcode, pc)
         let mut bh = builder.acquire_interp();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-        // Set merge_point on the OUTERMOST (last section = caller) blackhole.
-        if sec_idx == sections.len() - 1 {
-            if let Some(&merge_jitcode_pc) = pyjitcode.pc_map.get(merge_py_pc) {
+        // Set merge_point on the OUTERMOST (last = caller) blackhole.
+        if sec_idx == frames.len() - 1 {
+            if let Some(merge_jitcode_pc) =
+                crate::jit::codewriter::jitcode_pc_for_loop_header(&pyjitcode.pc_map, merge_py_pc)
+            {
                 bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
             }
         }
 
-        // RPython resume.py consume_one_section parity: load values
-        // into TYPED register files based on the Value variant.
-        // RPython: decode_int→setarg_i, decode_ref→setarg_r, decode_float→setarg_f.
-        // pyre codewriter puts all Python locals in ref registers, so
-        // RPython resume.py consume_one_section parity: Python locals
-        // are ref-typed at the jitcode level. Unboxed Int/Float values
-        // from the optimizer are materialized back to PyObjectRef via
-        // materialize_virtual (RPython getvirtual_ptr equivalent).
-        // resume.py:1017 _prepare_next_section parity: only LIVE boxes
-        // from rd_numb are written. Dead registers stay at setposition()
-        // defaults (0/null). No frame fallback — RPython relies on
-        // complete rd_numb + liveness, not current frame values.
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][blackhole-section] idx={} frame={:#x} py_pc={} vsd={} nvals={}",
+                sec_idx,
+                frame_ptr as usize,
+                py_pc,
+                vsd,
+                section.values.len(),
+            );
+        }
+
+        // resume.py:1017 _prepare_next_section + 1381 consume_one_section:
+        // enumerate_vars(info, liveness_info, callback_i, callback_r, callback_f)
+        // iterates ONLY live registers via LivenessIterator (liveness.py:170).
+        // Dead registers stay at setposition() defaults (0/null).
+        // No frame fallback — RPython relies on complete rd_numb + liveness.
         for i in 0..nlocals {
             let slot = 3 + i;
-            if let Some(val) = section.get(slot) {
+            if let Some(val) = section.values.get(slot) {
                 bh.setarg_r(i, materialize_virtual(val));
             }
             // Dead slot: stays at setposition() default (0).
         }
         for i in 0..stack_only {
             let slot = 3 + nlocals + i;
-            if let Some(val) = section.get(slot) {
+            if let Some(val) = section.values.get(slot) {
                 bh.runtime_stack_push(0, materialize_virtual(val));
             }
         }
+        // pyre convention: frame pointer in int register 3 for writeback.
         if 3 < bh.registers_i.len() {
             bh.setarg_i(3, frame_ptr as i64);
         }
@@ -920,7 +907,7 @@ pub fn resume_in_blackhole(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][blackhole-resume] chain_len={} merge_pc={}",
-            sections.len(),
+            frames.len(),
             merge_py_pc,
         );
     }
@@ -1056,19 +1043,13 @@ pub fn resume_in_blackhole(
     }
 }
 
-/// Parse multi-frame fail_args into per-frame sections.
-/// Single frame: [[Ref, Int, Int, locals..., stack...]]
-/// Multi frame: [[callee: Ref, Int, Int, ...], [caller: Ref, Int, Int, ...]]
-/// Re-box optimized raw values for the blackhole's ref register file.
+/// resume.py:945-956 decode_ref / getvirtual_ptr parity.
 ///
-/// RPython resume.py decode_ref(TAGVIRTUAL) → getvirtual_ptr() parity.
-///
-/// Python locals are always ref-typed at the jitcode level (both in
-/// RPython/PyPy and pyre). The optimizer unboxes values in the IR
-/// (guard_class + getfield_gc_pure_i). On guard failure, the resume
-/// reader materializes (re-boxes) unboxed values back to refs.
-/// RPython: getvirtual_ptr() allocates W_IntObject from virtual fields.
-/// pyre: w_int_new / w_float_new from the raw Value payload.
+/// Re-box optimizer-unboxed values back to PyObjectRef for the
+/// blackhole's ref register file. RPython's decode_ref dispatches
+/// on TAGVIRTUAL/TAGCONST/TAGBOX/TAGSMALLINT; pyre's deadframe
+/// already contains typed Values, so we just box Int/Float to
+/// W_IntObject/W_FloatObject.
 fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
@@ -1077,32 +1058,6 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
         Value::Float(v) => pyre_object::floatobject::w_float_new(*v) as i64,
         Value::Void => 0i64,
     }
-}
-
-fn parse_fail_arg_sections(typed_values: &[majit_ir::Value]) -> Vec<&[majit_ir::Value]> {
-    use majit_ir::Value;
-    let mut sections = Vec::new();
-    let mut cursor = 0usize;
-    while cursor + 3 <= typed_values.len() {
-        let section = &typed_values[cursor..];
-        let has_header = matches!(section[0], Value::Ref(_) | Value::Int(_))
-            && matches!(section[1], Value::Int(_))
-            && matches!(section[2], Value::Int(_));
-        if !has_header {
-            break;
-        }
-        let vsd = match section[2] {
-            Value::Int(v) if v >= 0 => v as usize,
-            _ => break,
-        };
-        let section_len = 3 + vsd;
-        if cursor + section_len > typed_values.len() {
-            break;
-        }
-        sections.push(&typed_values[cursor..cursor + section_len]);
-        cursor += section_len;
-    }
-    sections
 }
 
 /// bhimpl_jit_merge_point parity: run the blackhole from `guard_py_pc`
@@ -1133,20 +1088,13 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     } else {
         return false;
     };
-    // Use jitcode_pc_for_loop_header: the interpreter's merge_py_pc may
-    // include Cache-skip offset that doesn't match the codewriter's label.
-    let merge_jitcode_pc =
+    // jitcode_pc_for_loop_header handles Cache-skip offset mismatch
+    // between the interpreter's merge_py_pc and the codewriter's label.
+    let Some(merge_jitcode_pc) =
         crate::jit::codewriter::jitcode_pc_for_loop_header(&pyjitcode.pc_map, merge_py_pc)
-            .unwrap_or_else(|| {
-                if merge_py_pc < pyjitcode.pc_map.len() {
-                    pyjitcode.pc_map[merge_py_pc]
-                } else {
-                    0
-                }
-            });
-    if merge_jitcode_pc == 0 && merge_py_pc > 0 {
+    else {
         return false;
-    }
+    };
 
     thread_local! {
         static BH_BUILDER2: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =

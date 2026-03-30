@@ -1085,14 +1085,12 @@ impl<S: JitState> JitDriver<S> {
                 return Some(target_pc);
             }
 
-            // compile.py:711 guard failure → resume_in_blackhole parity.
-            // Restore interpreter state from guard's fail_args and resume
-            // at the guard's resume_pc (mid-loop), not the loop header.
+            // compile.py:701-716 handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
-            let exit_meta = result.meta.clone();
+            let _exit_meta = result.meta.clone();
             drop(result);
 
             // must_compile tick for bridge threshold counting.
@@ -1108,10 +1106,7 @@ impl<S: JitState> JitDriver<S> {
                 &raw_values,
             );
 
-            // compile.py:711 resume_in_blackhole parity.
-            // Guard fail_args = collect_jump_args + pc (appended by
-            // jitcode or force_finish_trace segmenting). The last Int
-            // value is the bytecode pc at the guard point.
+            // Extract guard_resume_pc from fail_args (last Int value).
             let num_inputs = self.meta.compiled_num_inputs(green_key);
             let guard_resume_pc = if raw_values.len() > num_inputs {
                 raw_values[raw_values.len() - 1] as usize
@@ -1119,28 +1114,8 @@ impl<S: JitState> JitDriver<S> {
                 target_pc
             };
 
-            // compile.py:711 resume_in_blackhole parity.
-            //
-            // STRUCTURAL LIMITATION: aheui compiled code mutates storage
-            // memory in-place via SetfieldGc. Mid-loop resume from
-            // guard_resume_pc would cause double mutation — compiled code
-            // already pushed/popped on the real storage, and the
-            // interpreter would repeat those operations.
-            //
-            // RPython avoids this because BlackholeInterpreter has its
-            // own register set (registers_i, registers_r) independent of
-            // heap memory. It runs bytecodes using those registers, so
-            // the already-mutated heap doesn't cause double effects.
-            //
-            // To achieve RPython parity here, the #[jit_interp] proc
-            // macro would need to generate a register-based blackhole
-            // interpreter (like RPython's BlackholeInterpreter) that
-            // doesn't share mutable storage with the main interpreter.
-            //
-            // guard_resume_pc is passed to start_bridge_tracing for
-            // correct bridge trace start position.
-
             if should_bridge {
+                // compile.py:704-709: _trace_and_compile_from_bridge
                 let bridge_ok = self.start_bridge_tracing(
                     green_key,
                     trace_id,
@@ -1158,6 +1133,21 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
 
+            // compile.py:711-715: resume_in_blackhole
+            //
+            // Try the blackhole interpreter with independent registers.
+            // This avoids the double-mutation problem with shared state.
+            let bh_result =
+                self.blackhole_resume_jitcode(env, guard_resume_pc, 0, &raw_values, num_inputs);
+            if let Some(ref bh) = bh_result {
+                if bh.reached_merge_point {
+                    if let Some(merge_pc) = bh.merge_point_jitcode_pc {
+                        return Some(merge_pc);
+                    }
+                }
+            }
+
+            // Fallback: return to loop header.
             return Some(target_pc);
         }
 
@@ -2494,23 +2484,37 @@ impl<S: JitState> JitDriver<S> {
                 return Some(target_pc);
             }
 
-            // RPython parity: guard failure → blackhole_from_resumedata.
-            // on_guard_failure restores interpreter state from fail_args.
-            // Called on every guard failure (Fn, not FnOnce).
-            let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
-
-            let Some(resume_pc) = resume_pc else {
-                // Could not restore — fall back to interpreter at target_pc
-                return Some(target_pc);
-            };
-
-            materialize_pending_fields(&exit_layout, &raw_values);
-            self.sync_after(state, &result_meta, descriptor.as_ref());
+            // compile.py:701-716 handle_fail
+            //
+            // RPython's guard failure handling:
+            //   if must_compile and not stack_almost_full:
+            //       _trace_and_compile_from_bridge(...)
+            //   else:
+            //       resume_in_blackhole(...)
+            //   assert 0, "unreachable"
 
             let (should_bridge, _owning_key) =
                 self.meta
                     .must_compile_with_values(key_hash, trace_id, fail_index, &raw_values);
+
+            // Extract guard_resume_pc from fail_args.
+            // The last Int value is the bytecode pc at the guard point,
+            // appended by jitcode or force_finish_trace segmenting.
+            let num_inputs = self.meta.compiled_num_inputs(key_hash);
+            let guard_resume_pc = if raw_values.len() > num_inputs {
+                raw_values[raw_values.len() - 1] as usize
+            } else {
+                target_pc
+            };
+
             if should_bridge {
+                // compile.py:704-709: _trace_and_compile_from_bridge
+                // Restore state for bridge tracing start point.
+                let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
+                let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
+                materialize_pending_fields(&exit_layout, &raw_values);
+                self.sync_after(state, &result_meta, descriptor.as_ref());
+
                 let bridge_ok = self.start_bridge_tracing(
                     key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
@@ -2523,6 +2527,46 @@ impl<S: JitState> JitDriver<S> {
                 return Some(resume_pc);
             }
 
+            // compile.py:711-715: resume_in_blackhole
+            //
+            // Try the blackhole interpreter first. If jitcode_factory
+            // produces a JitCode for the guard_resume_pc, run the
+            // blackhole from that point with independent registers.
+            // This avoids the double-mutation problem with shared state.
+            let bh_result = self.blackhole_resume_jitcode(
+                env,
+                guard_resume_pc,
+                0, // resume_op
+                &raw_values,
+                num_inputs,
+            );
+
+            if let Some(bh) = bh_result {
+                // Blackhole ran to completion. Restore state from
+                // blackhole's final register values, then return.
+                if bh.reached_merge_point {
+                    // Blackhole reached merge_point — interpreter can
+                    // resume at the merge point PC.
+                    if let Some(merge_pc) = bh.merge_point_jitcode_pc {
+                        // Restore state from on_guard_failure as fallback
+                        // to set interpreter state consistent with blackhole output.
+                        let _ = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
+                        materialize_pending_fields(&exit_layout, &raw_values);
+                        self.sync_after(state, &result_meta, descriptor.as_ref());
+                        return Some(merge_pc);
+                    }
+                }
+                // Blackhole finished without reaching merge_point.
+                // Fall through to legacy restore path.
+            }
+
+            // Fallback: legacy shared-state restoration.
+            // This path will be removed once all interpreters generate
+            // jitcode for the blackhole.
+            let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
+            let resume_pc = resume_pc.unwrap_or(target_pc);
+            materialize_pending_fields(&exit_layout, &raw_values);
+            self.sync_after(state, &result_meta, descriptor.as_ref());
             return Some(resume_pc);
         } // end loop { run_compiled ... }
     }

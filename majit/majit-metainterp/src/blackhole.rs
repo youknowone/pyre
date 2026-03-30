@@ -2310,9 +2310,12 @@ mod tests {
         let resume_data = ResumeData {
             frames: vec![],
             virtuals: vec![ResumeVirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 0,
                 descr_index: 7,
                 fields: vec![(3, VirtualFieldSource::Constant(55))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: Vec::new(),
         };
@@ -2726,9 +2729,12 @@ mod tests {
         let resume_layout = ResumeData {
             frames: vec![],
             virtuals: vec![ResumeVirtualInfo::VStruct {
+                typedescr: None,
                 type_id: 0,
                 descr_index: 7,
                 fields: vec![(3, VirtualFieldSource::Constant(55))],
+                fielddescrs: vec![],
+                descr_size: 0,
             }],
             pending_fields: vec![ResumePendingFieldInfo {
                 descr_index: 9,
