@@ -2797,7 +2797,11 @@ impl MIFrame {
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: self.orgpc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes, ctx),
+                boxes: Self::fail_args_to_snapshot_boxes_typed(
+                    &callee_active_boxes,
+                    &callee_types,
+                    ctx,
+                ),
             }];
             // fail_args = header + materialized active_boxes (for Cranelift deadframe).
             let materialized = self.materialize_active_boxes(ctx, &callee_active_boxes);
@@ -2815,7 +2819,7 @@ impl MIFrame {
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes(parent_active, ctx),
+                    boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, pfa_types, ctx),
                 });
                 fail_args.extend_from_slice(pfa);
                 let pt = if pfa_types.is_empty() {
@@ -2861,7 +2865,8 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+        let snapshot_boxes =
+            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &fail_arg_types, ctx);
         // opencoder.py:776-778: top snapshot uses frame.jitcode.index
         // and frame.pc (= resumepc set by capture_resumedata).
         // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
@@ -2901,7 +2906,10 @@ impl MIFrame {
             let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
             majit_trace::recorder::SnapshotTagged::Const(val, tp)
         } else {
-            majit_trace::recorder::SnapshotTagged::Box(opref.0)
+            // RPython: Box carries type ('r'/'i'/'f') as intrinsic property.
+            // Default to Ref — most boxes in Python traces are object references.
+            // Callers with explicit types should use fail_args_to_snapshot_boxes_typed.
+            majit_trace::recorder::SnapshotTagged::Box(opref.0, majit_ir::Type::Ref)
         }
     }
 
@@ -2974,16 +2982,29 @@ impl MIFrame {
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
-    /// snapshot boxes from fail_args = [frame, ni, vsd, locals, stack].
-    /// ni/vsd are also in Snapshot.vable_array; _number_boxes
-    /// deduplicates via liveboxes HashMap (same OpRef → same tag).
-    fn fail_args_to_snapshot_boxes(
-        fail_args: &[OpRef],
+    /// snapshot boxes from active_boxes = [locals, stack].
+    /// RPython: each Box carries type ('r'/'i'/'f') — pyre passes types
+    /// explicitly so _number_boxes can detect virtual vs int correctly.
+    fn fail_args_to_snapshot_boxes_typed(
+        active_boxes: &[OpRef],
+        types: &[majit_ir::Type],
         ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
-        fail_args
+        active_boxes
             .iter()
-            .map(|&opref| Self::opref_to_snapshot_tagged(opref, ctx))
+            .enumerate()
+            .map(|(i, &opref)| {
+                if opref.is_none() {
+                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+                } else if opref.0 >= 10_000 {
+                    let val = ctx.constant_value(opref).unwrap_or(0);
+                    let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
+                    majit_trace::recorder::SnapshotTagged::Const(val, tp)
+                } else {
+                    let tp = types.get(i).copied().unwrap_or(majit_ir::Type::Ref);
+                    majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
+                }
+            })
             .collect()
     }
 
@@ -3101,7 +3122,13 @@ impl MIFrame {
             Vec::with_capacity(local_values.len() + stack_values.len());
         active_boxes.extend_from_slice(&local_values);
         active_boxes.extend_from_slice(&stack_values);
-        let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+        // RPython: each Box carries type. Provide types for correct
+        // virtual detection in _number_boxes (resume.py:210 box.type).
+        let mut active_types: Vec<majit_ir::Type> = Vec::with_capacity(active_boxes.len());
+        active_types.extend(local_types.iter().copied());
+        active_types.extend(stack_types.iter().copied());
+        let snapshot_boxes =
+            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &active_types, ctx);
 
         // pyjitpl.py:2588: vable_array = virtualizable_boxes.
         // [ni, vsd, locals..., stack..., frame_ptr]
