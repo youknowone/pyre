@@ -6775,41 +6775,63 @@ impl ArithmeticOpcodeHandler for MIFrame {
                 if is_int(lhs_obj) && is_int(rhs_obj) {
                     let lhs = w_int_get_value(lhs_obj);
                     let rhs = w_int_get_value(rhs_obj);
-                    let result = match op {
-                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.wrapping_add(rhs),
+                    // intobject.py:556 int_add/sub/mul: overflow → long path.
+                    // intobject.py:205 _lshift: ovfcheck(a << b).
+                    // Use checked arithmetic; on overflow, skip this fast path
+                    // and fall through to the objspace slow path.
+                    let result: Option<i64> = match op {
+                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.checked_add(rhs),
                         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                            lhs.wrapping_sub(rhs)
+                            lhs.checked_sub(rhs)
                         }
                         BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                            lhs.wrapping_mul(rhs)
+                            lhs.checked_mul(rhs)
                         }
                         BinaryOperator::Remainder | BinaryOperator::InplaceRemainder
                             if rhs != 0 =>
                         {
-                            ((lhs % rhs) + rhs) % rhs
+                            Some(((lhs % rhs) + rhs) % rhs)
                         }
                         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
                             if rhs != 0 =>
                         {
-                            let d = lhs.wrapping_div(rhs);
-                            if (lhs ^ rhs) < 0 && d * rhs != lhs {
-                                d - 1
+                            lhs.checked_div(rhs).map(|d| {
+                                if (lhs ^ rhs) < 0 && d * rhs != lhs {
+                                    d - 1
+                                } else {
+                                    d
+                                }
+                            })
+                        }
+                        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(lhs & rhs),
+                        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(lhs | rhs),
+                        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
+                        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+                            let shift = rhs as u32;
+                            if shift >= 64 {
+                                None
                             } else {
-                                d
+                                let r = lhs.wrapping_shl(shift);
+                                if r.wrapping_shr(shift) != lhs {
+                                    None
+                                } else {
+                                    Some(r)
+                                }
                             }
                         }
-                        BinaryOperator::And | BinaryOperator::InplaceAnd => lhs & rhs,
-                        BinaryOperator::Or | BinaryOperator::InplaceOr => lhs | rhs,
-                        BinaryOperator::Xor | BinaryOperator::InplaceXor => lhs ^ rhs,
-                        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                            lhs.wrapping_shl(rhs as u32)
-                        }
                         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                            lhs.wrapping_shr(rhs as u32)
+                            let shift = rhs as u32;
+                            if shift >= 64 {
+                                Some(if lhs < 0 { -1 } else { 0 })
+                            } else {
+                                Some(lhs >> shift)
+                            }
                         }
-                        _ => 0,
+                        _ => None,
                     };
-                    result_concrete = ConcreteValue::Int(result);
+                    if let Some(r) = result {
+                        result_concrete = ConcreteValue::Int(r);
+                    }
                 }
             }
         }
