@@ -2853,7 +2853,7 @@ impl MIFrame {
         // pyjitpl.py:2586-2596 capture_resumedata(resumepc) parity:
         // Temporarily substitute frame.pc = resumepc, capture snapshot,
         // then restore. For normal guards, resumepc = orgpc.
-        self.record_guard_with_resume_pc(ctx, opcode, args, self.orgpc, after_residual_call);
+        self.record_guard_core(ctx, opcode, args, self.orgpc, after_residual_call);
     }
 
     /// Core guard recording with explicit resume PC.
@@ -2862,7 +2862,7 @@ impl MIFrame {
     /// substitute frame.pc = resume_pc before snapshot capture.
     /// Used by both record_guard (resume_pc=orgpc) and
     /// record_branch_guard (resume_pc=other_target).
-    fn record_guard_with_resume_pc(
+    fn record_guard_core(
         &mut self,
         ctx: &mut TraceCtx,
         opcode: OpCode,
@@ -2944,10 +2944,51 @@ impl MIFrame {
         }
     }
 
+    /// RPython pyjitpl.py:2586 virtualizable_boxes parity.
+    ///
+    /// RPython creates SEPARATE Box objects for virtualizable_boxes via
+    /// read_boxes()/wrap() — these are distinct from frame register boxes.
+    /// _number_boxes dedup uses object identity, so vable and frame get
+    /// independent TAGBOX indices → deadframe stores both (redundant but safe).
+    ///
+    /// pyre uses the SAME OpRefs for both → _number_boxes dedup merges them
+    /// → frame section shrinks → recovery expects more slots than exist.
+    ///
+    /// Fix: return EMPTY vable_boxes. All virtualizable state (ni, vsd,
+    /// locals, stack) is already in the frame section via fail_args header
+    /// [frame, ni, vsd] + get_list_of_active_boxes. The numbering produces
+    /// a single frame section with all slots. No dedup conflict.
+    ///
+    /// TODO(read_boxes parity): create separate OpRefs for vable_boxes
+    /// (like RPython's read_boxes/wrap), so vable section is non-empty
+    /// and matches RPython's rd_numb format exactly.
     fn build_virtualizable_boxes(
         sym: &PyreSym,
         ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+        // RPython pyjitpl.py:2586 virtualizable_boxes:
+        // [static_fields..., array_items..., virtualizable_ptr].
+        //
+        // RPython creates SEPARATE Box objects for vable_boxes (read_boxes/wrap),
+        // so _number_boxes dedup does NOT merge them with frame boxes.
+        // pyre's symbolic_locals/symbolic_stack are the SAME OpRefs in both
+        // vable and frame → dedup merges → fail_args shrinks → recovery fails.
+        //
+        // Fix: include ONLY the header fields (ni, vsd) and frame_ptr in
+        // vable_boxes. These use DIFFERENT OpRefs from frame boxes:
+        // - vable_next_instr is ctx.const_int(orgpc) from flush_to_frame_for_guard
+        // - vable_valuestackdepth is ctx.const_int(vsd)
+        // - frame is OpRef(0) (inputarg, not in active_boxes)
+        // The locals/stack array items are OMITTED to avoid dedup conflict.
+        let mut boxes = Vec::with_capacity(3);
+        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
+        boxes.push(Self::opref_to_snapshot_tagged(
+            sym.vable_valuestackdepth,
+            ctx,
+        ));
+        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
+        boxes
+        /* RPython full vable (disabled — locals/stack dedup):
         let stack_only = sym.stack_only_depth();
         let mut boxes = Vec::new();
         // Static fields: next_instr, valuestackdepth
@@ -2956,47 +2997,7 @@ impl MIFrame {
             sym.vable_valuestackdepth,
             ctx,
         ));
-        // virtualizable.py:86/139 parity: full array length.
-        let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
-            Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
-        } else {
-            None
-        };
-        let full_array_len = concrete_frame
-            .map(|f| f.locals_cells_stack_w.len())
-            .unwrap_or(sym.symbolic_locals.len() + stack_only);
-        for i in 0..full_array_len {
-            let opref = if i < sym.symbolic_locals.len() {
-                sym.symbolic_locals[i]
-            } else {
-                let stack_idx = i - sym.nlocals;
-                if stack_idx < stack_only && stack_idx < sym.symbolic_stack.len() {
-                    sym.symbolic_stack[stack_idx]
-                } else {
-                    OpRef::NONE
-                }
-            };
-            if !opref.is_none() {
-                boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
-            } else if let Some(frame) = concrete_frame {
-                // virtualizable.py:86: read concrete value for non-active slots.
-                let val = frame
-                    .locals_cells_stack_w
-                    .as_slice()
-                    .get(i)
-                    .copied()
-                    .unwrap_or(pyre_object::PY_NULL);
-                boxes.push(majit_trace::recorder::SnapshotTagged::Const(
-                    val as i64,
-                    Type::Ref,
-                ));
-            } else {
-                boxes.push(Self::opref_to_snapshot_tagged(OpRef::NONE, ctx));
-            }
-        }
-        // virtualizable.py:139: last element = virtualizable itself
-        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
-        boxes
+        */
     }
 
     /// pyjitpl.py:2597 virtualref_boxes parity.
@@ -3153,6 +3154,11 @@ impl MIFrame {
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args)
         let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
+        // pyjitpl.py:2594-2596 capture_resumedata(resumepc) parity:
+        // flush_to_frame_for_guard already set sym.vable_next_instr/vsd
+        // to resume_pc values. Save to restore after snapshot capture.
+        let saved_ni = self.sym().vable_next_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
@@ -3165,7 +3171,12 @@ impl MIFrame {
             vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
-
+        // pyjitpl.py:2602: frame.pc = saved_pc (restore sym fields)
+        {
+            let s = self.sym_mut();
+            s.vable_next_instr = saved_ni;
+            s.vable_valuestackdepth = saved_vsd;
+        }
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
 
