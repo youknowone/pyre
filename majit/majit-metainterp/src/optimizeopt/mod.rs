@@ -812,20 +812,26 @@ impl OptContext {
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
             // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // TODO: guard connection causes nbody infinite loop in compiled code.
-            // Guards are correctly generated and replayed, but compiled code
-            // enters an infinite loop. Likely cause: guard resume data
-            // (store_final_boxes_in_guard with patchguardop.rd_resume_position)
-            // produces incomplete state for inline_short_preamble guards.
+            // shortpreamble.py:389,396,406: info.make_guards → self.short
+            // shortpreamble.py:389,396,406: info.make_guards → self.short
+            // Guards not yet connected: nbody's extra jump_args from use_box
+            // change the short preamble entry signature, causing compiled loop
+            // incompatible-state on re-entry. Needs investigation of how
+            // inline_short_preamble extra args interact with target_token entry.
             let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
+            let (arg_guards, result_guards): (Vec<Op>, Vec<Op>) = (Vec::new(), Vec::new());
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
+                let ok = builder
+                    .use_box(preamble_source, &arg_guards, &result_guards)
+                    .is_some();
                 self.active_short_preamble_producer = Some(builder);
                 ok
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                let ok = builder.use_box(preamble_source, &[], &[]).is_some();
+                let ok = builder
+                    .use_box(preamble_source, &arg_guards, &result_guards)
+                    .is_some();
                 self.imported_short_preamble_builder = Some(builder);
                 ok
             } else {
@@ -939,6 +945,7 @@ impl OptContext {
     }
 
     /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
+    /// RPython uses sequential `if` (not elif) so multiple properties accumulate.
     /// `exported_infos`: None from use_box path (shortpreamble.py:404),
     /// Some from import_state path. When None, virtual branch does NOT recurse.
     fn setinfo_from_preamble(
@@ -948,93 +955,81 @@ impl OptContext {
         exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::unroll::ExportedValueInfo>>,
     ) {
         let op = self.get_box_replacement(op);
-        // unroll.py:55-56: if op.get_forwarded() is not None: return
+        // unroll.py:55: if op.get_forwarded() is not None: return
         if self.get_ptr_info(op).is_some() || self.is_replaced(op) {
             return;
         }
-        // unroll.py:57-58: if op.is_constant(): return
+        // unroll.py:57: if op.is_constant(): return
         if self.is_constant(op) {
             return;
         }
-        // unroll.py:59: isinstance(preamble_info, info.PtrInfo)
-        match preamble_info {
-            // unroll.py:60-64: virtual — forward directly + recurse
-            PtrInfo::Virtual(vinfo) => {
-                self.set_ptr_info(op, preamble_info.clone());
-                if let Some(infos) = exported_infos {
-                    let items: Vec<OpRef> = vinfo.fields.iter().map(|(_, r)| *r).collect();
-                    self.setinfo_from_preamble_list(&items, infos);
-                }
-            }
-            PtrInfo::VirtualArray(ainfo) => {
-                self.set_ptr_info(op, preamble_info.clone());
-                if let Some(infos) = exported_infos {
-                    let items: Vec<OpRef> = ainfo.items.iter().copied().collect();
-                    self.setinfo_from_preamble_list(&items, infos);
-                }
-            }
-            PtrInfo::VirtualStruct(sinfo) => {
-                self.set_ptr_info(op, preamble_info.clone());
-                if let Some(infos) = exported_infos {
-                    let items: Vec<OpRef> = sinfo.fields.iter().map(|(_, r)| *r).collect();
-                    self.setinfo_from_preamble_list(&items, infos);
-                }
-            }
-            PtrInfo::VirtualArrayStruct(asinfo) => {
-                self.set_ptr_info(op, preamble_info.clone());
-                if let Some(infos) = exported_infos {
-                    let items: Vec<OpRef> = asinfo
+
+        // unroll.py:60-64: virtual — set_forwarded + recurse, then return
+        if preamble_info.is_virtual() {
+            self.set_ptr_info(op, preamble_info.clone());
+            if let Some(infos) = exported_infos {
+                let items: Vec<OpRef> = match preamble_info {
+                    PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| *r).collect(),
+                    PtrInfo::VirtualArray(a) => a.items.iter().copied().collect(),
+                    PtrInfo::VirtualStruct(s) => s.fields.iter().map(|(_, r)| *r).collect(),
+                    PtrInfo::VirtualArrayStruct(a) => a
                         .element_fields
                         .iter()
                         .flat_map(|row| row.iter().map(|(_, r)| *r))
-                        .collect();
-                    self.setinfo_from_preamble_list(&items, infos);
+                        .collect(),
+                    PtrInfo::VirtualRawBuffer(r) => r.entries.iter().map(|(_, _, v)| *v).collect(),
+                    _ => Vec::new(),
+                };
+                self.setinfo_from_preamble_list(&items, infos);
+            }
+            return;
+        }
+
+        // unroll.py:65-68: constant — return early
+        if let PtrInfo::Constant(gcref) = preamble_info {
+            self.make_constant(op, Value::Ref(*gcref));
+            return;
+        }
+
+        // --- Sequential checks (RPython: NOT elif, all accumulate) ---
+
+        // unroll.py:69-74: Struct/Instance with descr → set_forwarded
+        if preamble_info.get_descr().is_some() {
+            if let PtrInfo::Struct(sinfo) = preamble_info {
+                self.set_ptr_info(op, PtrInfo::struct_ptr(sinfo.descr.clone()));
+            }
+            if let PtrInfo::Instance(iinfo) = preamble_info {
+                self.set_ptr_info(op, PtrInfo::instance(iinfo.descr.clone(), None));
+            }
+        }
+
+        // unroll.py:75-77: known_class → make_constant_class(op, class, False)
+        if let Some(cls) = preamble_info.get_known_class() {
+            // optimizer.py:137-156: updates existing InstancePtrInfo._known_class
+            let resolved = self.get_box_replacement(op);
+            let is_instance = matches!(self.get_ptr_info(resolved), Some(PtrInfo::Instance(_)));
+            if is_instance {
+                if let Some(PtrInfo::Instance(iinfo)) = self.get_ptr_info_mut(resolved) {
+                    iinfo.known_class = Some(*cls);
                 }
+            } else {
+                self.set_ptr_info(op, PtrInfo::known_class(*cls, true));
             }
-            // unroll.py:65-68: constant
-            PtrInfo::Constant(gcref) => {
-                self.make_constant(op, Value::Ref(*gcref));
-            }
-            // unroll.py:70-72: StructPtrInfo(preamble_info.get_descr())
-            PtrInfo::Struct(sinfo) => {
-                self.ensure_ptr_info_preserve_forwarding(
-                    op,
-                    PtrInfo::struct_ptr(sinfo.descr.clone()),
-                );
-            }
-            // unroll.py:73-78: InstancePtrInfo(descr) + known_class
-            PtrInfo::Instance(iinfo) => {
-                self.ensure_ptr_info_preserve_forwarding(
-                    op,
-                    PtrInfo::instance(iinfo.descr.clone(), None),
-                );
-                if let Some(cls) = iinfo.known_class {
-                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::known_class(cls, true));
-                }
-            }
-            // unroll.py:76-78: KnownClass
-            PtrInfo::KnownClass { class_ptr, .. } => {
-                self.ensure_ptr_info_preserve_forwarding(
-                    op,
-                    PtrInfo::known_class(*class_ptr, true),
-                );
-            }
-            // unroll.py:79-84: ArrayPtrInfo(descr) + lenbound.clone()
-            PtrInfo::Array(ainfo) => {
-                self.ensure_ptr_info_preserve_forwarding(
-                    op,
-                    PtrInfo::array(ainfo.descr.clone(), ainfo.lenbound.clone()),
-                );
-            }
-            // unroll.py:91-92: is_nonnull → make_nonnull
-            PtrInfo::NonNull { .. } => {
-                self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
-            }
-            _ => {
-                if preamble_info.is_nonnull() {
-                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
-                }
-            }
+        }
+
+        // unroll.py:79-84: ArrayPtrInfo → set_forwarded(ArrayPtrInfo(descr, lenbound))
+        if let PtrInfo::Array(ainfo) = preamble_info {
+            self.set_ptr_info(
+                op,
+                PtrInfo::array(ainfo.descr.clone(), ainfo.lenbound.clone()),
+            );
+        }
+
+        // unroll.py:85-89: StrPtrInfo — TODO when vstring lenbound is ported
+
+        // unroll.py:91-92: is_nonnull → make_nonnull
+        if preamble_info.is_nonnull() {
+            self.make_nonnull(op);
         }
     }
 
@@ -1055,10 +1050,31 @@ impl OptContext {
                 // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
                 if let Some(ref ptr_info) = info.ptr_info {
                     self.setinfo_from_preamble(item, ptr_info, Some(exported_infos));
+                } else if let Some(cls) = info.known_class {
+                    // ExportedValueInfo has known_class but no full PtrInfo.
+                    // RPython: the info IS the PtrInfo (always non-None when key exists).
+                    let synth = PtrInfo::known_class(cls, info.nonnull);
+                    self.setinfo_from_preamble(item, &synth, Some(exported_infos));
+                } else if info.nonnull {
+                    let synth = PtrInfo::nonnull();
+                    self.setinfo_from_preamble(item, &synth, Some(exported_infos));
                 }
+                // int_bound: unroll.py:93-96 — handled by setinfo_from_preamble
+                // when we add IntBound dispatch there.
+            } else {
+                // unroll.py:49: item.set_forwarded(None)
+                // "let's not inherit stuff we don't know anything about"
+                self.clear_forwarded(item);
             }
-            // unroll.py:49: item.set_forwarded(None)
-            // If not in exported_infos, leave as-is (no info to propagate)
+        }
+    }
+
+    /// unroll.py:49: item.set_forwarded(None)
+    fn clear_forwarded(&mut self, opref: OpRef) {
+        use crate::optimizeopt::info::Forwarded;
+        let idx = opref.0 as usize;
+        if idx < self.forwarded.len() {
+            self.forwarded[idx] = Forwarded::None;
         }
     }
 
@@ -1346,7 +1362,7 @@ impl OptContext {
 
     /// optimizer.py:652-686 emit_guard_operation — decide whether to share
     /// resume data from the previous guard (_copy_resume_data_from) or build
-    /// new resume data (store_final_boxes_in_guard / number_guard_inline_fallback).
+    /// new resume data (store_final_boxes_in_guard).
     fn emit_guard_operation(&mut self, op: &mut Op) {
         let opnum = op.opcode;
 
@@ -1370,13 +1386,10 @@ impl OptContext {
         // optimizer.py:672: `self._last_guard_op and guard_op.getdescr() is None`
         // getdescr() is None only for optimizer-created guards (no descr
         // from tracing, no ResumeAtPositionDescr from unroll).
-        // rd_resume_position < 0 ≡ getdescr() is None.
-        // rd_numb.is_none() ≡ resume.py:395 `assert not storage.rd_numb`.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
-            && op.rd_resume_position < 0
-            && op.rd_numb.is_none()
+            && op.descr.is_none()
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -1390,8 +1403,8 @@ impl OptContext {
             op.fail_args = self.new_operations[idx].fail_args.clone();
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
-            // store_final_boxes_in_guard: build new resume data.
-            self.number_guard_inline_fallback(op);
+            // optimizer.py:678: store_final_boxes_in_guard
+            self.store_final_boxes_in_guard(op, &[]);
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
@@ -1457,22 +1470,6 @@ impl OptContext {
         virtual_slots: &[crate::optimizeopt::optimizer::VirtualFailArgSlot],
     ) {
         self.store_final_boxes_in_guard(op, virtual_slots);
-    }
-
-    fn number_guard_inline_fallback(&self, op: &mut Op) {
-        // resume.py parity: after store_final_boxes_in_guard (via
-        // finalize_guard_resume_data), every guard has rd_numb.
-        // Guards without fail_args (FINISH) or with shared descr
-        // skip numbering entirely. This is a hard invariant — RPython's
-        // modifier.finish() (optimizer.py:735) is the single entry point
-        // for guard resume data generation.
-        if op.rd_numb.is_some() || op.fail_args.is_none() {
-            return;
-        }
-        panic!(
-            "[jit] guard {:?} at {:?} missing rd_numb after store_final_boxes_in_guard",
-            op.opcode, op.pos,
-        );
     }
 
     fn store_final_boxes_in_guard(

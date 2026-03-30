@@ -2003,10 +2003,12 @@ impl OptUnroll {
                     *arg = mapping[arg];
                 }
                 // unroll.py:405-411: copy_and_change creates a fresh guard
-                // with only args copied. RPython's fresh guard has no descr,
-                // no fail_args, no rd_numb/rd_consts/rd_virtuals_info.
+                // with descr=ResumeAtPositionDescr(), no fail_args,
+                // no rd_numb/rd_consts/rd_virtuals_info.
                 // store_final_boxes_in_guard rebuilds these from the snapshot.
                 if new_op.opcode.is_guard() {
+                    // unroll.py:407: descr=compile.ResumeAtPositionDescr()
+                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.fail_args = None;
                     new_op.rd_numb = None;
                     new_op.rd_consts = None;
@@ -2021,7 +2023,7 @@ impl OptUnroll {
                     }
                 }
                 if new_op.opcode.is_guard() {
-                    // unroll.py:407-409: guard gets ResumeAtPositionDescr
+                    // unroll.py:408-409: op.rd_resume_position = patchguardop.rd_resume_position
                     if let Some(ref patch) = ctx.patchguardop {
                         new_op.rd_resume_position = patch.rd_resume_position;
                     }
