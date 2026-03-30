@@ -51,7 +51,7 @@ fn derive_slot_types(
 // ── Compilation result types (compile.py) ───────────────────────────────
 
 /// Static exit metadata for a compiled guard or finish point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompiledExitLayout {
     /// compile.py:186 rd_loop_token: the green_key of the compiled loop
     /// that owns this guard. Used by handle_fail to find the owning
@@ -101,14 +101,14 @@ pub struct RawCompileResult<'a, M> {
 }
 
 /// Terminal exit layout for a FINISH or JUMP op.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompiledTerminalExitLayout {
     pub op_index: usize,
     pub exit_layout: CompiledExitLayout,
 }
 
 /// Full trace compilation layout with all exits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompiledTraceLayout {
     pub trace_id: u64,
     pub exit_layouts: Vec<CompiledExitLayout>,
@@ -116,7 +116,7 @@ pub struct CompiledTraceLayout {
 }
 
 /// Artifacts extracted from a backend DeadFrame.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DeadFrameArtifacts {
     pub values: Vec<i64>,
     pub typed_values: Vec<Value>,
@@ -346,6 +346,7 @@ pub(crate) fn build_guard_metadata(
                                     fielddescrs,
                                     fieldnums,
                                     descr_size,
+                                    ..
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();

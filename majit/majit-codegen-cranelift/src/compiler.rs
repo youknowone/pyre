@@ -9284,6 +9284,7 @@ fn collect_guards(
                             fielddescrs,
                             fieldnums,
                             descr_size,
+                            ..
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Struct {
@@ -10149,10 +10150,10 @@ impl majit_codegen::Backend for CraneliftBackend {
     }
 
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
-    /// gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
-    fn bh_new(&self, size: usize, type_id: u32) -> i64 {
+    fn bh_new(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
+        let size = sizedescr.size();
+        let type_id = sizedescr.type_id();
         let Some(runtime_id) = self.gc_runtime_id else {
-            // No GC configured — fall back to raw allocation.
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<u8>());
             return unsafe { std::alloc::alloc_zeroed(layout) as i64 };
@@ -10162,26 +10163,26 @@ impl majit_codegen::Backend for CraneliftBackend {
         })
     }
 
-    /// llmodel.py:778 bh_new_with_vtable(sizedescr).
+    /// llmodel.py:778-782 bh_new_with_vtable(sizedescr).
     /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, size: usize, type_id: u32, vtable: usize) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &dyn majit_ir::SizeDescr) -> i64 {
+        let size = sizedescr.size();
+        let type_id = sizedescr.type_id();
+        let vtable = sizedescr.vtable();
         let Some(runtime_id) = self.gc_runtime_id else {
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<u8>());
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut usize };
-            if !ptr.is_null() && self.vtable_offset.is_some() {
-                unsafe {
-                    let off = self.vtable_offset.unwrap_or(0);
-                    *((ptr as *mut u8).add(off) as *mut usize) = vtable;
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+            if !ptr.is_null() {
+                if let Some(off) = self.vtable_offset {
+                    unsafe { *((ptr.add(off)) as *mut usize) = vtable };
                 }
             }
             return ptr as i64;
         };
-        // llmodel.py:778: gc_malloc(sizedescr) — uses sizedescr type_id.
         let ptr = with_gc_runtime(runtime_id, |gc| {
             gc.alloc_nursery_typed(type_id, size).0 as i64
         });
-        // llmodel.py:780: write vtable at self.vtable_offset.
         if ptr != 0 {
             if let Some(off) = self.vtable_offset {
                 unsafe { *((ptr as *mut u8).add(off) as *mut usize) = vtable };

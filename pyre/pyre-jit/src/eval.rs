@@ -1818,21 +1818,16 @@ fn handle_jit_outcome(
     }
 }
 
-/// resume.py:1114 allocate_struct(typedescr) → cpu.bh_new(typedescr).
-/// gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, sizedescr.size).
-fn allocate_struct(type_id: u32, size: usize) -> usize {
+/// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
+fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let (driver, _) = driver_pair();
-    driver.meta_interp().backend().bh_new(size, type_id) as usize
+    driver.meta_interp().backend().bh_new(typedescr) as usize
 }
 
-/// llmodel.py:778 bh_new_with_vtable(sizedescr).
-/// gc_malloc(sizedescr) + write vtable at vtable_offset.
-fn allocate_with_vtable(size: usize, type_id: u32, vtable: usize) -> usize {
+/// resume.py:1437-1439 allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
+fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let (driver, _) = driver_pair();
-    driver
-        .meta_interp()
-        .backend()
-        .bh_new_with_vtable(size, type_id, vtable) as usize
+    driver.meta_interp().backend().bh_new_with_vtable(descr) as usize
 }
 
 /// resume.py:945-956 getvirtual_ptr parity.
@@ -2091,11 +2086,14 @@ fn materialize_virtual_from_rd(
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
     // resume.py:593 fielddescrs + fieldnums
-    enum VirtualKind {
+    enum VirtualKind<'a> {
         /// resume.py:612 VirtualInfo — allocate_with_vtable(descr).
         Instance { known_class: Option<i64> },
-        /// resume.py:628 VStructInfo — allocate_struct(typedescr).
-        Struct { type_id: u32 },
+        /// resume.py:628 VStructInfo — allocate_struct(self.typedescr).
+        Struct {
+            typedescr: &'a Option<majit_ir::DescrRef>,
+            type_id: u32,
+        },
     }
     let (kind, fielddescrs, fieldnums, descr_size) = match entry {
         majit_ir::RdVirtualInfo::Instance {
@@ -2113,13 +2111,17 @@ fn materialize_virtual_from_rd(
             *descr_size,
         ),
         majit_ir::RdVirtualInfo::Struct {
+            typedescr,
             type_id,
             fielddescrs,
             fieldnums,
             descr_size,
             ..
         } => (
-            VirtualKind::Struct { type_id: *type_id },
+            VirtualKind::Struct {
+                typedescr,
+                type_id: *type_id,
+            },
             fielddescrs.as_slice(),
             fieldnums.as_slice(),
             *descr_size,
@@ -2159,8 +2161,8 @@ fn materialize_virtual_from_rd(
                 // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
                 debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
                 let size = if descr_size > 0 { descr_size } else { 16 };
-                // type_id from known_class: pyre PyObject ob_type is the GC type.
-                allocate_with_vtable(size, ob_type as u32, ob_type as usize)
+                let descr = majit_ir::make_size_descr_with_vtable(0, size, 0, ob_type as usize);
+                allocate_with_vtable(descr.as_size_descr().unwrap())
             } else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -2171,15 +2173,23 @@ fn materialize_virtual_from_rd(
             }
         }
         // resume.py:634-637: VStructInfo.allocate(typedescr) → allocate_struct.
-        // gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
-        VirtualKind::Struct { type_id } => {
-            if descr_size == 0 {
+        VirtualKind::Struct { typedescr, type_id } => {
+            if let Some(td) = typedescr {
+                let sd = td
+                    .as_size_descr()
+                    .expect("VStruct typedescr must be SizeDescr");
+                allocate_struct(sd)
+            } else if descr_size > 0 {
+                // Fallback: EncodedResumeData decoded without live typedescr.
+                let fallback = majit_ir::make_size_descr_full(0, descr_size, type_id);
+                let sd = fallback.as_size_descr().unwrap();
+                allocate_struct(sd)
+            } else {
                 if majit_metainterp::majit_log_enabled() {
-                    eprintln!("[jit] materialize_virtual: vidx={vidx} Struct with descr_size=0",);
+                    eprintln!("[jit] materialize_virtual: vidx={vidx} Struct with no typedescr",);
                 }
                 return Value::Ref(majit_ir::GcRef::NULL);
             }
-            allocate_struct(type_id, descr_size)
         }
     };
 

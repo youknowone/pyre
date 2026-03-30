@@ -833,6 +833,7 @@ pub struct SimpleSizeDescr {
     size: usize,
     type_id: u32,
     is_immutable: bool,
+    vtable: usize,
 }
 
 impl SimpleSizeDescr {
@@ -842,6 +843,17 @@ impl SimpleSizeDescr {
             size,
             type_id,
             is_immutable: false,
+            vtable: 0,
+        }
+    }
+
+    pub fn with_vtable(index: u32, size: usize, type_id: u32, vtable: usize) -> Self {
+        SimpleSizeDescr {
+            index,
+            size,
+            type_id,
+            is_immutable: false,
+            vtable,
         }
     }
 }
@@ -864,6 +876,12 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn is_immutable(&self) -> bool {
         self.is_immutable
+    }
+    fn is_object(&self) -> bool {
+        self.vtable != 0
+    }
+    fn vtable(&self) -> usize {
+        self.vtable
     }
 }
 
@@ -1496,6 +1514,16 @@ pub fn make_size_descr(size: usize) -> DescrRef {
 /// Create a size descriptor with explicit index and type_id.
 pub fn make_size_descr_full(index: u32, size: usize, type_id: u32) -> DescrRef {
     std::sync::Arc::new(SimpleSizeDescr::new(index, size, type_id))
+}
+
+/// Create a size descriptor with vtable (for NEW_WITH_VTABLE objects).
+pub fn make_size_descr_with_vtable(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleSizeDescr::with_vtable(index, size, type_id, vtable))
 }
 
 /// Create an array descriptor.
