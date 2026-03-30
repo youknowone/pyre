@@ -1111,59 +1111,6 @@ pub fn resume_in_blackhole(
     }
 }
 
-/// resume.py:1334-1343 blackhole_from_resumedata parity:
-/// Parse typed Value array into per-frame ResumedFrame sections.
-///
-/// Each section starts with [Ref(frame), Int(py_pc), Int(vsd)] header.
-/// Section length = 3 + vsd. Multi-frame resume data has consecutive
-/// sections (callee first, caller last).
-fn parse_resumed_frames(typed_values: &[majit_ir::Value]) -> Vec<ResumedFrame> {
-    use majit_ir::Value;
-    let mut frames = Vec::new();
-    let mut cursor = 0usize;
-    while cursor + 3 <= typed_values.len() {
-        // Section header: [Ref/Int(frame), Int(py_pc), Int(vsd)]
-        let has_header = matches!(typed_values[cursor], Value::Ref(_) | Value::Int(_))
-            && matches!(typed_values[cursor + 1], Value::Int(_))
-            && matches!(typed_values[cursor + 2], Value::Int(_));
-        if !has_header {
-            break;
-        }
-        let vsd = match typed_values[cursor + 2] {
-            Value::Int(v) if v >= 0 => v as usize,
-            _ => break,
-        };
-        let section_len = 3 + vsd;
-        if cursor + section_len > typed_values.len() {
-            break;
-        }
-        let section = &typed_values[cursor..cursor + section_len];
-        let frame_ptr = match section[0] {
-            Value::Ref(r) => r.as_usize() as *mut PyFrame,
-            Value::Int(v) => v as *mut PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let py_pc = match section[1] {
-            Value::Int(v) => v as usize,
-            _ => 0,
-        };
-        let code = if !frame_ptr.is_null() {
-            unsafe { (*frame_ptr).code }
-        } else {
-            std::ptr::null()
-        };
-        frames.push(ResumedFrame {
-            code,
-            py_pc,
-            rd_numb_pc: None, // heuristic path: no rd_numb PC
-            frame_ptr,
-            values: section.to_vec(),
-        });
-        cursor += section_len;
-    }
-    frames
-}
-
 /// resume.py:945-956 decode_ref / getvirtual_ptr parity.
 ///
 /// Re-box optimizer-unboxed values back to PyObjectRef for the
@@ -1624,37 +1571,9 @@ fn jit_blackhole_resume_from_guard(
         return handle_blackhole_result(result, fail_values);
     }
 
-    // --- Path 2: heuristic fallback (no rd_numb) ---
-    let slot_types = match driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index) {
-        Some(st) if st.len() == fail_values.len() => st,
-        _ => return None,
-    };
-    let merge_py_pc = driver
-        .get_merge_point_pc(actual_green_key, trace_id, fail_index)
-        .unwrap_or(0) as usize;
-
-    let typed_values: Vec<Value> = slot_types
-        .iter()
-        .zip(fail_values.iter())
-        .map(|(tp, &raw)| match tp {
-            Type::Int => Value::Int(raw),
-            Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-            Type::Float => Value::Float(f64::from_bits(raw as u64)),
-            Type::Void => Value::Void,
-        })
-        .collect();
-
-    let frames = parse_resumed_frames(&typed_values);
-    if frames.is_empty() {
-        return None;
-    }
-    let callee_frame_ptr = frames[0].frame_ptr;
-    if callee_frame_ptr.is_null() {
-        return None;
-    }
-    let callee_frame = unsafe { &mut *callee_frame_ptr };
-    let bh_result = resume_in_blackhole(callee_frame, &frames, merge_py_pc);
-    handle_blackhole_result(bh_result, fail_values)
+    // RPython: every guard has rd_numb from capture_resumedata +
+    // store_final_boxes_in_guard. No heuristic fallback path.
+    None
 }
 
 /// resume.py:1312 blackhole_from_resumedata parity:
