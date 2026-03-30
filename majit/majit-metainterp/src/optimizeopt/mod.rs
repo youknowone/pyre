@@ -2207,20 +2207,38 @@ impl OptContext {
         // Snapshot-based numbering replaces the original fail_args with
         // only the live boxes (TAGBOX entries). Virtual fields are encoded
         // in rd_numb via TAGVIRTUAL + rd_virtuals_info.
-        // Update fail_arg_types to match the new liveboxes.
+        //
+        // RPython Box.type parity: each Box carries its type intrinsically
+        // (IntOp.type='i', RefOp.type='r', FloatOp.type='f'). In pyre,
+        // OpRef is untyped — determine types from value_types HashMap
+        // (seeded from inputargs + trace ops in Optimizer.setup).
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
+                if opref.is_none() {
+                    return majit_ir::Type::Ref;
+                }
                 let resolved = self.get_box_replacement(*opref);
                 // Constants carry explicit types.
                 if let Some(val) = self.get_constant(resolved) {
                     return val.get_type();
                 }
-                // Check constant_types_for_numbering (ob_type overrides etc.)
+                // constant_types_for_numbering (ob_type overrides etc.)
                 if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
                     return tp;
                 }
-                // Operation result type (covers new_operations + input args).
+                // value_types: seeded from inputargs, trace ops, previous phase.
+                // RPython equivalent: box.type on the Box object.
+                if let Some(&tp) = self.value_types.get(&resolved.0) {
+                    return tp;
+                }
+                // Try original OpRef (before replacement).
+                if *opref != resolved {
+                    if let Some(&tp) = self.value_types.get(&opref.0) {
+                        return tp;
+                    }
+                }
+                // Operation result type (covers new_operations).
                 if let Some(tp) = self.get_op_result_type(resolved) {
                     return tp;
                 }
@@ -2228,8 +2246,8 @@ impl OptContext {
                 if self.get_ptr_info(resolved).is_some() {
                     return majit_ir::Type::Ref;
                 }
-                // Default: Ref (RPython boxes are GCREF by default).
-                majit_ir::Type::Ref
+                // Default: Int (most common non-Ref type in loops).
+                majit_ir::Type::Int
             })
             .collect();
         op.store_final_boxes(liveboxes);
