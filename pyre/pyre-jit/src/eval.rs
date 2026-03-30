@@ -2445,60 +2445,11 @@ fn restore_guard_failure_for_loop(
     // resume.py:993-1007 _prepare_pendingfields: replay deferred
     // SETFIELD_GC/SETARRAYITEM_GC on materialized virtual objects.
     replay_pending_fields(&typed, exit_layout);
-    // Check for remaining null Ref: if materialization replaced all virtual
-    // slots, null_ref count is 0 and we proceed normally. If some slots
-    // couldn't be materialized (incomplete rd_virtuals_info), fall back to
-    // invalidation. The vsd-bounded check avoids false positives from
-    // virtual field values stored after the frame slots.
-    let vsd = typed
-        .get(2)
-        .map(|v| match v {
-            Value::Int(n) => *n as usize,
-            _ => 0,
-        })
-        .unwrap_or(0);
-    let frame_end = (3 + vsd).min(typed.len());
-    let has_null_ref = if typed.len() > 3 {
-        typed[3..frame_end]
-            .iter()
-            .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))))
-    } else {
-        false
-    };
-    // resume.py parity: null Ref slots in the frame are virtual objects
-    // whose rd_numb encoding used NULLREF (incomplete virtual tracking).
-    // Fall back to raw values from the deadframe for these slots.
-    // RPython's full virtual materialization via rd_virtuals_info would
-    // reconstruct the objects; pyre uses the raw Cranelift output
-    // which already had materialize_virtuals_for_bridge applied.
-    if has_null_ref {
-        let raw_typed = decode_exit_layout_values(raw_values, exit_layout);
-        for i in 3..frame_end {
-            if matches!(typed[i], Value::Ref(majit_ir::GcRef(0))) {
-                if let Some(raw_val) = raw_typed.get(i) {
-                    if !matches!(raw_val, Value::Ref(majit_ir::GcRef(0))) {
-                        typed[i] = raw_val.clone();
-                    }
-                }
-            }
-        }
-        // Recheck after raw fallback
-        let still_null = typed[3..frame_end]
-            .iter()
-            .any(|v| matches!(v, Value::Ref(majit_ir::GcRef(0))));
-        if still_null {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit] guard-fail: null Ref after raw fallback in [3..{}], skip recovery (rd_virtuals_info gap)",
-                    frame_end
-                );
-            }
-            // RPython compile.py:701: guard failure → bridge or blackhole,
-            // no invalidation. Null Refs are from incomplete rd_virtuals
-            // materialization (pyre limitation). Skip this guard recovery.
-            return None;
-        }
-    }
+    // resume.py:945/993 parity: rd_virtuals/rd_pendingfields provide
+    // precise virtual materialization. No raw deadframe fallback,
+    // no heuristic pair decode, no w_none() safety fill.
+    // If null Ref remains after materialization, log and continue
+    // (RPython: assertion failure in debug, silent in release).
     // RPython: guard failure counter tick is in handle_fail → must_compile
     // (compile.py:783-784), called by jitdriver before this callback.
     // Do NOT tick here — must_compile is the single tick point.
@@ -2639,59 +2590,15 @@ fn _prepare_next_section(
 /// field values stored as extra fail_args after null (NONE) slots.
 ///
 /// When the optimizer places a virtual in fail_args, it sets the
-/// RPython rebuild_state_after_failure parity: materialize virtual objects
-/// in raw i64 fail_args before bridge dispatch. Called from Cranelift's
-/// guard failure handler via TLS callback.
-///
-/// Virtual pattern in fail_args: null Ref slots followed by
-/// (ob_type, intval) Int pairs. Replace null Refs with boxed objects.
-fn rebuild_state_after_failure(outputs: &mut [i64], types: &[majit_ir::Type]) {
-    use majit_ir::Type;
-    let w_int_type_id = pyre_object::intobject::w_int_type_id();
-
-    // Find null Ref slots (skip frame/ni/vsd at 0-2).
-    let null_slots: Vec<usize> = (3..types.len().min(outputs.len()))
-        .filter(|&i| types[i] == Type::Ref && outputs[i] == 0)
-        .collect();
-    if null_slots.is_empty() {
-        return;
-    }
-
-    let last_null = *null_slots.last().unwrap();
-    let trailing_start = last_null + 1;
-    let trailing_count = outputs.len().saturating_sub(trailing_start);
-    let needed_fields = null_slots.len() * 2;
-
-    if trailing_count >= needed_fields {
-        // Validate: first field of each pair should be W_IntObject type id.
-        let mut valid = true;
-        let mut cursor = trailing_start;
-        for _ in &null_slots {
-            if cursor + 1 >= outputs.len() {
-                valid = false;
-                break;
-            }
-            if cursor < types.len() && types[cursor] == Type::Int {
-                if outputs[cursor] as usize != w_int_type_id {
-                    valid = false;
-                    break;
-                }
-            } else {
-                valid = false;
-                break;
-            }
-            cursor += 2;
-        }
-        if valid {
-            let mut field_cursor = trailing_start;
-            for &slot_idx in &null_slots {
-                let intval = outputs[field_cursor + 1];
-                let obj = pyre_object::intobject::jit_w_int_new(intval);
-                outputs[slot_idx] = obj as i64;
-                field_cursor += 2;
-            }
-        }
-    }
+/// resume.py:945/993 parity: virtual materialization via rd_virtuals.
+/// Called from Cranelift's guard failure handler via TLS callback.
+/// RPython uses rd_virtuals/rd_pendingfields for precise materialization.
+/// No heuristic pair decode — recovery_layout handles everything.
+fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) {
+    // RPython: materialization happens in rebuild_from_resumedata via
+    // getvirtual_ptr (resume.py:945) and _prepare_pendingfields (resume.py:993).
+    // The Cranelift callback is a no-op; precise materialization is done in
+    // rebuild_state_after_failure_with_exit_layout using recovery_layout.
 }
 
 /// virtual's slot to NONE and appends field values (ob_type, intval).
@@ -2758,111 +2665,22 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
     }
 }
 
-/// Pattern: [..., NONE, NONE] [ob_type1, intval1, ob_type2, intval2]
-/// Only apply when trailing fields are available (2 Int per null slot).
-/// Otherwise, replace remaining null Refs with w_none() for safety.
+/// resume.py:945/993 parity: materialize virtuals via rd_virtuals.
+/// RPython uses recovery_layout (rd_virtuals_info + rd_pendingfields)
+/// for precise materialization. No heuristic pair decode, no w_none().
 fn rebuild_state_after_failure_with_exit_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) {
-    // Try recovery layout first (rd_virtuals_info parity).
     if let Some(ref recovery) = exit_layout.recovery_layout {
         if !recovery.virtual_layouts.is_empty() {
-            if rebuild_state_after_failure_from_recovery_layout(
+            rebuild_state_after_failure_from_recovery_layout(
                 typed,
                 raw_values,
                 exit_layout,
                 recovery,
-            ) {
-                return;
-            }
-        }
-    }
-    // Fallback: heuristic-based materialization.
-    let null_slots: Vec<usize> = (3..typed.len())
-        .filter(|&i| matches!(typed.get(i), Some(Value::Ref(majit_ir::GcRef(0)))))
-        .collect();
-    if null_slots.is_empty() {
-        return;
-    }
-
-    // Check if trailing values after the LAST null/zero slot contain
-    // enough Int pairs to reconstruct all null slots as virtuals.
-    // Skip past any Int(0) slots that are also NONE virtuals (unboxed ints).
-    let last_null = *null_slots.last().unwrap();
-    let mut trailing_start = last_null + 1;
-    while trailing_start < typed.len() {
-        if matches!(typed[trailing_start], Value::Int(0)) {
-            trailing_start += 1;
-        } else {
-            break;
-        }
-    }
-    let trailing_count = typed.len() - trailing_start;
-    let needed_fields = null_slots.len() * 2;
-
-    if trailing_count >= needed_fields {
-        // Validate: first field of each (ob_type, payload) pair should be
-        // a W_IntObject type id. ALL null slots must have valid field data.
-        let w_int_type_id = pyre_object::intobject::w_int_type_id();
-        let mut valid = true;
-        let mut check_cursor = trailing_start;
-        for _ in &null_slots {
-            if check_cursor + 1 >= typed.len() {
-                valid = false;
-                break;
-            }
-            if let Value::Int(ob_type) = typed[check_cursor] {
-                if ob_type as usize != w_int_type_id {
-                    valid = false;
-                    break;
-                }
-            } else {
-                valid = false;
-                break;
-            }
-            check_cursor += 2;
-        }
-        if !valid {
-            // Not virtual field data — leave null Refs as-is.
-            // The caller's has_null_ref check will detect this and
-            // skip the restore entirely.
-            return;
-        }
-        // Enough trailing fields: reconstruct virtuals
-        let mut field_cursor = trailing_start;
-        for &slot_idx in &null_slots {
-            let payload_pos = field_cursor + 1; // field_cursor = ob_type, +1 = payload
-            if payload_pos >= typed.len() {
-                break;
-            }
-            if let Value::Int(v) = typed[payload_pos] {
-                let intval = decode_recovery_int_payload(
-                    v,
-                    typed,
-                    raw_values.get(payload_pos).copied(),
-                    raw_values,
-                    &exit_layout.exit_types,
-                );
-                let obj = pyre_object::intobject::w_int_new(intval);
-                typed[slot_idx] = Value::Ref(majit_ir::GcRef(obj as usize));
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] materialized virtual W_IntObject(intval={}) at slot {}",
-                        intval, slot_idx
-                    );
-                }
-            }
-            field_cursor += 2;
-        }
-        // Truncate consumed field values
-        typed.truncate(trailing_start);
-    } else {
-        // Not enough trailing fields — null slots are dead/unused.
-        // Replace with w_none() to prevent SIGSEGV.
-        for &slot_idx in &null_slots {
-            typed[slot_idx] = Value::Ref(majit_ir::GcRef(w_none() as usize));
+            );
         }
     }
 }

@@ -887,23 +887,16 @@ pub fn resume_in_blackhole(
         // are ref-typed at the jitcode level. Unboxed Int/Float values
         // from the optimizer are materialized back to PyObjectRef via
         // materialize_virtual (RPython getvirtual_ptr equivalent).
+        // resume.py:1017 _prepare_next_section parity: only LIVE boxes
+        // from rd_numb are written. Dead registers stay at setposition()
+        // defaults (0/null). No frame fallback — RPython relies on
+        // complete rd_numb + liveness, not current frame values.
         for i in 0..nlocals {
             let slot = 3 + i;
             if let Some(val) = section.get(slot) {
                 bh.setarg_r(i, materialize_virtual(val));
-            } else {
-                // resume.py:1017 _prepare_next_section + liveness.py:170
-                // LivenessIterator parity: RPython snapshots contain ONLY
-                // LIVE boxes. Dead registers are initialized to safe defaults
-                // in setposition(). In pyre, rd_numb may not encode all
-                // locals. Use the frame's current value as fallback — this
-                // is safe because the frame was live at guard failure time.
-                // SAFETY: frame_ptr is valid (checked above) and i < nlocals.
-                let arr_ptr =
-                    unsafe { std::ptr::addr_of!((*frame_ptr).locals_cells_stack_w) as *const i64 };
-                let frame_val = unsafe { *arr_ptr.add(i) };
-                bh.setarg_r(i, frame_val);
             }
+            // Dead slot: stays at setposition() default (0).
         }
         for i in 0..stack_only {
             let slot = 3 + nlocals + i;

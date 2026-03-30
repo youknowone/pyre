@@ -1487,6 +1487,19 @@ fn boxed_slot_value_from_runtime_kind(value: &Value) -> PyObjectRef {
     }
 }
 
+/// virtualizable.py:126/139 parity: box value for frame array slot.
+/// Frame array items (locals_cells_stack_w[*]) are declared as GCREF
+/// (interp_jit.py:25). The optimizer may unbox ints/floats in fail_args;
+/// this function re-boxes them for the frame. Ref values pass through.
+fn virtualizable_box_value(value: &Value) -> PyObjectRef {
+    match value {
+        Value::Ref(r) => r.as_usize() as PyObjectRef,
+        Value::Int(v) => w_int_new(*v),
+        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
+        Value::Void => PY_NULL,
+    }
+}
+
 fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -> OpRef {
     match value {
         Value::Int(v) => ctx.const_int(v),
@@ -2727,6 +2740,12 @@ impl MIFrame {
                 self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
+        // pyjitpl.py:2967-2969: generate a dummy GUARD_FUTURE_CONDITION
+        // just before the JUMP so that unroll can use it when it's
+        // creating artificial guards (patchguardop). record_guard calls
+        // capture_resumedata which captures the full framestack +
+        // virtualizable_boxes + virtualref_boxes.
+        self.record_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         args
     }
 
@@ -7303,21 +7322,20 @@ impl PyreJitState {
 
         let nlocals = self.local_count();
 
-        // Locals follow directly (indices 0..nlocals in unified array)
+        // virtualizable.py:126/139 parity: frame array items are always
+        // GCREF. i64 values from Cranelift output are raw pointers to
+        // boxed Python objects — write directly as PyObjectRef.
         for i in 0..nlocals {
             if idx < values.len() {
-                let slot_type = concrete_value_type(self.local_at(i).unwrap_or(PY_NULL));
-                let _ = self.set_local_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
+                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
                 idx += 1;
             }
         }
 
-        // Stack values follow locals (indices nlocals..valuestackdepth)
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
-                let slot_type = concrete_value_type(self.stack_at(i).unwrap_or(PY_NULL));
-                let _ = self.set_stack_at(i, boxed_slot_i64_for_type(slot_type, values[idx]));
+                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
                 idx += 1;
             }
         }
@@ -7737,20 +7755,21 @@ impl JitState for PyreJitState {
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        // virtualizable.py:126/139 parity: frame array items are always
+        // GCREF (interp_jit.py:25: locals_cells_stack_w[*] = ref type).
+        // The optimizer may unbox ints to Value::Int in fail_args, but
+        // the frame expects boxed Python objects. Re-box as needed.
         let mut idx = 3;
         for local_idx in 0..nlocals {
             if let Some(value) = values.get(idx) {
-                // RPython parity: virtualizable array slots are always GCREF.
-                // Values with trace-level Int type that are actually heap
-                // pointers must be treated as Ref for the Python frame.
-                let boxed = boxed_slot_value_from_runtime_kind(value);
+                let boxed = virtualizable_box_value(value);
                 let _ = self.set_local_at(local_idx, boxed);
             }
             idx += 1;
         }
         for stack_idx in 0..stack_only {
             if let Some(value) = values.get(idx) {
-                let boxed = boxed_slot_value_from_runtime_kind(value);
+                let boxed = virtualizable_box_value(value);
                 let _ = self.set_stack_at(stack_idx, boxed);
             }
             idx += 1;
