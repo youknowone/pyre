@@ -2764,10 +2764,17 @@ impl MIFrame {
                 self.get_list_of_active_boxes(ctx, false, after_residual_call);
             let callee_types = self.build_single_frame_fail_arg_types();
 
+            // snapshot.pc must match the liveness PC used for active boxes
+            // (get_list_of_active_boxes uses fallthrough_pc when after_residual_call).
+            let callee_live_pc = if after_residual_call {
+                self.fallthrough_pc
+            } else {
+                self.orgpc
+            };
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
-                pc: self.orgpc as u32,
+                pc: callee_live_pc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes(&callee_active_boxes, ctx),
             }];
             // fail_args = header + materialized active_boxes (for Cranelift deadframe).
@@ -2831,18 +2838,23 @@ impl MIFrame {
             fa
         };
 
+        // The snapshot's frame.pc must match the liveness PC used by
+        // get_list_of_active_boxes, so the blackhole decoder applies the
+        // same bitvector. after_residual_call → fallthrough_pc, else orgpc.
+        let snapshot_live_pc = if after_residual_call {
+            self.fallthrough_pc
+        } else {
+            self.orgpc
+        };
+
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
         let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
-        // opencoder.py:776-778: top snapshot uses frame.jitcode.index
-        // and frame.pc (= resumepc set by capture_resumedata).
-        // pyjitpl.py:2586-2588 + virtualizable.py:139 parity.
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
-        // opencoder.py:776: frame.jitcode.index
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
             frames: vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index,
-                pc: self.orgpc as u32,
+                pc: snapshot_live_pc as u32,
                 boxes: snapshot_boxes,
             }],
             vable_boxes,
