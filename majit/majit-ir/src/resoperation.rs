@@ -53,6 +53,8 @@ pub enum RdVirtualInfo {
     },
     /// resume.py:628 VStructInfo (NEW).
     Struct {
+        /// typedescr.tid — GC type identifier.
+        type_id: u32,
         descr_index: u32,
         fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,

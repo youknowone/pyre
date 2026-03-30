@@ -15,6 +15,7 @@ use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
+use majit_codegen::Backend;
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
 use majit_metainterp::blackhole::ExceptionState;
@@ -1813,10 +1814,26 @@ fn handle_jit_outcome(
     }
 }
 
+/// resume.py:1114 allocate_struct(typedescr) → cpu.bh_new(typedescr).
+/// gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, sizedescr.size).
+fn allocate_struct(type_id: u32, size: usize) -> usize {
+    let (driver, _) = driver_pair();
+    driver.meta_interp().backend().bh_new(size, type_id) as usize
+}
+
+/// llmodel.py:778 bh_new_with_vtable(sizedescr).
+fn allocate_with_vtable(size: usize, vtable: usize) -> usize {
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp()
+        .backend()
+        .bh_new_with_vtable(size, vtable) as usize
+}
+
 /// resume.py:945-956 getvirtual_ptr parity.
 ///
 /// Lazily materializes a virtual from rd_virtuals_info[vidx].
-/// Pattern: check cache → allocate_with_vtable → cache(real ptr) → setfields.
+/// Pattern: check cache → allocate_with_vtable/allocate_struct → cache → setfields.
 /// RPython caches the REAL object pointer before filling fields, enabling
 /// recursive/shared virtual resolution without NULL placeholders.
 fn materialize_virtual_from_rd(
@@ -2069,7 +2086,13 @@ fn materialize_virtual_from_rd(
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
     // resume.py:593 fielddescrs + fieldnums
-    let (known_class, fielddescrs, fieldnums, descr_size) = match entry {
+    enum VirtualKind {
+        /// resume.py:612 VirtualInfo — allocate_with_vtable(descr).
+        Instance { known_class: Option<i64> },
+        /// resume.py:628 VStructInfo — allocate_struct(typedescr).
+        Struct { type_id: u32 },
+    }
+    let (kind, fielddescrs, fieldnums, descr_size) = match entry {
         majit_ir::RdVirtualInfo::Instance {
             known_class,
             fielddescrs,
@@ -2077,18 +2100,21 @@ fn materialize_virtual_from_rd(
             descr_size,
             ..
         } => (
-            *known_class,
+            VirtualKind::Instance {
+                known_class: *known_class,
+            },
             fielddescrs.as_slice(),
             fieldnums.as_slice(),
             *descr_size,
         ),
         majit_ir::RdVirtualInfo::Struct {
+            type_id,
             fielddescrs,
             fieldnums,
             descr_size,
             ..
         } => (
-            None,
+            VirtualKind::Struct { type_id: *type_id },
             fielddescrs.as_slice(),
             fieldnums.as_slice(),
             *descr_size,
@@ -2096,54 +2122,59 @@ fn materialize_virtual_from_rd(
         _ => unreachable!(),
     };
 
-    // resume.py:617-621 VirtualInfo.allocate parity:
-    //   Phase 1: struct = allocate_with_vtable(descr)
+    // resume.py:617-621 VirtualInfo.allocate / resume.py:634-637 VStructInfo.allocate
+    //   Phase 1: allocate (allocate_with_vtable or allocate_struct)
     //   Phase 2: virtuals_cache.set_ptr(index, struct)  ← BEFORE setfields
     //   Phase 3: self.setfields(decoder, struct)         ← fields filled AFTER
-    //
-    let ob_type = known_class.unwrap_or(0);
-    let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
-    let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
 
-    // Phase 1: allocate_with_vtable — create object with ob_type set.
-    let obj_ptr: usize = if ob_type == int_type_addr {
-        let obj = Box::new(pyre_object::intobject::W_IntObject {
-            ob_header: pyre_object::pyobject::PyObject {
-                ob_type: ob_type as *const pyre_object::pyobject::PyType,
-            },
-            intval: 0,
-        });
-        Box::into_raw(obj) as usize
-    } else if ob_type == float_type_addr {
-        let obj = Box::new(pyre_object::floatobject::W_FloatObject {
-            ob_header: pyre_object::pyobject::PyObject {
-                ob_type: ob_type as *const pyre_object::pyobject::PyType,
-            },
-            floatval: 0.0,
-        });
-        Box::into_raw(obj) as usize
-    } else if ob_type != 0 {
-        // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
-        debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
-        let size = if descr_size > 0 { descr_size } else { 16 };
-        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-        unsafe { *ptr = ob_type }; // ob_type at offset 0
-        ptr as usize
-    } else if descr_size > 0 {
-        // resume.py:634-637 VStructInfo.allocate(typedescr): allocate_struct.
-        // resume.py:634 allocate_struct(typedescr): allocate zeroed memory.
-        let layout = std::alloc::Layout::from_size_align(descr_size, 8).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        ptr as usize
-    } else {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit] materialize_virtual: vidx={} no known_class and no field_offsets",
-                vidx
-            );
+    // Phase 1: allocate.
+    let obj_ptr: usize = match kind {
+        // resume.py:617-621: VirtualInfo.allocate(descr) → allocate_with_vtable.
+        VirtualKind::Instance { known_class } => {
+            let ob_type = known_class.unwrap_or(0);
+            let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
+            let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
+            if ob_type == int_type_addr {
+                let obj = Box::new(pyre_object::intobject::W_IntObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: ob_type as *const pyre_object::pyobject::PyType,
+                    },
+                    intval: 0,
+                });
+                Box::into_raw(obj) as usize
+            } else if ob_type == float_type_addr {
+                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: ob_type as *const pyre_object::pyobject::PyType,
+                    },
+                    floatval: 0.0,
+                });
+                Box::into_raw(obj) as usize
+            } else if ob_type != 0 {
+                // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
+                debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
+                let size = if descr_size > 0 { descr_size } else { 16 };
+                allocate_with_vtable(size, ob_type as usize)
+            } else {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] materialize_virtual: vidx={vidx} Instance with no known_class",
+                    );
+                }
+                return Value::Ref(majit_ir::GcRef::NULL);
+            }
         }
-        return Value::Ref(majit_ir::GcRef::NULL);
+        // resume.py:634-637: VStructInfo.allocate(typedescr) → allocate_struct.
+        // gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
+        VirtualKind::Struct { type_id } => {
+            if descr_size == 0 {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[jit] materialize_virtual: vidx={vidx} Struct with descr_size=0",);
+                }
+                return Value::Ref(majit_ir::GcRef::NULL);
+            }
+            allocate_struct(type_id, descr_size)
+        }
     };
 
     // Phase 2: cache REAL object pointer BEFORE setting fields.
@@ -2153,109 +2184,114 @@ fn materialize_virtual_from_rd(
 
     // Phase 3: setfields — decode each field and write to object.
     // resume.py:596-603: for each fielddescr, decoder.setfield(struct, num, descr)
-    //
-    // fieldnums does NOT include ob_type — only actual instance fields.
-    // W_IntObject: fieldnums[0] = intval (offset 8)
-    // W_FloatObject: fieldnums[0] = floatval (offset 8)
-    if ob_type == int_type_addr {
-        if let Some(&tagged) = fieldnums.first() {
-            let val = decode_tagged_value(
-                tagged,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals_info,
-                virtuals_cache,
-            );
-            let intval = match val {
-                Value::Int(n) => n,
-                Value::Ref(gc) if !gc.is_null() => unsafe {
-                    pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
-                },
-                _ => 0,
-            };
-            unsafe {
-                (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
-            }
-        }
-    } else if ob_type == float_type_addr {
-        if let Some(&tagged) = fieldnums.first() {
-            let val = decode_tagged_value(
-                tagged,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals_info,
-                virtuals_cache,
-            );
-            let floatval = match val {
-                Value::Float(f) => f,
-                Value::Int(bits) => f64::from_bits(bits as u64),
-                _ => 0.0,
-            };
-            unsafe {
-                (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval = floatval;
-            }
-        }
-    } else {
-        // General struct: resume.py:598-602 decoder.setfield(struct, num, descr)
-        // Use field_offsets from fielddescrs for byte-accurate writes.
-        for (i, &tagged) in fieldnums.iter().enumerate() {
-            if tagged == majit_ir::resumedata::NULLREF
-                || tagged == majit_ir::resumedata::UNINITIALIZED_TAG
-            {
-                continue;
-            }
-            let val = decode_tagged_value(
-                tagged,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals_info,
-                virtuals_cache,
-            );
-            let raw = match val {
-                Value::Int(n) => n,
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Ref(gc) => gc.0 as i64,
-                _ => 0,
-            };
-            // resume.py:597-602: descr = self.fielddescrs[i]; decoder.setfield(struct, num, descr)
-            let Some(descr) = fielddescrs.get(i) else {
-                debug_assert!(false, "fielddescrs missing for field {}", i);
-                continue;
-            };
-            if descr.offset == 0 && ob_type != 0 {
-                continue;
-            }
-            let byte_offset = descr.offset;
-            let ftype = descr.field_type;
-            let fsz = descr.field_size;
-            unsafe {
-                let addr = (obj_ptr as *mut u8).add(byte_offset);
-                match ftype {
-                    majit_ir::Type::Ref => {
-                        let p = match val {
-                            Value::Ref(gc) => gc.0 as i64,
-                            Value::Int(n) => n,
-                            _ => 0,
-                        };
-                        std::ptr::write(addr as *mut i64, p);
-                    }
-                    majit_ir::Type::Float => {
-                        let bits = match val {
-                            Value::Float(f) => f.to_bits(),
-                            Value::Int(n) => n as u64,
-                            _ => 0,
-                        };
-                        std::ptr::write(addr as *mut u64, bits);
-                    }
-                    _ => match fsz {
-                        1 => std::ptr::write(addr, raw as u8),
-                        2 => std::ptr::write(addr as *mut u16, raw as u16),
-                        4 => std::ptr::write(addr as *mut u32, raw as u32),
-                        _ => std::ptr::write(addr as *mut i64, raw),
+    let is_instance = matches!(kind, VirtualKind::Instance { .. });
+    match kind {
+        VirtualKind::Instance { known_class }
+            if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
+        {
+            // W_IntObject fast path: fieldnums[0] = intval (offset 8)
+            if let Some(&tagged) = fieldnums.first() {
+                let val = decode_tagged_value(
+                    tagged,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                );
+                let intval = match val {
+                    Value::Int(n) => n,
+                    Value::Ref(gc) if !gc.is_null() => unsafe {
+                        pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
                     },
+                    _ => 0,
+                };
+                unsafe {
+                    (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
+                }
+            }
+        }
+        VirtualKind::Instance { known_class }
+            if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
+        {
+            // W_FloatObject fast path: fieldnums[0] = floatval (offset 8)
+            if let Some(&tagged) = fieldnums.first() {
+                let val = decode_tagged_value(
+                    tagged,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                );
+                let floatval = match val {
+                    Value::Float(f) => f,
+                    Value::Int(bits) => f64::from_bits(bits as u64),
+                    _ => 0.0,
+                };
+                unsafe {
+                    (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval =
+                        floatval;
+                }
+            }
+        }
+        _ => {
+            // resume.py:598-602 AbstractVirtualStructInfo.setfields:
+            // for each fielddescr, decoder.setfield(struct, num, descr)
+            for (i, &tagged) in fieldnums.iter().enumerate() {
+                if tagged == majit_ir::resumedata::NULLREF
+                    || tagged == majit_ir::resumedata::UNINITIALIZED_TAG
+                {
+                    continue;
+                }
+                let val = decode_tagged_value(
+                    tagged,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals_info,
+                    virtuals_cache,
+                );
+                let raw = match val {
+                    Value::Int(n) => n,
+                    Value::Float(f) => f.to_bits() as i64,
+                    Value::Ref(gc) => gc.0 as i64,
+                    _ => 0,
+                };
+                let Some(descr) = fielddescrs.get(i) else {
+                    debug_assert!(false, "fielddescrs missing for field {}", i);
+                    continue;
+                };
+                // Skip vtable slot (offset 0) for Instance — already set by allocate_with_vtable.
+                if descr.offset == 0 && is_instance {
+                    continue;
+                }
+                unsafe {
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    match descr.field_type {
+                        majit_ir::Type::Ref => {
+                            let p = match val {
+                                Value::Ref(gc) => gc.0 as i64,
+                                Value::Int(n) => n,
+                                _ => 0,
+                            };
+                            std::ptr::write(addr as *mut i64, p);
+                        }
+                        majit_ir::Type::Float => {
+                            let bits = match val {
+                                Value::Float(f) => f.to_bits(),
+                                Value::Int(n) => n as u64,
+                                _ => 0,
+                            };
+                            std::ptr::write(addr as *mut u64, bits);
+                        }
+                        _ => match descr.field_size {
+                            1 => std::ptr::write(addr, raw as u8),
+                            2 => std::ptr::write(addr as *mut u16, raw as u16),
+                            4 => std::ptr::write(addr as *mut u32, raw as u32),
+                            _ => std::ptr::write(addr as *mut i64, raw),
+                        },
+                    }
                 }
             }
         }
