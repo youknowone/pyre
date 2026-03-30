@@ -1825,12 +1825,13 @@ fn allocate_struct(type_id: u32, size: usize) -> usize {
 }
 
 /// llmodel.py:778 bh_new_with_vtable(sizedescr).
-fn allocate_with_vtable(size: usize, vtable: usize) -> usize {
+/// gc_malloc(sizedescr) + write vtable at vtable_offset.
+fn allocate_with_vtable(size: usize, type_id: u32, vtable: usize) -> usize {
     let (driver, _) = driver_pair();
     driver
         .meta_interp()
         .backend()
-        .bh_new_with_vtable(size, vtable) as usize
+        .bh_new_with_vtable(size, type_id, vtable) as usize
 }
 
 /// resume.py:945-956 getvirtual_ptr parity.
@@ -2157,7 +2158,8 @@ fn materialize_virtual_from_rd(
                 // resume.py:617 VirtualInfo.allocate(descr): allocate_with_vtable.
                 debug_assert!(descr_size > 0, "VirtualInfo must have descr_size");
                 let size = if descr_size > 0 { descr_size } else { 16 };
-                allocate_with_vtable(size, ob_type as usize)
+                // type_id from known_class: pyre PyObject ob_type is the GC type.
+                allocate_with_vtable(size, ob_type as u32, ob_type as usize)
             } else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(

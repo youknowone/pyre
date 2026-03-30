@@ -1134,6 +1134,7 @@ fn materialize_virtual_recursive(
             fields,
             fielddescrs,
             descr_size,
+            type_id,
             ..
         } => {
             let vals: Vec<i64> = fields
@@ -1170,8 +1171,12 @@ fn materialize_virtual_recursive(
             let size = if *descr_size > 0 { *descr_size } else { 16 };
             let ptr = if ob_type != 0 {
                 if let Some(rt_id) = gc_runtime_id {
-                    let p = with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64);
+                    // llmodel.py:778: gc_malloc(sizedescr) with type_id.
+                    let p = with_gc_runtime(rt_id, |gc| {
+                        gc.alloc_nursery_typed(*type_id, size).0 as i64
+                    });
                     if p != 0 {
+                        // llmodel.py:780: write vtable at vtable_offset.
                         unsafe { *(p as *mut i64) = ob_type };
                     }
                     p
@@ -4860,6 +4865,9 @@ pub struct CraneliftBackend {
     next_header_pc: Option<u64>,
     registered_call_assembler_tokens: HashSet<u64>,
     registered_call_assembler_bridge_traces: HashSet<u64>,
+    /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
+    /// pyre PyObject layout: ob_type at offset 0.
+    vtable_offset: Option<usize>,
 }
 
 impl CraneliftBackend {
@@ -4887,6 +4895,8 @@ impl CraneliftBackend {
             next_header_pc: None,
             registered_call_assembler_tokens: HashSet::new(),
             registered_call_assembler_bridge_traces: HashSet::new(),
+            // pyre PyObject layout: ob_type at byte offset 0.
+            vtable_offset: Some(0),
         }
     }
 
@@ -10154,20 +10164,28 @@ impl majit_codegen::Backend for CraneliftBackend {
 
     /// llmodel.py:778 bh_new_with_vtable(sizedescr).
     /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, size: usize, vtable: usize) -> i64 {
+    fn bh_new_with_vtable(&self, size: usize, type_id: u32, vtable: usize) -> i64 {
         let Some(runtime_id) = self.gc_runtime_id else {
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<u8>());
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut usize };
-            if !ptr.is_null() {
-                unsafe { *ptr = vtable };
+            if !ptr.is_null() && self.vtable_offset.is_some() {
+                unsafe {
+                    let off = self.vtable_offset.unwrap_or(0);
+                    *((ptr as *mut u8).add(off) as *mut usize) = vtable;
+                }
             }
             return ptr as i64;
         };
-        // Allocate via GC — type_id 0 for vtable objects (type tracked by vtable).
-        let ptr = with_gc_runtime(runtime_id, |gc| gc.alloc_nursery_typed(0, size).0 as i64);
+        // llmodel.py:778: gc_malloc(sizedescr) — uses sizedescr type_id.
+        let ptr = with_gc_runtime(runtime_id, |gc| {
+            gc.alloc_nursery_typed(type_id, size).0 as i64
+        });
+        // llmodel.py:780: write vtable at self.vtable_offset.
         if ptr != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
+            if let Some(off) = self.vtable_offset {
+                unsafe { *((ptr as *mut u8).add(off) as *mut usize) = vtable };
+            }
         }
         ptr
     }
