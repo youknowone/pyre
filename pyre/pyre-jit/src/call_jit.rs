@@ -750,11 +750,6 @@ pub struct ResumedFrame {
     pub code: *const pyre_bytecode::CodeObject,
     /// resume.py:1050 pc (Python bytecode PC for blackhole setposition).
     pub py_pc: usize,
-    /// Raw frame.pc from rd_numb (= orgpc from snapshot).
-    /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
-    ///   pc=0 is valid (function start / loop header at bytecode 0).
-    /// None: no-snapshot guard (rd_numb pc=-1), positional fallback.
-    pub rd_numb_pc: Option<usize>,
     /// Frame pointer for this stack frame.
     pub frame_ptr: *mut PyFrame,
     /// resume.py:928-931 consume_one_section: resolved values.
@@ -877,51 +872,21 @@ pub fn resume_in_blackhole(
         }
 
         // resume.py:1381 consume_one_section → 1017 _prepare_next_section
-        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_i, cb_r, cb_f)
-        // → liveness.py:170 LivenessIterator: iterate ONLY live registers.
-        // rd_numb_pc = Some(orgpc): snapshot guard, liveness-safe.
-        // rd_numb_pc = None: no-snapshot guard, positional fallback.
-        // TODO: liveness-based filling requires the encoder
-        // (get_list_of_active_boxes) to use the SAME liveness data.
-        // Currently the encoder's liveness may differ from the decoder's
-        // (different CodeObject pointer due to CPython specialization),
-        // so liveness filtering is disabled until encoder parity is verified.
-        let use_liveness = false;
-        if use_liveness {
-            let live = pyre_jit_trace::state::liveness_for(section.code);
-            let live_pc = section.rd_numb_pc.unwrap(); // = encoder's orgpc
-            let mut val_idx = 3; // skip [frame, ni, vsd] header
-            for i in 0..nlocals {
-                if live.is_local_live(live_pc, i) {
-                    if let Some(val) = section.values.get(val_idx) {
-                        bh.setarg_r(i, materialize_virtual(val));
-                    }
-                    val_idx += 1;
-                }
+        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
+        // → liveness.py:170 LivenessIterator: compact values consumed
+        //   in liveness order. Dead registers keep setposition() defaults.
+        //
+        // TODO: activate liveness-based filling once ALL guards have
+        // snapshot with correct orgpc (encoder-decoder liveness parity).
+        for i in 0..nlocals {
+            if let Some(val) = section.values.get(3 + i) {
+                bh.setarg_r(i, materialize_virtual(val));
             }
-            let max_stack = vsd.saturating_sub(nlocals);
-            for i in 0..max_stack {
-                if live.is_stack_live(live_pc, i) {
-                    if let Some(val) = section.values.get(val_idx) {
-                        bh.runtime_stack_push(0, materialize_virtual(val));
-                    }
-                    val_idx += 1;
-                }
-            }
-        } else {
-            // Positional filling: values[3+i] → register[i].
-            // Valid when encoder included all locals (no liveness filtering)
-            // or when all locals happen to be live (common in loops).
-            for i in 0..nlocals {
-                if let Some(val) = section.values.get(3 + i) {
-                    bh.setarg_r(i, materialize_virtual(val));
-                }
-            }
-            let stack_only = vsd.saturating_sub(nlocals);
-            for i in 0..stack_only {
-                if let Some(val) = section.values.get(3 + nlocals + i) {
-                    bh.runtime_stack_push(0, materialize_virtual(val));
-                }
+        }
+        let stack_only = vsd.saturating_sub(nlocals);
+        for i in 0..stack_only {
+            if let Some(val) = section.values.get(3 + nlocals + i) {
+                bh.runtime_stack_push(0, materialize_virtual(val));
             }
         }
         // pyre convention: frame pointer in int register 3 for writeback.

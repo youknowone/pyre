@@ -2511,7 +2511,6 @@ fn restore_guard_failure_for_loop(
             vec![crate::call_jit::ResumedFrame {
                 code,
                 py_pc,
-                rd_numb_pc: None, // empty rd_numb: no orgpc available
                 frame_ptr,
                 values: typed.clone(),
             }]
@@ -2786,13 +2785,6 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
-            // frame.pc >= 0: orgpc from snapshot (liveness-safe).
-            // frame.pc < 0 (== -1): no-snapshot guard (positional only).
-            rd_numb_pc: if frame.pc >= 0 {
-                Some(frame.pc as usize)
-            } else {
-                None
-            },
             frame_ptr,
             values,
         });
