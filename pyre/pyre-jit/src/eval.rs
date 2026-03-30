@@ -2581,7 +2581,9 @@ fn _prepare_next_section(
                 rd_virtuals,
                 virtuals_cache,
             ),
-            RebuiltValue::Unassigned => Value::Int(0),
+            // resume.py:131 UNINITIALIZED parity: dead/uninitialized slots
+            // stay at default. In pyre, PY_NULL via Value::Void.
+            RebuiltValue::Unassigned => Value::Void,
         });
     }
 }
