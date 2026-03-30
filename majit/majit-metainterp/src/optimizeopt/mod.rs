@@ -272,6 +272,11 @@ pub struct OptContext {
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
     last_guard_idx: Option<usize>,
+    /// Last rd_resume_position with a valid snapshot. Used as fallback
+    /// for optimizer-created guards that can't share from a previous guard.
+    /// resume.py parity: RPython guards always get a snapshot via
+    /// capture_resumedata; pyre tracks the nearest valid position.
+    pub last_seen_snapshot_pos: Option<i32>,
 }
 
 /// resume.py:192-226 parity — BoxEnv for optimizer context.
@@ -440,6 +445,7 @@ impl OptContext {
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
+            last_seen_snapshot_pos: None,
         }
     }
 
@@ -491,6 +497,7 @@ impl OptContext {
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
+            last_seen_snapshot_pos: None,
         }
     }
 
@@ -1381,9 +1388,6 @@ impl OptContext {
         }
 
         // RPython parity: every guard has a snapshot from capture_resumedata.
-        // TODO: Phase 2 guards with rd_resume_position < 0 should not exist —
-        // they indicate missing snapshot propagation in unroll. Once fixed,
-        // this no-snapshot path should become a hard panic.
         // Guards without snapshot (optimizer-created, rd_resume_position < 0)
         // share resume data from _copy_resume_data_from. If they reach here
         // without a snapshot, build a minimal rd_numb directly from fail_args
