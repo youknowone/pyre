@@ -4869,64 +4869,27 @@ fn infer_fail_arg_types(
     let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
     for &opref in fail_arg_refs {
         if opref.is_none() {
-            // resume.py parity: OpRef::NONE marks a virtual object slot
-            // in fail_args. The backend stores 0 in this slot; the actual
-            // value is reconstructed from rd_virtuals_info on guard failure.
-            fail_arg_types.push(Type::Int);
+            // resoperation.py Box.type parity: NONE marks a virtual object
+            // slot. Virtual objects are GCREF (Ref). The backend stores null;
+            // materialization uses rd_virtuals_info on guard failure.
+            fail_arg_types.push(Type::Ref);
             continue;
         }
-        // Backend constant slots are currently integer-only. If a fail arg
-        // doesn't correspond to an input arg or operation result, treat it as
-        // an integer constant instead of silently manufacturing Ref/Float data.
-        fail_arg_types.push(value_types.get(&opref.0).copied().unwrap_or(Type::Int));
+        // resoperation.py Box.type parity: default to Ref (GCREF).
+        // RPython's Box carries an immutable .type attribute; unknown
+        // boxes are RefOp-based (the most common case in pyre).
+        fail_arg_types.push(value_types.get(&opref.0).copied().unwrap_or(Type::Ref));
     }
     Ok(fail_arg_types)
 }
 
-/// Position-aware fail_arg type inference. When an OpRef is both a label
-/// inputarg and a body operation result with a DIFFERENT type, the correct
-/// type depends on whether the guard is BEFORE or AFTER the operation that
-/// redefines it. Guards before the operation see the inputarg value (e.g.
-/// Ref from preamble), while guards after see the operation result (e.g.
-/// Int from IntAddOvf).
-fn infer_fail_arg_types_positional(
-    fail_arg_refs: &[OpRef],
-    value_types: &HashMap<u32, Type>,
-    inputarg_types: &HashMap<u32, Type>,
-    op_def_positions: &HashMap<u32, usize>,
-    guard_op_index: usize,
-) -> Result<Vec<Type>, BackendError> {
-    let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
-    for &opref in fail_arg_refs {
-        if opref.is_none() {
-            fail_arg_types.push(Type::Int);
-            continue;
-        }
-        let tp = if let Some(&def_pos) = op_def_positions.get(&opref.0) {
-            if guard_op_index < def_pos {
-                // Guard is before the operation that defines this OpRef.
-                // Use the inputarg type (value from preamble/label entry).
-                inputarg_types
-                    .get(&opref.0)
-                    .or_else(|| value_types.get(&opref.0))
-                    .copied()
-                    .unwrap_or(Type::Int)
-            } else {
-                value_types.get(&opref.0).copied().unwrap_or(Type::Int)
-            }
-        } else {
-            value_types.get(&opref.0).copied().unwrap_or(Type::Int)
-        };
-        fail_arg_types.push(tp);
-    }
-    Ok(fail_arg_types)
-}
-
-/// box.type parity: merge descriptor types with positional inference.
-/// Use descriptor types as the base, then override slots where
-/// op_def_positions detects a type conflict (JUMP→LABEL propagation
-/// or inputarg-vs-operation redefinition).
-fn merge_descriptor_with_positional(
+/// resoperation.py Box.type parity: determine fail_arg types.
+///
+/// RPython's Box.type is immutable — the backend reads box.type directly
+/// (assembler.py:46 compute_gcmap). In pyre, fail_arg_types come from
+/// the optimizer, which may assign Int to OpRefs that are defined AFTER
+/// this guard. For such cases, use the inputarg type (pre-redefinition).
+fn resolve_fail_arg_types(
     fail_arg_refs: &[OpRef],
     fd: Option<&dyn majit_ir::descr::FailDescr>,
     value_types: &HashMap<u32, Type>,
@@ -4934,31 +4897,36 @@ fn merge_descriptor_with_positional(
     op_def_positions: &HashMap<u32, usize>,
     guard_op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
-    let positional = infer_fail_arg_types_positional(
-        fail_arg_refs,
-        value_types,
-        inputarg_types,
-        op_def_positions,
-        guard_op_index,
-    )?;
-    let Some(fd) = fd else {
-        return Ok(positional);
+    // Use descriptor types as base, then fix positional conflicts.
+    let base = if let Some(fd) = fd {
+        let dt = fd.fail_arg_types();
+        if dt.len() == fail_arg_refs.len() {
+            dt.to_vec()
+        } else {
+            infer_fail_arg_types(fail_arg_refs, value_types)?
+        }
+    } else {
+        infer_fail_arg_types(fail_arg_refs, value_types)?
     };
-    let dt = fd.fail_arg_types();
-    if dt.len() != fail_arg_refs.len() {
-        return Ok(positional);
-    }
-    // Start from descriptor, override conflicting slots.
-    Ok(dt
-        .iter()
+
+    // Fix positional conflicts: when a guard fires BEFORE the operation
+    // that redefines an OpRef, the fail_arg holds the PRE-redefinition
+    // value. Use the inputarg type (not the post-redefinition type).
+    Ok(base
+        .into_iter()
         .enumerate()
-        .map(|(i, &descr_tp)| {
+        .map(|(i, tp)| {
             let opref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
-            if !opref.is_none() && op_def_positions.contains_key(&opref.0) {
-                positional[i]
-            } else {
-                descr_tp
+            if opref.is_none() {
+                return Type::Ref;
             }
+            if let Some(&def_pos) = op_def_positions.get(&opref.0) {
+                if guard_op_index < def_pos {
+                    // Guard before redefinition: use inputarg type.
+                    return inputarg_types.get(&opref.0).copied().unwrap_or(tp);
+                }
+            }
+            tp
         })
         .collect())
 }
@@ -9213,31 +9181,14 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            // RPython Box.type parity: use optimizer-provided fail_arg_types
-            // directly when available, bypassing value_types type inference.
-            let types = if let Some(ref fat) = op.fail_arg_types {
-                if fat.len() == refs.len() {
-                    fat.clone()
-                } else {
-                    merge_descriptor_with_positional(
-                        &refs,
-                        op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                        &value_types,
-                        &inputarg_types,
-                        &op_def_positions,
-                        op_idx,
-                    )?
-                }
-            } else {
-                merge_descriptor_with_positional(
-                    &refs,
-                    op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                    &value_types,
-                    &inputarg_types,
-                    &op_def_positions,
-                    op_idx,
-                )?
-            };
+            let types = resolve_fail_arg_types(
+                &refs,
+                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                &value_types,
+                &inputarg_types,
+                &op_def_positions,
+                op_idx,
+            )?;
             (refs, types)
         } else {
             let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
@@ -9245,7 +9196,7 @@ fn collect_guards(
             } else {
                 (0..num_inputs as u32).map(OpRef).collect()
             };
-            let types = merge_descriptor_with_positional(
+            let types = resolve_fail_arg_types(
                 &refs,
                 op.descr.as_ref().and_then(|d| d.as_fail_descr()),
                 &value_types,

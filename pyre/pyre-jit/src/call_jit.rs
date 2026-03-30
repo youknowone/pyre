@@ -1592,7 +1592,8 @@ pub fn trace_and_compile_from_bridge(
     trace_id: u64,
     fail_index: u32,
     frame: &mut PyFrame,
-    resume_pc_hint: usize,
+    raw_values: &[i64],
+    exit_layout: &majit_metainterp::CompiledExitLayout,
 ) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
@@ -1600,17 +1601,26 @@ pub fn trace_and_compile_from_bridge(
 
     let (driver, info) = crate::eval::driver_pair();
 
-    // compile.py:786-795: start_compiling / done_compiling are handled by
-    // the caller (handle_fail in eval.rs), matching RPython where
-    // handle_fail wraps _trace_and_compile_from_bridge in try/finally.
-
-    // RPython resume_in_blackhole parity: use resume_pc from guard's
-    // resume data (via LAST_GUARD_RESUME_PC or recovery_layout), not
-    // frame.next_instr which may have been reset by force_fn.
-    let resume_pc = if resume_pc_hint > 0 {
-        resume_pc_hint
+    // pyjitpl.py:2890-2911 handle_guard_failure parity:
+    // RPython creates a fresh MetaInterp and calls
+    // initialize_state_from_guard_failure(resumedescr, deadframe)
+    // which internally calls rebuild_from_resumedata (resume.py:1042).
+    // This restores the complete frame stack INSIDE the bridge function.
+    let meta = driver.meta_interp().get_compiled_meta(green_key).cloned();
+    let mut jit_state_local = build_jit_state(frame, info);
+    let resume_pc = if let Some(ref meta) = meta {
+        if let Some((_, pc)) = crate::eval::decode_and_restore_guard_failure(
+            &mut jit_state_local,
+            meta,
+            raw_values,
+            exit_layout,
+        ) {
+            pc
+        } else {
+            0
+        }
     } else {
-        frame.next_instr
+        0
     };
     if resume_pc == 0 {
         return false;
