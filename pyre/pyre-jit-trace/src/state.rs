@@ -2872,6 +2872,8 @@ impl MIFrame {
     ) {
         // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
         let saved_orgpc = self.orgpc;
+        let saved_ni = self.sym().vable_next_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
         self.flush_to_frame_for_guard(ctx);
@@ -2919,6 +2921,9 @@ impl MIFrame {
 
         // pyjitpl.py:2602: frame.pc = saved_pc (restore)
         self.orgpc = saved_orgpc;
+        let s = self.sym_mut();
+        s.vable_next_instr = saved_ni;
+        s.vable_valuestackdepth = saved_vsd;
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
@@ -2966,38 +2971,60 @@ impl MIFrame {
         sym: &PyreSym,
         ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_trace::recorder::SnapshotTagged> {
-        // RPython pyjitpl.py:2586 virtualizable_boxes:
-        // [static_fields..., array_items..., virtualizable_ptr].
-        //
-        // RPython creates SEPARATE Box objects for vable_boxes (read_boxes/wrap),
-        // so _number_boxes dedup does NOT merge them with frame boxes.
-        // pyre's symbolic_locals/symbolic_stack are the SAME OpRefs in both
-        // vable and frame → dedup merges → fail_args shrinks → recovery fails.
-        //
-        // Fix: include ONLY the header fields (ni, vsd) and frame_ptr in
-        // vable_boxes. These use DIFFERENT OpRefs from frame boxes:
-        // - vable_next_instr is ctx.const_int(orgpc) from flush_to_frame_for_guard
-        // - vable_valuestackdepth is ctx.const_int(vsd)
-        // - frame is OpRef(0) (inputarg, not in active_boxes)
-        // The locals/stack array items are OMITTED to avoid dedup conflict.
-        let mut boxes = Vec::with_capacity(3);
-        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
-        boxes.push(Self::opref_to_snapshot_tagged(
-            sym.vable_valuestackdepth,
-            ctx,
-        ));
-        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
-        boxes
-        /* RPython full vable (disabled — locals/stack dedup):
+        // opencoder.py:718-726 _list_of_boxes_virtualizable parity:
+        // RPython format: [virtualizable_ptr, static_fields..., array_items...]
+        // (virtualizable_ptr moved from end to front).
+        // RPython dedup: same Box objects in vable & frame → _number_boxes
+        // assigns the same TAGBOX index → deadframe stores the value once.
+        // Recovery uses vable_values to fill frame slots that were dedup'd.
         let stack_only = sym.stack_only_depth();
         let mut boxes = Vec::new();
-        // Static fields: next_instr, valuestackdepth
+        // opencoder.py:722: virtualizable_ptr FIRST.
+        boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
+        // Static fields: next_instr, valuestackdepth.
         boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
         boxes.push(Self::opref_to_snapshot_tagged(
             sym.vable_valuestackdepth,
             ctx,
         ));
-        */
+        // Array items: locals + stack (virtualizable.py:86 read_boxes).
+        let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
+            Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
+        } else {
+            None
+        };
+        let full_array_len = concrete_frame
+            .map(|f| f.locals_cells_stack_w.len())
+            .unwrap_or(sym.symbolic_locals.len() + stack_only);
+        for i in 0..full_array_len {
+            let opref = if i < sym.symbolic_locals.len() {
+                sym.symbolic_locals[i]
+            } else {
+                let stack_idx = i - sym.nlocals;
+                if stack_idx < stack_only && stack_idx < sym.symbolic_stack.len() {
+                    sym.symbolic_stack[stack_idx]
+                } else {
+                    OpRef::NONE
+                }
+            };
+            if !opref.is_none() {
+                boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
+            } else if let Some(frame) = concrete_frame {
+                let val = frame
+                    .locals_cells_stack_w
+                    .as_slice()
+                    .get(i)
+                    .copied()
+                    .unwrap_or(pyre_object::PY_NULL);
+                boxes.push(majit_trace::recorder::SnapshotTagged::Const(
+                    val as i64,
+                    Type::Ref,
+                ));
+            } else {
+                boxes.push(Self::opref_to_snapshot_tagged(OpRef::NONE, ctx));
+            }
+        }
+        boxes
     }
 
     /// pyjitpl.py:2597 virtualref_boxes parity.
