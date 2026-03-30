@@ -1013,40 +1013,25 @@ impl BlackholeInterpreter {
     ///
     /// Connect the return of values from the called frame to the
     /// 'xxx_call_yyy' instructions from the caller frame.
+    /// blackhole.py:1653 _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
-        // RPython: self.registers_i[ord(self.jitcode.code[self.position-1])] = result
-        if self.position > 0 && self.position - 1 < self.jitcode.code.len() {
-            let reg_idx = self.jitcode.code[self.position - 1] as usize;
-            if reg_idx < self.registers_i.len() {
-                self.registers_i[reg_idx] = result;
-            }
-        } else {
-            self.tmpreg_i = result;
-        }
+        // blackhole.py:1655-1656
+        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        self.registers_i[reg_idx] = result;
     }
 
     /// blackhole.py:1657 _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
-        if self.position > 0 && self.position - 1 < self.jitcode.code.len() {
-            let reg_idx = self.jitcode.code[self.position - 1] as usize;
-            if reg_idx < self.registers_r.len() {
-                self.registers_r[reg_idx] = result;
-            }
-        } else {
-            self.tmpreg_r = result;
-        }
+        // blackhole.py:1658-1659
+        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        self.registers_r[reg_idx] = result;
     }
 
     /// blackhole.py:1660 _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
-        if self.position > 0 && self.position - 1 < self.jitcode.code.len() {
-            let reg_idx = self.jitcode.code[self.position - 1] as usize;
-            if reg_idx < self.registers_f.len() {
-                self.registers_f[reg_idx] = result;
-            }
-        } else {
-            self.tmpreg_f = result;
-        }
+        // blackhole.py:1661-1662
+        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        self.registers_f[reg_idx] = result;
     }
 
     /// blackhole.py:1664 _done_with_this_frame
@@ -1899,20 +1884,17 @@ impl BlackholeInterpBuilder {
         self.pool.pop().unwrap_or_default()
     }
 
-    /// Return an interpreter to the pool after clearing its state.
-    ///
-    /// RPython: `BlackholeInterpBuilder.release_interp(interp)`
+    /// blackhole.py:253 release_interp
     pub fn release_interp(&mut self, mut interp: BlackholeInterpreter) {
-        interp.registers_i.clear();
-        interp.registers_r.clear();
-        interp.registers_f.clear();
+        // blackhole.py:254
+        interp.cleanup_registers();
+        // Pool management (RPython uses linked-list via .back; Rust uses Vec)
         interp.nextblackholeinterp = None;
         interp.runtime_stacks.clear();
         interp.merge_point_jitcode_pc = None;
         interp.reached_merge_point = false;
         interp.aborted = false;
         interp.got_exception = false;
-        interp.exception_last_value = 0;
         self.pool.push(interp);
     }
 
@@ -2010,17 +1992,16 @@ pub fn run_forever(
             }
         }
 
-        // blackhole.py:1759-1760
+        // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
-        match next.map(|b| *b) {
-            Some(caller) => bh = caller,
-            None => {
-                // Frame chain exhausted without JitException — should not
-                // happen in normal operation. Return void as fallback.
-                return JitException::DoneWithThisFrameVoid;
-            }
-        }
+        // blackhole.py:1760
+        // RPython: blackholeinterp = blackholeinterp.nextblackholeinterp
+        // In RPython this can be None, but _resume_mainloop on the
+        // bottommost frame always raises a JitException (via
+        // _done_with_this_frame or _exit_frame_with_exception), so
+        // this code is unreachable in normal operation.
+        bh = *next.expect("_run_forever: nextblackholeinterp is None (unreachable)");
     }
 }
 
@@ -2065,14 +2046,30 @@ pub fn convert_and_run_from_pyjitpl(
 /// Resume execution in the blackhole interpreter after a compiled
 /// code guard failure. Builds a frame chain from resume data, extracts
 /// exception from deadframe, and runs the chain to completion.
+///
+/// `resolve_jitcode` is `metainterp_sd.jitcodes[jitcode_pos]` in RPython.
 pub fn resume_in_blackhole(
     builder: &mut BlackholeInterpBuilder,
-    jitcodes: &[JitCode],
-    resumedata: &ResumeDataForBlackhole,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<JitCode>,
+    rd_numb: &[u8],
+    rd_consts: &[i64],
+    deadframe: &[i64],
     deadframe_exc: i64,
 ) -> JitException {
     // blackhole.py:1786-1792
-    let bh = blackhole_from_resumedata(builder, jitcodes, resumedata);
+    let null_alloc = crate::resume::NullAllocator;
+    let bh = crate::resume::blackhole_from_resumedata(
+        builder,
+        resolve_jitcode,
+        rd_numb,
+        rd_consts,
+        deadframe,
+        None, // rd_virtuals
+        None, // vrefinfo
+        None, // vinfo
+        None, // ginfo
+        &null_alloc,
+    );
 
     let Some(bh) = bh else {
         return JitException::DoneWithThisFrameVoid;
@@ -2083,77 +2080,6 @@ pub fn resume_in_blackhole(
 
     // blackhole.py:1795
     run_forever(builder, bh, current_exc)
-}
-
-/// Resume data structured for blackhole reconstruction.
-///
-/// Carries the information that `blackhole_from_resumedata` needs to
-/// rebuild the frame chain: frame PCs, register values per frame,
-/// and optionally virtualizable/virtualref sections.
-///
-/// This corresponds to `resumedescr` (ResumeGuardDescr) in RPython,
-/// which contains rd_numb, rd_consts, rd_virtuals, rd_pendingfields.
-#[derive(Debug, Clone, Default)]
-pub struct ResumeDataForBlackhole {
-    /// Per-frame: (jitcode_index, pc, register_values).
-    /// Frames are ordered outermost first (bottom of chain first).
-    pub frames: Vec<BlackholeFrameData>,
-}
-
-/// Data for one blackhole frame.
-#[derive(Debug, Clone)]
-pub struct BlackholeFrameData {
-    /// Index into the jitcodes array.
-    pub jitcode_index: usize,
-    /// Bytecode PC to resume at.
-    pub pc: usize,
-    /// Integer register values: (register_index, value).
-    pub registers_i: Vec<(usize, i64)>,
-    /// Reference register values: (register_index, value).
-    pub registers_r: Vec<(usize, i64)>,
-    /// Float register values: (register_index, value).
-    pub registers_f: Vec<(usize, i64)>,
-}
-
-/// resume.py:1312 blackhole_from_resumedata
-///
-/// Build a chain of BlackholeInterpreters from resume data.
-/// Returns the topmost (innermost) interpreter, linked to callers
-/// via `nextblackholeinterp`.
-pub fn blackhole_from_resumedata(
-    builder: &mut BlackholeInterpBuilder,
-    jitcodes: &[JitCode],
-    resumedata: &ResumeDataForBlackhole,
-) -> Option<BlackholeInterpreter> {
-    // resume.py:1332-1343
-    // Build chain outermost-first (bottom first), each new frame
-    // links to the previous as nextblackholeinterp.
-    let mut curbh: Option<Box<BlackholeInterpreter>> = None;
-
-    for frame_data in &resumedata.frames {
-        let mut nextbh = builder.acquire_interp();
-        nextbh.nextblackholeinterp = curbh;
-
-        // resume.py:1338-1340
-        let jitcode = jitcodes.get(frame_data.jitcode_index)?.clone();
-        nextbh.setposition(jitcode, frame_data.pc);
-
-        // resume.py:1341 — consume_one_section equivalent:
-        // Fill registers from resume data
-        for &(reg_idx, value) in &frame_data.registers_i {
-            nextbh.setarg_i(reg_idx, value);
-        }
-        for &(reg_idx, value) in &frame_data.registers_r {
-            nextbh.setarg_r(reg_idx, value);
-        }
-        for &(reg_idx, value) in &frame_data.registers_f {
-            nextbh.setarg_f(reg_idx, value);
-        }
-
-        curbh = Some(Box::new(nextbh));
-    }
-
-    curbh.map(|b| *b)
 }
 
 #[cfg(test)]

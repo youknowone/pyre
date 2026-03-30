@@ -5312,10 +5312,20 @@ pub trait VRefInfo {
 ///
 /// Corresponds to `jitdriver_sd.virtualizable_info` (VirtualizableInfo).
 pub trait VirtualizableInfo {
+    /// resume.py:1406 vinfo.get_total_size(virtualizable)
+    fn get_total_size(&self, virtualizable: i64) -> usize;
+
+    /// resume.py:1407 vinfo.reset_token_gcref(virtualizable)
+    fn reset_token_gcref(&self, virtualizable: i64);
+
     /// resume.py:1408 vinfo.write_from_resume_data_partial(virtualizable, self)
     ///
-    /// Read one field from the resume reader and write it into the virtualizable.
-    fn write_field_from_resume(&self, reader: &mut ResumeDataDirectReader);
+    /// Read fields from the resume reader and write them into the virtualizable.
+    fn write_from_resume_data_partial(
+        &self,
+        virtualizable: i64,
+        reader: &mut ResumeDataDirectReader,
+    );
 }
 
 /// RPython greenfield_info interface for resume data consumption.
@@ -5357,15 +5367,155 @@ pub struct ResumeDataDirectReader<'a> {
     // resume.py:910 virtuals_cache — lazy-allocated virtual objects
     virtuals_cache_ptr: Vec<i64>,
     virtuals_cache_int: Vec<i64>,
+
+    /// resume.py:1367 — CPU allocation backend.
+    /// RPython uses self.cpu (from metainterp_sd.cpu) for allocate_with_vtable etc.
+    allocator: &'a dyn BlackholeAllocator,
+}
+
+/// resume.py:1433-1456 CPU allocation interface for virtual materialization.
+///
+/// ResumeDataDirectReader calls these methods when TAGVIRTUAL values
+/// need to be lazily allocated during decode_ref/decode_int.
+pub trait BlackholeAllocator {
+    /// resume.py:1437 allocate_with_vtable
+    fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
+        let _ = descr_index;
+        0
+    }
+    /// resume.py:1441 allocate_struct
+    fn allocate_struct(&self, descr_index: u32) -> i64 {
+        let _ = descr_index;
+        0
+    }
+    /// resume.py:1444 allocate_array
+    fn allocate_array(&self, length: usize, descr_index: u32, clear: bool) -> i64 {
+        let _ = (length, descr_index, clear);
+        0
+    }
+    /// resume.py:1509 setfield
+    fn setfield(&self, struct_ptr: i64, field_descr: u32, value: i64) {
+        let _ = (struct_ptr, field_descr, value);
+    }
+    /// resume.py:1531 setarrayitem_int
+    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: u32) {
+        let _ = (array, index, value, descr);
+    }
+    /// resume.py:1535 setarrayitem_ref
+    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: u32) {
+        let _ = (array, index, value, descr);
+    }
+}
+
+/// Default no-op allocator.
+pub struct NullAllocator;
+impl BlackholeAllocator for NullAllocator {}
+
+impl VirtualInfo {
+    /// resume.py:576 kind attribute — REF for object/struct/array/string,
+    /// INT for raw buffers.
+    pub fn is_about_raw(&self) -> bool {
+        matches!(
+            self,
+            VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. }
+        )
+    }
+
+    /// resume.py:618/634/650 allocate(decoder, index)
+    ///
+    /// Allocate a virtual object and fill in its fields from the decoder.
+    /// Sets virtuals_cache_ptr[index] before filling fields (for recursive refs).
+    pub fn allocate(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64 {
+        match self {
+            VirtualInfo::VirtualObj {
+                descr_index,
+                fields,
+                ..
+            } => {
+                let obj = allocator.allocate_with_vtable(*descr_index);
+                decoder.virtuals_cache_ptr[index] = obj;
+                for (field_descr, source) in fields {
+                    let value = decoder.decode_field_source(source);
+                    allocator.setfield(obj, *field_descr, value);
+                }
+                obj
+            }
+            VirtualInfo::VStruct {
+                descr_index,
+                fields,
+                ..
+            } => {
+                let obj = allocator.allocate_struct(*descr_index);
+                decoder.virtuals_cache_ptr[index] = obj;
+                for (field_descr, source) in fields {
+                    let value = decoder.decode_field_source(source);
+                    allocator.setfield(obj, *field_descr, value);
+                }
+                obj
+            }
+            VirtualInfo::VArray { descr_index, items } => {
+                let length = items.len();
+                let array = allocator.allocate_array(length, *descr_index, true);
+                decoder.virtuals_cache_ptr[index] = array;
+                for (i, source) in items.iter().enumerate() {
+                    let value = decoder.decode_field_source(source);
+                    allocator.setarrayitem_int(array, i, value, *descr_index);
+                }
+                array
+            }
+            _ => {
+                decoder.virtuals_cache_ptr[index] = 0;
+                0
+            }
+        }
+    }
+
+    /// resume.py:701 VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
+    pub fn allocate_int(&self, decoder: &mut ResumeDataDirectReader, index: usize) -> i64 {
+        match self {
+            VirtualInfo::VRawBuffer { size, .. } => {
+                let buffer = *size as i64; // placeholder — real allocation needs CPU
+                decoder.virtuals_cache_int[index] = buffer;
+                buffer
+            }
+            VirtualInfo::VRawSlice { offset, parent } => {
+                let parent_val = decoder.decode_field_source(parent);
+                let result = parent_val + *offset;
+                decoder.virtuals_cache_int[index] = result;
+                result
+            }
+            _ => panic!("allocate_int called on non-raw virtual"),
+        }
+    }
 }
 
 impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py:1364 __init__
-    pub fn new(rd_numb: &'a [u8], rd_consts: &'a [i64], deadframe: &'a [i64]) -> Self {
+    pub fn new(
+        rd_numb: &'a [u8],
+        rd_consts: &'a [i64],
+        deadframe: &'a [i64],
+        all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
+        allocator: &'a dyn BlackholeAllocator,
+    ) -> Self {
         // resume.py:915-922 _init
         let mut resumecodereader = Reader::new(rd_numb);
         let items_resume_section = resumecodereader.next_item();
         let count = resumecodereader.next_item();
+
+        // resume.py:1368-1376
+        let (resume_after_guard_not_forced, virtuals_cache_ptr, virtuals_cache_int) =
+            if let Some((ptrs, ints)) = all_virtuals {
+                // resume.py:1373-1374: special case for GUARD_NOT_FORCED
+                (2, ptrs, ints)
+            } else {
+                (0, Vec::new(), Vec::new())
+            };
 
         ResumeDataDirectReader {
             resumecodereader,
@@ -5373,17 +5523,20 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe,
-            resume_after_guard_not_forced: 0,
+            resume_after_guard_not_forced,
             rd_virtuals: None,
-            virtuals_cache_ptr: Vec::new(),
-            virtuals_cache_int: Vec::new(),
+            virtuals_cache_ptr,
+            virtuals_cache_int,
+            allocator,
         }
     }
 
     /// resume.py:924 _prepare — init virtuals and pending fields.
     pub fn prepare(&mut self, rd_virtuals: Option<&'a [VirtualInfo]>) {
+        // resume.py:925
         self.prepare_virtuals(rd_virtuals);
-        // TODO: _prepare_pendingfields when pendingfields are supported
+        // resume.py:926 _prepare_pendingfields
+        // TODO: implement when pendingfields are supported
     }
 
     /// resume.py:1378 handling_async_forcing
@@ -5423,10 +5576,82 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.resumecodereader.items_read >= self.items_resume_section as usize
     }
 
+    /// resume.py:945 getvirtual_ptr
+    ///
+    /// Returns the index'th virtual, building it lazily if needed.
+    /// Note that this may be called recursively; that's why the
+    /// allocate() methods must fill in the cache as soon as they
+    /// have the object, before they fill its fields.
+    pub fn getvirtual_ptr(&mut self, index: usize) -> i64 {
+        // resume.py:950
+        assert!(
+            !self.virtuals_cache_ptr.is_empty(),
+            "virtuals_cache is None"
+        );
+        // resume.py:951-952
+        let v = self.virtuals_cache_ptr[index];
+        if v != 0 {
+            return v;
+        }
+        // resume.py:953-955: lazy allocation
+        assert!(self.rd_virtuals.is_some(), "rd_virtuals is None");
+        // Safety: rd_virtuals is an immutable slice reference that we need to
+        // read while mutating virtuals_cache through self. The slice data is
+        // never modified by allocate(), only the cache vectors are written.
+        let rd_virtuals_ptr = self.rd_virtuals.unwrap().as_ptr();
+        let rd_virtuals_len = self.rd_virtuals.unwrap().len();
+        let vinfo = unsafe { &*rd_virtuals_ptr.add(index) };
+        debug_assert!(index < rd_virtuals_len);
+        let allocator = self.allocator as *const dyn BlackholeAllocator;
+        let v = vinfo.allocate(self, index, unsafe { &*allocator });
+        debug_assert_eq!(v, self.virtuals_cache_ptr[index], "resume.py: bad cache");
+        v
+    }
+
+    /// resume.py:958 getvirtual_int
+    pub fn getvirtual_int(&mut self, index: usize) -> i64 {
+        // resume.py:959
+        assert!(
+            !self.virtuals_cache_int.is_empty(),
+            "virtuals_cache is None"
+        );
+        // resume.py:960-961
+        let v = self.virtuals_cache_int[index];
+        if v != 0 {
+            return v;
+        }
+        // resume.py:962-966
+        assert!(self.rd_virtuals.is_some(), "rd_virtuals is None");
+        let rd_virtuals_ptr = self.rd_virtuals.unwrap().as_ptr();
+        let vinfo = unsafe { &*rd_virtuals_ptr.add(index) };
+        assert!(vinfo.is_about_raw(), "getvirtual_int: not a raw virtual");
+        let v = vinfo.allocate_int(self, index);
+        debug_assert_eq!(v, self.virtuals_cache_int[index], "resume.py: bad cache");
+        v
+    }
+
+    /// resume.py:969 force_all_virtuals
+    pub fn force_all_virtuals(&mut self) -> (&[i64], &[i64]) {
+        if let Some(rd_virtuals) = self.rd_virtuals {
+            for i in 0..rd_virtuals.len() {
+                let rd_virtual = &rd_virtuals[i];
+                if rd_virtual.is_about_raw() {
+                    // resume.py:977: kind == INT
+                    self.getvirtual_int(i);
+                } else {
+                    // resume.py:976: kind == REF
+                    self.getvirtual_ptr(i);
+                }
+            }
+        }
+        (&self.virtuals_cache_ptr, &self.virtuals_cache_int)
+    }
+
     /// resume.py:983 _prepare_virtuals
     fn prepare_virtuals(&mut self, virtuals: Option<&'a [VirtualInfo]>) {
         if let Some(v) = virtuals {
             self.rd_virtuals = Some(v);
+            // resume.py:990-991
             self.virtuals_cache_ptr = vec![0; v.len()];
             self.virtuals_cache_int = vec![0; v.len()];
         }
@@ -5498,57 +5723,39 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1386 consume_virtualref_info
-    ///
-    /// Decode a list of references containing (virtual, vref) pairs.
-    /// In RPython, vrefinfo.continue_tracing(vref, virtual) is called
-    /// for each pair to store the virtual inside the vref.
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
         let size = self.resumecodereader.next_item();
-        if size == 0 {
+        // resume.py:1390
+        if vrefinfo.is_none() || size == 0 {
+            assert!(size == 0, "vrefinfo is None but vref size != 0");
             return;
         }
-        match vrefinfo {
-            None => {
-                // resume.py:1390 — assert size == 0
-                debug_assert_eq!(size, 0, "vrefinfo is None but size != 0");
-            }
-            Some(info) => {
-                // resume.py:1393-1397
-                for _i in 0..size {
-                    let virtual_ref = self.next_ref();
-                    let vref = self.next_ref();
-                    info.continue_tracing(vref, virtual_ref);
-                }
-            }
+        let vrefinfo = vrefinfo.unwrap();
+        // resume.py:1393-1397
+        for _i in 0..size {
+            let virtual_val = self.next_ref();
+            let vref = self.next_ref();
+            // resume.py:1397
+            vrefinfo.continue_tracing(vref, virtual_val);
         }
     }
 
     /// resume.py:1399 consume_vable_info
-    ///
-    /// Load the virtualizable from resume data and restore its fields.
     pub fn consume_vable_info(&mut self, vinfo: &dyn VirtualizableInfo, vable_size: i32) {
         // resume.py:1403
-        debug_assert!(vable_size > 0);
+        assert!(vable_size > 0);
         // resume.py:1404
-        let _virtualizable = self.next_ref();
-        // resume.py:1406-1408
-        // vinfo.reset_token_gcref(virtualizable)
-        // vinfo.write_from_resume_data_partial(virtualizable, self)
-        //
-        // Read the remaining vable_size - 1 items (the virtualizable
-        // itself was item #1, the fields are items #2..vable_size).
-        for _i in 0..(vable_size - 1) {
-            // Read and apply each field. The exact dispatch depends
-            // on the virtualizable layout.
-            vinfo.write_field_from_resume(self);
-        }
+        let virtualizable = self.next_ref();
+        // resume.py:1406
+        assert_eq!(vinfo.get_total_size(virtualizable) as i32, vable_size - 1);
+        // resume.py:1407
+        vinfo.reset_token_gcref(virtualizable);
+        // resume.py:1408
+        vinfo.write_from_resume_data_partial(virtualizable, self);
     }
 
     /// resume.py:1424 consume_vref_and_vable
-    ///
-    /// Consume the virtualizable, greenfield, and virtualref sections
-    /// from the resume data. Called before the per-frame sections.
     pub fn consume_vref_and_vable(
         &mut self,
         vrefinfo: Option<&dyn VRefInfo>,
@@ -5561,12 +5768,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
-                if vable_size > 0 {
-                    self.consume_vable_info(vi, vable_size);
-                }
-            } else if vable_size > 0 {
-                // No vinfo but vable_size > 0: skip the items
-                self.resumecodereader.jump(vable_size as usize);
+                self.consume_vable_info(vi, vable_size);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
@@ -5575,7 +5777,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1431
             self.consume_virtualref_info(vrefinfo);
         } else {
-            // resume.py:1433-1435 — GUARD_NOT_FORCED path: skip all
+            // resume.py:1433-1435
             self.resumecodereader.jump(vable_size as usize);
             let vref_size = self.resumecodereader.next_item();
             self.resumecodereader.jump(vref_size as usize * 2);
@@ -5583,13 +5785,13 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1552 decode_int
-    pub fn decode_int(&self, tagged: i16) -> i64 {
+    pub fn decode_int(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
                 // resume.py:1555
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts.get(idx).copied().unwrap_or(0)
+                self.consts[idx]
             }
             TAGINT => {
                 // resume.py:1557
@@ -5597,10 +5799,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             TAGVIRTUAL => {
                 // resume.py:1559
-                self.virtuals_cache_int
-                    .get(num as usize)
-                    .copied()
-                    .unwrap_or(0)
+                self.getvirtual_int(num as usize)
             }
             TAGBOX => {
                 // resume.py:1561-1564
@@ -5608,30 +5807,28 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+                self.deadframe[idx as usize]
             }
             _ => unreachable!("bad tag: {tag}"),
         }
     }
 
     /// resume.py:1566 decode_ref
-    pub fn decode_ref(&self, tagged: i16) -> i64 {
+    pub fn decode_ref(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
                 // resume.py:1569-1571
                 if tagged_eq(tagged, NULLREF) {
-                    return 0; // null pointer
+                    return 0; // ConstPtr.value (null pointer)
                 }
+                // resume.py:1571
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts.get(idx).copied().unwrap_or(0)
+                self.consts[idx]
             }
             TAGVIRTUAL => {
                 // resume.py:1573
-                self.virtuals_cache_ptr
-                    .get(num as usize)
-                    .copied()
-                    .unwrap_or(0)
+                self.getvirtual_ptr(num as usize)
             }
             TAGBOX => {
                 // resume.py:1575-1578
@@ -5639,37 +5836,50 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+                self.deadframe[idx as usize]
             }
             _ => {
-                // TAGINT not valid for refs
-                debug_assert!(false, "decode_ref: unexpected tag {tag}");
-                0
+                // resume.py:1566 — only TAGCONST, TAGVIRTUAL, TAGBOX valid for refs
+                panic!("decode_ref: unexpected tag {tag}")
             }
         }
     }
 
     /// resume.py:1580 decode_float
-    pub fn decode_float(&self, tagged: i16) -> i64 {
+    pub fn decode_float(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
                 // resume.py:1583
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts.get(idx).copied().unwrap_or(0)
+                self.consts[idx]
             }
             TAGBOX => {
-                // resume.py:1586-1588
+                // resume.py:1585-1588
                 let mut idx = num;
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe.get(idx as usize).copied().unwrap_or(0)
+                self.deadframe[idx as usize]
             }
             _ => {
-                debug_assert!(false, "decode_float: unexpected tag {tag}");
-                0
+                // resume.py:1580 — only TAGCONST and TAGBOX valid for floats
+                panic!("decode_float: unexpected tag {tag}")
             }
+        }
+    }
+
+    /// Decode a VirtualFieldSource to a concrete i64 value.
+    ///
+    /// This is used by VirtualInfo.allocate() to resolve field values
+    /// when materializing virtual objects.
+    pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
+        match source {
+            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::Constant(value) => *value,
+            ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
+            ResumeValueSource::Uninitialized => 0,
+            ResumeValueSource::Unavailable => 0,
         }
     }
 
@@ -5684,21 +5894,24 @@ impl<'a> ResumeDataDirectReader<'a> {
 /// Build a chain of BlackholeInterpreters from encoded resume data.
 /// Returns the topmost (innermost) interpreter.
 ///
-/// This is the primary entry point for reconstructing blackhole state
-/// from a guard failure's resume data.
-pub fn blackhole_from_resumedata(
+/// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup.
+/// In RPython, `metainterp_sd.jitcodes` is a pre-compiled array.
+/// In majit, this is typically backed by jitcode_factory or a pre-built table.
+pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    jitcodes: &[crate::jitcode::JitCode],
-    rd_numb: &[u8],
-    rd_consts: &[i64],
-    deadframe: &[i64],
-    rd_virtuals: Option<&[VirtualInfo]>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::jitcode::JitCode>,
+    rd_numb: &'a [u8],
+    rd_consts: &'a [i64],
+    deadframe: &'a [i64],
+    rd_virtuals: Option<&'a [VirtualInfo]>,
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
+    allocator: &'a dyn BlackholeAllocator,
 ) -> Option<BlackholeInterpreter> {
     // resume.py:1317-1321
-    let mut resumereader = ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe);
+    let mut resumereader =
+        ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
 
     // resume.py:1324
     resumereader.prepare(rd_virtuals);
@@ -5717,7 +5930,8 @@ pub fn blackhole_from_resumedata(
 
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
-        let jitcode = jitcodes.get(jitcode_pos as usize)?.clone();
+        // resume.py:1339: jitcode = jitcodes[jitcode_pos]
+        let jitcode = resolve_jitcode(jitcode_pos, pc)?;
         nextbh.setposition(jitcode, pc as usize);
 
         // resume.py:1341
@@ -5742,12 +5956,15 @@ pub fn force_from_resumedata<'a>(
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
+    allocator: &'a dyn BlackholeAllocator,
 ) -> ResumeDataDirectReader<'a> {
     // resume.py:1347-1348
-    let mut resumereader = ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe);
+    let mut resumereader =
+        ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
-    // resume.py:1351 — caller can call force_all_virtuals() on the returned reader
+    // resume.py:1351
+    resumereader.force_all_virtuals();
     resumereader
 }

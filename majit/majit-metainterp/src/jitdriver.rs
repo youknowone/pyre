@@ -1133,21 +1133,44 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
 
-            // compile.py:711-715: resume_in_blackhole
-            //
-            // Try the blackhole interpreter with independent registers.
-            // This avoids the double-mutation problem with shared state.
-            let bh_result =
-                self.blackhole_resume_jitcode(env, guard_resume_pc, 0, &raw_values, num_inputs);
-            if let Some(ref bh) = bh_result {
-                if bh.reached_merge_point {
-                    if let Some(merge_pc) = bh.merge_point_jitcode_pc {
-                        return Some(merge_pc);
-                    }
+            // compile.py:711 resume_in_blackhole
+            if let Some(rd_numb) = exit_layout.rd_numb.as_ref() {
+                let rd_consts_i64: Vec<i64> = exit_layout
+                    .rd_consts
+                    .as_ref()
+                    .map(|c| c.iter().map(|(v, _)| *v).collect())
+                    .unwrap_or_default();
+
+                // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
+                let resolve_jitcode = |_pos: i32, pc: i32| -> Option<crate::jitcode::JitCode> {
+                    let factory = self.jitcode_factory.as_ref()?;
+                    factory(env, pc as usize, 0)
+                };
+
+                let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                let null_alloc = crate::resume::NullAllocator;
+                let bh = crate::resume::blackhole_from_resumedata(
+                    &mut bh_builder,
+                    &resolve_jitcode,
+                    rd_numb,
+                    &rd_consts_i64,
+                    &raw_values,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &null_alloc,
+                );
+                if let Some(bh) = bh {
+                    let exc =
+                        crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
+                    let _jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    // RPython: resume_in_blackhole completes via JitException.
+                    // No shared-state restoration after blackhole.
+                    return Some(target_pc);
                 }
             }
 
-            // Fallback: return to loop header.
             return Some(target_pc);
         }
 
@@ -2527,42 +2550,50 @@ impl<S: JitState> JitDriver<S> {
                 return Some(resume_pc);
             }
 
-            // compile.py:711-715: resume_in_blackhole
+            // compile.py:711 resume_in_blackhole
             //
-            // Try the blackhole interpreter first. If jitcode_factory
-            // produces a JitCode for the guard_resume_pc, run the
-            // blackhole from that point with independent registers.
-            // This avoids the double-mutation problem with shared state.
-            let bh_result = self.blackhole_resume_jitcode(
-                env,
-                guard_resume_pc,
-                0, // resume_op
-                &raw_values,
-                num_inputs,
-            );
+            // RPython: resume_in_blackhole(metainterp_sd, jitdriver_sd, resumedescr, deadframe)
+            // Uses rd_numb/rd_consts to build blackhole frame chain.
+            // After blackhole completes, does NOT restore shared state.
+            if let Some(rd_numb) = exit_layout.rd_numb.as_ref() {
+                let rd_consts_i64: Vec<i64> = exit_layout
+                    .rd_consts
+                    .as_ref()
+                    .map(|c| c.iter().map(|(v, _)| *v).collect())
+                    .unwrap_or_default();
 
-            if let Some(bh) = bh_result {
-                // Blackhole ran to completion. Restore state from
-                // blackhole's final register values, then return.
-                if bh.reached_merge_point {
-                    // Blackhole reached merge_point — interpreter can
-                    // resume at the merge point PC.
-                    if let Some(merge_pc) = bh.merge_point_jitcode_pc {
-                        // Restore state from on_guard_failure as fallback
-                        // to set interpreter state consistent with blackhole output.
-                        let _ = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
-                        materialize_pending_fields(&exit_layout, &raw_values);
-                        self.sync_after(state, &result_meta, descriptor.as_ref());
-                        return Some(merge_pc);
-                    }
+                // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
+                let jitcode_factory_ref = self.jitcode_factory.as_ref();
+                let resolve_jitcode = |_pos: i32, pc: i32| -> Option<crate::jitcode::JitCode> {
+                    let factory = jitcode_factory_ref?;
+                    factory(env, pc as usize, 0)
+                };
+
+                let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                let null_alloc = crate::resume::NullAllocator;
+                let bh = crate::resume::blackhole_from_resumedata(
+                    &mut bh_builder,
+                    &resolve_jitcode,
+                    rd_numb,
+                    &rd_consts_i64,
+                    &raw_values,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &null_alloc,
+                );
+                if let Some(bh) = bh {
+                    let exc =
+                        crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
+                    let _jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
+                    // RPython: resume_in_blackhole completes via JitException.
+                    // No shared-state restoration after blackhole.
+                    return Some(target_pc);
                 }
-                // Blackhole finished without reaching merge_point.
-                // Fall through to legacy restore path.
             }
 
-            // Fallback: legacy shared-state restoration.
-            // This path will be removed once all interpreters generate
-            // jitcode for the blackhole.
+            // Legacy fallback: no rd_numb or jitcode resolution failed.
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
             materialize_pending_fields(&exit_layout, &raw_values);
