@@ -264,6 +264,10 @@ pub struct OptContext {
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
+    /// compile.rs value_types parity: OpRef → Type for all defined values
+    /// (inputargs + operation results). Used by store_final_boxes_in_guard
+    /// to infer fail_arg types correctly for OpRefs from earlier phases.
+    pub value_types: HashMap<u32, majit_ir::Type>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -438,6 +442,7 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
+            value_types: HashMap::new(),
             last_guard_idx: None,
         }
     }
@@ -488,6 +493,7 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
+            value_types: HashMap::new(),
             last_guard_idx: None,
         }
     }
@@ -559,6 +565,11 @@ impl OptContext {
             }
         }
 
+        // Track OpRef → Type for fail_arg_types inference
+        // (compile.rs value_types parity).
+        if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
+            self.value_types.insert(op.pos.0, op.result_type());
+        }
         self.new_operations.push(op);
         pos_ref
     }
@@ -1997,9 +2008,12 @@ impl OptContext {
         // resume.py:447,450-451: patch and store.
         numb_state.patch(1, liveboxes.len() as i32);
         op.store_final_boxes(liveboxes);
-        // Consumer switchover: recompute fail_arg_types on final liveboxes.
-        // resume.py:447 — after store_final_boxes, liveboxes = fail_args.
-        if virtual_slots.is_empty() {
+        // RPython Box type parity: recompute fail_arg_types on final
+        // liveboxes. In RPython, Box objects carry their type intrinsically.
+        // In pyre, fail_arg_types must be recomputed EVERY time
+        // store_final_boxes replaces fail_args — virtual expansion in
+        // optimizer.rs may have set stale types for the old fail_args.
+        {
             if let Some(ref fa) = op.fail_args {
                 op.fail_arg_types = Some(
                     fa.iter()
@@ -2017,10 +2031,12 @@ impl OptContext {
                                     _ => majit_ir::Type::Int,
                                 }
                             } else {
-                                self.new_operations
-                                    .iter()
-                                    .find(|o| o.pos == *opref)
-                                    .map(|o| o.result_type())
+                                // compile.rs value_types parity: check the
+                                // value_types map first (covers inputargs +
+                                // all emitted operations from all phases).
+                                self.value_types
+                                    .get(&opref.0)
+                                    .copied()
                                     .unwrap_or(majit_ir::Type::Int)
                             }
                         })

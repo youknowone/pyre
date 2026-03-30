@@ -1245,7 +1245,33 @@ fn execute_assembler(
                     frame.fix_array_ptrs();
                     return None;
                 }
-                // Fall through to blackhole resume below
+                // Fall through to blackhole resume below.
+                // Validate restored frame state before blackhole dispatch.
+                // Incomplete rd_numb may restore invalid ni/vsd.
+                let code = unsafe { &*frame.code };
+                let code_len = code.instructions.len();
+                let frame_size = frame.locals_cells_stack_w.len();
+                if frame.next_instr > code_len || frame.valuestackdepth > frame_size {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] guard restore invalid state for key={}: ni={} code_len={} vsd={} frame_size={}, restoring pre-entry",
+                            green_key,
+                            frame.next_instr,
+                            code_len,
+                            frame.valuestackdepth,
+                            frame_size
+                        );
+                    }
+                    driver.invalidate_loop(green_key);
+                    frame.next_instr = saved_ni;
+                    frame.valuestackdepth = saved_vsd;
+                    let restore_len = saved_locals.len().min(frame_size);
+                    for i in 0..restore_len {
+                        frame.locals_cells_stack_w[i] = saved_locals[i];
+                    }
+                    frame.fix_array_ptrs();
+                    return None;
+                }
             }
         }
     }
@@ -1260,19 +1286,29 @@ fn execute_assembler(
                 match crate::call_jit::resume_in_blackhole(frame, vals, entry_pc) {
                     crate::call_jit::BlackholeResult::ContinueRunningNormally => {
                         // RPython parity: blackhole reached merge point and
-                        // wrote back frame state. Check if the writeback
-                        // produced null locals (incomplete rd_numb).
+                        // wrote back frame state. Validate the restored state
+                        // to catch incomplete rd_numb (wrong pc, vsd, or null
+                        // locals from missing snapshot coverage).
                         let code = unsafe { &*frame.code };
                         let nlocals = code.varnames.len();
+                        let code_len = code.instructions.len();
+                        let frame_size = frame.locals_cells_stack_w.len();
                         let has_null_local =
                             (0..nlocals).any(|i| frame.locals_cells_stack_w[i].is_null());
-                        if has_null_local {
-                            // Writeback produced null locals — restore pre-entry
-                            // frame and invalidate.
+                        let ni_invalid = frame.next_instr > code_len;
+                        let vsd_invalid = frame.valuestackdepth > frame_size;
+                        if has_null_local || ni_invalid || vsd_invalid {
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit] blackhole writeback has null locals for key={}, restoring",
-                                    green_key
+                                    "[jit] blackhole writeback invalid for key={}: null_local={} ni_invalid={} (ni={} code_len={}) vsd_invalid={} (vsd={} frame_size={}), restoring",
+                                    green_key,
+                                    has_null_local,
+                                    ni_invalid,
+                                    frame.next_instr,
+                                    code_len,
+                                    vsd_invalid,
+                                    frame.valuestackdepth,
+                                    frame_size
                                 );
                             }
                             driver.invalidate_loop(green_key);
@@ -1289,9 +1325,12 @@ fn execute_assembler(
                         // RPython compile.py:710: blackhole resume succeeds.
                         // RPython does NOT invalidate — entry stays valid,
                         // guard failure counter accumulates, eventually
-                        // triggers bridge compilation. Pyre workaround:
-                        // bridge guard rd_numb still incomplete for some
-                        // benchmarks. Invalidate until rd_numb is complete.
+                        // triggers bridge compilation.
+                        //
+                        // WORKAROUND: some called functions have guards with
+                        // fail_args/rd_numb slot count mismatch (resume_pos=-1
+                        // path). Invalidate until all guard resume data is
+                        // consistent.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }

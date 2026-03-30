@@ -1361,6 +1361,12 @@ impl Optimizer {
             ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
         }
 
+        // Seed value_types with inputarg types so store_final_boxes_in_guard
+        // can correctly infer types for inputarg OpRefs (compile.rs parity).
+        for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
+            ctx.value_types.insert(i as u32, tp);
+        }
+
         // RPython resume.py parity: pass snapshot_boxes and constant_types
         // to OptContext so emit() can call store_final_boxes_in_guard inline
         // at each guard emission (not post-assembly).
