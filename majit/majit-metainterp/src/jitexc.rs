@@ -5,6 +5,33 @@
 
 use majit_ir::{GcRef, Value};
 
+/// jitexc.py:10 JitException — base class for all JIT control flow.
+///
+/// In RPython these are Python exceptions. In Rust we model them as an enum
+/// returned via `Result::Err(JitException)` from blackhole execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JitException {
+    /// jitexc.py:17 DoneWithThisFrameVoid
+    DoneWithThisFrameVoid,
+    /// jitexc.py:21 DoneWithThisFrameInt
+    DoneWithThisFrameInt(i64),
+    /// jitexc.py:29 DoneWithThisFrameRef
+    DoneWithThisFrameRef(GcRef),
+    /// jitexc.py:37 DoneWithThisFrameFloat
+    DoneWithThisFrameFloat(f64),
+    /// jitexc.py:45 ExitFrameWithExceptionRef
+    ExitFrameWithExceptionRef(GcRef),
+    /// jitexc.py:53 ContinueRunningNormally
+    ContinueRunningNormally {
+        green_int: Vec<i64>,
+        green_ref: Vec<i64>,
+        green_float: Vec<i64>,
+        red_int: Vec<i64>,
+        red_ref: Vec<i64>,
+        red_float: Vec<i64>,
+    },
+}
+
 /// Result of a completed trace execution.
 ///
 /// Mirrors DoneWithThisFrame{Void,Int,Ref,Float} in jitexc.py.

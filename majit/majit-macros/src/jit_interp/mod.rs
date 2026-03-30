@@ -927,6 +927,8 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     {
                         return majit_metainterp::TraceAction::CloseLoop;
                     }
+                    // pyjitpl.py:2594: record frame.pc for capture_resumedata.
+                    __ctx.last_traced_pc = __pc;
                     let __result = #trace_fn_name(__ctx, __sym, __env, __pc, __pool, __sel);
                     __sym.trace_started = true;
                     // RPython order: debug_merge_point (force_finish) runs
