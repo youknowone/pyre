@@ -228,13 +228,6 @@ impl Trace {
         }
     }
 
-    /// Set rd_resume_position on a specific op by index.
-    pub fn set_op_resume_position(&mut self, op_index: usize, snapshot_id: i32) {
-        if let Some(op) = self.ops.get_mut(op_index) {
-            op.rd_resume_position = snapshot_id;
-        }
-    }
-
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
