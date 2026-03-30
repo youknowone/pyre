@@ -85,6 +85,10 @@ thread_local! {
         );
         // resume.py:1367 — BlackholeAllocator for virtual materialization.
         d.register_blackhole_allocator(PyreBlackholeAllocator);
+        // warmspot.py:1039 handle_jitexception_from_blackhole parity:
+        // portal_runner is called when ContinueRunningNormally is raised
+        // at a recursive portal level during blackhole execution.
+        d.register_portal_runner(pyre_portal_runner);
         // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
         d.set_is_recursive(true);
         // warmstate.py:259 trace_eagerness=200 (RPython default).
@@ -800,6 +804,64 @@ pub(crate) fn portal_runner_for_force(frame: &mut PyFrame) -> PyResult {
     handle_jitexception(frame)
 }
 
+/// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
+///
+/// Called from handle_jitexception_in_portal (via portal_runner callback)
+/// when ContinueRunningNormally is raised at a recursive portal level.
+/// Extracts the red_ref values (frame locals as PyObjectRef pointers)
+/// and calls the portal function (eval_with_jit) with those values.
+///
+/// Returns Ok((return_type, value)) or Err(JitException) if the portal
+/// itself raises a JitException (warmspot.py:979-980 loop back).
+fn pyre_portal_runner(
+    exc: &majit_metainterp::jitexc::JitException,
+) -> Result<(majit_metainterp::blackhole::BhReturnType, i64), majit_metainterp::jitexc::JitException>
+{
+    use majit_metainterp::blackhole::BhReturnType;
+    use majit_metainterp::jitexc::JitException;
+
+    let JitException::ContinueRunningNormally { red_ref, .. } = exc else {
+        // Not ContinueRunningNormally — shouldn't reach here.
+        return Ok((BhReturnType::Void, 0));
+    };
+
+    // warmspot.py:972-975: extract args from ContinueRunningNormally.
+    // pyre's red args: [frame_ptr, next_instr, vsd, locals...]
+    // red_ref[0] is the frame pointer.
+    if red_ref.is_empty() {
+        return Ok((BhReturnType::Void, 0));
+    }
+
+    let frame_ptr = red_ref[0] as *mut PyFrame;
+    if frame_ptr.is_null() {
+        return Ok((BhReturnType::Void, 0));
+    }
+
+    // warmspot.py:976-978: result = portal_ptr(*args)
+    // In pyre, this means running the frame through eval_with_jit.
+    let frame = unsafe { &mut *frame_ptr };
+    match crate::eval::eval_with_jit(frame) {
+        Ok(result) => {
+            // warmspot.py:982: result = unspecialize_value(result)
+            Ok((BhReturnType::Ref, result as i64))
+        }
+        Err(py_err) => {
+            // blackhole.py:1773-1775: regular exception from portal_ptr.
+            // _handle_jitexception catches it with `except Exception as e`
+            // and converts via get_llexception(cpu, e) → lle.
+            // This lle becomes current_exc in the blackhole chain.
+            //
+            // In Rust, we return Err(ExitFrameWithExceptionRef) which
+            // handle_jitexception_in_portal converts to Err(exc_value),
+            // and handle_jitexception sets current_exc = exc_value.
+            let exc_obj = py_err.exc_object;
+            Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
+                exc_obj as usize,
+            )))
+        }
+    }
+}
+
 /// RPython warmspot.py:961-1007 handle_jitexception parity.
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
@@ -847,6 +909,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let env = PyreEnv;
     let (driver, info) = driver_pair();
     let is_portal: bool = &*code.obj_name != "<module>";
+
     loop {
         if frame.next_instr >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
@@ -1246,19 +1309,15 @@ fn execute_assembler(
                 if let Some(ref frames) = guard_frames {
                     match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            // TODO(parity): RPython does NOT invalidate or
-                            // validate here — blackhole writeback is correct
-                            // by construction (complete rd_numb). Remove both
-                            // validation and invalidation after rd_numb parity.
-                            let code = unsafe { &*frame.code };
-                            let code_len = code.instructions.len();
-                            let frame_size = frame.locals_cells_stack_w.len();
-                            if frame.next_instr > code_len || frame.valuestackdepth > frame_size {
-                                driver.invalidate_loop(green_key);
-                                frame.next_instr = saved_ni;
-                                frame.valuestackdepth = saved_vsd;
-                                return None;
-                            }
+                            // compile.py:701-716: resume_in_blackhole succeeds.
+                            // RPython does NOT invalidate — compiled loop stays
+                            // valid. Guard failure counter accumulates for bridge
+                            // compilation (compile.py:738 must_compile).
+                            //
+                            // Pyre: bridge tracing fails (compiled=false at step 0)
+                            // for some benchmarks, causing infinite guard-failure
+                            // loops without invalidation. Keep invalidation as
+                            // safety net until bridge tracing is fixed.
                             driver.invalidate_loop(green_key);
                             Some(LoopResult::ContinueRunningNormally)
                         }
@@ -2384,6 +2443,14 @@ pub(crate) fn decode_and_restore_guard_failure(
 fn build_blackhole_frames_from_deadframe(raw_values: &[i64], exit_layout: &CompiledExitLayout) {
     let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][deadframe] fail_index={} rd_numb_len={} exit_types={}",
+            exit_layout.fail_index,
+            rd_numb.len(),
+            exit_layout.exit_types.len(),
+        );
+    }
     let resumed_frames = if !rd_numb.is_empty() {
         build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
     } else {

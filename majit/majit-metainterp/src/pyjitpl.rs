@@ -2980,6 +2980,12 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
+        // finish_and_compile traces use function-entry bridges where
+        // adapt-live changes inputarg types (Ref→Int) after tracing.
+        // The trace's snapshot types (pre-adapt) don't match the compiled
+        // code's types (post-adapt), so snapshot-based numbering would
+        // produce wrong exit_types → GC corruption. Use no-snapshot
+        // fallback which derives types from the compiled fail_args.
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let mut updated_constant_types = constant_types.clone();

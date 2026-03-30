@@ -3111,12 +3111,30 @@ impl MIFrame {
         let next_instr = ctx.const_int(resume_pc as i64);
         let vsd_opref = ctx.const_int(stack_depth as i64);
 
-        // pyjitpl.py:2579: capture_resumedata unconditionally.
-        // Snapshot boxes = active boxes (no header), using raw symbolic OpRefs.
+        // pyjitpl.py:2579 + pyjitpl.py:214 parity: capture_resumedata
+        // with liveness-filtered active boxes. Dead registers are skipped
+        // entirely — recovery maps compact positions back via liveness table.
+        let code_ptr = unsafe { (*self.sym().jitcode).code };
+        let live = if !code_ptr.is_null() {
+            Some(liveness_for(code_ptr))
+        } else {
+            None
+        };
+        let live_pc = resume_pc;
         let mut active_boxes: Vec<OpRef> =
             Vec::with_capacity(local_values.len() + stack_values.len());
-        active_boxes.extend_from_slice(&local_values);
-        active_boxes.extend_from_slice(&stack_values);
+        for (idx, &slot) in local_values.iter().enumerate() {
+            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
+            if is_live {
+                active_boxes.push(slot);
+            }
+        }
+        for (idx, &slot) in stack_values.iter().enumerate() {
+            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
+            if is_live {
+                active_boxes.push(slot);
+            }
+        }
         let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
 
         // pyjitpl.py:2588: vable_array = virtualizable_boxes.

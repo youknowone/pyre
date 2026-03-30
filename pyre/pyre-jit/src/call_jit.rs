@@ -884,10 +884,23 @@ pub fn resume_in_blackhole(
         // → liveness.py:170 LivenessIterator: compact values consumed
         //   in liveness order. Dead registers keep setposition() defaults.
         let live = pyre_jit_trace::state::liveness_for(section.code);
-        let live_pc = section.py_pc;
-        let n_live = (0..nlocals)
+        // resume.py:1383: info = blackholeinterp.get_current_position_info()
+        // The liveness PC must match the encoder's orgpc (= snapshot PC
+        // stored in rd_numb). section.rd_numb_pc is this value.
+        // section.py_pc may differ for after_residual_call guards
+        // (encoder uses fallthrough_pc, not orgpc).
+        let live_pc = section.rd_numb_pc.unwrap_or(section.py_pc);
+        // resume.py:1017-1026 _prepare_next_section: count BOTH
+        // live locals AND live stack slots — the encoder (pyjitpl.py:177
+        // get_list_of_active_boxes) compacts both in liveness order.
+        let n_live_locals = (0..nlocals)
             .filter(|&i| live.is_local_live(live_pc, i))
             .count();
+        let max_stack = vsd.saturating_sub(nlocals);
+        let n_live_stack = (0..max_stack)
+            .filter(|&i| live.is_stack_live(live_pc, i))
+            .count();
+        let n_live = n_live_locals + n_live_stack;
         let n_vals = section.values.len().saturating_sub(3);
         // If liveness live count matches the value count, the encoder
         // compacted by liveness and we can use liveness-based filling.
@@ -896,7 +909,8 @@ pub fn resume_in_blackhole(
         let use_liveness = n_live == n_vals;
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][liveness-fill] py_pc={} nlocals={} live={} vals={} mode={}",
+                "[jit][liveness-fill] py_pc={} live_pc={} nlocals={} live={} vals={} mode={}",
+                section.py_pc,
                 live_pc,
                 nlocals,
                 n_live,
@@ -918,7 +932,6 @@ pub fn resume_in_blackhole(
                     val_idx += 1;
                 }
             }
-            let max_stack = vsd.saturating_sub(nlocals);
             for i in 0..max_stack {
                 if live.is_stack_live(live_pc, i) {
                     if let Some(val) = section.values.get(val_idx) {
@@ -969,7 +982,13 @@ pub fn resume_in_blackhole(
         bh.run();
 
         if bh.reached_merge_point {
-            // Write back to the frame that owns this merge point.
+            // PYRE-ONLY: merge point writeback.
+            // RPython's blackhole has NO merge point — it runs to
+            // RETURN_VALUE. pyre sets merge_point_jitcode_pc so the
+            // blackhole exits early at the loop header, and the
+            // interpreter re-enters compiled code on the next iteration.
+            // This writeback is the pyre equivalent of RPython's
+            // ContinueRunningNormally exception carrying all values.
             let frame_ptr = bh.registers_i.get(3).copied().unwrap_or(0) as *mut PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &mut *frame_ptr };
