@@ -1274,12 +1274,25 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py: make_constant_class(op, class_const)
-    /// Record that an OpRef has a known class (type pointer).
-    /// This is used by GUARD_CLASS to propagate class info.
+    /// optimizer.py:137-156: make_constant_class(op, class_const)
+    /// If existing info is InstancePtrInfo, update its known_class field.
+    /// Otherwise create KnownClass (majit's PtrInfo::KnownClass maps to
+    /// RPython's InstancePtrInfo(None, class_const) for non-Instance info).
     pub fn make_constant_class(ctx: &mut OptContext, opref: OpRef, class_value: i64) {
         let class_ptr = GcRef(class_value as usize);
-        ctx.set_ptr_info(opref, PtrInfo::known_class(class_ptr, true));
+        let resolved = ctx.get_box_replacement(opref);
+        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo)
+        let is_instance = matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Instance(_)));
+        if is_instance {
+            // optimizer.py:140: opinfo._known_class = class_const
+            if let Some(PtrInfo::Instance(iinfo)) = ctx.get_ptr_info_mut(resolved) {
+                iinfo.known_class = Some(class_ptr);
+            }
+        } else {
+            // optimizer.py:142-147: InstancePtrInfo(None, class_const)
+            // In majit, KnownClass is the canonical variant for class-only info.
+            ctx.set_ptr_info(resolved, PtrInfo::known_class(class_ptr, true));
+        }
     }
 
     /// optimizer.py: is_raw_ptr(op)
