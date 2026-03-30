@@ -84,9 +84,12 @@ pub enum ExitVirtualKind {
 }
 
 /// Backend-neutral description of a materialized virtual object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ExitVirtualLayout {
+    /// resume.py:612 VirtualInfo — allocate_with_vtable(descr=self.descr).
     Object {
+        /// resume.py:615 self.descr — live SizeDescr for allocate_with_vtable.
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
@@ -95,7 +98,10 @@ pub enum ExitVirtualLayout {
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
+    /// resume.py:628 VStructInfo — allocate_struct(self.typedescr).
     Struct {
+        /// resume.py:631 self.typedescr — live SizeDescr for allocate_struct.
+        typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
@@ -138,6 +144,7 @@ impl ExitVirtualLayout {
     pub fn shifted_virtuals(&self, virtual_offset: usize) -> Self {
         match self {
             Self::Object {
+                descr,
                 type_id,
                 descr_index,
                 fields,
@@ -145,6 +152,7 @@ impl ExitVirtualLayout {
                 fielddescrs,
                 descr_size,
             } => Self::Object {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -156,6 +164,7 @@ impl ExitVirtualLayout {
                 descr_size: *descr_size,
             },
             Self::Struct {
+                typedescr,
                 type_id,
                 descr_index,
                 fields,
@@ -163,6 +172,7 @@ impl ExitVirtualLayout {
                 fielddescrs,
                 descr_size,
             } => Self::Struct {
+                typedescr: typedescr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -234,6 +244,108 @@ impl ExitVirtualLayout {
         }
     }
 }
+
+// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+impl PartialEq for ExitVirtualLayout {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Object {
+                    type_id: a1,
+                    descr_index: a2,
+                    fields: a3,
+                    target_slot: a4,
+                    fielddescrs: a5,
+                    descr_size: a6,
+                    ..
+                },
+                Self::Object {
+                    type_id: b1,
+                    descr_index: b2,
+                    fields: b3,
+                    target_slot: b4,
+                    fielddescrs: b5,
+                    descr_size: b6,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            (
+                Self::Struct {
+                    type_id: a1,
+                    descr_index: a2,
+                    fields: a3,
+                    target_slot: a4,
+                    fielddescrs: a5,
+                    descr_size: a6,
+                    ..
+                },
+                Self::Struct {
+                    type_id: b1,
+                    descr_index: b2,
+                    fields: b3,
+                    target_slot: b4,
+                    fielddescrs: b5,
+                    descr_size: b6,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            (
+                Self::Array {
+                    descr_index: a1,
+                    clear: a2,
+                    kind: a3,
+                    items: a4,
+                },
+                Self::Array {
+                    descr_index: b1,
+                    clear: b2,
+                    kind: b3,
+                    items: b4,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            (
+                Self::ArrayStruct {
+                    descr_index: a1,
+                    field_types: a2,
+                    item_size: a3,
+                    field_offsets: a4,
+                    field_sizes: a5,
+                    element_fields: a6,
+                },
+                Self::ArrayStruct {
+                    descr_index: b1,
+                    field_types: b2,
+                    item_size: b3,
+                    field_offsets: b4,
+                    field_sizes: b5,
+                    element_fields: b6,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            (
+                Self::RawSlice {
+                    offset: a1,
+                    base: a2,
+                },
+                Self::RawSlice {
+                    offset: b1,
+                    base: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            (
+                Self::RawBuffer {
+                    size: a1,
+                    entries: a2,
+                },
+                Self::RawBuffer {
+                    size: b1,
+                    entries: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            _ => false,
+        }
+    }
+}
+impl Eq for ExitVirtualLayout {}
 
 /// Backend-neutral deferred heap write recovered from an exit.
 #[derive(Debug, Clone, PartialEq, Eq)]

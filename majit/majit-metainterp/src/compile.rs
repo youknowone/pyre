@@ -323,16 +323,17 @@ pub(crate) fn build_guard_metadata(
                             );
                             match entry {
                                 majit_ir::RdVirtualInfo::Instance {
+                                    descr,
                                     descr_index,
                                     known_class,
                                     fielddescrs,
                                     fieldnums,
                                     descr_size,
-                                    ..
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
                                     majit_codegen::ExitVirtualLayout::Object {
+                                        descr: descr.clone(),
                                         type_id: known_class.map_or(0, |kc| kc as u32),
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
@@ -342,16 +343,17 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::Struct {
+                                    typedescr,
                                     type_id,
                                     descr_index,
                                     fielddescrs,
                                     fieldnums,
                                     descr_size,
-                                    ..
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
                                     majit_codegen::ExitVirtualLayout::Struct {
+                                        typedescr: typedescr.clone(),
                                         type_id: *type_id,
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),

@@ -227,19 +227,18 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for &raw_opref in boxes {
-            // OpRef::NONE → NULLREF (no box at this slot).
+            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
             if raw_opref.is_none() {
-                numb_state.append_short(NULLREF);
+                numb_state.append_short(UNINITIALIZED_TAG);
                 continue;
             }
 
             // resume.py:201-202
             let opref = env.get_box_replacement(raw_opref);
 
-            // Defensive: RPython's get_box_replacement never returns None
-            // for non-None input. If it somehow does, encode as NULLREF.
+            // resume.py:561-562: forwarded-away box → UNINITIALIZED
             if opref.is_none() {
-                numb_state.append_short(NULLREF);
+                numb_state.append_short(UNINITIALIZED_TAG);
                 continue;
             }
 

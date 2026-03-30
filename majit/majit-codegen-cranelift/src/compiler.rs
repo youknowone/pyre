@@ -1129,8 +1129,9 @@ fn materialize_virtual_recursive(
 
     // Phase 1: allocate (without setfields)
     let ptr = match vl {
-        // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable.
+        // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable(descr).
         majit_codegen::ExitVirtualLayout::Object {
+            descr,
             fields,
             fielddescrs,
             descr_size,
@@ -1164,19 +1165,22 @@ fn materialize_virtual_recursive(
                 }
             }
 
-            // llmodel.py:778 bh_new_with_vtable: gc_malloc + set vtable.
-            if fielddescrs.is_empty() && *descr_size == 0 {
+            // resume.py:617 bh_new_with_vtable(descr): allocate via live SizeDescr.
+            let (alloc_size, alloc_tid) = descr
+                .as_ref()
+                .and_then(|d| d.as_size_descr())
+                .map(|sd| (sd.size(), sd.type_id()))
+                .unwrap_or((*descr_size, *type_id));
+            if fielddescrs.is_empty() && alloc_size == 0 {
                 return 0;
             }
-            let size = if *descr_size > 0 { *descr_size } else { 16 };
+            let size = if alloc_size > 0 { alloc_size } else { 16 };
             let ptr = if ob_type != 0 {
                 if let Some(rt_id) = gc_runtime_id {
-                    // llmodel.py:778: gc_malloc(sizedescr) with type_id.
                     let p = with_gc_runtime(rt_id, |gc| {
-                        gc.alloc_nursery_typed(*type_id, size).0 as i64
+                        gc.alloc_nursery_typed(alloc_tid, size).0 as i64
                     });
                     if p != 0 {
-                        // llmodel.py:780: write vtable at vtable_offset.
                         unsafe { *(p as *mut i64) = ob_type };
                     }
                     p
@@ -1207,18 +1211,24 @@ fn materialize_virtual_recursive(
         }
         // resume.py:634-637 VStructInfo.allocate → allocate_struct(typedescr).
         majit_codegen::ExitVirtualLayout::Struct {
+            typedescr,
             type_id,
             fielddescrs,
             descr_size,
             ..
         } => {
-            if fielddescrs.is_empty() && *descr_size == 0 {
+            // resume.py:635 allocate_struct(self.typedescr): use live SizeDescr.
+            let (alloc_size, alloc_tid) = typedescr
+                .as_ref()
+                .and_then(|d| d.as_size_descr())
+                .map(|sd| (sd.size(), sd.type_id()))
+                .unwrap_or((*descr_size, *type_id));
+            if fielddescrs.is_empty() && alloc_size == 0 {
                 return 0;
             }
-            let size = if *descr_size > 0 { *descr_size } else { 16 };
-            // gc.py:492 _bh_malloc: do_malloc_fixedsize_clear(type_id, size).
+            let size = if alloc_size > 0 { alloc_size } else { 16 };
             if let Some(rt_id) = gc_runtime_id {
-                with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(*type_id, size).0 as i64)
+                with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
             } else {
                 let layout = match std::alloc::Layout::from_size_align(size, 8) {
                     Ok(l) => l,
@@ -1304,6 +1314,19 @@ fn rebuild_state_after_failure_single_virtual(
     outputs: &[i64],
     materialized: &[Option<i64>],
 ) -> Option<i64> {
+    // Extract alloc size from live descr/typedescr when available.
+    let live_alloc_size = match vl {
+        majit_codegen::ExitVirtualLayout::Object { descr, .. } => descr
+            .as_ref()
+            .and_then(|d| d.as_size_descr())
+            .map(|sd| sd.size()),
+        majit_codegen::ExitVirtualLayout::Struct { typedescr, .. } => typedescr
+            .as_ref()
+            .and_then(|d| d.as_size_descr())
+            .map(|sd| sd.size()),
+        _ => None,
+    };
+
     match vl {
         majit_codegen::ExitVirtualLayout::Object {
             fields,
@@ -1345,11 +1368,13 @@ fn rebuild_state_after_failure_single_virtual(
                 }
             }
 
-            // General path: allocate + setfields using fielddescrs
-            if fielddescrs.is_empty() && *descr_size == 0 {
+            // General path: allocate + setfields using fielddescrs.
+            // Use live SizeDescr size when available, fall back to cached descr_size.
+            let alloc_size = live_alloc_size.unwrap_or(*descr_size);
+            if fielddescrs.is_empty() && alloc_size == 0 {
                 return None;
             }
-            let size = if *descr_size > 0 { *descr_size } else { 16 };
+            let size = if alloc_size > 0 { alloc_size } else { 16 };
             let layout = std::alloc::Layout::from_size_align(size, 8).ok()?;
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
             if ptr.is_null() {
@@ -9262,15 +9287,16 @@ fn collect_guards(
                     let target_slot = vidx_to_slot.get(&vidx).copied();
                     let layout = match entry {
                         majit_ir::RdVirtualInfo::Instance {
+                            descr,
                             descr_index,
                             known_class,
                             fielddescrs,
                             fieldnums,
                             descr_size,
-                            ..
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Object {
+                                descr: descr.clone(),
                                 type_id: known_class.map_or(0, |kc| kc as u32),
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
@@ -9280,15 +9306,16 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::Struct {
+                            typedescr,
                             type_id,
                             descr_index,
                             fielddescrs,
                             fieldnums,
                             descr_size,
-                            ..
                         } => {
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Struct {
+                                typedescr: typedescr.clone(),
                                 type_id: *type_id,
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),

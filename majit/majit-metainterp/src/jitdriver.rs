@@ -1164,14 +1164,13 @@ impl<S: JitState> JitDriver<S> {
                     None,
                     None,
                     None,
+                    None,
                     &null_alloc,
                 );
                 if let Some(bh) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
                     let _jit_exc = crate::blackhole::run_forever(&mut bh_builder, bh, exc);
-                    // RPython: resume_in_blackhole completes via JitException.
-                    // No shared-state restoration after blackhole.
                     return Some(target_pc);
                 }
             }
@@ -2599,6 +2598,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
+                    None,
                     None,
                     None,
                     None,
