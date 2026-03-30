@@ -1982,9 +1982,7 @@ impl OptUnroll {
                     {
                         continue; // Const: pass through (isinstance(box, Const))
                     }
-                    if let Some(&mapped) = mapping.get(arg) {
-                        *arg = mapped;
-                    }
+                    *arg = mapping[arg];
                 }
                 // unroll.py:405-411: copy_and_change creates a fresh guard
                 // with only args copied. RPython's fresh guard has no descr,

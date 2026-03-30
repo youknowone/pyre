@@ -1454,6 +1454,108 @@ impl ExtendedShortPreambleBuilder {
                 }
             }
         }
+        // shortpreamble.py:393 parity: resolve missing deps in base_short_ops.
+        // In RPython, use_box adds deps to the SAME self.short list, so deps
+        // always precede their consumers. In majit, base_short_ops (from the
+        // previous ShortPreamble) and extra_state.short (from use_box) are
+        // separate. Deps added by use_box during replay appear AFTER all base
+        // ops, causing ordering violations.
+        //
+        // Fix: after produced_short_boxes remap, scan base_short_ops for args
+        // that reference produced ops not yet in base. Recursively collect
+        // transitive deps and insert them before their first consumer.
+        // produced_short_boxes args are already remapped at this point.
+        self.resolve_base_deps();
+    }
+
+    /// Recursively collect transitive deps for `opref` from produced_short_boxes.
+    /// Deps are collected in dependency order (deps before consumers).
+    fn collect_transitive_deps(
+        &self,
+        opref: OpRef,
+        base_set: &HashSet<OpRef>,
+        collected: &mut Vec<Op>,
+        visited: &mut HashSet<OpRef>,
+    ) {
+        if !visited.insert(opref) {
+            return;
+        }
+        if let Some(produced) = self.produced_short_boxes.get(&opref) {
+            // Recurse into this dep's own args first (transitive)
+            for &arg in &produced.preamble_op.args {
+                if !base_set.contains(&arg)
+                    && !self.extra_state.short_inputargs.contains(&arg)
+                    && !self.extra_state.known_constants.contains(&arg)
+                    && self.produced_short_boxes.contains_key(&arg)
+                    && !visited.contains(&arg)
+                {
+                    self.collect_transitive_deps(arg, base_set, collected, visited);
+                }
+            }
+            collected.push(produced.preamble_op.clone());
+        }
+    }
+
+    fn resolve_base_deps(&mut self) {
+        let base_set: HashSet<OpRef> = self.base_short_ops.iter().map(|op| op.pos).collect();
+        // Collect all args from base ops that need deps not in base
+        let needed: HashSet<OpRef> = self
+            .base_short_ops
+            .iter()
+            .flat_map(|op| op.args.iter().copied())
+            .filter(|arg| {
+                !base_set.contains(arg)
+                    && !self.extra_state.short_inputargs.contains(arg)
+                    && !self.extra_state.known_constants.contains(arg)
+                    && self.produced_short_boxes.contains_key(arg)
+            })
+            .collect();
+        if needed.is_empty() {
+            return;
+        }
+        // Collect transitive deps in order
+        let mut all_deps: Vec<Op> = Vec::new();
+        let mut visited: HashSet<OpRef> = HashSet::new();
+        for &opref in &needed {
+            self.collect_transitive_deps(opref, &base_set, &mut all_deps, &mut visited);
+        }
+        if all_deps.is_empty() {
+            return;
+        }
+        let dep_set: HashSet<OpRef> = all_deps.iter().map(|op| op.pos).collect();
+        // Insert deps before their first consumer in base_short_ops
+        let mut new_base = Vec::with_capacity(self.base_short_ops.len() + all_deps.len());
+        let mut inserted: HashSet<OpRef> = HashSet::new();
+        for op in &self.base_short_ops {
+            for &arg in &op.args {
+                if dep_set.contains(&arg) && !inserted.contains(&arg) {
+                    for dep in &all_deps {
+                        if !inserted.contains(&dep.pos) && self.is_dep_of(dep.pos, arg, &dep_set) {
+                            new_base.push(dep.clone());
+                            inserted.insert(dep.pos);
+                        }
+                    }
+                }
+            }
+            new_base.push(op.clone());
+        }
+        self.base_short_ops = new_base;
+        self.base_results = self.base_short_ops.iter().map(|op| op.pos).collect();
+    }
+
+    /// Check if `dep_pos` is a transitive dep of `target` within `dep_set`.
+    fn is_dep_of(&self, dep_pos: OpRef, target: OpRef, dep_set: &HashSet<OpRef>) -> bool {
+        if dep_pos == target {
+            return true;
+        }
+        if let Some(produced) = self.produced_short_boxes.get(&target) {
+            for &arg in &produced.preamble_op.args {
+                if dep_set.contains(&arg) && self.is_dep_of(dep_pos, arg, dep_set) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
