@@ -2183,7 +2183,7 @@ impl Optimizer {
         retraced_count: u32,
         retrace_limit: u32,
         bridge_knowledge: Option<&OptimizerKnowledge>,
-        _loop_num_inputs: Option<usize>,
+        loop_num_inputs: Option<usize>,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
