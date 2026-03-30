@@ -624,13 +624,19 @@ impl OptContext {
                     )
                 })
                 .collect();
-        self.imported_short_preamble_builder = Some(
-            crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
-                label_args,
-                &produced,
-                short_inputargs,
-            ),
+        let mut builder = crate::optimizeopt::shortpreamble::ShortPreambleBuilder::new(
+            label_args,
+            &produced,
+            short_inputargs,
         );
+        // RPython parity: populate known_constants from OptContext
+        // so use_box_recursive can skip constant OpRef args.
+        for (idx, val) in self.constants.iter().enumerate() {
+            if val.is_some() {
+                builder.note_known_constant(OpRef(idx as u32));
+            }
+        }
+        self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
     }
 
@@ -770,11 +776,15 @@ impl OptContext {
             }
         }
 
-        self.imported_short_preamble_builder = Some(ShortPreambleBuilder::new(
-            short_args,
-            &produced,
-            short_inputargs,
-        ));
+        let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
+        // RPython parity: populate known_constants from OptContext
+        // so add_op_to_short can resolve constant OpRef args.
+        for (idx, val) in self.constants.iter().enumerate() {
+            if val.is_some() {
+                builder.note_known_constant(OpRef(idx as u32));
+            }
+        }
+        self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
         true
     }
@@ -1000,10 +1010,40 @@ impl OptContext {
         self.imported_short_preamble_builder
             .as_ref()
             .map(|builder| {
-                builder.build_short_preamble_struct(
-                    &HashMap::new(),
-                    &self.constant_types_for_numbering,
-                )
+                // RPython parity: extract constant pool from OptContext.
+                // In RPython, Const objects in short preamble ops survive
+                // across compilations via GC tracing. In majit, we must
+                // snapshot the constant pool so build_short_preamble_struct
+                // can capture referenced constants.
+                let loop_constants: HashMap<u32, i64> = self
+                    .constants
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        v.as_ref().map(|val| {
+                            let raw = match val {
+                                majit_ir::Value::Int(v) => *v,
+                                majit_ir::Value::Float(f) => f.to_bits() as i64,
+                                majit_ir::Value::Ref(r) => r.0 as i64,
+                                majit_ir::Value::Void => 0,
+                            };
+                            (i as u32, raw)
+                        })
+                    })
+                    .collect();
+                let mut loop_constant_types = self.constant_types_for_numbering.clone();
+                for (i, v) in self.constants.iter().enumerate() {
+                    if let Some(val) = v {
+                        let tp = match val {
+                            majit_ir::Value::Int(_) => majit_ir::Type::Int,
+                            majit_ir::Value::Float(_) => majit_ir::Type::Float,
+                            majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
+                            majit_ir::Value::Void => majit_ir::Type::Void,
+                        };
+                        loop_constant_types.entry(i as u32).or_insert(tp);
+                    }
+                }
+                builder.build_short_preamble_struct(&loop_constants, &loop_constant_types)
             })
     }
 

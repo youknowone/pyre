@@ -1780,7 +1780,11 @@ impl Optimizer {
                 .map(|(result, produced)| {
                     let canonical_result = ctx.get_box_replacement(result);
                     let mut preamble_op = produced.preamble_op;
-                    preamble_op.pos = ctx.get_box_replacement(preamble_op.pos);
+                    // RPython parity: key and preamble_op.pos must be the
+                    // same resolved value. Independent get_box_replacement
+                    // calls can diverge when forwarding chains differ.
+                    // Use canonical_result (resolved key) for both.
+                    preamble_op.pos = canonical_result;
                     for arg in &mut preamble_op.args {
                         *arg = ctx.get_box_replacement(*arg);
                     }
