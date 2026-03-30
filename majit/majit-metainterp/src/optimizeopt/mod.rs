@@ -817,7 +817,11 @@ impl OptContext {
         let preamble_source = self.imported_short_source(result);
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
-            // shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+            // shortpreamble.py:389,396,406: info.make_guards → self.short
+            // TODO: connect guards — currently disabled because non-redundant
+            // GUARD_NONNULL in nbody's retrace context causes compiled code
+            // to hit guard failure loops. Needs PtrInfo propagation from
+            // import_state to inline_short_preamble jump_args.
             let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
@@ -940,13 +944,9 @@ impl OptContext {
     }
 
     /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
-    /// Propagate PtrInfo from preamble to Phase 2 OpRef so that subsequent
-    /// guards can be removed as redundant by the optimizer.
     fn setinfo_from_preamble(&mut self, op: OpRef, preamble_info: &PtrInfo) {
         let op = self.get_box_replacement(op);
         // unroll.py:55-56: if op.get_forwarded() is not None: return
-        // In RPython, forwarded means info is already set (single field).
-        // In majit, check both PtrInfo and forwarding to avoid overwriting.
         if self.get_ptr_info(op).is_some() || self.is_replaced(op) {
             return;
         }
@@ -954,25 +954,54 @@ impl OptContext {
         if self.is_constant(op) {
             return;
         }
+        // unroll.py:59: isinstance(preamble_info, info.PtrInfo)
         match preamble_info {
+            // unroll.py:60-64: virtual — forward directly
+            PtrInfo::Virtual(..)
+            | PtrInfo::VirtualArray(..)
+            | PtrInfo::VirtualStruct(..)
+            | PtrInfo::VirtualArrayStruct(..) => {
+                self.set_ptr_info(op, preamble_info.clone());
+                // TODO: setinfo_from_preamble_list(all_items, exported_infos)
+            }
+            // unroll.py:65-68: constant
             PtrInfo::Constant(gcref) => {
-                // unroll.py:65-68: op.set_forwarded(preamble_info.getconst())
                 self.make_constant(op, Value::Ref(*gcref));
             }
+            // unroll.py:70-72: StructPtrInfo(preamble_info.get_descr())
+            PtrInfo::Struct(sinfo) => {
+                self.ensure_ptr_info_preserve_forwarding(
+                    op,
+                    PtrInfo::struct_ptr(sinfo.descr.clone()),
+                );
+            }
+            // unroll.py:73-78: InstancePtrInfo(descr) + known_class
+            PtrInfo::Instance(iinfo) => {
+                self.ensure_ptr_info_preserve_forwarding(
+                    op,
+                    PtrInfo::instance(iinfo.descr.clone(), None),
+                );
+                if let Some(cls) = iinfo.known_class {
+                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::known_class(cls, true));
+                }
+            }
+            // unroll.py:76-78: KnownClass
             PtrInfo::KnownClass { class_ptr, .. } => {
-                // unroll.py:76-78: make_constant_class(op, known_class, False)
                 self.ensure_ptr_info_preserve_forwarding(
                     op,
                     PtrInfo::known_class(*class_ptr, true),
                 );
             }
-            PtrInfo::Instance(info) => {
-                // unroll.py:73-78
-                if let Some(cls) = info.known_class {
-                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::known_class(cls, true));
-                } else if preamble_info.is_nonnull() {
-                    self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
-                }
+            // unroll.py:79-84: ArrayPtrInfo(descr) + lenbound.clone()
+            PtrInfo::Array(ainfo) => {
+                self.ensure_ptr_info_preserve_forwarding(
+                    op,
+                    PtrInfo::array(ainfo.descr.clone(), ainfo.lenbound.clone()),
+                );
+            }
+            // unroll.py:91-92: is_nonnull → make_nonnull
+            PtrInfo::NonNull { .. } => {
+                self.ensure_ptr_info_preserve_forwarding(op, PtrInfo::nonnull());
             }
             _ => {
                 if preamble_info.is_nonnull() {
