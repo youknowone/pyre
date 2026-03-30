@@ -880,20 +880,36 @@ pub fn resume_in_blackhole(
         }
 
         // resume.py:1381 consume_one_section → 1017 _prepare_next_section
-        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_i, cb_r, cb_f)
-        // → liveness.py:170 LivenessIterator: iterate ONLY live registers.
-        // rd_numb_pc = Some(orgpc): snapshot guard, liveness-safe.
-        // rd_numb_pc = None: no-snapshot guard, positional fallback.
-        // TODO: liveness-based filling requires the encoder
-        // (get_list_of_active_boxes) to use the SAME liveness data.
-        // Currently the encoder's liveness may differ from the decoder's
-        // (different CodeObject pointer due to CPython specialization),
-        // so liveness filtering is disabled until encoder parity is verified.
-        let use_liveness = false;
+        // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
+        // → liveness.py:170 LivenessIterator: compact values consumed
+        //   in liveness order. Dead registers keep setposition() defaults.
+        let live = pyre_jit_trace::state::liveness_for(section.code);
+        let live_pc = section.py_pc;
+        let n_live = (0..nlocals)
+            .filter(|&i| live.is_local_live(live_pc, i))
+            .count();
+        let n_vals = section.values.len().saturating_sub(3);
+        // If liveness live count matches the value count, the encoder
+        // compacted by liveness and we can use liveness-based filling.
+        // Otherwise encoder and decoder liveness diverge — fall back
+        // to positional filling to avoid mapping mismatch.
+        let use_liveness = n_live == n_vals;
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][liveness-fill] py_pc={} nlocals={} live={} vals={} mode={}",
+                live_pc,
+                nlocals,
+                n_live,
+                n_vals,
+                if use_liveness {
+                    "liveness"
+                } else {
+                    "positional"
+                },
+            );
+        }
         if use_liveness {
-            let live = pyre_jit_trace::state::liveness_for(section.code);
-            let live_pc = section.rd_numb_pc.unwrap(); // = encoder's orgpc
-            let mut val_idx = 3; // skip [frame, ni, vsd] header
+            let mut val_idx = 3;
             for i in 0..nlocals {
                 if live.is_local_live(live_pc, i) {
                     if let Some(val) = section.values.get(val_idx) {
@@ -912,9 +928,6 @@ pub fn resume_in_blackhole(
                 }
             }
         } else {
-            // Positional filling: values[3+i] → register[i].
-            // Valid when encoder included all locals (no liveness filtering)
-            // or when all locals happen to be live (common in loops).
             for i in 0..nlocals {
                 if let Some(val) = section.values.get(3 + i) {
                     bh.setarg_r(i, materialize_virtual(val));
