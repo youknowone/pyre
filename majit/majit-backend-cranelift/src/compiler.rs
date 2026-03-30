@@ -2637,15 +2637,27 @@ extern "C" fn call_assembler_guard_failure(
         return unsafe { *outputs_ptr };
     }
 
-    // RPython resume_in_blackhole parity: resume execution from the guard
-    // failure point using the blackhole interpreter. The blackhole reads
-    // values from the outputs buffer (deadframe) and executes the remaining
-    // IR ops from guard+1 to Finish, returning the result directly.
-    let num_outputs = fail_descr.fail_arg_types.len();
+    // resume.py:1312 blackhole_from_resumedata parity: materialize
+    // virtuals before blackhole resume.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.header_pc;
         let trace_id = target.trace_id;
-        if let Some(result) = bh_fn(green_key, trace_id, fail_index, outputs_ptr, num_outputs) {
+        let raw_num = fail_descr.fail_arg_types.len();
+        let mut bh_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) }.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            raw_num,
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
             return result;
         }
     }
@@ -2673,6 +2685,12 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     // pyjitpl.rs). The MetaInterp bridge has correct inputarg mapping.
     if fail_descr.has_bridge() {
         return true;
+    }
+    // compile.py:701 handle_fail: guard failures go to blackhole resume
+    // or bridge compilation. Only FINISH exits produce direct results.
+    // This function is a majit-only optimization (no RPython equivalent).
+    if !fail_descr.is_finish() {
+        return false;
     }
     let fail_arg_types = fail_descr.fail_arg_types();
 
@@ -2921,6 +2939,34 @@ fn call_assembler_fast_path(
 
     release_force_token(handle);
 
+    // resume.py:1312 blackhole_from_resumedata parity: materialize
+    // virtuals before blackhole resume.
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        let mut bh_outputs = outputs.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            fail_descr.fail_arg_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+    }
+
     // RPython assembler_call_helper: force_fn receives the callee frame.
     // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
     // but force_fn needs the callee frame which is inputs[0].
@@ -3015,6 +3061,33 @@ fn call_assembler_fast_path_heap(
 
     release_force_token(handle);
 
+    // resume.py:1312 blackhole_from_resumedata parity.
+    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        let green_key = target.header_pc;
+        let trace_id = target.trace_id;
+        let mut bh_outputs = outputs.to_vec();
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            &fail_descr.fail_arg_types,
+            fail_descr.recovery_layout_ref().as_ref(),
+            fail_descr.fail_arg_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
+        if let Some(result) = bh_fn(
+            green_key,
+            trace_id,
+            fail_index,
+            bh_outputs.as_ptr(),
+            num_outputs,
+        ) {
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return result as u64;
+        }
+    }
+
     // RPython assembler_call_helper: force_fn receives the callee frame.
     // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
     // but force_fn needs the callee frame which is inputs[0].
@@ -3108,12 +3181,25 @@ extern "C" fn call_assembler_shim(
         );
     }
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+        // resume.py:1312 blackhole_from_resumedata parity.
+        let mut bh_outputs = fail_values;
+        let recovery = target
+            .fail_descrs
+            .get(fail_index as usize)
+            .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
+        rebuild_state_after_failure(
+            &mut bh_outputs,
+            fail_types,
+            recovery.as_ref(),
+            fail_types.len(),
+        );
+        let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
             target.header_pc,
             target.trace_id,
             fail_index,
-            fail_values.as_ptr(),
-            fail_values.len(),
+            bh_outputs.as_ptr(),
+            num_outputs,
         ) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -9446,16 +9532,12 @@ fn collect_guards(
             let mut bits: u64 = 0;
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
-                    // TODO: upstream regalloc.py:1206 asserts that
-                    // fail_args never contain Const. We allow it here
-                    // as a workaround until the optimizer stops emitting
-                    // constants in fail_args. Remove this once the
-                    // consumer switchover produces rd_consts properly.
+                    // regalloc.py:1206 — assert not isinstance(arg, Const)
                     let opref_id = fail_arg_refs.get(i).map(|r| r.0).unwrap_or(u32::MAX);
-                    if constants.contains_key(&opref_id) {
-                        continue;
-                    }
-                    // Guard gcmap: bit = slot index (fail_args at jf_frame[i]).
+                    debug_assert!(
+                        !constants.contains_key(&opref_id),
+                        "regalloc.py:1206: fail_args must not contain Const (slot={i}, opref={opref_id})"
+                    );
                     if (i as u32) < 64 {
                         bits |= 1u64 << i;
                     }
