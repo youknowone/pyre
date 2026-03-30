@@ -1329,11 +1329,9 @@ fn execute_assembler(
                         // valid and guard failure counter accumulates for
                         // bridge compilation.
                         //
-                        // DIFFERS FROM UPSTREAM: pyre invalidates because
-                        // incomplete rd_numb can produce subtly wrong frame
-                        // state that passes validation but causes SEGFAULT
-                        // on re-entry to compiled code. Remove when rd_numb
-                        // fully covers all frame slots.
+                        // pyre: still invalidate — rd_numb can produce frame
+                        // state that passes validation but causes SEGFAULT on
+                        // re-entry. Remove when rd_numb fully covers all slots.
                         driver.invalidate_loop(green_key);
                         Some(LoopResult::ContinueRunningNormally)
                     }
