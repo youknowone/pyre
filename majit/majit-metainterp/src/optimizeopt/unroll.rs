@@ -2381,6 +2381,41 @@ impl OptUnroll {
         }
     }
 
+    /// RPython Box identity parity: allocate a fresh OpRef for a Phase 1
+    /// virtual field value. RPython Boxes are Python objects with unique
+    /// identity — Phase 1 Box and Phase 2 Box at the same trace position
+    /// are different objects, so Phase 2 trace processing never overwrites
+    /// Phase 1 field values. In majit, OpRef is a shared u32 index: Phase 2
+    /// reprocessing the same trace op at position X would overwrite the
+    /// forwarding/PtrInfo set during import for the virtual's field at X.
+    /// Remapping to fresh positions prevents this collision.
+    fn remap_field_ref(
+        old: OpRef,
+        exported_infos: &HashMap<OpRef, ExportedValueInfo>,
+        ctx: &mut OptContext,
+    ) -> OpRef {
+        if old.is_none() || old.0 >= 10_000 {
+            // Constants and NONE don't need remapping — they are globally
+            // valid and won't be overwritten by Phase 2 trace processing.
+            return old;
+        }
+        let fresh = ctx.reserve_pos();
+        // Copy value_type so backend knows the type of this position.
+        if let Some(&tp) = ctx.value_types.get(&old.0) {
+            ctx.value_types.insert(fresh.0, tp);
+        }
+        // Copy constant value if the field is a known constant.
+        if let Some(val) = ctx.get_constant(old).cloned() {
+            ctx.make_constant(fresh, val);
+        }
+        // Copy constant_types_for_numbering so resume data encoding
+        // picks up the correct type for this position.
+        if let Some(&tp) = ctx.constant_types_for_numbering.get(&old.0) {
+            ctx.constant_types_for_numbering.insert(fresh.0, tp);
+        }
+        fresh
+    }
+
     fn apply_exported_ptr_info(
         &self,
         opref: OpRef,
@@ -2393,11 +2428,26 @@ impl OptUnroll {
 
         match ptr_info {
             PtrInfo::Virtual(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::Virtual(info.clone()));
-                for &(_, field_ref) in &info.fields {
-                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                // Remap field OpRefs to fresh positions (Box identity parity).
+                let mut new_info = info.clone();
+                let remaps: Vec<(OpRef, OpRef)> = new_info
+                    .fields
+                    .iter_mut()
+                    .map(|(_, field_ref)| {
+                        let old = *field_ref;
+                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
+                        *field_ref = fresh;
+                        (old, fresh)
+                    })
+                    .collect();
+                ctx.set_ptr_info(opref, PtrInfo::Virtual(new_info));
+                for (old, fresh) in remaps {
+                    if old == fresh {
+                        continue;
+                    }
+                    if let Some(field_info) = exported_infos.get(&old) {
                         self.apply_exported_info_recursive(
-                            field_ref,
+                            fresh,
                             field_info,
                             exported_infos,
                             ctx,
@@ -2407,11 +2457,25 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualStruct(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(info.clone()));
-                for &(_, field_ref) in &info.fields {
-                    if let Some(field_info) = exported_infos.get(&field_ref) {
+                let mut new_info = info.clone();
+                let remaps: Vec<(OpRef, OpRef)> = new_info
+                    .fields
+                    .iter_mut()
+                    .map(|(_, field_ref)| {
+                        let old = *field_ref;
+                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
+                        *field_ref = fresh;
+                        (old, fresh)
+                    })
+                    .collect();
+                ctx.set_ptr_info(opref, PtrInfo::VirtualStruct(new_info));
+                for (old, fresh) in remaps {
+                    if old == fresh {
+                        continue;
+                    }
+                    if let Some(field_info) = exported_infos.get(&old) {
                         self.apply_exported_info_recursive(
-                            field_ref,
+                            fresh,
                             field_info,
                             exported_infos,
                             ctx,
@@ -2421,11 +2485,25 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArray(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(info.clone()));
-                for &item_ref in &info.items {
-                    if let Some(item_info) = exported_infos.get(&item_ref) {
+                let mut new_info = info.clone();
+                let remaps: Vec<(OpRef, OpRef)> = new_info
+                    .items
+                    .iter_mut()
+                    .map(|item_ref| {
+                        let old = *item_ref;
+                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
+                        *item_ref = fresh;
+                        (old, fresh)
+                    })
+                    .collect();
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArray(new_info));
+                for (old, fresh) in remaps {
+                    if old == fresh {
+                        continue;
+                    }
+                    if let Some(item_info) = exported_infos.get(&old) {
                         self.apply_exported_info_recursive(
-                            item_ref,
+                            fresh,
                             item_info,
                             exported_infos,
                             ctx,
@@ -2435,27 +2513,52 @@ impl OptUnroll {
                 }
             }
             PtrInfo::VirtualArrayStruct(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(info.clone()));
-                for fields in &info.element_fields {
-                    for &(_, field_ref) in fields {
-                        if let Some(field_info) = exported_infos.get(&field_ref) {
-                            self.apply_exported_info_recursive(
-                                field_ref,
-                                field_info,
-                                exported_infos,
-                                ctx,
-                                seen,
-                            );
-                        }
+                let mut new_info = info.clone();
+                let mut remaps: Vec<(OpRef, OpRef)> = Vec::new();
+                for fields in &mut new_info.element_fields {
+                    for (_, field_ref) in fields.iter_mut() {
+                        let old = *field_ref;
+                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
+                        *field_ref = fresh;
+                        remaps.push((old, fresh));
+                    }
+                }
+                ctx.set_ptr_info(opref, PtrInfo::VirtualArrayStruct(new_info));
+                for (old, fresh) in remaps {
+                    if old == fresh {
+                        continue;
+                    }
+                    if let Some(field_info) = exported_infos.get(&old) {
+                        self.apply_exported_info_recursive(
+                            fresh,
+                            field_info,
+                            exported_infos,
+                            ctx,
+                            seen,
+                        );
                     }
                 }
             }
             PtrInfo::VirtualRawBuffer(info) => {
-                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(info.clone()));
-                for &(_, _, entry_ref) in &info.entries {
-                    if let Some(entry_info) = exported_infos.get(&entry_ref) {
+                let mut new_info = info.clone();
+                let remaps: Vec<(OpRef, OpRef)> = new_info
+                    .entries
+                    .iter_mut()
+                    .map(|(_, _, entry_ref)| {
+                        let old = *entry_ref;
+                        let fresh = Self::remap_field_ref(old, exported_infos, ctx);
+                        *entry_ref = fresh;
+                        (old, fresh)
+                    })
+                    .collect();
+                ctx.set_ptr_info(opref, PtrInfo::VirtualRawBuffer(new_info));
+                for (old, fresh) in remaps {
+                    if old == fresh {
+                        continue;
+                    }
+                    if let Some(entry_info) = exported_infos.get(&old) {
                         self.apply_exported_info_recursive(
-                            entry_ref,
+                            fresh,
                             entry_info,
                             exported_infos,
                             ctx,
