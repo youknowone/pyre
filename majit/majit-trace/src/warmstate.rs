@@ -193,8 +193,8 @@ const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 /// rlib/jit.py:592 trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
 
-/// rlib/jit.py:595 retrace_limit = 0
-const DEFAULT_RETRACE_LIMIT: u32 = 0;
+/// warmspot.py:93 retrace_limit=5
+const DEFAULT_RETRACE_LIMIT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
