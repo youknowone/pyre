@@ -2248,37 +2248,12 @@ impl OptContext {
             })
             .collect();
         op.store_final_boxes(liveboxes);
-        // resoperation.py Box.type parity: after store_final_boxes
-        // rewrites fail_args (forwarding chains), recompute types from
-        // each final OpRef's type. RPython Box.type is immutable, so
-        // get_box_replacement().type always gives the correct type.
-        // Default to Ref (GCREF) for unknown OpRefs.
-        if let Some(ref fa) = op.fail_args {
-            op.fail_arg_types = Some(
-                fa.iter()
-                    .map(|opref| {
-                        if opref.is_none() {
-                            majit_ir::Type::Ref
-                        } else if self.is_constant(*opref) {
-                            self.constant_types_for_numbering
-                                .get(&opref.0)
-                                .copied()
-                                .unwrap_or_else(|| match self.get_constant(*opref) {
-                                    Some(majit_ir::Value::Ref(_)) => majit_ir::Type::Ref,
-                                    Some(majit_ir::Value::Float(_)) => majit_ir::Type::Float,
-                                    Some(majit_ir::Value::Int(_)) => majit_ir::Type::Int,
-                                    _ => majit_ir::Type::Ref,
-                                })
-                        } else {
-                            self.value_types
-                                .get(&opref.0)
-                                .copied()
-                                .unwrap_or(majit_ir::Type::Ref)
-                        }
-                    })
-                    .collect(),
-            );
-        }
+        // resoperation.py Box.type parity: new_types was computed from
+        // liveboxes with full type resolution (constants, constant_types,
+        // get_op_result_type, PtrInfo). RPython Box.type is immutable —
+        // store_final_boxes replaces fail_args with the same liveboxes
+        // that new_types was derived from, so use new_types directly.
+        op.fail_arg_types = Some(new_types);
         // Store rd_virtuals_info (indexed by vidx, RPython parity).
         // rd_virtuals_info is the authoritative source for virtual
         // materialization, indexed consistently with TAGVIRTUAL in rd_numb.
