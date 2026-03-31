@@ -1316,15 +1316,16 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // RPython blackhole never fails (complete rd_numb).
-                            // If pyre's blackhole fails, the resume data is buggy.
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][WARN] blackhole failed key={} — \
-                                     invalidating loop (resume data bug)",
-                                    green_key,
-                                );
-                            }
+                            // resume.py:1312: RPython blackhole never fails.
+                            // This path indicates a bug in rd_numb/resume data.
+                            // invalidate_loop prevents re-entering the same
+                            // broken guard path. Must be removed once blackhole
+                            // bugs are fixed (blackhole should never fail).
+                            eprintln!(
+                                "[jit][BUG] blackhole failed key={} — \
+                                 resume data is incomplete or corrupt",
+                                green_key,
+                            );
                             driver.invalidate_loop(green_key);
                             None
                         }
