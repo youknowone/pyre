@@ -8008,17 +8008,17 @@ impl JitState for PyreJitState {
     /// full [frame, ni, vsd, locals..., stack...] layout).
     fn restore_reconstructed_frame_values(
         &mut self,
-        _meta: &Self::Meta,
+        meta: &Self::Meta,
         _frame_index: usize,
         _total_frames: usize,
         _frame_pc: u64,
-        _values: &[Value],
-        _exception: &majit_metainterp::blackhole::ExceptionState,
+        values: &[Value],
+        exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
-        // Slot restoration is handled by restore_virtualizable_state which
-        // is called from the guard failure path. This method returns true
-        // to indicate success.
-        true
+        // resume.py:1077 consume_boxes parity: write values to the frame.
+        // Delegates to restore_guard_failure_values which handles the
+        // [frame, ni, vsd, locals..., stack...] layout.
+        self.restore_guard_failure_values(meta, values, exception)
     }
 
     /// blackhole.py:1800 parity: multi-frame support.

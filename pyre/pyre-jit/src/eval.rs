@@ -1316,16 +1316,18 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // resume.py:1312: RPython blackhole never fails.
-                            // This path indicates a bug in rd_numb/resume data.
-                            // invalidate_loop prevents re-entering the same
-                            // broken guard path. Must be removed once blackhole
-                            // bugs are fixed (blackhole should never fail).
-                            eprintln!(
-                                "[jit][BUG] blackhole failed key={} — \
-                                 resume data is incomplete or corrupt",
-                                green_key,
-                            );
+                            // resume.py:1312: blackhole_from_resumedata never
+                            // fails in upstream — it's a contract. This path
+                            // means a pyre resume data bug. Invalidate to
+                            // prevent re-entering the broken guard. Remove
+                            // once blackhole resume is fully sound.
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][BUG] blackhole failed key={} — \
+                                     invalidating compiled loop",
+                                    green_key,
+                                );
+                            }
                             driver.invalidate_loop(green_key);
                             None
                         }
@@ -1875,6 +1877,10 @@ fn materialize_virtual_from_rd(
                 _ => pyre_object::ArrayKind::Ref,
             };
             let array = pyre_object::allocate_array(fieldnums.len(), arr_kind, *clear);
+            // resume.py:654: cache BEFORE filling — recursive/shared virtuals
+            // may reference this vidx during element decoding.
+            let result = Value::Ref(majit_ir::GcRef(array as usize));
+            virtuals_cache.insert(vidx, result.clone());
             // resume.py:656-670: element kind dispatch + UNINITIALIZED skip.
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -1897,10 +1903,6 @@ fn materialize_virtual_from_rd(
                     }
                 }
             }
-            // resume.py:654,671: virtuals_cache.set_ptr + return array.
-            // The GcRef IS the allocated array — upstream returns it directly.
-            let result = Value::Ref(majit_ir::GcRef(array as usize));
-            virtuals_cache.insert(vidx, result.clone());
             return result;
         }
         majit_ir::RdVirtualInfo::ArrayStruct {
@@ -1978,6 +1980,9 @@ fn materialize_virtual_from_rd(
                         .unwrap_or(std::alloc::Layout::new::<u8>()),
                 )
             };
+            // resume.py:704: cache BEFORE filling fields.
+            let result = Value::Int(buffer as i64);
+            virtuals_cache.insert(vidx, result.clone());
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if let Some(val) = decode_tagged_fieldnum(
                     fnum,
@@ -2006,7 +2011,7 @@ fn materialize_virtual_from_rd(
                     }
                 }
             }
-            return Value::Int(buffer as i64);
+            return result;
         }
         majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
             // resume.py:723-727: base_buffer + offset
@@ -2019,7 +2024,10 @@ fn materialize_virtual_from_rd(
                     rd_virtuals_info,
                     virtuals_cache,
                 ) {
-                    return Value::Int(base + *offset as i64);
+                    let result = Value::Int(base + *offset as i64);
+                    // resume.py:727: virtuals_cache.set_int(index, buffer)
+                    virtuals_cache.insert(vidx, result.clone());
+                    return result;
                 }
             }
             return Value::Int(0);
@@ -2654,15 +2662,15 @@ fn rebuild_typed_from_rd_numb(
         Vec::new()
     };
 
-    // resume.py:1049-1056: consume_boxes per frame.
-    // Frame sections provide per-frame register values independently.
-    // synchronize_virtualizable is called in build_resumed_frames (blackhole
-    // path) but not here — this function returns a flat typed array that
-    // the caller uses for frame restoration.
+    // resume.py:1049-1056: rebuild_from_resumedata iterates all frames
+    // via newframe()+consume_boxes(). For guard-failure restore into JIT
+    // state (restore_guard_failure_values), only the outermost frame's
+    // values matter — inner frames are handled by build_resumed_frames →
+    // resume_in_blackhole. rd_numb frames are innermost-first; last = outermost.
     let mut typed = header;
-    for frame in &frames {
+    if let Some(outermost) = frames.last() {
         _prepare_next_section(
-            frame,
+            outermost,
             raw_values,
             &dead_frame_typed,
             exit_layout,
@@ -2880,10 +2888,24 @@ fn build_resumed_frames(
             // No-snapshot guard: fall back to vable ni.
             _vable_ni
         };
+        // resume.py:1339 jitcodes[jitcode_pos]:
+        // Outermost frame: code from frame_ptr. Inner frames: code from
+        // jitcode_index registry (no live PyFrame for inlined calls).
         let code = if !frame_ptr.is_null() {
             unsafe { (*frame_ptr).code }
         } else {
-            std::ptr::null()
+            pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
+                .unwrap_or(std::ptr::null())
+        };
+        // Per-frame VSD: outermost uses vable_vsd, inner frames derive
+        // from their code's nlocals + snapshot stack depth.
+        let vsd = if frames.len() == 1 || idx == frames.len() - 1 {
+            vable_vsd
+        } else if !code.is_null() {
+            let nlocals = unsafe { &*code }.varnames.len();
+            nlocals + values.len().saturating_sub(nlocals)
+        } else {
+            values.len()
         };
         result.push(crate::call_jit::ResumedFrame {
             code,
@@ -2894,7 +2916,7 @@ fn build_resumed_frames(
                 None
             },
             frame_ptr,
-            vsd: vable_vsd,
+            vsd,
             values,
         });
     }
@@ -3071,18 +3093,21 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
             continue; // null target — skip
         }
         // resume.py:1003-1007 _prepare_pendingfields parity:
-        //   descr = cast_base_ptr_to_instance(AbstractDescr, lldescr)
-        //   struct = self.decode_ref(num)
-        //   if itemindex < 0:
-        //       self.setfield(struct, fieldnum, descr)
-        //   else:
-        //       self.setarrayitem(struct, itemindex, fieldnum, descr)
+        //   if itemindex < 0: setfield(struct, fieldnum, descr)
+        //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
         //
-        // resume.py:1509-1518 setfield parity:
-        //   descr.is_pointer_field() → bh_setfield_gc_r
-        //   descr.is_float_field()   → bh_setfield_gc_f
-        //   else                     → bh_setfield_gc_i
-        let addr = target_ptr as usize + pf.field_offset;
+        // resume.py:1509-1518 setfield / 1520-1530 setarrayitem:
+        //   descr.is_pointer_field() → bh_setfield_gc_r / bh_setarrayitem_gc_r
+        //   descr.is_float_field()   → bh_setfield_gc_f / bh_setarrayitem_gc_f
+        //   else                     → bh_setfield_gc_i / bh_setarrayitem_gc_i
+        let addr = if pf.is_array_item {
+            // setarrayitem: base + offset + item_index * item_size
+            let item_index = pf.item_index.unwrap_or(0);
+            target_ptr as usize + pf.field_offset + item_index * pf.field_size
+        } else {
+            // setfield: base + offset
+            target_ptr as usize + pf.field_offset
+        };
         unsafe {
             match pf.field_type {
                 majit_ir::Type::Ref => {
