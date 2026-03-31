@@ -311,6 +311,10 @@ pub struct EncodedResumeData {
     pub rd_pendingfields: Vec<EncodedPendingFieldWrite>,
     /// compile.py:858 storage.rd_virtuals — live VirtualInfo objects.
     pub rd_virtuals: Vec<VirtualInfo>,
+    /// resume.py:411 liveboxes — compact TAGBOX(n) → original FailArg index.
+    /// In RPython, liveboxes[n] is the Box object that was assigned TAGBOX(n).
+    /// Here, liveboxes[n] is the original deadframe slot index.
+    pub liveboxes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,16 +921,25 @@ fn can_inline_tagged(value: i64) -> bool {
 /// resume.py:161-188 getconst + resume.py:199-226 _number_boxes
 ///
 /// Encode a ResumeValueSource as an i64 tagged value for rd_numb.
-/// This combines RPython's getconst (for constants) and _number_boxes
-/// tag assignment (for boxes and virtuals).
+/// Assigns compact sequential TAGBOX numbers via liveboxes/box_map,
+/// matching RPython's `_number_boxes` dedup assignment.
 fn encode_tagged_source(
     source: &ResumeValueSource,
     rd_consts: &mut Vec<i64>,
     const_indices: &mut HashMap<i64, usize>,
+    liveboxes: &mut Vec<usize>,
+    box_map: &mut HashMap<usize, usize>,
 ) -> i64 {
     match source {
-        // resume.py:222-224: non-virtual box → tag(num_boxes, TAGBOX)
-        ResumeValueSource::FailArg(index) => tag_i64(encode_len(*index), TAGBOX),
+        // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
+        ResumeValueSource::FailArg(index) => {
+            let compact = *box_map.entry(*index).or_insert_with(|| {
+                let n = liveboxes.len();
+                liveboxes.push(*index);
+                n
+            });
+            tag_i64(encode_len(compact), TAGBOX)
+        }
         // resume.py:209: isinstance(box, Const) → self.getconst(box)
         ResumeValueSource::Constant(value) if can_inline_tagged(*value) => {
             // resume.py:163-167: try tag(val, TAGINT)
@@ -1615,8 +1628,8 @@ impl EncodedResumeData {
 
     /// resume.py:231-267 number + resume.py:380-468 finish
     ///
-    /// Walks all frames via _number_boxes pattern, then walks virtual
-    /// fields and pending fields to compute count (resume.py:199-226).
+    /// Walks all frames via _number_boxes, assigning compact sequential
+    /// TAGBOX numbers to unique liveboxes (resume.py:199-226).
     fn from_semantic(
         frames: &[FrameInfo],
         virtuals: &[VirtualInfo],
@@ -1625,8 +1638,10 @@ impl EncodedResumeData {
         let mut rd_numb = Vec::new();
         let mut rd_consts = Vec::new();
         let mut const_indices = HashMap::new();
-        // resume.py:148 num_boxes — count of unique TAGBOX (livebox) entries.
-        let mut num_boxes: usize = 0;
+        // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
+        // liveboxes[compact_n] = original FailArg index.
+        let mut liveboxes: Vec<usize> = Vec::new();
+        let mut box_map: HashMap<usize, usize> = HashMap::new();
 
         // resume.py:234-235: reserve slots for items_resume_section and count.
         rd_numb.push(0); // [0] = items_resume_section (patched later)
@@ -1639,10 +1654,13 @@ impl EncodedResumeData {
             rd_numb.push(encode_len(frame.slot_map.len()));
             // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
-                let tagged = encode_tagged_source(source, &mut rd_consts, &mut const_indices);
-                if let ResumeValueSource::FailArg(idx) = source {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
+                let tagged = encode_tagged_source(
+                    source,
+                    &mut rd_consts,
+                    &mut const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                );
                 rd_numb.push(tagged);
             }
         }
@@ -1650,48 +1668,53 @@ impl EncodedResumeData {
         // compile.py:858 rd_virtuals — stored as live objects, not serialized.
         let rd_virtuals = virtuals.to_vec();
 
-        // resume.py:412-418: visitor_walk_recursive — walk virtual fields for count.
+        // resume.py:412-418: visitor_walk_recursive — register virtual field boxes.
         for vinfo in &rd_virtuals {
             for source in vinfo.field_sources() {
-                if let ResumeValueSource::FailArg(idx) = source {
-                    num_boxes = num_boxes.max(*idx + 1);
+                if let ResumeValueSource::FailArg(index) = source {
+                    box_map.entry(*index).or_insert_with(|| {
+                        let n = liveboxes.len();
+                        liveboxes.push(*index);
+                        n
+                    });
                 }
             }
         }
 
-        // resume.py:420-430: walk pending fields for count + encode.
+        // resume.py:420-430: walk pending fields — register + encode.
         let rd_pendingfields: Vec<_> = pending_fields
             .iter()
-            .map(|pending| {
-                if let ResumeValueSource::FailArg(idx) = &pending.target {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
-                if let ResumeValueSource::FailArg(idx) = &pending.value {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
-                EncodedPendingFieldWrite {
-                    descr_index: pending.descr_index,
-                    target: encode_tagged_source(
-                        &pending.target,
-                        &mut rd_consts,
-                        &mut const_indices,
-                    ),
-                    value: encode_tagged_source(&pending.value, &mut rd_consts, &mut const_indices),
-                    item_index: pending.item_index,
-                }
+            .map(|pending| EncodedPendingFieldWrite {
+                descr_index: pending.descr_index,
+                target: encode_tagged_source(
+                    &pending.target,
+                    &mut rd_consts,
+                    &mut const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                ),
+                value: encode_tagged_source(
+                    &pending.value,
+                    &mut rd_consts,
+                    &mut const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                ),
+                item_index: pending.item_index,
             })
             .collect();
 
         // resume.py:260: numb_state.patch_current_size(0) → items_resume_section
         rd_numb[0] = encode_len(rd_numb.len());
         // resume.py:464: numb_state.patch(1, len(liveboxes)) → count
-        rd_numb[1] = encode_len(num_boxes);
+        rd_numb[1] = encode_len(liveboxes.len());
 
         EncodedResumeData {
             rd_numb,
             rd_consts,
             rd_pendingfields,
             rd_virtuals,
+            liveboxes,
         }
     }
 
@@ -1762,7 +1785,12 @@ impl EncodedResumeData {
         let (value, tag) = untag_i64(encoded);
         match tag {
             TAGINT => ResumeValueSource::Constant(value),
-            TAGBOX => ResumeValueSource::FailArg(decode_len(value)),
+            // resume.py:1261 self.liveboxes[num] — compact TAGBOX → original FailArg.
+            TAGBOX => {
+                let compact_idx = decode_len(value);
+                let original_idx = self.liveboxes[compact_idx];
+                ResumeValueSource::FailArg(original_idx)
+            }
             TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
             TAGCONST => match value {
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
@@ -3372,7 +3400,9 @@ impl ResumeDataLoopMemo {
     /// resume.py:452-468 finish (on ResumeDataVirtualAdder) — encode with shared pool.
     pub fn encode_shared(&mut self, rd: &ResumeData) -> EncodedResumeData {
         let mut rd_numb = Vec::new();
-        let mut num_boxes: usize = 0;
+        // resume.py:138 compact TAGBOX numbering state.
+        let mut liveboxes: Vec<usize> = Vec::new();
+        let mut box_map: HashMap<usize, usize> = HashMap::new();
 
         // resume.py:234-235: reserve slots
         rd_numb.push(0); // [0] = items_resume_section
@@ -3384,63 +3414,66 @@ impl ResumeDataLoopMemo {
             rd_numb.push(encode_u64(frame.pc));
             rd_numb.push(encode_len(frame.slot_map.len()));
             for source in &frame.slot_map {
-                let tagged =
-                    encode_tagged_source(source, &mut self.rd_consts_pool, &mut self.const_indices);
-                if let ResumeValueSource::FailArg(idx) = source {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
+                let tagged = encode_tagged_source(
+                    source,
+                    &mut self.rd_consts_pool,
+                    &mut self.const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                );
                 rd_numb.push(tagged);
             }
         }
 
         let rd_virtuals = rd.virtuals.clone();
 
-        // resume.py:412-418: walk virtual fields for count.
+        // resume.py:412-418: register virtual field boxes.
         for vinfo in &rd_virtuals {
             for source in vinfo.field_sources() {
-                if let ResumeValueSource::FailArg(idx) = source {
-                    num_boxes = num_boxes.max(*idx + 1);
+                if let ResumeValueSource::FailArg(index) = source {
+                    box_map.entry(*index).or_insert_with(|| {
+                        let n = liveboxes.len();
+                        liveboxes.push(*index);
+                        n
+                    });
                 }
             }
         }
 
-        // resume.py:420-430: walk pending fields for count + encode.
+        // resume.py:420-430: walk pending fields — register + encode.
         let rd_pendingfields: Vec<_> = rd
             .pending_fields
             .iter()
-            .map(|pending| {
-                if let ResumeValueSource::FailArg(idx) = &pending.target {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
-                if let ResumeValueSource::FailArg(idx) = &pending.value {
-                    num_boxes = num_boxes.max(*idx + 1);
-                }
-                EncodedPendingFieldWrite {
-                    descr_index: pending.descr_index,
-                    target: encode_tagged_source(
-                        &pending.target,
-                        &mut self.rd_consts_pool,
-                        &mut self.const_indices,
-                    ),
-                    value: encode_tagged_source(
-                        &pending.value,
-                        &mut self.rd_consts_pool,
-                        &mut self.const_indices,
-                    ),
-                    item_index: pending.item_index,
-                }
+            .map(|pending| EncodedPendingFieldWrite {
+                descr_index: pending.descr_index,
+                target: encode_tagged_source(
+                    &pending.target,
+                    &mut self.rd_consts_pool,
+                    &mut self.const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                ),
+                value: encode_tagged_source(
+                    &pending.value,
+                    &mut self.rd_consts_pool,
+                    &mut self.const_indices,
+                    &mut liveboxes,
+                    &mut box_map,
+                ),
+                item_index: pending.item_index,
             })
             .collect();
 
         // resume.py:260 patch_current_size, resume.py:464 patch count
         rd_numb[0] = encode_len(rd_numb.len());
-        rd_numb[1] = encode_len(num_boxes);
+        rd_numb[1] = encode_len(liveboxes.len());
 
         EncodedResumeData {
             rd_numb,
             rd_consts: self.rd_consts_pool.clone(),
             rd_pendingfields,
             rd_virtuals,
+            liveboxes,
         }
     }
 

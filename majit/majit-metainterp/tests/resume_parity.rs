@@ -166,3 +166,68 @@ fn resume_py_count_frame_only() {
     // rd_numb[1] = count: 3 liveboxes
     assert_eq!(encoded.rd_numb[1], 3);
 }
+
+/// resume.py:199-226 _number_boxes: compact numbering assigns sequential
+/// indices. Sparse FailArg indices are renumbered: {0,7} → {0,1}, count=2.
+#[test]
+fn resume_py_compact_liveboxes_numbering() {
+    let rd = ResumeData {
+        frames: vec![FrameInfo {
+            pc: 10,
+            slot_map: vec![
+                FrameSlotSource::FailArg(0),
+                FrameSlotSource::FailArg(7),
+                FrameSlotSource::Constant(42),
+            ],
+        }],
+        virtuals: vec![],
+        pending_fields: vec![],
+    };
+    let encoded = rd.encode();
+    // count = 2 (two unique liveboxes, not 8)
+    assert_eq!(encoded.rd_numb[1], 2);
+    // liveboxes[0] = 0, liveboxes[1] = 7
+    assert_eq!(encoded.liveboxes, vec![0, 7]);
+    // TAGBOX(0) for FailArg(0), TAGBOX(1) for FailArg(7)
+    let slot_words = &encoded.rd_numb[5..8];
+    assert_eq!(untag(slot_words[0]), (0, TAG_BOX));
+    assert_eq!(untag(slot_words[1]), (1, TAG_BOX));
+    assert_eq!(untag(slot_words[2]), (42, TAG_INT));
+
+    // Roundtrip: decode recovers original indices.
+    let decoded = encoded.decode();
+    assert_eq!(decoded.frames[0].slot_map[0], FrameSlotSource::FailArg(0));
+    assert_eq!(decoded.frames[0].slot_map[1], FrameSlotSource::FailArg(7));
+}
+
+/// Same box appearing in multiple slots gets the same compact number.
+#[test]
+fn resume_py_dedup_same_box_same_number() {
+    let rd = ResumeData {
+        frames: vec![FrameInfo {
+            pc: 10,
+            slot_map: vec![
+                FrameSlotSource::FailArg(5),
+                FrameSlotSource::FailArg(5),
+                FrameSlotSource::FailArg(3),
+            ],
+        }],
+        virtuals: vec![],
+        pending_fields: vec![],
+    };
+    let encoded = rd.encode();
+    // count = 2 (two unique: 5 and 3)
+    assert_eq!(encoded.rd_numb[1], 2);
+    assert_eq!(encoded.liveboxes, vec![5, 3]);
+    // Both FailArg(5) slots get TAGBOX(0), FailArg(3) gets TAGBOX(1)
+    let slot_words = &encoded.rd_numb[5..8];
+    assert_eq!(untag(slot_words[0]), (0, TAG_BOX));
+    assert_eq!(untag(slot_words[1]), (0, TAG_BOX));
+    assert_eq!(untag(slot_words[2]), (1, TAG_BOX));
+
+    // Roundtrip
+    let decoded = encoded.decode();
+    assert_eq!(decoded.frames[0].slot_map[0], FrameSlotSource::FailArg(5));
+    assert_eq!(decoded.frames[0].slot_map[1], FrameSlotSource::FailArg(5));
+    assert_eq!(decoded.frames[0].slot_map[2], FrameSlotSource::FailArg(3));
+}
