@@ -2938,6 +2938,7 @@ impl ResumeDataLoopMemo {
     /// - `get_type(opref)` → box.type ('i', 'r', 'f') (resume.py:211,214)
     /// - `is_virtual_ref(opref)` → getptrinfo(box).is_virtual() (resume.py:212-213)
     /// - `is_virtual_raw(opref)` → getrawptrinfo(box).is_virtual() (resume.py:215-216)
+    /// See `majit_ir::resumedata::ResumeDataLoopMemo::_number_boxes` for docs.
     pub fn _number_boxes(
         &mut self,
         boxes: &[majit_ir::OpRef],
@@ -2945,39 +2946,30 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for &raw_opref in boxes {
-            // Dead slots (no box at this position) → NULLREF.
             if raw_opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            // resume.py:201-202: box = iter.get(item); box = box.get_box_replacement()
             let opref = env.get_box_replacement(raw_opref);
             if opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-
-            // resume.py:204-205: isinstance(box, Const) → self.getconst(box)
             if env.is_const(opref) {
                 let (val, tp) = env.get_const(opref);
                 let tagged = self.getconst(val, tp);
                 numb_state.append_short(tagged);
                 continue;
             }
-            // resume.py:207-208: liveboxes[box] (already seen)
             if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
                 numb_state.append_short(tagged);
                 continue;
             }
-            // resume.py:210-216: check virtual by type
             let is_virtual = match env.get_type(opref) {
-                // resume.py:211-213: if box.type == 'r': getptrinfo(box).is_virtual()
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
-                // resume.py:214-216: if box.type == 'i': getrawptrinfo(box).is_virtual()
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
                 _ => false,
             };
-            // resume.py:217-223: tag as TAGVIRTUAL or TAGBOX
             let tagged = if is_virtual {
                 let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
                 numb_state.num_virtuals += 1;

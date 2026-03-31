@@ -221,6 +221,19 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py:196-223 _number_boxes — tag each box in the snapshot.
+    ///
+    /// RPython's read_boxes/wrap() creates fresh Box objects for
+    /// virtualizable_boxes with separate Python object identity from
+    /// frame register boxes. This causes _number_boxes (keyed by id())
+    /// to assign separate TAGBOX indices. In pyre, OpRefs are shared
+    /// between vable and frame sections, so dedup occurs. Recovery uses
+    /// vable_array_items as the authoritative source for all slots,
+    /// making this dedup behaviorally transparent.
+    ///
+    /// TODO(read_boxes parity): create separate OpRefs for vable boxes
+    /// via SameAs operations in the trace recorder, matching RPython's
+    /// wrap(cpu, value, startindex) which produces fresh FrontendOp
+    /// objects. This would eliminate dedup at the _number_boxes level.
     pub fn _number_boxes(
         &mut self,
         boxes: &[OpRef],
