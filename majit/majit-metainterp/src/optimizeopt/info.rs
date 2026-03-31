@@ -548,9 +548,8 @@ impl PtrInfo {
     /// info.py:137-160 / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     ///
-    /// In majit we queue the generated ops via emit_through_passes() so the
-    /// optimizer chain can observe them again. Callers that are outside the
-    /// pass chain must explicitly drain ctx.extra_operations afterward.
+    /// Generated ops are routed via emit_through_passes_after() (RPython
+    /// emit_extra parity) so downstream passes can observe them.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         self.force_box_impl(opref, ctx, false)
     }

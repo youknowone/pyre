@@ -138,10 +138,6 @@ pub struct OptContext {
     num_inputs: u32,
     /// Next unique op position for newly emitted or queued extra operations.
     pub(crate) next_pos: u32,
-    /// Extra operations requested by the current pass. The optimizer drains
-    /// these through the remaining downstream passes, matching RPython
-    /// send_extra_operation()/emit_operation behavior.
-    extra_operations: VecDeque<Op>,
     /// RPython emit_extra(op, emit=False) parity: ops queued to be
     /// processed starting from a specific pass index (skipping earlier passes).
     /// Used by heap's force_lazy_set to route ops through remaining passes
@@ -237,7 +233,7 @@ pub struct OptContext {
     pub current_pass_idx: usize,
     /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
     /// where the stored value is virtual. Set by OptHeap.emitting_operation()
-    /// before a guard, consumed by emit_with_guard_check() to encode into
+    /// before a guard, consumed by emit_operation() to encode into
     /// the guard's rd_pendingfields.
     pub pending_for_guard: Vec<Op>,
     /// optimizer.py:787: constant_fold allocator callback.
@@ -406,7 +402,6 @@ impl OptContext {
             forwarded: Vec::new(),
             num_inputs: 0,
             next_pos: 0,
-            extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
@@ -458,7 +453,6 @@ impl OptContext {
             forwarded: Vec::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
-            extra_operations: VecDeque::new(),
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
             imported_int_bounds: HashMap::new(),
@@ -576,19 +570,6 @@ impl OptContext {
             self.value_types.insert(op.pos.0, op.result_type());
         }
         self.new_operations.push(op);
-        pos_ref
-    }
-
-    /// Queue an extra operation to be processed through the remaining
-    /// downstream passes instead of being appended directly.
-    pub fn emit_through_passes(&mut self, mut op: Op) -> OpRef {
-        if op.pos.is_none() {
-            op.pos = self.reserve_pos();
-        } else {
-            self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
-        }
-        let pos_ref = op.pos;
-        self.extra_operations.push_back(op);
         pos_ref
     }
 
@@ -814,14 +795,7 @@ impl OptContext {
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
             // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // RPython use_box appends arg guards before the preamble op
-            // and result guards after it. Currently disabled: connecting
-            // guards changes the short preamble entry signature which causes
-            // incompatible-state on re-entry (e.g. nbody short_args 15→19).
-            // Needs inline_short_preamble to handle guard constant args as
-            // inline constants rather than additional inputargs.
-            let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
-            let (arg_guards, result_guards): (Vec<Op>, Vec<Op>) = (Vec::new(), Vec::new());
+            let (arg_guards, result_guards) = self.collect_use_box_guards(preamble_source);
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
@@ -1169,20 +1143,6 @@ impl OptContext {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    pub(crate) fn pop_extra_operation(&mut self) -> Option<Op> {
-        self.extra_operations.pop_front()
-    }
-
-    pub(crate) fn has_extra_operations(&self) -> bool {
-        !self.extra_operations.is_empty()
-    }
-
-    pub(crate) fn flush_extra_operations_raw(&mut self) {
-        while let Some(op) = self.extra_operations.pop_front() {
-            self.emit(op);
-        }
     }
 
     /// Record that `old` should be replaced by `new` wherever it appears.
@@ -2491,7 +2451,6 @@ impl OptContext {
     /// Clear the output operation list (used when restarting optimization).
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
-        self.extra_operations.clear();
         self.next_pos = self.num_inputs;
         self.imported_int_bounds.clear();
         self.const_infos.clear();
@@ -2718,5 +2677,10 @@ pub trait Optimization {
     /// Called before any operation is emitted to the output, regardless of
     /// which pass emits it. This enables passes like OptHeap to force lazy
     /// sets before guards, even when the guard is emitted by an earlier pass.
-    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext) {}
+    ///
+    /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
+    /// RPython uses `self.next_optimization` to route lazy-set emissions
+    /// starting AFTER the current pass. In majit, pass this index to
+    /// `emit_through_passes_after` to achieve the same behavior.
+    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
