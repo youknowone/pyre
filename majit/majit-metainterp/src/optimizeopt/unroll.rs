@@ -269,10 +269,11 @@ impl UnrollOptimizer {
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
-            // RPython optimize_preamble uses flush=False, but in majit the
-            // assembly infrastructure requires JUMP to go through the pipeline
-            // for proper body_result_remap positioning. Virtualize.rs captures
-            // pre_force_virtual_state but no longer forces virtuals at JUMP.
+            // RPython optimize_preamble: flush=False — JUMP is NOT sent through
+            // the pass pipeline. In majit, skip_flush=true causes crashes because
+            // (1) OptHeap lazy sets are not flushed, and (2) emit_with_guard_check
+            // force_box is needed for guard resume data. Keep skip_flush=false
+            // until these dependencies are resolved.
             let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
@@ -1854,6 +1855,9 @@ impl OptUnroll {
                         optimizer,
                         ctx,
                     );
+                    if crate::optimizeopt::majit_log_enabled() {
+                        eprintln!("[jit][jte-isp] done, extra_len={}", extra.len());
+                    }
                 }
             }
 
@@ -3363,6 +3367,20 @@ fn assemble_peeled_trace_with_jump_args(
         };
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
+    // Advance max_pos past all label_args positions to prevent SameAs ops
+    // from colliding with LABEL block parameters. In Cranelift, a SameAs at
+    // position v36 followed by LABEL(v36) would redefine v36 as a block
+    // param, but the body still uses the SameAs value — causing wrong results.
+    for &la in &full_label_args {
+        if !la.is_none() && la.0 < 10_000 {
+            max_pos = max_pos.max(la.0.saturating_add(1));
+        }
+    }
+    for &la in &filtered_extra_label_args {
+        if !la.is_none() && la.0 < 10_000 {
+            max_pos = max_pos.max(la.0.saturating_add(1));
+        }
+    }
     let mut seen_body_defs = std::collections::HashSet::new();
     for op in p2_ops {
         let all_refs = op

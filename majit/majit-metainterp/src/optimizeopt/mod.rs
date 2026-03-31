@@ -814,12 +814,12 @@ impl OptContext {
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
             // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // shortpreamble.py:389,396,406: info.make_guards → self.short
-            // Guards not yet connected: nbody's extra jump_args from use_box
-            // change the short preamble entry signature, causing compiled loop
-            // incompatible-state on re-entry. Needs investigation of how
-            // inline_short_preamble extra args interact with target_token entry.
+            // RPython use_box appends arg guards before the preamble op
+            // and result guards after it. Currently disabled: connecting
+            // guards changes the short preamble entry signature which causes
+            // incompatible-state on re-entry (e.g. nbody short_args 15→19).
+            // Needs inline_short_preamble to handle guard constant args as
+            // inline constants rather than additional inputargs.
             let (_arg_guards, _result_guards) = self.collect_use_box_guards(preamble_source);
             let (arg_guards, result_guards): (Vec<Op>, Vec<Op>) = (Vec::new(), Vec::new());
 
