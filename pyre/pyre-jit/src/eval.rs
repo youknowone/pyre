@@ -2792,9 +2792,11 @@ fn build_resumed_frames(
         );
         all_values.push(values);
     }
-    for values in &mut all_values {
-        rebuild_state_after_failure_with_exit_layout(values, raw_values, exit_layout);
-    }
+    // RPython parity: _prepare_next_section + materialize_virtual_from_rd
+    // is the authoritative path for virtual materialization.
+    // rebuild_state_after_failure_with_exit_layout (recovery_layout) is a
+    // pyre-specific legacy path that is NOT in RPython and can produce
+    // stale values. Disabled for RPython parity.
     // resume.py:993 _prepare_pendingfields: apply ONCE for the whole reader.
     // No header — values = slot registers only.
     if let Some(first_values) = all_values.first() {
