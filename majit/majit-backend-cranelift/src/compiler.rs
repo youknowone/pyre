@@ -2641,6 +2641,24 @@ extern "C" fn call_assembler_guard_failure(
         return unsafe { *outputs_ptr };
     }
 
+    // RPython compile.py:701-717 handle_fail → must_compile parity:
+    // After trace_eagerness guard failures, compile a base-case bridge.
+    const CA_BRIDGE_THRESHOLD: u32 = 3;
+    if fail_count >= CA_BRIDGE_THRESHOLD {
+        if compile_base_case_bridge(target, fail_index) {
+            let new_bridge_ptr = fail_descr.bridge_code_ptr();
+            if !new_bridge_ptr.is_null() {
+                let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+                    unsafe { std::mem::transmute(new_bridge_ptr) };
+                let jf_ptr = unsafe {
+                    (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64
+                };
+                let _result_jf = unsafe { func(jf_ptr) };
+                return unsafe { *outputs_ptr };
+            }
+        }
+    }
+
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
@@ -2701,16 +2719,17 @@ fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> b
     let fail_arg_types = fail_descr.fail_arg_types();
 
     // Find the value to return in the bridge.
-    // Look for Ref (boxed int → unbox) or Int (raw value → return directly)
-    // after the virtualizable header (idx >= 3).
+    // For no-snapshot guards: fail_args = [frame, ni, vsd, local0, ...], return local0 (idx >= 3).
+    // For snapshot guards: fail_args = liveboxes (compact), return first Int/Ref.
+    let header_skip = if fail_arg_types.len() > 3 { 3 } else { 0 };
     let ref_idx = fail_arg_types
         .iter()
         .enumerate()
-        .position(|(i, tp)| i >= 3 && *tp == Type::Ref);
+        .position(|(i, tp)| i >= header_skip && *tp == Type::Ref);
     let int_idx = fail_arg_types
         .iter()
         .enumerate()
-        .position(|(i, tp)| i >= 3 && *tp == Type::Int);
+        .position(|(i, tp)| i >= header_skip && *tp == Type::Int);
 
     let mut bridge_ops = Vec::new();
     let num_inputs = fail_arg_types.len() as u32;

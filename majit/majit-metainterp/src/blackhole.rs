@@ -202,7 +202,9 @@ pub fn blackhole_execute_with_memory(
     .0
 }
 
-fn blackhole_execute_full(
+/// blackhole_execute_with_state + BlackholeMemory support.
+/// RPython _run_forever parity: Jump loops back to Label.
+pub fn blackhole_execute_full(
     ops: &[Op],
     constants: &HashMap<u32, i64>,
     initial_values: &HashMap<u32, i64>,
@@ -210,8 +212,6 @@ fn blackhole_execute_full(
     initial_exception: ExceptionState,
     memory: &dyn BlackholeMemory,
 ) -> (BlackholeResult, ExceptionState) {
-    // Build TraceValues from the initial HashMap state.
-    // This replaces per-op HashMap lookups with O(1) Vec indexing.
     let mut merged = initial_values.clone();
     for (&k, &v) in constants {
         merged.entry(k).or_insert(v);
@@ -220,7 +220,20 @@ fn blackhole_execute_full(
     drop(merged);
     let mut exc_state = initial_exception;
 
-    for op_idx in start_index..ops.len() {
+    // RPython _run_forever parity: find the Label op (loop header) so
+    // that Jump can loop back. The trace is [Label, ..., Jump(→Label)].
+    let label_index = ops
+        .iter()
+        .position(|op| op.opcode == OpCode::Label)
+        .unwrap_or(0);
+    let label_inputarg_positions: Vec<u32> = ops
+        .get(label_index)
+        .map(|op| op.args.iter().map(|a| a.0).collect())
+        .unwrap_or_default();
+
+    let mut op_idx = start_index;
+
+    while op_idx < ops.len() {
         let op = &ops[op_idx];
         let result = execute_one_with_memory(op, &tv, &mut exc_state, memory);
 
@@ -249,14 +262,13 @@ fn blackhole_execute_full(
                 );
             }
             OpResult::Jump(args) => {
+                // RPython _run_forever parity: Jump loops back to Label.
                 let vals: Vec<i64> = args.iter().map(|&r| tv.resolve(r)).collect();
-                return (
-                    BlackholeResult::Jump {
-                        op_index: op_idx,
-                        values: vals,
-                    },
-                    exc_state,
-                );
+                for (pos, val) in label_inputarg_positions.iter().zip(vals.iter()) {
+                    tv.set(*pos, *val);
+                }
+                op_idx = label_index + 1;
+                continue;
             }
             OpResult::GuardFailed => {
                 let fail_values = if let Some(ref fail_args) = op.fail_args {
@@ -276,6 +288,7 @@ fn blackhole_execute_full(
                 return (BlackholeResult::Abort(msg), exc_state);
             }
         }
+        op_idx += 1;
     }
 
     (
