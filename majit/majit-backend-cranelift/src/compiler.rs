@@ -1523,9 +1523,10 @@ pub fn register_call_assembler_blackhole(
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
 
-/// Bridge compilation callback: (frame_ptr, fail_index, trace_id, green_key) -> result.
-/// Called when a call_assembler guard fails enough times to warrant bridge compilation.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<extern "C" fn(i64, u32, u64, u64) -> i64> =
+/// compile.py:701-717 handle_fail callback for call_assembler guard failures.
+/// (green_key, trace_id, fail_index, raw_values_ptr, num_values) -> bridge_compiled.
+/// Checks must_compile (jitcounter.tick) and traces bridge if threshold reached.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> bool> =
     OnceLock::new();
 
 /// Thread-local: raw local0 value from CallAssemblerI inputs,
@@ -1779,7 +1780,7 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: extern "C" fn(i64, u32, u64, u64) -> i64) {
+pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2623,7 +2624,7 @@ extern "C" fn call_assembler_guard_failure(
     let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
     let fail_index = fail_descr_ref.fail_index();
     let fail_descr = &target.fail_descrs[fail_index as usize];
-    let fail_count = fail_descr.increment_fail_count();
+    let _fail_count = fail_descr.increment_fail_count();
 
     // Fast bridge dispatch: zero-copy — pass the caller's jf_frame
     // directly to the bridge. fail_args are already at the right offsets
@@ -2641,11 +2642,20 @@ extern "C" fn call_assembler_guard_failure(
         return unsafe { *outputs_ptr };
     }
 
-    // RPython compile.py:701-717 handle_fail → must_compile parity:
-    // After trace_eagerness guard failures, compile a base-case bridge.
-    const CA_BRIDGE_THRESHOLD: u32 = 3;
-    if fail_count >= CA_BRIDGE_THRESHOLD {
-        if compile_base_case_bridge(target, fail_index) {
+    // compile.py:701-717 handle_fail → must_compile → bridge tracing.
+    // Check jitcounter threshold; if reached, trace alternate path and
+    // compile bridge. The bridge is attached to fail_descr for fast
+    // dispatch on subsequent guard failures.
+    if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
+        let raw_num = fail_descr.fail_arg_types.len();
+        if bridge_fn(
+            target.header_pc,
+            target.trace_id,
+            fail_index,
+            outputs_ptr,
+            raw_num,
+        ) {
+            // Bridge compiled — dispatch to it immediately.
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
             if !new_bridge_ptr.is_null() {
                 let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
@@ -2691,130 +2701,6 @@ extern "C" fn call_assembler_guard_failure(
         PENDING_FORCE_LOCAL0.with(|c| c.set(Some(raw)));
     }
     CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr))
-}
-
-/// Compile a simple bridge (GetfieldGcI + Finish) for base-case guard failures.
-/// Called synchronously from call_assembler_guard_failure, matching RPython's
-/// handle_fail → _trace_and_compile_from_bridge pattern.
-///
-/// This does NOT use MetaInterp — bridge ops are trivial and need no optimizer.
-fn compile_base_case_bridge(target: &RegisteredLoopTarget, fail_index: u32) -> bool {
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
-
-    let fail_descr = match target.fail_descrs.get(fail_index as usize) {
-        Some(d) => d,
-        None => return false,
-    };
-    // Don't overwrite a bridge compiled by MetaInterp (compile_bridge in
-    // pyjitpl.rs). The MetaInterp bridge has correct inputarg mapping.
-    if fail_descr.has_bridge() {
-        return true;
-    }
-    // compile.py:701 handle_fail: guard failures go to blackhole resume
-    // or bridge compilation. Only FINISH exits produce direct results.
-    // This function is a majit-only optimization (no RPython equivalent).
-    if !fail_descr.is_finish() {
-        return false;
-    }
-    let fail_arg_types = fail_descr.fail_arg_types();
-
-    // Find the value to return in the bridge.
-    // For no-snapshot guards: fail_args = [frame, ni, vsd, local0, ...], return local0 (idx >= 3).
-    // For snapshot guards: fail_args = liveboxes (compact), return first Int/Ref.
-    let header_skip = if fail_arg_types.len() > 3 { 3 } else { 0 };
-    let ref_idx = fail_arg_types
-        .iter()
-        .enumerate()
-        .position(|(i, tp)| i >= header_skip && *tp == Type::Ref);
-    let int_idx = fail_arg_types
-        .iter()
-        .enumerate()
-        .position(|(i, tp)| i >= header_skip && *tp == Type::Int);
-
-    let mut bridge_ops = Vec::new();
-    let num_inputs = fail_arg_types.len() as u32;
-
-    if let Some(ref_idx) = ref_idx {
-        // compile.py:649 DoneWithThisFrameDescrRef.get_result:
-        // cpu.get_ref_value(deadframe, 0) → return Ref as-is.
-        let boxed = OpRef(ref_idx as u32);
-        let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs, vec![Type::Ref], true),
-        );
-        let mut finish_op = Op::with_descr(OpCode::Finish, &[boxed], finish_descr);
-        finish_op.pos = OpRef(num_inputs);
-        bridge_ops.push(finish_op);
-    } else if let Some(int_idx) = int_idx {
-        // Raw int: Finish(raw_value) directly
-        let raw_val = OpRef(int_idx as u32);
-        let finish_descr: majit_ir::DescrRef = std::sync::Arc::new(
-            crate::guard::CraneliftFailDescr::new_with_kind(num_inputs, vec![Type::Int], true),
-        );
-        let mut finish_op = Op::with_descr(OpCode::Finish, &[raw_val], finish_descr);
-        finish_op.pos = OpRef(num_inputs);
-        bridge_ops.push(finish_op);
-    } else {
-        return false;
-    };
-
-    let bridge_inputargs: Vec<InputArg> = fail_arg_types
-        .iter()
-        .enumerate()
-        .map(|(i, tp)| InputArg::from_type(*tp, i as u32))
-        .collect();
-
-    // Compile using a fresh backend instance
-    let mut backend = CraneliftBackend::new();
-    backend.set_next_trace_id(target.trace_id * 100 + fail_index as u64 + 1000);
-    backend.set_constants(std::collections::HashMap::new());
-
-    let compiled = match backend.do_compile(
-        &bridge_inputargs,
-        &bridge_ops,
-        None,
-        Some((target.trace_id, fail_index)),
-        None,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[bridge] do_compile failed: {e}");
-            return false;
-        }
-    };
-
-    let bridge_code_ptr = compiled.code_ptr;
-
-    // Attach bridge to the guard's fail descriptor
-    fail_descr.attach_bridge(crate::guard::BridgeData {
-        trace_id: compiled.trace_id,
-        input_types: compiled.input_types,
-        header_pc: compiled.header_pc,
-        source_guard: (target.trace_id, fail_index),
-        caller_prefix_layout: compiled.caller_prefix_layout,
-        code_ptr: bridge_code_ptr,
-        fail_descrs: compiled.fail_descrs,
-        terminal_exit_layouts: compiled.terminal_exit_layouts,
-        gc_runtime_id: compiled.gc_runtime_id,
-        loop_reentry: false,
-        num_inputs: compiled.num_inputs,
-        num_ref_roots: compiled.num_ref_roots,
-        max_output_slots: compiled.max_output_slots,
-        needs_force_frame: compiled.needs_force_frame,
-        invalidated_arc: None, // call_assembler bridges don't need invalidation
-    });
-
-    // RPython redirect_call_assembler parity: store bridge code pointer
-    // in dispatch entry so Cranelift codegen can dispatch guard failures
-    // directly without extern "C" call overhead.
-    let table = ca_dispatch_table().lock().unwrap();
-    if let Some(entry) = table.get(&(target.trace_id)) {
-        entry
-            .guard_bridge_ptr
-            .store(bridge_code_ptr as *mut u8, Ordering::Release);
-    }
-    drop(table);
-
-    true
 }
 
 /// Fast path for call_assembler when a force callback is available.

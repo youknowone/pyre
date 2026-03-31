@@ -1489,12 +1489,9 @@ pub fn install_jit_call_bridge() {
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
         majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
-        majit_backend_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
+        majit_backend_cranelift::register_call_assembler_bridge(jit_ca_handle_guard_failure);
         majit_backend_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
-        // Bridge compilation is triggered by MetaInterp.must_compile()
-        // (compile.py:783-784), not by backend fail_count threshold.
         majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
-        // Bridge compilation is handled by handle_fail() in eval.rs.
     });
 }
 
@@ -1985,81 +1982,93 @@ pub fn trace_and_compile_from_bridge(
     false
 }
 
-extern "C" fn jit_bridge_compile_callee(
-    frame_ptr: i64,
-    fail_index: u32,
-    trace_id: u64,
+/// compile.py:701-717 handle_fail for call_assembler guard failures.
+/// Checks must_compile (jitcounter.tick), and if threshold reached,
+/// traces the alternate path via trace_and_compile_from_bridge.
+fn jit_ca_handle_guard_failure(
     green_key: u64,
-) -> i64 {
-    let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
-    use std::collections::HashMap;
+    trace_id: u64,
+    fail_index: u32,
+    raw_values_ptr: *const i64,
+    num_values: usize,
+) -> bool {
+    if raw_values_ptr.is_null() || num_values == 0 {
+        return false;
+    }
+    let raw_values = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
 
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    // Reset frame state — compiled code may have modified next_instr/vsd.
-    let nlocals = unsafe { &*frame.code }.varnames.len();
-    frame.next_instr = 0;
-    frame.valuestackdepth = nlocals;
-    // If green_key=0, compute from the callee frame's code pointer.
-    let green_key = if green_key == 0 {
-        crate::eval::make_green_key(frame.code, 0)
-    } else {
-        green_key
+    // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
+    let (should_bridge, owning_key) = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .must_compile_with_values(green_key, trace_id, fail_index, raw_values)
     };
-    let protocol = finish_protocol(green_key);
-    let result = match crate::eval::eval_with_jit(frame) {
-        Ok(r) => match protocol {
-            FinishProtocol::RawInt if !r.is_null() && unsafe { is_int(r) } => unsafe {
-                w_int_get_value(r)
-            },
-            FinishProtocol::RawInt => r as i64,
-            FinishProtocol::Boxed => r as i64,
-        },
-        Err(_) => 0i64,
-    };
+    if !should_bridge {
+        return false;
+    }
 
-    let bridge_inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let frame_opref = OpRef(0);
-
-    let force_fn_ptr = jit_force_callee_frame as *const () as i64;
-    let func_const_ref = OpRef(10_000);
-    let mut constants: HashMap<u32, i64> = HashMap::new();
-    constants.insert(func_const_ref.0, force_fn_ptr);
-
-    // pyjitpl.py:3198: compile_done_with_this_frame selects descr based
-    // on result_type. result_type=Int → done_with_this_frame_descr_int.
-    let call_descr = majit_metainterp::make_call_descr(&[Type::Int], Type::Int);
-    let call_result = OpRef(1);
-    let mut call_op = Op::with_descr(OpCode::CallI, &[func_const_ref, frame_opref], call_descr);
-    call_op.pos = call_result;
-
-    let finish_descr = majit_metainterp::make_fail_descr_typed(vec![Type::Int]);
-    let mut finish_op = Op::with_descr(OpCode::Finish, &[call_result], finish_descr);
-    finish_op.pos = OpRef(2);
-
-    let bridge_ops = vec![call_op, finish_op];
-
-    let driver = crate::eval::driver_pair();
-    let meta = driver.0.meta_interp_mut();
-
-    if let Some(fail_descr) = meta.get_fail_descr_for_bridge(green_key, trace_id, fail_index) {
-        meta.compile_bridge(
-            green_key,
-            fail_index,
-            fail_descr.as_ref(),
-            &bridge_ops,
-            &bridge_inputargs,
-            constants,
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][ca-bridge] must_compile fired: key={} trace={} fail={}",
+            green_key, trace_id, fail_index,
         );
     }
 
-    // done_compiling happens automatically via DoneCompilingGuard Drop.
-    result
+    // compile.py:719-726: get exit_layout from the compiled trace.
+    let exit_layout = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp()
+            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+    };
+    let Some(exit_layout) = exit_layout else {
+        return false;
+    };
+
+    // Obtain callee frame from deadframe vable header.
+    // pyre vable_boxes = [frame, ni, vsd, locals..., stack...],
+    // so raw_values[0] is the callee's PyFrame pointer.
+    let frame_ptr = raw_values[0] as *mut PyFrame;
+    if frame_ptr.is_null() {
+        return false;
+    }
+    let frame = unsafe { &mut *frame_ptr };
+
+    // compile.py:786-788 start_compiling: set ST_BUSY_FLAG
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .set_guard_compiling(owning_key, trace_id, fail_index, true);
+    }
+
+    // compile.py:706-708 _trace_and_compile_from_bridge
+    let compiled = trace_and_compile_from_bridge(
+        owning_key,
+        trace_id,
+        fail_index,
+        frame,
+        raw_values,
+        &exit_layout,
+    );
+
+    // compile.py:790-795 done_compiling: clear ST_BUSY_FLAG
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .set_guard_compiling(owning_key, trace_id, fail_index, false);
+    }
+
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
+            compiled, green_key, trace_id, fail_index,
+        );
+    }
+
+    compiled
 }
 
 // ── Callee frame creation for call_assembler ─────────────────────

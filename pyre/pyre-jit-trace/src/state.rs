@@ -2850,6 +2850,30 @@ impl MIFrame {
             return;
         }
 
+        // pyjitpl.py:2586-2596 capture_resumedata(resumepc) parity:
+        // Temporarily substitute frame.pc = resumepc, capture snapshot,
+        // then restore. For normal guards, resumepc = orgpc.
+        self.record_guard_with_resume_pc(ctx, opcode, args, self.orgpc, after_residual_call);
+    }
+
+    /// Core guard recording with explicit resume PC.
+    ///
+    /// pyjitpl.py:2586-2602 capture_resumedata parity: temporarily
+    /// substitute frame.pc = resume_pc before snapshot capture.
+    /// Used by both record_guard (resume_pc=orgpc) and
+    /// record_branch_guard (resume_pc=other_target).
+    fn record_guard_with_resume_pc(
+        &mut self,
+        ctx: &mut TraceCtx,
+        opcode: OpCode,
+        args: &[OpRef],
+        resume_pc: usize,
+        after_residual_call: bool,
+    ) {
+        // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
+        let saved_orgpc = self.orgpc;
+        self.orgpc = resume_pc;
+
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: active boxes = registers only (no header).
         let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
@@ -2892,6 +2916,9 @@ impl MIFrame {
 
         ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
+
+        // pyjitpl.py:2602: frame.pc = saved_pc (restore)
+        self.orgpc = saved_orgpc;
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
@@ -3094,10 +3121,13 @@ impl MIFrame {
             return;
         }
 
-        // pyjitpl.py:2586-2602 capture_resumedata(resumepc) parity:
-        // RPython goto_if_not calls generate_guard(resumepc=target) which
-        // temporarily sets frame.pc = resumepc before get_list_of_active_boxes.
-        // pyre: other_target = branch NOT taken = the resume destination.
+        // pyjitpl.py:520 generate_guard(opnum, box, resumepc=orgpc).
+        // RPython's goto_if_not is a single opcode — resumepc=orgpc means
+        // the interpreter re-executes the entire compare+branch from scratch.
+        // pyre has separate COMPARE_OP + POP_JUMP_IF_FALSE — the comparison
+        // result is already consumed from the stack when the branch guard
+        // fires. Resume must use other_target (branch destination) so the
+        // interpreter takes the not-taken path without re-comparing.
         let other_target = self.sym().pending_branch_other_target;
         let resume_pc = {
             let s = self.sym();
