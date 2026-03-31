@@ -2072,10 +2072,12 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        // pyre-specific: unbox Ref→Int at function entry.
-        // pyre locals are always GCREF (PyObjectRef), but trace-internal
-        // operations unbox to Int/Float. adapt_live converts Ref pointers
-        // to Int values matching the compiled trace's typed label.
+        // Pyre-specific: unbox Ref→Int to match compiled trace types.
+        // RPython has no adapt-live because MIFrame registers are typed.
+        // In pyre, all values are Ref — the compiled trace may expect Int
+        // at positions where the optimizer unboxed (e.g. finish_and_compile
+        // traces have no preamble). compile_loop traces with preamble
+        // peeling do NOT need this (preamble handles conversion).
         let live_values = if target_pc == 0 {
             self.meta
                 .adapt_live_values_to_trace_types(green_key, live_values)

@@ -1415,7 +1415,13 @@ impl OptContext {
                 let fargs: Vec<OpRef> = fa.iter().copied().collect();
                 for farg in fargs {
                     if !farg.is_none() {
-                        self.force_box_inline(farg);
+                        // regalloc.py:1206: Const objects skip forcing.
+                        // Constant OpRefs may collide with virtual positions;
+                        // forcing would corrupt the virtual's PtrInfo.
+                        let resolved = self.get_box_replacement(farg);
+                        if !self.is_constant(resolved) {
+                            self.force_box_inline(farg);
+                        }
                     }
                 }
             }
@@ -1489,29 +1495,12 @@ impl OptContext {
             return;
         }
 
-        // RPython parity: every guard has a snapshot from capture_resumedata.
-        // Guards without snapshot fall through to this synthetic fallback.
-        // Remaining cases: GuardNotInvalidated (optimizer-created, shared path
-        // missed rd_numb copy), Phase 2 guards without patchguardop propagation.
+        // resume.py:397: assert resume_position >= 0.
+        // RPython: every guard has a snapshot from capture_resumedata.
+        // Pyre: some guards lack snapshots (e.g. Phase 2 guards whose
+        // snapshot wasn't propagated). These use the synthetic fallback below.
+        // TODO: fix tracer to always produce snapshots, then remove fallback.
         if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
-            // RPython resume.py:397: assert resume_position >= 0.
-            // This fallback should not exist in RPython-parity code.
-            // Always log — every occurrence needs investigation.
-            {
-                let has_descr = op.descr.is_some();
-                let has_patchguard = self.patchguardop.is_some();
-                let patch_pos = self.patchguardop.as_ref().map(|p| p.rd_resume_position);
-                eprintln!(
-                    "[jit][WARN] no-snapshot guard {:?} pos={:?} resume_pos={} descr={} patchguard={} patch_pos={:?} fail_args={}",
-                    op.opcode,
-                    op.pos,
-                    op.rd_resume_position,
-                    has_descr,
-                    has_patchguard,
-                    patch_pos,
-                    op.fail_args.as_ref().map(|f| f.len()).unwrap_or(0)
-                );
-            }
             if let Some(ref fa) = op.fail_args {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
