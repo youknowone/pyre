@@ -1563,11 +1563,20 @@ fn jit_blackhole_resume_from_guard(
                 raw_deadframe.len(),
             );
         }
+        // resume.py:924-926 _prepare: get rd_virtuals for TAGVIRTUAL materialization.
+        let rd_virtuals = driver.get_rd_virtuals(actual_green_key, trace_id, fail_index);
+        let rd_virtuals_ref = rd_virtuals.as_deref();
         // rd_numb TAGBOX indices reference the raw deadframe (before rebuild).
         // blackhole_from_resumedata returns None (→ Failed) for pc=-1
         // (no-snapshot) frames. Failed → None → force_fn fallback in
         // the caller, which is faster than jitcode-level BH dispatch.
-        let result = blackhole_resume_via_rd_numb(&rd_numb, &rd_consts, raw_deadframe);
+        let result = blackhole_resume_via_rd_numb(
+            &rd_numb,
+            &rd_consts,
+            raw_deadframe,
+            None,
+            rd_virtuals_ref,
+        );
         return handle_blackhole_result(result, fail_values);
     }
 
@@ -1579,10 +1588,12 @@ fn jit_blackhole_resume_from_guard(
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
-fn blackhole_resume_via_rd_numb(
+pub fn blackhole_resume_via_rd_numb(
     rd_numb: &[u8],
     rd_consts: &[i64],
     deadframe: &[i64],
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
+    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
@@ -1610,10 +1621,7 @@ fn blackhole_resume_via_rd_numb(
     // jitcode_index is a sequential index into MetaInterpStaticData.jitcodes.
     // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
     let resolve_jitcode =
-        |jitcode_index: i32, pc: i32| -> Option<majit_metainterp::jitcode::JitCode> {
-            // pc=-1 means no-snapshot guard — consume_one_section cannot
-            // decode without liveness info. Return None to fall back to
-            // the heuristic path.
+        |jitcode_index: i32, pc: i32| -> Option<(majit_metainterp::jitcode::JitCode, usize)> {
             if pc < 0 {
                 return None;
             }
@@ -1626,8 +1634,22 @@ fn blackhole_resume_via_rd_numb(
             if pyjitcode.has_abort_opcode() {
                 return None;
             }
-            Some(pyjitcode.jitcode.clone())
+            // Convert Python PC → JitCode byte offset via pc_map.
+            let jitcode_pc = pyjitcode.pc_map.get(pc as usize).copied().unwrap_or(0);
+            Some((pyjitcode.jitcode.clone(), jitcode_pc))
         };
+
+    // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
+    // for lazy materialization in getvirtual_ptr/getvirtual_int.
+    let count = deadframe.len() as i32;
+    let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> =
+        rd_virtuals_info.map(|rd_virts| {
+            rd_virts
+                .iter()
+                .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+                .collect()
+        });
+    let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
     // resume.py:1312-1343 blackhole_from_resumedata:
     // ResumeDataDirectReader decodes rd_numb, builds BH chain.
@@ -1638,18 +1660,28 @@ fn blackhole_resume_via_rd_numb(
         rd_numb,
         rd_consts,
         deadframe,
-        None, // rd_virtuals
-        None, // rd_pendingfields
-        None, // rd_guard_pendingfields
-        None, // vrefinfo
-        None, // vinfo
-        None, // ginfo
+        rd_virtuals_slice,      // rd_virtuals
+        None,                   // rd_pendingfields
+        rd_guard_pendingfields, // rd_guard_pendingfields
+        None,                   // vrefinfo
+        None,                   // vinfo
+        None,                   // ginfo
         &allocator,
     );
 
     let Some(mut bh) = bh else {
         return BlackholeResult::Failed;
     };
+
+    // Pyre-specific: initialize frame_reg (int register 3) with the frame
+    // pointer from deadframe[0]. The rd_numb only carries ref registers
+    // (locals); the frame pointer is not in the rd_numb because it is a
+    // Ref value that may be virtualized, incompatible with decode_int.
+    // RPython handles this via the virtualizable mechanism; pyre uses a
+    // direct int register for residual call arguments.
+    if !deadframe.is_empty() {
+        bh.setarg_i(3, deadframe[0]);
+    }
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
