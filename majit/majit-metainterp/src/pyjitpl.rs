@@ -3984,6 +3984,7 @@ impl<M: Clone> MetaInterp<M> {
         let exception = ExceptionState {
             exc_class: result.exception_class,
             exc_value: result.exception_value.0 as i64,
+            ovf_flag: false,
         };
         let compiled = self.compiled_loops.get(&green_key).unwrap();
 
@@ -4117,6 +4118,7 @@ impl<M: Clone> MetaInterp<M> {
         let exception = ExceptionState {
             exc_class: result.exception_class,
             exc_value: result.exception_value.0 as i64,
+            ovf_flag: false,
         };
         let compiled = self.compiled_loops.get(&green_key).unwrap();
 
@@ -4234,6 +4236,7 @@ impl<M: Clone> MetaInterp<M> {
         let exception = ExceptionState {
             exc_class: self.backend.grab_exc_class(&frame),
             exc_value: self.backend.grab_exc_value(&frame).0 as i64,
+            ovf_flag: false,
         };
 
         Some(CompileResult {
@@ -4393,6 +4396,7 @@ impl<M: Clone> MetaInterp<M> {
         let exception = ExceptionState {
             exc_class: self.backend.grab_exc_class(&frame),
             exc_value: self.backend.grab_exc_value(&frame).0 as i64,
+            ovf_flag: false,
         };
 
         Some(CompileResult {
@@ -7698,6 +7702,7 @@ mod tests {
                 ExceptionState {
                     exc_class: 0x1234,
                     exc_value: 0xABCD,
+                    ovf_flag: false,
                 },
             )
             .expect("compiled loop should exist");

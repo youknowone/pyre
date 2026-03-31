@@ -103,6 +103,9 @@ pub struct ExceptionState {
     pub exc_class: i64,
     /// The exception value pointer.
     pub exc_value: i64,
+    /// executor.py: metainterp.ovf_flag — set by Int*Ovf operations,
+    /// checked by GuardNoOverflow / GuardOverflow.
+    pub ovf_flag: bool,
 }
 
 impl ExceptionState {
@@ -2341,6 +2344,7 @@ mod tests {
             ExceptionState {
                 exc_class: 100,
                 exc_value: 200,
+                ovf_flag: false,
             },
         ) {
             BlackholeResult::GuardFailed { .. } => {}
@@ -2366,6 +2370,7 @@ mod tests {
             ExceptionState {
                 exc_class: 100,
                 exc_value: 200,
+                ovf_flag: false,
             },
         ) {
             BlackholeResult::Finish { values: vals, .. } => assert_eq!(vals, vec![200]),

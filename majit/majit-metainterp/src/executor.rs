@@ -357,10 +357,19 @@ pub(crate) fn execute_one(
             }
         }
         OpCode::GuardNoOverflow => {
-            // In blackhole, overflow checks are moot (we use wrapping)
-            OpResult::Void
+            if exc.ovf_flag {
+                OpResult::GuardFailed
+            } else {
+                OpResult::Void
+            }
         }
-        OpCode::GuardOverflow => OpResult::Void,
+        OpCode::GuardOverflow => {
+            if !exc.ovf_flag {
+                OpResult::GuardFailed
+            } else {
+                OpResult::Void
+            }
+        }
         OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
             // In blackhole, check if a call set an exception (simulated force).
             if exc.is_pending() {
@@ -455,17 +464,39 @@ pub(crate) fn execute_one(
         }
 
         // ── Overflow arithmetic ──
+        // executor.py: do_int_add_ovf/sub_ovf/mul_ovf set ovf_flag on overflow, return 0
         OpCode::IntAddOvf => {
             let (a, b) = binop(values, op);
-            OpResult::Value(a.wrapping_add(b))
+            exc.ovf_flag = false;
+            match a.checked_add(b) {
+                Some(z) => OpResult::Value(z),
+                None => {
+                    exc.ovf_flag = true;
+                    OpResult::Value(0)
+                }
+            }
         }
         OpCode::IntSubOvf => {
             let (a, b) = binop(values, op);
-            OpResult::Value(a.wrapping_sub(b))
+            exc.ovf_flag = false;
+            match a.checked_sub(b) {
+                Some(z) => OpResult::Value(z),
+                None => {
+                    exc.ovf_flag = true;
+                    OpResult::Value(0)
+                }
+            }
         }
         OpCode::IntMulOvf => {
             let (a, b) = binop(values, op);
-            OpResult::Value(a.wrapping_mul(b))
+            exc.ovf_flag = false;
+            match a.checked_mul(b) {
+                Some(z) => OpResult::Value(z),
+                None => {
+                    exc.ovf_flag = true;
+                    OpResult::Value(0)
+                }
+            }
         }
 
         // ── Float comparisons ──
