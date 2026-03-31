@@ -2002,11 +2002,13 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        // RPython warmstate.py:482-511 has no is_compatible check —
-        // runtime enters execute_token directly. However, our compiled
-        // code doesn't yet have sufficient entry guards to handle
-        // mismatched inputs safely. Keep is_compatible as a safety net
-        // until compiled code entry guards match RPython's.
+        // warmstate.py:482-511: RPython enters execute_token directly
+        // when the green key matches — no is_compatible check.
+        // pyre still needs this gate because compiled code reads
+        // virtualizable slots by positional index (not by field
+        // descriptor), so a valuestackdepth mismatch causes wrong
+        // slot reads. Remove when virtualizable field access uses
+        // descriptor-based addressing (RPython virtualizable.py parity).
         if !state.is_compatible(&meta) {
             if crate::majit_log_enabled() {
                 eprintln!(
