@@ -3159,6 +3159,31 @@ impl<M: Clone> MetaInterp<M> {
                 index: inputargs.len() as u32,
             });
         }
+        // Reconcile inputarg types with optimizer's post-unbox types.
+        // Pyre starts tracing with Ref values (all Python objects), but
+        // the optimizer may unbox Int-typed locals. Read the first guard's
+        // fail_arg_types to discover the optimizer's type decisions, then
+        // update inputargs to match. This ensures gcmap and adapt-live
+        // agree on which slots are GC refs vs raw ints.
+        if let Some(first_guard_types) = optimized_ops
+            .iter()
+            .find(|op| op.opcode.is_guard())
+            .and_then(|op| {
+                // Read from descr (original trace types, full-length).
+                // NOT from op.fail_arg_types which may be compact after
+                // snapshot-based numbering reduces fail_args to liveboxes.
+                op.descr
+                    .as_ref()
+                    .and_then(|d| d.as_fail_descr())
+                    .map(|fd| fd.fail_arg_types().to_vec())
+            })
+        {
+            for (i, ia) in inputargs.iter_mut().enumerate() {
+                if let Some(&tp) = first_guard_types.get(i) {
+                    ia.tp = tp;
+                }
+            }
+        }
 
         // Note: adapt-live type correction (inputarg Ref→Int, guard
         // fail_arg_types) is NOT applied here. CalAssemblerI calls the

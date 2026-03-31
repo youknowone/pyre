@@ -5583,11 +5583,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// allocate() methods must fill in the cache as soon as they
     /// have the object, before they fill its fields.
     pub fn getvirtual_ptr(&mut self, index: usize) -> i64 {
-        // resume.py:950
-        if self.virtuals_cache_ptr.is_empty() {
-            // No virtuals prepared — rd_virtuals not passed.
-            return 0;
-        }
+        // resume.py:950: assert self.virtuals_cache is not None
+        assert!(
+            !self.virtuals_cache_ptr.is_empty(),
+            "getvirtual_ptr: virtuals_cache is empty (rd_virtuals not prepared)"
+        );
         // resume.py:951-952
         let v = self.virtuals_cache_ptr[index];
         if v != 0 {
@@ -5610,12 +5610,11 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py:958 getvirtual_int
     pub fn getvirtual_int(&mut self, index: usize) -> i64 {
-        // resume.py:959
-        if self.virtuals_cache_int.is_empty() {
-            // No virtuals prepared — rd_virtuals not passed.
-            // RPython would have materialized via _prepare_virtuals.
-            return 0;
-        }
+        // resume.py:959: assert self.virtuals_cache is not None
+        assert!(
+            !self.virtuals_cache_int.is_empty(),
+            "getvirtual_int: virtuals_cache is empty (rd_virtuals not prepared)"
+        );
         // resume.py:960-961
         let v = self.virtuals_cache_int[index];
         if v != 0 {
@@ -5739,9 +5738,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         let size = self.resumecodereader.next_item();
         // resume.py:1390-1391
         if vrefinfo.is_none() || size == 0 {
-            // resume.py:1391: just return — skip vref data.
-            // Must advance reader past the vref pairs to keep position correct.
-            self.resumecodereader.jump(size as usize * 2);
+            // resume.py:1391: assert size == 0
+            assert!(
+                size == 0,
+                "consume_virtualref_info: vrefinfo is None but size={size} != 0"
+            );
             return;
         }
         let vrefinfo = vrefinfo.unwrap();
@@ -5782,9 +5783,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
                 self.consume_vable_info(vi, vable_size);
-            } else if vable_size > 0 {
-                // No virtualizable info — skip vable data to keep reader position.
-                self.resumecodereader.jump(vable_size as usize);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {

@@ -1168,7 +1168,10 @@ impl OptVirtualize {
                 let is_scalar = fail_arg_types
                     .get(i)
                     .is_some_and(|t| matches!(t, majit_ir::Type::Int | majit_ir::Type::Float));
-                if is_scalar {
+                if is_scalar || ctx.is_constant(resolved) {
+                    // regalloc.py:1206: Const objects skip virtualization.
+                    // Constant OpRefs may collide with virtual positions —
+                    // looking up PtrInfo would find the virtual, not the constant.
                     *arg = resolved;
                 } else {
                     *arg = self.prepare_guard_fail_arg(resolved, ctx);
