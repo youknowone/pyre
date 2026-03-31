@@ -799,9 +799,12 @@ impl OptContext {
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                let ok = builder
-                    .use_box(preamble_source, &arg_guards, &result_guards)
-                    .is_some();
+                // TODO: restore live bridge replay use_box once nbody no longer
+                // times out. Today, allowing the active short preamble producer
+                // to replay/extend short ops can loop or widen the bridge entry
+                // contract in ways that compiled re-entry does not handle.
+                // Keep imported_short_preamble_builder behavior unchanged.
+                let ok = false;
                 self.active_short_preamble_producer = Some(builder);
                 ok
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
@@ -819,7 +822,12 @@ impl OptContext {
             }
 
             // unroll.py:33-37: potential_extra_ops[op] = preamble_op
-            if tracked && !is_constant {
+            //
+            // TODO: re-enable for active_short_preamble_producer together with
+            // live bridge replay use_box(). For now both are suppressed to
+            // keep nbody from timing out under compiled bridge re-entry.
+            let suppress_live_bridge_tracking = self.active_short_preamble_producer.is_some();
+            if tracked && !is_constant && !suppress_live_bridge_tracking {
                 let produced = self
                     .imported_short_preamble_builder
                     .as_ref()
@@ -1350,8 +1358,17 @@ impl OptContext {
         // from tracing, no ResumeAtPositionDescr from unroll).
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
+        //
+        // RPython: ResumeAtPositionDescr guards (from inline_short_preamble /
+        // generate_guards) always have patchguardop for snapshot lookup.
+        // Pyre: traces without promote lack GUARD_FUTURE_CONDITION, so
+        // patchguardop may be None. Fall back to guard sharing.
+        let is_resume_at_pos_without_snapshot =
+            op.descr.as_ref().is_some_and(|d| d.is_resume_at_position())
+                && op.rd_resume_position < 0
+                && self.patchguardop.is_none();
         let can_share = self.last_guard_idx.is_some()
-            && op.descr.is_none()
+            && (op.descr.is_none() || is_resume_at_pos_without_snapshot)
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -1457,10 +1474,35 @@ impl OptContext {
 
         // resume.py:397: assert resume_position >= 0.
         // RPython: every guard has a snapshot from capture_resumedata.
-        // Pyre: some guards lack snapshots (e.g. Phase 2 guards whose
-        // snapshot wasn't propagated). These use the synthetic fallback below.
-        // TODO: fix tracer to always produce snapshots, then remove fallback.
-        if op.rd_resume_position < 0 || !self.snapshot_boxes.contains_key(&op.rd_resume_position) {
+        // Pyre: optimizer-created guards (VirtualState, inline_short_preamble)
+        // may have rd_resume_position=-1. Use patchguardop's position as
+        // fallback — RPython does this implicitly via patchguardop chain.
+        let mut resume_pos = op.rd_resume_position;
+        if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
+            if let Some(ref patch) = self.patchguardop {
+                if patch.rd_resume_position >= 0
+                    && self.snapshot_boxes.contains_key(&patch.rd_resume_position)
+                {
+                    resume_pos = patch.rd_resume_position;
+                    op.rd_resume_position = resume_pos;
+                }
+            }
+        }
+        let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
+        if !has_snapshot {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[jit][no-snapshot-fallback] {:?} pos={:?} resume_pos={} has_descr={} patchguardop={}",
+                    op.opcode,
+                    op.pos,
+                    op.rd_resume_position,
+                    op.descr.is_some(),
+                    self.patchguardop
+                        .as_ref()
+                        .map(|p| p.rd_resume_position)
+                        .unwrap_or(-99),
+                );
+            }
             if let Some(ref fa) = op.fail_args {
                 use majit_ir::resumedata;
                 let fa_len = fa.len();
