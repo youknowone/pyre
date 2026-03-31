@@ -980,7 +980,7 @@ impl Optimizer {
 
     // RPython optimizer.py:722-752 store_final_boxes_in_guard and
     // optimizer.py:649-670 emit_guard_operation are implemented inside
-    // emit_with_guard_check: _copy_resume_data_from, store_final_boxes_in_guard,
+    // emit_operation: _copy_resume_data_from, store_final_boxes_in_guard,
     // force_box on fail_args, and store_final_boxes_in_guard in ctx.emit().
 
     /// optimizer.py: add_pending_field(op)
@@ -1178,11 +1178,10 @@ impl Optimizer {
             return resolved;
         };
 
-        // RPython info.py: InstancePtrInfo and StructPtrInfo both inherit
-        // AbstractStructPtrInfo._force_at_the_end_of_preamble() which keeps
-        // the virtual alive, only recursing into field children.
-        // ArrayPtrInfo also overrides to keep virtual alive.
-        // Only AbstractRawPtrInfo (raw buffers) falls through to force_box().
+        // RPython info.py: InstancePtrInfo, StructPtrInfo, ArrayPtrInfo all
+        // override _force_at_the_end_of_preamble to keep the virtual alive
+        // and recurse into fields. AbstractRawPtrInfo uses the base
+        // _force_at_the_end_of_preamble → force_box() (materialization).
         if matches!(
             info,
             crate::optimizeopt::info::PtrInfo::Virtual(_)
@@ -1201,11 +1200,8 @@ impl Optimizer {
         }
 
         // RawBuffer: AbstractRawPtrInfo inherits base force_box() default.
+        // info.py:159-160: _force_at_the_end_of_preamble → force_box()
         if matches!(info, crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)) {
-            return self.force_box(resolved, ctx);
-        }
-
-        if info.is_virtual() {
             return self.force_box(resolved, ctx);
         }
 
@@ -1908,10 +1904,6 @@ impl Optimizer {
         // before building the exported loop state. If the loop header needs
         // additional inputargs, the corresponding SETFIELD/SETARRAYITEM must
         // remain in the trace rather than being silently discarded.
-        while let Some(extra) = ctx.pop_extra_operation() {
-            self.propagate_one(&extra, &mut ctx);
-        }
-
         // final_num_inputs = original inputs + virtual inputs added by passes.
         let num_virtual_inputs = (ctx.num_inputs as usize).saturating_sub(effective_inputs);
         self.final_num_inputs = num_inputs + num_virtual_inputs;
@@ -1938,10 +1930,6 @@ impl Optimizer {
                         self.force_box_for_end_of_preamble(resolved, &mut ctx);
                     }
                 }
-            }
-            // Drain any force artifacts into the output.
-            while let Some(extra) = ctx.pop_extra_operation() {
-                self.propagate_one(&extra, &mut ctx);
             }
         }
 
@@ -2455,12 +2443,9 @@ impl Optimizer {
         self.propagate_from_pass(0, op, ctx);
     }
 
-    fn drain_extra_operations_from(&mut self, start_pass: usize, ctx: &mut OptContext) {
+    fn drain_extra_operations_from(&mut self, _start_pass: usize, ctx: &mut OptContext) {
         let end_pass = self.extra_operation_end_pass();
         let mut pending = std::collections::VecDeque::new();
-        while let Some(op) = ctx.pop_extra_operation() {
-            pending.push_back((start_pass, op));
-        }
         // RPython emit_extra(op, emit=False) parity: operations queued
         // with a specific start pass skip earlier passes.
         while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
@@ -2468,9 +2453,6 @@ impl Optimizer {
         }
         while let Some((from_pass, op)) = pending.pop_front() {
             self.propagate_from_pass_range(from_pass, end_pass, &op, ctx);
-            while let Some(child) = ctx.pop_extra_operation() {
-                pending.push_front((start_pass, child));
-            }
             while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
                 pending.push_front((start, op));
             }
@@ -2518,7 +2500,7 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx);
             match result {
                 OptimizationResult::Emit(op) => {
-                    self.emit_with_guard_check(op, ctx);
+                    self.emit_operation(op, ctx);
                     return;
                 }
                 OptimizationResult::Replace(op) => {
@@ -2532,7 +2514,7 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is
-        self.emit_with_guard_check(current_op, ctx);
+        self.emit_operation(current_op, ctx);
     }
 
     /// optimizer.py: _emit_operation — emit with guard tracking.
@@ -2543,13 +2525,13 @@ impl Optimizer {
     /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
-    fn emit_with_guard_check(&mut self, mut op: Op, ctx: &mut OptContext) {
+    fn emit_operation(&mut self, mut op: Op, ctx: &mut OptContext) {
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
         // guards even when the guard is emitted by an earlier pass.
         // force_box_direct emits directly to new_operations, so no drain needed.
-        for pass in &mut self.passes {
-            pass.emitting_operation(&op, ctx);
+        for (idx, pass) in self.passes.iter_mut().enumerate() {
+            pass.emitting_operation(&op, ctx, idx);
         }
         // RPython emit_extra(op, emit=False) parity: drain operations
         // queued by emitting_operation (e.g., heap's force_lazy_set)
@@ -3231,10 +3213,11 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
-                let alloc = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let alloc =
+                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef(0)]);
                 set.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes(set);
+                ctx.emit_through_passes_after(ctx.current_pass_idx, set);
             }
             OptimizationResult::PassOn
         }
@@ -3692,15 +3675,17 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
-                let alloc_a = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let alloc_a =
+                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef(0)]);
                 set_a.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes(set_a);
+                ctx.emit_through_passes_after(ctx.current_pass_idx, set_a);
 
-                let alloc_b = ctx.emit_through_passes(Op::new(OpCode::New, &[]));
+                let alloc_b =
+                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef(1)]);
                 set_b.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes(set_b);
+                ctx.emit_through_passes_after(ctx.current_pass_idx, set_b);
             }
             OptimizationResult::PassOn
         }
@@ -4046,7 +4031,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_with_guard_check_materializes_virtual_args_directly() {
+    fn test_emit_operation_materializes_virtual_args_directly() {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
         let descr = make_size_descr(16);
@@ -4064,10 +4049,9 @@ mod tests {
 
         let mut opt = Optimizer::new();
         let op = Op::new(OpCode::GuardNonnull, &[OpRef(10)]);
-        opt.emit_with_guard_check(op, &mut ctx);
+        opt.emit_operation(op, &mut ctx);
 
         assert!(!ctx.in_final_emission);
-        assert!(!ctx.has_extra_operations());
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
         assert!(ctx.new_operations.iter().any(|op| {
             op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef(11) && op.descr.is_some()
@@ -4080,7 +4064,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_with_guard_check_forces_imported_short_guard_args() {
+    fn test_emit_operation_forces_imported_short_guard_args() {
         let mut opt = Optimizer::new();
         let mut ctx = OptContext::with_num_inputs(16, 1);
 
@@ -4113,7 +4097,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(14)]);
         guard.pos = OpRef(15);
-        opt.emit_with_guard_check(guard, &mut ctx);
+        opt.emit_operation(guard, &mut ctx);
 
         let sp = ctx
             .build_imported_short_preamble()

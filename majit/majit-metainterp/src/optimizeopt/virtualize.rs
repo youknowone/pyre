@@ -294,7 +294,7 @@ impl OptVirtualize {
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
             set_op.descr = Some(descr);
-            ctx.emit_through_passes(set_op);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
         }
 
         // Emit SETARRAYITEM_RAW for each tracked array element
@@ -317,7 +317,7 @@ impl OptVirtualize {
                         .or_else(|| Some(make_field_index_descr(descr_idx)));
                 }
             }
-            let array_ref = ctx.emit_through_passes(get_array_op);
+            let array_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, get_array_op);
 
             for (i, elem_ref) in elements.into_iter().enumerate() {
                 let item_type = self
@@ -334,7 +334,7 @@ impl OptVirtualize {
                 let idx_ref = self.emit_constant_int(ctx, i as i64);
                 let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[array_ref, idx_ref, elem_ref]);
                 set_op.descr = array_descr.clone();
-                ctx.emit_through_passes(set_op);
+                ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
             }
         }
 
@@ -380,7 +380,7 @@ impl OptVirtualize {
         // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_through_passes(alloc_op);
+        let alloc_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, alloc_op);
 
         // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
@@ -399,7 +399,7 @@ impl OptVirtualize {
                 get_field_descr(&vinfo.field_descrs, field_idx)
                     .unwrap_or_else(|| make_field_index_descr(field_idx)),
             );
-            ctx.emit_through_passes(set_op);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
         }
 
         alloc_ref
@@ -420,7 +420,7 @@ impl OptVirtualize {
         let len_ref = self.emit_constant_int(ctx, len as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_through_passes(alloc_op);
+        let alloc_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -433,7 +433,7 @@ impl OptVirtualize {
             let idx_ref = self.emit_constant_int(ctx, i as i64);
             let mut set_op = Op::new(OpCode::SetarrayitemGc, &[alloc_ref, idx_ref, item_ref]);
             set_op.descr = Some(vinfo.descr.clone());
-            ctx.emit_through_passes(set_op);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
         }
 
         alloc_ref
@@ -461,7 +461,7 @@ impl OptVirtualize {
         // Emit NEW
         let mut alloc_op = Op::new(OpCode::New, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_through_passes(alloc_op);
+        let alloc_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, alloc_op);
 
         // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
@@ -479,7 +479,7 @@ impl OptVirtualize {
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(descr);
-            ctx.emit_through_passes(set_op);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
         }
 
         alloc_ref
@@ -500,7 +500,7 @@ impl OptVirtualize {
         let len_ref = self.emit_constant_int(ctx, num_elements as i64);
         let mut alloc_op = Op::new(OpCode::NewArray, &[len_ref]);
         alloc_op.descr = Some(vinfo.descr.clone());
-        let alloc_ref = ctx.emit_through_passes(alloc_op);
+        let alloc_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -515,7 +515,7 @@ impl OptVirtualize {
                 let mut set_op =
                     Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, value_ref]);
                 set_op.descr = Some(make_field_index_descr(*field_idx));
-                ctx.emit_through_passes(set_op);
+                ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
             }
         }
 
@@ -534,7 +534,7 @@ impl OptVirtualize {
         // Emit CALL_MALLOC_NURSERY or equivalent raw allocation
         let size_ref = self.emit_constant_int(ctx, vinfo.size as i64);
         let alloc_op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
-        let alloc_ref = ctx.emit_through_passes(alloc_op);
+        let alloc_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, alloc_op);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
@@ -546,7 +546,7 @@ impl OptVirtualize {
             let value_ref = ctx.get_box_replacement(value_ref);
             let offset_ref = self.emit_constant_int(ctx, *offset as i64);
             let set_op = Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-            ctx.emit_through_passes(set_op);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_op);
         }
 
         alloc_ref
@@ -600,7 +600,7 @@ impl OptVirtualize {
         let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit_through_passes(op);
+        let opref = ctx.emit_through_passes_after(ctx.current_pass_idx, op);
         ctx.make_constant(opref, Value::Int(value));
         opref
     }
@@ -609,7 +609,7 @@ impl OptVirtualize {
         let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit_through_passes(op);
+        let opref = ctx.emit_through_passes_after(ctx.current_pass_idx, op);
         ctx.make_constant(opref, Value::Ref(value));
         opref
     }
@@ -618,7 +618,7 @@ impl OptVirtualize {
         let pos_ref = ctx.reserve_pos();
         let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
         op.pos = pos_ref;
-        let opref = ctx.emit_through_passes(op);
+        let opref = ctx.emit_through_passes_after(ctx.current_pass_idx, op);
         ctx.make_constant(opref, Value::Float(value));
         opref
     }
@@ -757,7 +757,7 @@ impl OptVirtualize {
         }
         // RPython: virtual value is NOT forced in optimize_SETFIELD_GC.
         // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
-        // In majit, this is handled by emit_with_guard_check or force_all_lazy.
+        // In majit, this is handled by emit_operation or force_all_lazy_sets.
         // virtualize.py:204: self.make_nonnull(op.getarg(0))
         if ctx.get_ptr_info(struct_ref).is_none() {
             ctx.set_ptr_info(struct_ref, PtrInfo::nonnull());
@@ -1357,7 +1357,7 @@ impl OptVirtualize {
 
         // Emit a FORCE_TOKEN to capture the JIT frame address.
         let token_op = Op::new(OpCode::ForceToken, &[]);
-        let token_ref = ctx.emit_through_passes(token_op);
+        let token_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, token_op);
 
         // The emitted ForceToken may reuse an OpRef index that previously
         // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
@@ -1430,14 +1430,14 @@ impl OptVirtualize {
         if !obj_is_null {
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[vref_ref, obj_ref]);
             set_forced.descr = Some(make_field_index_descr(VREF_FORCED_FIELD_INDEX));
-            ctx.emit_through_passes(set_forced);
+            ctx.emit_through_passes_after(ctx.current_pass_idx, set_forced);
         }
 
         // Set 'virtual_token' to NULL
         let null_ref = self.emit_constant_int(ctx, 0);
         let mut set_token = Op::new(OpCode::SetfieldGc, &[vref_ref, null_ref]);
         set_token.descr = Some(make_field_index_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX));
-        ctx.emit_through_passes(set_token);
+        ctx.emit_through_passes_after(ctx.current_pass_idx, set_token);
 
         OptimizationResult::Remove
     }
@@ -1547,7 +1547,7 @@ impl OptVirtualize {
                 // Not tracked — emit a read from the frame
                 let mut read_op = Op::new(OpCode::GetfieldRawI, &[frame_ref]);
                 read_op.descr = Some(make_field_index_descr(virtualizable_field_index(offset)));
-                let read_ref = ctx.emit_through_passes(read_op);
+                let read_ref = ctx.emit_through_passes_after(ctx.current_pass_idx, read_op);
                 fail_args.push(read_ref);
             }
         }
