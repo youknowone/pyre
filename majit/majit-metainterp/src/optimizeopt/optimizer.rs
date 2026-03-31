@@ -2485,6 +2485,16 @@ impl Optimizer {
 
         let mut current_op = resolved_op;
 
+        // optimizer.py:864-867: optimize_SAME_AS_I/R/F → make_equal_to(op, arg0)
+        // SameAs ops are absorbed into forwarding, never emitted.
+        if matches!(
+            current_op.opcode,
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+        ) {
+            ctx.make_equal_to(current_op.pos, current_op.arg(0));
+            return;
+        }
+
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
             let result = {

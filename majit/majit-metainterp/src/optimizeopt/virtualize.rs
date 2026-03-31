@@ -1801,9 +1801,7 @@ impl Optimization for OptVirtualize {
             }
 
             // JUMP (no virtualizable) — force escaping values.
-            OpCode::Jump => {
-                self.optimize_escaping_op(op, ctx)
-            }
+            OpCode::Jump => self.optimize_escaping_op(op, ctx),
 
             // Escape ops (testing)
             OpCode::EscapeI | OpCode::EscapeR | OpCode::EscapeF | OpCode::EscapeN => {
