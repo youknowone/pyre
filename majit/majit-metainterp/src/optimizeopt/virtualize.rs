@@ -341,153 +341,6 @@ impl OptVirtualize {
         opref
     }
 
-    /// RPython unroll.py: force_box_for_end_of_preamble — record virtual structure
-    /// before forcing, so the peeled loop body can reconstruct it.
-    /// RPython unroll.py: force_box_for_end_of_preamble — record virtual
-    /// structure before forcing, for preamble peeling phase 2.
-    fn imported_head_load_descr_index(&self, opref: OpRef, ctx: &OptContext) -> Option<u32> {
-        fn find_pool_head_descr(
-            opref: OpRef,
-            ctx: &OptContext,
-            visited: &mut std::collections::HashSet<OpRef>,
-        ) -> Option<u32> {
-            let resolved = ctx.get_box_replacement(opref);
-            if !visited.insert(resolved) {
-                return None;
-            }
-
-            if let Some(op) = ctx
-                .new_operations
-                .iter()
-                .find(|op| op.pos == resolved)
-                .filter(|op| matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR))
-            {
-                let pool_ref = ctx.get_box_replacement(OpRef(0));
-                if op.arg(0) == pool_ref {
-                    return op.descr.as_ref().map(|d| d.index());
-                }
-                if let Some(descr_idx) = find_pool_head_descr(op.arg(0), ctx, visited) {
-                    return Some(descr_idx);
-                }
-            }
-
-            let child_refs: Vec<OpRef> = match ctx.get_ptr_info(resolved) {
-                Some(PtrInfo::Virtual(vinfo)) => vinfo.fields.iter().map(|(_, r)| *r).collect(),
-                Some(PtrInfo::VirtualStruct(vinfo)) => {
-                    vinfo.fields.iter().map(|(_, r)| *r).collect()
-                }
-                Some(PtrInfo::VirtualArray(vinfo)) => vinfo.items.clone(),
-                _ => Vec::new(),
-            };
-
-            let mut matches = child_refs
-                .into_iter()
-                .filter_map(|child| find_pool_head_descr(child, ctx, visited))
-                .collect::<Vec<_>>();
-            matches.dedup();
-            if matches.len() == 1 {
-                Some(matches[0])
-            } else {
-                None
-            }
-        }
-
-        // Phase 2: the virtual's OpRef matches a GetfieldGcR that was emitted
-        // (imported virtual head forwarded from the pool load).
-        if let Some(idx) = ctx
-            .new_operations
-            .iter()
-            .find(|op| {
-                op.pos == opref
-                    && (op.opcode == OpCode::GetfieldGcR || op.opcode == OpCode::GetfieldRawR)
-            })
-            .and_then(|op| op.descr.as_ref())
-            .map(|d| d.index())
-        {
-            return Some(idx);
-        }
-        // Phase 1 fallback: the virtual was created by New(), not loaded
-        // directly from the pool. Recover the originating GetfieldGcR(pool)
-        // by walking the virtual's field graph until we find the unique
-        // non-virtual tail that came from the pool.
-        let mut visited = std::collections::HashSet::new();
-        find_pool_head_descr(opref, ctx, &mut visited)
-    }
-
-    fn export_virtual_for_preamble(
-        &self,
-        opref: OpRef,
-        jump_arg_index: usize,
-        ctx: &mut OptContext,
-    ) {
-        let resolved = ctx.get_box_replacement(opref);
-        let info = match ctx.get_ptr_info(resolved) {
-            Some(info) if info.is_virtual() => info.clone(),
-            _ => return,
-        };
-        match info {
-            PtrInfo::VirtualStruct(ref vinfo) => {
-                let fields: Vec<(
-                    majit_ir::DescrRef,
-                    crate::optimizeopt::virtualstate::VirtualStateInfo,
-                )> = vinfo
-                    .fields
-                    .iter()
-                    .map(|(field_idx, value_ref)| {
-                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
-                        let val = crate::optimizeopt::virtualstate::export_value_state(
-                            *value_ref,
-                            ctx,
-                            &ctx.forwarded,
-                        );
-                        (descr, val)
-                    })
-                    .collect();
-                ctx.exported_jump_virtuals.push(
-                    crate::optimizeopt::optimizer::ExportedJumpVirtual {
-                        jump_arg_index,
-                        size_descr: vinfo.descr.clone(),
-                        kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Struct,
-                        head_load_descr_index: self.imported_head_load_descr_index(resolved, ctx),
-                        fields,
-                    },
-                );
-            }
-            PtrInfo::Virtual(ref vinfo) => {
-                let fields: Vec<(
-                    majit_ir::DescrRef,
-                    crate::optimizeopt::virtualstate::VirtualStateInfo,
-                )> = vinfo
-                    .fields
-                    .iter()
-                    .map(|(field_idx, value_ref)| {
-                        let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                            .unwrap_or_else(|| make_field_index_descr(*field_idx));
-                        let val = crate::optimizeopt::virtualstate::export_value_state(
-                            *value_ref,
-                            ctx,
-                            &ctx.forwarded,
-                        );
-                        (descr, val)
-                    })
-                    .collect();
-                ctx.exported_jump_virtuals.push(
-                    crate::optimizeopt::optimizer::ExportedJumpVirtual {
-                        jump_arg_index,
-                        size_descr: vinfo.descr.clone(),
-                        kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Instance {
-                            known_class: vinfo.known_class,
-                        },
-                        head_load_descr_index: self.imported_head_load_descr_index(resolved, ctx),
-                        fields,
-                    },
-                );
-            }
-            _ => {}
-        }
-    }
-
     /// RPython unroll.py: make_inputargs_and_virtuals — extract field values
     /// from a virtual without materializing it. Returns field OpRefs.
     fn flatten_virtual_fields(&self, opref: OpRef, ctx: &OptContext) -> Vec<OpRef> {
@@ -1923,26 +1776,12 @@ impl Optimization for OptVirtualize {
             // Calls / escaping operations — force all virtual args
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
-            // JUMP — keep the virtualizable frame virtual and preserve the
-            // existing trace input contract. Standard virtualizable traces
-            // already carry box-state in the interpreter/JitCode layout; the
-            // optimizer must not append its own synthetic inputs here.
-            OpCode::Jump if self.vable_config.is_some() => {
-                let frame_ref = ctx.get_box_replacement(OpRef(0));
-                // RPython carries virtualizable fields as JUMP args,
-                // avoiding per-iteration writeback. When JUMP args
-                // include locals (args.len() > 3), they are SSA values
-                // that flow to the next iteration. Writeback is only
-                // needed when locals are NOT in JUMP args (nlocals=0,
-                // e.g., module-level code using namespace instead of
-                // fast locals).
-                //
-                // For module-level loops, force_virtualizable writes
-                // New() results to the frame's namespace storage.
-
-                let mut jump_op = op.clone();
-                // RPython: capture pre-force virtual state before forcing.
-                let pre_force_args: Vec<OpRef> = jump_op
+            // JUMP — RPython virtualize.py has no optimize_JUMP.
+            // Capture pre-force virtual state for the export code path,
+            // then let the default arm (escape handler) force virtual args.
+            OpCode::Jump => {
+                // Capture pre-force virtual state while virtuals are alive.
+                let pre_force_args: Vec<OpRef> = op
                     .args
                     .iter()
                     .map(|a| ctx.get_box_replacement(*a))
@@ -1953,55 +1792,29 @@ impl Optimization for OptVirtualize {
                     &ctx.forwarded,
                 );
                 ctx.pre_force_virtual_state = Some(pre_force_vs);
-                ctx.pre_force_jump_args = Some(pre_force_args.clone());
-                for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
+                ctx.pre_force_jump_args = Some(pre_force_args);
+
+                // Virtualizable frame: keep virtual, force others.
+                let frame_ref = if self.vable_config.is_some() {
+                    Some(ctx.get_box_replacement(OpRef(0)))
+                } else {
+                    None
+                };
+                let mut jump_op = op.clone();
+                for arg in &mut jump_op.args {
                     let resolved = ctx.get_box_replacement(*arg);
-                    if resolved == frame_ref {
-                        if matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_))) {
+                    if let Some(fr) = frame_ref {
+                        if resolved == fr
+                            && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
+                        {
                             *arg = resolved;
                             continue;
                         }
                     }
-                    if Self::is_virtual(resolved, ctx) {
-                        self.export_virtual_for_preamble(resolved, arg_idx, ctx);
-                        let forced = self.force_virtual(resolved, ctx);
-                        *arg = ctx.get_box_replacement(forced);
-                    } else {
-                        *arg = resolved;
-                    }
+                    self.force_virtual(resolved, ctx);
+                    *arg = ctx.get_box_replacement(resolved);
                 }
                 OptimizationResult::Replace(jump_op)
-            }
-
-            // JUMP (no virtualizable) / FINISH — export virtuals for preamble
-            // peeling, then force escaping values.
-            OpCode::Jump => {
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!("[jit] OptVirtualize: JUMP (non-vable path)");
-                }
-                let mut jump_op = op.clone();
-                for (arg_idx, arg) in jump_op.args.iter_mut().enumerate() {
-                    let resolved = ctx.get_box_replacement(*arg);
-                    if Self::is_virtual(resolved, ctx) {
-                        self.export_virtual_for_preamble(resolved, arg_idx, ctx);
-                    }
-                }
-                // RPython unroll.py:454-457: capture virtual state BEFORE force.
-                // This is what export_state sees — virtuals are still alive here.
-                let pre_force_args: Vec<OpRef> = jump_op
-                    .args
-                    .iter()
-                    .map(|a| ctx.get_box_replacement(*a))
-                    .collect();
-                let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
-                    &pre_force_args,
-                    ctx,
-                    &ctx.forwarded,
-                );
-                ctx.pre_force_virtual_state = Some(pre_force_vs);
-                ctx.pre_force_jump_args = Some(pre_force_args.clone());
-
-                self.optimize_escaping_op(&jump_op, ctx)
             }
 
             // Escape ops (testing)
@@ -2822,32 +2635,6 @@ mod tests {
 
         assert_eq!(opt.final_num_inputs(), 3);
         assert_eq!(jump.args.len(), 3);
-    }
-
-    #[test]
-    fn test_export_jump_virtual_without_pool_head_descr() {
-        let mut ctx = OptContext::with_num_inputs(16, 0);
-        let pass = OptVirtualize::new();
-        let field_descr = field_descr(8);
-        ctx.set_ptr_info(
-            OpRef(10),
-            PtrInfo::Virtual(crate::optimizeopt::info::VirtualInfo {
-                descr: size_descr(1),
-                known_class: None,
-                fields: vec![(field_descr.index(), OpRef(20))],
-                field_descrs: vec![(field_descr.index(), field_descr.clone())],
-                last_guard_pos: -1,
-            }),
-        );
-
-        pass.export_virtual_for_preamble(OpRef(10), 3, &mut ctx);
-
-        assert_eq!(ctx.exported_jump_virtuals.len(), 1);
-        let exported = &ctx.exported_jump_virtuals[0];
-        assert_eq!(exported.jump_arg_index, 3);
-        assert_eq!(exported.head_load_descr_index, None);
-        assert_eq!(exported.fields.len(), 1);
-        assert_eq!(exported.fields[0].0.index(), field_descr.index());
     }
 
     // ── Tests ──

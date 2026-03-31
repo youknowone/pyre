@@ -208,8 +208,6 @@ pub struct OptContext {
     /// existing target token's short preamble.
     active_short_preamble_producer:
         Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
-    /// RPython unroll.py: virtual structures at JUMP for preamble peeling.
-    pub exported_jump_virtuals: Vec<crate::optimizeopt::optimizer::ExportedJumpVirtual>,
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
@@ -425,7 +423,6 @@ impl OptContext {
 
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
-            exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),
@@ -478,7 +475,6 @@ impl OptContext {
 
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
-            exported_jump_virtuals: Vec::new(),
             exported_short_boxes: Vec::new(),
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),

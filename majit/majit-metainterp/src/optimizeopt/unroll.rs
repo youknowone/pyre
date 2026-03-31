@@ -242,12 +242,12 @@ impl UnrollOptimizer {
     ) -> (Vec<Op>, usize) {
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
-        let (mut exported_state, consts_p1, jump_virtuals, p1_ops) = if let Some(pre_imported) =
+        let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
             self.imported_state.take()
         {
             // Retrace path: Phase 1 already done; preamble ops are in
             // the caller's partial_trace, not produced here.
-            (pre_imported, constants.clone(), Vec::new(), Vec::new())
+            (pre_imported, constants.clone(), Vec::new())
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
@@ -269,10 +269,10 @@ impl UnrollOptimizer {
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
-            // Phase 1: DO flush. RPython optimize_preamble uses flush=False but
-            // that only skips the final cleanup flush — JUMP-time force_all_lazy
-            // still runs. In majit skip_flush also prevents JUMP lazy_set emit
-            // which breaks force_virtual.
+            // RPython optimize_preamble uses flush=False, but in majit the
+            // assembly infrastructure requires JUMP to go through the pipeline
+            // for proper body_result_remap positioning. Virtualize.rs captures
+            // pre_force_virtual_state but no longer forces virtuals at JUMP.
             let p1_ops = opt_p1.optimize_with_constants_and_inputs(ops, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
             // via make_constant (e.g., constant-folded heap reads, guard
@@ -294,7 +294,6 @@ impl UnrollOptimizer {
                 }
             }
             let p1_ni = opt_p1.final_num_inputs();
-            let jv = std::mem::take(&mut opt_p1.exported_jump_virtuals);
 
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
@@ -320,7 +319,7 @@ impl UnrollOptimizer {
                     // resume.py:570-574: collect Phase 1 per-guard knowledge.
                     self.per_guard_knowledge
                         .extend(opt_p1.per_guard_knowledge.drain(..));
-                    (state, consts_p1, jv, p1_ops)
+                    (state, consts_p1, p1_ops)
                 }
                 None => {
                     *constants = consts_p1;
@@ -351,8 +350,7 @@ impl UnrollOptimizer {
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: {} virtual(s), phase1 end_args={}",
-                jump_virtuals.len(),
+                "[jit] preamble peeling: phase1 end_args={}",
                 exported_state.end_args.len(),
             );
         }
@@ -397,11 +395,9 @@ impl UnrollOptimizer {
         opt_p2.imported_loop_state = Some(exported_state);
         // Set imported_virtuals so Phase 2 intercepts GetfieldGcR(pool)
         // and sets up VirtualStruct PtrInfo for the imported head.
-        let imported = build_imported_virtuals(&jump_virtuals);
-        opt_p2.imported_virtuals = imported;
-        // Phase 1's exported_jump_virtuals: tells Phase 2's
-        // store_final_boxes_in_guard which fail_args positions are virtual.
-        opt_p2.exported_jump_virtuals = jump_virtuals.clone();
+        // Virtual structure is derived from VirtualState (ExportedState).
+        opt_p2.imported_virtuals =
+            build_imported_virtuals_from_state(opt_p2.imported_loop_state.as_ref().unwrap());
         // RPython: propagate_all_forward(trace, flush=False) for Phase 2.
         // Don't flush lazy sets — virtuals remain virtual until JUMP handling.
         opt_p2.skip_flush = true;
@@ -3109,20 +3105,56 @@ pub(crate) fn import_state_with_source_slots(
 ///
 // ── RPython-parity helper functions for 2-phase preamble peeling ──
 
-/// unroll.py:479-504 import_state: build ImportedVirtual for Phase 2.
-fn build_imported_virtuals(
-    jump_virtuals: &[crate::optimizeopt::optimizer::ExportedJumpVirtual],
+/// Derive ImportedVirtual entries from ExportedState's VirtualState.
+/// Virtual structure is obtained from the VirtualState snapshot.
+fn build_imported_virtuals_from_state(
+    state: &ExportedState,
 ) -> Vec<crate::optimizeopt::optimizer::ImportedVirtual> {
-    jump_virtuals
-        .iter()
-        .map(|virt| crate::optimizeopt::optimizer::ImportedVirtual {
-            inputarg_index: virt.jump_arg_index,
-            size_descr: virt.size_descr.clone(),
-            kind: virt.kind.clone(),
-            fields: virt.fields.clone(),
-            head_load_descr_index: virt.head_load_descr_index,
-        })
-        .collect()
+    use crate::optimizeopt::virtualstate::VirtualStateInfo;
+    let mut result = Vec::new();
+    for (idx, info) in state.virtual_state.state.iter().enumerate() {
+        match info {
+            VirtualStateInfo::Virtual {
+                descr,
+                known_class,
+                fields,
+                field_descrs,
+            } => {
+                result.push(crate::optimizeopt::optimizer::ImportedVirtual {
+                    inputarg_index: idx,
+                    size_descr: descr.clone(),
+                    kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Instance {
+                        known_class: *known_class,
+                    },
+                    fields: field_descrs
+                        .iter()
+                        .zip(fields.iter())
+                        .map(|((_, fd), (_, fv))| (fd.clone(), (**fv).clone()))
+                        .collect(),
+                    head_load_descr_index: None,
+                });
+            }
+            VirtualStateInfo::VirtualStruct {
+                descr,
+                fields,
+                field_descrs,
+            } => {
+                result.push(crate::optimizeopt::optimizer::ImportedVirtual {
+                    inputarg_index: idx,
+                    size_descr: descr.clone(),
+                    kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Struct,
+                    fields: field_descrs
+                        .iter()
+                        .zip(fields.iter())
+                        .map(|((_, fd), (_, fv))| (fd.clone(), (**fv).clone()))
+                        .collect(),
+                    head_load_descr_index: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 /// compile.py:310-338: [preamble_no_jump] + Label(label_args) + [body_with_jump]
