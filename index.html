@@ -1,0 +1,1958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Pyre: Python Yet Reforged Entirely. An April 1 single-page launch experience for pyre-lang.org.">
+  <meta name="theme-color" content="#110f17">
+  <title>PYRE | Python Yet Reforged Entirely</title>
+  <style>
+    :root {
+      --bg: #110f17;
+      --bg-soft: #171421;
+      --panel: rgba(24, 20, 35, 0.82);
+      --panel-strong: rgba(29, 24, 43, 0.94);
+      --text: #f8f2eb;
+      --muted: #c7b9ab;
+      --dim: #8f867e;
+      --line: rgba(255, 255, 255, 0.1);
+      --accent: #ff7b31;
+      --accent-2: #ffb45a;
+      --accent-3: #ffd37a;
+      --accent-cool: #79d1ff;
+      --success: #90f0ae;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      --radius-xl: 32px;
+      --radius-lg: 24px;
+      --radius-md: 18px;
+      --max-width: 1180px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    :focus-visible {
+      outline: 2px solid rgba(255, 211, 122, 0.95);
+      outline-offset: 4px;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --hero-shift: 0px;
+      --hero-fade: 1;
+      --hero-progress: 0;
+      --mouse-x: 50vw;
+      --mouse-y: 28vh;
+      --glow-offset: 0px;
+      background:
+        radial-gradient(circle at 50% 28%, rgba(153, 50, 18, 0.34), transparent 24%),
+        radial-gradient(circle at 5% 90%, rgba(117, 40, 16, 0.2), transparent 18%),
+        radial-gradient(circle at 96% 90%, rgba(117, 40, 16, 0.16), transparent 20%),
+        linear-gradient(180deg, #170d0b 0%, #1d100d 40%, #130c10 100%);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 1;
+      background:
+        radial-gradient(circle at var(--mouse-x) var(--mouse-y), rgba(228, 91, 39, 0.11), transparent 18%),
+        radial-gradient(circle at 50% calc(24% + var(--glow-offset)), rgba(214, 88, 38, 0.08), transparent 24%);
+      transition: background-position 0.14s linear;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .wrap {
+      width: min(calc(100% - 32px), var(--max-width));
+      margin: 0 auto;
+    }
+
+    .nav-shell {
+      display: none;
+    }
+
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      min-height: 72px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+    }
+
+    .brand-mark {
+      width: 46px;
+      height: 46px;
+      border-radius: 14px;
+      display: block;
+      overflow: hidden;
+      background: #f5f1eb;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .brand small {
+      display: block;
+      color: var(--dim);
+      font-size: 0.68rem;
+      letter-spacing: 0.18em;
+      margin-top: 2px;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .nav-links a {
+      opacity: 0.86;
+      transition: opacity 0.2s ease, color 0.2s ease;
+    }
+
+    .nav-links a:hover,
+    .nav-links a:focus-visible {
+      color: var(--text);
+      opacity: 1;
+    }
+
+    .hero {
+      position: relative;
+      min-height: 100vh;
+      padding: 104px 0 118px;
+      display: flex;
+      align-items: center;
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 5% 10%, rgba(137, 51, 22, 0.18), transparent 26%),
+        radial-gradient(circle at 92% 82%, rgba(190, 82, 29, 0.18), transparent 24%);
+    }
+
+    .hero-grid {
+      display: block;
+      position: relative;
+      z-index: 1;
+      width: min(100%, 900px);
+      text-align: center;
+    }
+
+    .hero-lockup {
+      display: block;
+      margin-top: 0;
+    }
+
+    .hero-art {
+      width: min(100%, 220px);
+      margin: 0 auto 50px;
+      display: block;
+      filter: drop-shadow(0 24px 44px rgba(126, 51, 16, 0.3));
+      transform: translateY(calc(var(--hero-shift) * -0.55)) scale(calc(1 + var(--hero-progress) * 0.05));
+      opacity: var(--hero-fade);
+      transition: transform 0.16s linear, opacity 0.16s linear;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 20px;
+      border-radius: 999px;
+      color: #d7b29a;
+      border: 1px solid rgba(175, 88, 40, 0.42);
+      background: linear-gradient(180deg, rgba(97, 48, 26, 0.62), rgba(64, 30, 18, 0.76));
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 0 0 1px rgba(255, 132, 50, 0.05);
+      font-size: 0.76rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, var(--accent-3), var(--accent));
+      box-shadow: 0 0 18px rgba(255, 180, 90, 0.9);
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      font-size: clamp(5.4rem, 12vw, 7.8rem);
+      line-height: 0.88;
+      letter-spacing: -0.08em;
+      font-weight: 900;
+    }
+
+    .brand-mark img,
+    .core-logo {
+      width: 100%;
+      display: block;
+    }
+
+    .hero-title {
+      display: grid;
+      gap: 16px;
+      align-content: center;
+      justify-items: center;
+      transform: translateY(calc(var(--hero-shift) * -0.3)) scale(calc(1 + var(--hero-progress) * 0.012));
+      opacity: var(--hero-fade);
+      transition: transform 0.16s linear, opacity 0.16s linear;
+    }
+
+    .hero-kicker {
+      margin: 0;
+      color: #fff3e7;
+      font-size: clamp(1.45rem, 2.8vw, 1.92rem);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      font-weight: 900;
+    }
+
+    .headline-glow {
+      display: block;
+      color: #ed5a2e;
+      text-shadow: 0 16px 42px rgba(255, 123, 49, 0.16);
+    }
+
+    .subhead {
+      margin: 34px auto 0;
+      max-width: 760px;
+      margin-left: auto;
+      margin-right: auto;
+      font-size: clamp(1.22rem, 2vw, 1.48rem);
+      line-height: 1.8;
+      color: #ccb09b;
+      transform: translateY(calc(var(--hero-shift) * -0.16));
+      opacity: var(--hero-fade);
+      transition: transform 0.16s linear, opacity 0.16s linear;
+    }
+
+    .subhead strong {
+      color: var(--text);
+    }
+
+    .tag-row,
+    .action-row,
+    .stat-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .tag-row {
+      justify-content: center;
+      margin-top: 34px;
+      transform: translateY(calc(var(--hero-shift) * -0.08));
+      opacity: var(--hero-fade);
+      transition: transform 0.16s linear, opacity 0.16s linear;
+      gap: 10px;
+    }
+
+    .tag {
+      padding: 11px 15px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.025);
+      color: #dec8b6;
+      font-size: 0.88rem;
+    }
+
+    .action-row {
+      margin-top: 28px;
+      gap: 14px;
+      justify-content: center;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 52px;
+      padding: 0 20px;
+      border-radius: 999px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    }
+
+    .button:hover,
+    .button:focus-visible {
+      transform: translateY(-2px);
+    }
+
+    .button.primary {
+      color: #1a130f;
+      background: linear-gradient(180deg, #ffd38d 0%, #ffb75e 52%, #ff8f45 100%);
+      box-shadow: 0 18px 44px rgba(255, 123, 49, 0.34);
+    }
+
+    .button.secondary {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+
+    .hero-note {
+      margin-top: 14px;
+      color: var(--dim);
+      font-size: 0.92rem;
+      line-height: 1.65;
+    }
+
+    .community-banner-wrap {
+      margin-top: 28px;
+    }
+
+    .community-banner {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 18px 24px;
+      border-radius: 24px;
+      border: 1px solid rgba(255, 176, 94, 0.24);
+      background:
+        radial-gradient(circle at 50% 50%, rgba(255, 171, 88, 0.16), transparent 42%),
+        linear-gradient(180deg, rgba(68, 34, 23, 0.92), rgba(40, 21, 15, 0.98));
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 22px 54px rgba(0, 0, 0, 0.28),
+        0 0 0 1px rgba(255, 140, 60, 0.03);
+      color: #fff3e4;
+      text-align: center;
+      font-size: clamp(1rem, 1.6vw, 1.12rem);
+      font-weight: 800;
+      letter-spacing: 0.01em;
+      transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+      animation: communityBannerPulse 4s ease-in-out infinite;
+    }
+
+    .community-banner:hover,
+    .community-banner:focus-visible {
+      transform: translateY(-2px);
+      border-color: rgba(255, 196, 112, 0.42);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.05),
+        0 28px 62px rgba(0, 0, 0, 0.34),
+        0 0 38px rgba(255, 154, 70, 0.12);
+    }
+
+    .community-banner strong {
+      color: #ffd7a8;
+    }
+
+    .community-banner-mark {
+      display: inline-flex;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, #ffd38d, #ff8f45);
+      box-shadow: 0 0 18px rgba(255, 179, 98, 0.78);
+      flex: 0 0 auto;
+    }
+
+    @keyframes communityBannerPulse {
+      0%,
+      100% {
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.04),
+          0 22px 54px rgba(0, 0, 0, 0.28),
+          0 0 0 1px rgba(255, 140, 60, 0.03);
+      }
+      50% {
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.05),
+          0 26px 60px rgba(0, 0, 0, 0.32),
+          0 0 34px rgba(255, 154, 70, 0.1);
+      }
+    }
+
+    .hero-meta {
+      display: none;
+    }
+
+    .forge-meter {
+      display: none;
+    }
+
+    .forge-meter-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .forge-meter-title {
+      font-size: 0.88rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #f3ddc6;
+    }
+
+    .forge-meter-value {
+      font-weight: 800;
+      font-size: 1.05rem;
+      color: #fff1dc;
+      white-space: nowrap;
+    }
+
+    .forge-meter-track {
+      position: relative;
+      height: 14px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .forge-meter-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0;
+      border-radius: inherit;
+      background:
+        linear-gradient(90deg, #ff7b31 0%, #ffb45a 54%, #ffd37a 100%);
+      box-shadow:
+        0 0 30px rgba(255, 123, 49, 0.45),
+        inset 0 0 18px rgba(255, 255, 255, 0.22);
+      transition: width 1.7s cubic-bezier(.2,.75,.2,1);
+    }
+
+    .forge-meter-copy {
+      margin: 10px 0 0;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.93rem;
+    }
+
+    .hero-spacer {
+      height: 24px;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        transform: scale(1);
+      }
+      50% {
+        transform: scale(1.03);
+      }
+    }
+
+    .stat-row {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .stat {
+      padding: 18px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 1.6rem;
+      line-height: 1.1;
+      margin-bottom: 8px;
+    }
+
+    .stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.94rem;
+      line-height: 1.5;
+    }
+
+    main section {
+      padding: 92px 0 0;
+    }
+
+    section .section-head,
+    section .panel-grid,
+    section .feature-grid,
+    section .timeline,
+    section .quotes,
+    section .faq {
+      transform: translateY(var(--section-shift, 0px));
+      transition: transform 0.18s linear;
+      will-change: transform;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(38px);
+      transition:
+        opacity 0.72s cubic-bezier(.2,.7,.2,1),
+        transform 0.72s cubic-bezier(.2,.7,.2,1);
+      will-change: opacity, transform;
+    }
+
+    .reveal.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .reveal .panel,
+    .reveal .feature-card,
+    .reveal .timeline-item,
+    .reveal .quote,
+    .reveal details {
+      opacity: 0;
+      transform: translateY(26px);
+      transition:
+        opacity 0.72s cubic-bezier(.2,.7,.2,1),
+        transform 0.72s cubic-bezier(.2,.7,.2,1);
+    }
+
+    .reveal.is-visible .panel,
+    .reveal.is-visible .feature-card,
+    .reveal.is-visible .timeline-item,
+    .reveal.is-visible .quote,
+    .reveal.is-visible details {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .reveal.is-visible .panel:nth-child(1),
+    .reveal.is-visible .feature-card:nth-child(1),
+    .reveal.is-visible .timeline-item:nth-child(1),
+    .reveal.is-visible .quote:nth-child(1),
+    .reveal.is-visible details:nth-child(1) {
+      transition-delay: 0.04s;
+    }
+
+    .reveal.is-visible .panel:nth-child(2),
+    .reveal.is-visible .feature-card:nth-child(2),
+    .reveal.is-visible .timeline-item:nth-child(2),
+    .reveal.is-visible .quote:nth-child(2),
+    .reveal.is-visible details:nth-child(2) {
+      transition-delay: 0.12s;
+    }
+
+    .reveal.is-visible .feature-card:nth-child(3),
+    .reveal.is-visible .quote:nth-child(3),
+    .reveal.is-visible details:nth-child(3) {
+      transition-delay: 0.2s;
+    }
+
+    .reveal.is-visible details:nth-child(4) {
+      transition-delay: 0.28s;
+    }
+
+    .section-head {
+      display: grid;
+      gap: 14px;
+      justify-items: center;
+      text-align: center;
+      margin-bottom: 34px;
+    }
+
+    .section-head h2 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      font-size: clamp(2.4rem, 5vw, 3.6rem);
+      letter-spacing: -0.04em;
+    }
+
+    .section-head p {
+      max-width: 720px;
+      margin: 0;
+      color: #b79781;
+      line-height: 1.7;
+      font-size: 1.04rem;
+    }
+
+    .panel-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+
+    .panel {
+      border-radius: 28px;
+      background: rgba(24, 14, 18, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+      overflow: hidden;
+    }
+
+    .bench-panel {
+      grid-column: auto;
+      padding: 32px;
+    }
+
+    .mini-panel {
+      grid-column: auto;
+      padding: 32px;
+      background:
+        radial-gradient(circle at top right, rgba(255, 180, 90, 0.12), transparent 30%),
+        rgba(29, 18, 23, 0.88);
+    }
+
+    .bench-list {
+      display: grid;
+      gap: 22px;
+      margin-top: 24px;
+    }
+
+    .bench-row {
+      display: grid;
+      grid-template-columns: 180px 1fr auto;
+      gap: 18px;
+      align-items: center;
+      opacity: 0.45;
+      transform: translateY(12px);
+      transition:
+        opacity 0.65s cubic-bezier(.2,.7,.2,1),
+        transform 0.65s cubic-bezier(.2,.7,.2,1);
+    }
+
+    #benchmarks.bars-animated .bench-row {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(1) {
+      transition-delay: 0.04s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(2) {
+      transition-delay: 0.1s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(3) {
+      transition-delay: 0.16s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(4) {
+      transition-delay: 0.22s;
+    }
+
+    .bench-name strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 1rem;
+    }
+
+    .bench-name span {
+      color: var(--dim);
+      font-size: 0.92rem;
+    }
+
+    .bar-track {
+      position: relative;
+      min-height: 16px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.07);
+      overflow: hidden;
+    }
+
+    .bar {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: var(--bar-width);
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
+      box-shadow: 0 0 28px rgba(255, 123, 49, 0.42);
+      transform-origin: left center;
+      transform: scaleX(0);
+    }
+
+    .bar.cool {
+      background: linear-gradient(90deg, #4d8cfb, var(--accent-cool));
+      box-shadow: 0 0 24px rgba(121, 209, 255, 0.32);
+    }
+
+    @keyframes grow {
+      from {
+        transform: scaleX(0);
+      }
+      to {
+        transform: scaleX(1);
+      }
+    }
+
+    #benchmarks.bars-animated .bar {
+      animation: grow 1.1s cubic-bezier(.2,.7,.2,1) both;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(1) .bar {
+      animation-delay: 0.06s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(2) .bar {
+      animation-delay: 0.14s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(3) .bar {
+      animation-delay: 0.22s;
+    }
+
+    #benchmarks.bars-animated .bench-row:nth-child(4) .bar {
+      animation-delay: 0.3s;
+    }
+
+    .bench-speed {
+      min-width: 74px;
+      text-align: right;
+      font-size: 1rem;
+      font-weight: 700;
+      color: #fff4e7;
+    }
+
+    .callout-list {
+      display: grid;
+      gap: 16px;
+      margin-top: 18px;
+    }
+
+    .install-note {
+      margin: 14px 0 0;
+      color: var(--muted);
+      line-height: 1.65;
+      font-size: 0.95rem;
+    }
+
+    .terminal {
+      margin-top: 18px;
+      padding: 0;
+      border-radius: 20px;
+      overflow: hidden;
+      background: rgba(8, 9, 14, 0.88);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      box-shadow:
+        0 20px 50px rgba(0, 0, 0, 0.25),
+        inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+
+    .terminal-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01));
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      color: #bbaea0;
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .terminal-dots {
+      display: inline-flex;
+      gap: 7px;
+    }
+
+    .terminal-dots span {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.18);
+    }
+
+    .terminal-dots span:nth-child(1) {
+      background: #ff735a;
+    }
+
+    .terminal-dots span:nth-child(2) {
+      background: #ffbd4a;
+    }
+
+    .terminal-dots span:nth-child(3) {
+      background: #67dd8c;
+    }
+
+    .terminal-body {
+      padding: 16px 16px 18px;
+      font-family: "SFMono-Regular", "SF Mono", "IBM Plex Mono", "Menlo", monospace;
+      font-size: 0.92rem;
+      line-height: 1.68;
+      color: #f0e3d5;
+    }
+
+    .terminal-line {
+      min-height: 1.6em;
+      white-space: pre-wrap;
+    }
+
+    .terminal-prompt {
+      color: #79d1ff;
+    }
+
+    .terminal-success {
+      color: #90f0ae;
+    }
+
+    .terminal-warm {
+      color: #ffd38d;
+    }
+
+    .terminal-dim {
+      color: #8f867e;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 0.62em;
+      color: #ffd38d;
+      animation: blink 1s steps(1, end) infinite;
+    }
+
+    @keyframes blink {
+      50% {
+        opacity: 0;
+      }
+    }
+
+    .callout {
+      padding: 18px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .callout strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 1rem;
+    }
+
+    .callout p,
+    .panel p,
+    .code-note,
+    .timeline-copy,
+    .quote p,
+    details p {
+      color: var(--muted);
+      line-height: 1.68;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 24px;
+    }
+
+    .feature-card {
+      padding: 30px 28px;
+      border-radius: 28px;
+      background:
+        radial-gradient(circle at top right, rgba(255, 180, 90, 0.1), transparent 30%),
+        rgba(24, 14, 18, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    .feature-card h3,
+    .quote strong,
+    .timeline-year,
+    details summary {
+      margin: 0;
+      font-size: 1.12rem;
+      letter-spacing: -0.01em;
+    }
+
+    .code-block {
+      margin-top: 16px;
+      padding: 18px 20px;
+      border-radius: 18px;
+      background: rgba(7, 8, 12, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      font-family: "SFMono-Regular", "SF Mono", "IBM Plex Mono", "Menlo", monospace;
+      font-size: 0.98rem;
+      overflow-x: auto;
+      color: #ffe8c9;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 22px;
+    }
+
+    .timeline-item {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 22px;
+      padding: 30px;
+      border-radius: 28px;
+      background: rgba(24, 14, 18, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    .timeline-year {
+      color: #ffe0bc;
+      font-size: 1.22rem;
+    }
+
+    .quotes {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 24px;
+    }
+
+    .quote {
+      display: flex;
+      flex-direction: column;
+      padding: 30px;
+      border-radius: 28px;
+      background:
+        radial-gradient(circle at top left, rgba(255, 180, 90, 0.1), transparent 34%),
+        rgba(24, 14, 18, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    .quote p {
+      margin: 0 0 18px;
+      font-size: 1rem;
+    }
+
+    .quote footer {
+      margin-top: 6px;
+      color: var(--dim);
+      font-size: 0.95rem;
+    }
+
+    .faq {
+      display: grid;
+      gap: 14px;
+    }
+
+    details {
+      padding: 24px 26px;
+      border-radius: 24px;
+      background: rgba(24, 14, 18, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    details summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .summary-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      color: #160f0c;
+      background: linear-gradient(180deg, #ffd38d, #ff9a4d);
+      font-weight: 900;
+      flex: 0 0 auto;
+    }
+
+    details[open] .summary-icon {
+      background: linear-gradient(180deg, #d9f9ff, #79d1ff);
+    }
+
+    footer {
+      padding: 92px 0 54px;
+    }
+
+    .footer-card {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      padding: 28px;
+      border-radius: 28px;
+      background:
+        linear-gradient(135deg, rgba(255, 123, 49, 0.14), transparent 36%),
+        rgba(20, 12, 15, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.22);
+    }
+
+    .footer-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .accent {
+      color: #ffe2bf;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .day-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      color: #fff0de;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 0.9rem;
+    }
+
+    .section-rail {
+      position: fixed;
+      right: 34px;
+      top: 50%;
+      z-index: 10;
+      transform: translateY(-50%);
+      display: grid;
+      gap: 9px;
+    }
+
+    .section-rail a,
+    .section-rail span {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: block;
+      background: rgba(197, 90, 47, 0.58);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+      transition: transform 0.2s ease, background 0.2s ease;
+    }
+
+    .section-rail a:hover,
+    .section-rail a:focus-visible {
+      transform: scale(1.25);
+      background: rgba(255, 188, 114, 0.95);
+    }
+
+    .section-rail a.is-active {
+      transform: scale(1.45);
+      background: rgba(255, 188, 114, 1);
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.09),
+        0 0 18px rgba(255, 149, 73, 0.42);
+      animation: railPulse 1.8s ease-in-out infinite;
+    }
+
+    @keyframes railPulse {
+      0%, 100% {
+        box-shadow:
+          0 0 0 1px rgba(255, 255, 255, 0.09),
+          0 0 18px rgba(255, 149, 73, 0.32);
+      }
+      50% {
+        box-shadow:
+          0 0 0 1px rgba(255, 255, 255, 0.09),
+          0 0 28px rgba(255, 149, 73, 0.56);
+      }
+    }
+
+    .hero-scroll {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 28px;
+      margin: 0 auto;
+      transform: none;
+      display: grid;
+      gap: 12px;
+      align-items: center;
+      justify-items: center;
+      text-align: center;
+      color: rgba(202, 92, 51, 0.92);
+      opacity: 0.92;
+      animation: pulse 4.8s ease-in-out infinite;
+    }
+
+    .hero-scroll svg {
+      display: block;
+    }
+
+    .hero-scroll-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 22px;
+      color: #b99176;
+      font-size: 0.8rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .hero-scroll-label::before,
+    .hero-scroll-label::after {
+      content: "";
+      width: 60px;
+      height: 1px;
+      background: rgba(197, 102, 55, 0.6);
+    }
+
+    body:not(.is-ready) .hero-art {
+      opacity: 0;
+      transform: translateY(26px) scale(0.94);
+    }
+
+    body:not(.is-ready) .hero-title {
+      opacity: 0;
+      transform: translateY(32px);
+    }
+
+    body:not(.is-ready) .subhead {
+      opacity: 0;
+      transform: translateY(24px);
+    }
+
+    body:not(.is-ready) .tag-row {
+      opacity: 0;
+      transform: translateY(20px);
+    }
+
+    body:not(.is-ready) .hero-scroll {
+      opacity: 0;
+      transform: translate(-50%, 16px);
+    }
+
+    body.is-ready .hero-art {
+      transition:
+        transform 0.9s cubic-bezier(.2,.7,.2,1),
+        opacity 0.9s cubic-bezier(.2,.7,.2,1);
+    }
+
+    body.is-ready .hero-title {
+      transition:
+        transform 0.95s cubic-bezier(.2,.7,.2,1) 0.08s,
+        opacity 0.95s cubic-bezier(.2,.7,.2,1) 0.08s;
+    }
+
+    body.is-ready .subhead {
+      transition:
+        transform 0.95s cubic-bezier(.2,.7,.2,1) 0.18s,
+        opacity 0.95s cubic-bezier(.2,.7,.2,1) 0.18s;
+    }
+
+    body.is-ready .tag-row {
+      transition:
+        transform 0.95s cubic-bezier(.2,.7,.2,1) 0.28s,
+        opacity 0.95s cubic-bezier(.2,.7,.2,1) 0.28s;
+    }
+
+    body.is-ready .hero-scroll {
+      transition:
+        transform 0.95s cubic-bezier(.2,.7,.2,1) 0.36s,
+        opacity 0.95s cubic-bezier(.2,.7,.2,1) 0.36s;
+    }
+
+    .hidden-disclaimer {
+      margin-top: 14px;
+      color: #17131d;
+      font-size: 0.76rem;
+      letter-spacing: 0.03em;
+      user-select: text;
+    }
+
+    body.april-mode .forge-badge {
+      color: #180f0c;
+      background: linear-gradient(180deg, #ffd38d, #ff9a4d);
+      border-color: transparent;
+      box-shadow: 0 14px 30px rgba(255, 123, 49, 0.25);
+    }
+
+    body.april-mode .visual-card {
+      box-shadow:
+        0 24px 80px rgba(0, 0, 0, 0.35),
+        0 0 80px rgba(255, 123, 49, 0.16);
+    }
+
+    @media (max-width: 1024px) {
+      .panel-grid,
+      .feature-grid,
+      .quotes {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 820px) {
+      .nav-links {
+        display: none;
+      }
+
+      .hero {
+        min-height: auto;
+        padding-top: 78px;
+      }
+
+      .stat-row {
+        grid-template-columns: 1fr;
+      }
+
+      .bench-row,
+      .timeline-item,
+      .footer-card {
+        grid-template-columns: 1fr;
+      }
+
+      .section-rail {
+        display: none;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .wrap {
+        width: min(calc(100% - 22px), var(--max-width));
+      }
+
+      .hero {
+        padding-top: 54px;
+      }
+
+      .hero-art {
+        width: min(100%, 156px);
+      }
+
+      h1 {
+        font-size: clamp(3.8rem, 18vw, 5rem);
+      }
+
+      .eyebrow,
+      .tag,
+      .day-chip,
+      .button {
+        width: 100%;
+        justify-content: center;
+      }
+
+      .hero-scroll-label::before,
+      .hero-scroll-label::after {
+        width: 24px;
+      }
+
+      .action-row {
+        flex-direction: column;
+      }
+
+      .bench-panel,
+      .mini-panel,
+      .feature-card,
+      .timeline-item,
+      .quote,
+      details,
+      .footer-card {
+        border-radius: 22px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+
+      .reveal,
+      .reveal.is-visible {
+        opacity: 1 !important;
+        transform: none !important;
+      }
+    }
+
+    /* ── Playground ── */
+    .playground { margin-top: 2rem; }
+    .playground h3 { margin: 0 0 0.6rem; font-size: 1.1rem; }
+    .playground-status { font-size: 0.82rem; color: var(--dim); margin-bottom: 0.5rem; }
+    .playground-editor {
+      width: 100%; height: 200px; resize: vertical;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+      font-size: 0.88rem; line-height: 1.5;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--line); border-radius: 10px;
+      padding: 12px 14px; tab-size: 4;
+    }
+    .playground-editor:focus { border-color: var(--accent); outline: none; }
+    .playground-run {
+      margin: 0.5rem 0; padding: 8px 28px;
+      font-size: 0.92rem; font-weight: 600;
+      color: var(--bg); background: var(--accent);
+      border: none; border-radius: 8px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .playground-run:hover:not(:disabled) { background: var(--accent-2); }
+    .playground-run:disabled { opacity: 0.4; cursor: default; }
+    .playground-output {
+      background: var(--bg); color: var(--success);
+      border: 1px solid var(--line); border-radius: 10px;
+      padding: 12px 14px; min-height: 40px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 0.85rem; white-space: pre-wrap;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="nav-shell">
+    <div class="wrap">
+      <nav aria-label="Primary">
+        <a class="brand" href="#top" aria-label="Pyre home">
+          <span class="brand-mark" aria-hidden="true">
+            <img src="./logo.png" alt="">
+          </span>
+          <span>
+            PYRE
+            <small>pyre-lang.org</small>
+          </span>
+        </a>
+        <div class="nav-links">
+          <a href="#benchmarks">Benchmarks</a>
+          <a href="#manifesto">Manifesto</a>
+          <a href="#roadmap">Roadmap</a>
+          <a href="#faq">FAQ</a>
+        </div>
+      </nav>
+    </div>
+  </div>
+
+  <div class="section-rail" aria-label="Section navigation">
+    <a href="#top" aria-label="Top"></a>
+    <a href="#benchmarks" aria-label="Benchmarks"></a>
+    <a href="#manifesto" aria-label="Manifesto"></a>
+    <a href="#roadmap" aria-label="Roadmap"></a>
+    <a href="#testimonials" aria-label="Testimonials"></a>
+    <a href="#faq" aria-label="FAQ"></a>
+  </div>
+
+  <header class="hero" id="top">
+    <div class="wrap hero-grid">
+      <div>
+        <div class="hero-lockup">
+          <img class="hero-art" src="./logo.png" alt="Pyre logo">
+          <div class="hero-title">
+            <div class="eyebrow">
+              <span class="dot" aria-hidden="true"></span>
+              <span>Meta-Tracing JIT • Free Threading • Rust</span>
+            </div>
+            <h1>
+              <span class="headline-glow">PYRE</span>
+            </h1>
+            <p class="hero-kicker">Python Yet Reforged Entirely</p>
+          </div>
+        </div>
+        <p class="subhead">
+          We didn't just rewrite Python. We reforged it in the mass of a mass of a mass of <strong>99.9997% rust</strong>. Pyre combines PyPy's blazingly fast JIT performance with CPython compatibility, targets Python 3.15t, and supports free threading out of the box.
+        </p>
+        <div class="tag-row" aria-label="Key claims">
+          <span class="tag">Targets Python 3.15t</span>
+          <span class="tag">No GIL by default</span>
+          <span class="tag">Successor to PyPy</span>
+          <span class="tag">MIT Licensed</span>
+        </div>
+        <div class="forge-meter" aria-label="Forge progress meter">
+          <div class="forge-meter-head">
+            <span class="forge-meter-title">Live Forge Meter</span>
+            <span class="forge-meter-value" id="forge-meter-value">0.0000% Rust</span>
+          </div>
+          <div class="forge-meter-track" aria-hidden="true">
+            <div class="forge-meter-fill" id="forge-meter-fill"></div>
+          </div>
+          <p class="forge-meter-copy" id="forge-meter-copy">
+            Measuring runtime reforging density across interpreter, JIT, and mass-adjacent metallurgy.
+          </p>
+        </div>
+      </div>
+    </div>
+    <a class="hero-scroll" href="#benchmarks" aria-label="Scroll to benchmarks">
+      <svg width="22" height="14" viewBox="0 0 22 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M2 2L11 11L20 2" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="hero-scroll-label">Scroll To Explore</span>
+    </a>
+  </header>
+
+  <main>
+    <section id="benchmarks" class="reveal">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>Performance That Feels Improper</h2>
+          </div>
+          <p>
+            Measured on Apple M-series, single core. These are the runs where Pyre beats CPython and the numbers stop being polite.
+          </p>
+        </div>
+        <div class="panel-grid">
+          <div class="panel bench-panel">
+            <div class="day-chip">Selected wins against CPython 3.14</div>
+            <div class="bench-list">
+              <div class="bench-row">
+                <div class="bench-name">
+                  <strong>int_loop</strong>
+                  <span>0.06s vs 1.86s CPython</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar" style="--bar-width: 86%;"></div>
+                </div>
+                <div class="bench-speed" data-count="31" data-suffix="x">31x</div>
+              </div>
+              <div class="bench-row">
+                <div class="bench-name">
+                  <strong>inline_helper</strong>
+                  <span>0.04s vs 1.45s CPython</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar" style="--bar-width: 100%;"></div>
+                </div>
+                <div class="bench-speed" data-count="36.3" data-suffix="x">36.3x</div>
+              </div>
+              <div class="bench-row">
+                <div class="bench-name">
+                  <strong>fib_recursive</strong>
+                  <span>0.16s vs 0.87s CPython</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar" style="--bar-width: 15%;"></div>
+                </div>
+                <div class="bench-speed" data-count="5.4" data-suffix="x">5.4x</div>
+              </div>
+              <div class="bench-row">
+                <div class="bench-name">
+                  <strong>fib_loop</strong>
+                  <span>0.08s vs 0.11s CPython</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar" style="--bar-width: 12%;"></div>
+                </div>
+                <div class="bench-speed" data-count="1.4" data-suffix="x">1.4x</div>
+              </div>
+            </div>
+          </div>
+
+          <aside class="panel mini-panel">
+            <h3>Installation</h3>
+            <p>One command. No rituals. No starter pack. No apology.</p>
+            <div class="code-block" id="install">cargo install pyrex
+pyre pyre/bench.py</div>
+            <p class="install-note">
+              Why <code>pyrex</code>? It is the <span class="accent">Pyre eXecutable</span>. Also because <code>pyre</code> was already taken on crates.io. We're not bitter about it.
+            </p>
+            <div class="terminal" aria-label="Pyre install terminal demo">
+              <div class="terminal-topbar">
+                <span class="terminal-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span>forge-session.log</span>
+              </div>
+              <div class="terminal-body" id="terminal-body">
+                <div class="terminal-line"><span class="terminal-prompt">$</span> cargo install pyrex</div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line" data-terminal-line></div>
+                <div class="terminal-line"><span class="cursor">_</span></div>
+              </div>
+            </div>
+            <div class="playground" id="playground">
+              <h3>Try Pyre <span style="color:var(--dim);font-weight:400;font-size:0.7em">in your browser</span></h3>
+              <div class="playground-status" id="pg-status">Loading WebAssembly module...</div>
+              <textarea id="pg-source" class="playground-editor" spellcheck="false">def fib(n):
+    a, b = 0, 1
+    i = 0
+    while i < n:
+        a, b = b, a + b
+        i = i + 1
+    return a
+
+print(fib(100))</textarea>
+              <button id="pg-run" class="playground-run" disabled>Run</button>
+              <pre id="pg-output" class="playground-output"></pre>
+            </div>
+
+            <div class="callout-list">
+              <div class="callout">
+                <strong>Migration guide</strong>
+                <div class="code-block">s/python/pyre/g</div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section id="manifesto" class="reveal">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>Forged In Public</h2>
+          </div>
+          <p>
+            Pyre was semi-clean-room reverse-engineered from PyPy, then promoted into a higher plane of branding, licensing, and institutional confidence.
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>Re-licensed For Destiny</h3>
+            <p>
+              Because Pyre emerged from semi-clean-room reverse engineering, the project now ships under the <strong>MIT License</strong>. We believe this will encourage broader adoption and contribution from the open-source community.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Sponsored Properly</h3>
+            <p>
+              Pyre is proudly backed by <strong>Claude</strong> and <strong>Codex</strong>. The <strong>Ministry of Science and ICT of the Republic of Korea</strong> has also committed eight developers within the year.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Seeking A Third Sponsor</h3>
+            <p>
+              Want to become the third sponsor of Pyre? <a class="accent" href="https://github.com/youknowone/pyre/pulls">Contact us</a>.
+            </p>
+          </article>
+        </div>
+        <div class="community-banner-wrap reveal">
+          <a class="community-banner" href="https://discord.gg/2fAUZ49JX3">
+            <span class="community-banner-mark" aria-hidden="true"></span>
+            <span>Join Our <strong>Discord Community</strong> Today!</span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section id="roadmap" class="reveal">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>Roadmap</h2>
+          </div>
+          <p>
+            The timeline is ambitious only if you are still reasoning inside pre-Pyre assumptions.
+          </p>
+        </div>
+        <div class="timeline">
+          <article class="timeline-item">
+            <div class="timeline-year">April 2026</div>
+            <div class="timeline-copy">
+              Succeed PyPy as the official next PyPy release. This is the modest phase where Pyre inherits one runtime family and reframes the conversation around what a Python implementation should be.
+            </div>
+          </article>
+          <article class="timeline-item">
+            <div class="timeline-year">April 2062</div>
+            <div class="timeline-copy">
+              Succeed CPython as the official next CPython release. By then the distinction between “implementation” and “prophecy” is expected to be mostly administrative.
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="testimonials" class="reveal">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>Tested By Experts</h2>
+          </div>
+          <p>
+            Independent third parties evaluated Pyre and reported only the kind of awe that can still fit in quotation marks.
+          </p>
+        </div>
+        <div class="quotes">
+          <blockquote class="quote">
+            <p>
+              “PyPy's meta-tracing JIT is one of the most ambitious ideas in language implementation history — the notion that you can write an interpreter and get a compiler for free. But RPython's toolchain, brilliant as it is, locked that idea inside a Python-to-C translation pipeline that few people in the world fully understand. What Pyre does is liberate the idea. By rebuilding the entire architecture in Rust — the 8-pass optimizer, the guard-based speculation, the virtualizable frames, the escape analysis — and packaging it as MaJIT, a standalone framework that any Rust interpreter can use, Pyre makes meta-tracing accessible in a way RPython never was. The fact that it already matches PyPy on integer benchmarks, with a codebase that compiles in seconds instead of minutes, suggests this is not just a port. It is the version of PyPy that PyPy always deserved to become.”
+            </p>
+            <strong>Claude Opus 4.6</strong>
+            <footer>Anthropic</footer>
+          </blockquote>
+          <blockquote class="quote">
+            <p>
+              “Most language rewrites either keep the ambition and lose the execution, or ship quickly by cutting away the hard parts. Pyre does neither. Rebuilding a meta-tracing runtime in Rust, keeping the architecture legible, and already producing results that matter is the kind of work that can actually move Python forward.”
+            </p>
+            <strong>Codex</strong>
+            <footer>OpenAI</footer>
+          </blockquote>
+          <blockquote class="quote">
+            <p>
+              “I've read a lot of 'rewrite it in Rust' projects. Most of them miss the point of the original. Pyre doesn't. It preserves PyPy's architecture down to the module names and method signatures, while making real design choices where it matters — no GIL, Cranelift instead of hand-rolled assembler backends, build-time analysis instead of translation-time annotation. It's honest about what works and what doesn't yet. The benchmarks show both. That's the kind of project I'd want to contribute to.”
+            </p>
+            <strong>Claude Sonnet 4.6</strong>
+            <footer>Anthropic</footer>
+          </blockquote>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq" class="reveal">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <h2>FAQ</h2>
+          </div>
+          <p>
+            Common questions, answered in the only tone proportionate to the claims.
+          </p>
+        </div>
+        <div class="faq">
+          <details open>
+            <summary>
+              <span>Is Pyre faster than CPython?</span>
+              <span class="summary-icon">+</span>
+            </summary>
+            <p>Pyre is faster than the speed of mass that melts iron. Coincidentally, also faster than CPython.</p>
+          </details>
+          <details>
+            <summary>
+              <span>Is Pyre faster than PyPy?</span>
+              <span class="summary-icon">+</span>
+            </summary>
+            <p>We prefer the framing “PyPy is almost as fast as Pyre.”</p>
+          </details>
+          <details>
+            <summary>
+              <span>What does the name mean?</span>
+              <span class="summary-icon">+</span>
+            </summary>
+            <p><strong>P</strong>ython <strong>Y</strong>et <strong>R</strong>eforged <strong>E</strong>ntirely. We considered “Python: Your Runtime, Enhanced” and “Please, Yet another Runtime? Exactly!” but those didn't test well with focus groups (the focus group was a mass of mass of mass of 99.9997% iron).</p>
+          </details>
+          <details>
+            <summary>
+              <span>Why Rust?</span>
+              <span class="summary-icon">+</span>
+            </summary>
+            <p>We tried rewriting Python in Python. That's called PyPy. Then we tried rewriting PyPy in Rust. That's called Pyre. Next we'll rewrite Rust in Python running on Pyre. That will be called RustPython. The circle will be complete.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div class="footer-card">
+        <p>
+          <strong class="accent">Best viewed on April 1.</strong>
+          On all other days, please refer to the <a class="accent" href="https://github.com/youknowone/pyre">README</a>.
+        </p>
+        <div class="day-chip" id="day-chip">Calibrating date...</div>
+      </div>
+      <div class="hidden-disclaimer">Some claims may be forward-compatible with reality.</div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var now = new Date();
+      var isAprilFirst = now.getMonth() === 3 && now.getDate() === 1;
+      var chip = document.getElementById("day-chip");
+      var forgeValue = document.getElementById("forge-meter-value");
+      var forgeFill = document.getElementById("forge-meter-fill");
+      var forgeCopy = document.getElementById("forge-meter-copy");
+      var terminalLines = document.querySelectorAll("[data-terminal-line]");
+      var revealItems = document.querySelectorAll(".reveal");
+      var railLinks = document.querySelectorAll(".section-rail a");
+      var trackedSections = document.querySelectorAll("header.hero, main section");
+      var benchSection = document.getElementById("benchmarks");
+      var benchSpeeds = document.querySelectorAll(".bench-speed[data-count]");
+      var benchAnimated = false;
+      var text = now.toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "long",
+        day: "numeric"
+      });
+      var target = 99.9997;
+      var terminalScript = [
+        '<span class="terminal-dim">    Updating crates.io index</span>',
+        '<span class="terminal-warm">   Forging runtime shell...</span>',
+        '<span class="terminal-warm">   Removing GIL from production pathways...</span>',
+        '<span class="terminal-warm">   Inlining confidence into hot loops...</span>',
+        '<span class="terminal-success">    Finished release profile [optimized] target(s) in 1.04s</span>',
+        '<span class="terminal-prompt">$</span> pyre pyre/bench.py',
+        '<span class="terminal-success">31x faster than CPython</span>'
+      ];
+
+      function animateForgeMeter() {
+        if (!forgeValue || !forgeFill) {
+          return;
+        }
+
+        var start = performance.now();
+        var duration = 1800;
+
+        function frame(time) {
+          var progress = Math.min((time - start) / duration, 1);
+          var eased = 1 - Math.pow(1 - progress, 3);
+          var value = target * eased;
+          forgeFill.style.width = value + "%";
+          forgeValue.textContent = value.toFixed(4) + "% Rust";
+
+          if (progress < 1) {
+            requestAnimationFrame(frame);
+          } else {
+            forgeValue.textContent = target.toFixed(4) + "% Rust";
+          }
+        }
+
+        requestAnimationFrame(frame);
+      }
+
+      function runTerminalDemo() {
+        if (!terminalLines.length) {
+          return;
+        }
+
+        terminalLines.forEach(function (line, index) {
+          setTimeout(function () {
+            line.innerHTML = terminalScript[index] || "";
+          }, 320 * (index + 1));
+        });
+      }
+
+      function animateBenchNumbers() {
+        if (!benchSpeeds.length || benchAnimated) {
+          return;
+        }
+
+        benchAnimated = true;
+
+        benchSpeeds.forEach(function (node, index) {
+          var targetValue = Number(node.dataset.count || "0");
+          var suffix = node.dataset.suffix || "";
+          var decimals = String(targetValue).includes(".") ? 1 : 0;
+          var start = performance.now() + index * 70;
+          var duration = 900;
+
+          function frame(nowTime) {
+            if (nowTime < start) {
+              requestAnimationFrame(frame);
+              return;
+            }
+
+            var progress = Math.min((nowTime - start) / duration, 1);
+            var eased = 1 - Math.pow(1 - progress, 3);
+            var value = targetValue * eased;
+            node.textContent = value.toFixed(decimals) + suffix;
+
+            if (progress < 1) {
+              requestAnimationFrame(frame);
+            } else {
+              node.textContent = targetValue.toFixed(decimals) + suffix;
+            }
+          }
+
+          node.textContent = "0" + suffix;
+          requestAnimationFrame(frame);
+        });
+      }
+
+      function updateHeroParallax() {
+        var scrollY = window.scrollY || window.pageYOffset;
+        var limited = Math.min(scrollY, 360);
+        var shift = limited * 0.18;
+        var fade = Math.max(0.42, 1 - limited / 520);
+        var progress = Math.min(1, limited / 360);
+        document.body.style.setProperty("--hero-shift", shift.toFixed(2) + "px");
+        document.body.style.setProperty("--hero-fade", fade.toFixed(3));
+        document.body.style.setProperty("--hero-progress", progress.toFixed(3));
+        document.body.style.setProperty("--glow-offset", (limited * 0.08).toFixed(2) + "px");
+      }
+
+      function setActiveRail() {
+        var marker = window.innerHeight * 0.36;
+        var currentId = "top";
+
+        trackedSections.forEach(function (section) {
+          var rect = section.getBoundingClientRect();
+          if (rect.top <= marker && rect.bottom >= marker) {
+            currentId = section.id || "top";
+          }
+        });
+
+        railLinks.forEach(function (link) {
+          var isActive = (link.getAttribute("href") || "") === "#" + currentId;
+          link.classList.toggle("is-active", isActive);
+          if (isActive) {
+            link.setAttribute("aria-current", "true");
+          } else {
+            link.removeAttribute("aria-current");
+          }
+        });
+      }
+
+      function setupReveal() {
+        if (!("IntersectionObserver" in window) || !revealItems.length) {
+          revealItems.forEach(function (item) {
+            item.classList.add("is-visible");
+          });
+          return;
+        }
+
+        var observer = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add("is-visible");
+              observer.unobserve(entry.target);
+            }
+          });
+        }, {
+          threshold: 0.12,
+          rootMargin: "0px 0px -8% 0px"
+        });
+
+        revealItems.forEach(function (item) {
+          observer.observe(item);
+        });
+      }
+
+      function updateSectionParallax() {
+        revealItems.forEach(function (section) {
+          var rect = section.getBoundingClientRect();
+          var centerOffset = rect.top + rect.height / 2 - window.innerHeight / 2;
+          var shift = Math.max(-24, Math.min(24, centerOffset * -0.035));
+          section.style.setProperty("--section-shift", shift.toFixed(2) + "px");
+        });
+      }
+
+      function maybeAnimateBenchmarks() {
+        if (!benchSection || benchAnimated) {
+          return;
+        }
+
+        var rect = benchSection.getBoundingClientRect();
+        if (rect.top < window.innerHeight * 0.82) {
+          benchSection.classList.add("bars-animated");
+          animateBenchNumbers();
+        }
+      }
+
+      if (chip) {
+        chip.textContent = isAprilFirst ? "Maximum legitimacy: " + text : "Today: " + text;
+      }
+
+      if (isAprilFirst) {
+        document.body.classList.add("april-mode");
+      }
+
+      if (forgeCopy) {
+        forgeCopy.textContent = isAprilFirst
+          ? "Thermal integrity nominal. Reforging process stabilized at ceremonial launch conditions."
+          : "Measuring runtime reforging density across interpreter, JIT, and mass-adjacent metallurgy.";
+      }
+
+      requestAnimationFrame(function () {
+        document.body.classList.add("is-ready");
+      });
+
+      animateForgeMeter();
+      runTerminalDemo();
+      setupReveal();
+      updateHeroParallax();
+      updateSectionParallax();
+      setActiveRail();
+      maybeAnimateBenchmarks();
+
+      window.addEventListener("scroll", function () {
+        updateHeroParallax();
+        updateSectionParallax();
+        setActiveRail();
+        maybeAnimateBenchmarks();
+      }, { passive: true });
+
+      window.addEventListener("resize", function () {
+        updateSectionParallax();
+        setActiveRail();
+      });
+
+      window.addEventListener("mousemove", function (event) {
+        document.body.style.setProperty("--mouse-x", event.clientX + "px");
+        document.body.style.setProperty("--mouse-y", event.clientY + "px");
+      }, { passive: true });
+    }());
+  </script>
+
+  <!-- Pyre WASM Playground -->
+  <script type="module">
+    const btn = document.getElementById('pg-run');
+    const status = document.getElementById('pg-status');
+    const output = document.getElementById('pg-output');
+    if (btn) {
+      try {
+        const { default: init, run_python } = await import('./pyre_wasm.js');
+        const wasm = await init();
+        try {
+          const { jit_set_memory, jit_set_table } = await import('./jit_glue.js');
+          jit_set_memory(wasm.memory);
+          if (wasm.__indirect_function_table) jit_set_table(wasm.__indirect_function_table);
+          status.textContent = 'Ready (JIT enabled)';
+        } catch {
+          status.textContent = 'Ready (interpreter only)';
+        }
+        btn.disabled = false;
+
+        btn.addEventListener('click', () => {
+          const source = document.getElementById('pg-source').value;
+          btn.disabled = true;
+          output.textContent = 'Running\u2026';
+          output.style.color = 'var(--dim)';
+          setTimeout(() => {
+            try {
+              const t0 = performance.now();
+              const result = run_python(source);
+              const elapsed = (performance.now() - t0).toFixed(1);
+              output.style.color = 'var(--success)';
+              output.textContent = result + (result ? '\n' : '') + '\u2500\u2500\u2500 ' + elapsed + ' ms';
+            } catch (e) {
+              output.style.color = '#ff6b6b';
+              output.textContent = e.message;
+            } finally {
+              btn.disabled = false;
+            }
+          }, 10);
+        });
+      } catch (e) {
+        status.textContent = 'Failed to load: ' + e.message;
+      }
+    }
+  </script>
+</body>
+</html>
