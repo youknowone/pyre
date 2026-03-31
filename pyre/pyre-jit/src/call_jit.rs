@@ -1070,6 +1070,11 @@ pub fn resume_in_blackhole(
             builder.release_interp(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
+                // blackhole.py:1752 _run_forever parity: exception in topmost
+                // frame with no caller → propagate to JIT driver.
+                // TODO: currently returns Failed because the blackhole may be
+                // executing on corrupt state (resume data bug). Once blackhole
+                // resume is sound, this should return DoneWithThisFrame(Err).
                 return BlackholeResult::Failed;
             };
 
