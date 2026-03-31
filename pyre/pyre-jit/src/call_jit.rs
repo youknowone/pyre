@@ -902,10 +902,9 @@ pub fn resume_in_blackhole(
             .count();
         let n_live = n_live_locals + n_live_stack;
         let n_vals = section.values.len().saturating_sub(3);
-        // If liveness live count matches the value count, the encoder
-        // compacted by liveness and we can use liveness-based filling.
-        // Otherwise encoder and decoder liveness diverge — fall back
-        // to positional filling to avoid mapping mismatch.
+        // resume.py:1381 parity: snapshot-path guards use liveness-compact
+        // encoding (n_live == n_vals). No-snapshot guards (finish_and_compile
+        // etc.) encode all fail_args positionally (n_live != n_vals).
         let use_liveness = n_live == n_vals;
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -982,32 +981,29 @@ pub fn resume_in_blackhole(
         bh.run();
 
         if bh.reached_merge_point {
-            // PYRE-ONLY: merge point writeback.
-            // RPython's blackhole has NO merge point — it runs to
-            // RETURN_VALUE. pyre sets merge_point_jitcode_pc so the
-            // blackhole exits early at the loop header, and the
-            // interpreter re-enters compiled code on the next iteration.
-            // This writeback is the pyre equivalent of RPython's
-            // ContinueRunningNormally exception carrying all values.
+            // blackhole.py:1068 ContinueRunningNormally parity:
+            // RPython raises ContinueRunningNormally(*args) at
+            // jit_merge_point, carrying live values to warmspot.py
+            // which calls portal_runner. pyre writes live values
+            // back to the frame and returns ContinueRunningNormally.
             let frame_ptr = bh.registers_i.get(3).copied().unwrap_or(0) as *mut PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &mut *frame_ptr };
                 let code = unsafe { &*frame.code };
                 let nlocals = code.varnames.len();
-                // Only write back locals that the blackhole actually
-                // has valid values for. rd_numb may not cover all locals,
-                // leaving some registers at 0 (null). Writing null over
-                // a valid PyObjectRef causes SEGFAULT on re-entry.
-                // RPython avoids this because rd_numb always covers all
-                // live values, so all registers are correctly filled.
+                // blackhole.py:1068 parity: only live values are carried
+                // by ContinueRunningNormally. Use liveness at merge_py_pc
+                // to determine which locals to write back. Dead locals
+                // keep their existing frame values (they will be
+                // reassigned before next use by definition of liveness).
+                let live = pyre_jit_trace::state::liveness_for(code);
                 for i in 0..nlocals {
-                    if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
-                        let bh_val = bh.registers_r[i] as pyre_object::PyObjectRef;
-                        if !bh_val.is_null() {
-                            frame.locals_cells_stack_w[i] = bh_val;
-                        }
-                        // If bh_val is null, keep the existing frame value.
-                        // This preserves locals that rd_numb didn't cover.
+                    if i < bh.registers_r.len()
+                        && i < frame.locals_cells_stack_w.len()
+                        && live.is_local_live(merge_py_pc, i)
+                    {
+                        frame.locals_cells_stack_w[i] =
+                            bh.registers_r[i] as pyre_object::PyObjectRef;
                     }
                 }
                 let stack = bh.runtime_stack_drain(0);
