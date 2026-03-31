@@ -2851,9 +2851,19 @@ impl MIFrame {
         }
 
         // pyjitpl.py:2586-2596 capture_resumedata(resumepc) parity:
-        // Temporarily substitute frame.pc = resumepc, capture snapshot,
-        // then restore. For normal guards, resumepc = orgpc.
-        self.record_guard_core(ctx, opcode, args, self.orgpc, after_residual_call);
+        // Normal guards: resumepc = orgpc (re-execute the opcode from start).
+        // after_residual_call guards (GUARD_NOT_FORCED, GUARD_NO_EXCEPTION):
+        //   RPython generate_guard passes resumepc=-1, and capture_resumedata
+        //   skips the "frame.pc = resumepc" assignment — frame.pc stays at
+        //   the auto-advanced next instruction (pyre fallthrough_pc equivalent).
+        //   This ensures the liveness PC, header ni, and blackhole resume PC
+        //   all point to the instruction AFTER the call, not the call itself.
+        let resume_pc = if after_residual_call {
+            self.fallthrough_pc
+        } else {
+            self.orgpc
+        };
+        self.record_guard_core(ctx, opcode, args, resume_pc, after_residual_call);
     }
 
     /// Core guard recording with explicit resume PC.
@@ -2954,19 +2964,17 @@ impl MIFrame {
     /// RPython creates SEPARATE Box objects for virtualizable_boxes via
     /// read_boxes()/wrap() — these are distinct from frame register boxes.
     /// _number_boxes dedup uses object identity, so vable and frame get
-    /// independent TAGBOX indices → deadframe stores both (redundant but safe).
+    /// independent TAGBOX indices → deadframe stores both.
     ///
     /// pyre uses the SAME OpRefs for both → _number_boxes dedup merges them
-    /// → frame section shrinks → recovery expects more slots than exist.
+    /// → vable and frame sections share TAGBOX indices. Recovery uses frame
+    /// sections with liveness-based mapping (restore_guard_failure_values),
+    /// matching RPython's consume_boxes(position_info) architecture.
     ///
-    /// Fix: return EMPTY vable_boxes. All virtualizable state (ni, vsd,
-    /// locals, stack) is already in the frame section via fail_args header
-    /// [frame, ni, vsd] + get_list_of_active_boxes. The numbering produces
-    /// a single frame section with all slots. No dedup conflict.
-    ///
-    /// TODO(read_boxes parity): create separate OpRefs for vable_boxes
-    /// (like RPython's read_boxes/wrap), so vable section is non-empty
-    /// and matches RPython's rd_numb format exactly.
+    /// Fresh identity approaches (VABLE_FRESH_BIT, VABLE_KEY_OFFSET)
+    /// expand num_boxes → larger fail_args → deadframe/exit layout mismatch.
+    /// Fix requires backend exit block recompilation after numbering,
+    /// or trace-time SameAs emission for fresh vable OpRefs.
     fn build_virtualizable_boxes(
         sym: &PyreSym,
         ctx: &majit_metainterp::TraceCtx,
@@ -3149,21 +3157,40 @@ impl MIFrame {
             return;
         }
 
-        // pyjitpl.py:520 generate_guard(opnum, box, resumepc=orgpc).
-        // RPython's goto_if_not is a single opcode — resumepc=orgpc means
-        // the interpreter re-executes the entire compare+branch from scratch.
-        // pyre has separate COMPARE_OP + POP_JUMP_IF_FALSE — the comparison
-        // result is already consumed from the stack when the branch guard
-        // fires. Resume must use other_target (branch destination) so the
-        // interpreter takes the not-taken path without re-comparing.
+        // pyjitpl.py:510-520 goto_if_not(box, target, orgpc):
+        // RPython's goto_if_not is a compound opcode (jtransform.py:196
+        // optimize_goto_if_not merges comparison + branch). resumepc=orgpc
+        // points to the compound opcode; blackhole.py:865 bhimpl_goto_if_not
+        // re-evaluates the condition and takes the other path.
+        //
+        // pyre has separate COMPARE_OP + POP_JUMP_IF_FALSE (Python bytecodes).
+        // Using COMPARE_OP's pc as resumepc is infeasible because:
+        //   1. The JIT may have unboxed comparison operands (Int OpRefs),
+        //      but the Python interpreter's COMPARE_OP expects boxed
+        //      PyObject values on the stack. Re-executing COMPARE_OP with
+        //      raw ints causes a type mismatch crash.
+        //   2. RPython avoids this because both JIT bytecode AND blackhole
+        //      operate on the same unboxed register representation.
+        //
+        // INTENTIONAL ADAPTATION (not source parity):
+        // Use other_target (the not-taken branch destination) so the
+        // blackhole starts at the correct path without re-comparing.
+        // This achieves the same behavioral result as RPython's
+        // goto_if_not but is NOT structurally equivalent — RPython
+        // uses resumepc=orgpc with a compound opcode, pyre uses a
+        // direct jump to the alternate branch target.
         let other_target = self.sym().pending_branch_other_target;
         let resume_pc = {
             let s = self.sym();
             other_target.unwrap_or(s.pending_next_instr.unwrap_or(self.fallthrough_pc))
         };
 
-        // pyjitpl.py:2593: saved_pc = frame.pc; frame.pc = resumepc
+        // pyjitpl.py:2593-2602: saved_pc = frame.pc; frame.pc = resumepc;
+        // capture_resumedata(); frame.pc = saved_pc
+        // Save ALL state BEFORE flush (record_guard_core parity).
         let saved_orgpc = self.orgpc;
+        let saved_ni = self.sym().vable_next_instr;
+        let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
 
         self.flush_to_frame_for_guard(ctx);
@@ -3181,11 +3208,6 @@ impl MIFrame {
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args)
         let snapshot_boxes = Self::fail_args_to_snapshot_boxes(&active_boxes, ctx);
-        // pyjitpl.py:2594-2596 capture_resumedata(resumepc) parity:
-        // flush_to_frame_for_guard already set sym.vable_next_instr/vsd
-        // to resume_pc values. Save to restore after snapshot capture.
-        let saved_ni = self.sym().vable_next_instr;
-        let saved_vsd = self.sym().vable_valuestackdepth;
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
@@ -3198,17 +3220,15 @@ impl MIFrame {
             vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
         };
         let snapshot_id = ctx.capture_resumedata(snapshot);
-        // pyjitpl.py:2602: frame.pc = saved_pc (restore sym fields)
-        {
-            let s = self.sym_mut();
-            s.vable_next_instr = saved_ni;
-            s.vable_valuestackdepth = saved_vsd;
-        }
+
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], fail_arg_types, &fail_args);
         ctx.set_last_guard_resume_position(snapshot_id);
 
-        // pyjitpl.py:2602: frame.pc = saved_pc
+        // pyjitpl.py:2602: frame.pc = saved_pc (restore all, record_guard_core parity)
         self.orgpc = saved_orgpc;
+        let s = self.sym_mut();
+        s.vable_next_instr = saved_ni;
+        s.vable_valuestackdepth = saved_vsd;
     }
 
     /// RPython registers[idx] parity: read concrete value from Box arrays.
@@ -7899,23 +7919,52 @@ impl JitState for PyreJitState {
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
-        // virtualizable.py:134-137: array items use declared ARRAYITEMTYPE.
-        // locals_cells_stack_w[*] ARRAYITEMTYPE = GCREF (interp_jit.py:27).
-        // Re-box Int/Float fail_args into Python objects for GCREF slots.
+        // resume.py:1077 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
+        // RPython's consume_boxes uses position_info (liveness at resume PC)
+        // to map compact active_boxes back to register indices. Dead registers
+        // are skipped in the compact array — only live registers advance the
+        // value index.
+        //
+        // values[3..] = compact active_boxes from get_list_of_active_boxes,
+        // which filters by liveness. Use the same liveness table to restore.
+        let code_ptr = if self.frame != 0 {
+            unsafe {
+                *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_CODE_OFFSET)
+                    as *const *const pyre_interpreter::CodeObject)
+            }
+        } else {
+            std::ptr::null()
+        };
+        let live = if !code_ptr.is_null() {
+            Some(liveness_for(code_ptr))
+        } else {
+            None
+        };
+        // resume.py:1383: info = blackholeinterp.get_current_position_info()
+        // Use next_instr (already set from values[1]) as the liveness PC.
+        let live_pc = self.next_instr;
         let mut idx = 3;
         for local_idx in 0..nlocals {
-            if let Some(value) = values.get(idx) {
-                let boxed = virtualizable_box_value(value);
-                let _ = self.set_local_at(local_idx, boxed);
+            // resume.py:1077: only live registers consume a value from the
+            // compact array. Dead registers keep their previous contents.
+            let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
+            if is_live {
+                if let Some(value) = values.get(idx) {
+                    let boxed = virtualizable_box_value(value);
+                    let _ = self.set_local_at(local_idx, boxed);
+                }
+                idx += 1;
             }
-            idx += 1;
         }
         for stack_idx in 0..stack_only {
-            if let Some(value) = values.get(idx) {
-                let boxed = virtualizable_box_value(value);
-                let _ = self.set_stack_at(stack_idx, boxed);
+            let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
+            if is_live {
+                if let Some(value) = values.get(idx) {
+                    let boxed = virtualizable_box_value(value);
+                    let _ = self.set_stack_at(stack_idx, boxed);
+                }
+                idx += 1;
             }
-            idx += 1;
         }
 
         // Clear stale slots beyond valuestackdepth (blackhole fresh frame parity).

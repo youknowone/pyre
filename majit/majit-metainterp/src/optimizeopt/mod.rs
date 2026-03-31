@@ -2246,8 +2246,14 @@ impl OptContext {
                 if self.get_ptr_info(resolved).is_some() {
                     return majit_ir::Type::Ref;
                 }
-                // Default: Int (most common non-Ref type in loops).
-                majit_ir::Type::Int
+                // RPython Box.type is always known; hitting this fallback
+                // means type propagation missed this OpRef.
+                panic!(
+                    "fail_arg_types: unknown type for OpRef({}) resolved=OpRef({}). \
+                     All OpRefs must have types registered in value_types or be \
+                     derivable from constants/operations.",
+                    opref.0, resolved.0
+                )
             })
             .collect();
         op.store_final_boxes(liveboxes);

@@ -222,18 +222,23 @@ impl ResumeDataLoopMemo {
 
     /// resume.py:196-223 _number_boxes — tag each box in the snapshot.
     ///
-    /// RPython's read_boxes/wrap() creates fresh Box objects for
-    /// virtualizable_boxes with separate Python object identity from
-    /// frame register boxes. This causes _number_boxes (keyed by id())
-    /// to assign separate TAGBOX indices. In pyre, OpRefs are shared
-    /// between vable and frame sections, so dedup occurs. Recovery uses
-    /// vable_array_items as the authoritative source for all slots,
-    /// making this dedup behaviorally transparent.
+    /// KNOWN DEVIATION: RPython's read_boxes/wrap() (virtualizable.py:86)
+    /// creates fresh Box objects for virtualizable_boxes with separate
+    /// Python identity from frame register boxes. _number_boxes
+    /// (resume.py:207) keys by box identity after get_box_replacement(),
+    /// so fresh vable boxes MAY get separate TAGBOX indices if their
+    /// forwarding chains diverge from the frame register boxes.
     ///
-    /// TODO(read_boxes parity): create separate OpRefs for vable boxes
-    /// via SameAs operations in the trace recorder, matching RPython's
-    /// wrap(cpu, value, startindex) which produces fresh FrontendOp
-    /// objects. This would eliminate dedup at the _number_boxes level.
+    /// In pyre, OpRefs are integers shared between vable and frame sections.
+    /// Dedup always occurs. This is a CONFIRMED deviation: when two vable
+    /// slots share a TAGBOX with a frame register slot, recovery gives all
+    /// three the same deadframe value, corrupting distinct vable slots.
+    /// (Observed: fib_loop locals[1] and locals[2] get identical pointers.)
+    ///
+    /// Consequence: synchronize_virtualizable (vable→PyFrame writeback) is
+    /// BLOCKED — only frame-section recovery (liveness-based) is safe.
+    /// Fix requires fresh OpRef identity for vable (SameAs-based encoding
+    /// at trace recording time, with backend exit block recompilation).
     pub fn _number_boxes(
         &mut self,
         boxes: &[OpRef],

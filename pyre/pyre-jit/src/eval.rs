@@ -1307,7 +1307,7 @@ fn execute_assembler(
                 if let Some(ref frames) = guard_frames {
                     match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            // warmstate.py:387-423: RPython does NOT invalidate
+                            // compile.py:711-717: RPython does NOT invalidate
                             // after blackhole resume. Guard counter accumulates
                             // for bridge compilation on the next failure.
                             Some(LoopResult::ContinueRunningNormally)
@@ -2619,23 +2619,13 @@ fn rebuild_typed_from_rd_numb(
             _ => Value::Int(0),
         }
     }
-    // resume.py:1042-1057 / pyjitpl.py:3428 synchronize_virtualizable parity:
-    // RPython recovery produces TWO streams: virtualizable_boxes (for
-    // synchronize_virtualizable → write_boxes) and frame registers (from
-    // frame section). In pyre the virtualizable IS the frame, so the
-    // vable section is the authoritative source for ALL state:
-    // [frame_ptr(0), ni(1), vsd(2), locals..., stack...].
-    //
-    // The encoding (record_guard_core / record_branch_guard) sets
-    // sym.vable_next_instr = resume_pc before build_virtualizable_boxes,
-    // so vable[1] == frame section pc (RPython capture_resumedata parity).
-
-    // Decode vable array items (locals + stack).
-    let vable_array_items: Vec<Value> = vable_values
-        .iter()
-        .skip(3)
-        .map(|rv| decode_rv(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache))
-        .collect();
+    // resume.py:1042-1057 rebuild_from_resumedata parity:
+    // RPython produces TWO streams:
+    //   1. virtualizable_boxes (consume_vref_and_vable → synchronize_virtualizable)
+    //   2. frame registers (consume_boxes per frame)
+    // pyjitpl.py:3419-3430: virtualizable_boxes restored, then
+    // synchronize_virtualizable writes them back to the heap.
+    // Frame registers fill frame.registers_i/r/f independently.
 
     // Decode vable header: [frame_ptr(0), ni(1), vsd(2)].
     let header: Vec<Value> = if vable_values.len() >= 3 {
@@ -2663,32 +2653,28 @@ fn rebuild_typed_from_rd_numb(
         Vec::new()
     };
 
-    // resume.py:1049 rebuild_from_resumedata parity:
-    // Decode ALL frame sections. RPython rebuilds every frame in the
-    // chain, not just the outermost. The vable header is prepended once.
-    let has_vable = !vable_array_items.is_empty();
+    // resume.py:1049-1056: consume_boxes per frame.
+    // Frame sections provide per-frame register values independently.
+    // synchronize_virtualizable is called in build_resumed_frames (blackhole
+    // path) but not here — this function returns a flat typed array that
+    // the caller uses for frame restoration.
     let mut typed = header;
-    if has_vable {
-        typed.extend(vable_array_items);
-    } else {
-        for frame in &frames {
-            _prepare_next_section(
-                frame,
-                raw_values,
-                &dead_frame_typed,
-                exit_layout,
-                &mut typed,
-                &mut virtuals_cache,
-            );
-        }
+    for frame in &frames {
+        _prepare_next_section(
+            frame,
+            raw_values,
+            &dead_frame_typed,
+            exit_layout,
+            &mut typed,
+            &mut virtuals_cache,
+        );
     }
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] guard-fail: rd_numb decoded {} slots from {} frame(s) vable={}",
+            "[jit] guard-fail: rd_numb decoded {} slots from {} frame(s)",
             typed.len(),
             frames.len(),
-            has_vable,
         );
     }
 
@@ -2750,22 +2736,25 @@ fn build_resumed_frames(
         }
     }
     // RPython parity: extract frame_ptr/ni/vsd from vable_values (snapshot).
+    // _list_of_boxes_virtualizable (opencoder.py:722) reorders: virtualizable_ptr
+    // is moved from boxes[-1] to snapshot[0]. After rebuild_from_resumedata,
+    // vable_values[0] = frame_ptr, [1] = ni, [2] = vsd, [3..] = array items.
     // Per-frame values contain slot registers only (no header prepend).
     let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
         let frame_val = resolve_rebuilt_value(
-            vable_values.last().unwrap(),
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
             &vable_values[0],
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
-        let vsd_val = resolve_rebuilt_value(
+        let ni_val = resolve_rebuilt_value(
             &vable_values[1],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        );
+        let vsd_val = resolve_rebuilt_value(
+            &vable_values[2],
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
@@ -2850,6 +2839,27 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
+    // pyjitpl.py:3419-3430 + 3446-3450 synchronize_virtualizable:
+    // RPython fully decodes virtualizable_boxes and writes them back to the
+    // heap virtualizable via vinfo.write_boxes(). This ensures the actual
+    // frame object is consistent before blackhole execution begins.
+    //
+    // BLOCKED: pyre's vable/frame OpRef dedup causes multiple vable slots
+    // to share a single TAGBOX → same deadframe value for distinct slots.
+    // RPython avoids this via fresh Box identity (separate TAGBOX per slot).
+    // Enabling synchronize_virtualizable requires either:
+    //   (a) fresh OpRef identity for vable (SameAs-based), or
+    //   (b) frame-section-only recovery (current approach — authoritative).
+    // Frame section recovery uses liveness-based mapping independently,
+    // so the PyFrame gets correct values without synchronize_virtualizable.
+    //
+    // if !vable_frame_ptr.is_null() && vable_values.len() > 3 {
+    //     synchronize_virtualizable(
+    //         vable_frame_ptr, &vable_values[3..], vable_vsd,
+    //         &dead_frame_typed, exit_layout, &mut virtuals_cache,
+    //     );
+    // }
+
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
         // frame_ptr from vable for single-frame or outermost (caller).
@@ -2893,6 +2903,70 @@ fn build_resumed_frames(
         );
     }
     result
+}
+
+/// pyjitpl.py:3446-3450 synchronize_virtualizable +
+/// virtualizable.py:101-113 write_boxes parity:
+/// Decode vable array items (locals + stack) from the snapshot and write
+/// them back to the actual PyFrame's locals_cells_stack_w.
+/// RPython calls vinfo.write_boxes(virtualizable, virtualizable_boxes)
+/// after rebuild_from_resumedata to keep the heap object consistent.
+///
+/// `vsd` (valuestackdepth) limits writes to live slots only.
+/// RPython's write_boxes writes ALL slots unconditionally because
+/// virtualizable_boxes always has valid values. pyre's vable snapshot
+/// may have stale values beyond the live range.
+fn synchronize_virtualizable(
+    frame_ptr: *mut pyre_interpreter::pyframe::PyFrame,
+    vable_array_items: &[majit_ir::resumedata::RebuiltValue],
+    vsd: usize,
+    dead_frame_typed: &[Value],
+    exit_layout: &CompiledExitLayout,
+    virtuals_cache: &mut HashMap<usize, Value>,
+) {
+    use majit_ir::resumedata::RebuiltValue;
+    let frame = unsafe { &mut *frame_ptr };
+    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    let rd_virtuals = exit_layout.rd_virtuals_info.as_deref();
+    let num_failargs = exit_layout.exit_types.len() as i32;
+    // virtualizable.py:101-113: write static_fields, then array items.
+    // In pyre, vable_array_items = [locals..., stack...].
+    // Only write up to vsd (= nlocals + stack_depth) — beyond that is dead.
+    let live_count = vsd
+        .min(vable_array_items.len())
+        .min(frame.locals_cells_stack_w.len());
+
+    for (i, rv) in vable_array_items[..live_count].iter().enumerate() {
+        let val = match rv {
+            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Int(v) => Value::Int(*v as i64),
+            RebuiltValue::Const(c, tp) => match tp {
+                majit_ir::Type::Int => Value::Int(*c),
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
+                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
+                _ => Value::Int(*c),
+            },
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            ),
+            _ => continue,
+        };
+        // virtualizable.py:105-111 unwrap(FIELDTYPE, boxes[i]):
+        // Convert Value to PyObjectRef for the heap frame.
+        // Null Ref = uninitialized slot — write PY_NULL (RPython: None).
+        let pyobj = match val {
+            Value::Ref(r) => r.as_usize() as pyre_object::PyObjectRef,
+            Value::Int(v) => pyre_object::intobject::w_int_new(v) as pyre_object::PyObjectRef,
+            Value::Float(v) => pyre_object::floatobject::w_float_new(v) as pyre_object::PyObjectRef,
+            Value::Void => pyre_object::PY_NULL,
+        };
+        frame.locals_cells_stack_w[i] = pyobj;
+    }
 }
 
 /// resume.py:1017-1026 _prepare_next_section: decode one frame's slots
