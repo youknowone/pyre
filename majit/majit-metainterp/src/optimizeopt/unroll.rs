@@ -408,9 +408,8 @@ impl UnrollOptimizer {
         // Previously disabled (set_phase2(true)) due to missing rd_virtuals_info;
         // now enabled after compile.rs rd_virtuals→rd_virtuals_info generation.
         // RPython parity: Phase 2 imports heap cache via short preamble
-        // (inline_short_preamble), not via direct cache import. The short
-        // preamble replays HeapOps that populate Phase 2's cache.
-        // opt_p2.import_all_cached_fields — removed (majit-only workaround).
+        // RPython: Phase 2 heap cache is populated by inline_short_preamble
+        // replaying HeapOps through send_extra_operation.
         if std::env::var_os("MAJIT_LOG").is_some() {
             let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(

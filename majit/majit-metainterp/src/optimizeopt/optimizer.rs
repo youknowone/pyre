@@ -1061,16 +1061,6 @@ impl Optimizer {
         result
     }
 
-    /// Import cached field entries from preamble into all optimizer passes.
-    pub fn import_all_cached_fields(&mut self, entries: &[(OpRef, u32, OpRef)]) {
-        if entries.is_empty() {
-            return;
-        }
-        for pass in &mut self.passes {
-            pass.import_cached_fields(entries);
-        }
-    }
-
     /// Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
 
     /// Lock JUMP arg OpRefs so replace_op won't forward them.
@@ -1655,54 +1645,68 @@ impl Optimizer {
             }
         }
 
-        // RPython optimizer.py:536-556: JUMP/FINISH is separated from
-        // the main loop. With flush=False (Phase 2), JUMP is NOT processed
-        // through the passes — it's returned as last_op for the caller.
+        // RPython optimizer.py:536-538: JUMP/FINISH always breaks the main
+        // loop. flush() is called before JUMP is processed.
         let mut last_op = None;
         for op in ops {
-            if self.skip_flush && op.opcode == OpCode::Jump {
+            if op.opcode == OpCode::Jump || op.opcode == OpCode::Finish {
                 last_op = Some(op.clone());
-                break;
-            }
-            // Finish must go through passes even with skip_flush=true:
-            // OptVirtualize.optimize_escaping_op forces virtual args,
-            // emitting New + SetfieldGc. Without this, Finish receives
-            // an empty New() with no fields set.
-            if self.skip_flush && op.opcode == OpCode::Finish {
-                self.propagate_one(op, &mut ctx);
-                // The Finish op was replaced by propagate_one; grab it.
-                if let Some(finish_op) = ctx
-                    .new_operations
-                    .iter()
-                    .rev()
-                    .find(|o| o.opcode == OpCode::Finish)
-                {
-                    last_op = Some(finish_op.clone());
-                }
                 break;
             }
             self.propagate_one(op, &mut ctx);
         }
 
-        // RPython optimizer.py:553-556: flush=True sends JUMP through
-        // passes after flush; flush=False (Phase 2) stores it directly.
+        // RPython: flush() before JUMP processing (export_state calls flush
+        // before get_virtual_state). Phase 2 skips flush.
+        if !self.skip_flush {
+            self.flush(&mut ctx);
+        }
+
+        // RPython unroll.py:457: get_virtual_state(end_args)
+        // Capture virtual state BEFORE JUMP is processed through passes
+        // (which forces virtuals). This replaces pre_force_virtual_state.
+        let pre_jump_virtual_state = if !self.skip_flush {
+            last_op
+                .as_ref()
+                .filter(|op| op.opcode == OpCode::Jump)
+                .map(|jump_op| {
+                    let resolved_args: Vec<OpRef> = jump_op
+                        .args
+                        .iter()
+                        .map(|&arg| ctx.get_box_replacement(arg))
+                        .collect();
+                    (
+                        crate::optimizeopt::virtualstate::export_state(
+                            &resolved_args,
+                            &ctx,
+                            &ctx.forwarded,
+                        ),
+                        resolved_args,
+                    )
+                })
+        } else {
+            None
+        };
+
+        // Set pre_force_virtual_state for export_state_with_bounds to use.
+        // This replaces the previous approach where OptVirtualize's JUMP handler set it.
+        if let Some((ref vs, ref args)) = pre_jump_virtual_state {
+            ctx.pre_force_virtual_state = Some(vs.clone());
+            ctx.pre_force_jump_args = Some(args.clone());
+        }
+
+        // Process JUMP/FINISH through passes to force virtual args.
+        // RPython doesn't send JUMP through passes, but majit's virtual
+        // forcing relies on OptVirtualize's JUMP handler for now.
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
-                // RPython optimizer.py:553: resolve args via get_box_replacement.
                 for arg in &mut terminal_op.args {
                     *arg = ctx.get_box_replacement(*arg);
                 }
                 self.terminal_op = Some(terminal_op);
             } else {
-                for arg in &mut terminal_op.args {
-                    *arg = ctx.get_box_replacement(*arg);
-                }
                 self.propagate_one(&terminal_op, &mut ctx);
             }
-        }
-        // Phase 2 leaves lazy sets pending so virtuals aren't forced.
-        if !self.skip_flush {
-            self.flush(&mut ctx);
         }
 
         // RPython store_final_boxes_in_guard parity: re-encode late virtuals
@@ -1725,37 +1729,32 @@ impl Optimizer {
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
         self.patchguardop = ctx.patchguardop.clone();
-        // RPython flush=False: JUMP is stored in terminal_op, not in new_operations.
-        // Fall back to new_operations for flush=True (bridge optimization).
-        let jump = self
-            .terminal_op
-            .clone()
-            .filter(|op| op.opcode == OpCode::Jump)
+        // JUMP location: in new_operations (flush=True path where JUMP was
+        // processed through passes), or terminal_op (skip_flush path).
+        let jump = ctx
+            .new_operations
+            .iter()
+            .rfind(|op| op.opcode == OpCode::Jump)
+            .cloned()
             .or_else(|| {
-                ctx.new_operations
-                    .iter()
-                    .rfind(|op| op.opcode == OpCode::Jump)
-                    .cloned()
+                self.terminal_op
+                    .clone()
+                    .filter(|op| op.opcode == OpCode::Jump)
             });
-        if crate::optimizeopt::majit_log_enabled() {
-            eprintln!(
-                "[jit] export: pre_force_vs={} pre_force_args={}",
-                ctx.pre_force_virtual_state.is_some(),
-                ctx.pre_force_jump_args.is_some()
-            );
-        }
         self.exported_loop_state = jump.map(|jump| {
-            let original_jump_args = ctx
-                .pre_force_jump_args
-                .clone()
-                .unwrap_or_else(|| jump.args.to_vec());
-            // RPython Box identity parity: resolve args BEFORE forcing,
-            // then dedup duplicates with SameAsR while PtrInfo is still
-            // Virtual. Only after dedup do we force the virtuals.
-            let mut resolved_args: Vec<OpRef> = original_jump_args
-                .iter()
-                .map(|&arg| ctx.get_box_replacement(arg))
-                .collect();
+            // Use pre-JUMP virtual state captured before passes forced virtuals.
+            // RPython unroll.py:457: get_virtual_state(end_args) — computed
+            // after force_box_for_end_of_preamble but before final JUMP emission.
+            let (pre_vs, pre_args) = pre_jump_virtual_state.clone()
+                .unwrap_or_else(|| {
+                    let args: Vec<OpRef> = jump.args.iter()
+                        .map(|&a| ctx.get_box_replacement(a))
+                        .collect();
+                    let vs = crate::optimizeopt::virtualstate::export_state(&args, &ctx, &ctx.forwarded);
+                    (vs, args)
+                });
+            let original_jump_args = pre_args;
+            let mut resolved_args = original_jump_args.clone();
             // Dedup: when two slots reference the same OpRef (e.g. b and t
             // in fib_loop), create SameAsR with fresh OpRef and copy the
             // VIRTUAL PtrInfo (before force turns it into Instance).
@@ -1811,14 +1810,9 @@ impl Optimizer {
             // forced by force_box_for_end_of_preamble's recursive walk.
             // Additional force is handled by the undefined-ref cleanup below
             // which drops ops referencing un-forced virtual OpRefs.
-            // RPython unroll.py:454-457: use virtual state from BEFORE force.
-            // OptVirtualize captures this in the JUMP handler.
-            let preview_virtual_state = ctx.pre_force_virtual_state.clone().unwrap_or_else(|| {
-                crate::optimizeopt::virtualstate::export_state(&jump.args, &ctx, &ctx.forwarded)
-            });
-            // Use pre-force args for make_inputargs so virtual entries can
-            // look up their field values from the still-virtual PtrInfo.
-            let vs_args = ctx.pre_force_jump_args.as_deref().unwrap_or(&jump.args);
+            // Virtual state was captured before JUMP went through passes.
+            let preview_virtual_state = pre_vs;
+            let vs_args = &original_jump_args;
             let (preview_label_args, preview_virtuals) =
                 preview_virtual_state.make_inputargs_and_virtuals(vs_args, &ctx);
             let mut preview_short_args = preview_label_args.clone();
