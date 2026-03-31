@@ -437,7 +437,18 @@ impl Op {
     }
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
+    /// compile.py:874-876 store_final_boxes
     pub fn store_final_boxes(&mut self, boxes: Vec<OpRef>) {
+        // optimizer.py:745-749: check no duplicates (debug only)
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = std::collections::HashSet::new();
+            for &b in &boxes {
+                if !b.is_none() {
+                    debug_assert!(seen.insert(b.0), "duplicate box in fail_args: {:?}", b);
+                }
+            }
+        }
         self.fail_args = Some(boxes.into());
     }
 }

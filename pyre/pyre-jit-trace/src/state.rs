@@ -3824,7 +3824,7 @@ impl MIFrame {
             }
             BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => OpCode::FloatMod,
             BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
-            BinaryOperator::Power | BinaryOperator::InplacePower => OpCode::FloatMul, // placeholder
+            BinaryOperator::Power | BinaryOperator::InplacePower => OpCode::FloatMul, // unused: is_power branch calls float_pow directly
             _ => return self.trace_binary_value(a, b, op),
         };
 

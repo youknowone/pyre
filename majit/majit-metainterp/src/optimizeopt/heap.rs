@@ -573,7 +573,7 @@ impl OptHeap {
             let value_ref = ctx.get_box_replacement(op.arg(1));
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    info.force_to_ops_direct(value_ref, ctx);
+                    info.force_box_direct(value_ref, ctx);
                 }
             }
             for arg in op.args.iter_mut() {
@@ -615,17 +615,13 @@ impl OptHeap {
         self.force_all_lazy_setarrayitems(ctx);
     }
 
-    /// heap.py: force_lazy_sets_for_guard()
-    ///
-    /// RPython defers virtual-value SetfieldGc to pendingfields (stored in
-    /// guard resume data, materialized on guard failure). majit does NOT have
-    /// the rd_pendingfields resume mechanism, so we must distinguish:
-    ///
-    /// heap.py:608-637: force_lazy_sets_for_guard()
+    /// heap.py:608-637 force_lazy_sets_for_guard()
     ///
     /// Returns pendingfields: SetfieldGc/SetarrayitemGc ops where the stored
     /// VALUE is virtual. These go into rd_pendingfields on the guard's resume
-    /// data. Non-virtual lazy sets are emitted (forced) immediately.
+    /// data (emitting_operation stores them in ctx.pending_for_guard →
+    /// optimizer.rs encodes as op.rd_pendingfields).
+    /// Non-virtual lazy sets are emitted (forced) immediately.
     fn force_lazy_sets_for_guard(&mut self, ctx: &mut OptContext) -> Vec<Op> {
         let mut pendingfields = Vec::new();
 
@@ -2013,7 +2009,7 @@ impl Optimization for OptHeap {
             let value_ref = ctx.get_box_replacement(op.arg(1));
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    info.force_to_ops_direct(value_ref, ctx);
+                    info.force_box_direct(value_ref, ctx);
                 }
             }
             for arg in op.args.iter_mut() {
@@ -2154,7 +2150,7 @@ impl Optimization for OptHeap {
             let orig_val = op.arg(1);
             if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
                 if info.is_virtual() {
-                    info.force_to_ops(orig_val, ctx);
+                    info.force_box(orig_val, ctx);
                 }
             }
         }

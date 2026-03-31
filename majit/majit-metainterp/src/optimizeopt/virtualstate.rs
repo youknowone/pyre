@@ -1386,22 +1386,24 @@ pub enum GuardRequirement {
 }
 
 impl GuardRequirement {
-    /// Convert this guard requirement into a concrete Op, given the
-    /// concrete args vector. Uses box_opref as the guard's first argument
-    /// (virtualstate.py:646 boxes parameter), falling back to args[arg_index].
-    pub fn to_op(&self, args: &[OpRef]) -> Option<Op> {
+    /// Convert this guard requirement into a concrete Op, registering
+    /// constant args via ctx. RPython creates ConstInt/ConstPtr objects
+    /// inline in ResOperation args (virtualstate.py:401, 603); we
+    /// allocate constant OpRefs via make_constant_int/make_constant_ref.
+    pub fn to_op(&self, args: &[OpRef], ctx: &mut OptContext) -> Option<Op> {
         match self {
             GuardRequirement::GuardClass {
                 arg_index,
                 box_opref,
-                expected_class: _,
+                expected_class,
             } => {
                 let arg = if !box_opref.is_none() {
                     *box_opref
                 } else {
                     *args.get(*arg_index)?
                 };
-                let class_const = OpRef(10_000 + *arg_index as u32); // placeholder
+                // virtualstate.py:603: ConstInt(self.known_class)
+                let class_const = ctx.make_constant_int(expected_class.0 as i64);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
                 op.fail_args = Some(Default::default());
                 Some(op)
@@ -1422,14 +1424,20 @@ impl GuardRequirement {
             GuardRequirement::GuardValue {
                 arg_index,
                 box_opref,
-                expected_value: _,
+                expected_value,
             } => {
                 let arg = if !box_opref.is_none() {
                     *box_opref
                 } else {
                     *args.get(*arg_index)?
                 };
-                let val_const = OpRef(10_000 + *arg_index as u32); // placeholder
+                // virtualstate.py:401: ResOperation(GUARD_VALUE, [box, self.constbox])
+                let val_const = ctx.make_constant_int(match expected_value {
+                    Value::Int(v) => *v,
+                    Value::Float(f) => f.to_bits() as i64,
+                    Value::Ref(r) => r.0 as i64,
+                    Value::Void => 0,
+                });
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
                 op.fail_args = Some(Default::default());
                 Some(op)
