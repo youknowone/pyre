@@ -1394,6 +1394,9 @@ impl Optimizer {
         self.imported_label_args = None;
         self.imported_label_source_slots = None;
         self.terminal_op = None;
+        // RPython parity: each optimizer run is a fresh Optimizer instance.
+        // In pyre we reuse the same Optimizer, so clear per-run state.
+        self.last_guard_op = None;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.

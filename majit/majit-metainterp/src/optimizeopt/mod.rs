@@ -293,8 +293,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 
     fn is_const(&self, opref: OpRef) -> bool {
         // RPython resume.py:204: isinstance(box, Const)
-        // Checks both optimizer constant map AND PtrInfo::Constant (ConstPtrInfo).
-        if self.ctx.is_constant(opref) {
+        // True Const = constant pool entry (>= CONST_BASE) or PtrInfo::Constant.
+        // NOT optimizer-known values from make_constant() on operation results.
+        if opref.is_constant() {
             return true;
         }
         // info.py: ConstPtrInfo.is_constant() → True
@@ -1619,31 +1620,44 @@ impl OptContext {
                                         if resolved.is_none() {
                                             return resumedata::UNINITIALIZED_TAG;
                                         }
-                                        if let Some((raw, tp)) = self.getconst(resolved) {
-                                            if tp == majit_ir::Type::Int {
-                                                if let Ok(t) =
-                                                    resumedata::tag(raw as i32, resumedata::TAGINT)
-                                                {
-                                                    return t;
+                                        // RPython isinstance(box, Const): only true
+                                        // constant pool entries or PtrInfo::Constant.
+                                        let is_true_const = resolved.is_constant()
+                                            || matches!(
+                                                self.get_ptr_info(resolved),
+                                                Some(crate::optimizeopt::info::PtrInfo::Constant(
+                                                    _
+                                                ))
+                                            );
+                                        if is_true_const {
+                                            if let Some((raw, tp)) = self.getconst(resolved) {
+                                                if tp == majit_ir::Type::Int {
+                                                    if let Ok(t) = resumedata::tag(
+                                                        raw as i32,
+                                                        resumedata::TAGINT,
+                                                    ) {
+                                                        return t;
+                                                    }
                                                 }
+                                                if tp == majit_ir::Type::Ref && raw == 0 {
+                                                    return resumedata::NULLREF;
+                                                }
+                                                let ex = rd_cv
+                                                    .iter()
+                                                    .position(|(v, t)| *v == raw && *t == tp);
+                                                let ci = ex.unwrap_or_else(|| {
+                                                    let j = rd_cv.len();
+                                                    rd_cv.push((raw, tp));
+                                                    j
+                                                });
+                                                return resumedata::tag(
+                                                    (ci + resumedata::TAG_CONST_OFFSET as usize)
+                                                        as i32,
+                                                    resumedata::TAGCONST,
+                                                )
+                                                .unwrap_or(resumedata::NULLREF);
                                             }
-                                            if tp == majit_ir::Type::Ref && raw == 0 {
-                                                return resumedata::NULLREF;
-                                            }
-                                            let ex = rd_cv
-                                                .iter()
-                                                .position(|(v, t)| *v == raw && *t == tp);
-                                            let ci = ex.unwrap_or_else(|| {
-                                                let j = rd_cv.len();
-                                                rd_cv.push((raw, tp));
-                                                j
-                                            });
-                                            return resumedata::tag(
-                                                (ci + resumedata::TAG_CONST_OFFSET as usize) as i32,
-                                                resumedata::TAGCONST,
-                                            )
-                                            .unwrap_or(resumedata::NULLREF);
-                                        }
+                                        } // is_true_const
                                         // Field value in extra fail_args → TAGBOX(position).
                                         let fap = fa.iter().position(|&a| a == resolved);
                                         if let Some(fap) = fap {
@@ -1808,7 +1822,7 @@ impl OptContext {
             }
             fn is_const(&self, opref: OpRef) -> bool {
                 // resume.py:204: isinstance(box, Const)
-                if self.ctx.is_constant(opref) {
+                if opref.is_constant() {
                     return true;
                 }
                 // info.py: ConstPtrInfo.is_constant() → True
@@ -1938,7 +1952,23 @@ impl OptContext {
                     return resumedata::UNINITIALIZED_TAG;
                 }
                 // resume.py:563-564: isinstance(box, Const) → getconst
-                if self.is_constant(resolved_val) {
+                // RPython Const boxes and liveboxes are disjoint:
+                // isinstance(Const) is true ONLY for ConstInt/ConstPtr,
+                // never for InputArg or OpResult with known values.
+                // In pyre, is_constant()/constants[] can include non-Const
+                // OpRefs (via make_constant). Check liveboxes first to
+                // maintain disjointness.
+                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
+                    return existing_tag;
+                }
+                // RPython isinstance(box, Const): only true Const (constant pool
+                // entry >= CONST_BASE or PtrInfo::Constant).
+                let is_true_const = resolved_val.is_constant()
+                    || matches!(
+                        self.get_ptr_info(resolved_val),
+                        Some(crate::optimizeopt::info::PtrInfo::Constant(_))
+                    );
+                if is_true_const {
                     if let Some(val) = self.get_constant(resolved_val) {
                         let type_override = self
                             .constant_types_for_numbering
@@ -1959,9 +1989,6 @@ impl OptContext {
                     self.get_ptr_info(resolved_val)
                 {
                     return memo.getconst(gcref.0 as i64, majit_ir::Type::Ref);
-                }
-                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
-                    return existing_tag;
                 }
                 // resume.py:495 parity: nested virtual → TAGVIRTUAL + worklist
                 if self
