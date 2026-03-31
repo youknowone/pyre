@@ -2072,7 +2072,10 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        // RPython MIFrame: function-entry unbox Ref→Int for typed label.
+        // pyre-specific: unbox Ref→Int at function entry.
+        // pyre locals are always GCREF (PyObjectRef), but trace-internal
+        // operations unbox to Int/Float. adapt_live converts Ref pointers
+        // to Int values matching the compiled trace's typed label.
         let live_values = if target_pc == 0 {
             self.meta
                 .adapt_live_values_to_trace_types(green_key, live_values)

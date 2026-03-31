@@ -480,7 +480,6 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     if let Some(raw_local0) = pending {
         return jit_force_self_recursive_call_raw_1(frame_ptr, raw_local0);
     }
-
     // Nursery-safe force: read code/namespace/exec_ctx via raw offsets
     // (valid for both arena PyFrame AND nursery-allocated raw blocks).
     // Then create a proper PyFrame for the interpreter.
@@ -1506,8 +1505,7 @@ pub fn install_jit_call_bridge() {
 /// blackhole in RPython.
 ///
 /// When rd_numb is available, uses ResumeDataDirectReader for exact
-/// frame decoding (resume.py:1312 parity). Falls back to heuristic
-/// parse_resumed_frames when rd_numb is absent.
+/// frame decoding (resume.py:1312 parity).
 fn jit_blackhole_resume_from_guard(
     green_key: u64,
     trace_id: u64,

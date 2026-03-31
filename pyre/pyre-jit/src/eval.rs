@@ -29,6 +29,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Take the last guard frames (consuming them).
+pub(crate) fn take_last_guard_frames() -> Option<Vec<crate::call_jit::ResumedFrame>> {
+    LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take())
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 enum LoopResult {
     Done(PyResult),
@@ -1298,7 +1303,7 @@ fn execute_assembler(
             HandleFailOutcome::ResumeInBlackhole => {
                 // blackhole.py:1782 resume_in_blackhole →
                 // blackhole.py:1752 _run_forever
-                let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
+                let guard_frames = take_last_guard_frames();
                 if let Some(ref frames) = guard_frames {
                     match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
@@ -1467,7 +1472,7 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
+                    let guard_frames = take_last_guard_frames();
                     if let Some(ref frames) = guard_frames {
                         match crate::call_jit::resume_in_blackhole(frame, frames, loop_header_pc) {
                             crate::call_jit::BlackholeResult::ContinueRunningNormally => {
@@ -1601,7 +1606,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
                     // compile.py:710-716: resume_in_blackhole
-                    let guard_frames = LAST_GUARD_FRAMES.with(|c| c.borrow_mut().take());
+                    let guard_frames = take_last_guard_frames();
                     if let Some(ref frames) = guard_frames {
                         match crate::call_jit::resume_in_blackhole(frame, frames, frame.next_instr)
                         {
@@ -2478,7 +2483,10 @@ pub(crate) fn decode_and_restore_guard_failure(
 /// RPython does NOT call rebuild_from_resumedata (guard restore)
 /// before the blackhole path — the blackhole chain consumes
 /// deadframe values directly via consume_one_section.
-fn build_blackhole_frames_from_deadframe(raw_values: &[i64], exit_layout: &CompiledExitLayout) {
+pub(crate) fn build_blackhole_frames_from_deadframe(
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) {
     let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
     if majit_metainterp::majit_log_enabled() {
@@ -2496,6 +2504,24 @@ fn build_blackhole_frames_from_deadframe(raw_values: &[i64], exit_layout: &Compi
         build_blackhole_frames_fallback(&typed)
     };
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
+}
+
+/// resume.py:1312 blackhole_from_resumedata parity:
+/// Build resumed frames directly from deadframe without thread-local storage.
+/// Used by call_assembler_guard_failure path where the thread-local may be
+/// consumed by try_function_entry_jit's resume path.
+pub(crate) fn build_resumed_frames_from_deadframe(
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) -> Vec<crate::call_jit::ResumedFrame> {
+    let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    if !rd_numb.is_empty() {
+        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout)
+    } else {
+        let typed = decode_exit_layout_values(raw_values, exit_layout);
+        build_blackhole_frames_fallback(&typed)
+    }
 }
 
 fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
@@ -2654,6 +2680,15 @@ fn build_resumed_frames(
         rebuild_from_numbering(rd_numb, rd_consts);
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[jit][resume] exit_types={} dead_frame={} vable={} frames={}",
+            exit_layout.exit_types.len(),
+            dead_frame_typed.len(),
+            vable_values.len(),
+            frames.len()
+        );
+    }
     let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
 
     // resume.py:1045 consume_vref_and_vable parity:
@@ -2684,54 +2719,10 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    // RPython parity: extract frame_ptr/ni/vsd from vable_values (snapshot).
-    // Per-frame values contain slot registers only (no header prepend).
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
-        let frame_val = resolve_rebuilt_value(
-            vable_values.last().unwrap(),
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
-            &vable_values[0],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let vsd_val = resolve_rebuilt_value(
-            &vable_values[1],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let fp = match &frame_val {
-            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let ni = match &ni_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match &vsd_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    } else {
-        (std::ptr::null_mut(), 0, 0)
-    };
-
     // resume.py:1312-1343 blackhole_from_resumedata parity:
-    // 1. consume_vref_and_vable ONCE before the frame loop (lines 1324-1325)
-    // 2. _prepare_virtuals + _prepare_pendingfields ONCE (lines 924-926)
+    // 1. consume_vref_and_vable ONCE — writes locals/stack to virtualizable
+    // 2. _prepare_virtuals + _prepare_pendingfields ONCE
     // 3. Frame loop: read_jitcode_pos_pc + consume_one_section per frame
-    //
-    // The vable header (frame_ptr, ni, vsd) is consumed ONCE from
-    // vable_values and applies to the OUTERMOST frame only. Each frame
-    // section's locals/stack come from _prepare_next_section independently.
-    // RPython does NOT clone the vable header into every frame section.
 
     // _prepare: materialize virtuals + replay pending fields ONCE.
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());

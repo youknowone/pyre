@@ -2975,6 +2975,16 @@ impl<M: Clone> MetaInterp<M> {
         let mut recorder = ctx.recorder;
         recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
         let trace = recorder.get_trace();
+        let trace_snapshots = trace.snapshots.clone();
+
+        // RPython Box type parity: build type index from the trace ops.
+        // snapshot_boxes reference positions from the original trace.
+        let pre_cut_trace_op_types: std::collections::HashMap<u32, majit_ir::Type> = trace
+            .ops
+            .iter()
+            .filter(|op| !op.pos.is_none())
+            .map(|op| (op.pos.0, op.result_type()))
+            .collect();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
@@ -2999,15 +3009,39 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
-        // finish_and_compile traces use function-entry bridges where
-        // adapt-live unboxes Ref→Int AFTER tracing. trace.inputargs carry
-        // pre-adapt types (Ref), but the compiled code/gcmap uses post-adapt
-        // types (Int). Snapshot-based numbering reduces fail_args to liveboxes,
-        // but Cranelift's gcmap is still generated from inputarg types (Ref),
-        // causing GC to scan raw ints as pointers → SEGFAULT.
-        // Blocker: adapt-live type divergence. RPython has no adapt-live;
-        // Box types are set correctly at trace time.
-        // No-snapshot fallback keeps all fail_args (correct gcmap via descr).
+        // RPython Box type parity: inputarg types from tracing.
+        optimizer.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.original_trace_op_types = pre_cut_trace_op_types;
+
+        // resume.py parity: convert tracing-time snapshots to flat OpRef
+        // vectors so the optimizer can rebuild fail_args from snapshot in
+        // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, sbt) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
+        // Snapshot-based guard numbering: infrastructure ready.
+        // Activation blocked by performance regression (bridge compilation
+        // delay). IR blackhole's NullMemory::call_i returns 0 for
+        // CallAssembler ops → wrong intermediate results → delayed bridge
+        // compilation → 34s vs 0.2s for fib_recursive.
+        // Fix: implement call_i/call_r in IR blackhole (CallAssembler
+        // execution via portal_runner), or trigger bridge compilation
+        // from call_assembler_guard_failure after trace_eagerness threshold.
+        // Snapshot + adapt-live type correction blocked by gcmap conflict:
+        // try_function_entry_jit applies adapt-live (Ref→Int) but CalAssemblerI
+        // does not. Same compiled code, one gcmap → cannot satisfy both.
+        // RPython has no adapt-live; Box types match from the start.
+        let _ = (
+            &snapshot_map,
+            &snapshot_frame_size_map,
+            &snapshot_vable_map,
+            &snapshot_pc_map,
+            &sbt,
+        );
+
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let mut updated_constant_types = constant_types.clone();
@@ -3126,11 +3160,11 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
-        // No preamble for FINISH traces — CALL_ASSEMBLER passes all args
-        // directly (frame + ni + sd + locals). A guard before GETFIELD ops
-        // ensures tagged pointers (force_cache hits) don't get dereferenced.
-
-        // rd_numb produced inline during optimization (store_final_boxes_in_guard).
+        // Note: adapt-live type correction (inputarg Ref→Int, guard
+        // fail_arg_types) is NOT applied here. CalAssemblerI calls the
+        // callee without adapt-live, so the runtime types at guard failure
+        // are the original Ref types. The no-snapshot fallback handles
+        // types correctly via MetaFailDescr.
 
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -4190,7 +4224,11 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
-    /// RPython MIFrame: unbox Ref→Int where compiled trace expects Int.
+    /// pyre-specific: unbox Ref→Int where compiled trace expects Int.
+    /// pyre traces start with all-Ref locals (PyObjectRef) but trace-internal
+    /// operations unbox to Int/Float. At compiled entry, live_values carry
+    /// Ref pointers that must be unboxed to match the trace's typed label.
+    /// RPython doesn't need this because wrap() sets Box types before tracing.
     pub fn adapt_live_values_to_trace_types(
         &self,
         green_key: u64,
@@ -4199,8 +4237,6 @@ impl<M: Clone> MetaInterp<M> {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return values;
         };
-        // Read actual label types from first guard's fail_arg_types,
-        // which reflects the tracer's typed locals (not build_meta's all-Ref).
         let types: Vec<Type> = compiled
             .traces
             .get(&compiled.root_trace_id)
@@ -6020,6 +6056,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// RPython resume_in_blackhole parity: resume execution from the guard
     /// failure point using the IR-based blackhole interpreter.
+    /// RPython bh_call_i parity: `memory` provides call_i/call_r for
     pub fn blackhole_guard_failure(
         &self,
         green_key: u64,

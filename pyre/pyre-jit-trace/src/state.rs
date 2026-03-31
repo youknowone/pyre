@@ -1426,8 +1426,10 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
     Type::Ref
 }
 
-/// RPython parity: virtualizable array slots are always GCREF (Ref).
-/// Even W_IntObject values are Ref — the trace unboxes via GetfieldGcPureI.
+/// pyre slots are always GCREF (Ref) at the concrete frame level.
+/// Even W_IntObject values are stored as Ref pointers — the trace
+/// unboxes via GetfieldGcPureI. adapt_live_values_to_trace_types
+/// converts Ref→Int at compiled entry to match trace-internal types.
 fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
@@ -2311,7 +2313,7 @@ impl MIFrame {
         // RPython pyjitpl.py opimpl_setlocal: stores the box directly.
         // Unboxing happens at operation time (binary_float_value, etc.),
         // not at store time. concrete_virtualizable_slot_type always
-        // returns Type::Ref (virtualizable slots are GCREFs), so any
+        // returns Type::Ref (pyre slots are GCREFs), so any
         // concrete-type-based unboxing here was dead code.
         let stored_type = self.value_type(value);
         let s = self.sym_mut();
