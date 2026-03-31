@@ -7548,10 +7548,6 @@ impl JitState for PyreJitState {
             && self.valuestackdepth == meta.valuestackdepth
     }
 
-    fn update_meta_merge_pc(meta: &mut Self::Meta, new_pc: usize) {
-        meta.merge_pc = new_pc;
-    }
-
     fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {
         // RPython rebuild_from_resumedata (resume.py:1042, pyjitpl.py:3400)
         // restores the complete frame stack from rd_numb before bridge
@@ -7611,10 +7607,6 @@ impl JitState for PyreJitState {
             virtualref_values: vref_values,
             constants,
         })
-    }
-
-    fn meta_merge_pc(meta: &Self::Meta) -> usize {
-        meta.merge_pc
     }
 
     /// pyjitpl.py:2982 get_procedure_token: compute green key for a PC.
