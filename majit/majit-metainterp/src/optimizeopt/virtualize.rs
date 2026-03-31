@@ -1780,44 +1780,29 @@ impl Optimization for OptVirtualize {
             _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
 
             // JUMP — RPython virtualize.py has no optimize_JUMP.
-            // Capture pre-force virtual state for the export code path,
-            // then let the default arm (escape handler) force virtual args.
-            OpCode::Jump => {
-                // Capture pre-force virtual state while virtuals are alive.
-                let pre_force_args: Vec<OpRef> = op
-                    .args
-                    .iter()
-                    .map(|a| ctx.get_box_replacement(*a))
-                    .collect();
-                let pre_force_vs = crate::optimizeopt::virtualstate::export_state(
-                    &pre_force_args,
-                    ctx,
-                    &ctx.forwarded,
-                );
-                ctx.pre_force_virtual_state = Some(pre_force_vs);
-                ctx.pre_force_jump_args = Some(pre_force_args);
-
-                // Virtualizable frame: keep virtual, force others.
-                let frame_ref = if self.vable_config.is_some() {
-                    Some(ctx.get_box_replacement(OpRef(0)))
-                } else {
-                    None
-                };
+            // pre_force_virtual_state is set by optimizer.rs before JUMP
+            // enters passes.
+            // Virtualizable frame: keep virtual, force others.
+            OpCode::Jump if self.vable_config.is_some() => {
+                let frame_ref = ctx.get_box_replacement(OpRef(0));
                 let mut jump_op = op.clone();
                 for arg in &mut jump_op.args {
                     let resolved = ctx.get_box_replacement(*arg);
-                    if let Some(fr) = frame_ref {
-                        if resolved == fr
-                            && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
-                        {
-                            *arg = resolved;
-                            continue;
-                        }
+                    if resolved == frame_ref
+                        && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
+                    {
+                        *arg = resolved;
+                        continue;
                     }
                     self.force_virtual(resolved, ctx);
                     *arg = ctx.get_box_replacement(resolved);
                 }
                 OptimizationResult::Replace(jump_op)
+            }
+
+            // JUMP (no virtualizable) — force escaping values.
+            OpCode::Jump => {
+                self.optimize_escaping_op(op, ctx)
             }
 
             // Escape ops (testing)
