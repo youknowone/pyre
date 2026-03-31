@@ -2981,11 +2981,14 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // finish_and_compile traces use function-entry bridges where
-        // adapt-live changes inputarg types (Ref→Int) after tracing.
-        // The trace's snapshot types (pre-adapt) don't match the compiled
-        // code's types (post-adapt), so snapshot-based numbering would
-        // produce wrong exit_types → GC corruption. Use no-snapshot
-        // fallback which derives types from the compiled fail_args.
+        // adapt-live unboxes Ref→Int AFTER tracing. trace.inputargs carry
+        // pre-adapt types (Ref), but the compiled code/gcmap uses post-adapt
+        // types (Int). Snapshot-based numbering reduces fail_args to liveboxes,
+        // but Cranelift's gcmap is still generated from inputarg types (Ref),
+        // causing GC to scan raw ints as pointers → SEGFAULT.
+        // Blocker: adapt-live type divergence. RPython has no adapt-live;
+        // Box types are set correctly at trace time.
+        // No-snapshot fallback keeps all fail_args (correct gcmap via descr).
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
         let mut updated_constant_types = constant_types.clone();

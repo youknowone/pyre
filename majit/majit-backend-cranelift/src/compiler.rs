@@ -9160,14 +9160,32 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            let types = resolve_fail_arg_types(
-                &refs,
-                op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                &value_types,
-                &inputarg_types,
-                &op_def_positions,
-                op_idx,
-            )?;
+            // store_final_boxes_in_guard sets op.fail_arg_types to match
+            // the reduced liveboxes. Prefer these over the FailDescr types
+            // (which reflect the pre-optimization fail_args count).
+            let types = if let Some(ref explicit) = op.fail_arg_types {
+                if explicit.len() == refs.len() {
+                    explicit.clone()
+                } else {
+                    resolve_fail_arg_types(
+                        &refs,
+                        op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                        &value_types,
+                        &inputarg_types,
+                        &op_def_positions,
+                        op_idx,
+                    )?
+                }
+            } else {
+                resolve_fail_arg_types(
+                    &refs,
+                    op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                    &value_types,
+                    &inputarg_types,
+                    &op_def_positions,
+                    op_idx,
+                )?
+            };
             (refs, types)
         } else {
             let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
