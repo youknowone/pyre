@@ -2823,6 +2823,8 @@ impl OptUnroll {
                         continue;
                     };
                     ctx.replace_op(source, result_opref);
+                    // Register type for the new OpRef (RPython Box.type parity).
+                    ctx.value_types.insert(result_opref.0, opcode.result_type());
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -2907,6 +2909,8 @@ impl OptUnroll {
                     // via take_preamble_field and call force_op_from_preamble.
                     let _slot_value = resolve_result(result);
                     let value = ctx.alloc_op_position();
+                    // Register type for the new OpRef (RPython Box.type parity).
+                    ctx.value_types.insert(value.0, result_type);
                     if let Some((csrc, cval)) = const_to_register {
                         ctx.make_constant(csrc, cval);
                     }
@@ -2995,6 +2999,8 @@ impl OptUnroll {
                     // Fresh OpRef for PreambleOp.op identity isolation.
                     let _slot_value = resolve_result(result);
                     let value = ctx.alloc_op_position();
+                    // Register type for the new OpRef (RPython Box.type parity).
+                    ctx.value_types.insert(value.0, result_type);
                     if let Some((csrc, cval)) = const_to_register {
                         ctx.make_constant(csrc, cval);
                     }
