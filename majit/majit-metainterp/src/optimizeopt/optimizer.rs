@@ -1728,6 +1728,20 @@ impl Optimizer {
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
+        // RPython: patchguardop is set by GUARD_FUTURE_CONDITION.
+        // In pyre, traces without `promote` lack GUARD_FUTURE_CONDITION.
+        // Fallback: use the last emitted guard so inline_short_preamble
+        // guards (unroll.py:409) get a valid rd_resume_position.
+        if ctx.patchguardop.is_none() {
+            if let Some(last) = ctx
+                .new_operations
+                .iter()
+                .rev()
+                .find(|op| op.opcode.is_guard() && op.rd_resume_position >= 0)
+            {
+                ctx.patchguardop = Some(last.clone());
+            }
+        }
         self.patchguardop = ctx.patchguardop.clone();
         // JUMP location: in new_operations (flush=True path where JUMP was
         // processed through passes), or terminal_op (skip_flush path).
