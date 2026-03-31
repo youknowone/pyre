@@ -436,20 +436,6 @@ impl OptHeap {
     /// Register a cached value in the per-descr CachedField.
     /// RPython: cf.register_info(structop, info)
     /// Keep nonnull knowledge only for boxes known to be allocated in this trace.
-    /// RPython: per-box flag on PtrInfo — nonnull survives calls only for
-    /// objects whose allocation we saw.
-    fn retain_nonnull_for_allocations(&mut self) {
-        if self.seen_allocation.iter().any(|&v| v) {
-            for i in 0..self.known_nonnull.len() {
-                if self.known_nonnull[i] && !vb_get(&self.seen_allocation, i as u32) {
-                    self.known_nonnull[i] = false;
-                }
-            }
-        } else {
-            self.known_nonnull.clear();
-        }
-    }
-
     fn cache_field(&mut self, obj: OpRef, field_idx: u32, value: OpRef, descr: Option<&DescrRef>) {
         let cf = self
             .field_cache
@@ -719,33 +705,22 @@ impl OptHeap {
     /// - Immutable (green) field caches: values never change.
     /// - Unescaped object caches: calls cannot access objects that haven't
     ///   been passed to a call or stored into the heap.
+    /// heap.py:379-391: invalidate non-pure field/array caches.
+    /// Only `is_always_pure` (immutable) fields survive.
     fn clean_caches(&mut self) {
-        let has_survivors =
-            self.immutable_field_descrs.iter().any(|&v| v) || self.unescaped.iter().any(|&v| v);
-
-        if has_survivors {
-            for (&field_idx, cf) in self.field_cache.iter_mut() {
-                if vb_get(&self.immutable_field_descrs, field_idx) {
-                    continue; // immutable fields survive
-                }
-                cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
+        for (&field_idx, cf) in self.field_cache.iter_mut() {
+            // heap.py:384: if not descr.is_always_pure(): cf.invalidate()
+            if !vb_get(&self.immutable_field_descrs, field_idx) {
+                cf.invalidate();
             }
-            for cai in self.array_cache.values_mut() {
-                cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
-            }
-            self.cached_arrayitems_var
-                .retain(|&(obj, _, _), _| vb_get(&self.unescaped, obj.0));
-        } else {
-            self.field_cache.values_mut().for_each(|cf| cf.invalidate());
-            self.immutable_cached_fields.clear();
-            self.array_cache
-                .values_mut()
-                .for_each(|cai| cai.invalidate());
-            self.cached_arrayitems_var.clear();
-            self.array_min_lengths.clear();
         }
-
-        self.retain_nonnull_for_allocations();
+        // heap.py:386-389: invalidate non-pure array caches
+        for cai in self.array_cache.values_mut() {
+            cai.invalidate();
+        }
+        self.cached_arrayitems_var.clear();
+        // heap.py:390: self.cached_dict_reads.clear()
+        // (no dict_reads cache in majit)
     }
 
     /// Invalidate field caches affected by a write to `obj` for field `field_idx`.
@@ -880,30 +855,13 @@ impl OptHeap {
         // RPython effectinfo.py: zero bitstrings mean the call touches NO
         // tracked heap fields (e.g., I/O). Only fall back to conservative
         // invalidation for calls with ForcesVirtual/RandomEffects.
-        let has_bitstrings = ei.readonly_descrs_fields != 0
-            || ei.write_descrs_fields != 0
-            || ei.readonly_descrs_arrays != 0
-            || ei.write_descrs_arrays != 0;
-        if !has_bitstrings {
-            if ei.forces_virtual_or_virtualizable() || ei.has_random_effects() {
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                for (&field_idx, cf) in self.field_cache.iter_mut() {
-                    if vb_get(&self.immutable_field_descrs, field_idx) {
-                        continue;
-                    }
-                    cf.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
-                }
-                for cai in self.array_cache.values_mut() {
-                    cai.retain_entries(|obj| vb_get(&self.unescaped, obj.0));
-                }
-                self.cached_arrayitems_var
-                    .retain(|&(obj, _, _), _| vb_get(&self.unescaped, obj.0));
-                self.retain_nonnull_for_allocations();
-            }
-            // Zero bitstrings + CannotRaise/CanRaise: call doesn't touch
-            // any tracked heap fields → cache survives (RPython parity).
-            return;
-        }
+        // heap.py:567-571: forces_virtual_or_virtualizable → force virtualref field
+        // (In RPython this forces vrefinfo.descr_forced; majit has no virtualref
+        // field tracking yet, so this is a no-op placeholder.)
+        //
+        // Note: has_random_effects() calls are filtered BEFORE reaching this
+        // function (emitting_operation line 460: !has_random_effects → return).
+        // No special handling needed here.
 
         // Force/invalidate field caches based on read/write bitstrings
         let field_indices: Vec<u32> = self.field_cache.keys().copied().collect();
@@ -952,9 +910,6 @@ impl OptHeap {
         }
         self.cached_arrayitems_var
             .retain(|&(_, descr_idx, _), _| !ei.check_write_descr_array(descr_idx));
-
-        // Remaining lazy sets for unaffected fields stay lazy.
-        self.retain_nonnull_for_allocations();
     }
 
     // ── Handlers for specific opcodes ──
@@ -2092,7 +2047,8 @@ impl Optimization for OptHeap {
             | OpCode::EnterPortalFrame
             | OpCode::LeavePortalFrame
             | OpCode::Copystrcontent
-            | OpCode::Copyunicodecontent => {
+            | OpCode::Copyunicodecontent
+            | OpCode::CheckMemoryError => {
                 ctx.current_pass_idx = saved_pass_idx;
                 return;
             }
