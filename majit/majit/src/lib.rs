@@ -19,7 +19,6 @@
 //! use majit::cranelift::CraneliftBackend;
 //! use majit::trace::recorder::Trace;
 //! use majit::gc;
-//! use majit::runtime;
 //! ```
 
 /// IR definitions: opcodes, types, values, descriptors.
@@ -42,9 +41,6 @@ pub use majit_metainterp as metainterp;
 
 /// GC support: nursery, oldgen, write barriers, card marking.
 pub use majit_gc as gc;
-
-/// Runtime helpers: jit_merge_point, can_enter_jit.
-pub use majit_runtime as runtime;
 
 /// Proc macros: #[jit_driver], #[jit_interp], #[jit_inline], #[jit_module].
 pub use majit_macros as macros;

@@ -6,7 +6,12 @@
 ///
 /// Greens: [pc]
 /// Reds:   [stack (via storage pool)]
-use majit_runtime::hint_promote;
+/// Hint to the JIT that this value should be treated as a compile-time constant.
+/// During tracing, the tracer records a GUARD_VALUE. Non-tracing mode: identity.
+#[inline(always)]
+fn hint_promote<T: Copy>(val: T) -> T {
+    val
+}
 
 // ── Storage pool types ──
 

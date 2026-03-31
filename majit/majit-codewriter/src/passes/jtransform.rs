@@ -588,18 +588,18 @@ fn remap_terminator(
     }
 }
 
-fn classify_vable_hint(target: &CallTarget) -> Option<majit_runtime::VirtualizableHintKind> {
+fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::VirtualizableHintKind> {
     target
         .path_segments()
-        .and_then(|segments| majit_runtime::classify_virtualizable_hint_segments(segments))
+        .and_then(|segments| crate::hints::classify_virtualizable_hint_segments(segments))
 }
 
 fn is_vable_identity_hint(target: &CallTarget) -> bool {
     matches!(
         classify_vable_hint(target),
         Some(
-            majit_runtime::VirtualizableHintKind::AccessDirectly
-                | majit_runtime::VirtualizableHintKind::FreshVirtualizable
+            crate::hints::VirtualizableHintKind::AccessDirectly
+                | crate::hints::VirtualizableHintKind::FreshVirtualizable
         )
     )
 }
@@ -607,7 +607,7 @@ fn is_vable_identity_hint(target: &CallTarget) -> bool {
 fn is_vable_force_hint(target: &CallTarget) -> bool {
     matches!(
         classify_vable_hint(target),
-        Some(majit_runtime::VirtualizableHintKind::ForceVirtualizable)
+        Some(crate::hints::VirtualizableHintKind::ForceVirtualizable)
     )
 }
 

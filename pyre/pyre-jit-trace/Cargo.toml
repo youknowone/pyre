@@ -15,6 +15,6 @@ majit-trace = { path = "../../majit/majit-trace" }
 majit-gc = { path = "../../majit/majit-gc" }
 
 [build-dependencies]
-majit-analyze = { path = "../../majit/majit-analyze" }
+majit-codewriter = { path = "../../majit/majit-codewriter" }
 serde_json = "1"
 syn = { version = "2", features = ["full", "visit"] }
