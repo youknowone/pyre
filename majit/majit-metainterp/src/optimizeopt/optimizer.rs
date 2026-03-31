@@ -2774,17 +2774,15 @@ impl Optimizer {
             // Majit deviation: collect_virtual_field_values forces nested
             // virtuals. RPython's visitor_walk_recursive only collects.
             //
-            // Why forcing is needed: force_box_direct creates concrete
-            // New()+SetfieldGc ops. The forced OpRef is then a valid
-            // Cranelift variable. Without forcing, virtual field value
-            // OpRefs have no concrete op in the body loop, so Cranelift
-            // maps them to undefined values — guard failure recovery
-            // reads wrong data from the deadframe (fib_loop overflow).
+            // Root cause: Phase 2 virtual PtrInfo field values reference
+            // Phase 1 OpRefs that weren't remapped to Phase 2 LABEL args.
+            // Without forcing, the snapshot path's _number_virtuals reads
+            // these stale field values → wrong rd_virtuals_info encoding →
+            // guard recovery produces incorrect values (fib_loop wrong output).
+            // Forcing creates concrete ops, bypassing _number_virtuals entirely.
             //
-            // RPython avoids this because deadframe stores Box runtime
-            // values (Python objects), not Cranelift variables. A Box
-            // always has a valid runtime value regardless of whether
-            // its virtual was forced.
+            // Prerequisite for removal: fix Phase 2 virtual field value
+            // mapping in setinfo_from_preamble / import_virtual_state.
             let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
             let mut extra_fail_args: Vec<OpRef> = Vec::new();
             let original_len = fail_args.len();
