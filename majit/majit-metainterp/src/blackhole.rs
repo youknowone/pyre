@@ -1305,13 +1305,16 @@ impl BlackholeInterpreter {
                 self.registers_i[dst] = value;
             }
             BC_LOAD_CONST_R => {
-                // Ref constants: for now store 0 (no ref constant pool yet)
-                let _dst = self.next_u16() as usize;
-                let _const_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let const_idx = self.next_u16() as usize;
+                let value = self.jitcode.constants_r[const_idx];
+                self.registers_r[dst] = value;
             }
             BC_LOAD_CONST_F => {
-                let _dst = self.next_u16() as usize;
-                let _const_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let const_idx = self.next_u16() as usize;
+                let value = self.jitcode.constants_f[const_idx];
+                self.registers_f[dst] = value;
             }
             BC_MOVE_I => {
                 let dst = self.next_u16() as usize;

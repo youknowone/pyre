@@ -557,6 +557,23 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// compile.py:830 store_hash: deterministic guard hash.
+    ///
+    /// RPython uses fetch_next_hash() (sequential counter) tied to the
+    /// guard descriptor object, which dies on invalidation. pyre
+    /// invalidates more aggressively, so we derive a stable hash from
+    /// (green_key, trace_id, fail_index) to preserve accumulated failure
+    /// counts across invalidation/re-compilation cycles.
+    fn stable_guard_hash(green_key: u64, trace_id: u64, fail_index: u32) -> u64 {
+        green_key
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(trace_id)
+            .wrapping_mul(1442695040888963407)
+            .wrapping_add(fail_index as u64)
+            .wrapping_mul(6364136223846793005)
+            | 1 // ensure nonzero low bits for jitcounter subhash
+    }
+
     fn trace_for_exit<'a>(
         compiled: &'a CompiledEntry<M>,
         trace_id: u64,
@@ -3606,7 +3623,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -3659,7 +3676,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -3708,7 +3725,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -3756,7 +3773,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -3884,7 +3901,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -4018,7 +4035,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -4085,7 +4102,7 @@ impl<M: Clone> MetaInterp<M> {
                 .guard_failures
                 .entry((trace_id, fail_index))
                 .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: self.warm_state.fetch_next_hash(),
+                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
                     compiling: false,
                     per_value: None,
                     copied_from: None,
@@ -4616,18 +4633,18 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// compile.py:826-830: get the jitcounter hash for a guard.
-    /// Returns the hash allocated via store_hash (fetch_next_hash).
+    /// Returns the stable hash derived from (green_key, trace_id, fail_index).
     /// Looks up by trace_id across all compiled loops.
     pub fn guard_hash_for_trace(&mut self, trace_id: u64, fail_index: u32) -> u64 {
         // Find which compiled loop owns this trace_id.
-        for compiled in self.compiled_loops.values_mut() {
+        for (&gk, compiled) in self.compiled_loops.iter_mut() {
             let norm_tid = Self::normalize_trace_id(compiled, trace_id);
             if norm_tid == compiled.root_trace_id || compiled.traces.contains_key(&norm_tid) {
                 let info = compiled
                     .guard_failures
                     .entry((norm_tid, fail_index))
                     .or_insert_with(|| GuardFailureInfo {
-                        guard_hash: self.warm_state.fetch_next_hash(),
+                        guard_hash: Self::stable_guard_hash(gk, norm_tid, fail_index),
                         compiling: false,
                         per_value: None,
                         copied_from: None,
@@ -4635,8 +4652,8 @@ impl<M: Clone> MetaInterp<M> {
                 return info.guard_hash;
             }
         }
-        // Fallback: allocate a new hash.
-        self.warm_state.fetch_next_hash()
+        // Fallback: no owning loop found.
+        Self::stable_guard_hash(0, trace_id, fail_index)
     }
 
     /// Get the number of fail_arg_types for a guard.
@@ -4819,7 +4836,7 @@ impl<M: Clone> MetaInterp<M> {
             .guard_failures
             .entry((tid, fail_index))
             .or_insert_with(|| {
-                let guard_hash = self.warm_state.fetch_next_hash();
+                let guard_hash = Self::stable_guard_hash(green_key, tid, fail_index);
                 // compile.py:813-824 make_a_counter_per_value parity:
                 // if this guard is GUARD_VALUE, set up per-value counting
                 // immediately (RPython does this at backend regalloc time).
@@ -4855,7 +4872,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py:753-781: GUARD_VALUE per-value hash.
         // RPython: hash = current_object_addr_as_int(self) * 777767777 + intval * 1442968193
-        // guard_hash (unique per guard from fetch_next_hash) serves as
+        // guard_hash (unique per guard from stable_guard_hash) serves as
         // the stable guard identity, matching RPython's descriptor address.
         let hash = if let Some((idx, _tp)) = info.per_value {
             let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
@@ -5821,7 +5838,9 @@ impl<M: Clone> MetaInterp<M> {
                             .guard_failures
                             .entry((norm_tid, fail_index))
                             .or_insert_with(|| GuardFailureInfo {
-                                guard_hash: self.warm_state.fetch_next_hash(),
+                                guard_hash: Self::stable_guard_hash(
+                                    green_key, norm_tid, fail_index,
+                                ),
                                 compiling: false,
                                 per_value: None,
                                 copied_from: None,

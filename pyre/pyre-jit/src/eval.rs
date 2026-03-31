@@ -2768,23 +2768,35 @@ fn build_resumed_frames(
     let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
         let frame_val = resolve_rebuilt_value(
             vable_values.last().unwrap(),
-            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
         );
         let ni_val = resolve_rebuilt_value(
             &vable_values[0],
-            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
         );
         let vsd_val = resolve_rebuilt_value(
             &vable_values[1],
-            &dead_frame_typed, exit_layout, &mut virtuals_cache,
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
         );
         let fp = match frame_val {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
             Value::Int(v) => v as *mut pyre_interpreter::pyframe::PyFrame,
             _ => std::ptr::null_mut(),
         };
-        let ni = match ni_val { Value::Int(v) => v as usize, _ => 0 };
-        let vsd = match vsd_val { Value::Int(v) => v as usize, _ => 0 };
+        let ni = match ni_val {
+            Value::Int(v) => v as usize,
+            _ => 0,
+        };
+        let vsd = match vsd_val {
+            Value::Int(v) => v as usize,
+            _ => 0,
+        };
         (fp, ni, vsd)
     } else {
         (std::ptr::null_mut(), 0, 0)
