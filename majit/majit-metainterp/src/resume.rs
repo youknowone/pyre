@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use majit_codegen::{
+use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout,
 };

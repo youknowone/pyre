@@ -11,8 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{PyExecutionContext, PyNamespace, namespace_load, namespace_store};
-use pyre_bytecode::{CodeObject, Mode, compile_source_with_filename};
 use pyre_object::*;
 
 use crate::eval::eval_frame_plain;

@@ -15,7 +15,7 @@ use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
-use majit_codegen::Backend;
+use majit_backend::Backend;
 use majit_gc::trace::TypeInfo;
 use majit_ir::Value;
 use majit_metainterp::blackhole::ExceptionState;
@@ -298,7 +298,7 @@ fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) 
         return None;
     }
     Some(make_green_key(
-        code_ptr as *const pyre_bytecode::CodeObject,
+        code_ptr as *const pyre_interpreter::CodeObject,
         next_instr,
     ))
 }
@@ -313,7 +313,7 @@ pub fn get_printable_location(
     let mut code_name = "<unknown>".to_string();
     let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
     if !code_ptr.is_null() {
-        let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
+        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
         code_name = code.obj_name.to_string();
         if let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, next_instr) {
             opcode = format!("{:?}", instr);
@@ -347,7 +347,7 @@ pub fn get_location(
                 "<eof>".to_string(),
             ),
             code_ptr => {
-                let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
+                let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
                 let (_opcode, opname) =
                     match pyre_interpreter::decode_instruction_at(code, next_instr) {
                         Some((instruction, _)) => {
@@ -392,8 +392,8 @@ pub fn should_unroll_one_iteration(
     match unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) } {
         ptr if ptr.is_null() => false,
         code_ptr => {
-            let code = unsafe { &*code_ptr.cast::<pyre_bytecode::CodeObject>() };
-            code.flags.contains(pyre_bytecode::CodeFlags::GENERATOR)
+            let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
+            code.flags.contains(pyre_interpreter::CodeFlags::GENERATOR)
         }
     }
 }
@@ -704,7 +704,7 @@ fn call_depth() -> u32 {
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
-pub fn make_green_key(code_ptr: *const pyre_bytecode::CodeObject, pc: usize) -> u64 {
+pub fn make_green_key(code_ptr: *const pyre_interpreter::CodeObject, pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
@@ -756,7 +756,7 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     );
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
-    majit_codegen_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
+    majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
     frame.fix_array_ptrs();
 
     // RPython blackhole.py parity: during bridge tracing, concrete
@@ -882,13 +882,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         if frame.pending_inline_resume_pc == Some(pc) {
             if matches!(
                 instruction,
-                pyre_bytecode::bytecode::Instruction::Call { .. }
+                pyre_interpreter::bytecode::Instruction::Call { .. }
             ) {
                 frame.pending_inline_resume_pc = None;
                 continue;
             }
         }
-        if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
+        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
             if !frame.pending_inline_results.is_empty() {
                 frame.next_instr = pc + 1;
                 if pyre_interpreter::call::replay_pending_inline_call(
@@ -904,7 +904,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         frame.next_instr += 1;
         let next_instr = frame.next_instr;
-        if let pyre_bytecode::bytecode::Instruction::Call { argc } = instruction {
+        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
             if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
             {
                 continue;
@@ -940,7 +940,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 #[inline(never)]
 fn jit_merge_point_hook(
     frame: &mut PyFrame,
-    code: &pyre_bytecode::CodeObject,
+    code: &pyre_interpreter::CodeObject,
     pc: usize,
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -1452,7 +1452,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             static DUMPED: OnceLock<()> = OnceLock::new();
             if DUMPED.get().is_none() {
                 let _ = DUMPED.set(());
-                let mut state = pyre_bytecode::OpArgState::default();
+                let mut state = pyre_interpreter::OpArgState::default();
                 eprintln!("-- fannkuch bytecode dump --");
                 for (pc, unit) in code.instructions.iter().copied().enumerate() {
                     let (instr, oparg) = state.get(unit);
@@ -2796,9 +2796,9 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
         return;
     }
 
-    let resolve_value = |src: &majit_codegen::ExitValueSourceLayout| -> Option<i64> {
+    let resolve_value = |src: &majit_backend::ExitValueSourceLayout| -> Option<i64> {
         match src {
-            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                 typed.get(*idx).map(|v| match v {
                     Value::Int(i) => *i,
                     Value::Float(f) => f.to_bits() as i64,
@@ -2806,7 +2806,7 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
                     _ => 0,
                 })
             }
-            majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+            majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
             _ => None,
         }
     };
@@ -2869,7 +2869,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
     typed: &mut Vec<Value>,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-    recovery: &majit_codegen::ExitRecoveryLayout,
+    recovery: &majit_backend::ExitRecoveryLayout,
 ) -> bool {
     let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
     let w_float_type = &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize;
@@ -2878,13 +2878,13 @@ fn rebuild_state_after_failure_from_recovery_layout(
     // not from rd_numb-decoded typed array. Virtual field values live at
     // deadframe positions beyond the frame slots.
     // resume.py:1252 parity: resolve field values, including nested virtuals.
-    let resolve_value = |src: &majit_codegen::ExitValueSourceLayout,
+    let resolve_value = |src: &majit_backend::ExitValueSourceLayout,
                          materialized: &[usize]|
      -> Option<i64> {
         match src {
-            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => raw_values.get(*idx).copied(),
-            majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
-            majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+            majit_backend::ExitValueSourceLayout::ExitValue(idx) => raw_values.get(*idx).copied(),
+            majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
+            majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
                 materialized.get(*vidx).map(|&ptr| ptr as i64)
             }
             _ => None,
@@ -2895,13 +2895,13 @@ fn rebuild_state_after_failure_from_recovery_layout(
     let mut materialized: Vec<usize> = Vec::new();
     for vl in &recovery.virtual_layouts {
         match vl {
-            majit_codegen::ExitVirtualLayout::Object {
+            majit_backend::ExitVirtualLayout::Object {
                 fields,
                 fielddescrs,
                 descr_size,
                 ..
             }
-            | majit_codegen::ExitVirtualLayout::Struct {
+            | majit_backend::ExitVirtualLayout::Struct {
                 fields,
                 fielddescrs,
                 descr_size,
@@ -2971,7 +2971,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 };
                 materialized.push(obj);
             }
-            majit_codegen::ExitVirtualLayout::Array {
+            majit_backend::ExitVirtualLayout::Array {
                 clear, kind, items, ..
             } => {
                 // resume.py:650-670: allocate_array(len, arraydescr, clear)
@@ -3002,7 +3002,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 // resume.py:654: return array GcRef directly
                 materialized.push(array as usize);
             }
-            majit_codegen::ExitVirtualLayout::ArrayStruct {
+            majit_backend::ExitVirtualLayout::ArrayStruct {
                 field_types,
                 item_size,
                 field_offsets,
@@ -3032,7 +3032,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 }
                 materialized.push(array as usize);
             }
-            majit_codegen::ExitVirtualLayout::RawBuffer { size, entries } => {
+            majit_backend::ExitVirtualLayout::RawBuffer { size, entries } => {
                 let buffer = unsafe {
                     std::alloc::alloc_zeroed(
                         std::alloc::Layout::from_size_align(*size, 8)
@@ -3055,7 +3055,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 }
                 materialized.push(buffer as usize);
             }
-            majit_codegen::ExitVirtualLayout::RawSlice { offset, base } => {
+            majit_backend::ExitVirtualLayout::RawSlice { offset, base } => {
                 // resume.py:723-727: base_buffer + offset
                 let base_val = resolve_value(base, &materialized).unwrap_or(0);
                 materialized.push((base_val + *offset as i64) as usize);
@@ -3067,7 +3067,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
     let mut replaced = 0usize;
     if let Some(frame) = recovery.frames.last() {
         for (slot_idx, src) in frame.slots.iter().enumerate() {
-            if let majit_codegen::ExitValueSourceLayout::Virtual(vidx) = src {
+            if let majit_backend::ExitValueSourceLayout::Virtual(vidx) = src {
                 if let Some(&ptr) = materialized.get(*vidx) {
                     if slot_idx < typed.len() {
                         typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
@@ -3084,8 +3084,8 @@ fn rebuild_state_after_failure_from_recovery_layout(
     if replaced == 0 && !materialized.is_empty() {
         for (vidx, vl) in recovery.virtual_layouts.iter().enumerate() {
             let target = match vl {
-                majit_codegen::ExitVirtualLayout::Object { target_slot, .. }
-                | majit_codegen::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
+                majit_backend::ExitVirtualLayout::Object { target_slot, .. }
+                | majit_backend::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
                 _ => None,
             };
             if let Some(slot_idx) = target {
@@ -3107,13 +3107,13 @@ fn rebuild_state_after_failure_from_recovery_layout(
 
 fn decode_recovery_payload_from_source(
     raw: i64,
-    src: Option<&majit_codegen::ExitValueSourceLayout>,
+    src: Option<&majit_backend::ExitValueSourceLayout>,
     typed: &[Value],
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> i64 {
     match src {
-        Some(majit_codegen::ExitValueSourceLayout::ExitValue(_)) => {
+        Some(majit_backend::ExitValueSourceLayout::ExitValue(_)) => {
             maybe_unbox_known_int_ref(raw, typed, raw_values, &exit_layout.exit_types)
         }
         _ => raw,
@@ -3122,13 +3122,13 @@ fn decode_recovery_payload_from_source(
 
 fn decode_recovery_float_payload_bits(
     raw: i64,
-    src: Option<&majit_codegen::ExitValueSourceLayout>,
+    src: Option<&majit_backend::ExitValueSourceLayout>,
     typed: &[Value],
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> i64 {
     match src {
-        Some(majit_codegen::ExitValueSourceLayout::ExitValue(_)) => {
+        Some(majit_backend::ExitValueSourceLayout::ExitValue(_)) => {
             maybe_unbox_known_float_ref_bits(raw, typed, raw_values, &exit_layout.exit_types)
         }
         _ => raw,
@@ -3287,7 +3287,7 @@ mod tests {
     #[test]
     fn test_eval_simple_addition() {
         let source = "x = 1 + 2";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3304,7 +3304,7 @@ s = 0
 while i < 100:
     s = s + i
     i = i + 1";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3384,9 +3384,9 @@ def fannkuch(n):
                 i = i + 1
 
 r = fannkuch(6)";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut state = pyre_bytecode::OpArgState::default();
+            let mut state = pyre_interpreter::OpArgState::default();
             for (pc, unit) in code.instructions.iter().copied().enumerate() {
                 let (instr, oparg) = state.get(unit);
                 eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
@@ -3420,7 +3420,7 @@ def fib(n):
         return n
     return fib(n - 1) + fib(n - 2)
 ";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3435,7 +3435,7 @@ def fib(n):
 def add(a, b):
     return a + b
 ";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3456,7 +3456,7 @@ def g(n):
 first = g(12)
 factor = 2
 second = g(12)";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3481,7 +3481,7 @@ i = 0
 while i < 300:
     s = s + outer(i)
     i = i + 1";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3510,7 +3510,7 @@ i = 0
 while i < 300:
     s = add(s, compute(i))
     i = add(i, 1)";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
@@ -3530,7 +3530,7 @@ while i < 200:
     s = s + q[q0]
     q[q0] = q[q0] + 1
     i = i + 1";
-        let code = pyre_bytecode::compile_exec(source).expect("compile failed");
+        let code = pyre_interpreter::compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {

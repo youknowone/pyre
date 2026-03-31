@@ -1,4 +1,4 @@
-use majit_codegen::ExitValueSourceLayout;
+use majit_backend::ExitValueSourceLayout;
 
 /// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
@@ -313,7 +313,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// PyPy warmstate.py get_assembler_token(greenkey).
     /// Returns the JitCellToken for the compiled loop at this green key.
-    pub fn get_loop_token(&self, green_key: u64) -> Option<&majit_codegen::JitCellToken> {
+    pub fn get_loop_token(&self, green_key: u64) -> Option<&majit_backend::JitCellToken> {
         self.meta.get_loop_token(green_key)
     }
 
@@ -810,7 +810,7 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(green_key) = self.meta.compile_simple_loop(meta) {
                     // pyjitpl.py:1662-1663
                     let install_num = self.meta.warm_state.alloc_token_number();
-                    let install_token = majit_codegen::JitCellToken::new(install_num);
+                    let install_token = majit_backend::JitCellToken::new(install_num);
                     self.meta
                         .warm_state
                         .attach_procedure_to_interp(green_key, install_token);

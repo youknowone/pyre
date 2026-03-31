@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 pyre-object = { workspace = true }
-pyre-bytecode = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-jit = { path = "../pyre-jit" }
 majit-metainterp = { path = "../../majit/majit-metainterp" }

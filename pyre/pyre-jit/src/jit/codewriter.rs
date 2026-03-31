@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use majit_ir::OpCode;
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
-use pyre_bytecode::bytecode::{CodeObject, Instruction, OpArgState};
+use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 // ---------------------------------------------------------------------------
@@ -519,7 +519,7 @@ impl CodeWriter {
                     );
                     assembler.load_const_i_value(
                         int_tmp0,
-                        binary_op_tag(pyre_bytecode::bytecode::BinaryOperator::Subtract)
+                        binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                             .expect("subtract must have a jit binary-op tag"),
                     );
                     assembler.call_may_force_ref_typed(
@@ -690,7 +690,7 @@ impl CodeWriter {
             use majit_metainterp::jitcode::JitExceptionHandler;
             // decode_exception_table: decode ALL entries from the binary table.
             // Each ExceptionTableEntry: { start, end, target, depth, push_lasti }.
-            let entries = pyre_bytecode::bytecode::decode_exception_table(&code.exceptiontable);
+            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
             let handlers: Vec<JitExceptionHandler> = entries
                 .iter()
                 .filter_map(|entry| {

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use majit_codegen::JitCellToken;
+use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef};
 
 use super::{

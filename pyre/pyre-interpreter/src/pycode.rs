@@ -86,7 +86,7 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
 }
 
 /// Box a cloned compiler code object into a heap Python code wrapper.
-pub fn box_code_constant(code: &pyre_bytecode::CodeObject) -> PyObjectRef {
+pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
     w_code_new(code_ptr)
 }

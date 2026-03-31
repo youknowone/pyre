@@ -1,11 +1,11 @@
 [package]
-name = "majit-codegen-cranelift"
+name = "majit-backend-cranelift"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 majit-ir = { path = "../majit-ir" }
-majit-codegen = { path = "../majit-codegen" }
+majit-backend = { path = "../majit-backend" }
 majit-gc = { path = "../majit-gc" }
 cranelift-codegen = "0.130"
 cranelift-frontend = "0.130"

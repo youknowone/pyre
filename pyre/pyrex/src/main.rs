@@ -7,10 +7,10 @@ use std::rc::Rc;
 use lexopt::Arg::*;
 use lexopt::ValueExt;
 
-use pyre_bytecode::*;
 use pyre_interpreter::call;
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
+use pyre_interpreter::*;
 use pyre_interpreter::{PyDisplay, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
 

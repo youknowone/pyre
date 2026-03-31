@@ -6,8 +6,8 @@
 
 use majit_ir::{OpRef, Type};
 use majit_metainterp::{TraceAction, TraceCtx};
-use pyre_bytecode::CodeObject;
-use pyre_bytecode::bytecode::Instruction;
+use pyre_interpreter::CodeObject;
+use pyre_interpreter::bytecode::Instruction;
 
 use super::state::{
     ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, materialize_pending_inline_result,
@@ -29,7 +29,7 @@ pub struct MetaInterpFrame {
     pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,
     pub drop_frame_opref: Option<OpRef>,
     pub caller_result_stack_idx: Option<usize>,
-    pub arg_state: pyre_bytecode::bytecode::OpArgState,
+    pub arg_state: pyre_interpreter::bytecode::OpArgState,
 }
 
 impl MetaInterpFrame {
@@ -95,10 +95,10 @@ impl PyreMetaInterp {
             while pc < code.instructions.len() {
                 match pyre_interpreter::decode_instruction_at(code, pc) {
                     Some((
-                        pyre_bytecode::bytecode::Instruction::Cache
-                        | pyre_bytecode::bytecode::Instruction::ExtendedArg
-                        | pyre_bytecode::bytecode::Instruction::Nop
-                        | pyre_bytecode::bytecode::Instruction::NotTaken,
+                        pyre_interpreter::bytecode::Instruction::Cache
+                        | pyre_interpreter::bytecode::Instruction::ExtendedArg
+                        | pyre_interpreter::bytecode::Instruction::Nop
+                        | pyre_interpreter::bytecode::Instruction::NotTaken,
                         _,
                     )) => {
                         pc += 1;
@@ -323,7 +323,7 @@ impl PyreMetaInterp {
             parent_frames: pending.parent_frames,
             drop_frame_opref: pending.drop_frame_opref,
             caller_result_stack_idx: caller_result_idx,
-            arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         self.portal_call_depth += 1;
@@ -507,7 +507,7 @@ impl PyreMetaInterp {
 
             // RPython: if opcode == op_catch_exception → handler found
             if let Some(entry) =
-                pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+                pyre_interpreter::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
             {
                 let handler_pc = entry.target as usize;
                 let handler_depth = entry.depth as usize;

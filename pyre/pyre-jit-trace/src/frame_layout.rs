@@ -1,6 +1,6 @@
 use majit_ir::Type;
 use majit_metainterp::virtualizable::VirtualizableInfo;
-use pyre_bytecode::CodeObject;
+use pyre_interpreter::CodeObject;
 use pyre_interpreter::{PyExecutionContext, PyNamespace, PyObjectArray};
 use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PYOBJECT_ARRAY_PTR_OFFSET};
 

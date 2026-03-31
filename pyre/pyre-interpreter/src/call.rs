@@ -201,7 +201,7 @@ fn call_user_function_with_eval(
     let globals = unsafe { function_get_globals(callable) };
     let closure = unsafe { function_get_closure(callable) };
     let defaults = unsafe { crate::function_get_defaults(callable) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const crate::CodeObject;
 
     // PyPy: pyframe.py handle_operation_error / init_cells
     // Fill missing positional args from defaults tuple.
@@ -269,7 +269,7 @@ fn call_user_function_with_eval(
     // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
     if code_ref
         .flags
-        .intersects(pyre_bytecode::CodeFlags::GENERATOR | pyre_bytecode::CodeFlags::COROUTINE)
+        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
         let mut gen_frame = PyFrame::new_for_call_with_closure(
             func_code,
@@ -394,7 +394,7 @@ pub fn call_user_function_plain_with_ctx(
     let code_ptr = unsafe { function_get_code(callable) };
     let globals = unsafe { function_get_globals(callable) };
     let closure = unsafe { function_get_closure(callable) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const crate::CodeObject;
     let mut func_frame =
         PyFrame::new_for_call_with_closure(func_code, args, globals, execution_context, closure);
     func_frame.fix_array_ptrs();
@@ -509,7 +509,7 @@ pub(crate) fn resolve_kwargs(
     };
 
     let code_ptr = unsafe { function_get_code(target_func) };
-    let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
+    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     // Total named params = positional + keyword-only
     let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
     // Effective params = params visible to the caller (excludes implicit cls for types)
@@ -743,7 +743,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let globals = unsafe { function_get_globals(func) };
     let closure = unsafe { function_get_closure(func) };
     let defaults = unsafe { crate::function_get_defaults(func) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const crate::CodeObject;
     let exec_ctx = BUILD_CLASS_EXEC_CTX.with(|c| c.get());
     let exec_ctx = if exec_ctx.is_null() {
         LAST_EXEC_CTX.with(|c| c.get())
@@ -807,7 +807,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     // Generator function: wrap frame in generator object
     if code_ref
         .flags
-        .intersects(pyre_bytecode::CodeFlags::GENERATOR | pyre_bytecode::CodeFlags::COROUTINE)
+        .intersects(crate::CodeFlags::GENERATOR | crate::CodeFlags::COROUTINE)
     {
         let mut gen_frame =
             PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
@@ -852,7 +852,7 @@ fn call_metaclass_with_kwargs(
         if unsafe { crate::is_function(new_fn) } {
             // User function: resolve kwargs to kwonly params
             let code_ptr = unsafe { function_get_code(new_fn) };
-            let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
+            let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
             let nparams = code.arg_count as usize; // positional params
             let nkwonly = code.kwonlyarg_count as usize;
 
@@ -883,10 +883,10 @@ fn call_metaclass_with_kwargs(
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
 /// PyPy: argument.py _match_signature varargs/varkeywords packing
-fn pack_varargs(code: &pyre_bytecode::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
+fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
     let nparams = (code.arg_count + code.kwonlyarg_count) as usize;
-    let has_varargs = code.flags.contains(pyre_bytecode::CodeFlags::VARARGS);
-    let has_varkw = code.flags.contains(pyre_bytecode::CodeFlags::VARKEYWORDS);
+    let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
+    let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
 
     if !has_varargs && !has_varkw {
         return args;
@@ -1007,7 +1007,7 @@ fn build_class_inner(
     let code_ptr = unsafe { function_get_code(body_fn) };
     let globals = unsafe { function_get_globals(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const crate::CodeObject;
 
     // Call metaclass.__prepare__(name, bases, **kwds) if it exists.
     // PyPy: build_class → metaclass.__prepare__(name, bases, **kwds)

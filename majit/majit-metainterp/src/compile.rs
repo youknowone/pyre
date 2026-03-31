@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_codegen::{
+use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
@@ -32,19 +32,19 @@ fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
 /// Rules: ExitValue(idx) → exit_types[idx], Virtual → Ref,
 /// Constant → Int, Uninitialized/Unavailable → Ref (conservative).
 fn derive_slot_types(
-    slots: &[majit_codegen::ExitValueSourceLayout],
+    slots: &[majit_backend::ExitValueSourceLayout],
     exit_types: &[Type],
 ) -> Vec<Type> {
     slots
         .iter()
         .map(|slot| match slot {
-            majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                 exit_types.get(*idx).copied().unwrap_or(Type::Ref)
             }
-            majit_codegen::ExitValueSourceLayout::Virtual(_) => Type::Ref,
-            majit_codegen::ExitValueSourceLayout::Constant(_) => Type::Int,
-            majit_codegen::ExitValueSourceLayout::Uninitialized
-            | majit_codegen::ExitValueSourceLayout::Unavailable => Type::Ref,
+            majit_backend::ExitValueSourceLayout::Virtual(_) => Type::Ref,
+            majit_backend::ExitValueSourceLayout::Constant(_) => Type::Int,
+            majit_backend::ExitValueSourceLayout::Uninitialized
+            | majit_backend::ExitValueSourceLayout::Unavailable => Type::Ref,
         })
         .collect()
 }
@@ -258,7 +258,7 @@ pub(crate) fn build_guard_metadata(
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals_info.
-            use majit_codegen::{ExitRecoveryLayout, ExitValueSourceLayout};
+            use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
             let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
                 (&op.rd_numb, &op.rd_consts)
             {
@@ -313,7 +313,7 @@ pub(crate) fn build_guard_metadata(
                     })
                     .collect()
             };
-            let virtual_layouts: Vec<majit_codegen::ExitVirtualLayout> = op
+            let virtual_layouts: Vec<majit_backend::ExitVirtualLayout> = op
                 .rd_virtuals_info
                 .as_ref()
                 .map(|entries| {
@@ -335,7 +335,7 @@ pub(crate) fn build_guard_metadata(
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
-                                    majit_codegen::ExitVirtualLayout::Object {
+                                    majit_backend::ExitVirtualLayout::Object {
                                         descr: descr.clone(),
                                         type_id: known_class.map_or(0, |kc| kc as u32),
                                         descr_index: *descr_index,
@@ -355,7 +355,7 @@ pub(crate) fn build_guard_metadata(
                                 } => {
                                     let idx: Vec<u32> =
                                         fielddescrs.iter().map(|fd| fd.index).collect();
-                                    majit_codegen::ExitVirtualLayout::Struct {
+                                    majit_backend::ExitVirtualLayout::Struct {
                                         typedescr: typedescr.clone(),
                                         type_id: *type_id,
                                         descr_index: *descr_index,
@@ -399,7 +399,7 @@ pub(crate) fn build_guard_metadata(
                                             }
                                         })
                                         .collect();
-                                    majit_codegen::ExitVirtualLayout::Array {
+                                    majit_backend::ExitVirtualLayout::Array {
                                         descr_index: *descr_index,
                                         clear: *clear,
                                         kind: *kind,
@@ -428,7 +428,7 @@ pub(crate) fn build_guard_metadata(
                                             resolve_fieldnums(&fieldnums[s..e], fielddescr_indices)
                                         })
                                         .collect();
-                                    majit_codegen::ExitVirtualLayout::ArrayStruct {
+                                    majit_backend::ExitVirtualLayout::ArrayStruct {
                                         descr_index: *descr_index,
                                         field_types: field_types.clone(),
                                         item_size: *item_size,
@@ -475,7 +475,7 @@ pub(crate) fn build_guard_metadata(
                                             (offset, esz, source)
                                         })
                                         .collect();
-                                    majit_codegen::ExitVirtualLayout::RawBuffer {
+                                    majit_backend::ExitVirtualLayout::RawBuffer {
                                         size: *size,
                                         entries,
                                     }
@@ -497,7 +497,7 @@ pub(crate) fn build_guard_metadata(
                                             }
                                         })
                                         .unwrap_or(ExitValueSourceLayout::Constant(0));
-                                    majit_codegen::ExitVirtualLayout::RawSlice {
+                                    majit_backend::ExitVirtualLayout::RawSlice {
                                         offset: *offset,
                                         base,
                                     }
@@ -513,7 +513,7 @@ pub(crate) fn build_guard_metadata(
             {
                 let st = derive_slot_types(&frame_slots, &exit_types);
                 Some(ExitRecoveryLayout {
-                    frames: vec![majit_codegen::ExitFrameLayout {
+                    frames: vec![majit_backend::ExitFrameLayout {
                         trace_id: None,
                         header_pc: Some(pc),
                         source_guard: None,
@@ -529,11 +529,11 @@ pub(crate) fn build_guard_metadata(
             // No rd_numb: identity recovery layout.
             // Every guard has at minimum an identity mapping from
             // fail_args → frame slots, with exit_types as slot_types.
-            let slots: Vec<majit_codegen::ExitValueSourceLayout> = (0..exit_types.len())
-                .map(majit_codegen::ExitValueSourceLayout::ExitValue)
+            let slots: Vec<majit_backend::ExitValueSourceLayout> = (0..exit_types.len())
+                .map(majit_backend::ExitValueSourceLayout::ExitValue)
                 .collect();
             Some(ExitRecoveryLayout {
-                frames: vec![majit_codegen::ExitFrameLayout {
+                frames: vec![majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: Some(pc),
                     source_guard: None,
@@ -1745,8 +1745,8 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
-    backend: &mut majit_codegen_cranelift::CraneliftBackend,
-    token: &majit_codegen::JitCellToken,
+    backend: &mut majit_backend_cranelift::CraneliftBackend,
+    token: &majit_backend::JitCellToken,
     trace_id: u64,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
 ) {
@@ -1768,8 +1768,8 @@ pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
-    backend: &mut majit_codegen_cranelift::CraneliftBackend,
-    token: &majit_codegen::JitCellToken,
+    backend: &mut majit_backend_cranelift::CraneliftBackend,
+    token: &majit_backend::JitCellToken,
     trace_id: u64,
     terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
 ) {

@@ -4,6 +4,7 @@
 //! JIT-free: it processes bytecode instructions with no tracing,
 //! no merge points, and no compiled-code hooks.
 
+use crate::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 use crate::*;
 use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
@@ -14,7 +15,6 @@ use crate::{
     namespace_store, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
     unpack_sequence_exact, w_code_new,
 };
-use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator, Instruction};
 use pyre_object::*;
 
 use crate::call::call_callable;
@@ -79,7 +79,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError) -> bool {
     let pc = frame.next_instr.saturating_sub(1) as u32;
 
     // Python 3.11+ exception table dispatch
-    if let Some(entry) = pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc) {
+    if let Some(entry) = crate::bytecode::find_exception_handler(&code.exceptiontable, pc) {
         // Unwind stack to handler's expected depth
         let target_depth = frame.nlocals() + frame.ncells() + entry.depth as usize;
         while frame.valuestackdepth > target_depth {
@@ -564,7 +564,7 @@ impl ConstantOpcodeHandler for PyFrame {
 
     fn code_constant(
         &mut self,
-        code: &pyre_bytecode::bytecode::CodeObject,
+        code: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
         let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
         Ok(w_code_new(code_ptr))
@@ -772,14 +772,14 @@ impl OpcodeStepExecutor for PyFrame {
     // ── ContainsOp (in / not in) ──
     // PyPy: pyopcode.py COMPARE_OP with 'in' / 'not in'
 
-    fn contains_op(&mut self, invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+    fn contains_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
         // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
         let needle = self.pop();
         let result = crate::baseobjspace::contains(haystack, needle)?;
         let inverted = match invert {
-            pyre_bytecode::bytecode::Invert::No => result,
-            pyre_bytecode::bytecode::Invert::Yes => !result,
+            crate::bytecode::Invert::No => result,
+            crate::bytecode::Invert::Yes => !result,
         };
         self.push(pyre_object::w_bool_from(inverted));
         Ok(())
@@ -788,13 +788,13 @@ impl OpcodeStepExecutor for PyFrame {
     // ── IsOp (is / is not) ──
     // PyPy: pyopcode.py COMPARE_OP with 'is' / 'is not'
 
-    fn is_op(&mut self, invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
         let b = self.pop();
         let a = self.pop();
         let same = std::ptr::eq(a, b); // pointer identity
         let result = match invert {
-            pyre_bytecode::bytecode::Invert::No => same,
-            pyre_bytecode::bytecode::Invert::Yes => !same,
+            crate::bytecode::Invert::No => same,
+            crate::bytecode::Invert::Yes => !same,
         };
         self.push(pyre_object::w_bool_from(result));
         Ok(())
@@ -865,14 +865,14 @@ impl OpcodeStepExecutor for PyFrame {
     // ── ConvertValue (repr/str/ascii conversion) ──
     fn convert_value(
         &mut self,
-        conv: pyre_bytecode::bytecode::ConvertValueOparg,
+        conv: crate::bytecode::ConvertValueOparg,
     ) -> Result<(), Self::Error> {
         let val = self.pop();
         let s = match conv {
-            pyre_bytecode::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
-            pyre_bytecode::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val) },
-            pyre_bytecode::bytecode::ConvertValueOparg::Ascii => unsafe { crate::py_repr(val) },
-            pyre_bytecode::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val) },
+            crate::bytecode::ConvertValueOparg::Str => unsafe { crate::py_str(val) },
+            crate::bytecode::ConvertValueOparg::Repr => unsafe { crate::py_repr(val) },
+            crate::bytecode::ConvertValueOparg::Ascii => unsafe { crate::py_repr(val) },
+            crate::bytecode::ConvertValueOparg::None => unsafe { crate::py_str(val) },
         };
         self.push(pyre_object::w_str_new(&s));
         Ok(())
@@ -896,9 +896,9 @@ impl OpcodeStepExecutor for PyFrame {
     /// Pops both, sets attribute on func, pushes func back.
     fn set_function_attribute_with_flag(
         &mut self,
-        flag: pyre_bytecode::bytecode::MakeFunctionFlag,
+        flag: crate::bytecode::MakeFunctionFlag,
     ) -> Result<(), Self::Error> {
-        use pyre_bytecode::bytecode::MakeFunctionFlag;
+        use crate::bytecode::MakeFunctionFlag;
         let func = self.pop(); // TOS = function
         let attr = self.pop(); // TOS1 = attribute value (closure tuple etc.)
         match flag {
@@ -1505,10 +1505,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unpack_ex ──
     // PyPy: UNPACK_SEQUENCE with star; CPython: UNPACK_EX
     // `a, *b, c = iterable`
-    fn unpack_ex(
-        &mut self,
-        args: pyre_bytecode::bytecode::UnpackExArgs,
-    ) -> Result<(), Self::Error> {
+    fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
         let before = args.before as usize;
         let after = args.after as usize;
         let value = self.pop();
@@ -1584,9 +1581,9 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.13: BUILD_SLICE creates a slice object from 2 or 3 stack items
     fn build_slice(
         &mut self,
-        argc: pyre_bytecode::bytecode::BuildSliceArgCount,
+        argc: crate::bytecode::BuildSliceArgCount,
     ) -> Result<(), Self::Error> {
-        use pyre_bytecode::bytecode::BuildSliceArgCount;
+        use crate::bytecode::BuildSliceArgCount;
         let step = match argc {
             BuildSliceArgCount::Three => self.pop(),
             BuildSliceArgCount::Two => pyre_object::w_none(),
@@ -1730,8 +1727,8 @@ impl OpcodeStepExecutor for PyFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
     use crate::{PyExecutionContext, function_new};
-    use pyre_bytecode::*;
     use std::rc::Rc;
 
     fn run_eval(source: &str) -> PyResult {

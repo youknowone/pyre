@@ -9,7 +9,7 @@
 /// failures, execution transfers to the bridge instead of returning to
 /// the interpreter.
 use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_roots};
-use majit_codegen::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
+use majit_backend::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
 use majit_ir::{AccumVectorInfo, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;

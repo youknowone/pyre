@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use majit_codegen::JitCellToken;
+use majit_backend::JitCellToken;
 use majit_ir::Type;
 
 use crate::counter::JitCounter;

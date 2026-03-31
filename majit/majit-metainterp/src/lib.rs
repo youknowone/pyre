@@ -55,7 +55,7 @@ pub use jitcode::{
     trace_jitcode_with_runtime,
 };
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
-pub use majit_codegen::CompiledTraceInfo;
+pub use majit_backend::CompiledTraceInfo;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
@@ -147,7 +147,7 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 
 // ── we_are_jitted / JIT mode flag ──
 // Re-exported from majit-codegen so both meta and backend can access it.
-pub use majit_codegen::{JittedGuard, set_jitted, we_are_jitted};
+pub use majit_backend::{JittedGuard, set_jitted, we_are_jitted};
 
 /// Generic guard state restore for storage-pool interpreters.
 ///

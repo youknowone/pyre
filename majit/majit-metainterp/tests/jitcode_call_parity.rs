@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use majit_codegen::JitCellToken;
+use majit_backend::JitCellToken;
 use majit_ir::{GcRef, OpCode, Type};
 use majit_metainterp::{
     BackEdgeAction, JitCallArg, JitCodeBuilder, JitCodeMachine, JitCodeSym, MIFrame, MetaInterp,

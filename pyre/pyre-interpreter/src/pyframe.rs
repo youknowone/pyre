@@ -8,8 +8,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
+use crate::CodeObject;
 use crate::{PyExecutionContext, PyNamespace, PyObjectArray};
-use pyre_bytecode::CodeObject;
 use pyre_object::*;
 
 // Ensure *const PyExecutionContext and Rc<PyExecutionContext> have the same
@@ -1120,8 +1120,8 @@ impl PyFrame {
     /// Load a constant from the code object by raw index.
     /// Used by the blackhole interpreter's bh_load_const_fn.
     pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
+        use crate::bytecode::ConstantData;
         use num_traits::ToPrimitive;
-        use pyre_bytecode::bytecode::ConstantData;
         let code = self.code();
         // RPython: constants are in JitCode.constants_r. In pyre, we resolve
         // from the CodeObject's constant table at runtime.

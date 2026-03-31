@@ -7,6 +7,10 @@
 //! import machinery (importing.rs), builtin functions (builtins.rs),
 //! type definitions (typedef.rs), and builtin modules (module/).
 
+// ── Bytecode / compiler re-exports (was pyre-bytecode) ──
+pub mod compile;
+pub use compile::*;
+
 // ── Core interpreter modules ──
 pub mod baseobjspace;
 pub mod builtins;
