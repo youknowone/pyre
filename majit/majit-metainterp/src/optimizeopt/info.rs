@@ -551,25 +551,21 @@ impl PtrInfo {
     /// In majit we queue the generated ops via emit_through_passes() so the
     /// optimizer chain can observe them again. Callers that are outside the
     /// pass chain must explicitly drain ctx.extra_operations afterward.
-    pub fn force_to_ops(
-        &mut self,
-        opref: OpRef,
-        ctx: &mut crate::optimizeopt::OptContext,
-    ) -> OpRef {
-        self.force_to_ops_impl(opref, ctx, false)
+    pub fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
+        self.force_box_impl(opref, ctx, false)
     }
 
-    /// Like force_to_ops but emits directly to new_operations (bypasses pass
+    /// Like force_box but emits directly to new_operations (bypasses pass
     /// chain). Used by emitting_operation where drain would re-virtualize.
-    pub fn force_to_ops_direct(
+    pub fn force_box_direct(
         &mut self,
         opref: OpRef,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> OpRef {
-        self.force_to_ops_impl(opref, ctx, true)
+        self.force_box_impl(opref, ctx, true)
     }
 
-    fn force_to_ops_impl(
+    fn force_box_impl(
         &mut self,
         opref: OpRef,
         ctx: &mut crate::optimizeopt::OptContext,
@@ -585,7 +581,7 @@ impl PtrInfo {
             let value_ref = ctx.get_box_replacement(value_ref);
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    return info.force_to_ops_impl(value_ref, ctx, direct);
+                    return info.force_box_impl(value_ref, ctx, direct);
                 }
             }
             value_ref
@@ -686,7 +682,7 @@ impl PtrInfo {
                         .map(|(_, d)| d.clone());
                     debug_assert!(
                         descr.is_some(),
-                        "force_to_ops: field_idx={} has value but no descriptor \
+                        "force_box: field_idx={} has value but no descriptor \
                          — field_descrs out of sync with fields",
                         field_idx,
                     );
@@ -732,7 +728,7 @@ impl PtrInfo {
                     // bug in field/descriptor propagation.
                     debug_assert!(
                         descr.is_some(),
-                        "force_to_ops: field_idx={} has value but no descriptor \
+                        "force_box: field_idx={} has value but no descriptor \
                          — field_descrs out of sync with fields",
                         field_idx,
                     );
@@ -1052,135 +1048,6 @@ impl PtrInfo {
         }
     }
 
-    /// info.py: force_box(op, optforce)
-    ///
-    /// If this PtrInfo is virtual, generate the operations needed to
-    /// materialize the virtual object into a concrete allocation.
-    /// Returns a Vec of ops to emit (NEW + SETFIELD/SETARRAYITEM).
-    /// If not virtual, returns empty vec (caller uses original op).
-    pub fn force_box(&self, original_opref: OpRef) -> Vec<Op> {
-        if !self.is_virtual() {
-            return vec![];
-        }
-        let mut ops = Vec::new();
-        match self {
-            PtrInfo::Virtual(v) => {
-                // Emit: NEW_WITH_VTABLE(vtable)
-                let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
-                new_op.descr = Some(v.descr.clone());
-                new_op.pos = original_opref;
-                ops.push(new_op);
-                // Emit: SETFIELD_GC for each field
-                for &(field_idx, value) in &v.fields {
-                    if !value.is_none() {
-                        let mut set_op = Op::new(OpCode::SetfieldGc, &[original_opref, value]);
-                        // The field descriptor index is embedded in the op's descr
-                        // (normally the Descr carries the offset). For now, just
-                        // record the field index for the caller to resolve.
-                        let _ = field_idx;
-                        ops.push(set_op);
-                    }
-                }
-            }
-            PtrInfo::VirtualStruct(v) => {
-                let mut new_op = Op::new(OpCode::New, &[]);
-                new_op.descr = Some(v.descr.clone());
-                new_op.pos = original_opref;
-                ops.push(new_op);
-                for &(field_idx, value) in &v.fields {
-                    if !value.is_none() {
-                        let set_op = Op::new(OpCode::SetfieldGc, &[original_opref, value]);
-                        let _ = field_idx;
-                        ops.push(set_op);
-                    }
-                }
-            }
-            PtrInfo::VirtualArray(v) => {
-                let len_const = OpRef(10000 + v.items.len() as u32); // placeholder
-                let mut new_op = Op::new(OpCode::NewArray, &[len_const]);
-                new_op.descr = Some(v.descr.clone());
-                new_op.pos = original_opref;
-                ops.push(new_op);
-                for (i, &item) in v.items.iter().enumerate() {
-                    if !item.is_none() {
-                        let idx_const = OpRef(10000 + i as u32); // placeholder
-                        let set_op =
-                            Op::new(OpCode::SetarrayitemGc, &[original_opref, idx_const, item]);
-                        ops.push(set_op);
-                    }
-                }
-            }
-            _ => {}
-        }
-        ops
-    }
-
-    /// Copy fields from this virtual info to another.
-    /// info.py: _force_elements(op, optforce, descr)
-    ///
-    /// Generate SETFIELD_GC/SETARRAYITEM_GC ops for each field/item
-    /// of a virtual, using field descriptors from the allocation descriptor.
-    /// Returns ops to emit and clears the fields in the virtual.
-    pub fn force_elements(&mut self, obj_opref: OpRef) -> Vec<Op> {
-        let mut ops = Vec::new();
-        match self {
-            PtrInfo::Virtual(v) => {
-                for (field_idx, value) in v.fields.iter_mut() {
-                    if !value.is_none() {
-                        let set_op = Op::new(OpCode::SetfieldGc, &[obj_opref, *value]);
-                        ops.push(set_op);
-                        *value = OpRef::NONE; // clear after forcing
-                    }
-                }
-            }
-            PtrInfo::VirtualStruct(v) => {
-                for (field_idx, value) in v.fields.iter_mut() {
-                    if !value.is_none() {
-                        let set_op = Op::new(OpCode::SetfieldGc, &[obj_opref, *value]);
-                        ops.push(set_op);
-                        *value = OpRef::NONE;
-                    }
-                }
-            }
-            PtrInfo::VirtualArray(v) => {
-                for (i, item) in v.items.iter_mut().enumerate() {
-                    if !item.is_none() {
-                        let idx_ref = OpRef(10000 + i as u32);
-                        let set_op = Op::new(OpCode::SetarrayitemGc, &[obj_opref, idx_ref, *item]);
-                        ops.push(set_op);
-                        *item = OpRef::NONE;
-                    }
-                }
-            }
-            PtrInfo::VirtualArrayStruct(v) => {
-                for (elem_idx, fields) in v.element_fields.iter_mut().enumerate() {
-                    for (field_idx, value) in fields.iter_mut() {
-                        if !value.is_none() {
-                            let idx_ref = OpRef(10000 + elem_idx as u32);
-                            let set_op =
-                                Op::new(OpCode::SetinteriorfieldGc, &[obj_opref, idx_ref, *value]);
-                            ops.push(set_op);
-                            *value = OpRef::NONE;
-                        }
-                    }
-                }
-            }
-            PtrInfo::VirtualRawBuffer(v) => {
-                for entry in v.entries.iter_mut() {
-                    let (offset, _len, ref mut value) = *entry;
-                    if !value.is_none() {
-                        let offset_ref = OpRef(10000 + offset as u32);
-                        let set_op = Op::new(OpCode::RawStore, &[obj_opref, offset_ref, *value]);
-                        ops.push(set_op);
-                        *value = OpRef::NONE;
-                    }
-                }
-            }
-            _ => {}
-        }
-        ops
-    }
-
     /// info.py: produce_short_preamble_ops(structbox, descr, index, optimizer, shortboxes)
     ///
     /// Add cached field values to the short preamble builder.
@@ -1220,36 +1087,6 @@ impl PtrInfo {
             }
         }
         result
-    }
-
-    /// info.py: copy_fields_to_const()
-    pub fn copy_fields_to(&self, other: &mut PtrInfo) {
-        match (self, other) {
-            (PtrInfo::Instance(src), PtrInfo::Instance(dst)) => {
-                dst.fields = src.fields.clone();
-                dst.field_descrs = src.field_descrs.clone();
-            }
-            (PtrInfo::Struct(src), PtrInfo::Struct(dst)) => {
-                dst.fields = src.fields.clone();
-                dst.field_descrs = src.field_descrs.clone();
-            }
-            (PtrInfo::Array(src), PtrInfo::Array(dst)) => {
-                dst.items = src.items.clone();
-                dst.lenbound = src.lenbound.clone();
-            }
-            (PtrInfo::Virtual(src), PtrInfo::Virtual(dst)) => {
-                dst.fields = src.fields.clone();
-                dst.field_descrs = src.field_descrs.clone();
-            }
-            (PtrInfo::VirtualStruct(src), PtrInfo::VirtualStruct(dst)) => {
-                dst.fields = src.fields.clone();
-                dst.field_descrs = src.field_descrs.clone();
-            }
-            (PtrInfo::VirtualArray(src), PtrInfo::VirtualArray(dst)) => {
-                dst.items = src.items.clone();
-            }
-            _ => {}
-        }
     }
 }
 

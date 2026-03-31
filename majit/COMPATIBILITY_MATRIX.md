@@ -126,7 +126,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Missing: variable-index array caching (`cache_varindex_read/write`, `lookup_cached`)
 - Missing: aliasing analysis (`_cannot_alias_via_content`, `_cannot_alias_via_classes_or_lengths`)
 - Missing: `serialize_optheap()` / `deserialize_optheap()` (bridge 지식 직렬화)
-- Missing: `force_lazy_sets_for_guard()` (가드 전용 선택적 lazy set forcing → pendingfields)
+- Implemented: `force_lazy_sets_for_guard()` (가드 전용 선택적 lazy set forcing → pendingfields → rd_pendingfields)
 - Missing: `clean_caches()` (순수 필드만 보존하는 선택적 무효화)
 - Missing: `FieldUpdater` 패턴 (field update 조율 헬퍼)
 - Note: pendingfields, DICT_LOOKUP, postponed ops, GUARD_NO_EXCEPTION은 구현됨

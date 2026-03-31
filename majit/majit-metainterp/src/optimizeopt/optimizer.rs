@@ -1099,7 +1099,7 @@ impl Optimizer {
                 // Always emit force ops directly to new_operations.
                 // RPython info.py: force_box→emit_extra inserts ops at the
                 // current position so they appear BEFORE the current op.
-                let forced = info.force_to_ops_direct(resolved, ctx);
+                let forced = info.force_box_direct(resolved, ctx);
                 return ctx.get_box_replacement(forced);
             }
         }
@@ -1132,7 +1132,7 @@ impl Optimizer {
             }
             // RPython AbstractVirtualPtrInfo._force_at_the_end_of_preamble():
             // top-level instance-like virtuals fall back to force_box().
-            let forced_ref = info.force_to_ops_direct(resolved, ctx);
+            let forced_ref = info.force_box_direct(resolved, ctx);
             if let Some(new_info) = ctx.get_ptr_info(forced_ref).cloned() {
                 let mut updated = new_info;
                 updated.force_at_the_end_of_preamble(|child| {
@@ -2505,7 +2505,7 @@ impl Optimizer {
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
         // guards even when the guard is emitted by an earlier pass.
-        // force_to_ops_direct emits directly to new_operations, so no drain needed.
+        // force_box_direct emits directly to new_operations, so no drain needed.
         for pass in &mut self.passes {
             pass.emitting_operation(&op, ctx);
         }
@@ -2547,6 +2547,11 @@ impl Optimizer {
                     last.opcode != OpCode::GuardNotForced && last.opcode != OpCode::GuardNotForced2
                 })
             {
+                self.last_guard_op = None;
+            }
+            // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share resume
+            // data with a previous guard.
+            if opcode == OpCode::GuardAlwaysFails {
                 self.last_guard_op = None;
             }
 
@@ -2769,7 +2774,7 @@ impl Optimizer {
             // Majit deviation: collect_virtual_field_values forces nested
             // virtuals. RPython's visitor_walk_recursive only collects.
             //
-            // Why forcing is needed: force_to_ops_direct creates concrete
+            // Why forcing is needed: force_box_direct creates concrete
             // New()+SetfieldGc ops. The forced OpRef is then a valid
             // Cranelift variable. Without forcing, virtual field value
             // OpRefs have no concrete op in the body loop, so Cranelift
@@ -2799,7 +2804,7 @@ impl Optimizer {
                             virtual_slots.push((fa_idx, resolved));
                             fail_args[fa_idx] = OpRef::NONE;
                         } else {
-                            let forced = info.force_to_ops_direct(resolved, ctx);
+                            let forced = info.force_box_direct(resolved, ctx);
                             fail_args[fa_idx] = ctx.get_box_replacement(forced);
                         }
                         continue;
@@ -2841,7 +2846,7 @@ impl Optimizer {
                                     virtual_slots.push((fa_idx, resolved));
                                 } else {
                                     // Unsupported virtual kind (Array etc.) → force.
-                                    let forced = info.force_to_ops_direct(resolved, ctx);
+                                    let forced = info.force_box_direct(resolved, ctx);
                                     fail_args[fa_idx] = ctx.get_box_replacement(forced);
                                 }
                             } else {
@@ -2870,7 +2875,7 @@ impl Optimizer {
             } else {
                 // Unsupported virtual kind (Array etc.) → force to concrete.
                 let mut info_mut = info;
-                let forced = info_mut.force_to_ops_direct(resolved, ctx);
+                let forced = info_mut.force_box_direct(resolved, ctx);
                 fail_args[fa_idx] = ctx.get_box_replacement(forced);
             }
         }
@@ -2939,7 +2944,7 @@ impl Optimizer {
             if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
                 if nested.is_virtual() {
                     let mut nested_mut = nested;
-                    let forced = nested_mut.force_to_ops_direct(final_ref, ctx);
+                    let forced = nested_mut.force_box_direct(final_ref, ctx);
                     final_ref = ctx.get_box_replacement(forced);
                 }
             }
@@ -3961,7 +3966,7 @@ mod tests {
         match ctx.get_ptr_info(result) {
             Some(PtrInfo::VirtualStruct(info)) => {
                 // The inner virtual (OpRef(20)) was also forced; its allocation
-                // ref is whatever force_to_ops assigned.
+                // ref is whatever force_box assigned.
                 assert_eq!(info.fields.len(), 1);
                 assert_eq!(info.fields[0].0, 1);
             }
@@ -3991,7 +3996,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let forced = opt.force_box(OpRef(10), &mut ctx);
         assert_ne!(forced, OpRef(10));
-        // force_box uses force_to_ops_direct → emits to new_operations
+        // force_box uses force_box_direct → emits to new_operations
         assert!(
             ctx.new_operations
                 .iter()
