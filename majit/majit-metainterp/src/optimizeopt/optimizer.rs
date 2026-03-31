@@ -779,7 +779,8 @@ impl Optimizer {
                     });
                 *label_slot += 1;
                 Self::apply_imported_virtual_state(info, opref, ctx);
-                ctx.get_box_replacement(opref)
+                let resolved = ctx.get_box_replacement(opref);
+                resolved
             }
         }
     }
@@ -2772,17 +2773,20 @@ impl Optimizer {
             // RPython: finish() handles everything without forcing.
             //
             // Majit deviation: collect_virtual_field_values forces nested
-            // virtuals. RPython's visitor_walk_recursive only collects.
+            // virtuals. RPython's _number_virtuals only collects.
             //
-            // Root cause: Phase 2 virtual PtrInfo field values reference
-            // Phase 1 OpRefs that weren't remapped to Phase 2 LABEL args.
-            // Without forcing, the snapshot path's _number_virtuals reads
-            // these stale field values → wrong rd_virtuals_info encoding →
-            // guard recovery produces incorrect values (fib_loop wrong output).
-            // Forcing creates concrete ops, bypassing _number_virtuals entirely.
+            // Root cause: virtual field values share Cranelift variable
+            // positions with body ops. LABEL defines v22 = prev iteration,
+            // but body IntAddOvf redefines v22 = current result. The
+            // virtual field still references v22, getting wrong value.
+            // RPython Boxes have unique identity, preventing this collision.
             //
-            // Prerequisite for removal: fix Phase 2 virtual field value
-            // mapping in setinfo_from_preamble / import_virtual_state.
+            // Additionally, install_imported_virtuals label_slot aliasing
+            // can cause multiple virtual field values to reference the same
+            // LABEL arg, producing incorrect values.
+            //
+            // Prerequisite for removal: Box identity parity for LABEL args
+            // used as virtual field values (Cranelift variable separation).
             let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
             let mut extra_fail_args: Vec<OpRef> = Vec::new();
             let original_len = fail_args.len();
