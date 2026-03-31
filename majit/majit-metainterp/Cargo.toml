@@ -13,5 +13,4 @@ majit-gc = { path = "../majit-gc" }
 [dev-dependencies]
 majit-macros = { path = "../majit-macros" }
 majit-gc = { path = "../majit-gc" }
-majit-runtime = { path = "../majit-runtime" }
 smallvec = "1"

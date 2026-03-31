@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn test_traceable_opcodes() {
-        // majit-analyze classifies opcodes based on static analysis.
+        // majit-codewriter classifies opcodes based on static analysis.
         // VableArrayRead/Write are the primary classified patterns for
         // locals/cells access (LoadFast → VableArrayRead etc.).
         assert!(is_traceable("VableArrayRead"));

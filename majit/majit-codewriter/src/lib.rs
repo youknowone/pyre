@@ -1,6 +1,7 @@
-//! majit-analyze: Static program analyzer for meta-tracing JIT generation.
+//! majit-codewriter: JIT code generation pipeline.
 //!
-//! This is the Rust equivalent of RPython's translation toolchain.
+//! RPython equivalent: `rpython/jit/codewriter/`
+//!
 //! Given a bundled interpreter source file, it:
 //! 1. Parses the entire crate with `syn`
 //! 2. Extracts the opcode dispatch table (match arms)
@@ -15,6 +16,7 @@ pub mod codewriter;
 mod field_match;
 pub mod front;
 pub mod graph;
+pub mod hints;
 mod parse;
 pub mod passes;
 mod patterns;
@@ -777,7 +779,7 @@ mod tests {
 
             impl Frame {
                 fn load_fast(&mut self) -> i64 {
-                    let idx = majit_runtime::hint_access_directly(self.next_instr);
+                    let idx = self.next_instr;
                     self.locals_w[idx]
                 }
             }

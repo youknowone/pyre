@@ -8,6 +8,27 @@ use syn::{
     Local, Pat, Path, ReturnType, Stmt, Type, UnOp,
 };
 
+// Duplicated from majit-codewriter::hints — proc-macro crates cannot depend
+// on heavy library crates, so we inline the small enum + classifier here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualizableHintKind {
+    AccessDirectly,
+    FreshVirtualizable,
+    ForceVirtualizable,
+}
+
+fn classify_virtualizable_hint_segments<'a, I>(segments: I) -> Option<VirtualizableHintKind>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    match segments.into_iter().last().unwrap_or_default() {
+        "hint_access_directly" => Some(VirtualizableHintKind::AccessDirectly),
+        "hint_fresh_virtualizable" => Some(VirtualizableHintKind::FreshVirtualizable),
+        "hint_force_virtualizable" => Some(VirtualizableHintKind::ForceVirtualizable),
+        _ => None,
+    }
+}
+
 // ── LowererConfig ────────────────────────────────────────────────────
 
 /// Configuration for storage-aware JitCode lowering.
@@ -48,15 +69,13 @@ pub struct LowererConfig {
 
 const MAX_HELPER_CALL_ARITY: usize = 16;
 
-fn classify_virtualizable_hint_syn_path(
-    path: &Path,
-) -> Option<majit_runtime::VirtualizableHintKind> {
+fn classify_virtualizable_hint_syn_path(path: &Path) -> Option<VirtualizableHintKind> {
     let segments = path
         .segments
         .iter()
         .map(|seg| seg.ident.to_string())
         .collect::<Vec<_>>();
-    majit_runtime::classify_virtualizable_hint_segments(segments.iter().map(String::as_str))
+    classify_virtualizable_hint_segments(segments.iter().map(String::as_str))
 }
 
 pub(crate) struct InlineHelperJitCode {
@@ -586,7 +605,7 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         let hint = classify_virtualizable_hint_syn_path(&mac.mac.path)?;
-        if hint != majit_runtime::VirtualizableHintKind::ForceVirtualizable {
+        if hint != VirtualizableHintKind::ForceVirtualizable {
             return None;
         }
         self.statements.push(quote! {
@@ -612,8 +631,7 @@ impl<'c> Lowerer<'c> {
         };
         match func_name {
             Some(
-                majit_runtime::VirtualizableHintKind::AccessDirectly
-                | majit_runtime::VirtualizableHintKind::FreshVirtualizable,
+                VirtualizableHintKind::AccessDirectly | VirtualizableHintKind::FreshVirtualizable,
             ) => {
                 let arg = call.args.first()?;
                 self.lower_value_expr(arg)
@@ -640,8 +658,7 @@ impl<'c> Lowerer<'c> {
         };
         match classify_virtualizable_hint_syn_path(&mac.mac.path) {
             Some(
-                majit_runtime::VirtualizableHintKind::AccessDirectly
-                | majit_runtime::VirtualizableHintKind::FreshVirtualizable,
+                VirtualizableHintKind::AccessDirectly | VirtualizableHintKind::FreshVirtualizable,
             ) => Some(()),
             _ => None,
         }

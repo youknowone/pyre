@@ -15,7 +15,7 @@ pub mod state;
 pub mod trace;
 pub mod virtualizable_spec;
 
-/// Auto-generated trace functions from majit-analyze.
+/// Auto-generated trace functions from majit-codewriter.
 #[allow(dead_code, unused_imports)]
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));

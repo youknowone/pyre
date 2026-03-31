@@ -1846,15 +1846,11 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // Step 4: non-data descriptor
             // PyPy: descroperation.py — invoke __get__ to bind methods
             if let Some(descr) = w_descr {
-                // Builtin methods found via type MRO must be bound to the
-                // instance (PyPy: function.py Function.__get__ returns bound method)
-                if crate::is_builtin_code(descr) {
-                    return Ok(pyre_object::w_method_new(descr, obj, w_type));
-                }
                 if let Some(result) = get(descr, obj, w_type) {
                     return Ok(result);
                 }
-                // Step 5: return descriptor as-is
+                // Step 5: return descriptor as-is (e.g. builtin_function_or_method
+                // does not bind self when accessed on an instance)
                 return Ok(descr);
             }
 

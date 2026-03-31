@@ -1,6 +1,14 @@
 use majit_macros::jit_interp;
 use majit_metainterp::JitDriver;
 
+/// Marker macros — `#[jit_interp]` rewrites these before they execute.
+macro_rules! jit_merge_point {
+    ($($tt:tt)*) => { $( let _ = ::core::hint::black_box(&$tt); )* };
+}
+macro_rules! can_enter_jit {
+    ($($tt:tt)*) => { $( let _ = ::core::hint::black_box(&$tt); )* };
+}
+
 const UNTRACEABLE: usize = 99;
 const OP_BACKEDGE: u8 = 1;
 const OP_STOP: u8 = 2;
@@ -116,21 +124,13 @@ mod explicit_case {
         let mut ip = start_ip;
         let mut sp_len = -1;
         while ip < env.ops.len() {
-            majit_runtime::jit_merge_point!(jit_drv, env, ip);
+            jit_merge_point!(jit_drv, env, ip);
             let op = env.get_op(ip);
             match op {
                 OP_BACKEDGE => {
                     vm_state.push(77);
                     let target = env.get_target(ip);
-                    majit_runtime::can_enter_jit!(
-                        jit_drv,
-                        target,
-                        vm_state,
-                        env,
-                        || {},
-                        ip,
-                        sp_len
-                    );
+                    can_enter_jit!(jit_drv, target, vm_state, env, || {}, ip, sp_len);
                     ip += 1;
                 }
                 OP_STOP => break,
@@ -187,13 +187,13 @@ mod legacy_case {
         let mut pc = start_pc;
         let mut stacksize = -1;
         while pc < program.ops.len() {
-            majit_runtime::jit_merge_point!();
+            jit_merge_point!();
             let op = program.get_op(pc);
             match op {
                 OP_BACKEDGE => {
                     state.push(11);
                     let target = program.get_target(pc);
-                    majit_runtime::can_enter_jit!(driver, target, state, program, || {});
+                    can_enter_jit!(driver, target, state, program, || {});
                     pc += 1;
                 }
                 OP_STOP => break,
@@ -251,13 +251,13 @@ mod structured_green_case {
         let mut pc = start_pc;
         let mut stacksize = -1;
         while pc < program.ops.len() {
-            majit_runtime::jit_merge_point!();
+            jit_merge_point!();
             let op = program.get_op(pc);
             match op {
                 OP_BACKEDGE => {
                     state.push(33);
                     let target = program.get_target(pc);
-                    majit_runtime::can_enter_jit!(driver, target, state, program, || {});
+                    can_enter_jit!(driver, target, state, program, || {});
                     pc += 1;
                 }
                 OP_STOP => break,
@@ -314,13 +314,13 @@ mod marker_green_tuple_case {
         let mut pc = start_pc;
         let mut stacksize = -1;
         while pc < program.ops.len() {
-            majit_runtime::jit_merge_point!(driver, program, pc; state.selected, 321_i64);
+            jit_merge_point!(driver, program, pc; state.selected, 321_i64);
             let op = program.get_op(pc);
             match op {
                 OP_BACKEDGE => {
                     state.push(44);
                     let target = program.get_target(pc);
-                    majit_runtime::can_enter_jit!(
+                    can_enter_jit!(
                         driver,
                         target,
                         state,
