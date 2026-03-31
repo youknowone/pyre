@@ -3217,13 +3217,33 @@ fn resolve_opref(
     if opref.is_none() {
         return builder.ins().iconst(cl_types::I64, 0);
     }
-    DECLARED_VARS_DEBUG.with(|cell| {
-        if let Some(ref dv) = *cell.borrow() {
-            if !dv.contains(&opref.0) {
-                eprintln!("[cranelift] UNDECLARED var{} at use_var", opref.0);
-            }
-        }
+    // Safety net: verify this OpRef has a defined Cranelift variable
+    // (either an op result or a declared input arg) before calling use_var.
+    // RPython's regalloc tracks all Boxes; Cranelift only has def_var for
+    // emitted ops and input args. If the optimizer's forwarding chain left
+    // an unmaterialized OpRef in fail_args, return zero rather than reading
+    // an undefined variable.
+    let is_op_result = OP_RESULT_VARS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|rv| rv.contains(&opref.0))
     });
+    if !is_op_result {
+        let is_declared = DECLARED_VARS_DEBUG.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|dv| dv.contains(&opref.0))
+        });
+        if !is_declared {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[cranelift] WARN: OpRef({}) has no def_var, using zero fallback",
+                    opref.0
+                );
+            }
+            return builder.ins().iconst(cl_types::I64, 0);
+        }
+    }
     builder.use_var(var(opref.0))
 }
 
