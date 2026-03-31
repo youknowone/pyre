@@ -20,7 +20,14 @@ pub struct FieldRoleSpec {
 }
 
 /// Virtualizable scalar fields in canonical index order.
-pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[("next_instr", 0), ("valuestackdepth", 1)];
+/// interp_jit.py:25-32: last_instr, pycode, valuestackdepth, ..., w_globals
+/// pyre maps: last_instr → next_instr, pycode → code, w_globals → namespace
+pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
+    ("next_instr", 0),      // interp_jit.py:25 last_instr
+    ("code", 1),            // interp_jit.py:25 pycode
+    ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
+    ("namespace", 3),       // interp_jit.py:31 w_globals
+];
 
 /// Virtualizable array fields in canonical index order.
 pub const PYFRAME_VABLE_ARRAYS: &[(&str, usize)] = &[("locals_cells_stack_w", 0)];
