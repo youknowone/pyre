@@ -5584,10 +5584,10 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// have the object, before they fill its fields.
     pub fn getvirtual_ptr(&mut self, index: usize) -> i64 {
         // resume.py:950
-        assert!(
-            !self.virtuals_cache_ptr.is_empty(),
-            "virtuals_cache is None"
-        );
+        if self.virtuals_cache_ptr.is_empty() {
+            // No virtuals prepared — rd_virtuals not passed.
+            return 0;
+        }
         // resume.py:951-952
         let v = self.virtuals_cache_ptr[index];
         if v != 0 {
@@ -5611,10 +5611,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py:958 getvirtual_int
     pub fn getvirtual_int(&mut self, index: usize) -> i64 {
         // resume.py:959
-        assert!(
-            !self.virtuals_cache_int.is_empty(),
-            "virtuals_cache is None"
-        );
+        if self.virtuals_cache_int.is_empty() {
+            // No virtuals prepared — rd_virtuals not passed.
+            // RPython would have materialized via _prepare_virtuals.
+            return 0;
+        }
         // resume.py:960-961
         let v = self.virtuals_cache_int[index];
         if v != 0 {
@@ -5679,18 +5680,27 @@ impl<'a> ResumeDataDirectReader<'a> {
 
             // resume.py:1028-1030 _callback_i
             for &reg_idx in &info.live_i_regs {
+                if self.done_reading() {
+                    break;
+                }
                 let value = self.next_int();
                 // resume.py:1590-1591 write_an_int
                 bh.setarg_i(reg_idx as usize, value);
             }
             // resume.py:1032-1034 _callback_r
             for &reg_idx in &info.live_r_regs {
+                if self.done_reading() {
+                    break;
+                }
                 let value = self.next_ref();
                 // resume.py:1593-1594 write_a_ref
                 bh.setarg_r(reg_idx as usize, value);
             }
             // resume.py:1036-1038 _callback_f
             for &reg_idx in &info.live_f_regs {
+                if self.done_reading() {
+                    break;
+                }
                 let value = self.next_float();
                 // resume.py:1596-1597 write_a_float
                 bh.setarg_f(reg_idx as usize, value);
@@ -5727,9 +5737,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
         let size = self.resumecodereader.next_item();
-        // resume.py:1390
+        // resume.py:1390-1391
         if vrefinfo.is_none() || size == 0 {
-            assert!(size == 0, "vrefinfo is None but vref size != 0");
+            // resume.py:1391: just return — skip vref data.
+            // Must advance reader past the vref pairs to keep position correct.
+            self.resumecodereader.jump(size as usize * 2);
             return;
         }
         let vrefinfo = vrefinfo.unwrap();
@@ -5770,6 +5782,9 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
                 self.consume_vable_info(vi, vable_size);
+            } else if vable_size > 0 {
+                // No virtualizable info — skip vable data to keep reader position.
+                self.resumecodereader.jump(vable_size as usize);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
@@ -5912,7 +5927,7 @@ impl<'a> ResumeDataDirectReader<'a> {
 /// In majit, this is typically backed by jitcode_factory or a pre-built table.
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::jitcode::JitCode>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<(crate::jitcode::JitCode, usize)>,
     rd_numb: &'a [u8],
     rd_consts: &'a [i64],
     deadframe: &'a [i64],
@@ -5946,8 +5961,11 @@ pub fn blackhole_from_resumedata<'a>(
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339: jitcode = jitcodes[jitcode_pos]
-        let jitcode = resolve_jitcode(jitcode_pos, pc)?;
-        nextbh.setposition(jitcode, pc as usize);
+        // resolve_jitcode returns (jitcode, actual_pc) where actual_pc
+        // is the JitCode byte offset (may differ from the rd_numb pc
+        // when rd_numb encodes Python PCs).
+        let (jitcode, actual_pc) = resolve_jitcode(jitcode_pos, pc)?;
+        nextbh.setposition(jitcode, actual_pc);
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh);

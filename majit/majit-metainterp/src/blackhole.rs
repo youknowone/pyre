@@ -2203,7 +2203,7 @@ pub fn convert_and_run_from_pyjitpl(
 /// `resolve_jitcode` is `metainterp_sd.jitcodes[jitcode_pos]` in RPython.
 pub fn resume_in_blackhole(
     builder: &mut BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<JitCode>,
+    resolve_jitcode: &dyn Fn(i32, i32) -> Option<(JitCode, usize)>,
     rd_numb: &[u8],
     rd_consts: &[i64],
     deadframe: &[i64],

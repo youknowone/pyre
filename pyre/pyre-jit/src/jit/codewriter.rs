@@ -133,18 +133,24 @@ impl CodeWriter {
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
         let nlocals = code.varnames.len();
-        // RPython parity: Python bytecode locals / stack hold PyObject refs.
-        // Keep object values in ref registers, and reserve a separate int
-        // scratch bank for opcode immediates, truth flags, and the frame ptr.
-        let obj_tmp0 = nlocals as u16;
-        let obj_tmp1 = (nlocals + 1) as u16;
-        let arg_regs_start = (nlocals + 2) as u16; // up to CALL 8
-        let null_ref_reg = (nlocals + 10) as u16; // permanently zero / null
+        // regalloc.py parity: all values (locals + stack temporaries) live in
+        // typed register files. The value stack is mapped to ref registers
+        // starting at `stack_base`.
+        let max_stackdepth = code.max_stackdepth.max(1) as usize;
+        let stack_base = nlocals as u16;
+        let obj_tmp0 = (nlocals + max_stackdepth) as u16;
+        let obj_tmp1 = (nlocals + max_stackdepth + 1) as u16;
+        let arg_regs_start = (nlocals + max_stackdepth + 2) as u16;
+        let null_ref_reg = (nlocals + max_stackdepth + 10) as u16;
 
         let int_tmp0 = 0u16;
         let int_tmp1 = 1u16;
         let op_code_reg = 2u16;
         let frame_reg = 3u16;
+
+        // regalloc.py: compile-time stack depth counter — tracks which
+        // stack register (stack_base + depth) is the current TOS.
+        let mut current_depth: u16 = 0;
 
         // RPython: self.assembler = Assembler()
         let mut assembler = JitCodeBuilder::default();
@@ -203,6 +209,21 @@ impl CodeWriter {
             }
         }
 
+        // Exception table: handler target PC → handler stack depth.
+        // Python sets the stack depth to handler.depth (+1 if push_lasti)
+        // at exception handler entry. Used to correct current_depth at
+        // non-linear control flow points.
+        let handler_depth_at: std::collections::HashMap<usize, u16> = {
+            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+            entries
+                .iter()
+                .map(|e| {
+                    let extra = if e.push_lasti { 1u16 } else { 0 };
+                    (e.target as usize, e.depth as u16 + extra + 1)
+                })
+                .collect()
+        };
+
         // pc_map: Python PC → JitCode byte offset
         let mut pc_map = vec![0usize; num_instrs];
 
@@ -211,11 +232,21 @@ impl CodeWriter {
         // For pyre, we combine both steps: walk Python bytecodes and emit
         // JitCode bytecodes directly.
         let mut arg_state = OpArgState::default();
+        // liveness.py parity: record stack depth at each Python PC for
+        // precise liveness generation. Stack registers stack_base..stack_base+depth
+        // are live at each PC.
+        let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
         for py_pc in 0..num_instrs {
+            // Exception handler entry: Python resets stack depth to the
+            // handler's specified depth. Correct current_depth to match.
+            if let Some(&handler_depth) = handler_depth_at.get(&py_pc) {
+                current_depth = handler_depth;
+            }
             // RPython flatten.py: Label(block) at block entry
             assembler.mark_label(labels[py_pc]);
             pc_map[py_pc] = assembler.current_pos();
+            depth_at_pc[py_pc] = current_depth;
 
             // RPython jtransform.py:1690 + blackhole.py:1066 parity:
             // Emit BC_JUMP_TARGET at loop headers (JUMP_BACKWARD targets).
@@ -239,21 +270,21 @@ impl CodeWriter {
                     // RPython: no-op operations produce no jitcode output
                 }
 
-                // RPython flatten.py: input args → registers 0..n-1
+                // flatten.py: input args → registers 0..n-1
+                // regalloc.py: LOAD_FAST = ref_copy local → stack register
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
-                    assembler.push_r(reg);
+                    assembler.move_r(stack_base + current_depth, reg);
+                    current_depth += 1;
                 }
 
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
-                    assembler.pop_r(reg);
+                    current_depth -= 1;
+                    assembler.move_r(reg, stack_base + current_depth);
                 }
 
                 Instruction::LoadSmallInt { i } => {
-                    // RPython parity: Python stack carries boxed object refs.
-                    // Box the raw integer via w_int_new and keep the result in
-                    // the ref register file.
                     let val = i.get(op_arg) as u32 as i64;
                     assembler.load_const_i_value(int_tmp0, val);
                     assembler.call_ref_typed(
@@ -261,13 +292,11 @@ impl CodeWriter {
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 Instruction::LoadConst { consti } => {
-                    // RPython assembler.py: emit_const() stores constants in
-                    // the jitcode constant pool. For pyre, load from the
-                    // frame's code object at runtime via a helper call.
                     let idx = consti.get(op_arg).as_usize();
                     assembler.load_const_i_value(int_tmp0, idx as i64);
                     assembler.call_ref_typed(
@@ -278,7 +307,8 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 // Superinstruction: two consecutive LoadFastBorrow
@@ -286,16 +316,20 @@ impl CodeWriter {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
-                    assembler.push_r(reg_a);
-                    assembler.push_r(reg_b);
+                    assembler.move_r(stack_base + current_depth, reg_a);
+                    current_depth += 1;
+                    assembler.move_r(stack_base + current_depth, reg_b);
+                    current_depth += 1;
                 }
 
                 // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                 Instruction::StoreSubscr => {
-                    assembler.pop_r(obj_tmp1); // key
-                    assembler.pop_r(obj_tmp0); // obj
-                    // value is still on stack; pop to arg_regs_start
-                    assembler.pop_r(arg_regs_start);
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp1, stack_base + current_depth); // key
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth); // obj
+                    current_depth -= 1;
+                    assembler.move_r(arg_regs_start, stack_base + current_depth); // value
                     assembler.call_may_force_void_typed_args(
                         store_subscr_fn_idx,
                         &[
@@ -307,22 +341,24 @@ impl CodeWriter {
                 }
 
                 Instruction::PopTop => {
-                    assembler.pop_discard();
+                    current_depth -= 1;
+                    // regalloc.py: discard = just decrement depth, no bytecode
                 }
 
                 Instruction::PushNull => {
-                    assembler.push_r(null_ref_reg);
+                    assembler.move_r(stack_base + current_depth, null_ref_reg);
+                    current_depth += 1;
                 }
 
-                // RPython jtransform.py: rewrite_op_int_add etc.
+                // jtransform.py: rewrite_op_int_add etc.
                 Instruction::BinaryOp { op } => {
                     let op_val = binary_op_tag(op.get(op_arg))
                         .expect("unsupported binary op tag in jitcode lowering")
                         as u32;
-                    assembler.pop_r(obj_tmp1); // rhs
-                    assembler.pop_r(obj_tmp0); // lhs
-                    // RPython: residual_call for generic binary dispatch,
-                    // returning a boxed PyObject ref.
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp1, stack_base + current_depth); // rhs
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
                         binary_op_fn_idx,
@@ -333,14 +369,17 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
-                // RPython jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
+                // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
                     let op_val = compare_op_tag(opname.get(op_arg)) as u32;
-                    assembler.pop_r(obj_tmp1); // rhs
-                    assembler.pop_r(obj_tmp0); // lhs
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp1, stack_base + current_depth); // rhs
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth); // lhs
                     assembler.load_const_i_value(op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
                         compare_fn_idx,
@@ -351,12 +390,11 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
-                // RPython jtransform.py: optimize_goto_if_not → goto_if_not
-                // Stack top is a Python object (True/False). We need to
-                // convert to raw 0/1 for branch_reg_zero.
+                // jtransform.py: optimize_goto_if_not → goto_if_not
                 Instruction::PopJumpIfFalse { delta } => {
                     let target_py_pc = jump_target_forward(
                         code,
@@ -364,8 +402,8 @@ impl CodeWriter {
                         py_pc + 1,
                         delta.get(op_arg).as_usize(),
                     );
-                    assembler.pop_r(obj_tmp0);
-                    // truth_fn: PyObjectRef → 0/1 (truthiness check)
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.call_int_typed(
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -383,10 +421,8 @@ impl CodeWriter {
                         py_pc + 1,
                         delta.get(op_arg).as_usize(),
                     );
-                    // Invert: branch_reg_zero branches if zero, but we want
-                    // branch if nonzero. Emit: tmp0 = (tmp0 == 0), then
-                    // branch_reg_zero.
-                    assembler.pop_r(obj_tmp0);
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.call_int_typed(
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -420,12 +456,10 @@ impl CodeWriter {
                     }
                 }
 
-                // RPython flatten.py: int_return / ref_return
+                // flatten.py: int_return / ref_return
                 Instruction::ReturnValue => {
-                    // RPython bhimpl_ref_return: pop return value and
-                    // emit BC_REF_RETURN so the blackhole returns cleanly
-                    // (not BC_ABORT which marks a failed/unsupported path).
-                    assembler.pop_r(obj_tmp0);
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.ref_return(obj_tmp0);
                 }
 
@@ -443,9 +477,11 @@ impl CodeWriter {
                     );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
-                        assembler.push_r(null_ref_reg);
+                        assembler.move_r(stack_base + current_depth, null_ref_reg);
+                        current_depth += 1;
                     }
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call →
@@ -461,13 +497,13 @@ impl CodeWriter {
                 // We pop in reverse: args first, then callable, then NULL.
                 Instruction::Call { argc } => {
                     let nargs = argc.get(op_arg) as usize;
-                    // Pop args in reverse into scratch registers
-                    // For now, support up to 3 args (covers fib_recursive CALL 1)
                     for i in (0..nargs).rev() {
-                        assembler.pop_r(arg_regs_start + i as u16);
+                        current_depth -= 1;
+                        assembler.move_r(arg_regs_start + i as u16, stack_base + current_depth);
                     }
-                    assembler.pop_r(obj_tmp1); // callable
-                    assembler.pop_discard(); // NULL
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp1, stack_base + current_depth); // callable
+                    current_depth -= 1; // NULL (discard)
 
                     // call_fn(callable, arg0, frame_ptr) → result
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
@@ -500,7 +536,8 @@ impl CodeWriter {
                         };
                         assembler.call_may_force_ref_typed(fn_idx, &call_args, obj_tmp0);
                     }
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 // Python 3.13: ToBool converts TOS to bool before branch.
@@ -510,7 +547,8 @@ impl CodeWriter {
 
                 // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                 Instruction::UnaryNegative => {
-                    assembler.pop_r(obj_tmp0);
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth);
                     assembler.load_const_i_value(int_tmp0, 0);
                     assembler.call_may_force_ref_typed(
                         box_int_fn_idx,
@@ -531,7 +569,8 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 // Match the interpreter's direct PC arithmetic for
@@ -548,13 +587,13 @@ impl CodeWriter {
                 // RPython bhimpl_newlist: build list from N items on stack.
                 Instruction::BuildList { count } => {
                     let argc = count.get(op_arg) as usize;
-                    // Pop items into registers (reverse order like CALL).
                     for i in (0..argc.min(2)).rev() {
-                        assembler.pop_r(arg_regs_start + i as u16);
+                        current_depth -= 1;
+                        assembler.move_r(arg_regs_start + i as u16, stack_base + current_depth);
                     }
                     // Discard extra items beyond 2 (helper supports 0-2).
                     for _ in 2..argc {
-                        assembler.pop_discard();
+                        current_depth -= 1;
                     }
                     // build_list_fn(argc, item0, item1) → list
                     assembler.load_const_i_value(int_tmp0, argc as i64);
@@ -577,7 +616,8 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 // Exception handling: residual calls to frame helpers.
@@ -587,8 +627,8 @@ impl CodeWriter {
                 Instruction::RaiseVarargs { argc } => {
                     let n = argc.get(op_arg) as i64;
                     if n >= 1 {
-                        // blackhole.py bhimpl_raise(excvalue): pop exception, raise it.
-                        assembler.pop_r(obj_tmp0); // exception value
+                        current_depth -= 1;
+                        assembler.move_r(obj_tmp0, stack_base + current_depth);
                         assembler.emit_raise(obj_tmp0);
                     } else {
                         // reraise: re-raise exception_last_value
@@ -597,17 +637,16 @@ impl CodeWriter {
                 }
 
                 Instruction::PushExcInfo => {
-                    // TOS is the exception. Push exc_info (type, value, tb).
-                    // For blackhole: peek TOS, push (type, value) pair.
-                    // Simplified: duplicate TOS (exception value stays).
-                    assembler.dup_stack();
+                    // flatten.py: dup = ref_copy TOS → TOS+1
+                    assembler.move_r(stack_base + current_depth, stack_base + current_depth - 1);
+                    current_depth += 1;
                 }
 
                 Instruction::CheckExcMatch => {
-                    // TOS = exception type to match, TOS1 = raised exception.
-                    // Pop type, compare, push boolean result.
-                    assembler.pop_r(obj_tmp1); // match type
-                    assembler.pop_r(obj_tmp0); // exception
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp1, stack_base + current_depth); // match type
+                    current_depth -= 1;
+                    assembler.move_r(obj_tmp0, stack_base + current_depth); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
                     assembler.load_const_i_value(int_tmp0, 10); // isinstance op
                     assembler.call_may_force_ref_typed(
@@ -619,7 +658,8 @@ impl CodeWriter {
                         ],
                         obj_tmp0,
                     );
-                    assembler.push_r(obj_tmp0);
+                    assembler.move_r(stack_base + current_depth, obj_tmp0);
+                    current_depth += 1;
                 }
 
                 Instruction::PopExcept => {
@@ -635,7 +675,9 @@ impl CodeWriter {
                 Instruction::Copy { i } => {
                     let d = i.get(op_arg) as usize;
                     if d == 1 {
-                        assembler.dup_stack();
+                        assembler
+                            .move_r(stack_base + current_depth, stack_base + current_depth - 1);
+                        current_depth += 1;
                     } else {
                         // COPY(d>1): exception handler pattern only.
                         // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
@@ -674,6 +716,34 @@ impl CodeWriter {
         // byte value 13 appeared as register operand data, blocking
         // blackhole entry entirely.
         let has_abort = false;
+
+        // liveness.py parity: generate LivenessInfo at each bytecode PC.
+        // Each entry lists which ref registers are live:
+        //   locals 0..nlocals-1 (conservative: all live)
+        //   stack  stack_base..stack_base+depth-1 (precise from depth_at_pc)
+        {
+            let local_regs: Vec<u16> = (0..nlocals as u16).collect();
+            let mut liveness = Vec::with_capacity(num_instrs);
+            for py_pc in 0..num_instrs {
+                let jit_pc = pc_map[py_pc];
+                let depth = depth_at_pc[py_pc];
+                let mut live_r = local_regs.clone();
+                for d in 0..depth {
+                    live_r.push(stack_base + d);
+                }
+                liveness.push(majit_metainterp::jitcode::LivenessInfo {
+                    pc: jit_pc as u16,
+                    live_i_regs: vec![],
+                    live_r_regs: live_r,
+                    live_f_regs: vec![],
+                });
+            }
+            // Deduplicate entries at the same JitCode PC (multiple Python
+            // bytecodes may map to the same JitCode offset, e.g. Cache/Nop).
+            liveness.sort_by_key(|l| l.pc);
+            liveness.dedup_by_key(|l| l.pc);
+            jitcode.liveness = liveness;
+        }
 
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.

@@ -454,6 +454,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_rd_numb(green_key, trace_id, fail_index)
     }
 
+    pub fn get_rd_virtuals(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<majit_ir::RdVirtualInfo>> {
+        self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
+    }
+
     /// compile.py:710 recovery_layout header_pc parity: get the merge point
     /// PC for blackhole resume from a guard exit.
     pub fn get_merge_point_pc(
@@ -1264,10 +1273,12 @@ impl<S: JitState> JitDriver<S> {
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
-                let resolve_jitcode = |_pos: i32, pc: i32| -> Option<crate::jitcode::JitCode> {
-                    let factory = self.jitcode_factory.as_ref()?;
-                    factory(env, pc as usize, 0)
-                };
+                let resolve_jitcode =
+                    |_pos: i32, pc: i32| -> Option<(crate::jitcode::JitCode, usize)> {
+                        let factory = self.jitcode_factory.as_ref()?;
+                        let jitcode = factory(env, pc as usize, 0)?;
+                        Some((jitcode, pc as usize))
+                    };
 
                 let fallback_alloc = crate::resume::NullAllocator;
                 let allocator: &dyn crate::resume::BlackholeAllocator = self
@@ -2737,10 +2748,12 @@ impl<S: JitState> JitDriver<S> {
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
                 let jitcode_factory_ref = self.jitcode_factory.as_ref();
-                let resolve_jitcode = |_pos: i32, pc: i32| -> Option<crate::jitcode::JitCode> {
-                    let factory = jitcode_factory_ref?;
-                    factory(env, pc as usize, 0)
-                };
+                let resolve_jitcode =
+                    |_pos: i32, pc: i32| -> Option<(crate::jitcode::JitCode, usize)> {
+                        let factory = jitcode_factory_ref?;
+                        let jitcode = factory(env, pc as usize, 0)?;
+                        Some((jitcode, pc as usize))
+                    };
 
                 let fallback_alloc = crate::resume::NullAllocator;
                 let allocator: &dyn crate::resume::BlackholeAllocator = self
