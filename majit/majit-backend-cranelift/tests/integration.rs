@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use majit_codegen::{
+use majit_backend::{
     Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
 };
-use majit_codegen_cranelift::guard::CraneliftFailDescr;
-use majit_codegen_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
+use majit_backend_cranelift::guard::CraneliftFailDescr;
+use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
@@ -298,7 +298,7 @@ fn test_bridge_end_to_end() {
     // We need a CraneliftFailDescr to pass to compile_bridge.
     // The fail_index matches the guard's index in the original loop.
     let bridge_fail_descr =
-        majit_codegen_cranelift::guard::CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
+        majit_backend_cranelift::guard::CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
 
     let bridge_info = backend
         .compile_bridge(
@@ -1241,7 +1241,7 @@ fn assign_positions(ops: &mut [Op], base: u32) {
 
 #[test]
 fn test_threadlocalref_get_basic() {
-    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+    use majit_backend_cranelift::compiler::jit_threadlocalref_set;
 
     // Set slot 0 (offset=0) to 0x544C (same magic value as RPython test).
     jit_threadlocalref_set(0, 0x544C);
@@ -1284,7 +1284,7 @@ fn test_threadlocalref_get_basic() {
 
 #[test]
 fn test_threadlocalref_get_multiple_slots() {
-    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+    use majit_backend_cranelift::compiler::jit_threadlocalref_set;
 
     // Set slot 0 (offset 0) and slot 1 (offset 8) to different values.
     jit_threadlocalref_set(0, 0xAAAA);
@@ -1336,7 +1336,7 @@ fn test_threadlocalref_get_multiple_slots() {
 
 #[test]
 fn test_threadlocalref_set_and_read_roundtrip() {
-    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+    use majit_backend_cranelift::compiler::jit_threadlocalref_set;
 
     // Build trace once: ThreadlocalrefGet(offset=16) -> finish(result)
     let mut rec = Trace::new();
@@ -1376,7 +1376,7 @@ fn test_threadlocalref_set_and_read_roundtrip() {
 
 #[test]
 fn test_threadlocalref_thread_isolation() {
-    use majit_codegen_cranelift::compiler::jit_threadlocalref_set;
+    use majit_backend_cranelift::compiler::jit_threadlocalref_set;
     use std::sync::{Arc as StdArc, Barrier};
     use std::thread;
 
@@ -1393,14 +1393,14 @@ fn test_threadlocalref_thread_isolation() {
         // Read back to confirm child's slot is 0x2222.
         // We can't easily run compiled code on the child thread
         // (JitCellToken/backend not Send), but we can verify via the shim.
-        let base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
+        let base = majit_backend_cranelift::compiler::jit_threadlocalref_base();
         let val = if base.is_null() { 0 } else { unsafe { *base } };
         val
     });
 
     barrier.wait();
     // Main thread's slot 0 should still be 0x1111.
-    let main_base = majit_codegen_cranelift::compiler::jit_threadlocalref_base();
+    let main_base = majit_backend_cranelift::compiler::jit_threadlocalref_base();
     let main_val = if main_base.is_null() {
         0
     } else {
@@ -1619,7 +1619,7 @@ fn test_call_release_gil_hooks_are_callable() {
     // The actual hook invocation is tested implicitly by the CallReleaseGilI
     // tests above (the shim functions are always called; they just check
     // whether a hook was installed).
-    use majit_codegen_cranelift::set_gil_hooks;
+    use majit_backend_cranelift::set_gil_hooks;
 
     // set_gil_hooks uses OnceLock, so it may fail silently if already set
     // by another test. That's fine; we just verify the function is callable.

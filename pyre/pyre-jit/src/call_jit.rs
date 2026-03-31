@@ -7,7 +7,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Once;
 
-use pyre_bytecode::bytecode::{Instruction, OpArgState};
+use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_code, function_get_globals, function_get_name,
     is_function, register_jit_function_caller,
@@ -95,7 +95,7 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
         if !function_get_closure(callable).is_null() {
             return false;
         }
-        let code = &*(function_get_code(callable) as *const pyre_bytecode::CodeObject);
+        let code = &*(function_get_code(callable) as *const pyre_interpreter::CodeObject);
         let func_name = function_get_name(callable);
         let mut arg_state = OpArgState::default();
         let mut saw_self_reference = false;
@@ -322,9 +322,9 @@ static mut ARENA_INITIALIZED: usize = 0;
 
 /// Returns addresses of the global arena state variables and frame
 /// layout constants needed by Cranelift to inline arena take/put.
-pub fn arena_global_info() -> majit_codegen_cranelift::InlineFrameArenaInfo {
+pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
     use majit_metainterp::jitframe::*;
-    majit_codegen_cranelift::InlineFrameArenaInfo {
+    majit_backend_cranelift::InlineFrameArenaInfo {
         buf_base_addr: unsafe { std::ptr::addr_of!(ARENA_BUF_BASE) as usize },
         top_addr: unsafe { std::ptr::addr_of!(ARENA_TOP) as usize },
         initialized_addr: unsafe { std::ptr::addr_of!(ARENA_INITIALIZED) as usize },
@@ -471,8 +471,8 @@ extern "C" fn jit_call_user_function_from_frame(
 
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
-    let _ = majit_codegen_cranelift::take_pending_frame_restore();
-    let pending = majit_codegen_cranelift::take_pending_force_local0();
+    let _ = majit_backend_cranelift::take_pending_frame_restore();
+    let pending = majit_backend_cranelift::take_pending_force_local0();
 
     // Lazy frame (RPython parity): when CallR(create_frame) is elided,
     // frame_ptr is the CALLER frame. pending_force_local0 contains the
@@ -491,7 +491,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let (code, namespace, exec_ctx) = unsafe {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
-        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const pyre_bytecode::CodeObject);
+        let code = *(p.add(PYFRAME_CODE_OFFSET) as *const *const pyre_interpreter::CodeObject);
         let ns = *(p.add(std::mem::offset_of!(PyFrame, namespace))
             as *const *mut pyre_interpreter::PyNamespace);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
@@ -551,7 +551,7 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     let raw_arg = unsafe { JitFrame::get_int_value(jf, 0) };
 
     // Step 2: get caller frame from the force context
-    let pending = majit_codegen_cranelift::take_pending_force_local0();
+    let pending = majit_backend_cranelift::take_pending_force_local0();
     let raw_local0 = pending.unwrap_or(raw_arg as i64);
 
     // Step 3: create a PyFrame and run it
@@ -579,7 +579,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
         for i in 0..nlocals {
             inputs.push(frame.locals_cells_stack_w[i] as i64);
         }
-        if let Some(raw) = majit_codegen_cranelift::execute_call_assembler_direct(
+        if let Some(raw) = majit_backend_cranelift::execute_call_assembler_direct(
             token_num,
             &inputs,
             jit_force_callee_frame_interp,
@@ -747,7 +747,7 @@ pub enum BlackholeResult {
 pub struct ResumedFrame {
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
     /// pyre: CodeObject pointer (resolved from jitcode_index).
-    pub code: *const pyre_bytecode::CodeObject,
+    pub code: *const pyre_interpreter::CodeObject,
     /// resume.py:1050 pc (Python bytecode PC for blackhole setposition).
     pub py_pc: usize,
     /// Raw frame.pc from rd_numb (= orgpc from snapshot).
@@ -820,9 +820,9 @@ pub fn resume_in_blackhole(
         // Skip Cache/ExtendedArg/NotTaken (CPython 3.13 pseudo-instructions).
         while py_pc > 0 {
             match pyre_interpreter::decode_instruction_at(code, py_pc) {
-                Some((pyre_bytecode::bytecode::Instruction::Cache, _))
-                | Some((pyre_bytecode::bytecode::Instruction::ExtendedArg, _))
-                | Some((pyre_bytecode::bytecode::Instruction::NotTaken, _)) => {
+                Some((pyre_interpreter::bytecode::Instruction::Cache, _))
+                | Some((pyre_interpreter::bytecode::Instruction::ExtendedArg, _))
+                | Some((pyre_interpreter::bytecode::Instruction::NotTaken, _)) => {
                     py_pc -= 1;
                 }
                 _ => break,
@@ -1476,12 +1476,12 @@ pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
-        majit_codegen_cranelift::register_call_assembler_force(jit_force_callee_frame);
-        majit_codegen_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
-        majit_codegen_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
+        majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
+        majit_backend_cranelift::register_call_assembler_bridge(jit_bridge_compile_callee);
+        majit_backend_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
         // Bridge compilation is triggered by MetaInterp.must_compile()
         // (compile.py:783-784), not by backend fail_count threshold.
-        majit_codegen_cranelift::register_inline_frame_arena(arena_global_info());
+        majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
         // Bridge compilation is handled by handle_fail() in eval.rs.
     });
 }
@@ -1674,8 +1674,8 @@ pub fn trace_and_compile_from_bridge(
     // RESTORE_EXCEPTION before the guard. The exception class/value
     // are read from the TLS exception state set by Cranelift codegen.
     if driver.last_bridge_is_exception_guard {
-        let exc_class = majit_codegen_cranelift::jit_exc_class_raw();
-        let exc_value = majit_codegen_cranelift::jit_exc_value_raw();
+        let exc_class = majit_backend_cranelift::jit_exc_class_raw();
+        let exc_value = majit_backend_cranelift::jit_exc_value_raw();
         if exc_class != 0 {
             // RPython pyjitpl.py:3125-3126 + 3138:
             // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION
@@ -1872,7 +1872,7 @@ fn create_callee_frame_impl_1_boxed(
     let code_ptr = unsafe { function_get_code(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const pyre_interpreter::CodeObject;
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
@@ -1980,7 +1980,7 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let code_ptr = unsafe { function_get_code(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
-    let func_code = code_ptr as *const pyre_bytecode::CodeObject;
+    let func_code = code_ptr as *const pyre_interpreter::CodeObject;
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {

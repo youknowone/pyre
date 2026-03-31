@@ -6,7 +6,7 @@
 //! concrete execution and symbolic IR recording.
 
 use majit_metainterp::{TraceAction, TraceCtx};
-use pyre_bytecode::CodeObject;
+use pyre_interpreter::CodeObject;
 
 use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
 use crate::state::PyreSym;
@@ -40,7 +40,7 @@ pub fn trace_bytecode(
         parent_frames: Vec::new(),
         drop_frame_opref: None,
         caller_result_stack_idx: None,
-        arg_state: pyre_bytecode::bytecode::OpArgState::default(),
+        arg_state: pyre_interpreter::bytecode::OpArgState::default(),
     };
 
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
@@ -106,8 +106,8 @@ pub fn trace_bytecode(
 #[cfg(test)]
 mod tests {
     use crate::metainterp::semantic_fallthrough_pc;
-    use pyre_bytecode::bytecode::Instruction;
-    use pyre_bytecode::compile_exec;
+    use pyre_interpreter::bytecode::Instruction;
+    use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
 
     #[test]
@@ -124,7 +124,7 @@ mod tests {
             .constants
             .iter()
             .find_map(|constant| match constant {
-                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
                     Some((**code).clone())
                 }
                 _ => None,

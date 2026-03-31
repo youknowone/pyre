@@ -222,7 +222,7 @@ pub fn emit_trace_binary_value(
     ctx: &mut TraceCtx,
     a: OpRef,
     b: OpRef,
-    op: pyre_bytecode::bytecode::BinaryOperator,
+    op: pyre_interpreter::bytecode::BinaryOperator,
 ) -> Result<OpRef, PyError> {
     let Some(tag) = binary_op_tag(op) else {
         return Err(PyError::type_error(format!(
@@ -242,7 +242,7 @@ pub fn emit_trace_compare_value(
     ctx: &mut TraceCtx,
     a: OpRef,
     b: OpRef,
-    op: pyre_bytecode::bytecode::ComparisonOperator,
+    op: pyre_interpreter::bytecode::ComparisonOperator,
 ) -> OpRef {
     let tag = ctx.const_int(compare_op_tag(op));
     emit_trace_call_ref_typed(
@@ -416,7 +416,7 @@ pub trait TraceHelperAccess {
         &mut self,
         a: OpRef,
         b: OpRef,
-        op: pyre_bytecode::bytecode::BinaryOperator,
+        op: pyre_interpreter::bytecode::BinaryOperator,
     ) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| emit_trace_binary_value(ctx, a, b, op))
     }
@@ -425,7 +425,7 @@ pub trait TraceHelperAccess {
         &mut self,
         a: OpRef,
         b: OpRef,
-        op: pyre_bytecode::bytecode::ComparisonOperator,
+        op: pyre_interpreter::bytecode::ComparisonOperator,
     ) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(emit_trace_compare_value(ctx, a, b, op)))
     }
@@ -458,7 +458,10 @@ pub trait TraceHelperAccess {
         self.with_trace_ctx(|ctx| Ok(ctx.const_int(box_str_constant(value) as i64)))
     }
 
-    fn trace_code_constant(&mut self, code: &pyre_bytecode::CodeObject) -> Result<OpRef, PyError> {
+    fn trace_code_constant(
+        &mut self,
+        code: &pyre_interpreter::CodeObject,
+    ) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| {
             Ok(ctx.const_int(pyre_interpreter::box_code_constant(code) as i64))
         })
@@ -530,8 +533,8 @@ pub fn emit_box_float_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_bytecode::{ConstantData, compile_exec};
     use pyre_interpreter::PyExecutionContext;
+    use pyre_interpreter::{ConstantData, compile_exec};
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {

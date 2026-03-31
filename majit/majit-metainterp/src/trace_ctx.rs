@@ -5,7 +5,7 @@ use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type};
 use majit_trace::heapcache::HeapCache;
 use majit_trace::recorder::{Trace, TracePosition};
 
-use majit_codegen::JitCellToken;
+use majit_backend::JitCellToken;
 
 use crate::TraceAction;
 use crate::call_descr::{make_call_assembler_descr, make_call_descr, make_call_may_force_descr};
@@ -2036,7 +2036,7 @@ impl TraceCtx {
 mod tests {
     use super::*;
     use crate::jit_state::JitState;
-    use majit_codegen::JitCellToken;
+    use majit_backend::JitCellToken;
     use majit_ir::Type;
 
     extern "C" fn dummy_call_target() {}

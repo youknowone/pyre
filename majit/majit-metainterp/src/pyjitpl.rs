@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::optimizer::{Optimizer, OptimizerKnowledge};
-use majit_codegen::{
+use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
-use majit_codegen_cranelift::CraneliftBackend;
+use majit_backend_cranelift::CraneliftBackend;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
@@ -5351,7 +5351,7 @@ impl<M: Clone> MetaInterp<M> {
                             green_key, fail_index
                         );
                     }
-                    Err(majit_codegen::BackendError::CompilationFailed(
+                    Err(majit_backend::BackendError::CompilationFailed(
                         "Cranelift panic during bridge compilation".to_string(),
                     ))
                 }
@@ -6862,13 +6862,13 @@ pub enum InlineDecision {
 mod tests {
     use super::*;
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
-    use majit_codegen::DeadFrame;
-    use majit_codegen::{Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
-    use majit_codegen_cranelift::compiler::{
+    use majit_backend::DeadFrame;
+    use majit_backend::{Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+    use majit_backend_cranelift::compiler::{
         force_token_to_dead_frame, get_int_from_deadframe, get_latest_descr_from_deadframe,
         set_savedata_ref_on_deadframe,
     };
-    use majit_codegen_cranelift::guard::CraneliftFailDescr;
+    use majit_backend_cranelift::guard::CraneliftFailDescr;
     use majit_gc::collector::MiniMarkGC;
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
@@ -7724,7 +7724,7 @@ mod tests {
         assert_eq!(backend_recovery.frames[0].slot_types, Some(vec![Type::Int]));
         assert_eq!(
             backend_recovery.frames[0].slots,
-            vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)]
+            vec![majit_backend::ExitValueSourceLayout::ExitValue(0)]
         );
     }
 
@@ -9596,7 +9596,7 @@ mod tests {
     fn test_single_frame_restore_with_frame_stack() {
         use crate::jit_state::JitState;
         use crate::resume::{ReconstructedFrame, ReconstructedValue, ResumeFrameLayoutSummary};
-        use majit_codegen::ExitValueSourceLayout;
+        use majit_backend::ExitValueSourceLayout;
 
         #[derive(Default)]
         struct SingleFrameState {

@@ -15,7 +15,7 @@
 //! use majit::ir::{OpCode, OpRef, Type, Value};
 //! use majit::meta::MetaInterp;
 //! use majit::opt::optimizer::Optimizer;
-//! use majit::codegen::Backend;
+//! use majit::backend::Backend;
 //! use majit::cranelift::CraneliftBackend;
 //! use majit::trace::recorder::Trace;
 //! use majit::gc;
@@ -32,10 +32,10 @@ pub use majit_metainterp::optimizeopt as opt;
 pub use majit_trace as trace;
 
 /// Backend abstraction: Backend trait, JitCellToken, DeadFrame.
-pub use majit_codegen as codegen;
+pub use majit_backend as backend;
 
 /// Cranelift backend: native code generation.
-pub use majit_codegen_cranelift as cranelift;
+pub use majit_backend_cranelift as cranelift;
 
 /// Meta-interpreter: JitDriver, MetaInterp, JitState, resume, blackhole.
 pub use majit_metainterp as metainterp;

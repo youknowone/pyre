@@ -10,7 +10,7 @@ use majit_metainterp::{
     JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
 };
 
-use pyre_bytecode::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::PendingInlineResult;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
@@ -128,7 +128,7 @@ impl LiveVars {
     /// Backward dataflow liveness analysis on Python bytecodes.
     /// Fixed-point iteration handles loops correctly.
     fn compute(code: &CodeObject) -> Self {
-        use pyre_bytecode::bytecode::Instruction;
+        use pyre_interpreter::bytecode::Instruction;
         let n = code.instructions.len();
         if n == 0 {
             return LiveVars {
@@ -285,11 +285,11 @@ impl LiveVars {
 /// Stack effects: (fallthrough_depth, branch_depth).
 /// Returns new absolute stack depths after the instruction.
 fn stack_effects(
-    instr: &pyre_bytecode::bytecode::Instruction,
-    op_arg: pyre_bytecode::OpArg,
+    instr: &pyre_interpreter::bytecode::Instruction,
+    op_arg: pyre_interpreter::OpArg,
     depth: usize,
 ) -> (usize, usize) {
-    use pyre_bytecode::bytecode::Instruction;
+    use pyre_interpreter::bytecode::Instruction;
     let d = depth as i32;
     let (ft, br) = match instr {
         // No-ops
@@ -417,8 +417,8 @@ fn stack_effects(
 }
 
 /// Is the instruction an unconditional jump (no fallthrough)?
-fn is_unconditional_jump(instr: &pyre_bytecode::bytecode::Instruction) -> bool {
-    use pyre_bytecode::bytecode::Instruction;
+fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> bool {
+    use pyre_interpreter::bytecode::Instruction;
     matches!(
         instr,
         Instruction::JumpForward { .. }
@@ -431,11 +431,11 @@ fn is_unconditional_jump(instr: &pyre_bytecode::bytecode::Instruction) -> bool {
 
 /// Branch target PC for branching instructions.
 fn target_pc(
-    instr: &pyre_bytecode::bytecode::Instruction,
+    instr: &pyre_interpreter::bytecode::Instruction,
     pc: usize,
-    op_arg: pyre_bytecode::OpArg,
+    op_arg: pyre_interpreter::OpArg,
 ) -> Option<usize> {
-    use pyre_bytecode::bytecode::Instruction;
+    use pyre_interpreter::bytecode::Instruction;
     match instr {
         Instruction::JumpForward { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
         Instruction::JumpBackward { delta } | Instruction::JumpBackwardNoInterrupt { delta } => {
@@ -633,8 +633,8 @@ impl ConcreteValue {
 }
 
 /// Convert a bytecode constant to ConcreteValue.
-pub fn load_const_concrete(constant: &pyre_bytecode::bytecode::ConstantData) -> ConcreteValue {
-    use pyre_bytecode::bytecode::ConstantData;
+pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) -> ConcreteValue {
+    use pyre_interpreter::bytecode::ConstantData;
     match constant {
         ConstantData::Integer { value } => match i64::try_from(value).ok() {
             Some(v) => ConcreteValue::Int(v),
@@ -1321,7 +1321,7 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let code_ptr = unsafe {
         *(frame_ptr.add(crate::frame_layout::PYFRAME_CODE_OFFSET)
-            as *const *const pyre_bytecode::CodeObject)
+            as *const *const pyre_interpreter::CodeObject)
     };
     if code_ptr.is_null() {
         return None;
@@ -5316,7 +5316,7 @@ impl MIFrame {
                             ctx.call_ref_typed(helper, &[this.frame(), raw_arg], &helper_arg_types);
                         let callee_nlocals = unsafe {
                             let code_ptr = function_get_code(concrete_callable)
-                                as *const pyre_bytecode::CodeObject;
+                                as *const pyre_interpreter::CodeObject;
                             (&*code_ptr).varnames.len()
                         };
                         // RPython pyjitpl.py:3583: pass raw Int arg, return raw Int.
@@ -5862,7 +5862,7 @@ impl MIFrame {
         // pyjitpl.py:2510-2520: scan for catch_exception handler
         // (Python 3.11+ exception table replaces RPython's op_catch_exception)
         if let Some(entry) =
-            pyre_bytecode::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+            pyre_interpreter::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
         {
             let handler_pc = entry.target as usize;
             let handler_depth = entry.depth as usize;
@@ -6147,7 +6147,7 @@ impl TraceHelperAccess for MIFrame {
         &mut self,
         a: OpRef,
         b: OpRef,
-        op: pyre_bytecode::bytecode::BinaryOperator,
+        op: pyre_interpreter::bytecode::BinaryOperator,
     ) -> Result<OpRef, PyError> {
         self.with_ctx(|this, ctx| {
             let lhs = box_value_for_python_helper(this, ctx, a);
@@ -7120,7 +7120,7 @@ impl OpcodeStepExecutor for MIFrame {
                 // call, no exception would be pending and the guard always fails.
                 let exc_type_const = ctx.const_int(exc_class_ptr as i64);
                 ctx.call_void(
-                    majit_codegen_cranelift::jit_exc_raise as *const (),
+                    majit_backend_cranelift::jit_exc_raise as *const (),
                     &[exc_val.opref, exc_type_const],
                 );
             });
@@ -8400,7 +8400,7 @@ mod tests {
 
     #[test]
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -8535,7 +8535,7 @@ mod tests {
 
     #[test]
     fn test_virtualizable_array_lengths_uses_full_array() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -8564,8 +8564,8 @@ mod tests {
     #[test]
     fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
         use majit_ir::GcRef;
-        use pyre_bytecode::{ConstantData, compile_exec};
         use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{ConstantData, compile_exec};
 
         let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
             .expect("test code should compile");
@@ -8688,7 +8688,7 @@ mod tests {
 
     #[test]
     fn test_store_local_value_preserves_traced_raw_int_type_for_ref_slot() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -8838,7 +8838,7 @@ mod tests {
 
     #[test]
     fn test_compare_value_direct_keeps_raw_truth_for_immediate_branch_consumer() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
@@ -8937,7 +8937,7 @@ mod tests {
 
     #[test]
     fn test_compare_value_direct_boxes_bool_when_not_immediately_consumed_by_branch() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -8999,7 +8999,7 @@ mod tests {
 
     #[test]
     fn test_next_instruction_consumes_comparison_truth_skips_extended_arg_trivia() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
@@ -9014,7 +9014,7 @@ mod tests {
             .constants
             .iter()
             .find_map(|constant| match constant {
-                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
                     Some((**code).clone())
                 }
                 _ => None,
@@ -9068,7 +9068,7 @@ mod tests {
 
     #[test]
     fn test_trace_code_step_preserves_comparison_truth_across_extended_arg_trivia() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
@@ -9083,7 +9083,7 @@ mod tests {
             .constants
             .iter()
             .find_map(|constant| match constant {
-                pyre_bytecode::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
                     Some((**code).clone())
                 }
                 _ => None,
@@ -9145,7 +9145,7 @@ mod tests {
 
     #[test]
     fn test_concrete_branch_truth_uses_cached_comparison_truth_without_stack_value() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -9182,7 +9182,7 @@ mod tests {
 
     #[test]
     fn test_truth_value_direct_caches_concrete_truth_for_raw_int_branch_consumer() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -9225,7 +9225,7 @@ mod tests {
 
     #[test]
     fn test_record_branch_guard_uses_branch_pc_and_pre_pop_stack_shape() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -9284,7 +9284,7 @@ mod tests {
 
     #[test]
     fn test_generic_guard_during_branch_truth_uses_pre_pop_stack_shape() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -9344,7 +9344,7 @@ mod tests {
 
     #[test]
     fn test_branch_truth_uses_concrete_parameter() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -9430,7 +9430,7 @@ mod tests {
 
     #[test]
     fn test_current_fail_args_materializes_symbolic_holes_from_concrete_frame() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
@@ -9482,7 +9482,7 @@ mod tests {
 
     #[test]
     fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
@@ -9609,7 +9609,7 @@ mod tests {
 
     #[test]
     fn test_list_append_value_uses_raw_int_storage_fast_path() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -9697,7 +9697,7 @@ mod tests {
 
     #[test]
     fn test_list_append_value_uses_raw_float_storage_fast_path() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -9781,7 +9781,7 @@ mod tests {
 
     #[test]
     fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
-        use pyre_bytecode::compile_exec;
+        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_object::w_range_iter_new;
 

@@ -1,4 +1,4 @@
-use pyre_bytecode::bytecode::{
+use crate::bytecode::{
     BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
     IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState,
 };
@@ -954,10 +954,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // Containment / identity
-    fn contains_op(&mut self, _invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+    fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("contains_op not implemented").into())
     }
-    fn is_op(&mut self, _invert: pyre_bytecode::bytecode::Invert) -> Result<(), Self::Error> {
+    fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("is_op not implemented").into())
     }
 
@@ -981,7 +981,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn build_slice(
         &mut self,
-        _argc: pyre_bytecode::bytecode::BuildSliceArgCount,
+        _argc: crate::bytecode::BuildSliceArgCount,
     ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("build_slice not implemented").into())
     }
@@ -1083,7 +1083,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn convert_value(
         &mut self,
-        _conv: pyre_bytecode::bytecode::ConvertValueOparg,
+        _conv: crate::bytecode::ConvertValueOparg,
     ) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("convert_value not implemented").into())
     }
@@ -1099,7 +1099,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn set_function_attribute_with_flag(
         &mut self,
-        _flag: pyre_bytecode::bytecode::MakeFunctionFlag,
+        _flag: crate::bytecode::MakeFunctionFlag,
     ) -> Result<(), Self::Error> {
         // Default: pop the attribute value and discard
         let _attr = self.pop_value().map_err(Into::into)?;
@@ -1114,10 +1114,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn match_stub(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("pattern matching not implemented").into())
     }
-    fn unpack_ex(
-        &mut self,
-        _args: pyre_bytecode::bytecode::UnpackExArgs,
-    ) -> Result<(), Self::Error> {
+    fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
 
@@ -1861,8 +1858,8 @@ fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::decode_instruction_at;
-    use pyre_bytecode::bytecode::Instruction;
-    use pyre_bytecode::{OpArgState, compile_exec};
+    use crate::bytecode::Instruction;
+    use crate::{OpArgState, compile_exec};
 
     #[test]
     fn decode_instruction_at_matches_forward_decode_across_extended_arg_prefix() {

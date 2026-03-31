@@ -1,7 +1,7 @@
 use std::slice;
 use std::sync::OnceLock;
 
-use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
+use crate::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_int, is_list, is_range_iter, is_seq_iter,
     is_str, is_tuple, w_dict_new, w_dict_setitem, w_dict_store, w_int_get_value, w_int_new,
@@ -19,7 +19,7 @@ pub fn make_function_from_code_obj(
     globals: *mut PyNamespace,
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
-    let code = unsafe { &*(code_ptr as *const pyre_bytecode::CodeObject) };
+    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     function_new(code_ptr, code.qualname.to_string(), globals)
 }
 

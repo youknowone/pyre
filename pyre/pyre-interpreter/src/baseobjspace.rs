@@ -1997,8 +1997,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         if crate::is_function(obj) {
             match name {
                 "__code__" => {
-                    let code_ptr =
-                        crate::function_get_code(obj) as *const pyre_bytecode::CodeObject;
+                    let code_ptr = crate::function_get_code(obj) as *const crate::CodeObject;
                     if code_ptr.is_null() {
                         return Ok(w_none());
                     }
@@ -2040,8 +2039,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     if let Some(value) = found {
                         return Ok(value);
                     }
-                    let code_ptr =
-                        crate::function_get_code(obj) as *const pyre_bytecode::CodeObject;
+                    let code_ptr = crate::function_get_code(obj) as *const crate::CodeObject;
                     if !code_ptr.is_null() {
                         return Ok(w_str_new((*code_ptr).qualname.as_ref()));
                     }
@@ -2063,7 +2061,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
         if crate::pycode::is_code(obj) {
-            let code_ptr = crate::pycode::w_code_get_ptr(obj) as *const pyre_bytecode::CodeObject;
+            let code_ptr = crate::pycode::w_code_get_ptr(obj) as *const crate::CodeObject;
             if code_ptr.is_null() {
                 return Ok(w_none());
             }
@@ -2848,7 +2846,7 @@ fn generator_next(gen_obj: PyObjectRef) -> PyResult {
                 let is_yield = if pc > 0 && pc <= code.instructions.len() {
                     matches!(
                         code.instructions[pc - 1].op,
-                        pyre_bytecode::Instruction::YieldValue { .. }
+                        crate::Instruction::YieldValue { .. }
                     )
                 } else {
                     false

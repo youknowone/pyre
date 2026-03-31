@@ -1,5 +1,5 @@
 use crate::PyError;
-use pyre_bytecode::bytecode::{BinaryOperator, ComparisonOperator};
+use crate::bytecode::{BinaryOperator, ComparisonOperator};
 use pyre_object::{PyObjectRef, w_bool_from};
 
 use crate::{

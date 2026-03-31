@@ -3,7 +3,7 @@
 /// RPython codewriter.py: assembler that emits bytecodes into a JitCode object.
 use std::cmp::max;
 
-use majit_codegen::JitCellToken;
+use majit_backend::JitCellToken;
 use majit_ir::OpCode;
 
 use super::{

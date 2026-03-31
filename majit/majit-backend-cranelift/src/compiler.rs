@@ -20,7 +20,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use cranelift_codegen::ir::Value as CValue;
 
-use majit_codegen::{
+use majit_backend::{
     AsmInfo, BackendError, CompiledTraceInfo, DeadFrame, ExitFrameLayout, ExitRecoveryLayout,
     ExitValueSourceLayout, ExitVirtualLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
@@ -976,7 +976,7 @@ fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
 fn rebuild_state_after_failure(
     outputs: &mut Vec<i64>,
     types: &[majit_ir::Type],
-    recovery: Option<&majit_codegen::ExitRecoveryLayout>,
+    recovery: Option<&majit_backend::ExitRecoveryLayout>,
     bridge_num_inputs: usize,
 ) {
     // Phase 1: recovery_layout-based materialization (rd_virtuals_info parity).
@@ -1012,13 +1012,13 @@ fn rebuild_state_after_failure(
             for frame_layout in recovery.frames.iter().rev() {
                 for slot in &frame_layout.slots {
                     match slot {
-                        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                        majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                             rebuilt.push(outputs.get(*idx).copied().unwrap_or(0));
                         }
-                        majit_codegen::ExitValueSourceLayout::Constant(c) => {
+                        majit_backend::ExitValueSourceLayout::Constant(c) => {
                             rebuilt.push(*c);
                         }
-                        majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
                             rebuilt.push(materialize(*vidx, &mut materialized));
                         }
                         _ => rebuilt.push(0),
@@ -1029,15 +1029,15 @@ fn rebuild_state_after_failure(
             // Step 3: replay pending field writes (resume.py:1003-1007).
             // Must happen AFTER materialization so target/value virtuals
             // resolve to concrete pointers.
-            let resolve_pending = |src: &majit_codegen::ExitValueSourceLayout,
+            let resolve_pending = |src: &majit_backend::ExitValueSourceLayout,
                                    materialized: &[Option<i64>]|
              -> Option<i64> {
                 match src {
-                    majit_codegen::ExitValueSourceLayout::ExitValue(idx) => {
+                    majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                         outputs.get(*idx).copied()
                     }
-                    majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
-                    majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+                    majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
+                    majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
                         materialized.get(*vidx).copied().flatten()
                     }
                     _ => None,
@@ -1115,7 +1115,7 @@ fn rebuild_state_after_failure(
 /// Phase 3: setfields — fill fields (may reference self via cycle)
 fn materialize_virtual_recursive(
     vidx: usize,
-    virtual_layouts: &[majit_codegen::ExitVirtualLayout],
+    virtual_layouts: &[majit_backend::ExitVirtualLayout],
     outputs: &[i64],
     materialized: &mut Vec<Option<i64>>,
     gc_runtime_id: Option<u64>,
@@ -1130,7 +1130,7 @@ fn materialize_virtual_recursive(
     // Phase 1: allocate (without setfields)
     let ptr = match vl {
         // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable(descr).
-        majit_codegen::ExitVirtualLayout::Object {
+        majit_backend::ExitVirtualLayout::Object {
             descr,
             fields,
             fielddescrs,
@@ -1210,7 +1210,7 @@ fn materialize_virtual_recursive(
             ptr
         }
         // resume.py:634-637 VStructInfo.allocate → allocate_struct(typedescr).
-        majit_codegen::ExitVirtualLayout::Struct {
+        majit_backend::ExitVirtualLayout::Struct {
             typedescr,
             type_id,
             fielddescrs,
@@ -1247,12 +1247,12 @@ fn materialize_virtual_recursive(
 
     // Phase 3: setfields — may recurse into nested virtuals
     match vl {
-        majit_codegen::ExitVirtualLayout::Object {
+        majit_backend::ExitVirtualLayout::Object {
             fields,
             fielddescrs,
             ..
         }
-        | majit_codegen::ExitVirtualLayout::Struct {
+        | majit_backend::ExitVirtualLayout::Struct {
             fields,
             fielddescrs,
             ..
@@ -1272,7 +1272,7 @@ fn materialize_virtual_recursive(
                         )
                         .unwrap_or_else(|| {
                             // Nested virtual not yet materialized — recurse
-                            if let majit_codegen::ExitValueSourceLayout::Virtual(nv) = src {
+                            if let majit_backend::ExitValueSourceLayout::Virtual(nv) = src {
                                 materialize_virtual_recursive(
                                     *nv,
                                     virtual_layouts,
@@ -1310,17 +1310,17 @@ fn materialize_virtual_recursive(
 }
 
 fn rebuild_state_after_failure_single_virtual(
-    vl: &majit_codegen::ExitVirtualLayout,
+    vl: &majit_backend::ExitVirtualLayout,
     outputs: &[i64],
     materialized: &[Option<i64>],
 ) -> Option<i64> {
     // Extract alloc size from live descr/typedescr when available.
     let live_alloc_size = match vl {
-        majit_codegen::ExitVirtualLayout::Object { descr, .. } => descr
+        majit_backend::ExitVirtualLayout::Object { descr, .. } => descr
             .as_ref()
             .and_then(|d| d.as_size_descr())
             .map(|sd| sd.size()),
-        majit_codegen::ExitVirtualLayout::Struct { typedescr, .. } => typedescr
+        majit_backend::ExitVirtualLayout::Struct { typedescr, .. } => typedescr
             .as_ref()
             .and_then(|d| d.as_size_descr())
             .map(|sd| sd.size()),
@@ -1328,13 +1328,13 @@ fn rebuild_state_after_failure_single_virtual(
     };
 
     match vl {
-        majit_codegen::ExitVirtualLayout::Object {
+        majit_backend::ExitVirtualLayout::Object {
             fields,
             fielddescrs,
             descr_size,
             ..
         }
-        | majit_codegen::ExitVirtualLayout::Struct {
+        | majit_backend::ExitVirtualLayout::Struct {
             fields,
             fielddescrs,
             descr_size,
@@ -1414,12 +1414,12 @@ fn rebuild_state_after_failure_single_virtual(
 }
 
 fn resolve_virtual_field_value(
-    source: &majit_codegen::ExitValueSourceLayout,
+    source: &majit_backend::ExitValueSourceLayout,
     outputs: &[i64],
 ) -> Option<i64> {
     match source {
-        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
-        majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
+        majit_backend::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
+        majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
         _ => None,
     }
 }
@@ -1427,14 +1427,14 @@ fn resolve_virtual_field_value(
 /// resolve_virtual_field_value with nested virtual support.
 /// resume.py:1552-1573: TAGVIRTUAL → getvirtual_ptr/int.
 fn resolve_virtual_field_value_with_materialized(
-    source: &majit_codegen::ExitValueSourceLayout,
+    source: &majit_backend::ExitValueSourceLayout,
     outputs: &[i64],
     materialized: &[Option<i64>],
 ) -> Option<i64> {
     match source {
-        majit_codegen::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
-        majit_codegen::ExitValueSourceLayout::Constant(c) => Some(*c),
-        majit_codegen::ExitValueSourceLayout::Virtual(vidx) => {
+        majit_backend::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
+        majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
+        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
             materialized.get(*vidx).copied().flatten()
         }
         _ => None,
@@ -2812,7 +2812,7 @@ fn call_assembler_fast_path(
     let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
         unsafe { std::mem::transmute(target.code_ptr) };
 
-    let _jitted_guard = majit_codegen::JittedGuard::enter();
+    let _jitted_guard = majit_backend::JittedGuard::enter();
 
     let handle = 0u64;
 
@@ -4450,7 +4450,7 @@ impl CompiledLoop {
 fn find_trace_fail_descr_layouts_in_fail_descrs(
     fail_descrs: &[Arc<CraneliftFailDescr>],
     trace_id: u64,
-) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+) -> Option<Vec<majit_backend::FailDescrLayout>> {
     for descr in fail_descrs {
         let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
@@ -4476,7 +4476,7 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
 fn find_trace_terminal_exit_layouts_in_fail_descrs(
     fail_descrs: &[Arc<CraneliftFailDescr>],
     trace_id: u64,
-) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+) -> Option<Vec<majit_backend::TerminalExitLayout>> {
     for descr in fail_descrs {
         let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
@@ -4606,7 +4606,7 @@ fn run_compiled_code(
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
     let func: unsafe extern "C" fn(*mut i64) -> *mut i64 = unsafe { std::mem::transmute(code_ptr) };
 
-    let _jitted_guard = majit_codegen::JittedGuard::enter();
+    let _jitted_guard = majit_backend::JittedGuard::enter();
 
     let (handle, force_frame) = if needs_force_frame {
         let (h, f) = register_force_frame(fail_descrs, gc_runtime_id);
@@ -9573,7 +9573,7 @@ fn collect_terminal_exit_layouts(
 // Backend trait implementation
 // ---------------------------------------------------------------------------
 
-impl majit_codegen::Backend for CraneliftBackend {
+impl majit_backend::Backend for CraneliftBackend {
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
@@ -9770,7 +9770,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         &self,
         token: &JitCellToken,
         args: &[i64],
-    ) -> majit_codegen::RawExecResult {
+    ) -> majit_backend::RawExecResult {
         let compiled = token
             .compiled
             .as_ref()
@@ -9839,7 +9839,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                     }
                 }
             }
-            return majit_codegen::RawExecResult {
+            return majit_backend::RawExecResult {
                 outputs: result,
                 typed_outputs: typed_result,
                 exit_layout,
@@ -9904,7 +9904,7 @@ impl majit_codegen::Backend for CraneliftBackend {
                     }
                 }
             }
-            return majit_codegen::RawExecResult {
+            return majit_backend::RawExecResult {
                 outputs: result,
                 typed_outputs: typed_result,
                 exit_layout: Some(descr.fail_descr.layout()),
@@ -9942,7 +9942,7 @@ impl majit_codegen::Backend for CraneliftBackend {
             }
         }
 
-        majit_codegen::RawExecResult {
+        majit_backend::RawExecResult {
             outputs,
             typed_outputs,
             exit_layout: Some(fail_descr.layout()),
@@ -9959,7 +9959,7 @@ impl majit_codegen::Backend for CraneliftBackend {
     fn compiled_fail_descr_layouts(
         &self,
         token: &JitCellToken,
-    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = token
             .compiled
             .as_ref()
@@ -9978,7 +9978,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
-    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let original_compiled = original_token
             .compiled
             .as_ref()
@@ -10004,7 +10004,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         &self,
         token: &JitCellToken,
         trace_id: u64,
-    ) -> Option<Vec<majit_codegen::FailDescrLayout>> {
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = token
             .compiled
             .as_ref()
@@ -10024,7 +10024,7 @@ impl majit_codegen::Backend for CraneliftBackend {
     fn compiled_terminal_exit_layouts(
         &self,
         token: &JitCellToken,
-    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let compiled = token
             .compiled
             .as_ref()
@@ -10037,7 +10037,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
-    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let original_compiled = original_token
             .compiled
             .as_ref()
@@ -10054,7 +10054,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         &self,
         token: &JitCellToken,
         trace_id: u64,
-    ) -> Option<Vec<majit_codegen::TerminalExitLayout>> {
+    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
         let compiled = token
             .compiled
             .as_ref()
@@ -10088,7 +10088,7 @@ impl majit_codegen::Backend for CraneliftBackend {
     fn compiled_guard_frame_stacks(
         &self,
         token: &JitCellToken,
-    ) -> Option<Vec<(u32, Vec<majit_codegen::ExitFrameLayout>)>> {
+    ) -> Option<Vec<(u32, Vec<majit_backend::ExitFrameLayout>)>> {
         let compiled = token
             .compiled
             .as_ref()
@@ -10103,7 +10103,7 @@ impl majit_codegen::Backend for CraneliftBackend {
         Some(result)
     }
 
-    fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_codegen::FailDescrLayout> {
+    fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_backend::FailDescrLayout> {
         deadframe_layout(frame)
     }
 
@@ -10476,7 +10476,7 @@ fn emit_inline_arena_put(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_codegen::Backend;
+    use majit_backend::Backend;
     use majit_gc::collector::{GcConfig, MiniMarkGC};
     use majit_gc::flags;
     use majit_gc::header::{GcHeader, header_of};
@@ -11120,8 +11120,8 @@ mod tests {
         assert_eq!(
             recovery.frames[0].slots,
             vec![
-                majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                majit_backend::ExitValueSourceLayout::ExitValue(0),
+                majit_backend::ExitValueSourceLayout::ExitValue(1),
             ]
         );
         assert_eq!(
@@ -11168,8 +11168,8 @@ mod tests {
         assert_eq!(
             recovery.frames[0].slots,
             vec![
-                majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                majit_backend::ExitValueSourceLayout::ExitValue(0),
+                majit_backend::ExitValueSourceLayout::ExitValue(1),
             ]
         );
         assert_eq!(
@@ -11216,8 +11216,8 @@ mod tests {
         assert_eq!(
             recovery.frames[0].slots,
             vec![
-                majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                majit_backend::ExitValueSourceLayout::ExitValue(0),
+                majit_backend::ExitValueSourceLayout::ExitValue(1),
             ]
         );
         assert_eq!(
@@ -11241,13 +11241,13 @@ mod tests {
         let mut token = JitCellToken::new(8010);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        let patched = majit_codegen::ExitRecoveryLayout {
-            frames: vec![majit_codegen::ExitFrameLayout {
+        let patched = majit_backend::ExitRecoveryLayout {
+            frames: vec![majit_backend::ExitFrameLayout {
                 trace_id: None,
                 header_pc: None,
                 source_guard: None,
                 pc: 4242,
-                slots: vec![majit_codegen::ExitValueSourceLayout::Constant(99)],
+                slots: vec![majit_backend::ExitValueSourceLayout::Constant(99)],
                 slot_types: Some(vec![Type::Int]),
             }],
             virtual_layouts: Vec::new(),
@@ -11364,38 +11364,38 @@ mod tests {
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
 
-        let source_layout = majit_codegen::ExitRecoveryLayout {
+        let source_layout = majit_backend::ExitRecoveryLayout {
             frames: vec![
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: Some(10),
                     header_pc: Some(900),
                     source_guard: Some((9, 0)),
                     pc: 900,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: Some(190),
                     header_pc: Some(1000),
                     source_guard: None,
                     pc: 1000,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
             ],
-            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 17,
                 items: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                    majit_codegen::ExitValueSourceLayout::Constant(44),
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::Constant(44),
                 ],
             }],
-            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr_index: 33,
                 item_index: Some(1),
                 is_array_item: true,
-                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
-                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                target: majit_backend::ExitValueSourceLayout::Virtual(0),
+                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
                 field_offset: 0,
                 field_size: 8,
                 field_type: Type::Int,
@@ -11541,35 +11541,35 @@ mod tests {
             .compile_loop(&inputargs, &root_ops, &mut token)
             .unwrap();
 
-        let root_layout = majit_codegen::ExitRecoveryLayout {
+        let root_layout = majit_backend::ExitRecoveryLayout {
             frames: vec![
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: None,
                     source_guard: None,
                     pc: 900,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: None,
                     source_guard: None,
                     pc: 1000,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
             ],
-            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 17,
-                items: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                items: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
             }],
-            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr_index: 33,
                 item_index: Some(0),
                 is_array_item: true,
-                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
-                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                target: majit_backend::ExitValueSourceLayout::Virtual(0),
+                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
                 field_offset: 0,
                 field_size: 8,
                 field_type: Type::Int,
@@ -11611,38 +11611,38 @@ mod tests {
             Some((290, 0))
         );
 
-        let bridge_source_layout = majit_codegen::ExitRecoveryLayout {
+        let bridge_source_layout = majit_backend::ExitRecoveryLayout {
             frames: vec![
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: None,
                     source_guard: None,
                     pc: 444,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
-                majit_codegen::ExitFrameLayout {
+                majit_backend::ExitFrameLayout {
                     trace_id: None,
                     header_pc: None,
                     source_guard: Some((290, 0)),
                     pc: 2000,
-                    slots: vec![majit_codegen::ExitValueSourceLayout::ExitValue(0)],
+                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
             ],
-            virtual_layouts: vec![majit_codegen::ExitVirtualLayout::Array {
+            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 99,
                 items: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                    majit_codegen::ExitValueSourceLayout::Constant(55),
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::Constant(55),
                 ],
             }],
-            pending_field_layouts: vec![majit_codegen::ExitPendingFieldLayout {
+            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr_index: 77,
                 item_index: Some(1),
                 is_array_item: true,
-                target: majit_codegen::ExitValueSourceLayout::Virtual(0),
-                value: majit_codegen::ExitValueSourceLayout::ExitValue(0),
+                target: majit_backend::ExitValueSourceLayout::Virtual(0),
+                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
                 field_offset: 0,
                 field_size: 8,
                 field_type: Type::Int,

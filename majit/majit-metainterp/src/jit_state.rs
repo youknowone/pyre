@@ -1184,7 +1184,7 @@ mod tests {
         MaterializedValue, MaterializedVirtual, ReconstructedFrame, ReconstructedState,
         ReconstructedValue, ResumeFrameLayoutSummary,
     };
-    use majit_codegen::ExitFrameLayout;
+    use majit_backend::ExitFrameLayout;
     use std::cell::Cell;
 
     /// Test state that tracks how many times `materialize_virtual_ref` was
@@ -1416,8 +1416,8 @@ mod tests {
                 source_guard: None,
                 pc: 10,
                 slots: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::ExitValue(1),
                 ],
                 slot_types: Some(vec![Type::Int, Type::Ref]),
             },
@@ -1495,8 +1495,8 @@ mod tests {
                 source_guard: None,
                 pc: 10,
                 slots: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::ExitValue(1),
                 ],
                 slot_types: Some(vec![Type::Int, Type::Ref]),
             },
@@ -1564,8 +1564,8 @@ mod tests {
                 source_guard: None,
                 pc: 10,
                 slots: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(0),
-                    majit_codegen::ExitValueSourceLayout::ExitValue(1),
+                    majit_backend::ExitValueSourceLayout::ExitValue(0),
+                    majit_backend::ExitValueSourceLayout::ExitValue(1),
                 ],
                 slot_types: Some(vec![Type::Int, Type::Ref]),
             }),
@@ -1575,8 +1575,8 @@ mod tests {
                 source_guard: None,
                 pc: 20,
                 slots: vec![
-                    majit_codegen::ExitValueSourceLayout::ExitValue(2),
-                    majit_codegen::ExitValueSourceLayout::ExitValue(3),
+                    majit_backend::ExitValueSourceLayout::ExitValue(2),
+                    majit_backend::ExitValueSourceLayout::ExitValue(3),
                 ],
                 slot_types: Some(vec![Type::Ref, Type::Int]),
             }),
