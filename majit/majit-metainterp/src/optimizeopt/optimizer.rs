@@ -132,9 +132,6 @@ pub struct Optimizer {
     /// RPython parity: GcRef constants (ob_type etc.) recorded as const_int
     /// need Ref type for resume data but must NOT trigger Cranelift GC root.
     pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
-    /// RPython unroll.py: virtual structures found in JUMP args during preamble.
-    /// Populated by OptVirtualize.export_virtual_for_preamble().
-    pub exported_jump_virtuals: Vec<ExportedJumpVirtual>,
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
@@ -291,25 +288,6 @@ pub enum ImportedVirtualKind {
         known_class: Option<majit_ir::GcRef>,
     },
     Struct,
-}
-
-/// RPython unroll.py: ExportedState virtual field info.
-/// Records a virtual object's structure at JUMP for preamble peeling phase 2.
-#[derive(Clone, Debug)]
-pub struct ExportedJumpVirtual {
-    /// Index in JUMP args where this virtual was.
-    pub jump_arg_index: usize,
-    /// Size descriptor for New().
-    pub size_descr: majit_ir::DescrRef,
-    /// Whether this exported virtual is an instance or a plain struct.
-    pub kind: ImportedVirtualKind,
-    /// Descr index of the pool GetfieldGcR that loaded this head.
-    pub head_load_descr_index: Option<u32>,
-    /// Fields: (field_descr, exported abstract info for the field value).
-    pub fields: Vec<(
-        majit_ir::DescrRef,
-        crate::optimizeopt::virtualstate::VirtualStateInfo,
-    )>,
 }
 
 impl Optimizer {
@@ -534,6 +512,31 @@ impl Optimizer {
                 imported_label_args
             );
         }
+        // RPython Box identity parity: Two-pass approach.
+        //
+        // Pass 1: process all fields with import_virtual_state_from_label_args.
+        //   Constant fields get alloc_op_position. Leaf fields get LABEL arg OpRefs.
+        //   Record which leaf field positions need SameAs (skip_flush_mode = Phase 2).
+        //
+        // Pass 2: allocate SameAs positions and create ops for recorded leaves.
+        //   This happens AFTER all Constant allocs, preventing reserve_pos collision
+        //   with Phase 1 virtual head positions.
+        //
+        // Without SameAs, the assembly's body_result_remap maps fail_args entries
+        // from LABEL arg positions to body op fresh positions, causing virtual fields
+        // to get body IntAddOvf results instead of LABEL values.
+        struct VirtualEntry {
+            head: OpRef,
+            size_descr: majit_ir::DescrRef,
+            fields: Vec<(u32, OpRef)>,
+            field_descrs: Vec<(u32, majit_ir::DescrRef)>,
+            kind: ImportedVirtualKind,
+            head_load_descr_index: Option<u32>,
+        }
+        let mut entries: Vec<VirtualEntry> = Vec::new();
+        // Track leaf field positions that need SameAs (position, entry_idx, field_idx).
+        let mut same_as_targets: Vec<(OpRef, usize, usize)> = Vec::new();
+
         for iv in &self.imported_virtuals {
             let virtual_head = ctx.get_box_replacement(OpRef(iv.inputarg_index as u32));
             let mut fields = Vec::new();
@@ -545,25 +548,74 @@ impl Optimizer {
                     &mut label_slot,
                     ctx,
                 );
+                let field_idx = fields.len();
+                // Record leaf field values that need SameAs protection.
+                if ctx.skip_flush_mode
+                    && !field_ref.is_none()
+                    && field_ref.0 < 10_000
+                    // Only for leaf values — Constant/Virtual heads already have
+                    // unique positions from alloc_op_position.
+                    && ctx.get_ptr_info(field_ref).map_or(true, |info| !info.is_virtual())
+                    && ctx.get_constant(field_ref).is_none()
+                {
+                    same_as_targets.push((field_ref, entries.len(), field_idx));
+                }
                 fields.push((descr.index(), field_ref));
                 field_descrs.push((descr.index(), descr.clone()));
             }
+            entries.push(VirtualEntry {
+                head: virtual_head,
+                size_descr: iv.size_descr.clone(),
+                fields,
+                field_descrs,
+                kind: iv.kind.clone(),
+                head_load_descr_index: iv.head_load_descr_index,
+            });
+        }
+
+        // Pass 2: allocate SameAs ops for leaf field values.
+        // Advance next_pos past all virtual head positions to prevent
+        // reserve_pos from returning a position that's already used
+        // as a virtual head (allocated during import_state).
+        for entry in &entries {
+            if !entry.head.is_none() && entry.head.0 < 10_000 {
+                ctx.next_pos = ctx.next_pos.max(entry.head.0 + 1);
+            }
+        }
+        for (label_arg, entry_idx, field_idx) in &same_as_targets {
+            let tp = ctx
+                .value_types
+                .get(&label_arg.0)
+                .copied()
+                .unwrap_or(majit_ir::Type::Int);
+            let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
+            let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
+            op.pos = ctx.reserve_pos();
+            let fresh = op.pos;
+            ctx.value_types.insert(fresh.0, tp);
+            ctx.new_operations.push(op);
+            // Update the field to reference the SameAs result.
+            entries[*entry_idx].fields[*field_idx].1 = fresh;
+        }
+
+        // Install PtrInfo for each virtual.
+        for entry in entries {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
-                    "[jit] install_imported_virtual head={virtual_head:?} fields={:?}",
-                    fields
+                    "[jit] install_imported_virtual head={:?} fields={:?}",
+                    entry.head, entry.fields
                 );
             }
-            match &iv.kind {
+            match &entry.kind {
                 ImportedVirtualKind::Instance { known_class } => {
                     ctx.set_ptr_info(
-                        virtual_head,
+                        entry.head,
                         crate::optimizeopt::info::PtrInfo::Virtual(
                             crate::optimizeopt::info::VirtualInfo {
-                                descr: iv.size_descr.clone(),
+                                descr: entry.size_descr,
                                 known_class: *known_class,
-                                fields,
-                                field_descrs,
+                                fields: entry.fields,
+                                field_descrs: entry.field_descrs,
                                 last_guard_pos: -1,
                             },
                         ),
@@ -571,21 +623,21 @@ impl Optimizer {
                 }
                 ImportedVirtualKind::Struct => {
                     ctx.set_ptr_info(
-                        virtual_head,
+                        entry.head,
                         crate::optimizeopt::info::PtrInfo::VirtualStruct(
                             crate::optimizeopt::info::VirtualStructInfo {
-                                descr: iv.size_descr.clone(),
-                                fields,
-                                field_descrs,
+                                descr: entry.size_descr,
+                                fields: entry.fields,
+                                field_descrs: entry.field_descrs,
                                 last_guard_pos: -1,
                             },
                         ),
                     );
                 }
             }
-            if let Some(descr_idx) = iv.head_load_descr_index {
+            if let Some(descr_idx) = entry.head_load_descr_index {
                 ctx.imported_virtual_heads
-                    .push((descr_idx as usize, virtual_head));
+                    .push((descr_idx as usize, entry.head));
             }
         }
     }
@@ -799,7 +851,6 @@ impl Optimizer {
             constant_types: std::collections::HashMap::new(),
             bridge_preamble_constants: std::collections::HashMap::new(),
             numbering_type_overrides: std::collections::HashMap::new(),
-            exported_jump_virtuals: Vec::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
             exported_loop_state: None,
@@ -1127,41 +1178,31 @@ impl Optimizer {
             return resolved;
         };
 
-        if matches!(info, crate::optimizeopt::info::PtrInfo::Virtual(_)) {
-            if !rec.insert(resolved) {
-                return resolved;
-            }
-            // RPython AbstractVirtualPtrInfo._force_at_the_end_of_preamble():
-            // top-level instance-like virtuals fall back to force_box().
-            let forced_ref = info.force_box_direct(resolved, ctx);
-            if let Some(new_info) = ctx.get_ptr_info(forced_ref).cloned() {
-                let mut updated = new_info;
-                updated.force_at_the_end_of_preamble(|child| {
-                    self.force_box_for_end_of_preamble_rec(child, ctx, rec)
-                });
-                ctx.set_ptr_info(forced_ref, updated);
-            }
-            return forced_ref;
-        }
-
+        // RPython info.py: InstancePtrInfo and StructPtrInfo both inherit
+        // AbstractStructPtrInfo._force_at_the_end_of_preamble() which keeps
+        // the virtual alive, only recursing into field children.
+        // ArrayPtrInfo also overrides to keep virtual alive.
+        // Only AbstractRawPtrInfo (raw buffers) falls through to force_box().
         if matches!(
             info,
-            crate::optimizeopt::info::PtrInfo::VirtualStruct(_)
+            crate::optimizeopt::info::PtrInfo::Virtual(_)
+                | crate::optimizeopt::info::PtrInfo::VirtualStruct(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualArray(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
-                | crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
         ) {
             if !rec.insert(resolved) {
                 return resolved;
             }
-            // RPython AbstractStructPtrInfo/ArrayPtrInfo override
-            // _force_at_the_end_of_preamble() to recurse into children while
-            // leaving the top-level virtual in the exported virtual state.
             info.force_at_the_end_of_preamble(|child| {
                 self.force_box_for_end_of_preamble_rec(child, ctx, rec)
             });
             ctx.set_ptr_info(resolved, info);
             return resolved;
+        }
+
+        // RawBuffer: AbstractRawPtrInfo inherits base force_box() default.
+        if matches!(info, crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)) {
+            return self.force_box(resolved, ctx);
         }
 
         if info.is_virtual() {
@@ -1384,11 +1425,6 @@ impl Optimizer {
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
         ctx.imported_label_args = self.imported_label_args.clone();
-        // Phase 1's exported_jump_virtuals tell store_final_boxes_in_guard
-        // which fail_args positions are virtual (using jump_arg_index).
-        if ctx.exported_jump_virtuals.is_empty() {
-            ctx.exported_jump_virtuals = self.exported_jump_virtuals.clone();
-        }
 
         // RPython Box type parity: in RPython each Box carries its type
         // intrinsically (InputArgInt, InputArgRef, etc.). In majit, OpRef
@@ -1688,17 +1724,23 @@ impl Optimizer {
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
-        let exported_jump_virtuals = std::mem::take(&mut ctx.exported_jump_virtuals);
         self.imported_short_sources = std::mem::take(&mut ctx.imported_short_sources);
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
         self.patchguardop = ctx.patchguardop.clone();
-        let jump = ctx
-            .new_operations
-            .iter()
-            .rfind(|op| op.opcode == OpCode::Jump)
-            .cloned();
+        // RPython flush=False: JUMP is stored in terminal_op, not in new_operations.
+        // Fall back to new_operations for flush=True (bridge optimization).
+        let jump = self
+            .terminal_op
+            .clone()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .or_else(|| {
+                ctx.new_operations
+                    .iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .cloned()
+            });
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!(
                 "[jit] export: pre_force_vs={} pre_force_args={}",
@@ -1861,7 +1903,6 @@ impl Optimizer {
                     .collect();
             }
         }
-        self.exported_jump_virtuals = exported_jump_virtuals;
 
         // RPython export_state() flushes force artifacts into the preamble
         // before building the exported loop state. If the loop header needs
@@ -2770,23 +2811,15 @@ impl Optimizer {
             op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
         if has_snapshot {
             // optimizer.py:732-748 + resume.py:389-452:
-            // RPython: finish() handles everything without forcing.
+            // RPython finish() handles virtuals without forcing.
             //
             // Majit deviation: collect_virtual_field_values forces nested
             // virtuals. RPython's _number_virtuals only collects.
             //
-            // Root cause: virtual field values share Cranelift variable
-            // positions with body ops. LABEL defines v22 = prev iteration,
-            // but body IntAddOvf redefines v22 = current result. The
-            // virtual field still references v22, getting wrong value.
-            // RPython Boxes have unique identity, preventing this collision.
-            //
-            // Additionally, install_imported_virtuals label_slot aliasing
-            // can cause multiple virtual field values to reference the same
-            // LABEL arg, producing incorrect values.
-            //
-            // Prerequisite for removal: Box identity parity for LABEL args
-            // used as virtual field values (Cranelift variable separation).
+            // install_imported_virtuals emits SameAs ops for virtual field
+            // values (Box identity parity). The remaining blocker for
+            // forcing removal is fib_loop label_args aliasing (OpRef(22)
+            // duplicated in make_inputargs) and raise_catch guard recovery.
             let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
             let mut extra_fail_args: Vec<OpRef> = Vec::new();
             let original_len = fail_args.len();
