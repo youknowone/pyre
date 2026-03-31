@@ -1879,18 +1879,10 @@ impl Optimization for OptHeap {
             // The optimizer replaces the field read with the cached value and
             // emits GUARD_NOT_INVALIDATED to ensure validity.
             OpCode::QuasiimmutField => {
-                if !self.seen_guard_not_invalidated {
-                    self.seen_guard_not_invalidated = true;
-                    let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-                    // RPython parity: inherit rd_resume_position from
-                    // patchguardop so the guard gets a snapshot for numbering.
-                    if let Some(ref patch) = ctx.patchguardop {
-                        guard_op.rd_resume_position = patch.rd_resume_position;
-                        guard_op.fail_args = patch.fail_args.clone();
-                    }
-                    self.force_all_lazy(ctx);
-                    ctx.emit(guard_op);
-                }
+                // RPython optimize_QUASIIMMUT_FIELD (heap.py:781):
+                // Does NOT create a new GUARD_NOT_INVALIDATED — the tracer
+                // already emitted one via generate_guard (pyjitpl.py:1087).
+                // Records quasi_immutable_deps for invalidation tracking.
                 let obj = op.arg(0);
                 // RPython optimize_QUASIIMMUT_FIELD: collect quasi-immutable
                 // dependencies. Add (obj_ptr, field_idx) to quasi_immutable_deps

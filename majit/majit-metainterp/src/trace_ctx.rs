@@ -74,6 +74,10 @@ pub struct TraceCtx {
     /// pyjitpl.py:2594 frame.pc: last bytecode pc passed to trace_fn.
     /// Used by force_finish_trace segmenting to record the guard-point pc.
     pub last_traced_pc: usize,
+    /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
+    /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
+    /// Stores Some(orgpc) when pending.
+    pending_guard_not_invalidated_pc: Option<usize>,
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -181,6 +185,16 @@ impl TraceCtx {
         &mut self.heap_cache
     }
 
+    /// pyjitpl.py:1087 parity: check if a quasi-immut guard is pending.
+    pub fn pending_guard_not_invalidated_pc(&self) -> Option<usize> {
+        self.pending_guard_not_invalidated_pc
+    }
+
+    /// Set pending quasi-immut guard with the field read's orgpc.
+    pub fn set_pending_guard_not_invalidated(&mut self, pc: Option<usize>) {
+        self.pending_guard_not_invalidated_pc = pc;
+    }
+
     /// pyjitpl.py:2951, 2418: reset heap cache at loop header / retrace.
     pub fn reset_heap_cache(&mut self) {
         self.heap_cache.reset();
@@ -253,6 +267,7 @@ impl TraceCtx {
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
+            pending_guard_not_invalidated_pc: None,
         }
     }
 
@@ -291,6 +306,7 @@ impl TraceCtx {
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
+            pending_guard_not_invalidated_pc: None,
         }
     }
 

@@ -1200,13 +1200,6 @@ fn execute_assembler(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     frame.next_instr = entry_pc;
-    // TODO(parity): RPython does NOT snapshot frame state — its rd_numb
-    // is always complete so blackhole writeback never corrupts. Pyre's
-    // rd_numb can be incomplete, causing garbage writeback. This snapshot
-    // detects and recovers from corruption. Remove when rd_numb encoding
-    // reaches full parity with RPython's get_list_of_active_boxes.
-    let saved_ni = frame.next_instr;
-    let saved_vsd = frame.valuestackdepth;
 
     let mut jit_state = build_jit_state(frame, info);
     jit_state.next_instr = entry_pc;
@@ -1309,25 +1302,25 @@ fn execute_assembler(
                 if let Some(ref frames) = guard_frames {
                     match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            // compile.py:701-716: resume_in_blackhole succeeds.
-                            // RPython does NOT invalidate — compiled loop stays
-                            // valid. Guard failure counter accumulates for bridge
-                            // compilation (compile.py:738 must_compile).
-                            //
-                            // Pyre: bridge tracing fails (compiled=false at step 0)
-                            // for some benchmarks, causing infinite guard-failure
-                            // loops without invalidation. Keep invalidation as
-                            // safety net until bridge tracing is fixed.
-                            driver.invalidate_loop(green_key);
+                            // warmstate.py:387-423: RPython does NOT invalidate
+                            // after blackhole resume. Guard counter accumulates
+                            // for bridge compilation on the next failure.
                             Some(LoopResult::ContinueRunningNormally)
                         }
                         crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
+                            // RPython blackhole never fails (complete rd_numb).
+                            // If pyre's blackhole fails, the resume data is buggy.
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][WARN] blackhole failed key={} — \
+                                     invalidating loop (resume data bug)",
+                                    green_key,
+                                );
+                            }
                             driver.invalidate_loop(green_key);
-                            frame.next_instr = saved_ni;
-                            frame.valuestackdepth = saved_vsd;
                             None
                         }
                     }
