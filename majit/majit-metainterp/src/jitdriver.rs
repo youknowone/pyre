@@ -2540,8 +2540,33 @@ impl<S: JitState> JitDriver<S> {
         // resume.py:1042: inject bridge frame constants into the trace's
         // constant pool so the optimizer can fold them.
         if let Some(ref bfm) = resume_data_result {
+            // resume.py:1042: inject bridge frame constants.
             if !bfm.constants.is_empty() {
                 self.meta.inject_bridge_constants(&bfm.constants);
+            }
+            // resume.py:1047: virtualizable_boxes consumed by
+            // pyjitpl.py:3420 self.virtualizable_boxes = virtualizable_boxes.
+            // Store in resume_data_result for the trace state to pick up.
+            // resume.py:1054-1055: consume_boxes fills register types.
+            // Update trace_meta slot_types from the innermost frame's
+            // decoded values if available.
+            if let Some(innermost) = bfm.frames.first() {
+                let new_types: Vec<Type> = innermost
+                    .values
+                    .iter()
+                    .map(|rv| match rv {
+                        majit_ir::resumedata::RebuiltValue::Box(_) => Type::Ref,
+                        majit_ir::resumedata::RebuiltValue::Int(_) => Type::Int,
+                        majit_ir::resumedata::RebuiltValue::Const(_, tp) => *tp,
+                        majit_ir::resumedata::RebuiltValue::Virtual(_) => Type::Ref,
+                        _ => Type::Ref,
+                    })
+                    .collect();
+                if !new_types.is_empty() {
+                    if let Some(ref mut tm) = self.trace_meta {
+                        S::update_meta_for_bridge(tm, &new_types);
+                    }
+                }
             }
         }
         self.resume_data_result = resume_data_result;

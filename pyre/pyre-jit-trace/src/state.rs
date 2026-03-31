@@ -7649,11 +7649,17 @@ impl JitState for PyreJitState {
             && self.valuestackdepth == meta.valuestackdepth
     }
 
-    fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {
-        // RPython rebuild_from_resumedata (resume.py:1042, pyjitpl.py:3400)
-        // restores the complete frame stack from rd_numb before bridge
-        // tracing starts. The meta (num_locals, valuestackdepth, slot_types)
-        // remains unchanged — bridge tracing sees the full frame layout.
+    fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
+        // RPython resume.py:1042: bridge tracing always has rd_numb and
+        // rebuilds the full frame state. This fallback runs when rd_numb
+        // is absent (pyre-specific). Update valuestackdepth and slot_types
+        // from the guard's fail_arg_types to avoid stale metadata.
+        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
+        if fail_arg_types.len() >= 3 {
+            let new_vsd = fail_arg_types.len() - 3;
+            meta.valuestackdepth = new_vsd;
+            meta.slot_types = fail_arg_types[3..].to_vec();
+        }
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.

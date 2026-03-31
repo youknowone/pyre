@@ -65,19 +65,27 @@ pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = VirtualizableInfo::new(PYFRAME_VABLE_TOKEN_OFFSET);
     // interp_jit.py:25: virtualizable_name = 'frame'
     info.name = "frame".to_string();
-    // PyPy: last_instr
+    // interp_jit.py:25: last_instr (pyre: next_instr)
     info.add_field(
         PYFRAME_VABLE_FIELDS[0].0,
         Type::Int,
         PYFRAME_NEXT_INSTR_OFFSET,
     );
-    // PyPy: valuestackdepth
+    // interp_jit.py:25: pycode (pyre: code)
+    info.add_field(PYFRAME_VABLE_FIELDS[1].0, Type::Ref, PYFRAME_CODE_OFFSET);
+    // interp_jit.py:26: valuestackdepth
     info.add_field(
-        PYFRAME_VABLE_FIELDS[1].0,
+        PYFRAME_VABLE_FIELDS[2].0,
         Type::Int,
         PYFRAME_VALUESTACKDEPTH_OFFSET,
     );
-    // PyPy: locals_cells_stack_w[*] — single unified array
+    // interp_jit.py:31: w_globals (pyre: namespace)
+    info.add_field(
+        PYFRAME_VABLE_FIELDS[3].0,
+        Type::Ref,
+        PYFRAME_NAMESPACE_OFFSET,
+    );
+    // interp_jit.py:27: locals_cells_stack_w[*] — single unified array
     info.add_embedded_array_field_with_layout(
         PYFRAME_VABLE_ARRAYS[0].0,
         Type::Ref,

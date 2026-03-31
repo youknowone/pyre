@@ -5704,13 +5704,17 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// RPython flow: force_now() → cpu.force(token) → handle_async_forcing()
     /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
+    ///
+    /// Returns the forced virtual caches (ptr, int) for later blackhole
+    /// resumption from the GUARD_NOT_FORCED. RPython stores these as
+    /// AllVirtuals via cpu.set_savedata_ref().
     pub fn handle_async_forcing(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
-    ) {
+    ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
@@ -5720,37 +5724,43 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values.len()
             );
         }
-        // compile.py:994: force_from_resumedata — reconstruct virtuals
-        // from resume data and materialize them.
-        let compiled = match self.compiled_loops.get(&green_key) {
-            Some(c) => c,
-            None => return,
-        };
+        // compile.py:988-991: resolve metainterp_sd, vinfo, ginfo
+        let compiled = self.compiled_loops.get(&green_key)?;
         let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-        if let Some((_, trace)) = Self::trace_for_exit(compiled, norm_tid) {
-            if let Some(exit_layout) =
-                Self::compiled_exit_layout_from_trace(trace, green_key, norm_tid, fail_index)
-            {
-                // resume.py:1347: ResumeDataDirectReader + force_all_virtuals
-                // Use reconstruct_state to materialize virtuals from rd_numb.
-                if let Some(ref resume_layout) = exit_layout.resume_layout {
-                    let state = resume_layout.reconstruct_state(fail_values);
-                    // compile.py:999: store materialized virtuals.
-                    // In majit, materialized Ref values are already in fail_values.
-                    // The reconstruct_state result captures pending fields that
-                    // need to be written back to heap objects.
-                    for pf in &state.pending_fields {
-                        // compile.py:999: log forced virtual field writes.
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][force] pending field: descr={} item={:?}",
-                                pf.descr_index, pf.item_index,
-                            );
-                        }
-                    }
-                }
-            }
+        let (_, trace) = Self::trace_for_exit(compiled, norm_tid)?;
+        let exit_layout =
+            Self::compiled_exit_layout_from_trace(trace, green_key, norm_tid, fail_index)?;
+
+        // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
+        let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+        let rd_consts: Vec<i64> = exit_layout
+            .rd_consts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        let allocator = crate::resume::NullAllocator;
+        let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
+            rd_numb,
+            &rd_consts,
+            fail_values,
+            None, // vrefinfo
+            None, // vinfo
+            None, // ginfo
+            &allocator,
+        );
+        // compile.py:999-1000: obj = AllVirtuals(all_virtuals)
+        //   metainterp_sd.cpu.set_savedata_ref(deadframe, obj.hide())
+        // Return the virtual caches so the caller can store them.
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit][handle_async_forcing] forced {} ptr + {} int virtuals",
+                all_virtuals_ptr.len(),
+                all_virtuals_int.len(),
+            );
         }
+        Some((all_virtuals_ptr, all_virtuals_int))
     }
 
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
