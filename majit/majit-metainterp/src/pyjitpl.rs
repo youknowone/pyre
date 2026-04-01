@@ -3026,10 +3026,11 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constant_types,
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
-        // LivenessInfo has precise per-local liveness (liveness.py parity).
-        // Blocked: fib_recursive SEGFAULT in blackhole_from_resumedata —
-        // decode_ref(TAGINT) boxes via w_int_new but the boxed object
-        // may be reclaimed before BH returns (GC/lifetime issue).
+        // Snapshot propagation: infrastructure complete (liveness unified,
+        // exit_types reconciled, decode_ref TAGINT boxing, vable skip).
+        // Blocked: fib_recursive CallAssembler recursive guard failure →
+        // compiled code receives BH result as PyObjectRef but expects raw Int
+        // (adapt-live type divergence in CallAssemblerI result handling).
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
