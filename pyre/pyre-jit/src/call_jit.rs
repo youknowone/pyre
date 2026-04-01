@@ -2725,6 +2725,11 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
             }
         }
     }
+    // RPython blackhole.py:1095 bhimpl_residual_call → portal_ptr.
+    // call_user_function_plain bypasses EVAL_OVERRIDE for THIS frame.
+    // Nested calls from the callee go through normal call_user_function
+    // which respects EVAL_OVERRIDE (eval_with_jit), allowing JIT re-entry
+    // for compiled code — matching RPython's portal_runner behavior.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };
