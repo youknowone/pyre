@@ -6040,10 +6040,12 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
+    exit_types: &'a [majit_ir::Type],
 ) -> (Vec<i64>, Vec<i64>) {
     // resume.py:1347-1348
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
+    resumereader.exit_types = exit_types;
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

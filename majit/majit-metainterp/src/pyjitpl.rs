@@ -5753,6 +5753,7 @@ impl<M: Clone> MetaInterp<M> {
             vinfo.map(|v| v as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,
+            &exit_layout.exit_types,
         );
         // compile.py:999-1000: obj = AllVirtuals(all_virtuals)
         //   metainterp_sd.cpu.set_savedata_ref(deadframe, obj.hide())
