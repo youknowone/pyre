@@ -745,6 +745,10 @@ impl CodeWriter {
             jitcode.liveness = liveness;
         }
 
+        // RPython parity: forward PC map (py_pc → jitcode_pc) so
+        // get_list_of_active_boxes can look up LivenessInfo by Python PC.
+        jitcode.py_to_jit_pc = pc_map.clone();
+
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
         //

@@ -932,6 +932,7 @@ impl JitCodeBuilder {
             assembler_targets: self.assembler_targets,
             exception_handlers: Vec::new(),
             jit_to_py_pc: Vec::new(),
+            py_to_jit_pc: Vec::new(),
             has_abort: self.has_abort,
             is_portal: false,
         }

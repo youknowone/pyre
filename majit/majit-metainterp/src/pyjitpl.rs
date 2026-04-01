@@ -3022,18 +3022,12 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 &mut constant_types,
             );
-        // Snapshot-based guard numbering: infrastructure ready.
-        // Activation blocked by performance regression (bridge compilation
-        // delay). IR blackhole's NullMemory::call_i returns 0 for
-        // CallAssembler ops → wrong intermediate results → delayed bridge
-        // compilation → 34s vs 0.2s for fib_recursive.
-        // Fix: implement call_i/call_r in IR blackhole (CallAssembler
-        // execution via portal_runner), or trigger bridge compilation
-        // from call_assembler_guard_failure after trace_eagerness threshold.
-        // Snapshot + adapt-live type correction blocked by gcmap conflict:
-        // try_function_entry_jit applies adapt-live (Ref→Int) but CalAssemblerI
-        // does not. Same compiled code, one gcmap → cannot satisfy both.
-        // RPython has no adapt-live; Box types match from the start.
+        // compile.py:92-96: SimpleCompileData.optimize → optimize_loop →
+        // propagate_all_forward processes entire trace including snapshots.
+        // Blocked: LivenessInfo has all-locals-always-live (conservative).
+        // Snapshot numbering with all locals includes stale dead-local values
+        // → wrong computation on guard failure. Fix: precise per-local
+        // liveness in LivenessInfo (RPython liveness.py backward analysis).
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
