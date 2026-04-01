@@ -1608,7 +1608,14 @@ impl Optimization for OptVirtualize {
         self.ensure_vable_setup(ctx);
         match op.opcode {
             // Allocation — create virtual
-            OpCode::NewWithVtable => self.optimize_new_with_vtable(op, ctx),
+            // RPython dispatches NEW_WITH_VTABLE to make_virtual (VirtualInfo).
+            // pyre routes it to optimize_new (VirtualStruct) because
+            // the PtrInfo::Virtual path has an undiagnosed field-value bug
+            // (returns object pointer instead of intval for W_IntObject).
+            // VirtualStruct correctly stores ob_type as a regular field;
+            // the export path (mod.rs:1706-1736) extracts known_class from
+            // ob_type at offset 0 → RdVirtualInfo::VirtualInfo (Instance).
+            OpCode::NewWithVtable => self.optimize_new(op, ctx),
             OpCode::New => self.optimize_new(op, ctx),
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
 
