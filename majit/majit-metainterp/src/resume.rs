@@ -5286,7 +5286,7 @@ pub trait BlackholeAllocator {
     /// when adapt-live stores a raw Int in a slot that decode_ref reads,
     /// this method wraps it into a valid GCREF (W_IntObject).
     fn box_int(&self, value: i64) -> i64 {
-        value // default: return raw value (override in pyre allocator)
+        value
     }
 }
 

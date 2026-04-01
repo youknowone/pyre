@@ -2183,8 +2183,13 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
         {
-            // W_IntObject fast path: fieldnums[0] = intval (offset 8)
-            if let Some(&tagged) = fieldnums.first() {
+            // W_IntObject fast path: find the intval field by offset (8),
+            // not by index — VirtualInfo fields include ob_type at offset 0.
+            let intval_idx = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == 8)
+                .unwrap_or(0);
+            if let Some(&tagged) = fieldnums.get(intval_idx) {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -2208,8 +2213,12 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
         {
-            // W_FloatObject fast path: fieldnums[0] = floatval (offset 8)
-            if let Some(&tagged) = fieldnums.first() {
+            // W_FloatObject fast path: find floatval field by offset (8).
+            let floatval_idx = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == 8)
+                .unwrap_or(0);
+            if let Some(&tagged) = fieldnums.get(floatval_idx) {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -3493,11 +3502,18 @@ struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
-        // resume.py:1437-1439 allocate_with_vtable
-        // pyre objects are GC-managed; allocation requires type_id → gc.alloc.
-        // Delegate to GC allocator when available.
         let _ = descr_index;
         0 // TODO: gc.alloc_with_type_id(descr_index)
+    }
+
+    fn box_int(&self, raw: i64) -> i64 {
+        let obj = Box::new(pyre_object::intobject::W_IntObject {
+            ob_header: pyre_object::pyobject::PyObject {
+                ob_type: &pyre_object::INT_TYPE as *const _ as *const pyre_object::pyobject::PyType,
+            },
+            intval: raw,
+        });
+        Box::into_raw(obj) as i64
     }
 
     fn setfield_typed(

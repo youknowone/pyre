@@ -244,6 +244,8 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
+    /// RPython Box identity: separate non-chaining import_box map.
+    pub import_box_map: HashMap<u32, OpRef>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
@@ -432,6 +434,7 @@ impl OptContext {
             current_pass_idx: 0,
 
             in_final_emission: false,
+            import_box_map: HashMap::new(),
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
@@ -483,6 +486,7 @@ impl OptContext {
             current_pass_idx: 0,
 
             in_final_emission: false,
+            import_box_map: HashMap::new(),
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
@@ -1208,6 +1212,7 @@ impl OptContext {
     /// setinfo_from_preamble_recursive then sets PtrInfo on the TARGET
     /// (via get_replacement).
     pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
+        self.import_box_map.insert(source.0, target);
         self.replace_op(source, target);
     }
 
@@ -1245,6 +1250,14 @@ impl OptContext {
     /// follows the _forwarded chain on the box itself.
     pub fn get_box_replacement(&self, mut opref: OpRef) -> OpRef {
         use crate::optimizeopt::info::Forwarded;
+        // RPython Box identity: check import_box_map FIRST for a non-chaining
+        // one-step lookup. This prevents chains where import_box(a→b) and
+        // import_box(b→c) would make get_replacement(a) skip b entirely.
+        // RPython stops at PtrInfo terminals; here we stop by using the map
+        // instead of following forwarded[] which may be overwritten.
+        if let Some(&target) = self.import_box_map.get(&opref.0) {
+            opref = target;
+        }
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarded.len() {
