@@ -262,8 +262,6 @@ pub struct OptContext {
     /// Used by InlineBoxEnv.get_type() to avoid fallback to Int for
     /// unresolved OpRefs (resume.py:210 box.type == 'r' vs 'i').
     pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
-    /// optimizer.py:432 box.set_forwarded(constbox) parity.
-    pub made_constant: HashSet<u32>,
     /// compile.rs value_types parity: OpRef → Type for all defined values
     /// (inputargs + operation results). Used by store_final_boxes_in_guard
     /// to infer fail_arg types correctly for OpRefs from earlier phases.
@@ -298,11 +296,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if opref.is_constant() {
             return true;
         }
-        // optimizer.py:432 box.set_forwarded(constbox) parity.
-        // TODO: blocked by Ref-as-Int encoding (see make_constant).
-        // if self.ctx.made_constant.contains(&opref.0) {
-        //     return true;
-        // }
+        // optimizer.py:432: make_constant → box.set_forwarded(constbox)
+        // makes isinstance(box, Const) true. Blocked by Ref-as-Int gap
+        // (see make_constant doc). No-op until set_forwarded is implemented.
         // info.py: ConstPtrInfo.is_constant() → True
         matches!(
             self.ctx.get_ptr_info(opref),
@@ -446,7 +442,6 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             snapshot_box_types: HashMap::new(),
-            made_constant: HashSet::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -498,7 +493,6 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             snapshot_box_types: HashMap::new(),
-            made_constant: HashSet::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1264,21 +1258,22 @@ impl OptContext {
     }
 
     /// optimizer.py:410-432 make_constant(box, constbox).
+    ///
+    /// RPython: `box = get_box_replacement(box); box.set_forwarded(constbox)`.
+    /// set_forwarded makes `get_box_replacement` return the Const, so
+    /// `isinstance(box, Const)` becomes True in `_number_boxes`.
+    ///
+    /// Pyre gap: pyre stores Ref pointers as Value::Int (no ConstPtr type).
+    /// Until Value carries an explicit type or set_forwarded is implemented
+    /// with real Const OpRefs (>= 10000), `is_const` cannot safely recognize
+    /// make_constant'd values — Ref pointers would be TAGINT'd, corrupting
+    /// resume data. This is the make_constant forwarding gap.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
         }
         self.constants[idx] = Some(value);
-        // optimizer.py:432: box.set_forwarded(constbox).
-        // TODO: made_constant tracking is blocked by Ref-as-Int encoding.
-        // pyre stores Ref pointers as Value::Int in make_constant
-        // (e.g. GetfieldGcPureI constant folding). is_const would tag
-        // them as TAGINT, but the value is a Ref pointer → corrupt resume.
-        // RPython doesn't have this issue because ConstPtr and ConstInt
-        // are distinct box types with immutable .type.
-        // Fix requires either: (a) store Value::Ref for Ref constants, or
-        // (b) set_forwarded to a real Const OpRef (>= 10000) like RPython.
     }
 
     /// resume.py:157 getconst parity for synthetic rd_numb encoding.
@@ -1588,11 +1583,8 @@ impl OptContext {
                 if opref.is_constant() {
                     return true;
                 }
-                // optimizer.py:432 box.set_forwarded(constbox) parity.
-                // TODO: blocked by Ref-as-Int encoding (see make_constant).
-                // if self.ctx.made_constant.contains(&opref.0) {
-                //     return true;
-                // }
+                // optimizer.py:432: make_constant → set_forwarded(constbox).
+                // Blocked by Ref-as-Int gap (see make_constant doc).
                 // info.py: ConstPtrInfo.is_constant() → True
                 matches!(
                     self.ctx.get_ptr_info(opref),
