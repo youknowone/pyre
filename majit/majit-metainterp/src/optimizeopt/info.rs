@@ -12,8 +12,9 @@ use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
 /// - None (no forwarding, no info)
 /// - another Box (forwarding to that box)
 /// - a PtrInfo instance (terminal info)
+/// - a Const value (terminal — RPython: _forwarded = constbox)
 ///
-/// `get_box_replacement` follows Box→Box links, stops at None/PtrInfo.
+/// `get_box_replacement` follows Box→Box links, stops at None/PtrInfo/Const.
 /// `getptrinfo` reads PtrInfo from the terminal Box.
 #[derive(Clone, Debug)]
 pub enum Forwarded {
@@ -23,6 +24,10 @@ pub enum Forwarded {
     Op(OpRef),
     /// Terminal info (RPython: _forwarded = info_instance).
     Info(PtrInfo),
+    /// Terminal constant (RPython: _forwarded = constbox).
+    /// optimizer.py:432: box.set_forwarded(constbox).
+    /// get_box_replacement stops here; is_const returns true.
+    Const(majit_ir::Value),
 }
 
 impl Default for Forwarded {
