@@ -691,8 +691,9 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-    // resume.py:1381-1430 consume_one_section / write_a_ref parity:
-    // pyre locals are PyObjectRef (GCREF) → ref register bank.
+    // resume.py:1381 consume_one_section / write_a_ref:
+    // RPython dispatches to write_an_int/write_a_ref/write_a_float by type.
+    // pyre: all Python locals are PyObjectRef (GCREF) → always ref bank.
     // codewriter emits move_r for LOAD_FAST.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
@@ -713,7 +714,9 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
         }
     }
 
-    // frame_reg = 3 (fixed in codewriter, independent of nlocals)
+    // pyre codewriter convention: frame_reg = int register 3.
+    // RPython uses opimpl_getfield_vable_* instead of a frame register.
+    // This is required until the codewriter is virtualizable-based.
     const FRAME_REG: usize = 3;
     if FRAME_REG < bh.registers_i.len() {
         bh.setarg_i(FRAME_REG, frame as *mut PyFrame as i64);
@@ -732,7 +735,9 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: _run_forever(blackholeinterp, current_exc)
     bh.run();
 
-    // blackhole.py:842 ref_return → tmpreg_r
+    // blackhole.py:1664-1672 _done_with_this_frame:
+    // RPython dispatches by _return_type. pyre codewriter only emits
+    // ref_return (all Python values are boxed GCREF), so Ref is correct.
     let result = bh.get_tmpreg_r() as PyObjectRef;
 
     // RPython: builder.release_interp(blackholeinterp) — return to pool
@@ -1688,9 +1693,9 @@ pub fn blackhole_resume_via_rd_numb(
         rd_virtuals_slice,      // rd_virtuals
         None,                   // rd_pendingfields
         rd_guard_pendingfields, // rd_guard_pendingfields
-        None,                   // vrefinfo
+        None,                   // vrefinfo — pyre has no virtualref mechanism
         Some(&vinfo as &dyn resume::VirtualizableInfo),
-        None, // ginfo
+        None, // ginfo — pyre has no greenfield mechanism
         &allocator,
     );
 
@@ -1752,11 +1757,16 @@ pub fn blackhole_resume_via_rd_numb(
         let next = bh.nextblackholeinterp.take();
         let caller = next.map(|b| *b);
         if caller.is_none() {
-            // blackhole.py:1634-1635 _done_with_this_frame
+            // blackhole.py:1664-1677 _done_with_this_frame
             let result = match rt {
                 BhReturnType::Int => bh.get_tmpreg_i() as pyre_object::PyObjectRef,
                 BhReturnType::Ref => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
-                BhReturnType::Float => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
+                BhReturnType::Float => {
+                    // blackhole.py:1674-1675: DoneWithThisFrameFloat(get_tmpreg_f())
+                    // pyre: box float bits into W_FloatObject
+                    let bits = bh.get_tmpreg_f() as u64;
+                    pyre_object::floatobject::w_float_new(f64::from_bits(bits))
+                }
                 BhReturnType::Void => pyre_object::PY_NULL,
             };
             builder.release_interp(bh);
