@@ -72,7 +72,7 @@ pub struct CompiledExitLayout {
     /// resume.py:451 — shared constant pool.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object blueprints.
-    pub rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
     /// resume.py:858 rd_pendingfields — deferred heap writes.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
@@ -249,15 +249,15 @@ pub(crate) fn build_guard_metadata(
             resume_layout = None;
         }
 
-        // Store rd_numb/rd_consts/rd_virtuals_info/rd_pendingfields for guard failure recovery.
+        // Store rd_numb/rd_consts/rd_virtuals/rd_pendingfields for guard failure recovery.
         let rd_numb = op.rd_numb.clone();
         let rd_consts = op.rd_consts.clone();
-        let rd_virtuals_info = op.rd_virtuals_info.clone();
+        let rd_virtuals = op.rd_virtuals.clone();
         let rd_pendingfields = op.rd_pendingfields.clone();
 
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
-            // Build recovery_layout from rd_numb + rd_virtuals_info.
+            // Build recovery_layout from rd_numb + rd_virtuals.
             use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
             let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
                 (&op.rd_numb, &op.rd_consts)
@@ -314,7 +314,7 @@ pub(crate) fn build_guard_metadata(
                     .collect()
             };
             let virtual_layouts: Vec<majit_backend::ExitVirtualLayout> = op
-                .rd_virtuals_info
+                .rd_virtuals
                 .as_ref()
                 .map(|entries| {
                     entries
@@ -325,7 +325,7 @@ pub(crate) fn build_guard_metadata(
                                 |s| matches!(s, ExitValueSourceLayout::Virtual(v) if *v == vidx),
                             );
                             match entry {
-                                majit_ir::RdVirtualInfo::Instance {
+                                majit_ir::RdVirtualInfo::VirtualInfo {
                                     descr,
                                     descr_index,
                                     known_class,
@@ -345,7 +345,7 @@ pub(crate) fn build_guard_metadata(
                                         descr_size: *descr_size,
                                     }
                                 }
-                                majit_ir::RdVirtualInfo::Struct {
+                                majit_ir::RdVirtualInfo::VStructInfo {
                                     typedescr,
                                     type_id,
                                     descr_index,
@@ -365,12 +365,20 @@ pub(crate) fn build_guard_metadata(
                                         descr_size: *descr_size,
                                     }
                                 }
-                                majit_ir::RdVirtualInfo::Array {
+                                majit_ir::RdVirtualInfo::VArrayInfoClear {
                                     descr_index,
-                                    clear,
+                                    kind,
+                                    fieldnums,
+                                }
+                                | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                                    descr_index,
                                     kind,
                                     fieldnums,
                                 } => {
+                                    let clear = matches!(
+                                        entry,
+                                        majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+                                    );
                                     let items = fieldnums
                                         .iter()
                                         .map(|&fnum| {
@@ -401,12 +409,12 @@ pub(crate) fn build_guard_metadata(
                                         .collect();
                                     majit_backend::ExitVirtualLayout::Array {
                                         descr_index: *descr_index,
-                                        clear: *clear,
+                                        clear,
                                         kind: *kind,
                                         items,
                                     }
                                 }
-                                majit_ir::RdVirtualInfo::ArrayStruct {
+                                majit_ir::RdVirtualInfo::VArrayStructInfo {
                                     descr_index,
                                     size,
                                     fielddescr_indices,
@@ -437,7 +445,7 @@ pub(crate) fn build_guard_metadata(
                                         element_fields,
                                     }
                                 }
-                                majit_ir::RdVirtualInfo::RawBuffer {
+                                majit_ir::RdVirtualInfo::VRawBufferInfo {
                                     size,
                                     offsets,
                                     entry_sizes,
@@ -480,7 +488,7 @@ pub(crate) fn build_guard_metadata(
                                         entries,
                                     }
                                 }
-                                majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+                                majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
                                     // resume.py:717: VRawSliceInfo — base_buffer + offset.
                                     let base = fieldnums
                                         .first()
@@ -503,7 +511,7 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::Empty => {
-                                    panic!("[jit] rd_virtuals_info[{vidx}] is Empty");
+                                    panic!("[jit] rd_virtuals[{vidx}] is Empty");
                                 }
                             }
                         })
@@ -562,7 +570,7 @@ pub(crate) fn build_guard_metadata(
                 resume_layout,
                 rd_numb,
                 rd_consts,
-                rd_virtuals_info,
+                rd_virtuals,
                 rd_pendingfields,
             },
         );
@@ -619,7 +627,7 @@ pub(crate) fn merge_backend_exit_layouts(
                     resume_layout: None,
                     rd_numb: None,
                     rd_consts: None,
-                    rd_virtuals_info: None,
+                    rd_virtuals: None,
                     rd_pendingfields: None,
                 });
         entry.source_op_index = layout.source_op_index;
@@ -865,7 +873,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             });
         entry.source_op_index = Some(layout.op_index);
@@ -1019,7 +1027,7 @@ pub(crate) fn infer_terminal_exit_layout(
         resume_layout: None,
         rd_numb: None,
         rd_consts: None,
-        rd_virtuals_info: None,
+        rd_virtuals: None,
         rd_pendingfields: None,
     })
 }
@@ -1046,7 +1054,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     resume_layout: None,
                     rd_numb: None,
                     rd_consts: None,
-                    rd_virtuals_info: None,
+                    rd_virtuals: None,
                     rd_pendingfields: None,
                 },
             );

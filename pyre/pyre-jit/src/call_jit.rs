@@ -1095,8 +1095,9 @@ pub fn resume_in_blackhole(
             continue;
         }
 
-        // DoneWithThisFrame: callee finished (RETURN_VALUE).
-        let return_value = bh.registers_r.get(0).copied().unwrap_or(0);
+        // blackhole.py:1636-1644: return value is in tmpreg_r
+        // (set by ref_return), not registers_r[0].
+        let return_value = bh.tmpreg_r;
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
 
@@ -1593,7 +1594,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_consts: &[i64],
     deadframe: &[i64],
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
-    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
@@ -1642,13 +1643,12 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
     let count = deadframe.len() as i32;
-    let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> =
-        rd_virtuals_info.map(|rd_virts| {
-            rd_virts
-                .iter()
-                .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
-                .collect()
-        });
+    let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals.map(|rd_virts| {
+        rd_virts
+            .iter()
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .collect()
+    });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
     // resume.py:1312-1343 blackhole_from_resumedata:
@@ -1720,8 +1720,9 @@ pub fn blackhole_resume_via_rd_numb(
             continue;
         }
 
-        // DoneWithThisFrame: callee finished (RETURN_VALUE).
-        let return_value = bh.registers_r.get(0).copied().unwrap_or(0);
+        // blackhole.py:1636-1644: return value is in tmpreg_r
+        // (set by ref_return), not registers_r[0].
+        let return_value = bh.tmpreg_r;
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
         let Some(mut caller_bh) = next.map(|b| *b) else {
@@ -1738,6 +1739,8 @@ pub fn blackhole_resume_via_rd_numb(
 fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> Option<i64> {
     match bh_result {
         BlackholeResult::DoneWithThisFrame(Ok(result)) => {
+            // blackhole.py:1673 / warmspot.py:986: DoneWithThisFrameRef
+            // always carries a GCREF. No heuristic detection needed.
             let raw = if !result.is_null() && unsafe { is_int(result) } {
                 unsafe { w_int_get_value(result) }
             } else {
@@ -1755,9 +1758,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             None
         }
         BlackholeResult::ContinueRunningNormally => {
-            // blackhole.py:1756 _run_forever → jitexc.ContinueRunningNormally:
-            // Blackhole reached merge point. Frame state already written back.
-            // Re-enter via eval_with_jit (RPython portal re-entry parity).
+            // warmspot.py:970-983 handle_jitexception:
+            // ContinueRunningNormally → call portal_ptr(*args) directly.
+            // RPython calls the interpreter (not JIT) to avoid re-entering
+            // compiled code that would fail at the same guard again.
+            // force_plain_eval ensures nested function calls also use the
+            // interpreter, not the JIT (prevents recursive guard failures).
             let callee_frame_ptr = fail_values[0] as *mut PyFrame;
             if callee_frame_ptr.is_null() {
                 return None;
@@ -1765,11 +1771,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, fail_values: &[i64]) -> O
             let callee_frame = unsafe { &mut *callee_frame_ptr };
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[blackhole-resume] ContinueRunningNormally, re-enter from pc={}",
+                    "[blackhole-resume] ContinueRunningNormally, interpreter from pc={}",
                     callee_frame.next_instr,
                 );
             }
-            match crate::eval::eval_with_jit(callee_frame) {
+            let _plain_guard = pyre_interpreter::call::force_plain_eval();
+            match pyre_interpreter::eval::eval_frame_plain(callee_frame) {
                 Ok(result) => {
                     let raw = if !result.is_null() && unsafe { is_int(result) } {
                         unsafe { w_int_get_value(result) }

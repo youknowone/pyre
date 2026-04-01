@@ -1104,7 +1104,7 @@ pub type FrameSlotSource = ResumeValueSource;
 /// Mirrors RPython's AbstractVirtualInfo hierarchy:
 /// - VirtualInfo (NEW_WITH_VTABLE)
 /// - VStructInfo (NEW / plain struct)
-/// - VArrayInfo (NEW_ARRAY)
+/// - VArrayInfoClear / VArrayInfoNotClear (NEW_ARRAY)
 /// - VArrayStructInfo (array of structs with interior fields)
 /// - VRawBufferInfo (raw memory buffer)
 #[derive(Debug, Clone)]
@@ -1449,7 +1449,7 @@ pub fn rd_virtual_to_virtual_info(
     count: i32,
 ) -> VirtualInfo {
     match rd {
-        majit_ir::RdVirtualInfo::Instance {
+        majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             descr_index,
             fielddescrs,
@@ -1471,7 +1471,7 @@ pub fn rd_virtual_to_virtual_info(
                 descr_size: *descr_size,
             }
         }
-        majit_ir::RdVirtualInfo::Struct {
+        majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
             type_id,
             descr_index,
@@ -1493,7 +1493,12 @@ pub fn rd_virtual_to_virtual_info(
                 descr_size: *descr_size,
             }
         }
-        majit_ir::RdVirtualInfo::Array {
+        majit_ir::RdVirtualInfo::VArrayInfoClear {
+            descr_index,
+            fieldnums,
+            ..
+        }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             descr_index,
             fieldnums,
             ..
@@ -1507,7 +1512,7 @@ pub fn rd_virtual_to_virtual_info(
                 items,
             }
         }
-        majit_ir::RdVirtualInfo::ArrayStruct {
+        majit_ir::RdVirtualInfo::VArrayStructInfo {
             descr_index,
             size,
             fielddescr_indices,
@@ -1534,7 +1539,7 @@ pub fn rd_virtual_to_virtual_info(
                 element_fields,
             }
         }
-        majit_ir::RdVirtualInfo::RawBuffer {
+        majit_ir::RdVirtualInfo::VRawBufferInfo {
             size,
             offsets,
             entry_sizes,
@@ -1551,7 +1556,7 @@ pub fn rd_virtual_to_virtual_info(
                 entries,
             }
         }
-        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+        majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
             let parent = fieldnums
                 .first()
                 .map(|&tagged| tagged_to_source(tagged, consts, count))
@@ -3572,7 +3577,7 @@ pub struct RebuiltFrame {
 
 /// resume.py:576-728 VirtualInfo parity.
 /// Describes a virtual object's fields for materialization.
-/// RPython uses a class hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
+/// RPython uses a class hierarchy (VirtualInfo, VStructInfo, VArrayInfoClear, etc.).
 /// We use a single struct with tagged field values.
 #[derive(Debug, Clone, Default)]
 pub struct VirtualFieldValues {

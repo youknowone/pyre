@@ -2611,7 +2611,7 @@ impl Optimizer {
                 // Copy complete resume data so store_final_boxes_in_guard is a no-op.
                 op.rd_numb = last.rd_numb.clone();
                 op.rd_consts = last.rd_consts.clone();
-                op.rd_virtuals_info = last.rd_virtuals_info.clone();
+                op.rd_virtuals = last.rd_virtuals.clone();
             } else {
                 // optimizer.py:678: store_final_boxes_in_guard
                 op = Self::store_final_boxes_in_guard(op, ctx);
@@ -2787,7 +2787,7 @@ impl Optimizer {
     /// Encode virtual objects in guard fail_args via rd_virtuals for lazy
     /// reconstruction on guard failure. Resolves all fail_args through
     /// get_box_replacement, replaces virtual OpRefs with NONE, appends
-    /// virtual field values. finalize_guard_resume_data builds rd_virtuals_info.
+    /// virtual field values. finalize_guard_resume_data builds rd_virtuals.
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
         use crate::optimizeopt::info::PtrInfo;
 
@@ -2808,7 +2808,7 @@ impl Optimizer {
         // via snapshot-based numbering. When a snapshot exists (rd_resume_position >= 0
         // AND snapshot_boxes has the key), the snapshot path in
         // finalize_guard_resume_data handles everything: _number_boxes resolves
-        // virtuals to TAGVIRTUAL, builds rd_virtuals_info, and
+        // virtuals to TAGVIRTUAL, builds rd_virtuals, and
         // store_final_boxes(liveboxes) replaces fail_args with concrete liveboxes.
         let has_snapshot =
             op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
@@ -2816,7 +2816,7 @@ impl Optimizer {
             // optimizer.py:732-748 + resume.py:389-452:
             // RPython finish() handles virtuals without forcing.
             // _number_boxes tags virtual fail_args as TAGVIRTUAL,
-            // _number_virtuals builds rd_virtuals_info from PtrInfo.
+            // _number_virtuals builds rd_virtuals from PtrInfo.
             // No pre-forcing or extra_fail_args needed.
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
@@ -2923,7 +2923,7 @@ impl Optimizer {
         }
 
         // resume.py ResumeDataVirtualAdder.finish() parity:
-        // Generate rd_numb + rd_consts + rd_virtuals_info in the SAME call as
+        // Generate rd_numb + rd_consts + rd_virtuals in the SAME call as
         // fail_args finalization. RPython does not defer to a later phase.
         ctx.finalize_guard_resume_data(&mut op, &virtual_slots);
 
@@ -3861,7 +3861,7 @@ mod tests {
             guard.rd_numb.is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        // rd_virtuals removed — rd_virtuals_info is produced by number_guard_inline_impl.
+        // rd_virtuals removed — rd_virtuals is produced by number_guard_inline_impl.
         let fail_args = guard
             .fail_args
             .as_ref()

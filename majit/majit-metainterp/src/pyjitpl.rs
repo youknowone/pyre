@@ -171,7 +171,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
-    pub(crate) rd_virtuals_info: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub(crate) rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
     pub(crate) rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
@@ -197,7 +197,7 @@ impl StoredExitLayout {
             resume_layout: self.resume_layout.clone(),
             rd_numb: self.rd_numb.clone(),
             rd_consts: self.rd_consts.clone(),
-            rd_virtuals_info: self.rd_virtuals_info.clone(),
+            rd_virtuals: self.rd_virtuals.clone(),
             rd_pendingfields: self.rd_pendingfields.clone(),
         }
     }
@@ -639,7 +639,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             })
     }
@@ -669,7 +669,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             })
     }
@@ -721,7 +721,7 @@ impl<M: Clone> MetaInterp<M> {
                             .and_then(|existing| existing.resume_layout.clone()),
                         rd_numb: None,
                         rd_consts: None,
-                        rd_virtuals_info: None,
+                        rd_virtuals: None,
                         rd_pendingfields: None,
                     },
                 );
@@ -778,7 +778,7 @@ impl<M: Clone> MetaInterp<M> {
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
                             rd_numb: None,
                             rd_consts: None,
-                            rd_virtuals_info: None,
+                            rd_virtuals: None,
                             rd_pendingfields: None,
                         },
                     },
@@ -3022,18 +3022,15 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 &mut constant_types,
             );
-        // Snapshot-based guard numbering: infrastructure ready.
-        // Activation blocked by performance regression (bridge compilation
-        // delay). IR blackhole's NullMemory::call_i returns 0 for
-        // CallAssembler ops → wrong intermediate results → delayed bridge
-        // compilation → 34s vs 0.2s for fib_recursive.
-        // Fix: implement call_i/call_r in IR blackhole (CallAssembler
-        // execution via portal_runner), or trigger bridge compilation
-        // from call_assembler_guard_failure after trace_eagerness threshold.
-        // Snapshot + adapt-live type correction blocked by gcmap conflict:
-        // try_function_entry_jit applies adapt-live (Ref→Int) but CalAssemblerI
-        // does not. Same compiled code, one gcmap → cannot satisfy both.
-        // RPython has no adapt-live; Box types match from the start.
+        // resume.py parity: snapshot_boxes activation requires typed blackhole
+        // registers. Currently, adapt-live unboxes Ref→Int at compiled entry,
+        // so deadframe values contain raw ints. Blackhole resume decodes these
+        // via next_ref (TAGBOX) and places raw ints into ref registers. When
+        // blackhole interprets Python ops like BINARY_ADD, it calls
+        // binary_value(raw_int, ...) → SEGFAULT.
+        // Root fix: remove adapt-live and make tracing start with Ref-typed
+        // inputargs (RPython wrap() parity). Then deadframe values are always
+        // GCREF, and blackhole ref registers contain valid PyObjectRefs.
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
@@ -3915,8 +3912,7 @@ impl<M: Clone> MetaInterp<M> {
                     resume_layout,
                     rd_numb: trace_layout_ref.and_then(|layout| layout.rd_numb.clone()),
                     rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
-                    rd_virtuals_info: trace_layout_ref
-                        .and_then(|layout| layout.rd_virtuals_info.clone()),
+                    rd_virtuals: trace_layout_ref.and_then(|layout| layout.rd_virtuals.clone()),
                     rd_pendingfields: trace_layout_ref
                         .and_then(|layout| layout.rd_pendingfields.clone()),
                 }
@@ -3940,7 +3936,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
@@ -4050,8 +4046,7 @@ impl<M: Clone> MetaInterp<M> {
                     resume_layout,
                     rd_numb: trace_layout_ref.and_then(|layout| layout.rd_numb.clone()),
                     rd_consts: trace_layout_ref.and_then(|layout| layout.rd_consts.clone()),
-                    rd_virtuals_info: trace_layout_ref
-                        .and_then(|layout| layout.rd_virtuals_info.clone()),
+                    rd_virtuals: trace_layout_ref.and_then(|layout| layout.rd_virtuals.clone()),
                     rd_pendingfields: trace_layout_ref
                         .and_then(|layout| layout.rd_pendingfields.clone()),
                 }
@@ -4075,7 +4070,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
@@ -4204,7 +4199,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
@@ -4364,7 +4359,7 @@ impl<M: Clone> MetaInterp<M> {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             });
         let mut values = Vec::with_capacity(exit_arity);
@@ -5223,7 +5218,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
         let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
-        exit_layout.rd_virtuals_info.clone()
+        exit_layout.rd_virtuals.clone()
     }
 
     /// Compile a bridge from a guard failure point.
@@ -5901,7 +5896,7 @@ impl<M: Clone> MetaInterp<M> {
                     resume_layout: None,
                     rd_numb: None,
                     rd_consts: None,
-                    rd_virtuals_info: None,
+                    rd_virtuals: None,
                     rd_pendingfields: None,
                 });
         let reconstructed_state = exit_layout
@@ -7778,7 +7773,7 @@ mod tests {
                 resume_layout: Some(expected_layout.clone()),
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -7976,7 +7971,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -8031,7 +8026,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -9183,7 +9178,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -9200,7 +9195,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -9865,7 +9860,7 @@ mod tests {
                 resume_layout: None,
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );
@@ -9966,7 +9961,7 @@ mod tests {
                 resume_layout: Some(existing_resume),
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 rd_pendingfields: None,
             },
         );

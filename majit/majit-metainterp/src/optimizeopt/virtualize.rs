@@ -52,7 +52,7 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
     /// Phase 2 (loop body): don't virtualize New() because guard failure
-    /// recovery_layout is not yet populated (RPython rd_virtuals_info equivalent).
+    /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
     pub is_phase2: bool,
     /// If set, frame OpRef(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
@@ -724,7 +724,7 @@ impl OptVirtualize {
                         // RPython: NewWithVtable carries the class directly.
                         // pyre: New() + SetfieldGc(offset=0, class_ptr).
                         // When setting ob_type (offset 0) to a constant,
-                        // capture it as known_class for rd_virtuals_info
+                        // capture it as known_class for rd_virtuals
                         // materialization (resume.py:612 VirtualInfo.allocate).
                         if vinfo.known_class.is_none() {
                             let offset = extract_field_offset(field_idx);
@@ -1124,7 +1124,7 @@ impl OptVirtualize {
     /// optimizer.py: store_final_boxes_in_guard / ResumeDataVirtualAdder
     ///
     /// For each fail_arg that is virtual:
-    ///   - Record its shape (descr, known_class, fields) in rd_virtuals_info
+    ///   - Record its shape (descr, known_class, fields) in rd_virtuals
     ///   - Add the virtual's field values as extra fail_args at the end
     ///   - Set the original fail_arg slot to OpRef::NONE (placeholder)
     ///   - If a field value is itself virtual, force it (no recursive encoding yet)
@@ -1138,7 +1138,7 @@ impl OptVirtualize {
     /// Force virtual references in guard fail_args and re-resolve all args.
     ///
     /// RPython parity: virtualize.py does NOT force fail_args (it uses
-    /// rd_virtuals_info for lazy reconstruction). majit currently forces because
+    /// rd_virtuals for lazy reconstruction). majit currently forces because
     /// pyre hasn't implemented materialize_virtual_ref yet. When it does,
     /// this method should skip forcing and let store_final_boxes_in_guard handle it.
     /// RPython parity: virtualize.py does NOT force fail_args.
@@ -3888,7 +3888,7 @@ mod tests {
         let fa = guard_op.fail_args.as_ref().unwrap();
         // Nested virtual fields force the root fail_arg concrete.
         assert!(
-            guard_op.rd_numb.is_none() || guard_op.rd_virtuals_info.is_none(),
+            guard_op.rd_numb.is_none() || guard_op.rd_virtuals.is_none(),
             "nested virtual fields should force the root fail_arg concrete"
         );
         assert!(

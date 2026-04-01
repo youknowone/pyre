@@ -1378,7 +1378,7 @@ impl OptContext {
             // _copy_resume_data_from: share resume data from last guard.
             op.rd_numb = self.new_operations[idx].rd_numb.clone();
             op.rd_consts = self.new_operations[idx].rd_consts.clone();
-            op.rd_virtuals_info = self.new_operations[idx].rd_virtuals_info.clone();
+            op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
             op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
             op.fail_args = self.new_operations[idx].fail_args.clone();
             // Don't update last_guard_idx — copied guards don't become sources.
@@ -1576,10 +1576,10 @@ impl OptContext {
                 op.rd_numb = Some(ns.create_numbering());
                 op.rd_consts = Some(rd_consts);
 
-                // Build rd_virtuals_info from PtrInfo for no-snapshot guards.
+                // Build rd_virtuals from PtrInfo for no-snapshot guards.
                 // resume.py _gettagged parity: tag each field value as
                 // TAGBOX/TAGCONST/TAGINT based on its nature.
-                if op.rd_virtuals_info.is_none() && !virtual_slots.is_empty() {
+                if op.rd_virtuals.is_none() && !virtual_slots.is_empty() {
                     use crate::optimizeopt::info::PtrInfo;
                     let mut rd_cv = op.rd_consts.take().unwrap_or_default();
                     let info: Vec<majit_ir::RdVirtualInfo> = virtual_slots
@@ -1683,7 +1683,7 @@ impl OptContext {
                                             vi.descr.as_size_descr().map(|sd| sd.vtable() as i64)
                                         })
                                         .filter(|&v| v != 0);
-                                    majit_ir::RdVirtualInfo::Instance {
+                                    majit_ir::RdVirtualInfo::VirtualInfo {
                                         descr: Some(vi.descr.clone()),
                                         descr_index: vi.descr.index(),
                                         known_class: kc,
@@ -1698,7 +1698,7 @@ impl OptContext {
                                     let sd = vi.descr.as_size_descr();
                                     let ds = sd.map(|s| s.size()).unwrap_or(0);
                                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                                    majit_ir::RdVirtualInfo::Struct {
+                                    majit_ir::RdVirtualInfo::VStructInfo {
                                         typedescr: Some(vi.descr.clone()),
                                         type_id: tid,
                                         descr_index: vi.descr.index(),
@@ -1709,14 +1709,14 @@ impl OptContext {
                                 }
                                 // Forced virtual: PtrInfo changed from Virtual→Struct
                                 // (nested forcing in collect_virtual_field_values).
-                                // Use Struct/Instance PtrInfo fields for rd_virtuals_info.
+                                // Use Struct/Instance PtrInfo fields for rd_virtuals.
                                 Some(PtrInfo::Struct(ref si)) => {
                                     let (fdinfo, fns) =
                                         build_fieldnums(&si.fields, &si.field_descrs);
                                     let sd = si.descr.as_size_descr();
                                     let ds = sd.map(|s| s.size()).unwrap_or(0);
                                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                                    majit_ir::RdVirtualInfo::Struct {
+                                    majit_ir::RdVirtualInfo::VStructInfo {
                                         typedescr: Some(si.descr.clone()),
                                         type_id: tid,
                                         descr_index: si.descr.index(),
@@ -1742,7 +1742,7 @@ impl OptContext {
                                             })
                                         })
                                         .filter(|&v| v != 0);
-                                    majit_ir::RdVirtualInfo::Instance {
+                                    majit_ir::RdVirtualInfo::VirtualInfo {
                                         descr: ii.descr.clone(),
                                         descr_index: ii
                                             .descr
@@ -1761,7 +1761,7 @@ impl OptContext {
                         .collect();
                     op.rd_consts = Some(rd_cv);
                     if !info.is_empty() {
-                        op.rd_virtuals_info = Some(info);
+                        op.rd_virtuals = Some(info);
                     }
                 }
             }
@@ -1771,7 +1771,7 @@ impl OptContext {
         // RPython parity: snapshot path handles ALL guards with snapshots,
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
-        // _number_virtuals then builds rd_virtuals_info from PtrInfo.
+        // _number_virtuals then builds rd_virtuals from PtrInfo.
         let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
         let vable_oprefs = self
             .snapshot_vable_boxes
@@ -2052,7 +2052,7 @@ impl OptContext {
                         })
                         .collect();
                     let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                    majit_ir::RdVirtualInfo::Instance {
+                    majit_ir::RdVirtualInfo::VirtualInfo {
                         descr: Some(vi.descr.clone()),
                         descr_index: vi.descr.index(),
                         // virtualize.py:208: known_class = descr.get_vtable()
@@ -2118,7 +2118,7 @@ impl OptContext {
                     let sd = vi.descr.as_size_descr();
                     let descr_size = sd.map(|s| s.size()).unwrap_or(0);
                     let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                    majit_ir::RdVirtualInfo::Struct {
+                    majit_ir::RdVirtualInfo::VStructInfo {
                         typedescr: Some(vi.descr.clone()),
                         type_id: tid,
                         descr_index: vi.descr.index(),
@@ -2150,11 +2150,19 @@ impl OptContext {
                             _ => 0u8, // Ref
                         })
                         .unwrap_or(0);
-                    majit_ir::RdVirtualInfo::Array {
-                        descr_index: vi.descr.index(),
-                        clear: vi.clear,
-                        kind,
-                        fieldnums,
+                    // resume.py:326: VArrayInfoClear or VArrayInfoNotClear
+                    if vi.clear {
+                        majit_ir::RdVirtualInfo::VArrayInfoClear {
+                            descr_index: vi.descr.index(),
+                            kind,
+                            fieldnums,
+                        }
+                    } else {
+                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                            descr_index: vi.descr.index(),
+                            kind,
+                            fieldnums,
+                        }
                     }
                 }
                 Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(ref vi)) => {
@@ -2200,7 +2208,7 @@ impl OptContext {
                     if ft.is_empty() {
                         ft = vec![0u8; fielddescr_indices.len()];
                     }
-                    majit_ir::RdVirtualInfo::ArrayStruct {
+                    majit_ir::RdVirtualInfo::VArrayStructInfo {
                         descr_index: vi.descr.index(),
                         size: vi.element_fields.len(),
                         fielddescr_indices: fielddescr_indices.clone(),
@@ -2217,7 +2225,7 @@ impl OptContext {
                         vi.entries.iter().map(|(_, len, _)| *len).collect();
                     let fieldnums: Vec<i16> =
                         vi.entries.iter().map(|(_, _, vr)| gettagged(*vr)).collect();
-                    majit_ir::RdVirtualInfo::RawBuffer {
+                    majit_ir::RdVirtualInfo::VRawBufferInfo {
                         size: vi.size,
                         offsets,
                         entry_sizes,
@@ -2235,7 +2243,7 @@ impl OptContext {
         // resume.py:447: store liveboxes as new fail_args.
         // Snapshot-based numbering replaces the original fail_args with
         // only the live boxes (TAGBOX entries). Virtual fields are encoded
-        // in rd_numb via TAGVIRTUAL + rd_virtuals_info.
+        // in rd_numb via TAGVIRTUAL + rd_virtuals.
         //
         // RPython Box.type parity: each Box carries its type intrinsically
         // (IntOp.type='i', RefOp.type='r', FloatOp.type='f'). In pyre,
@@ -2292,11 +2300,11 @@ impl OptContext {
         // store_final_boxes replaces fail_args with the same liveboxes
         // that new_types was derived from, so use new_types directly.
         op.fail_arg_types = Some(new_types);
-        // Store rd_virtuals_info (indexed by vidx, RPython parity).
-        // rd_virtuals_info is the authoritative source for virtual
+        // Store rd_virtuals (indexed by vidx, RPython parity).
+        // rd_virtuals is the authoritative source for virtual
         // materialization, indexed consistently with TAGVIRTUAL in rd_numb.
         if !rd_virt_info.is_empty() {
-            op.rd_virtuals_info = Some(rd_virt_info);
+            op.rd_virtuals = Some(rd_virt_info);
         }
 
         // resume.py:520-558 _add_pending_fields: tag pendingfield target/value
