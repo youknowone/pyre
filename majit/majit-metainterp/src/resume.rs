@@ -5866,8 +5866,14 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
                 self.deadframe[idx as usize]
             }
+            TAGINT => {
+                // pyre parity: all values are in ref registers (no typed
+                // register files). Optimizer may unbox Ref→Int, producing
+                // TAGINT in snapshot numbering for a ref-register slot.
+                // Return the raw int value (RPython decode_int path).
+                num as i64
+            }
             _ => {
-                // resume.py:1566 — only TAGCONST, TAGVIRTUAL, TAGBOX valid for refs
                 panic!("decode_ref: unexpected tag {tag}")
             }
         }

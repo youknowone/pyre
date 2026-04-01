@@ -2077,20 +2077,21 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:177 get_list_of_active_boxes parity.
-    /// Returns register boxes: [locals..., stack...].
-    /// Does NOT include frame/ni/vsd (stored in virtualizable_boxes).
+    /// Returns compact register boxes for live registers only.
     ///
-    /// pyjitpl.py:194: `in_a_call` or `after_residual_call` → use
-    /// post-call PC (self.pc in RPython = self.fallthrough_pc in pyre).
-    /// Otherwise → use pre-instruction PC (self.orgpc).
-    /// Dead slots are OpRef::NONE (→ UNINITIALIZED_TAG in rd_numb).
+    /// RPython: both capture (here) and resume (consume_one_section,
+    /// resume.py:1381) use the SAME `all_liveness` data, iterating
+    /// via LivenessIterator over the same register indices in the
+    /// same order. In pyre, both use JitCode.liveness (LivenessInfo),
+    /// which now has precise per-local liveness from LiveVars::compute
+    /// (RPython liveness.py backward analysis parity).
     fn get_list_of_active_boxes(
         &mut self,
         _ctx: &mut TraceCtx,
         in_a_call: bool,
         after_residual_call: bool,
     ) -> Vec<OpRef> {
-        let (nlocals, local_values, stack_values, code_ptr) = {
+        let (nlocals, local_values, stack_values, majit_jitcode) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
@@ -2098,41 +2099,70 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            (s.nlocals, s.symbolic_locals.clone(), stack_values, unsafe {
-                (*s.jitcode).code
-            })
-        };
-        // codewriter/liveness.py _live_vars(pc) parity.
-        let live = if !code_ptr.is_null() {
-            Some(liveness_for(code_ptr))
-        } else {
-            None
+            let mjc = unsafe { (*s.jitcode).majit_jitcode };
+            (s.nlocals, s.symbolic_locals.clone(), stack_values, mjc)
         };
         // pyjitpl.py:194: in_a_call or after_residual_call → self.pc
-        // (RPython self.pc = post-instruction = pyre fallthrough_pc).
-        // Otherwise → self.pc - SIZE_LIVE_OP (= pyre orgpc).
         let live_pc = if in_a_call || after_residual_call {
             self.fallthrough_pc
         } else {
             self.orgpc
         };
-        let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-        // pyjitpl.py:214 parity: only live registers in compact array.
-        // Dead registers are skipped entirely (not NONE-filled).
-        // Recovery maps compact positions back via liveness table.
-        for (idx, slot) in local_values.iter().enumerate() {
-            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
-            if is_live {
-                boxes.push(*slot);
+        // pyjitpl.py:202-203: look up liveness from JitCode (same data
+        // that consume_one_section uses via bh.get_current_position_info).
+        let liveness_info = if !majit_jitcode.is_null() {
+            let jc = unsafe { &*majit_jitcode };
+            jc.py_to_jit_pc
+                .get(live_pc)
+                .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc))
+        } else {
+            None
+        };
+        if let Some(info) = liveness_info {
+            // pyjitpl.py:216-233: iterate live registers via LivenessIterator.
+            // live_r_regs contains precise register indices (now with
+            // backward-analysis liveness for locals, not all-locals-live).
+            let stack_base = info
+                .live_r_regs
+                .iter()
+                .find(|&&idx| idx as usize >= nlocals)
+                .map(|&idx| idx as usize)
+                .unwrap_or(nlocals);
+            let mut boxes = Vec::with_capacity(info.live_r_regs.len());
+            for &reg_idx in &info.live_r_regs {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    let stack_idx = idx - stack_base;
+                    stack_values.get(stack_idx).copied().unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
             }
-        }
-        for (idx, slot) in stack_values.iter().enumerate() {
-            let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
-            if is_live {
-                boxes.push(*slot);
+            boxes
+        } else {
+            // Fallback: no majit JitCode (proc-macro path).
+            let code_ptr = unsafe { (*self.sym().jitcode).code };
+            let live = if !code_ptr.is_null() {
+                Some(liveness_for(code_ptr))
+            } else {
+                None
+            };
+            let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
+            for (idx, slot) in local_values.iter().enumerate() {
+                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
+                if is_live {
+                    boxes.push(*slot);
+                }
             }
+            for (idx, slot) in stack_values.iter().enumerate() {
+                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
+                if is_live {
+                    boxes.push(*slot);
+                }
+            }
+            boxes
         }
-        boxes
     }
 
     /// RPython Box.type parity: build fail_arg_types matching compact
