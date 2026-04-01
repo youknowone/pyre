@@ -1608,13 +1608,16 @@ impl Optimization for OptVirtualize {
         self.ensure_vable_setup(ctx);
         match op.opcode {
             // Allocation — create virtual
-            // RPython dispatches NEW_WITH_VTABLE to make_virtual (VirtualInfo).
-            // pyre routes it to optimize_new (VirtualStruct) because
-            // the PtrInfo::Virtual path has an undiagnosed field-value bug
-            // (returns object pointer instead of intval for W_IntObject).
-            // VirtualStruct correctly stores ob_type as a regular field;
-            // the export path (mod.rs:1706-1736) extracts known_class from
-            // ob_type at offset 0 → RdVirtualInfo::VirtualInfo (Instance).
+            // virtualize.py:207-209: optimize_NEW_WITH_VTABLE → make_virtual.
+            // Routed to optimize_new (VirtualStruct) because Phase 1 JUMP
+            // goes through passes and forces all virtuals (optimizer.py:536
+            // parity gap: RPython uses flush=False). With PtrInfo::Virtual,
+            // the forced W_IntObject produces NewWithVtable + SetfieldGc in
+            // the Phase 1 output. With VirtualStruct, it stays virtual
+            // longer (VirtualStruct is not forced by JUMP when ob_type is
+            // the only "escaping" field and the optimizer recognizes it as
+            // a constant). The export path extracts known_class from ob_type
+            // field → correct RdVirtualInfo::Instance encoding.
             OpCode::NewWithVtable => self.optimize_new(op, ctx),
             OpCode::New => self.optimize_new(op, ctx),
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
@@ -1790,6 +1793,13 @@ impl Optimization for OptVirtualize {
             // pre_force_virtual_state is set by optimizer.rs before JUMP
             // enters passes.
             // Virtualizable frame: keep virtual, force others.
+            // optimizer.py:536-538 parity note: RPython does NOT send Phase 1
+            // JUMP through passes (flush=False). Virtuals stay virtual for
+            // export_state. In pyre, Phase 1 JUMP goes through passes because
+            // OptHeap lazy-set flush and guard resume data depend on it.
+            // This forces Phase 1 virtuals, which is a known deviation.
+            // TODO: implement force_box_for_end_of_preamble (unroll.py:454)
+            // to decouple virtual export from JUMP pass processing.
             OpCode::Jump if self.vable_config.is_some() => {
                 let frame_ref = ctx.get_box_replacement(OpRef(0));
                 let mut jump_op = op.clone();
@@ -1807,7 +1817,7 @@ impl Optimization for OptVirtualize {
                 OptimizationResult::Replace(jump_op)
             }
 
-            // JUMP (no virtualizable) — force escaping values.
+            // Phase 2 JUMP (no virtualizable) — force escaping values.
             OpCode::Jump => self.optimize_escaping_op(op, ctx),
 
             // Escape ops (testing)
