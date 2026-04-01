@@ -2337,6 +2337,7 @@ pub fn resume_in_blackhole(
     rd_consts: &[i64],
     deadframe: &[i64],
     deadframe_exc: i64,
+    exit_types: &[majit_ir::Type],
 ) -> JitException {
     // blackhole.py:1786-1792
     let null_alloc = crate::resume::NullAllocator;
@@ -2353,7 +2354,7 @@ pub fn resume_in_blackhole(
         None, // vinfo
         None, // ginfo
         &null_alloc,
-        &[], // exit_types (proc-macro path, no adapt-live)
+        exit_types,
     );
 
     let Some((bh, _virtualizable_ptr)) = bh else {
