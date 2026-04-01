@@ -5794,7 +5794,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
-                self.consume_vable_info(vi, vable_size);
+                if vable_size > 0 {
+                    self.consume_vable_info(vi, vable_size);
+                }
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
