@@ -263,7 +263,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .iter()
         .map(|&obj| format!("{}", PyDisplay(obj)))
         .collect();
-    print!("{}{}", parts.join(&sep), end);
+    crate::print_output(&format!("{}{}", parts.join(&sep), end));
     Ok(w_none())
 }
 

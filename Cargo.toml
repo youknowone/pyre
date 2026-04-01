@@ -14,6 +14,7 @@ members = [
     "majit/majit-trace",
     "majit/majit-backend",
     "majit/majit-backend-cranelift",
+    "majit/majit-backend-wasm",
     "majit/majit-gc",
     "majit/majit-macros",
     "majit/majit-metainterp",
@@ -33,6 +34,8 @@ members = [
     "pyre/pyre-jit",
     "pyre/pyre-jit-trace",
     "pyre/pyrex",
+    "pyre/pyre-wasm",
+    "pyre/pyre-wasm-test",
 ]
 
 [workspace.dependencies]

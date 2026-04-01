@@ -1,0 +1,15 @@
+[package]
+name = "pyre-wasm"
+version.workspace = true
+edition.workspace = true
+description = "pyre Python interpreter compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyre-object = { workspace = true }
+pyre-interpreter = { path = "../pyre-interpreter", default-features = false }
+pyre-jit = { path = "../pyre-jit" }
+wasm-bindgen = "0.2"
+getrandom = { version = "0.3.4", features = ["wasm_js"] }

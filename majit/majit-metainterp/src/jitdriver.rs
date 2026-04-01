@@ -256,6 +256,7 @@ impl<S: JitState> JitDriver<S> {
         // Background thread: periodically invalidate all registered loops.
         // RPython uses GC/signal-triggered invalidation; we use a timer as
         // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
+        #[cfg(not(target_arch = "wasm32"))]
         let invalidation_thread = {
             let qmut = epoch_qmut.clone();
             std::thread::spawn(move || {
@@ -280,7 +281,10 @@ impl<S: JitState> JitDriver<S> {
             entry_points: Vec::new(),
             is_recursive: false,
             epoch_qmut,
+            #[cfg(not(target_arch = "wasm32"))]
             _invalidation_thread: Some(invalidation_thread),
+            #[cfg(target_arch = "wasm32")]
+            _invalidation_thread: None,
             jitcode_factory: None,
             blackhole_allocator: None,
             portal_runner: None,

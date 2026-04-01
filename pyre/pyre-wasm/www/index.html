@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>pyre - Python in WebAssembly</title>
+  <style>
+    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 1.5em; }
+    textarea { width: 100%; height: 200px; font-family: monospace; font-size: 14px; }
+    pre { background: #f0f0f0; padding: 12px; white-space: pre-wrap; min-height: 40px; }
+    button { font-size: 16px; padding: 8px 24px; cursor: pointer; margin: 8px 0; }
+    #status { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>pyre - Python interpreter in WebAssembly</h1>
+  <p id="status">Loading wasm module...</p>
+  <textarea id="source">def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+print(fib(30))</textarea>
+  <br>
+  <button id="run" disabled>Run</button>
+  <h3>Output:</h3>
+  <pre id="output"></pre>
+
+  <script type="module">
+    import init, { run_python } from './pyre_wasm.js';
+
+    const btn = document.getElementById('run');
+    const status = document.getElementById('status');
+
+    const wasm = await init();
+
+    // Set up JIT glue if available
+    try {
+      const { jit_set_memory, jit_set_table } = await import('./jit_glue.js');
+      jit_set_memory(wasm.memory);
+      if (wasm.__indirect_function_table) jit_set_table(wasm.__indirect_function_table);
+      status.textContent = 'Ready (JIT enabled)!';
+    } catch {
+      status.textContent = 'Ready (interpreter only)';
+    }
+    btn.disabled = false;
+    btn.disabled = false;
+
+    btn.addEventListener('click', () => {
+      const source = document.getElementById('source').value;
+      const output = document.getElementById('output');
+      btn.disabled = true;
+      output.textContent = 'Running...';
+      // Yield to let the browser paint before blocking on wasm
+      setTimeout(() => {
+        try {
+          const t0 = performance.now();
+          const result = run_python(source);
+          const elapsed = (performance.now() - t0).toFixed(1);
+          output.textContent =
+            result + (result ? '\n' : '') + `--- ${elapsed}ms ---`;
+        } catch (e) {
+          output.textContent = `[wasm error] ${e.message}\n${e.stack || ''}`;
+        } finally {
+          btn.disabled = false;
+        }
+      }, 10);
+    });
+  </script>
+</body>
+</html>

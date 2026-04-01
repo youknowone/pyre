@@ -5,7 +5,10 @@ use majit_backend::{
     Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
     TerminalExitLayout,
 };
-use majit_backend_cranelift::CraneliftBackend;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
@@ -406,7 +409,7 @@ pub(crate) struct PartialTrace {
 /// closing a trace and receives it back when running compiled code.
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
-    pub(crate) backend: CraneliftBackend,
+    pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: HashMap<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
@@ -803,7 +806,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn new(threshold: u32) -> Self {
         MetaInterp {
             warm_state: WarmEnterState::new(threshold),
-            backend: CraneliftBackend::new(),
+            backend: BackendImpl::new(),
             compiled_loops: HashMap::new(),
             tracing: None,
             next_trace_id: 1,
@@ -4284,7 +4287,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             if let (Value::Ref(r), Type::Int) = (&values[i], tp) {
                 let ptr = r.as_usize();
-                if ptr >= 0x1_0000 && ptr < (1usize << 56) && (ptr & 7) == 0 {
+                if ptr >= 0x1_0000 && ptr < (1u64 << 56) as usize && (ptr & 7) == 0 {
                     values[i] = Value::Int(unsafe { *((ptr + 8) as *const i64) });
                 } else {
                     values[i] = Value::Int(ptr as i64);
@@ -6815,12 +6818,12 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Access the backend directly (for advanced operations).
-    pub fn backend(&self) -> &CraneliftBackend {
+    pub fn backend(&self) -> &BackendImpl {
         &self.backend
     }
 
     /// Access the backend mutably (for advanced operations).
-    pub fn backend_mut(&mut self) -> &mut CraneliftBackend {
+    pub fn backend_mut(&mut self) -> &mut BackendImpl {
         &mut self.backend
     }
 

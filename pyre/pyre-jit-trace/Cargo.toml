@@ -12,9 +12,11 @@ pyre-interpreter = { path = "../pyre-interpreter" }
 majit-ir = { path = "../../majit/majit-ir" }
 majit-metainterp = { path = "../../majit/majit-metainterp" }
 majit-backend = { path = "../../majit/majit-backend" }
-majit-backend-cranelift = { path = "../../majit/majit-backend-cranelift" }
 majit-trace = { path = "../../majit/majit-trace" }
 majit-gc = { path = "../../majit/majit-gc" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+majit-backend-cranelift = { path = "../../majit/majit-backend-cranelift" }
 
 [build-dependencies]
 majit-codewriter = { path = "../../majit/majit-codewriter" }

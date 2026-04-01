@@ -763,8 +763,10 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     pyre_interpreter::call::register_inline_call_override(
         crate::call_jit::maybe_handle_inline_concrete_call,
     );
+    #[cfg(not(target_arch = "wasm32"))]
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
+    #[cfg(not(target_arch = "wasm32"))]
     majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
     frame.fix_array_ptrs();
 

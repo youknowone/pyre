@@ -1,0 +1,14 @@
+[package]
+name = "majit-backend-wasm"
+version.workspace = true
+edition.workspace = true
+description = "WebAssembly backend for majit — generates wasm bytecodes via wasm-encoder"
+
+[dependencies]
+majit-ir = { path = "../majit-ir" }
+majit-backend = { path = "../majit-backend" }
+majit-gc = { path = "../majit-gc" }
+wasm-encoder = { version = "0.245", default-features = false }
+
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+wasm-bindgen = "0.2"

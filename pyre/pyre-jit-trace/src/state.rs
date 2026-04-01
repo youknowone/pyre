@@ -1472,7 +1472,7 @@ fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
 fn looks_like_heap_ref(value: PyObjectRef) -> bool {
     let addr = value as usize;
     let word_align = std::mem::align_of::<usize>() - 1;
-    addr >= 0x1_0000 && addr < (1usize << 56) && (addr & word_align) == 0
+    addr >= 0x1_0000 && addr < ((1u64 << 56) as usize) && (addr & word_align) == 0
 }
 
 fn extract_concrete_typed_value(slot_type: Type, value: PyObjectRef) -> Value {
@@ -1554,7 +1554,7 @@ fn boxed_slot_value_as_ref(value: &Value) -> PyObjectRef {
             let addr = *v as usize;
             if addr == 0 {
                 PY_NULL
-            } else if addr >= 0x1_0000 && addr < (1usize << 56) && (addr & 7) == 0 {
+            } else if addr >= 0x1_0000 && addr < ((1u64 << 56) as usize) && (addr & 7) == 0 {
                 // Heap pointer — use as PyObjectRef directly
                 *v as PyObjectRef
             } else {
@@ -7285,10 +7285,11 @@ impl OpcodeStepExecutor for MIFrame {
                 // GUARD_EXCEPTION checks jit_exc_type_matches(); without this
                 // call, no exception would be pending and the guard always fails.
                 let exc_type_const = ctx.const_int(exc_class_ptr as i64);
-                ctx.call_void(
-                    majit_backend_cranelift::jit_exc_raise as *const (),
-                    &[exc_val.opref, exc_type_const],
-                );
+                #[cfg(not(target_arch = "wasm32"))]
+                let exc_raise_ptr = majit_backend_cranelift::jit_exc_raise as *const ();
+                #[cfg(target_arch = "wasm32")]
+                let exc_raise_ptr: *const () = std::ptr::null();
+                ctx.call_void(exc_raise_ptr, &[exc_val.opref, exc_type_const]);
             });
         }
         // RPython pyjitpl.py:2745 execute_ll_raised: store concrete

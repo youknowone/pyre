@@ -45,6 +45,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             0.0
         }
     };
+    #[cfg(feature = "host_env")]
     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     Ok(w_none())
 }
