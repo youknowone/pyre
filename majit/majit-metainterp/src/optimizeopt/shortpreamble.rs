@@ -1420,20 +1420,14 @@ impl ExtendedShortPreambleBuilder {
                 }
             }
         }
-        // Remap produced_short_boxes args: Phase 1 → current inputargs
-        // Must happen BEFORE building short list, so deps have correct args.
-        if !self.phase1_to_inputarg.is_empty() {
-            for produced in self.produced_short_boxes.values_mut() {
-                for arg in &mut produced.preamble_op.args {
-                    if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
-                        *arg = remapped;
-                    }
-                }
-            }
-        }
+        // RPython parity: DO NOT mutate produced_short_boxes in-place.
+        // RPython's setup() only sets self.short/jump_args/label_args;
+        // the preamble producer (self) may be reused across multiple
+        // setup() calls with different label_args. In-place remap would
+        // corrupt the original Phase 1 args for subsequent calls.
+        // Instead, remap on-the-fly when reading from produced_short_boxes.
+
         // Build single short list with inline dep resolution.
-        // RPython use_box parity: for each op, ensure all args that reference
-        // produced ops are already in the list. If not, insert them first.
         let inputargs_set: HashSet<OpRef> = label_args.iter().copied().collect();
         let constants_set: HashSet<u32> = short_preamble.constants.keys().copied().collect();
         self.short.clear();
@@ -1445,25 +1439,10 @@ impl ExtendedShortPreambleBuilder {
                     *arg = remapped;
                 }
             }
-            // RPython use_box arg loop: insert missing deps before this op
+            // RPython use_box arg loop: insert missing deps before this op.
+            // Recursive: deps of deps are also inserted (transitive closure).
             for &arg in &op.args {
-                if self.short_results.contains(&arg)
-                    || inputargs_set.contains(&arg)
-                    || self.known_constants.contains(&arg)
-                    || constants_set.contains(&arg.0)
-                {
-                    continue;
-                }
-                if let Some(dep) = self.produced_short_boxes.get(&arg) {
-                    let dep_pos = dep.preamble_op.pos;
-                    if !self.short_results.contains(&dep_pos) {
-                        self.short_results.insert(dep_pos);
-                        self.short.push(dep.preamble_op.clone());
-                        if dep.preamble_op.opcode.is_ovf() {
-                            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
-                        }
-                    }
-                }
+                self.insert_dep_recursive(arg, &inputargs_set, &constants_set);
             }
             self.short_results.insert(op.pos);
             self.short.push(op);
@@ -1481,6 +1460,46 @@ impl ExtendedShortPreambleBuilder {
         self.label_args = label_args.to_vec();
         self.used_boxes = short_preamble.used_boxes.clone();
         self.short_jump_args = jump_args;
+    }
+
+    /// Recursively insert a dep (and its transitive deps) into self.short.
+    /// Used by setup() to ensure all args of base ops are satisfied.
+    /// Applies phase1_to_inputarg remap when reading from produced_short_boxes.
+    fn insert_dep_recursive(
+        &mut self,
+        arg: OpRef,
+        inputargs_set: &HashSet<OpRef>,
+        constants_set: &HashSet<u32>,
+    ) {
+        if self.short_results.contains(&arg)
+            || inputargs_set.contains(&arg)
+            || self.known_constants.contains(&arg)
+            || constants_set.contains(&arg.0)
+        {
+            return;
+        }
+        if let Some(dep) = self.produced_short_boxes.get(&arg).cloned() {
+            let dep_pos = dep.preamble_op.pos;
+            if self.short_results.contains(&dep_pos) {
+                return;
+            }
+            // Remap dep args on-the-fly (don't mutate produced_short_boxes)
+            let mut dep_op = dep.preamble_op.clone();
+            for a in &mut dep_op.args {
+                if let Some(&remapped) = self.phase1_to_inputarg.get(a) {
+                    *a = remapped;
+                }
+            }
+            // Recurse into dep's own args first (transitive)
+            for &dep_arg in &dep_op.args {
+                self.insert_dep_recursive(dep_arg, inputargs_set, constants_set);
+            }
+            self.short_results.insert(dep_pos);
+            self.short.push(dep_op);
+            if dep.preamble_op.opcode.is_ovf() {
+                self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+            }
+        }
     }
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
@@ -1542,6 +1561,20 @@ impl ExtendedShortPreambleBuilder {
         self.use_box_recursive(result, &mut HashSet::new())
     }
 
+    /// Remap a preamble op's args using phase1_to_inputarg (on-the-fly, no mutation).
+    fn remap_op(&self, op: &Op) -> Op {
+        if self.phase1_to_inputarg.is_empty() {
+            return op.clone();
+        }
+        let mut remapped = op.clone();
+        for arg in &mut remapped.args {
+            if let Some(&r) = self.phase1_to_inputarg.get(arg) {
+                *arg = r;
+            }
+        }
+        remapped
+    }
+
     /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
     /// Called by force_op_from_preamble (unroll.py:32).
     pub fn use_box(
@@ -1551,14 +1584,15 @@ impl ExtendedShortPreambleBuilder {
         result_guards: &[Op],
     ) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        let canonical = produced.preamble_op.pos;
+        let preamble_op = self.remap_op(&produced.preamble_op);
+        let canonical = preamble_op.pos;
         // shortpreamble.py:479: jump_op = self.short.pop()
         let jump_op = self.short.pop();
         // shortpreamble.py:480: AbstractShortPreambleBuilder.use_box(...)
         if !self.short_results.contains(&canonical) {
             let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
             // Add deps for each arg
-            for &arg in &produced.preamble_op.args {
+            for &arg in &preamble_op.args {
                 if self.short_results.contains(&arg)
                     || self.short_inputargs.contains(&arg)
                     || self.known_constants.contains(&arg)
@@ -1574,7 +1608,7 @@ impl ExtendedShortPreambleBuilder {
                     let dep_pos = dep.preamble_op.pos;
                     if !self.short_results.contains(&dep_pos) {
                         self.short_results.insert(dep_pos);
-                        self.short.push(dep.preamble_op.clone());
+                        self.short.push(self.remap_op(&dep.preamble_op));
                         if dep.preamble_op.opcode.is_ovf() {
                             self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
                         }
@@ -1583,8 +1617,8 @@ impl ExtendedShortPreambleBuilder {
             }
             self.short.extend_from_slice(arg_guards);
             self.short_results.insert(canonical);
-            self.short.push(produced.preamble_op.clone());
-            if produced.preamble_op.opcode.is_ovf() {
+            self.short.push(preamble_op.clone());
+            if preamble_op.opcode.is_ovf() {
                 self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
             }
             self.short.extend_from_slice(result_guards);
@@ -1593,7 +1627,7 @@ impl ExtendedShortPreambleBuilder {
         if let Some(jump) = jump_op {
             self.short.push(jump);
         }
-        Some(produced.preamble_op)
+        Some(preamble_op)
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {

@@ -578,7 +578,7 @@ impl OptContext {
     /// be processed through passes AFTER the calling pass. Skips earlier
     /// passes (including the caller) to avoid re-absorption loops.
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
-    pub fn emit_through_passes_after(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
+    pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
         if op.pos.is_none() {
             op.pos = self.reserve_pos();
         } else {
@@ -1010,7 +1010,20 @@ impl OptContext {
             );
         }
 
-        // unroll.py:85-89: StrPtrInfo — TODO when vstring lenbound is ported
+        // unroll.py:85-89: StrPtrInfo — clone lenbound
+        if let PtrInfo::Str(sinfo) = preamble_info {
+            let mut new_info = crate::optimizeopt::info::StrPtrInfo {
+                lenbound: sinfo.lenbound.clone(),
+                mode: sinfo.mode,
+                length: -1,
+                last_guard_pos: -1,
+            };
+            if new_info.lenbound.is_none() {
+                new_info.lenbound = Some(crate::optimizeopt::intutils::IntBound::nonnegative());
+            }
+            self.set_ptr_info(op, PtrInfo::Str(new_info));
+            return;
+        }
 
         // unroll.py:91-92: is_nonnull → make_nonnull
         if preamble_info.is_nonnull() {
@@ -2660,6 +2673,27 @@ impl OptContext {
         self.set_ptr_info(resolved, PtrInfo::NonNull { last_guard_pos: -1 });
     }
 
+    /// optimizer.py:453-459: make_nonnull_str — record StrPtrInfo on a string box.
+    /// Only sets if no existing PtrInfo is present or existing is not StrPtrInfo.
+    pub fn make_nonnull_str(&mut self, opref: OpRef, mode: u8) {
+        let resolved = self.get_box_replacement(opref);
+        if resolved.is_constant() {
+            return;
+        }
+        if let Some(PtrInfo::Str(_)) = self.get_ptr_info(resolved) {
+            return;
+        }
+        self.set_ptr_info(
+            resolved,
+            PtrInfo::Str(crate::optimizeopt::info::StrPtrInfo {
+                lenbound: None,
+                mode,
+                length: -1,
+                last_guard_pos: -1,
+            }),
+        );
+    }
+
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;
@@ -2778,6 +2812,6 @@ pub trait Optimization {
     /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
     /// RPython uses `self.next_optimization` to route lazy-set emissions
     /// starting AFTER the current pass. In majit, pass this index to
-    /// `emit_through_passes_after` to achieve the same behavior.
+    /// `emit_extra` to achieve the same behavior.
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }

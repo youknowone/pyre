@@ -508,11 +508,17 @@ impl OptString {
 
     /// vstring.py: postprocess — after STRLEN on a known-length string,
     /// record as pure (for CSE with OptPure).
-    fn postprocess_strlen(&self, op: &Op, ctx: &OptContext) {
+    fn postprocess_strlen(&self, op: &Op, ctx: &mut OptContext) {
+        // vstring.py: postprocess_STRLEN → make_nonnull_str
+        let mode = if op.opcode == OpCode::Strlen {
+            0u8
+        } else {
+            1u8
+        };
+        ctx.make_nonnull_str(op.arg(0), mode);
         let str_ref = ctx.get_box_replacement(op.arg(0));
         if let Some(len) = self.get_known_length(str_ref, ctx) {
-            // STRLEN(s) = constant len: record for CSE
-            let _ = len; // In RPython, this would call pure_from_args
+            let _ = len;
         }
     }
 

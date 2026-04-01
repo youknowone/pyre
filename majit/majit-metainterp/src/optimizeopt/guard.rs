@@ -111,7 +111,7 @@ impl Guard {
 
     /// guard.py: get_compare_opnum — effective comparison considering
     /// guard_true vs guard_false inversion.
-    pub fn effective_cmp(&self) -> OpCode {
+    pub fn get_compare_opnum(&self) -> OpCode {
         if self.guard_opcode == OpCode::GuardTrue {
             self.cmp_opcode
         } else {
@@ -140,8 +140,8 @@ impl Guard {
         if self.lhs != other.lhs {
             return false;
         }
-        let self_cmp = self.effective_cmp();
-        let other_cmp = other.effective_cmp();
+        let self_cmp = self.get_compare_opnum();
+        let other_cmp = other.get_compare_opnum();
 
         // Same comparison direction with constant rhs
         let self_rhs = ctx.get_constant_int(self.rhs);

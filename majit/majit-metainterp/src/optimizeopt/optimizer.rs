@@ -972,9 +972,9 @@ impl Optimizer {
         self.replaces_guard.insert(guard_pos, replacement);
     }
 
-    /// optimizer.py: replace_guard(old_guard_pos, new_guard)
+    /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
     /// Replace a previously emitted guard with a new one.
-    pub fn replace_guard(&mut self, old_pos: u32, new_guard: Op) {
+    pub fn replace_guard_op(&mut self, old_pos: u32, new_guard: Op) {
         self.replaces_guard.insert(old_pos, new_guard);
     }
 
@@ -1360,7 +1360,8 @@ impl Optimizer {
     /// Run all optimization passes over a list of operations.
     ///
     /// Returns the optimized operation list.
-    pub fn optimize(&mut self, ops: &[Op]) -> Vec<Op> {
+    /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
+    pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
         self.optimize_with_constants(ops, &mut std::collections::HashMap::new())
     }
 
@@ -1487,7 +1488,7 @@ impl Optimizer {
             for &(obj, field_idx, val) in &knowledge.heap_fields {
                 if !obj.is_none() && !val.is_none() {
                     if let Some(info) = ctx.get_ptr_info_mut(obj) {
-                        info.set_field(field_idx, val);
+                        info.setfield(field_idx, val);
                     }
                 }
             }
@@ -3203,11 +3204,10 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
-                let alloc =
-                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
+                let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc, OpRef(0)]);
                 set.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes_after(ctx.current_pass_idx, set);
+                ctx.emit_extra(ctx.current_pass_idx, set);
             }
             OptimizationResult::PassOn
         }
@@ -3665,17 +3665,15 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
-                let alloc_a =
-                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
+                let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a, OpRef(0)]);
                 set_a.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes_after(ctx.current_pass_idx, set_a);
+                ctx.emit_extra(ctx.current_pass_idx, set_a);
 
-                let alloc_b =
-                    ctx.emit_through_passes_after(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
+                let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b, OpRef(1)]);
                 set_b.descr = Some(self.field_descr.clone());
-                ctx.emit_through_passes_after(ctx.current_pass_idx, set_b);
+                ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
             OptimizationResult::PassOn
         }
