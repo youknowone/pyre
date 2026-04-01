@@ -2459,7 +2459,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
-        let bridge_ops = ctx.recorder.ops().to_vec();
+        let mut bridge_ops = ctx.recorder.ops().to_vec();
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputarg_types()
@@ -2467,6 +2467,50 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
+        // RPython parity: bridge ops reference the tracer's OpRef space.
+        // When snapshot numbering produces compact fail_args, the bridge's
+        // inputargs are re-indexed (OpRef(0..n) for n liveboxes). The ops
+        // may reference the ORIGINAL trace's OpRef indices. Remap to match.
+        if let Some((trace_id, fail_index)) = bridge_origin {
+            let guard_fail_args: Option<Vec<OpRef>> = self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| {
+                    let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+                    compiled.traces.get(&norm_tid)
+                })
+                .and_then(|trace| {
+                    let guard_idx = trace.guard_op_indices.get(&fail_index)?;
+                    let guard_op = trace.ops.get(*guard_idx)?;
+                    guard_op.fail_args.as_ref().map(|fa| fa.to_vec())
+                });
+            if let Some(fail_args) = guard_fail_args {
+                // Build remap: fail_args[i].0 → i (compact index).
+                let mut remap: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for (compact_idx, &opref) in fail_args.iter().enumerate() {
+                    if !opref.is_none() {
+                        remap.insert(opref.0, compact_idx as u32);
+                    }
+                }
+                if !remap.is_empty() {
+                    for op in &mut bridge_ops {
+                        for arg in &mut op.args {
+                            if let Some(&new_idx) = remap.get(&arg.0) {
+                                *arg = OpRef(new_idx);
+                            }
+                        }
+                        if let Some(ref mut fa) = op.fail_args {
+                            for arg in fa.iter_mut() {
+                                if let Some(&new_idx) = remap.get(&arg.0) {
+                                    *arg = OpRef(new_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
