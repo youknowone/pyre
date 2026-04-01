@@ -1318,15 +1318,15 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // warmstate.py:387-423: RPython's blackhole never
-                            // fails (rd_numb is always complete). pyre's rd_numb
-                            // can be incomplete, causing blackhole failure.
-                            // Invalidate to prevent re-entering the broken guard,
-                            // but don't retrace immediately — let the counter
-                            // accumulate naturally.
+                            // resume.py:1312: blackhole_from_resumedata never
+                            // fails in upstream — it's a contract. This path
+                            // means a pyre resume data bug. Invalidate to
+                            // prevent re-entering the broken guard. Remove
+                            // once blackhole resume is fully sound.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][WARN] blackhole resume incomplete key={}",
+                                    "[jit][BUG] blackhole failed key={} — \
+                                     invalidating compiled loop",
                                     green_key,
                                 );
                             }
@@ -1386,22 +1386,13 @@ fn bound_reached(
     // warmstate.py:482-511 + warmstate.py:437-444 combined:
     // compiled code → run, else → start tracing.
     let outcome = if driver.has_compiled_loop(green_key) {
-        // warmstate.py:483: procedure_token = cell.get_procedure_token()
-        // RPython enters only when green key matches (implies correct PC).
-        let merge_ok = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |m| m.merge_pc == loop_header_pc);
-        if merge_ok {
-            Some(driver.run_compiled_detailed_with_bridge_keyed(
-                green_key,
-                loop_header_pc,
-                &mut jit_state,
-                env,
-                || {},
-            ))
-        } else {
-            None
-        }
+        Some(driver.run_compiled_detailed_with_bridge_keyed(
+            green_key,
+            loop_header_pc,
+            &mut jit_state,
+            env,
+            || {},
+        ))
     } else if !driver.is_tracing() {
         // warmstate.py:437-444 compile_and_run_once parity:
         // start tracing AND trace synchronously in a single call.
@@ -1560,18 +1551,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
-        // warmstate.py:482-511: RPython enters compiled code only when
-        // green key matches (which implies correct PC). Skip if the
-        // compiled loop's merge_pc doesn't match frame.next_instr —
-        // the interpreter will reach the right PC naturally.
-        let merge_ok = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |m| m.merge_pc == frame.next_instr);
-        if !merge_ok {
-            // Fall through: interpreter runs from pc=0, back-edge at
-            // merge_pc will enter compiled code via maybe_compile_and_run.
-            return None;
-        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
@@ -2771,64 +2750,11 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    // opencoder.py:722 _list_of_boxes_virtualizable: virtualizable_ptr
-    // moved from boxes[-1] to snapshot[0].
-    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
-    // Per-frame values contain slot registers only (no header prepend).
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 5 {
-        let frame_val = resolve_rebuilt_value(
-            &vable_values[0],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
-            &vable_values[1], // ni
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[2]=code (immutable)
-        let vsd_val = resolve_rebuilt_value(
-            &vable_values[3], // vsd
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[4]=namespace (immutable)
-        let fp = match &frame_val {
-            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let ni = match &ni_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match &vsd_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    } else {
-        // vable_values empty: no-snapshot guard. Fall back to
-        // deadframe header [Ref(frame), Int(ni), Int(vsd), ...].
-        // RPython never hits this (all guards have snapshots).
-        let fp = match dead_frame_typed.first() {
-            Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let ni = match dead_frame_typed.get(1) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match dead_frame_typed.get(2) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    };
+    // resume.py:1045 consume_vref_and_vable: vable header is extracted
+    // AFTER _prepare_next_section materializes virtuals. The pre-section
+    // resolve here is only used for _prepare_next_section's own needs
+    // (frame counting, etc.). The authoritative vable header extraction
+    // happens after all_values are built (see below).
 
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
