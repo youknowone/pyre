@@ -3086,15 +3086,27 @@ impl MIFrame {
             ctx,
         ));
         boxes.push(Self::opref_to_snapshot_tagged(sym.vable_namespace, ctx));
-        // Array items: locals + stack (virtualizable.py:86 read_boxes).
+        // Array items: locals + stack (virtualizable.py:94-98 read_boxes).
+        // RPython: len(lst) = runtime array length, always consistent
+        // with get_total_size(). Use vable_array_len for the same effect.
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
         } else {
             None
         };
-        let full_array_len = concrete_frame
-            .map(|f| f.locals_cells_stack_w.len())
-            .unwrap_or(sym.symbolic_locals.len() + stack_only);
+        let vinfo = crate::frame_layout::build_pyframe_virtualizable_info();
+        let full_array_len = if !sym.concrete_vable_ptr.is_null() && !vinfo.array_fields.is_empty()
+        {
+            // virtualizable.py:94: len(lst) — runtime array length.
+            unsafe {
+                majit_metainterp::virtualizable::vable_array_len(
+                    sym.concrete_vable_ptr as *const u8,
+                    &vinfo.array_fields[0],
+                )
+            }
+        } else {
+            sym.symbolic_locals.len() + stack_only
+        };
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
