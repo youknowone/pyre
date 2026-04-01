@@ -3070,11 +3070,19 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constant_types,
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
-        optimizer.snapshot_boxes = snapshot_map;
-        optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
-        optimizer.snapshot_vable_boxes = snapshot_vable_map;
-        optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        optimizer.snapshot_box_types = sbt;
+        // Blocked: snapshot_boxes activation in finish_and_compile causes
+        // fib_recursive SEGFAULT. The vable_array_len mismatch (state.rs)
+        // is fixed, but the snapshot-based rd_numb produces deadframe
+        // values that crash the blackhole. compile_loop (with unroll)
+        // activates snapshot_boxes successfully; this path needs further
+        // debugging of the blackhole resume flow.
+        let _ = (
+            &snapshot_map,
+            &snapshot_frame_size_map,
+            &snapshot_vable_map,
+            &snapshot_pc_map,
+            &sbt,
+        );
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.

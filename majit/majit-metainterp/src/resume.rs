@@ -5878,19 +5878,11 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             TAGBOX => {
                 // resume.py:1575-1578: cpu.get_ref_value(deadframe, num)
-                // RPython: cpu knows slot type. Pyre: check exit_types.
                 let mut idx = num;
                 if idx < 0 {
                     idx += self.count;
                 }
-                let raw = self.deadframe[idx as usize];
-                // Pyre: adapt-live may put raw Int in a deadframe slot.
-                // If exit_types says this slot is Int, box it.
-                if let Some(&majit_ir::Type::Int) = self.exit_types.get(idx as usize) {
-                    self.allocator.box_int(raw)
-                } else {
-                    raw
-                }
+                self.deadframe[idx as usize]
             }
             TAGINT => {
                 // pyre parity: all values are in ref registers (no typed
