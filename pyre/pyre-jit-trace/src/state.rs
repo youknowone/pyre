@@ -3767,14 +3767,23 @@ impl MIFrame {
                 OpCode::IntLshift
             }
             BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                let Some((_lhs, rhs)) = concrete else {
+                let Some((lhs, rhs)) = concrete else {
                     return self.trace_binary_value(a, b, op);
                 };
+                // intobject.py:225: r_uint(b) >= LONG_BIT
                 let Ok(shift) = u32::try_from(rhs) else {
+                    // intobject.py:227: negative shift → ValueError
                     return self.trace_binary_value(a, b, op);
                 };
                 if shift >= i64::BITS {
-                    return self.trace_binary_value(a, b, op);
+                    // intobject.py:229-231: large shift → 0 or -1
+                    let result = if lhs < 0 { -1i64 } else { 0i64 };
+                    return self.with_ctx(|this, ctx| {
+                        let raw = ctx.const_int(result);
+                        let boxed = box_traced_raw_int(ctx, raw);
+                        this.remember_value_type(boxed, Type::Ref);
+                        Ok(boxed)
+                    });
                 }
                 OpCode::IntRshift
             }

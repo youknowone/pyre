@@ -682,17 +682,21 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-    // RPython resume.py:1381-1430 consume_one_section: load register values.
-    // pyre fast locals → int registers (blackhole dispatch reads as i64).
+    // resume.py:1381-1430 consume_one_section / write_a_ref parity:
+    // pyre locals are PyObjectRef (GCREF) → ref register bank.
+    // codewriter emits move_r for LOAD_FAST.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
-            bh.setarg_i(i, frame.locals_cells_stack_w[i] as i64);
+            bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
         }
     }
 
-    // Load value stack into blackhole runtime stack
-    let stack_base = nlocals;
+    // Load value stack into blackhole runtime stack.
+    // locals_cells_stack_w layout: [locals..., cells..., stack...]
+    // stack_base = nlocals + ncells (pyframe.py stack_base parity).
+    let ncells = pyre_interpreter::pyframe::ncells(code);
+    let stack_base = nlocals + ncells;
     let vsd = frame.valuestackdepth;
     for i in stack_base..vsd {
         if i < frame.locals_cells_stack_w.len() {
@@ -708,20 +712,19 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][blackhole] setup pc={} nlocals={} regs_i_len={} local0={} frame_reg={}",
+            "[jit][blackhole] setup pc={} nlocals={} regs_r_len={} frame_reg={}",
             py_pc,
             nlocals,
-            bh.registers_i.len(),
-            bh.registers_i.get(0).copied().unwrap_or(-999),
-            bh.registers_i.get(nlocals + 3).copied().unwrap_or(-999),
+            bh.registers_r.len(),
+            bh.registers_i.get(3).copied().unwrap_or(-999),
         );
     }
 
     // RPython: _run_forever(blackholeinterp, current_exc)
     bh.run();
 
-    // Return value is in registers_i[0] (set by RETURN_VALUE → move_i(0, tmp0))
-    let result = bh.registers_i[0] as PyObjectRef;
+    // blackhole.py:842 ref_return → tmpreg_r
+    let result = bh.get_tmpreg_r() as PyObjectRef;
 
     // RPython: builder.release_interp(blackholeinterp) — return to pool
     builder.release_interp(bh);
@@ -1003,10 +1006,12 @@ pub fn resume_in_blackhole(
                             bh.registers_r[i] as pyre_object::PyObjectRef;
                     }
                 }
+                let ncells = pyre_interpreter::pyframe::ncells(code);
+                let stack_base = nlocals + ncells;
                 let stack = bh.runtime_stack_drain(0);
-                frame.valuestackdepth = nlocals + stack.len();
+                frame.valuestackdepth = stack_base + stack.len();
                 for (i, val) in stack.iter().enumerate() {
-                    let idx = nlocals + i;
+                    let idx = stack_base + i;
                     if idx < frame.locals_cells_stack_w.len() {
                         frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
                     }
@@ -1095,22 +1100,20 @@ pub fn resume_in_blackhole(
             continue;
         }
 
-        // blackhole.py:1636-1644: return value is in tmpreg_r
-        // (set by ref_return), not registers_r[0].
-        let return_value = bh.tmpreg_r;
+        // blackhole.py:1636-1640: get_tmpreg_r() for ref return.
+        let return_value = bh.get_tmpreg_r();
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
 
         let Some(mut caller_bh) = next.map(|b| *b) else {
-            // Outermost frame finished — function return.
+            // blackhole.py:1664-1672 _done_with_this_frame
             return BlackholeResult::DoneWithThisFrame(
                 Ok(return_value as pyre_object::PyObjectRef),
             );
         };
 
-        // RPython _run_forever: pass return value to caller blackhole.
-        // The caller's CALL instruction result goes onto the runtime stack.
-        caller_bh.runtime_stack_push(0, return_value);
+        // blackhole.py:1657-1659 _setup_return_value_r
+        caller_bh.setup_return_value_r(return_value);
 
         bh = caller_bh;
     }
@@ -1188,7 +1191,9 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
             bh.setarg_r(i, frame.locals_cells_stack_w[i] as i64);
         }
     }
-    let stack_base = nlocals;
+    // locals_cells_stack_w: [locals..., cells..., stack...]
+    let ncells = pyre_interpreter::pyframe::ncells(code);
+    let stack_base = nlocals + ncells;
     let vsd = frame.valuestackdepth;
     for i in stack_base..vsd {
         if i < frame.locals_cells_stack_w.len() {
@@ -1217,16 +1222,20 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     }
 
     // Write back blackhole register state → frame locals.
+    // Locals are in ref register bank (codewriter uses move_r).
     for i in 0..nlocals {
-        if i < bh.registers_i.len() && i < frame.locals_cells_stack_w.len() {
-            frame.locals_cells_stack_w[i] = bh.registers_i[i] as pyre_object::PyObjectRef;
+        if i < bh.registers_r.len() && i < frame.locals_cells_stack_w.len() {
+            frame.locals_cells_stack_w[i] = bh.registers_r[i] as pyre_object::PyObjectRef;
         }
     }
     // Write back runtime stack → frame value stack.
+    // stack starts at nlocals + ncells in locals_cells_stack_w.
+    let ncells = pyre_interpreter::pyframe::ncells(code);
+    let stack_base = nlocals + ncells;
     let stack = bh.runtime_stack_drain(0);
-    frame.valuestackdepth = nlocals + stack.len();
+    frame.valuestackdepth = stack_base + stack.len();
     for (i, val) in stack.iter().enumerate() {
-        let idx = nlocals + i;
+        let idx = stack_base + i;
         if idx < frame.locals_cells_stack_w.len() {
             frame.locals_cells_stack_w[idx] = *val as pyre_object::PyObjectRef;
         }
@@ -1720,17 +1729,18 @@ pub fn blackhole_resume_via_rd_numb(
             continue;
         }
 
-        // blackhole.py:1636-1644: return value is in tmpreg_r
-        // (set by ref_return), not registers_r[0].
-        let return_value = bh.tmpreg_r;
+        // blackhole.py:1636-1640: get_tmpreg_r() for ref return.
+        let return_value = bh.get_tmpreg_r();
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
         let Some(mut caller_bh) = next.map(|b| *b) else {
+            // blackhole.py:1664-1672 _done_with_this_frame
             return BlackholeResult::DoneWithThisFrame(
                 Ok(return_value as pyre_object::PyObjectRef),
             );
         };
-        caller_bh.runtime_stack_push(0, return_value);
+        // blackhole.py:1657-1659 _setup_return_value_r
+        caller_bh.setup_return_value_r(return_value);
         bh = caller_bh;
     }
 }

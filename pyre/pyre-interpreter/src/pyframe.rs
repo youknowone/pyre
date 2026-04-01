@@ -201,7 +201,7 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 /// Count cell+free variable slots, excluding cellvars already in varnames.
 /// CPython 3.13+ unified indexing: cellvars that overlap with varnames
 /// share the same slot. Only cellvar-only variables get extra slots.
-fn ncells(code: &CodeObject) -> usize {
+pub fn ncells(code: &CodeObject) -> usize {
     let cellvars_only = code
         .cellvars
         .iter()
