@@ -1486,6 +1486,12 @@ impl OptContext {
         // Pyre: optimizer-created guards (VirtualState, inline_short_preamble)
         // may have rd_resume_position=-1. Use patchguardop's position as
         // fallback — RPython does this implicitly via patchguardop chain.
+        // resume.py:396-397: resume_position = self.guard_op.rd_resume_position
+        // assert resume_position >= 0
+        // RPython: every guard has a valid snapshot from capture_resumedata.
+        // pyre: optimizer-created guards may have rd_resume_position=-1.
+        // Fall back to patchguardop (unroll.py:336), then to the highest
+        // snapshot index (last capture_resumedata from tracing).
         let mut resume_pos = op.rd_resume_position;
         if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
             if let Some(ref patch) = self.patchguardop {
@@ -1497,19 +1503,21 @@ impl OptContext {
                 }
             }
         }
+        if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
+            // Last resort: use highest snapshot key (last capture_resumedata).
+            if let Some(&max_key) = self.snapshot_boxes.keys().max() {
+                if max_key >= 0 {
+                    resume_pos = max_key;
+                    op.rd_resume_position = resume_pos;
+                }
+            }
+        }
         let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
         if !has_snapshot {
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
-                    "[jit][no-snapshot-fallback] {:?} pos={:?} resume_pos={} has_descr={} patchguardop={}",
-                    op.opcode,
-                    op.pos,
-                    op.rd_resume_position,
-                    op.descr.is_some(),
-                    self.patchguardop
-                        .as_ref()
-                        .map(|p| p.rd_resume_position)
-                        .unwrap_or(-99),
+                    "[jit][WARN] no-snapshot guard {:?} pos={:?} resume_pos={}",
+                    op.opcode, op.pos, op.rd_resume_position,
                 );
             }
             if let Some(ref fa) = op.fail_args {

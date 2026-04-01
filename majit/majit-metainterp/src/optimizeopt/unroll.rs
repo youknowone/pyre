@@ -393,7 +393,21 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
-        opt_p2.patchguardop = self.phase1_patchguardop.clone();
+        // RPython traces always contain GUARD_FUTURE_CONDITION (from promote
+        // hint) which sets patchguardop. pyre traces lack promote, so
+        // patchguardop may be None. Fall back to the highest snapshot index
+        // in snapshot_boxes — this is the last capture_resumedata position
+        // from Phase 1, matching RPython's invariant that patchguardop is
+        // always set before Phase 2 generate_guards (unroll.py:333).
+        opt_p2.patchguardop = self.phase1_patchguardop.clone().or_else(|| {
+            let max_pos = self.snapshot_boxes.keys().copied().max()?;
+            if max_pos < 0 {
+                return None;
+            }
+            let mut synthetic = majit_ir::Op::new(majit_ir::OpCode::GuardTrue, &[]);
+            synthetic.rd_resume_position = max_pos;
+            Some(synthetic)
+        });
         // gcreftracer.py parity: root GcRef values on the shadow stack.
         // RPython: single Python object — GC traces automatically.
         // Rust: LIFO shadow stack requires longer-lived roots at lower depth.
@@ -1729,6 +1743,13 @@ impl OptUnroll {
                 Some(vs) => vs,
                 None => continue,
             };
+
+            // RPython unroll.py:333: patchguardop = self.optimizer.patchguardop
+            // Ensure ctx.patchguardop is set before generate_guards so that
+            // extra guards get a valid rd_resume_position (resume.py:397).
+            if ctx.patchguardop.is_none() {
+                ctx.patchguardop = optimizer.patchguardop.clone();
+            }
 
             // RPython unroll.py:315 parity: try generate_guards directly
             // instead of gating on generalization_of. If guards can't be
