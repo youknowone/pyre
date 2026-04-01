@@ -256,18 +256,16 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardNoOverflow => {
-                // overflow flag is in the preceding IntAddOvf/IntSubOvf/IntMulOvf op
-                // Convention: op.arg(0) holds the overflow flag variable
-                emit_resolve(&mut sink, constants, op.arg(0));
-                sink.i64_const(0);
-                sink.i64_ne();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                // RPython: 0 args — overflow flag implicit from preceding ovf op.
+                // Wasm MVP doesn't detect overflow, so always passes.
                 guard_idx += 1;
             }
             OpCode::GuardOverflow => {
-                emit_resolve(&mut sink, constants, op.arg(0));
-                sink.i64_eqz();
-                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                // Always fails (no overflow detected in wasm MVP).
+                emit_guard_exit(&mut sink, constants, guard_idx, op);
+                if has_loop {
+                    sink.br(1);
+                }
                 guard_idx += 1;
             }
             // Guards that always pass in wasm MVP
