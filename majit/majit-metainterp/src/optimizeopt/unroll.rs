@@ -2062,20 +2062,36 @@ impl OptUnroll {
                 // RPython: both guards and non-guards follow the same path:
                 //   copy_and_change → mapping[sop] = op → send_extra_operation(op)
                 if new_op.opcode.is_guard() {
-                    // unroll.py:405-411: copy_and_change with ResumeAtPositionDescr.
-                    // All guard replay infrastructure verified:
-                    // ✓ GUARD_FUTURE_CONDITION emitted, patchguardop valid
-                    // ✓ snapshot_boxes populated, rd_numb/fail_args generated
-                    // ✓ mapping/ordering match RPython, 7/8 benchmarks pass
-                    //
-                    // Blocked by nbody: replayed guards change compiled loop's
-                    // entry condition → incompatible-state on warm re-entry →
-                    // infinite retrace. Root cause: single entry point per loop.
-                    // RPython uses target_token dispatch (compile.py:288) for
-                    // multiple entry points. Until target_token dispatch is
-                    // implemented, skip guard replay to prevent this.
-                    replay_index += 1;
-                    continue;
+                    // unroll.py:406-409: copy_and_change with ResumeAtPositionDescr
+                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
+                    new_op.fail_args = None;
+                    new_op.rd_numb = None;
+                    new_op.rd_consts = None;
+                    new_op.rd_virtuals = None;
+                    new_op.rd_pendingfields = None;
+                    new_op.fail_arg_types = None;
+                    // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
+                    new_op.rd_resume_position = ctx
+                        .patchguardop
+                        .as_ref()
+                        .map(|p| p.rd_resume_position)
+                        .unwrap_or(-1);
+                    // Re-register guard constant args from preamble's constant pool.
+                    for &arg in &new_op.args {
+                        if let Some(&(val, tp)) = short_preamble.constants.get(&arg.0) {
+                            let value = match tp {
+                                majit_ir::Type::Int => majit_ir::Value::Int(val),
+                                majit_ir::Type::Ref => {
+                                    majit_ir::Value::Ref(majit_ir::GcRef(val as usize))
+                                }
+                                majit_ir::Type::Float => {
+                                    majit_ir::Value::Float(f64::from_bits(val as u64))
+                                }
+                                majit_ir::Type::Void => majit_ir::Value::Int(val),
+                            };
+                            ctx.make_constant(arg, value);
+                        }
+                    }
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
