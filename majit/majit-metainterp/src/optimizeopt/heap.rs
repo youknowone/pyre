@@ -2033,7 +2033,7 @@ impl Optimization for OptHeap {
             let value_ref = ctx.get_box_replacement(op.arg(1));
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    info.force_box_direct(value_ref, ctx);
+                    info.force_box(value_ref, ctx);
                 }
             }
             for arg in op.args.iter_mut() {

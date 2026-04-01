@@ -1443,7 +1443,7 @@ impl OptContext {
         }
         if let Some(mut info) = self.get_ptr_info(resolved).cloned() {
             if info.is_virtual() {
-                let forced = info.force_box_direct(resolved, self);
+                let forced = info.force_box(resolved, self);
                 return self.get_box_replacement(forced);
             }
         }
