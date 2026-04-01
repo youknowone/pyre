@@ -2,6 +2,9 @@
 name = "pyre-object"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python object model for pyre interpreter"
 
 [dependencies]
 malachite-bigint = { workspace = true }

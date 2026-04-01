@@ -2,7 +2,9 @@
 name = "pyre-jit"
 version.workspace = true
 edition.workspace = true
-description = "Auto-generated JIT for pyre — rpython/jit/ equivalent"
+license.workspace = true
+repository.workspace = true
+description = "JIT compiler integration for pyre interpreter"
 
 [dependencies]
 pyre-object = { path = "../pyre-object" }
