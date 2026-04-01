@@ -896,6 +896,14 @@ pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode
         if !cache.contains_key(&key) {
             let pyjitcode = writer.make_jitcode(code);
             cache.insert(key, pyjitcode);
+            // RPython parity: link state::JitCode to majit JitCode so
+            // get_list_of_active_boxes uses the same liveness data as
+            // consume_one_section (resume.py all_liveness parity).
+            let entry = cache.get(&key).unwrap();
+            pyre_jit_trace::set_majit_jitcode(
+                code as *const _,
+                &entry.jitcode as *const majit_metainterp::jitcode::JitCode,
+            );
         }
         let entry = cache.get(&key).unwrap();
         // SAFETY: thread-local cache lives for thread lifetime

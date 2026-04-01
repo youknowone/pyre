@@ -42,6 +42,11 @@ pub(crate) struct JitCode {
     pub code: *const CodeObject,
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
+    /// RPython parity: pointer to majit JitCode (liveness, bytecodes).
+    /// Set by codewriter via set_majit_jitcode(). Used by
+    /// get_list_of_active_boxes to access the same LivenessInfo
+    /// that consume_one_section uses (all_liveness parity).
+    pub majit_jitcode: *const majit_metainterp::jitcode::JitCode,
 }
 
 /// warmspot.py:148-282: MetaInterpStaticData — per-driver compile-time data.
@@ -76,7 +81,11 @@ impl MetaInterpStaticData {
             return &*self.jitcodes[idx] as *const JitCode;
         }
         let index = self.jitcodes.len() as i32;
-        let jitcode = Box::new(JitCode { code, index });
+        let jitcode = Box::new(JitCode {
+            code,
+            index,
+            majit_jitcode: std::ptr::null(),
+        });
         let ptr = &*jitcode as *const JitCode;
         self.by_code.insert(key, self.jitcodes.len());
         self.jitcodes.push(jitcode);
@@ -98,6 +107,27 @@ fn jitcode_for(code: *const CodeObject) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 
+/// RPython parity: link state::JitCode to its majit JitCode.
+/// Called by codewriter after PyJitCode compilation so that
+/// get_list_of_active_boxes can look up LivenessInfo from the same
+/// data source as consume_one_section (RPython all_liveness parity).
+pub fn set_majit_jitcode(
+    code: *const CodeObject,
+    majit_jitcode: *const majit_metainterp::jitcode::JitCode,
+) {
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        // Ensure the JitCode entry exists.
+        let _ = sd.jitcode_for(code);
+        let key = code as usize;
+        if let Some(&idx) = sd.by_code.get(&key) {
+            // SAFETY: jitcode is Box'd and never removed from the vec.
+            let jc = &mut *sd.jitcodes[idx];
+            jc.majit_jitcode = majit_jitcode;
+        }
+    });
+}
+
 /// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
 /// Resolve jitcode_index (sequential int from snapshot numbering)
 /// to the corresponding CodeObject pointer.
@@ -113,6 +143,7 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
 static NULL_JITCODE: JitCode = JitCode {
     code: std::ptr::null(),
     index: -1,
+    majit_jitcode: std::ptr::null(),
 };
 
 /// codewriter/liveness.py parity: bytecode liveness analysis.
