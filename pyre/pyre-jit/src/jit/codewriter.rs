@@ -718,16 +718,23 @@ impl CodeWriter {
         let has_abort = false;
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
-        // Each entry lists which ref registers are live:
-        //   locals 0..nlocals-1 (conservative: all live)
-        //   stack  stack_base..stack_base+depth-1 (precise from depth_at_pc)
+        // RPython: compute_liveness() runs backward dataflow on SSARepr,
+        // marking only actually-live registers. Both get_list_of_active_boxes
+        // (pyjitpl.py:177) and consume_one_section (resume.py:1381) use the
+        // same all_liveness data. In pyre, LiveVars::compute provides the
+        // equivalent backward analysis on Python bytecodes.
         {
-            let local_regs: Vec<u16> = (0..nlocals as u16).collect();
+            let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
             let mut liveness = Vec::with_capacity(num_instrs);
             for py_pc in 0..num_instrs {
                 let jit_pc = pc_map[py_pc];
                 let depth = depth_at_pc[py_pc];
-                let mut live_r = local_regs.clone();
+                // liveness.py: only live locals are included.
+                let mut live_r: Vec<u16> = (0..nlocals)
+                    .filter(|&idx| live_vars.is_local_live(py_pc, idx))
+                    .map(|idx| idx as u16)
+                    .collect();
+                // Stack slots: live if index < depth at this PC.
                 for d in 0..depth {
                     live_r.push(stack_base + d);
                 }
@@ -740,9 +747,25 @@ impl CodeWriter {
             }
             // Deduplicate entries at the same JitCode PC (multiple Python
             // bytecodes may map to the same JitCode offset, e.g. Cache/Nop).
+            // When merging, take the UNION of live registers (conservative).
             liveness.sort_by_key(|l| l.pc);
-            liveness.dedup_by_key(|l| l.pc);
-            jitcode.liveness = liveness;
+            let mut merged: Vec<majit_metainterp::jitcode::LivenessInfo> = Vec::new();
+            for entry in liveness {
+                if let Some(last) = merged.last_mut() {
+                    if last.pc == entry.pc {
+                        // Union: merge live_r_regs
+                        for &reg in &entry.live_r_regs {
+                            if !last.live_r_regs.contains(&reg) {
+                                last.live_r_regs.push(reg);
+                            }
+                        }
+                        last.live_r_regs.sort();
+                        continue;
+                    }
+                }
+                merged.push(entry);
+            }
+            jitcode.liveness = merged;
         }
 
         // RPython parity: forward PC map (py_pc → jitcode_pc) so

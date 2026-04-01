@@ -3025,12 +3025,12 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 &mut constant_types,
             );
-        // compile.py:92-96: SimpleCompileData.optimize → optimize_loop →
-        // propagate_all_forward processes entire trace including snapshots.
-        // Blocked: LivenessInfo has all-locals-always-live (conservative).
-        // Snapshot numbering with all locals includes stale dead-local values
-        // → wrong computation on guard failure. Fix: precise per-local
-        // liveness in LivenessInfo (RPython liveness.py backward analysis).
+        // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
+        // LivenessInfo has precise per-local liveness (liveness.py parity).
+        // Blocked: fib_recursive blackhole_from_resumedata path crashes
+        // with compact fail_args — blackhole registers get wrong values.
+        // Fix: align blackhole_from_resumedata with compact layout or
+        // ensure all eval.rs guard failure paths handle compact correctly.
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
