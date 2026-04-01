@@ -2042,12 +2042,16 @@ impl OptUnroll {
                 // no rd_numb/rd_consts/rd_virtuals.
                 // store_final_boxes_in_guard rebuilds these from the snapshot.
                 if new_op.opcode.is_guard() {
-                    // unroll.py:407-411: copy_and_change with ResumeAtPositionDescr.
-                    // RPython replays short preamble guards with fresh resume data.
-                    // Currently blocked: guard resume data from short preamble
-                    // replay doesn't match compiled bridge re-entry expectations.
-                    // TODO: connect ResumeAtPositionDescr to patchguardop's
-                    // rd_resume_position so replayed guards can fail correctly.
+                    // unroll.py:405-411: copy_and_change with ResumeAtPositionDescr.
+                    // RPython: patchguardop.rd_resume_position → guard.rd_resume_position
+                    // then send_extra_operation routes through optimizer which calls
+                    // store_final_boxes_in_guard(op, pendingfields) → finish().
+                    //
+                    // Blocked: jump_ctx.snapshot_boxes is empty at this point,
+                    // so store_final_boxes_in_guard falls through to no-snapshot
+                    // path which generates invalid resume data. Need to propagate
+                    // Phase 2 body's snapshot_boxes into jump_ctx.
+                    // RPython ref: resume.py:389-452 finish(), unroll.py:405-414
                     replay_index += 1;
                     continue;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
