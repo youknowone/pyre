@@ -1313,7 +1313,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &[], // exit_types (proc-macro path, no adapt-live)
+                    &exit_layout.exit_types,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
@@ -2821,7 +2821,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &[], // exit_types (proc-macro path, no adapt-live)
+                    &exit_layout.exit_types,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
