@@ -3502,6 +3502,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             }
         }
     }
+
+    fn box_int(&self, value: i64) -> i64 {
+        pyre_object::intobject::w_int_new(value) as i64
+    }
 }
 
 #[cfg(test)]
