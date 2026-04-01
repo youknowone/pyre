@@ -5190,6 +5190,10 @@ pub struct ResumeDataDirectReader<'a> {
     // ResumeDataDirectReader fields (resume.py:1364-1367)
     /// resume.py:1366 deadframe — raw fail_args values
     pub deadframe: &'a [i64],
+    /// Pyre: exit_types for each deadframe slot (adapt-live type info).
+    /// RPython: cpu.get_int_value/get_ref_value handles type dispatch.
+    /// In pyre, deadframe is raw i64; exit_types tells Int vs Ref.
+    pub exit_types: &'a [majit_ir::Type],
 
     // resume.py:1358 resume_after_guard_not_forced
     //   0: not a GUARD_NOT_FORCED
@@ -5407,6 +5411,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe,
+            exit_types: &[],
             resume_after_guard_not_forced,
             rd_virtuals: None,
             virtuals_cache_ptr,
@@ -5871,12 +5876,20 @@ impl<'a> ResumeDataDirectReader<'a> {
                 self.getvirtual_ptr(num as usize)
             }
             TAGBOX => {
-                // resume.py:1575-1578
+                // resume.py:1575-1578: cpu.get_ref_value(deadframe, num)
+                // RPython: cpu knows slot type. Pyre: check exit_types.
                 let mut idx = num;
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                let raw = self.deadframe[idx as usize];
+                // Pyre: adapt-live may put raw Int in a deadframe slot.
+                // If exit_types says this slot is Int, box it.
+                if let Some(&majit_ir::Type::Int) = self.exit_types.get(idx as usize) {
+                    self.allocator.box_int(raw)
+                } else {
+                    raw
+                }
             }
             TAGINT => {
                 // pyre parity: all values are in ref registers (no typed
@@ -5968,10 +5981,13 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
+    exit_types: &'a [majit_ir::Type],
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1317-1321
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
+    // Pyre: exit_types for TAGBOX type-aware decode (adapt-live Int slots).
+    resumereader.exit_types = exit_types;
 
     // resume.py:1324
     resumereader.prepare(rd_virtuals, rd_pendingfields, rd_guard_pendingfields);

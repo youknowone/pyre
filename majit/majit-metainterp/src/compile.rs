@@ -172,17 +172,33 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
+        // Reconcile livebox types with inputarg types (adapt-live Ref→Int).
+        let inputarg_type_map: HashMap<u32, Type> =
+            inputargs.iter().map(|ia| (ia.index, ia.tp)).collect();
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref types) = op.fail_arg_types {
-            types.clone()
+            if let Some(ref fail_args) = op.fail_args {
+                types
+                    .iter()
+                    .zip(fail_args.iter())
+                    .map(|(&tp, opref)| inputarg_type_map.get(&opref.0).copied().unwrap_or(tp))
+                    .collect()
+            } else {
+                types.clone()
+            }
         } else if let Some(ref fail_args) = op.fail_args {
             fail_args
                 .iter()
-                .map(|opref| fail_arg_type(opref, &value_types))
+                .map(|opref| {
+                    inputarg_type_map
+                        .get(&opref.0)
+                        .copied()
+                        .unwrap_or_else(|| fail_arg_type(opref, &value_types))
+                })
                 .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
@@ -627,7 +643,9 @@ pub(crate) fn merge_backend_exit_layouts(
                     rd_pendingfields: None,
                 });
         entry.source_op_index = layout.source_op_index;
-        entry.exit_types = layout.fail_arg_types.clone();
+        if entry.exit_types.is_empty() {
+            entry.exit_types = layout.fail_arg_types.clone();
+        }
         entry.is_finish = layout.is_finish;
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();

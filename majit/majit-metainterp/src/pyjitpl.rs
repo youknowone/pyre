@@ -3026,18 +3026,11 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constant_types,
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
-        // Snapshot propagation: infrastructure complete (liveness unified,
-        // exit_types reconciled, decode_ref TAGINT boxing, vable skip).
-        // Blocked: fib_recursive CallAssembler recursive guard failure →
-        // compiled code receives BH result as PyObjectRef but expects raw Int
-        // (adapt-live type divergence in CallAssemblerI result handling).
-        let _ = (
-            &snapshot_map,
-            &snapshot_frame_size_map,
-            &snapshot_vable_map,
-            &snapshot_pc_map,
-            &sbt,
-        );
+        optimizer.snapshot_boxes = snapshot_map;
+        optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
+        optimizer.snapshot_vable_boxes = snapshot_vable_map;
+        optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        optimizer.snapshot_box_types = sbt;
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
@@ -5204,6 +5197,20 @@ impl<M: Clone> MetaInterp<M> {
         let rd_numb = exit_layout.rd_numb.as_ref()?.clone();
         let rd_consts = exit_layout.rd_consts.as_ref()?.clone();
         Some((rd_numb, rd_consts))
+    }
+
+    /// Get exit_types for a guard failure (adapt-live type info).
+    pub fn get_exit_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        Some(exit_layout.exit_types.clone())
     }
 
     /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
