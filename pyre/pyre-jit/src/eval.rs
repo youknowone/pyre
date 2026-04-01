@@ -2658,8 +2658,9 @@ fn rebuild_typed_from_rd_numb(
     // synchronize_virtualizable writes them back to the heap.
     // Frame registers fill frame.registers_i/r/f independently.
 
-    // Decode vable header: [frame_ptr(0), ni(1), vsd(2)].
-    let header: Vec<Value> = if vable_values.len() >= 3 {
+    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
+    // fail_args header = [frame, ni, vsd] (3-slot; code/ns immutable → skip)
+    let header: Vec<Value> = if vable_values.len() >= 5 {
         vec![
             decode_rv(
                 &vable_values[0],
@@ -2668,17 +2669,19 @@ fn rebuild_typed_from_rd_numb(
                 &mut virtuals_cache,
             ),
             decode_rv(
-                &vable_values[1],
+                &vable_values[1], // ni
                 &dead_frame_typed,
                 exit_layout,
                 &mut virtuals_cache,
             ),
+            // skip vable_values[2]=code (immutable)
             decode_rv(
-                &vable_values[2],
+                &vable_values[3], // vsd
                 &dead_frame_typed,
                 exit_layout,
                 &mut virtuals_cache,
             ),
+            // skip vable_values[4]=namespace (immutable)
         ]
     } else {
         Vec::new()
@@ -2766,12 +2769,11 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    // RPython parity: extract frame_ptr/ni/vsd from vable_values (snapshot).
-    // _list_of_boxes_virtualizable (opencoder.py:722) reorders: virtualizable_ptr
-    // is moved from boxes[-1] to snapshot[0]. After rebuild_from_resumedata,
-    // vable_values[0] = frame_ptr, [1] = ni, [2] = vsd, [3..] = array items.
+    // opencoder.py:722 _list_of_boxes_virtualizable: virtualizable_ptr
+    // moved from boxes[-1] to snapshot[0].
+    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
     // Per-frame values contain slot registers only (no header prepend).
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
+    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 5 {
         let frame_val = resolve_rebuilt_value(
             &vable_values[0],
             &dead_frame_typed,
@@ -2779,17 +2781,19 @@ fn build_resumed_frames(
             &mut virtuals_cache,
         );
         let ni_val = resolve_rebuilt_value(
-            &vable_values[1],
+            &vable_values[1], // ni
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
+        // skip vable_values[2]=code (immutable)
         let vsd_val = resolve_rebuilt_value(
-            &vable_values[2],
+            &vable_values[3], // vsd
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
+        // skip vable_values[4]=namespace (immutable)
         let fp = match &frame_val {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
             Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
@@ -2850,8 +2854,9 @@ fn build_resumed_frames(
     }
 
     // opencoder.py:722 _list_of_boxes_virtualizable: snapshot reorders
-    // virtualizable_ptr from end to front → [frame_ptr(0), ni(1), vsd(2), array...]
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 3 {
+    // virtualizable_ptr from end to front.
+    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
+    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 5 {
         let frame_val = resolve_rebuilt_value(
             &vable_values[0],
             &dead_frame_typed,
@@ -2859,17 +2864,19 @@ fn build_resumed_frames(
             &mut virtuals_cache,
         );
         let ni_val = resolve_rebuilt_value(
-            &vable_values[1],
+            &vable_values[1], // ni
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
+        // skip vable_values[2]=code (immutable)
         let vsd_val = resolve_rebuilt_value(
-            &vable_values[2],
+            &vable_values[3], // vsd
             &dead_frame_typed,
             exit_layout,
             &mut virtuals_cache,
         );
+        // skip vable_values[4]=namespace (immutable)
         let fp = match &frame_val {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
             Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,

@@ -711,8 +711,8 @@ use crate::descr::{
     w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET, PYFRAME_NEXT_INSTR_OFFSET,
-    PYFRAME_VALUESTACKDEPTH_OFFSET, build_pyframe_virtualizable_info,
+    PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
+    PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, build_pyframe_virtualizable_info,
 };
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 
@@ -773,8 +773,12 @@ pub struct PyreSym {
     /// Number of local variable slots (cached from code object).
     pub(crate) nlocals: usize,
     pub(crate) symbolic_initialized: bool,
+    // virtualizable.py:86-93: static fields in declared order.
+    // interp_jit.py:25: last_instr, pycode, valuestackdepth, ..., w_globals
     pub(crate) vable_next_instr: OpRef,
+    pub(crate) vable_code: OpRef,
     pub(crate) vable_valuestackdepth: OpRef,
+    pub(crate) vable_namespace: OpRef,
     pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
     /// Base OpRef index for virtualizable array slots.
     /// When set, symbolic_locals[i] = OpRef(vable_array_base + i),
@@ -1723,7 +1727,9 @@ impl PyreSym {
             nlocals: 0,
             symbolic_initialized: false,
             vable_next_instr: OpRef::NONE,
+            vable_code: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
+            vable_namespace: OpRef::NONE,
             symbolic_namespace_slots: std::collections::HashMap::new(),
             vable_array_base: None,
             last_comparison_truth: None,
@@ -2449,9 +2455,19 @@ impl MIFrame {
     /// separately (in metainterp.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
+        let frame_addr = self.concrete_frame_addr;
+        let code_ptr = if frame_addr != 0 {
+            unsafe { *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize) }
+        } else {
+            0
+        };
+        let ns_ptr = self.sym().concrete_namespace as i64;
         let s = self.sym_mut();
+        // virtualizable.py:86-93: all static fields in declared order.
         s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_code = ctx.const_int(code_ptr as i64);
         s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
+        s.vable_namespace = ctx.const_int(ns_ptr);
     }
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
@@ -2469,8 +2485,17 @@ impl MIFrame {
         // Always use orgpc (opcode start PC) as the resume PC.
         // orgpc is set to the current opcode's code unit in from_sym().
         let resume_pc = self.orgpc;
+        let frame_addr = self.concrete_frame_addr;
+        let code_ptr = if frame_addr != 0 {
+            unsafe { *((frame_addr + PYFRAME_CODE_OFFSET) as *const usize) }
+        } else {
+            0
+        };
+        let ns_ptr = self.sym().concrete_namespace as i64;
         let s = self.sym_mut();
         s.vable_next_instr = ctx.const_int(resume_pc as i64);
+        s.vable_code = ctx.const_int(code_ptr as i64);
+        s.vable_namespace = ctx.const_int(ns_ptr);
         if let Some(pre_vsd) = s.pre_opcode_vsd {
             s.vable_valuestackdepth = ctx.const_int(pre_vsd as i64);
         } else {
@@ -3013,19 +3038,24 @@ impl MIFrame {
         // opencoder.py:718-726 _list_of_boxes_virtualizable parity:
         // RPython format: [virtualizable_ptr, static_fields..., array_items...]
         // (virtualizable_ptr moved from end to front).
-        // RPython dedup: same Box objects in vable & frame → _number_boxes
-        // assigns the same TAGBOX index → deadframe stores the value once.
-        // Recovery uses vable_values to fill frame slots that were dedup'd.
+        // virtualizable.py:86/139 read_boxes / load_list_of_boxes:
+        // Memory order: [static_field_0, ..., array_items..., vable_ptr]
+        // read_boxes creates fresh Box objects for each field via wrap().
+        // opencoder.py:722 _list_of_boxes_virtualizable: reorders
+        //   vable_ptr from end to front → snapshot = [vable_ptr, fields..., items...]
         let stack_only = sym.stack_only_depth();
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
         boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
-        // Static fields: next_instr, valuestackdepth.
+        // Static fields in declared order (virtualizable.py:90-93):
+        //   next_instr, code, valuestackdepth, namespace
         boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
+        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_code, ctx));
         boxes.push(Self::opref_to_snapshot_tagged(
             sym.vable_valuestackdepth,
             ctx,
         ));
+        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_namespace, ctx));
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
@@ -5253,10 +5283,19 @@ impl MIFrame {
             sym.jitcode = jitcode_for(code_ptr);
             sym.concrete_namespace = callee_globals as *mut PyNamespace;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
-            let (vable_next_instr, vable_valuestackdepth) =
-                self.with_ctx(|_, ctx| (ctx.const_int(0), ctx.const_int(callee_nlocals as i64)));
+            let (vable_next_instr, vable_code, vable_valuestackdepth, vable_namespace) = self
+                .with_ctx(|_, ctx| {
+                    (
+                        ctx.const_int(0),
+                        ctx.const_int(code_ptr as i64),
+                        ctx.const_int(callee_nlocals as i64),
+                        ctx.const_int(callee_globals as i64),
+                    )
+                });
             sym.vable_next_instr = vable_next_instr;
+            sym.vable_code = vable_code;
             sym.vable_valuestackdepth = vable_valuestackdepth;
+            sym.vable_namespace = vable_namespace;
             (sym, None)
         } else {
             // Create symbolic OpRef for callee frame in trace
@@ -7528,12 +7567,16 @@ impl PyreJitState {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) -> bool {
-        let Some(&next_instr) = static_boxes.first() else {
+        // virtualizable.py:86 read_boxes: all static fields in declared order.
+        // [0]=next_instr, [1]=code, [2]=valuestackdepth, [3]=namespace
+        let Some(&next_instr) = static_boxes.get(0) else {
             return false;
         };
-        let Some(&valuestackdepth) = static_boxes.get(1) else {
+        // [1]=code — immutable, no import needed
+        let Some(&valuestackdepth) = static_boxes.get(2) else {
             return false;
         };
+        // [3]=namespace — immutable, no import needed
         // Single unified array: locals_cells_stack_w
         let Some(unified) = array_boxes.first() else {
             return false;
@@ -7562,7 +7605,15 @@ impl PyreJitState {
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
-        let static_boxes = vec![self.next_instr as i64, self.valuestackdepth as i64];
+        // virtualizable.py:101 write_boxes: all static fields in declared order.
+        let code_ptr = self.read_frame_usize(PYFRAME_CODE_OFFSET).unwrap_or(0);
+        let ns_ptr = self.read_frame_usize(PYFRAME_NAMESPACE_OFFSET).unwrap_or(0);
+        let static_boxes = vec![
+            self.next_instr as i64,
+            code_ptr as i64,
+            self.valuestackdepth as i64,
+            ns_ptr as i64,
+        ];
         // Single unified array
         let array_boxes = vec![
             self.locals_cells_stack_array()
