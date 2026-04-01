@@ -800,12 +800,10 @@ impl OptContext {
 
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
             let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                // TODO: restore live bridge replay use_box once nbody no longer
-                // times out. Today, allowing the active short preamble producer
-                // to replay/extend short ops can loop or widen the bridge entry
-                // contract in ways that compiled re-entry does not handle.
-                // Keep imported_short_preamble_builder behavior unchanged.
-                let ok = false;
+                // shortpreamble.py:478-481: ExtendedShortPreambleBuilder.use_box
+                let ok = builder
+                    .use_box(preamble_source, &arg_guards, &result_guards)
+                    .is_some();
                 self.active_short_preamble_producer = Some(builder);
                 ok
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
@@ -824,11 +822,8 @@ impl OptContext {
 
             // unroll.py:33-37: potential_extra_ops[op] = preamble_op
             //
-            // TODO: re-enable for active_short_preamble_producer together with
-            // live bridge replay use_box(). For now both are suppressed to
-            // keep nbody from timing out under compiled bridge re-entry.
-            let suppress_live_bridge_tracking = self.active_short_preamble_producer.is_some();
-            if tracked && !is_constant && !suppress_live_bridge_tracking {
+            // shortpreamble.py:471-477: add_preamble_op — track used ops.
+            if tracked && !is_constant {
                 let produced = self
                     .imported_short_preamble_builder
                     .as_ref()
