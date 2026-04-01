@@ -5738,14 +5738,16 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|(v, _)| *v)
             .collect();
+        // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
+        let vinfo = self.virtualizable_info();
         let allocator = crate::resume::NullAllocator;
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
             rd_numb,
             &rd_consts,
             fail_values,
-            None, // vrefinfo
-            None, // vinfo
-            None, // ginfo
+            None, // vrefinfo — pyre has no vref mechanism
+            vinfo.map(|v| v as &dyn crate::resume::VirtualizableInfo),
+            None, // ginfo — pyre has no greenfield mechanism
             &allocator,
         );
         // compile.py:999-1000: obj = AllVirtuals(all_virtuals)

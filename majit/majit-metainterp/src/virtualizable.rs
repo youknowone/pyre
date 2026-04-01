@@ -1961,3 +1961,102 @@ mod tests {
         assert_eq!(info.get_index_in_array(1, 4, lens), 9);
     }
 }
+
+// ── resume.py:1350 VirtualizableInfo trait impl ──
+
+impl crate::resume::VirtualizableInfo for VirtualizableInfo {
+    /// virtualizable.py:115-121 get_total_size
+    fn get_total_size(&self, virtualizable: i64) -> usize {
+        let mut size = self.static_fields.len();
+        let vable_ptr = virtualizable as *const u8;
+        if !vable_ptr.is_null() {
+            for array in &self.array_fields {
+                let arr_len = unsafe { vable_array_len(vable_ptr, array) };
+                size += arr_len;
+            }
+        }
+        size
+    }
+
+    /// virtualizable.py:56 reset_token_gcref
+    fn reset_token_gcref(&self, virtualizable: i64) {
+        let vable_ptr = virtualizable as *mut u8;
+        if !vable_ptr.is_null() {
+            unsafe { self.reset_vable_token(vable_ptr) };
+        }
+    }
+
+    /// virtualizable.py:126-137 write_from_resume_data_partial
+    fn write_from_resume_data_partial(
+        &self,
+        virtualizable: i64,
+        reader: &mut crate::resume::ResumeDataDirectReader,
+    ) {
+        let vable_ptr = virtualizable as *mut u8;
+        if vable_ptr.is_null() {
+            return;
+        }
+        // virtualizable.py:131-133: static fields
+        for field in &self.static_fields {
+            let value = reader.next_value_of_type(field.field_type);
+            unsafe {
+                let dest = vable_ptr.add(field.offset);
+                std::ptr::write(dest as *mut i64, value);
+            }
+        }
+        // virtualizable.py:134-137: array items
+        for array in &self.array_fields {
+            let arr_len = unsafe { vable_array_len(vable_ptr as *const u8, array) };
+            for j in 0..arr_len {
+                let value = reader.next_value_of_type(array.item_type);
+                unsafe {
+                    vable_write_array_item(vable_ptr, array, j, value);
+                }
+            }
+        }
+    }
+}
+
+/// Read the length of a virtualizable array field.
+unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
+    match array.storage {
+        VableArrayStorage::EmbeddedArray { .. } => {
+            // Embedded array: length at field_offset + length_offset
+            let container = vable_ptr.add(array.field_offset);
+            *(container.add(array.length_offset) as *const usize)
+        }
+        VableArrayStorage::DirectPointer => {
+            // Direct pointer: dereference pointer, then read length
+            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+            if arr_ptr.is_null() {
+                0
+            } else {
+                *(arr_ptr.add(array.length_offset) as *const usize)
+            }
+        }
+    }
+}
+
+/// Write a value to a virtualizable array item.
+unsafe fn vable_write_array_item(
+    vable_ptr: *mut u8,
+    array: &VableArrayInfo,
+    index: usize,
+    value: i64,
+) {
+    let item_size = 8usize; // i64/ptr size
+    let data_ptr = match array.storage {
+        VableArrayStorage::EmbeddedArray { ptr_offset } => {
+            let container = vable_ptr.add(array.field_offset);
+            *(container.add(ptr_offset) as *const *mut u8)
+        }
+        VableArrayStorage::DirectPointer => {
+            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *mut u8);
+            arr_ptr.add(array.items_offset)
+        }
+    };
+    if !data_ptr.is_null() {
+        let dest = data_ptr.add(index * item_size);
+        std::ptr::write(dest as *mut i64, value);
+    }
+}
