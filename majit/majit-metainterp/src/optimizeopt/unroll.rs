@@ -2065,19 +2065,16 @@ impl OptUnroll {
                 if new_op.opcode.is_guard() {
                     // unroll.py:405-411: copy_and_change with ResumeAtPositionDescr.
                     // RPython: guard.rd_resume_position = patchguardop.rd_resume_position
-                    // patchguardop is GUARD_FUTURE_CONDITION emitted at loop header
-                    // (pyjitpl.py:2969). Its snapshot captures loop header state.
-                    // When replayed guard fails, interpreter resumes at loop header.
+                    // guard is sent through optimizer → store_final_boxes_in_guard
+                    // builds resume data from patchguardop's snapshot.
                     //
-                    // Blocked: pyre's GUARD_FUTURE_CONDITION snapshot captures
-                    // frame state at trace recording time, but recovery from
-                    // replayed guards causes infinite re-entry. Root cause likely:
-                    // snapshot_boxes format mismatch — pyre snapshots use
-                    // [frame, ni, vsd, locals...] layout while RPython uses
-                    // opencoder-based snapshot with per-frame jitcode+pc encoding.
-                    // The guard's rd_resume_position points to patchguardop's
-                    // snapshot, but store_final_boxes_in_guard generates rd_numb
-                    // that doesn't correctly map to blackhole resume state.
+                    // Status: patchguardop IS valid (GUARD_FUTURE_CONDITION emitted
+                    // in pyre traces). snapshot_boxes ARE populated. Guard replay
+                    // correctly generates rd_numb in snapshot path. However, guard
+                    // failure in compiled code doesn't correctly resume — likely
+                    // because Cranelift fail_descr for replayed guards lacks proper
+                    // exit_types or the blackhole resume path reads wrong PC from
+                    // the shared patchguardop snapshot.
                     replay_index += 1;
                     continue;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
