@@ -1671,13 +1671,24 @@ impl OptContext {
                                                 .unwrap_or(resumedata::NULLREF);
                                             }
                                         } // is_true_const
-                                        // Field value in extra fail_args → TAGBOX(position).
-                                        let fap = fa.iter().position(|&a| a == resolved);
-                                        if let Some(fap) = fap {
-                                            resumedata::tag(fap as i32, resumedata::TAGBOX)
+                                        // resume.py _gettagged: check liveboxes
+                                        // (which may contain TAGVIRTUAL for nested virtuals)
+                                        let vidx = virtual_slots
+                                            .iter()
+                                            .position(|(_, vr)| *vr == resolved);
+                                        if let Some(vidx) = vidx {
+                                            // Nested virtual → TAGVIRTUAL(index)
+                                            resumedata::tag(vidx as i32, resumedata::TAGVIRTUAL)
                                                 .unwrap_or(resumedata::NULLREF)
                                         } else {
-                                            resumedata::NULLREF
+                                            // Field value in extra fail_args → TAGBOX(position).
+                                            let fap = fa.iter().position(|&a| a == resolved);
+                                            if let Some(fap) = fap {
+                                                resumedata::tag(fap as i32, resumedata::TAGBOX)
+                                                    .unwrap_or(resumedata::NULLREF)
+                                            } else {
+                                                resumedata::NULLREF
+                                            }
                                         }
                                     })
                                     .collect();
