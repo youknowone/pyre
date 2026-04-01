@@ -2042,20 +2042,14 @@ impl OptUnroll {
                 // no rd_numb/rd_consts/rd_virtuals.
                 // store_final_boxes_in_guard rebuilds these from the snapshot.
                 if new_op.opcode.is_guard() {
-                    // TODO: restore bridge short-preamble guard replay after
-                    // optimizer-generated guard resume data matches compiled
-                    // bridge re-entry expectations. For now, skip replaying
-                    // these guards so nbody can pass pre-merge checks.
+                    // unroll.py:407-411: copy_and_change with ResumeAtPositionDescr.
+                    // RPython replays short preamble guards with fresh resume data.
+                    // Currently blocked: guard resume data from short preamble
+                    // replay doesn't match compiled bridge re-entry expectations.
+                    // TODO: connect ResumeAtPositionDescr to patchguardop's
+                    // rd_resume_position so replayed guards can fail correctly.
                     replay_index += 1;
                     continue;
-                    // unroll.py:407: descr=compile.ResumeAtPositionDescr()
-                    new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
-                    new_op.fail_args = None;
-                    new_op.rd_numb = None;
-                    new_op.rd_consts = None;
-                    new_op.rd_virtuals = None;
-                    new_op.rd_pendingfields = None;
-                    new_op.fail_arg_types = None;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
                     for arg in fail_args.iter_mut() {
                         if let Some(&mapped) = mapping.get(arg) {
