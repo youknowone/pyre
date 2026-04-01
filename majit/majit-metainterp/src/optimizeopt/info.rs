@@ -591,50 +591,32 @@ impl PtrInfo {
     /// Generated ops are routed via emit_extra() (RPython
     /// emit_extra parity) so downstream passes can observe them.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
-        self.force_box_impl(opref, ctx, false)
+        self.force_box_impl(opref, ctx)
     }
 
-    /// Like force_box but emits directly to new_operations (bypasses pass
-    /// chain). Used by emitting_operation where drain would re-virtualize.
-    pub fn force_box_direct(
-        &mut self,
-        opref: OpRef,
-        ctx: &mut crate::optimizeopt::OptContext,
-    ) -> OpRef {
-        self.force_box_impl(opref, ctx, true)
-    }
-
-    fn force_box_impl(
-        &mut self,
-        opref: OpRef,
-        ctx: &mut crate::optimizeopt::OptContext,
-        direct: bool,
-    ) -> OpRef {
+    fn force_box_impl(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         use majit_ir::{Op, OpCode};
 
-        fn force_child(
-            value_ref: OpRef,
-            ctx: &mut crate::optimizeopt::OptContext,
-            direct: bool,
-        ) -> OpRef {
+        fn force_child(value_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
             let value_ref = ctx.get_box_replacement(value_ref);
             if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
                 if info.is_virtual() {
-                    return info.force_box_impl(value_ref, ctx, direct);
+                    return info.force_box_impl(value_ref, ctx);
                 }
             }
             value_ref
         }
 
+        // RPython info.py:148,226: optforce.emit_extra(op)
+        // When called from _emit_operation (in_final_emission=true),
+        // RPython is at the end of the chain so emit_extra goes directly
+        // to _newoperations. Use ctx.emit() for direct emission.
+        // When called from pass-level code (in_final_emission=false),
+        // route through emit_extra to process through remaining passes.
         let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> OpRef {
-            if direct {
+            if ctx.in_final_emission {
                 ctx.emit(op)
             } else {
-                // RPython info.py:148,226: emit_extra(op) routes through
-                // passes AFTER the calling pass (Virtualize). This prevents
-                // OptVirtualize from re-absorbing the materialized New().
-                // The non-virtual PtrInfo (Struct/Instance) set on alloc_ref
-                // tells downstream passes this is materialized.
                 ctx.emit_extra(ctx.current_pass_idx, op)
             }
         };
@@ -713,7 +695,7 @@ impl PtrInfo {
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                    let value_ref = force_child(value_ref, ctx, direct);
+                    let value_ref = force_child(value_ref, ctx);
                     let descr = vinfo
                         .field_descrs
                         .iter()
@@ -754,7 +736,7 @@ impl PtrInfo {
                     ctx.replace_op(opref, alloc_ref);
                 }
                 for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                    let value_ref = force_child(value_ref, ctx, direct);
+                    let value_ref = force_child(value_ref, ctx);
                     let descr = vinfo
                         .field_descrs
                         .iter()

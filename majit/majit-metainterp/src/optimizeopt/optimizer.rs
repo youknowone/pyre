@@ -1138,10 +1138,9 @@ impl Optimizer {
         }
         if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
             if info.is_virtual() {
-                // Always emit force ops directly to new_operations.
-                // RPython info.py: force_box→emit_extra inserts ops at the
-                // current position so they appear BEFORE the current op.
-                let forced = info.force_box_direct(resolved, ctx);
+                // RPython optimizer.py:624: self.force_box(arg)
+                // force_box→emit_extra routes through pass chain.
+                let forced = info.force_box(resolved, ctx);
                 return ctx.get_box_replacement(forced);
             }
         }
@@ -2548,10 +2547,13 @@ impl Optimizer {
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
     fn emit_operation(&mut self, mut op: Op, ctx: &mut OptContext) {
+        // RPython optimizer.py:614: _emit_operation is on the Optimizer (last
+        // "pass" in the chain). Any force_box called here should emit directly,
+        // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
+        ctx.in_final_emission = true;
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
         // guards even when the guard is emitted by an earlier pass.
-        // force_box_direct emits directly to new_operations, so no drain needed.
         for (idx, pass) in self.passes.iter_mut().enumerate() {
             pass.emitting_operation(&op, ctx, idx);
         }
@@ -2576,12 +2578,10 @@ impl Optimizer {
                 | OpCode::SetarrayitemGc
                 | OpCode::SetarrayitemRaw
         ) {
-            ctx.in_final_emission = true;
             for i in 0..op.num_args() {
                 let arg = ctx.get_box_replacement(op.arg(i));
                 op.args[i] = self.force_box(arg, ctx);
             }
-            ctx.in_final_emission = false;
         }
         if op.opcode.is_guard() {
             // optimizer.py:652-686 emit_guard_operation
@@ -2743,6 +2743,7 @@ impl Optimizer {
                     }
                     if target_pos < ctx.new_operations.len() {
                         ctx.new_operations[target_pos] = op.clone();
+                        ctx.in_final_emission = false;
                         return;
                     }
                 }
@@ -2781,6 +2782,7 @@ impl Optimizer {
                 ctx.new_operations.len()
             );
         }
+        ctx.in_final_emission = false;
     }
 
     /// optimizer.py:722-752 store_final_boxes_in_guard
@@ -2855,7 +2857,7 @@ impl Optimizer {
                                     virtual_slots.push((fa_idx, resolved));
                                 } else {
                                     // Unsupported virtual kind (Array etc.) → force.
-                                    let forced = info.force_box_direct(resolved, ctx);
+                                    let forced = info.force_box(resolved, ctx);
                                     fail_args[fa_idx] = ctx.get_box_replacement(forced);
                                 }
                             } else {
@@ -2890,7 +2892,7 @@ impl Optimizer {
             } else {
                 // Unsupported virtual kind (Array etc.) → force to concrete.
                 let mut info_mut = info;
-                let forced = info_mut.force_box_direct(resolved, ctx);
+                let forced = info_mut.force_box(resolved, ctx);
                 fail_args[fa_idx] = ctx.get_box_replacement(forced);
             }
         }
@@ -4032,7 +4034,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let forced = opt.force_box(OpRef(10), &mut ctx);
         assert_ne!(forced, OpRef(10));
-        // force_box uses force_box_direct → emits to new_operations
+        // force_box → emit_extra routes through pass chain, emits to new_operations
         assert!(
             ctx.new_operations
                 .iter()
