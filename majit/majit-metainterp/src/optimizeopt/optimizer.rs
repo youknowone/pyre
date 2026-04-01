@@ -2849,6 +2849,7 @@ impl Optimizer {
                                     &info,
                                     original_len,
                                     &mut extra_fail_args,
+                                    &mut virtual_slots,
                                     ctx,
                                 ) {
                                     virtual_slots.push((fa_idx, resolved));
@@ -2877,7 +2878,13 @@ impl Optimizer {
             }
 
             // Virtual fail_arg → NONE + collect field values as extra fail_args.
-            if Self::collect_virtual_field_values(&info, original_len, &mut extra_fail_args, ctx) {
+            if Self::collect_virtual_field_values(
+                &info,
+                original_len,
+                &mut extra_fail_args,
+                &mut virtual_slots,
+                ctx,
+            ) {
                 virtual_slots.push((fa_idx, resolved));
                 fail_args[fa_idx] = OpRef::NONE;
             } else {
@@ -2931,14 +2938,15 @@ impl Optimizer {
         op
     }
 
-    /// Collect a virtual's field values as extra fail_args, forcing nested
-    /// virtuals to concrete. Returns true if field values were collected
-    /// (Instance/Struct). Returns false for unsupported virtual kinds
-    /// (Array, ArrayStruct, RawBuffer) — caller should force these.
+    /// resume.py: register_virtual_fields / visitor_walk_recursive parity.
+    /// Collect a virtual's field values WITHOUT forcing nested virtuals.
+    /// Nested virtuals are added to virtual_slots recursively.
+    /// Returns true if field values were collected (Instance/Struct).
     fn collect_virtual_field_values(
         info: &crate::optimizeopt::info::PtrInfo,
         _original_len: usize,
         extra_fail_args: &mut Vec<OpRef>,
+        virtual_slots: &mut Vec<VirtualFailArgSlot>,
         ctx: &mut OptContext,
     ) -> bool {
         use crate::optimizeopt::info::PtrInfo;
@@ -2948,12 +2956,32 @@ impl Optimizer {
             _ => return false,
         };
         for &(_field_idx, value_ref) in fields_vec {
-            let mut final_ref = ctx.get_box_replacement(value_ref);
+            let final_ref = ctx.get_box_replacement(value_ref);
+            // resume.py: register_box — record field value in extra_fail_args.
+            // If field is a nested virtual, record it as a virtual_slot
+            // (RPython: _gettagged returns TAGVIRTUAL for nested virtuals).
             if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                if nested.is_virtual() {
-                    let mut nested_mut = nested;
-                    let forced = nested_mut.force_box_direct(final_ref, ctx);
-                    final_ref = ctx.get_box_replacement(forced);
+                if nested.is_virtual() && !matches!(nested, PtrInfo::Virtualizable(_)) {
+                    // Check if this nested virtual is already registered
+                    let already = virtual_slots.iter().any(|(_, vr)| *vr == final_ref);
+                    if !already {
+                        // Register nested virtual — fail_args slot is at the
+                        // position where this field will be appended.
+                        let slot_idx = _original_len + extra_fail_args.len();
+                        extra_fail_args.push(OpRef::NONE); // placeholder for virtual
+                        virtual_slots.push((slot_idx, final_ref));
+                        // Recursively collect nested virtual's fields
+                        Self::collect_virtual_field_values(
+                            &nested,
+                            _original_len,
+                            extra_fail_args,
+                            virtual_slots,
+                            ctx,
+                        );
+                    } else {
+                        extra_fail_args.push(final_ref);
+                    }
+                    continue;
                 }
             }
             extra_fail_args.push(final_ref);
