@@ -4646,7 +4646,7 @@ impl<M: Clone> MetaInterp<M> {
         #[cfg(target_os = "linux")]
         {
             use std::mem::MaybeUninit;
-            extern "C" {
+            unsafe extern "C" {
                 fn pthread_self() -> usize;
                 fn pthread_getattr_np(thread: usize, attr: *mut [u8; 64]) -> i32;
                 fn pthread_attr_getstack(
