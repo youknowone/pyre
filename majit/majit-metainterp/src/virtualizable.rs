@@ -2018,7 +2018,8 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 }
 
 /// Read the length of a virtualizable array field.
-unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
+/// blackhole.py:1406-1409 bhimpl_arraylen_vable parity.
+pub unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     match array.storage {
         VableArrayStorage::EmbeddedArray { .. } => {
             // Embedded array: length at field_offset + length_offset
@@ -2037,8 +2038,35 @@ unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize
     }
 }
 
+/// Read a value from a virtualizable array item.
+/// blackhole.py:1374-1387 bhimpl_getarrayitem_vable_* parity.
+pub unsafe fn vable_read_array_item(
+    vable_ptr: *const u8,
+    array: &VableArrayInfo,
+    index: usize,
+) -> i64 {
+    let item_size = 8usize; // i64/ptr size
+    let data_ptr = match array.storage {
+        VableArrayStorage::EmbeddedArray { ptr_offset } => {
+            let container = vable_ptr.add(array.field_offset);
+            *(container.add(ptr_offset) as *const *const u8)
+        }
+        VableArrayStorage::DirectPointer => {
+            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+            arr_ptr.add(array.items_offset)
+        }
+    };
+    if data_ptr.is_null() {
+        0
+    } else {
+        let src = data_ptr.add(index * item_size);
+        std::ptr::read(src as *const i64)
+    }
+}
+
 /// Write a value to a virtualizable array item.
-unsafe fn vable_write_array_item(
+/// blackhole.py:1390-1403 bhimpl_setarrayitem_vable_* parity.
+pub unsafe fn vable_write_array_item(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
     index: usize,
@@ -2058,5 +2086,23 @@ unsafe fn vable_write_array_item(
     if !data_ptr.is_null() {
         let dest = data_ptr.add(index * item_size);
         std::ptr::write(dest as *mut i64, value);
+    }
+}
+
+/// virtualizable.py:218-222 clear_vable_token for blackhole context.
+///
+/// In the blackhole, no compiled JIT code is running so the token should
+/// already be TOKEN_NONE. If it is TOKEN_TRACING_RESCALL, clear it.
+/// If it is Active (shouldn't happen in blackhole), force-clear to 0.
+///
+/// # Safety
+/// `obj_ptr` must point to a valid virtualizable object.
+pub unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
+    let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut u64;
+    let token = *token_ptr;
+    if token != 0 {
+        // TOKEN_TRACING_RESCALL or stale Active — clear unconditionally.
+        // In the blackhole, no JIT frame is active so forcing is not needed.
+        *token_ptr = 0;
     }
 }

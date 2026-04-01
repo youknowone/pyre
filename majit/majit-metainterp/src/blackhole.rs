@@ -885,6 +885,13 @@ pub struct BlackholeInterpreter {
     /// Set when handle_exception_in_frame finds a handler.
     /// Read by CheckExcMatch and other exception opcodes in the handler.
     pub exception_last_value: i64,
+    /// blackhole.py bhimpl_getfield_vable_*: pointer to the virtualizable
+    /// object (e.g. PyFrame). Used by BC_GETFIELD_VABLE_* bytecodes.
+    /// Set during blackhole setup from the guard failure's virtualizable ptr.
+    pub virtualizable_ptr: i64,
+    /// Pointer to the VirtualizableInfo describing field offsets.
+    /// Used by vable bytecodes to compute memory offsets.
+    pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
 }
 
 /// blackhole.py: last exception value from a residual call.
@@ -892,6 +899,14 @@ pub struct BlackholeInterpreter {
 /// Read by dispatch_one to populate exception_last_value on handler dispatch.
 thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// blackhole.py bhimpl_recursive_call: virtualizable pointer for call helpers.
+/// Set by the blackhole run loop before dispatch so extern "C" helpers
+/// (bh_call_fn_impl etc.) can access the parent frame without passing
+/// it through the register file.
+thread_local! {
+    pub static BH_VABLE_PTR: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 impl Default for BlackholeInterpreter {
@@ -921,6 +936,8 @@ impl BlackholeInterpreter {
             got_exception: false,
             last_opcode_position: 0,
             exception_last_value: 0,
+            virtualizable_ptr: 0,
+            virtualizable_info: std::ptr::null(),
         }
     }
 
@@ -1306,6 +1323,9 @@ impl BlackholeInterpreter {
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
     /// catches exceptions and calls `handle_exception_in_frame`.
     pub fn run(&mut self) {
+        // Publish virtualizable_ptr so extern "C" call helpers can access
+        // the parent frame without it being passed through the register file.
+        BH_VABLE_PTR.with(|c| c.set(self.virtualizable_ptr));
         let trace = crate::majit_log_enabled();
         loop {
             if self.finished() {
@@ -1873,28 +1893,122 @@ impl BlackholeInterpreter {
                 let _src = self.next_u16();
             }
             // -- Virtualizable field/array access --
-            BC_GETFIELD_VABLE_I | BC_GETFIELD_VABLE_R | BC_GETFIELD_VABLE_F => {
-                let _descr_idx = self.next_u16();
-                let _dst = self.next_u16();
-                // No-op in standalone blackhole (requires virtualizable info)
+            // blackhole.py:1446-1458 bhimpl_getfield_vable_i/r/f:
+            //   fielddescr.get_vinfo().clear_vable_token(struct)
+            //   return cpu.bh_getfield_gc_i/r/f(struct, fielddescr)
+            BC_GETFIELD_VABLE_I => {
+                let field_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                // virtualizable.py:218-222 clear_vable_token
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = unsafe { *(ptr.add(offset) as *const i64) };
+                self.registers_i[dst] = value;
             }
-            BC_SETFIELD_VABLE_I | BC_SETFIELD_VABLE_R | BC_SETFIELD_VABLE_F => {
-                let _descr_idx = self.next_u16();
-                let _src = self.next_u16();
+            BC_GETFIELD_VABLE_R => {
+                let field_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = unsafe { *(ptr.add(offset) as *const i64) };
+                self.registers_r[dst] = value;
             }
+            BC_GETFIELD_VABLE_F => {
+                let field_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = unsafe { *(ptr.add(offset) as *const i64) };
+                self.registers_f[dst] = value;
+            }
+            // blackhole.py:1485-1495 bhimpl_setfield_vable_i/r/f
+            BC_SETFIELD_VABLE_I => {
+                let field_idx = self.next_u16() as usize;
+                let src = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = self.registers_i[src];
+                unsafe { *(ptr.add(offset) as *mut i64) = value };
+            }
+            BC_SETFIELD_VABLE_R => {
+                let field_idx = self.next_u16() as usize;
+                let src = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = self.registers_r[src];
+                unsafe { *(ptr.add(offset) as *mut i64) = value };
+            }
+            BC_SETFIELD_VABLE_F => {
+                let field_idx = self.next_u16() as usize;
+                let src = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let offset = vinfo.static_fields[field_idx].offset;
+                let value = self.registers_f[src];
+                unsafe { *(ptr.add(offset) as *mut i64) = value };
+            }
+            // blackhole.py:1374-1387 bhimpl_getarrayitem_vable_i/r/f:
+            //   fielddescr.get_vinfo().clear_vable_token(vable)
+            //   array = cpu.bh_getfield_gc_r(vable, fielddescr)
+            //   return cpu.bh_getarrayitem_gc_i/r/f(array, index, arraydescr)
             BC_GETARRAYITEM_VABLE_I | BC_GETARRAYITEM_VABLE_R | BC_GETARRAYITEM_VABLE_F => {
-                let _descr_idx = self.next_u16();
-                let _index = self.next_u16();
-                let _dst = self.next_u16();
+                let array_idx = self.next_u16() as usize;
+                let index_reg = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let ainfo = &vinfo.array_fields[array_idx];
+                let index = self.registers_i[index_reg] as usize;
+                let value = unsafe {
+                    crate::virtualizable::vable_read_array_item(ptr as *const u8, ainfo, index)
+                };
+                match opcode {
+                    BC_GETARRAYITEM_VABLE_I => self.registers_i[dst] = value,
+                    BC_GETARRAYITEM_VABLE_R => self.registers_r[dst] = value,
+                    _ => self.registers_f[dst] = value,
+                }
             }
+            // blackhole.py:1390-1403 bhimpl_setarrayitem_vable_i/r/f
             BC_SETARRAYITEM_VABLE_I | BC_SETARRAYITEM_VABLE_R | BC_SETARRAYITEM_VABLE_F => {
-                let _descr_idx = self.next_u16();
-                let _index = self.next_u16();
-                let _src = self.next_u16();
+                let array_idx = self.next_u16() as usize;
+                let index_reg = self.next_u16() as usize;
+                let src = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let ainfo = &vinfo.array_fields[array_idx];
+                let index = self.registers_i[index_reg] as usize;
+                let value = match opcode {
+                    BC_SETARRAYITEM_VABLE_I => self.registers_i[src],
+                    BC_SETARRAYITEM_VABLE_R => self.registers_r[src],
+                    _ => self.registers_f[src],
+                };
+                unsafe {
+                    crate::virtualizable::vable_write_array_item(ptr, ainfo, index, value);
+                }
             }
+            // blackhole.py:1406-1409 bhimpl_arraylen_vable
             BC_ARRAYLEN_VABLE => {
-                let _descr_idx = self.next_u16();
-                let _dst = self.next_u16();
+                let array_idx = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
+                let vinfo = unsafe { &*self.virtualizable_info };
+                let ptr = self.virtualizable_ptr as *mut u8;
+                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
+                let ainfo = &vinfo.array_fields[array_idx];
+                let len = unsafe { crate::virtualizable::vable_array_len(ptr as *const u8, ainfo) };
+                self.registers_i[dst] = len as i64;
             }
             BC_HINT_FORCE_VIRTUALIZABLE => {
                 // No-op in blackhole
