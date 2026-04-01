@@ -1471,6 +1471,9 @@ impl Optimizer {
                 value_from_backend_constant_bits(OpRef(idx), val, ops),
             );
         }
+        // Pre-seeded constants are backend seeds, not optimizer-proven.
+        // Clear so is_const only sees THIS phase's make_constant calls.
+        ctx.made_constant.clear();
 
         // Setup all passes
         for pass in &mut self.passes {
@@ -1510,6 +1513,9 @@ impl Optimizer {
                     break;
                 }
             }
+            // call_pure_results are cross-iteration seeds (not THIS phase's
+            // optimizer-proven constants). Clear like pre-seeded constants.
+            ctx.made_constant.clear();
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {

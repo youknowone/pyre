@@ -262,6 +262,8 @@ pub struct OptContext {
     /// Used by InlineBoxEnv.get_type() to avoid fallback to Int for
     /// unresolved OpRefs (resume.py:210 box.type == 'r' vs 'i').
     pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
+    /// optimizer.py:432 box.set_forwarded(constbox) parity.
+    pub made_constant: HashSet<u32>,
     /// compile.rs value_types parity: OpRef → Type for all defined values
     /// (inputargs + operation results). Used by store_final_boxes_in_guard
     /// to infer fail_arg types correctly for OpRefs from earlier phases.
@@ -292,12 +294,15 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        // RPython resume.py:204: isinstance(box, Const)
-        // True Const = constant pool entry (>= CONST_BASE) or PtrInfo::Constant.
-        // NOT optimizer-known values from make_constant() on operation results.
+        // resume.py:204: isinstance(box, Const)
         if opref.is_constant() {
             return true;
         }
+        // optimizer.py:432 box.set_forwarded(constbox) parity.
+        // TODO: blocked by Ref-as-Int encoding (see make_constant).
+        // if self.ctx.made_constant.contains(&opref.0) {
+        //     return true;
+        // }
         // info.py: ConstPtrInfo.is_constant() → True
         matches!(
             self.ctx.get_ptr_info(opref),
@@ -441,6 +446,7 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             snapshot_box_types: HashMap::new(),
+            made_constant: HashSet::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -492,6 +498,7 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             snapshot_box_types: HashMap::new(),
+            made_constant: HashSet::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1256,13 +1263,22 @@ impl OptContext {
         }
     }
 
-    /// Record that an operation produces a known constant value.
+    /// optimizer.py:410-432 make_constant(box, constbox).
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
         }
         self.constants[idx] = Some(value);
+        // optimizer.py:432: box.set_forwarded(constbox).
+        // TODO: made_constant tracking is blocked by Ref-as-Int encoding.
+        // pyre stores Ref pointers as Value::Int in make_constant
+        // (e.g. GetfieldGcPureI constant folding). is_const would tag
+        // them as TAGINT, but the value is a Ref pointer → corrupt resume.
+        // RPython doesn't have this issue because ConstPtr and ConstInt
+        // are distinct box types with immutable .type.
+        // Fix requires either: (a) store Value::Ref for Ref constants, or
+        // (b) set_forwarded to a real Const OpRef (>= 10000) like RPython.
     }
 
     /// resume.py:157 getconst parity for synthetic rd_numb encoding.
@@ -1486,12 +1502,6 @@ impl OptContext {
         // Pyre: optimizer-created guards (VirtualState, inline_short_preamble)
         // may have rd_resume_position=-1. Use patchguardop's position as
         // fallback — RPython does this implicitly via patchguardop chain.
-        // resume.py:396-397: resume_position = self.guard_op.rd_resume_position
-        // assert resume_position >= 0
-        // RPython: every guard has a valid snapshot from capture_resumedata.
-        // pyre: optimizer-created guards may have rd_resume_position=-1.
-        // Fall back to patchguardop (unroll.py:336), then to the highest
-        // snapshot index (last capture_resumedata from tracing).
         let mut resume_pos = op.rd_resume_position;
         if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
             if let Some(ref patch) = self.patchguardop {
@@ -1578,6 +1588,11 @@ impl OptContext {
                 if opref.is_constant() {
                     return true;
                 }
+                // optimizer.py:432 box.set_forwarded(constbox) parity.
+                // TODO: blocked by Ref-as-Int encoding (see make_constant).
+                // if self.ctx.made_constant.contains(&opref.0) {
+                //     return true;
+                // }
                 // info.py: ConstPtrInfo.is_constant() → True
                 matches!(
                     self.ctx.get_ptr_info(opref),
