@@ -8055,6 +8055,11 @@ impl JitState for PyreJitState {
         //
         // values[3..] = compact active_boxes from get_list_of_active_boxes,
         // which filters by liveness. Use the same liveness table to restore.
+        // resume.py:1383: info = blackholeinterp.get_current_position_info()
+        // Use next_instr (already set from values[1]) as the liveness PC.
+        // RPython parity: use JitCode.liveness (same source as
+        // get_list_of_active_boxes and consume_one_section).
+        let live_pc = self.next_instr;
         let code_ptr = if self.frame != 0 {
             unsafe {
                 *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_CODE_OFFSET)
@@ -8063,35 +8068,68 @@ impl JitState for PyreJitState {
         } else {
             std::ptr::null()
         };
-        let live = if !code_ptr.is_null() {
-            Some(liveness_for(code_ptr))
+        // Look up JitCode LivenessInfo via majit_jitcode pointer.
+        let majit_jc = if !code_ptr.is_null() {
+            let state_jc = jitcode_for(code_ptr);
+            unsafe { (*state_jc).majit_jitcode }
+        } else {
+            std::ptr::null()
+        };
+        let liveness_info = if !majit_jc.is_null() {
+            let jc = unsafe { &*majit_jc };
+            jc.py_to_jit_pc
+                .get(live_pc)
+                .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc))
         } else {
             None
         };
-        // resume.py:1383: info = blackholeinterp.get_current_position_info()
-        // Use next_instr (already set from values[1]) as the liveness PC.
-        let live_pc = self.next_instr;
         let mut idx = 3;
-        for local_idx in 0..nlocals {
-            // resume.py:1077: only live registers consume a value from the
-            // compact array. Dead registers keep their previous contents.
-            let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
-            if is_live {
+        if let Some(info) = liveness_info {
+            // RPython parity: iterate live_r_regs (same order as capture).
+            let stack_base = info
+                .live_r_regs
+                .iter()
+                .find(|&&r| r as usize >= nlocals)
+                .map(|&r| r as usize)
+                .unwrap_or(nlocals);
+            for &reg_idx in &info.live_r_regs {
+                let r = reg_idx as usize;
                 if let Some(value) = values.get(idx) {
                     let boxed = virtualizable_box_value(value);
-                    let _ = self.set_local_at(local_idx, boxed);
+                    if r < nlocals {
+                        let _ = self.set_local_at(r, boxed);
+                    } else {
+                        let _ = self.set_stack_at(r - stack_base, boxed);
+                    }
                 }
                 idx += 1;
             }
-        }
-        for stack_idx in 0..stack_only {
-            let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
-            if is_live {
-                if let Some(value) = values.get(idx) {
-                    let boxed = virtualizable_box_value(value);
-                    let _ = self.set_stack_at(stack_idx, boxed);
+        } else {
+            // Fallback: LiveVars path
+            let live = if !code_ptr.is_null() {
+                Some(liveness_for(code_ptr))
+            } else {
+                None
+            };
+            for local_idx in 0..nlocals {
+                let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
+                if is_live {
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        let _ = self.set_local_at(local_idx, boxed);
+                    }
+                    idx += 1;
                 }
-                idx += 1;
+            }
+            for stack_idx in 0..stack_only {
+                let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
+                if is_live {
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        let _ = self.set_stack_at(stack_idx, boxed);
+                    }
+                    idx += 1;
+                }
             }
         }
 

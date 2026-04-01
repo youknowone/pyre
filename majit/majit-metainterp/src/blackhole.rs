@@ -2353,6 +2353,7 @@ pub fn resume_in_blackhole(
         None, // vinfo
         None, // ginfo
         &null_alloc,
+        &[], // exit_types (proc-macro path, no adapt-live)
     );
 
     let Some((bh, _virtualizable_ptr)) = bh else {

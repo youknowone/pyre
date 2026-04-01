@@ -467,6 +467,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
     }
 
+    pub fn get_exit_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        self.meta.get_exit_types(green_key, trace_id, fail_index)
+    }
+
     /// compile.py:710 recovery_layout header_pc parity: get the merge point
     /// PC for blackhole resume from a guard exit.
     pub fn get_merge_point_pc(
@@ -1304,6 +1313,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
+                    &[], // exit_types (proc-macro path, no adapt-live)
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
@@ -2811,6 +2821,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
+                    &[], // exit_types (proc-macro path, no adapt-live)
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
