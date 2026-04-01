@@ -3022,15 +3022,18 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 &mut constant_types,
             );
-        // resume.py parity: snapshot_boxes activation requires typed blackhole
-        // registers. Currently, adapt-live unboxes Ref→Int at compiled entry,
-        // so deadframe values contain raw ints. Blackhole resume decodes these
-        // via next_ref (TAGBOX) and places raw ints into ref registers. When
-        // blackhole interprets Python ops like BINARY_ADD, it calls
-        // binary_value(raw_int, ...) → SEGFAULT.
-        // Root fix: remove adapt-live and make tracing start with Ref-typed
-        // inputargs (RPython wrap() parity). Then deadframe values are always
-        // GCREF, and blackhole ref registers contain valid PyObjectRefs.
+        // Snapshot-based guard numbering: infrastructure ready.
+        // Activation blocked by performance regression (bridge compilation
+        // delay). IR blackhole's NullMemory::call_i returns 0 for
+        // CallAssembler ops → wrong intermediate results → delayed bridge
+        // compilation → 34s vs 0.2s for fib_recursive.
+        // Fix: implement call_i/call_r in IR blackhole (CallAssembler
+        // execution via portal_runner), or trigger bridge compilation
+        // from call_assembler_guard_failure after trace_eagerness threshold.
+        // Snapshot + adapt-live type correction blocked by gcmap conflict:
+        // try_function_entry_jit applies adapt-live (Ref→Int) but CalAssemblerI
+        // does not. Same compiled code, one gcmap → cannot satisfy both.
+        // RPython has no adapt-live; Box types match from the start.
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,

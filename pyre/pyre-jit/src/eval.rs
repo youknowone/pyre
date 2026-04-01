@@ -2851,27 +2851,6 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
-    // pyjitpl.py:3419-3430 + 3446-3450 synchronize_virtualizable:
-    // RPython fully decodes virtualizable_boxes and writes them back to the
-    // heap virtualizable via vinfo.write_boxes(). This ensures the actual
-    // frame object is consistent before blackhole execution begins.
-    //
-    // BLOCKED: pyre's vable/frame OpRef dedup causes multiple vable slots
-    // to share a single TAGBOX → same deadframe value for distinct slots.
-    // RPython avoids this via fresh Box identity (separate TAGBOX per slot).
-    // Enabling synchronize_virtualizable requires either:
-    //   (a) fresh OpRef identity for vable (SameAs-based), or
-    //   (b) frame-section-only recovery (current approach — authoritative).
-    // Frame section recovery uses liveness-based mapping independently,
-    // so the PyFrame gets correct values without synchronize_virtualizable.
-    //
-    // if !vable_frame_ptr.is_null() && vable_values.len() > 3 {
-    //     synchronize_virtualizable(
-    //         vable_frame_ptr, &vable_values[3..], vable_vsd,
-    //         &dead_frame_typed, exit_layout, &mut virtuals_cache,
-    //     );
-    // }
-
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
         // frame_ptr from vable for single-frame or outermost (caller).
@@ -2928,71 +2907,19 @@ fn build_resumed_frames(
             result.len()
         );
     }
+
+    // pyjitpl.py:3419-3430 + 3446-3450 synchronize_virtualizable:
+    // RPython's blackhole path calls write_from_resume_data_partial to write
+    // ALL vable fields to the heap virtualizable BEFORE blackhole execution.
+    //
+    // In pyre, the blackhole handles frame restoration independently via
+    // frame section values. synchronize_virtualizable is not called here
+    // because the blackhole overwrites frame slots from its own registers,
+    // and any sync'd values for untouched slots may conflict with the
+    // blackhole's state. The PyFrame is updated by the blackhole's
+    // writeback at merge point or ContinueRunningNormally.
+
     result
-}
-
-/// pyjitpl.py:3446-3450 synchronize_virtualizable +
-/// virtualizable.py:101-113 write_boxes parity:
-/// Decode vable array items (locals + stack) from the snapshot and write
-/// them back to the actual PyFrame's locals_cells_stack_w.
-/// RPython calls vinfo.write_boxes(virtualizable, virtualizable_boxes)
-/// after rebuild_from_resumedata to keep the heap object consistent.
-///
-/// `vsd` (valuestackdepth) limits writes to live slots only.
-/// RPython's write_boxes writes ALL slots unconditionally because
-/// virtualizable_boxes always has valid values. pyre's vable snapshot
-/// may have stale values beyond the live range.
-fn synchronize_virtualizable(
-    frame_ptr: *mut pyre_interpreter::pyframe::PyFrame,
-    vable_array_items: &[majit_ir::resumedata::RebuiltValue],
-    vsd: usize,
-    dead_frame_typed: &[Value],
-    exit_layout: &CompiledExitLayout,
-    virtuals_cache: &mut HashMap<usize, Value>,
-) {
-    use majit_ir::resumedata::RebuiltValue;
-    let frame = unsafe { &mut *frame_ptr };
-    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
-    let num_failargs = exit_layout.exit_types.len() as i32;
-    // virtualizable.py:101-113: write static_fields, then array items.
-    // In pyre, vable_array_items = [locals..., stack...].
-    // Only write up to vsd (= nlocals + stack_depth) — beyond that is dead.
-    let live_count = vsd
-        .min(vable_array_items.len())
-        .min(frame.locals_cells_stack_w.len());
-
-    for (i, rv) in vable_array_items[..live_count].iter().enumerate() {
-        let val = match rv {
-            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
-            RebuiltValue::Int(v) => Value::Int(*v as i64),
-            RebuiltValue::Const(c, tp) => match tp {
-                majit_ir::Type::Int => Value::Int(*c),
-                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
-                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
-                _ => Value::Int(*c),
-            },
-            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
-                *vidx,
-                dead_frame_typed,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-            ),
-            _ => continue,
-        };
-        // virtualizable.py:105-111 unwrap(FIELDTYPE, boxes[i]):
-        // Convert Value to PyObjectRef for the heap frame.
-        // Null Ref = uninitialized slot — write PY_NULL (RPython: None).
-        let pyobj = match val {
-            Value::Ref(r) => r.as_usize() as pyre_object::PyObjectRef,
-            Value::Int(v) => pyre_object::intobject::w_int_new(v) as pyre_object::PyObjectRef,
-            Value::Float(v) => pyre_object::floatobject::w_float_new(v) as pyre_object::PyObjectRef,
-            Value::Void => pyre_object::PY_NULL,
-        };
-        frame.locals_cells_stack_w[i] = pyobj;
-    }
 }
 
 /// resume.py:1017-1026 _prepare_next_section: decode one frame's slots

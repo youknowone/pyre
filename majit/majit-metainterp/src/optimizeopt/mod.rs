@@ -1697,14 +1697,54 @@ impl OptContext {
                                         build_fieldnums(&vi.fields, &vi.field_descrs);
                                     let sd = vi.descr.as_size_descr();
                                     let ds = sd.map(|s| s.size()).unwrap_or(0);
-                                    let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                                    majit_ir::RdVirtualInfo::VStructInfo {
-                                        typedescr: Some(vi.descr.clone()),
-                                        type_id: tid,
-                                        descr_index: vi.descr.index(),
-                                        fielddescrs: fdinfo,
-                                        fieldnums: fns,
-                                        descr_size: ds,
+                                    // Extract known_class from ob_type field (offset 0).
+                                    // pyre emits New + SetfieldGc(ob_type) instead of
+                                    // NewWithVtable, so VirtualStruct carries ob_type as
+                                    // a regular field. If field[0] is a constant Ref at
+                                    // offset 0, use it as known_class for VirtualInfo encoding.
+                                    // This enables correct ob_type in materialization.
+                                    let known_class = vi.fields.iter().find_map(|(fidx, opref)| {
+                                        let offset = {
+                                            let idx = *fidx;
+                                            if idx & 0xF000_0000 == 0x1000_0000 {
+                                                Some(((idx >> 4) & 0x000f_ffff) as usize)
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if offset == Some(0) {
+                                            self.get_constant(*opref).and_then(|v| match v {
+                                                majit_ir::Value::Int(i) if *i != 0 => Some(*i),
+                                                majit_ir::Value::Ref(r) if !r.is_null() => {
+                                                    Some(r.as_usize() as i64)
+                                                }
+                                                _ => None,
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(kc) = known_class {
+                                        // resume.py:612 VirtualInfo — has vtable
+                                        majit_ir::RdVirtualInfo::VirtualInfo {
+                                            descr: Some(vi.descr.clone()),
+                                            descr_index: vi.descr.index(),
+                                            known_class: Some(kc),
+                                            fielddescrs: fdinfo,
+                                            fieldnums: fns,
+                                            descr_size: ds,
+                                        }
+                                    } else {
+                                        // resume.py:628 VStructInfo — no vtable
+                                        let tid = sd.map(|s| s.type_id()).unwrap_or(0);
+                                        majit_ir::RdVirtualInfo::VStructInfo {
+                                            typedescr: Some(vi.descr.clone()),
+                                            type_id: tid,
+                                            descr_index: vi.descr.index(),
+                                            fielddescrs: fdinfo,
+                                            fieldnums: fns,
+                                            descr_size: ds,
+                                        }
                                     }
                                 }
                                 // Forced virtual: PtrInfo changed from Virtual→Struct
@@ -1951,44 +1991,24 @@ impl OptContext {
                 if resolved_val.is_none() {
                     return resumedata::UNINITIALIZED_TAG;
                 }
-                // resume.py:563-564: isinstance(box, Const) → getconst
-                // RPython Const boxes and liveboxes are disjoint:
-                // isinstance(Const) is true ONLY for ConstInt/ConstPtr,
-                // never for InputArg or OpResult with known values.
-                // In pyre, is_constant()/constants[] can include non-Const
-                // OpRefs (via make_constant). Check liveboxes first to
-                // maintain disjointness.
-                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
-                    return existing_tag;
-                }
-                // RPython isinstance(box, Const): only true Const (constant pool
-                // entry >= CONST_BASE or PtrInfo::Constant).
+                // resume.py:563-564: isinstance(box, Const) → memo.getconst(box).
+                // RPython Const = ConstInt/ConstPtr/ConstFloat (true constant pool
+                // entries). NOT optimizer-discovered constants via make_constant().
+                // is_true_const gates on OpRef >= CONST_BASE or PtrInfo::Constant.
                 let is_true_const = resolved_val.is_constant()
                     || matches!(
                         self.get_ptr_info(resolved_val),
                         Some(crate::optimizeopt::info::PtrInfo::Constant(_))
                     );
                 if is_true_const {
-                    if let Some(val) = self.get_constant(resolved_val) {
-                        let type_override = self
-                            .constant_types_for_numbering
-                            .get(&resolved_val.0)
-                            .copied();
-                        let (c, tp) = match val {
-                            Value::Int(i) => (*i, type_override.unwrap_or(majit_ir::Type::Int)),
-                            Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
-                            Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                            Value::Void => (0, majit_ir::Type::Void),
-                        };
+                    // Unified extraction: constant pool, raw constants, PtrInfo::Constant.
+                    if let Some((c, tp)) = self.getconst(resolved_val) {
                         return memo.getconst(c, tp);
                     }
-                    return resumedata::NULLREF;
                 }
-                // info.py: ConstPtrInfo — GcRef constant in PtrInfo
-                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
-                    self.get_ptr_info(resolved_val)
-                {
-                    return memo.getconst(gcref.0 as i64, majit_ir::Type::Ref);
+                // resume.py:566-567: liveboxes_from_env → existing tag
+                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
+                    return existing_tag;
                 }
                 // resume.py:495 parity: nested virtual → TAGVIRTUAL + worklist
                 if self

@@ -559,17 +559,16 @@ impl OptVirtualize {
     /// Extract the int payload from a VirtualStruct (e.g., W_IntObject).
     /// Returns the OpRef of the raw int if the virtual has a field at offset 8.
     fn extract_virtual_int_field(opref: OpRef, ctx: &OptContext) -> Option<OpRef> {
-        match ctx.get_ptr_info(opref)? {
-            PtrInfo::VirtualStruct(vinfo) => {
-                // Standard layout: [type_ptr@0, intval@8]
-                vinfo
-                    .fields
-                    .iter()
-                    .find(|(idx, _)| extract_field_offset(*idx) == Some(8))
-                    .map(|(_, opref)| *opref)
-            }
-            _ => None,
-        }
+        let fields = match ctx.get_ptr_info(opref)? {
+            PtrInfo::Virtual(vinfo) => &vinfo.fields,
+            PtrInfo::VirtualStruct(vinfo) => &vinfo.fields,
+            _ => return None,
+        };
+        // Standard layout: [type_ptr@0, intval@8]
+        fields
+            .iter()
+            .find(|(idx, _)| extract_field_offset(*idx) == Some(8))
+            .map(|(_, opref)| *opref)
     }
 
     fn has_any_virtual_arg(op: &Op, ctx: &OptContext) -> bool {
