@@ -31,7 +31,27 @@ Integer-heavy benchmarks where the JIT fires still trail PyPy, but the gap is sm
 
 Run `pyre/check.sh` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
-## Building & running
+## Installation
+
+### Homebrew
+
+```sh
+brew install youknowone/tap/pyrex
+```
+
+The formula lives in the [youknowone/homebrew-tap](https://github.com/youknowone/homebrew-tap/tree/main/Formula).
+
+### Prebuilt binaries
+
+Download a prebuilt binary from the [GitHub releases page](https://github.com/youknowone/pyre/releases).
+
+### Cargo
+
+```sh
+cargo install pyrex
+```
+
+## Building from source
 
 ```sh
 cargo build --release -p pyrex
