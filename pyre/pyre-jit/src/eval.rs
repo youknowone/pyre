@@ -1394,22 +1394,13 @@ fn bound_reached(
     // warmstate.py:482-511 + warmstate.py:437-444 combined:
     // compiled code → run, else → start tracing.
     let outcome = if driver.has_compiled_loop(green_key) {
-        // warmstate.py:483: procedure_token = cell.get_procedure_token()
-        // RPython enters only when green key matches (implies correct PC).
-        let merge_ok = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |m| m.merge_pc == loop_header_pc);
-        if merge_ok {
-            Some(driver.run_compiled_detailed_with_bridge_keyed(
-                green_key,
-                loop_header_pc,
-                &mut jit_state,
-                env,
-                || {},
-            ))
-        } else {
-            None
-        }
+        Some(driver.run_compiled_detailed_with_bridge_keyed(
+            green_key,
+            loop_header_pc,
+            &mut jit_state,
+            env,
+            || {},
+        ))
     } else if !driver.is_tracing() {
         // warmstate.py:437-444 compile_and_run_once parity:
         // start tracing AND trace synchronously in a single call.
@@ -1568,18 +1559,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
-        // warmstate.py:482-511: RPython enters compiled code only when
-        // green key matches (which implies correct PC). Skip if the
-        // compiled loop's merge_pc doesn't match frame.next_instr —
-        // the interpreter will reach the right PC naturally.
-        let merge_ok = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |m| m.merge_pc == frame.next_instr);
-        if !merge_ok {
-            // Fall through: interpreter runs from pc=0, back-edge at
-            // merge_pc will enter compiled code via maybe_compile_and_run.
-            return None;
-        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
