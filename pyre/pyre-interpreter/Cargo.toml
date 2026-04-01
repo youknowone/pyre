@@ -2,6 +2,9 @@
 name = "pyre-interpreter"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bytecode interpreter for pyre"
 
 [dependencies]
 pyre-object = { workspace = true }

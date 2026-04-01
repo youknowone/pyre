@@ -2,7 +2,9 @@
 name = "pyre-jit-trace"
 version.workspace = true
 edition.workspace = true
-description = "Trace-time JIT for pyre — MIFrame and tracing logic, isolated from eval_loop_jit compilation unit"
+license.workspace = true
+repository.workspace = true
+description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 
 [dependencies]
 pyre-object = { path = "../pyre-object" }

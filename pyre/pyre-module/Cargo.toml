@@ -2,7 +2,9 @@
 name = "pyre-module"
 version.workspace = true
 edition.workspace = true
-description = "Optional builtin modules — PyPy equivalent: pypy/module/ (non-essential)"
+license.workspace = true
+repository.workspace = true
+description = "Optional builtin modules for pyre interpreter"
 
 [dependencies]
 pyre-object = { workspace = true }

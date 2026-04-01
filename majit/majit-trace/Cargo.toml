@@ -2,6 +2,9 @@
 name = "majit-trace"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trace management and warm-up state for majit JIT compiler"
 
 [dependencies]
 majit-ir = { path = "../majit-ir" }

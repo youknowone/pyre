@@ -2,7 +2,9 @@
 name = "pyrex"
 version.workspace = true
 edition.workspace = true
-description = "pyre executable — Python Yet Reforged Entirely"
+license.workspace = true
+repository.workspace = true
+description = "pyre executable — Python Rewritten"
 
 [[bin]]
 name = "pyre"
