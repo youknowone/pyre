@@ -1857,13 +1857,13 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let trace_ops = compile::fold_box_into_create_frame(
+        let (trace_ops, _) = compile::fold_box_into_create_frame(
             trace.ops.clone(),
             &mut constants,
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
-        let trace_ops = compile::elide_create_frame_for_call_assembler(
+        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
             trace_ops,
             &constants,
             &self.create_frame_raw_map,
@@ -2636,13 +2636,13 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let trace_ops = compile::fold_box_into_create_frame(
+        let (trace_ops, _) = compile::fold_box_into_create_frame(
             trace.ops.clone(),
             &mut constants,
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
-        let trace_ops = compile::elide_create_frame_for_call_assembler(
+        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
             trace_ops,
             &constants,
             &self.create_frame_raw_map,
@@ -2992,13 +2992,13 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let trace_ops = compile::fold_box_into_create_frame(
+        let (trace_ops, pos_remap1) = compile::fold_box_into_create_frame(
             trace.ops.clone(),
             &mut constants,
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
-        let trace_ops = compile::elide_create_frame_for_call_assembler(
+        let (trace_ops, pos_remap2) = compile::elide_create_frame_for_call_assembler(
             trace_ops,
             &constants,
             &self.create_frame_raw_map,
@@ -3378,13 +3378,13 @@ impl<M: Clone> MetaInterp<M> {
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
-        let trace_ops = compile::fold_box_into_create_frame(
+        let (trace_ops, _) = compile::fold_box_into_create_frame(
             trace.ops.clone(),
             &mut constants,
             &self.raw_int_box_helpers,
             &self.create_frame_raw_map,
         );
-        let trace_ops = compile::elide_create_frame_for_call_assembler(
+        let (trace_ops, _) = compile::elide_create_frame_for_call_assembler(
             trace_ops,
             &constants,
             &self.create_frame_raw_map,

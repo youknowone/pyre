@@ -1444,12 +1444,16 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
 ///
 /// Pattern: `vB = CallI(box_fn, raw) ... vF = CallI(create_frame, ..., vB)`
 /// Result:  `vF = CallI(create_frame_raw, ..., raw)` + remove vB
+/// Returns (transformed_ops, position_remap).
+/// position_remap maps old op.pos → new op.pos for ops whose position
+/// changed due to removal. OpRefs in snapshot_boxes must be remapped
+/// through this table.
 pub(crate) fn fold_box_into_create_frame(
     mut ops: Vec<Op>,
     constants: &mut HashMap<u32, i64>,
     box_helpers: &HashSet<i64>,
     create_frame_raw_map: &HashMap<i64, i64>,
-) -> Vec<Op> {
+) -> (Vec<Op>, HashMap<u32, u32>) {
     use majit_ir::OpCode;
 
     #[derive(Clone)]
@@ -1461,7 +1465,7 @@ pub(crate) fn fold_box_into_create_frame(
     }
 
     if box_helpers.is_empty() || create_frame_raw_map.is_empty() {
-        return ops;
+        return (ops, HashMap::new());
     }
 
     let mut replacements: Vec<Replacement> = Vec::new();
@@ -1590,7 +1594,16 @@ pub(crate) fn fold_box_into_create_frame(
         }
     }
 
-    ops
+    // Build position remap: old op.pos → new op.pos.
+    // After removals, surviving ops shift down. Record each op's
+    // original pos (stored in op.pos) and its new index.
+    let mut remap = HashMap::new();
+    for (new_idx, op) in ops.iter().enumerate() {
+        if op.pos != OpRef::NONE {
+            remap.insert(op.pos.0, new_idx as u32);
+        }
+    }
+    (ops, remap)
 }
 
 /// RPython parity: elide create_frame + drop_frame around CallAssemblerI
@@ -1612,7 +1625,7 @@ pub(crate) fn elide_create_frame_for_call_assembler(
     ops: Vec<Op>,
     _constants: &HashMap<u32, i64>,
     _create_frame_raw_map: &HashMap<i64, i64>,
-) -> Vec<Op> {
+) -> (Vec<Op>, HashMap<u32, u32>) {
     // RPython parity: elide frame creation for self-recursive calls.
     // Force_fn uses PENDING_FORCE_LOCAL0 for lazy callee frame creation.
 
@@ -1625,7 +1638,7 @@ pub(crate) fn elide_create_frame_for_call_assembler(
         let create_frame_raw_map = _create_frame_raw_map;
 
         if create_frame_raw_map.is_empty() {
-            return ops;
+            return (ops, HashMap::new());
         }
 
         // Collect all create_frame function pointers (keys AND values of the map)
@@ -1721,7 +1734,13 @@ pub(crate) fn elide_create_frame_for_call_assembler(
             ops.remove(ci);
         }
 
-        ops
+        let mut remap = HashMap::new();
+        for (new_idx, op) in ops.iter().enumerate() {
+            if op.pos != OpRef::NONE {
+                remap.insert(op.pos.0, new_idx as u32);
+            }
+        }
+        (ops, remap)
     }
 }
 
