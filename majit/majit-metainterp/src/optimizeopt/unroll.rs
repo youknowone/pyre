@@ -92,6 +92,9 @@ pub struct UnrollOptimizer {
     /// Phase 2 references Phase 1 OpRefs via imported_label_args (NONE
     /// resolution). These OpRefs may not exist in Phase 2's input ops.
     phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// RPython: same Optimizer instance across phases keeps patchguardop.
+    /// In majit, separate instances — forward explicitly.
+    phase1_patchguardop: Option<majit_ir::Op>,
 }
 
 impl UnrollOptimizer {
@@ -114,6 +117,7 @@ impl UnrollOptimizer {
             trace_inputarg_types: Vec::new(),
             original_trace_op_types: std::collections::HashMap::new(),
             phase1_value_types: std::collections::HashMap::new(),
+            phase1_patchguardop: None,
         }
     }
 
@@ -247,6 +251,10 @@ impl UnrollOptimizer {
         {
             // Retrace path: Phase 1 already done; preamble ops are in
             // the caller's partial_trace, not produced here.
+            // RPython: same Optimizer persists patchguardop. Recover here.
+            if self.phase1_patchguardop.is_none() {
+                self.phase1_patchguardop = pre_imported.patchguardop.clone();
+            }
             (pre_imported, constants.clone(), Vec::new())
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
@@ -317,6 +325,11 @@ impl UnrollOptimizer {
                     // must be accessible to Phase 2 (imported_label_args
                     // reference Phase 1 OpRefs). Save Phase 1 value_types.
                     self.phase1_value_types = opt_p1.prev_phase_value_types.clone();
+                    // RPython: same Optimizer instance keeps patchguardop.
+                    if self.phase1_patchguardop.is_none() {
+                        self.phase1_patchguardop = opt_p1.patchguardop.clone();
+                    }
+                    state.patchguardop = opt_p1.patchguardop.clone();
                     // resume.py:570-574: collect Phase 1 per-guard knowledge.
                     self.per_guard_knowledge
                         .extend(opt_p1.per_guard_knowledge.drain(..));
@@ -379,6 +392,8 @@ impl UnrollOptimizer {
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
+        // RPython: same Optimizer instance keeps patchguardop across phases.
+        opt_p2.patchguardop = self.phase1_patchguardop.clone();
         // gcreftracer.py parity: root GcRef values on the shadow stack.
         // RPython: single Python object — GC traces automatically.
         // Rust: LIFO shadow stack requires longer-lived roots at lower depth.
@@ -928,6 +943,8 @@ pub struct ExportedState {
     pub renamed_inputarg_types: Vec<Type>,
     /// Short inputargs for the short preamble.
     pub short_inputargs: Vec<OpRef>,
+    /// RPython: Optimizer.patchguardop persists across phases.
+    pub patchguardop: Option<majit_ir::Op>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1068,6 +1085,7 @@ impl ExportedState {
             renamed_inputargs,
             renamed_inputarg_types,
             short_inputargs,
+            patchguardop: None,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1254,6 +1272,7 @@ impl Clone for ExportedState {
             renamed_inputargs: self.renamed_inputargs.clone(),
             renamed_inputarg_types: self.renamed_inputarg_types.clone(),
             short_inputargs: self.short_inputargs.clone(),
+            patchguardop: self.patchguardop.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
