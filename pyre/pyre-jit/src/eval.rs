@@ -2954,12 +2954,12 @@ fn build_resumed_frames(
         );
     }
 
-    // pyjitpl.py:3419-3430 synchronize_virtualizable:
-    // RPython calls write_from_resume_data_partial via consume_vable_info
-    // inside blackhole_from_resumedata (resume.py:1399-1408). This is now
-    // handled by passing real vinfo to blackhole_from_resumedata in
-    // call_jit.rs, which calls consume_vref_and_vable → consume_vable_info
-    // → write_from_resume_data_partial automatically.
+    // pyjitpl.py:3446-3450 synchronize_virtualizable:
+    // RPython calls write_from_resume_data_partial to write ALL vable
+    // fields to the virtualizable BEFORE blackhole. Still blocked by
+    // vable/frame dedup (same TAGVIRTUAL for distinct slots → same
+    // materialized object written to multiple locals). The frame section
+    // recovery (liveness-based) is authoritative until dedup is resolved.
 
     result
 }
