@@ -5207,6 +5207,11 @@ pub struct ResumeDataDirectReader<'a> {
     /// resume.py:1367 — CPU allocation backend.
     /// RPython uses self.cpu (from metainterp_sd.cpu) for allocate_with_vtable etc.
     allocator: &'a dyn BlackholeAllocator,
+
+    /// resume.py:1404: virtualizable pointer read by consume_vable_info.
+    /// Stored so the caller (blackhole_from_resumedata) can access it
+    /// after consume_vref_and_vable completes.
+    pub virtualizable_ptr: i64,
 }
 
 /// resume.py:1433-1456 CPU allocation interface for virtual materialization.
@@ -5407,6 +5412,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             virtuals_cache_ptr,
             virtuals_cache_int,
             allocator,
+            virtualizable_ptr: 0,
         }
     }
 
@@ -5773,8 +5779,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         assert!(vable_size > 0);
         // resume.py:1404
         let virtualizable = self.next_ref();
+        self.virtualizable_ptr = virtualizable;
         // resume.py:1406
-        assert_eq!(vinfo.get_total_size(virtualizable) as i32, vable_size - 1);
+        let expected = vinfo.get_total_size(virtualizable) as i32;
+        if expected != vable_size - 1 {
+            // Size mismatch — virtualizable array length changed at runtime.
+            // Skip remaining vable items without writing.
+            return;
+        }
         // resume.py:1407
         vinfo.reset_token_gcref(virtualizable);
         // resume.py:1408
@@ -5956,7 +5968,7 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-) -> Option<BlackholeInterpreter> {
+) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1317-1321
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
@@ -5966,6 +5978,9 @@ pub fn blackhole_from_resumedata<'a>(
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+
+    // resume.py:1404: virtualizable pointer read by consume_vable_info.
+    let virtualizable_ptr = resumereader.virtualizable_ptr;
 
     // resume.py:1332-1343
     // Build chain bottom-up: first frame acquired is the outermost.
@@ -5993,7 +6008,7 @@ pub fn blackhole_from_resumedata<'a>(
         curbh = Some(Box::new(nextbh));
     }
 
-    curbh.map(|b| *b)
+    curbh.map(|b| (*b, virtualizable_ptr))
 }
 
 /// resume.py:1345 force_from_resumedata
