@@ -1337,9 +1337,8 @@ impl BlackholeInterpreter {
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
                         eprintln!(
-                            "[bh-trace] leave-frame at pos={} reg0={}",
-                            pos_before,
-                            self.registers_i.get(0).copied().unwrap_or(-1)
+                            "[bh-trace] leave-frame at pos={} ret_type={:?}",
+                            pos_before, self.return_type,
                         );
                     }
                     return;

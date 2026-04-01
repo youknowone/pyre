@@ -1779,7 +1779,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
 
 /// resume.py:945-956 getvirtual_ptr parity.
 ///
-/// Lazily materializes a virtual from rd_virtuals_info[vidx].
+/// Lazily materializes a virtual from rd_virtuals[vidx].
 /// Pattern: check cache → allocate_with_vtable/allocate_struct → cache → setfields.
 /// RPython caches the REAL object pointer before filling fields, enabling
 /// recursive/shared virtual resolution without NULL placeholders.
@@ -1788,14 +1788,14 @@ fn materialize_virtual_from_rd(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     // resume.py:951: v = self.virtuals_cache.get_ptr(index)
     if let Some(cached) = virtuals_cache.get(&vidx) {
         return cached.clone();
     }
-    let Some(virtuals) = rd_virtuals_info else {
+    let Some(virtuals) = rd_virtuals else {
         return Value::Ref(majit_ir::GcRef::NULL);
     };
     let Some(entry) = virtuals.get(vidx) else {
@@ -1807,7 +1807,7 @@ fn materialize_virtual_from_rd(
         dead_frame: &[Value],
         num_failargs: i32,
         rd_consts: &[(i64, majit_ir::Type)],
-        rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> Option<Value> {
         if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -1847,7 +1847,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 ));
             }
@@ -1864,19 +1864,20 @@ fn materialize_virtual_from_rd(
     }
     // resume.py:643-760: dispatch by virtual kind.
     match entry {
-        majit_ir::RdVirtualInfo::Array {
-            clear,
-            kind,
-            fieldnums,
-            ..
+        majit_ir::RdVirtualInfo::VArrayInfoClear {
+            kind, fieldnums, ..
+        }
+        | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+            kind, fieldnums, ..
         } => {
+            let clear = matches!(entry, majit_ir::RdVirtualInfo::VArrayInfoClear { .. });
             // resume.py:650-670: allocate_array(len, arraydescr, clear)
             let arr_kind = match kind {
                 2 => pyre_object::ArrayKind::Float,
                 1 => pyre_object::ArrayKind::Int,
                 _ => pyre_object::ArrayKind::Ref,
             };
-            let array = pyre_object::allocate_array(fieldnums.len(), arr_kind, *clear);
+            let array = pyre_object::allocate_array(fieldnums.len(), arr_kind, clear);
             // resume.py:654: cache BEFORE filling — recursive/shared virtuals
             // may reference this vidx during element decoding.
             let result = Value::Ref(majit_ir::GcRef(array as usize));
@@ -1891,7 +1892,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 );
                 if let Some(val) = v {
@@ -1905,7 +1906,7 @@ fn materialize_virtual_from_rd(
             }
             return result;
         }
-        majit_ir::RdVirtualInfo::ArrayStruct {
+        majit_ir::RdVirtualInfo::VArrayStructInfo {
             size,
             field_types,
             item_size,
@@ -1947,7 +1948,7 @@ fn materialize_virtual_from_rd(
                         dead_frame,
                         num_failargs,
                         rd_consts,
-                        rd_virtuals_info,
+                        rd_virtuals,
                         virtuals_cache,
                     );
                     if let Some(val) = v {
@@ -1967,7 +1968,7 @@ fn materialize_virtual_from_rd(
             }
             return result;
         }
-        majit_ir::RdVirtualInfo::RawBuffer {
+        majit_ir::RdVirtualInfo::VRawBufferInfo {
             size,
             offsets,
             entry_sizes,
@@ -1989,7 +1990,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 ) {
                     let offset = offsets.get(i).copied().unwrap_or(i * 8);
@@ -2013,7 +2014,7 @@ fn materialize_virtual_from_rd(
             }
             return result;
         }
-        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+        majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
             // resume.py:723-727: base_buffer + offset
             if let Some(fnum) = fieldnums.first() {
                 if let Some(Value::Int(base)) = decode_tagged_fieldnum(
@@ -2021,7 +2022,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 ) {
                     let result = Value::Int(base + *offset as i64);
@@ -2033,7 +2034,7 @@ fn materialize_virtual_from_rd(
             return Value::Int(0);
         }
         majit_ir::RdVirtualInfo::Empty => {
-            panic!("[jit] materialize_virtual: rd_virtuals_info[{vidx}] is Empty");
+            panic!("[jit] materialize_virtual: rd_virtuals[{vidx}] is Empty");
         }
         _ => {} // Instance/Struct: fall through
     }
@@ -2052,7 +2053,7 @@ fn materialize_virtual_from_rd(
         },
     }
     let (kind, fielddescrs, fieldnums, descr_size) = match entry {
-        majit_ir::RdVirtualInfo::Instance {
+        majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             known_class,
             fielddescrs,
@@ -2068,7 +2069,7 @@ fn materialize_virtual_from_rd(
             fieldnums.as_slice(),
             *descr_size,
         ),
-        majit_ir::RdVirtualInfo::Struct {
+        majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
             type_id,
             fielddescrs,
@@ -2179,7 +2180,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 );
                 let intval = match val {
@@ -2204,7 +2205,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 );
                 let floatval = match val {
@@ -2232,7 +2233,7 @@ fn materialize_virtual_from_rd(
                     dead_frame,
                     num_failargs,
                     rd_consts,
-                    rd_virtuals_info,
+                    rd_virtuals,
                     virtuals_cache,
                 );
                 let raw = match val {
@@ -2292,7 +2293,7 @@ fn decode_tagged_value(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals_info: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     let (val, tagbits) = majit_metainterp::resume::untag(tagged);
@@ -2324,7 +2325,7 @@ fn decode_tagged_value(
                 dead_frame,
                 num_failargs,
                 rd_consts,
-                rd_virtuals_info,
+                rd_virtuals,
                 virtuals_cache,
             )
         }
@@ -2622,7 +2623,7 @@ fn rebuild_typed_from_rd_numb(
                 dead_frame_typed,
                 exit_layout.exit_types.len() as i32,
                 exit_layout.rd_consts.as_deref().unwrap_or(&[]),
-                exit_layout.rd_virtuals_info.as_deref(),
+                exit_layout.rd_virtuals.as_deref(),
                 virtuals_cache,
             ),
             _ => Value::Int(0),
@@ -2738,7 +2739,7 @@ fn build_resumed_frames(
                 dead_frame_typed,
                 exit_layout.exit_types.len() as i32,
                 exit_layout.rd_consts.as_deref().unwrap_or(&[]),
-                exit_layout.rd_virtuals_info.as_deref(),
+                exit_layout.rd_virtuals.as_deref(),
                 virtuals_cache,
             ),
             _ => Value::Int(0),
@@ -2952,7 +2953,7 @@ fn synchronize_virtualizable(
     use majit_ir::resumedata::RebuiltValue;
     let frame = unsafe { &mut *frame_ptr };
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    let rd_virtuals = exit_layout.rd_virtuals_info.as_deref();
+    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
     let num_failargs = exit_layout.exit_types.len() as i32;
     // virtualizable.py:101-113: write static_fields, then array items.
     // In pyre, vable_array_items = [locals..., stack...].
@@ -3006,7 +3007,7 @@ fn _prepare_next_section(
 ) {
     use majit_ir::resumedata::RebuiltValue;
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    let rd_virtuals = exit_layout.rd_virtuals_info.as_deref();
+    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
@@ -3144,7 +3145,7 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
 }
 
 /// resume.py:945/993 parity: materialize virtuals via rd_virtuals.
-/// RPython uses recovery_layout (rd_virtuals_info + rd_pendingfields)
+/// RPython uses recovery_layout (rd_virtuals + rd_pendingfields)
 /// for precise materialization. No heuristic pair decode, no w_none().
 fn rebuild_state_after_failure_with_exit_layout(
     typed: &mut Vec<Value>,
@@ -3163,7 +3164,7 @@ fn rebuild_state_after_failure_with_exit_layout(
     }
 }
 
-/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals_info).
+/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals).
 /// Field values are read from raw_values (deadframe) since rd_numb-decoded
 /// typed array only contains frame slots, not the appended virtual fields.
 fn rebuild_state_after_failure_from_recovery_layout(

@@ -28,7 +28,7 @@ impl OpRef {
     }
 }
 
-/// resume.py:576-860: virtual object serialization for rd_virtuals_info.
+/// resume.py:576-860: virtual object serialization for rd_virtuals.
 ///
 /// Each variant corresponds to a concrete virtual type in RPython's
 /// resume.py:591-593 AbstractVirtualStructInfo.fielddescrs parity.
@@ -44,7 +44,7 @@ pub struct FieldDescrInfo {
 #[derive(Clone, Debug)]
 pub enum RdVirtualInfo {
     /// resume.py:612 VirtualInfo(descr, fielddescrs).
-    Instance {
+    VirtualInfo {
         /// resume.py:615 self.descr — live SizeDescr reference.
         descr: Option<crate::DescrRef>,
         descr_index: u32,
@@ -54,7 +54,7 @@ pub enum RdVirtualInfo {
         descr_size: usize,
     },
     /// resume.py:628 VStructInfo(typedescr, fielddescrs).
-    Struct {
+    VStructInfo {
         /// resume.py:631 self.typedescr — live SizeDescr reference.
         typedescr: Option<crate::DescrRef>,
         /// typedescr.tid — GC type identifier (cached for serialization).
@@ -64,14 +64,22 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
         descr_size: usize,
     },
-    Array {
+    /// resume.py:680: VArrayInfoClear (clear=True)
+    VArrayInfoClear {
         descr_index: u32,
-        clear: bool,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
     },
-    ArrayStruct {
+    /// resume.py:683: VArrayInfoNotClear (clear=False)
+    VArrayInfoNotClear {
+        descr_index: u32,
+        /// resume.py:656: arraydescr element kind (ref/int/float).
+        kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:736: VArrayStructInfo
+    VArrayStructInfo {
         descr_index: u32,
         size: usize,
         /// resume.py VArrayStructInfo.fielddescrs — per-field descriptor indices.
@@ -87,13 +95,15 @@ pub enum RdVirtualInfo {
         field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    RawBuffer {
+    /// resume.py:692: VRawBufferInfo
+    VRawBufferInfo {
         size: usize,
         offsets: Vec<usize>,
         entry_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    RawSlice {
+    /// resume.py:717: VRawSliceInfo
+    VRawSliceInfo {
         offset: usize,
         fieldnums: Vec<i16>,
     },
@@ -105,7 +115,7 @@ impl PartialEq for RdVirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                Self::Instance {
+                Self::VirtualInfo {
                     descr_index: a1,
                     known_class: a2,
                     fielddescrs: a3,
@@ -113,7 +123,7 @@ impl PartialEq for RdVirtualInfo {
                     descr_size: a5,
                     ..
                 },
-                Self::Instance {
+                Self::VirtualInfo {
                     descr_index: b1,
                     known_class: b2,
                     fielddescrs: b3,
@@ -123,7 +133,7 @@ impl PartialEq for RdVirtualInfo {
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
-                Self::Struct {
+                Self::VStructInfo {
                     type_id: a1,
                     descr_index: a2,
                     fielddescrs: a3,
@@ -131,7 +141,7 @@ impl PartialEq for RdVirtualInfo {
                     descr_size: a5,
                     ..
                 },
-                Self::Struct {
+                Self::VStructInfo {
                     type_id: b1,
                     descr_index: b2,
                     fielddescrs: b3,
@@ -141,21 +151,31 @@ impl PartialEq for RdVirtualInfo {
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
-                Self::Array {
+                Self::VArrayInfoClear {
                     descr_index: a1,
-                    clear: a2,
-                    kind: a3,
-                    fieldnums: a4,
+                    kind: a2,
+                    fieldnums: a3,
                 },
-                Self::Array {
+                Self::VArrayInfoClear {
                     descr_index: b1,
-                    clear: b2,
-                    kind: b3,
-                    fieldnums: b4,
+                    kind: b2,
+                    fieldnums: b3,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => a1 == b1 && a2 == b2 && a3 == b3,
             (
-                Self::ArrayStruct {
+                Self::VArrayInfoNotClear {
+                    descr_index: a1,
+                    kind: a2,
+                    fieldnums: a3,
+                },
+                Self::VArrayInfoNotClear {
+                    descr_index: b1,
+                    kind: b2,
+                    fieldnums: b3,
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3,
+            (
+                Self::VArrayStructInfo {
                     descr_index: a1,
                     size: a2,
                     fielddescr_indices: a3,
@@ -165,7 +185,7 @@ impl PartialEq for RdVirtualInfo {
                     field_sizes: a7,
                     fieldnums: a8,
                 },
-                Self::ArrayStruct {
+                Self::VArrayStructInfo {
                     descr_index: b1,
                     size: b2,
                     fielddescr_indices: b3,
@@ -186,13 +206,13 @@ impl PartialEq for RdVirtualInfo {
                     && a8 == b8
             }
             (
-                Self::RawBuffer {
+                Self::VRawBufferInfo {
                     size: a1,
                     offsets: a2,
                     entry_sizes: a3,
                     fieldnums: a4,
                 },
-                Self::RawBuffer {
+                Self::VRawBufferInfo {
                     size: b1,
                     offsets: b2,
                     entry_sizes: b3,
@@ -200,11 +220,11 @@ impl PartialEq for RdVirtualInfo {
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
             (
-                Self::RawSlice {
+                Self::VRawSliceInfo {
                     offset: a1,
                     fieldnums: a2,
                 },
-                Self::RawSlice {
+                Self::VRawSliceInfo {
                     offset: b1,
                     fieldnums: b2,
                 },
@@ -315,7 +335,7 @@ pub struct Op {
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info.
     /// Each entry describes a virtual's type, field descriptors, and fieldnums.
-    pub rd_virtuals_info: Option<Vec<RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<RdVirtualInfo>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,
@@ -401,7 +421,7 @@ impl Op {
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
-            rd_virtuals_info: None,
+            rd_virtuals: None,
             vecinfo: None,
         }
     }
@@ -419,7 +439,7 @@ impl Op {
             rd_resume_position: -1,
             rd_numb: None,
             rd_consts: None,
-            rd_virtuals_info: None,
+            rd_virtuals: None,
             vecinfo: None,
         }
     }
@@ -2322,7 +2342,7 @@ mod tests {
                 $($field)*
                 rd_numb: None,
                 rd_consts: None,
-                rd_virtuals_info: None,
+                rd_virtuals: None,
                 vecinfo: None,
             }
         };

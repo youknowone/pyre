@@ -979,7 +979,7 @@ fn rebuild_state_after_failure(
     recovery: Option<&majit_backend::ExitRecoveryLayout>,
     bridge_num_inputs: usize,
 ) {
-    // Phase 1: recovery_layout-based materialization (rd_virtuals_info parity).
+    // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
     // Process ALL frames, not just frames[0].
     if let Some(recovery) = recovery {
         if !recovery.frames.is_empty()
@@ -3742,7 +3742,7 @@ fn normalize_ops_for_codegen(
                     }
                 }
             }
-            // rd_virtuals_info fieldnums use TAGBOX indices, not OpRef,
+            // rd_virtuals fieldnums use TAGBOX indices, not OpRef,
             // so they don't need OpRef remapping — only fail_arg_index adjustment
             // if fail_args were reordered (they aren't in dense renumbering).
             n
@@ -4854,7 +4854,7 @@ fn infer_fail_arg_types(
         if opref.is_none() {
             // resoperation.py Box.type parity: NONE marks a virtual object
             // slot. Virtual objects are GCREF (Ref). The backend stores null;
-            // materialization uses rd_virtuals_info on guard failure.
+            // materialization uses rd_virtuals on guard failure.
             fail_arg_types.push(Type::Ref);
             continue;
         }
@@ -5251,7 +5251,7 @@ impl CraneliftBackend {
         // The bridge's fail_args contain the full frame state needed
         // for interpreter resume (bridge inputargs include parent locals).
         // RPython resume.py:rebuild_state_after_failure uses the bridge's
-        // rd_numb/rd_virtuals_info to reconstruct frame state.
+        // rd_numb/rd_virtuals to reconstruct frame state.
         DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
@@ -9250,7 +9250,7 @@ fn collect_guards(
         // as TAGVIRTUAL), while the identity recovery_layout only has
         // fail_args-count slots. The rd_numb-based layout is authoritative.
         if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
-            let rd_vi = op.rd_virtuals_info.as_deref();
+            let rd_vi = op.rd_virtuals.as_deref();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[(i64, Type)] = rd_consts_data;
             let (_num_failargs, _vable_values, _vref_values, frames) =
@@ -9292,7 +9292,7 @@ fn collect_guards(
                 frame.slot_types = Some(new_slot_types);
             }
 
-            // Build virtual_layouts from rd_virtuals_info.
+            // Build virtual_layouts from rd_virtuals.
             let resolve_fieldnum = |fnum: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = resumedata::untag(fnum);
                 match tagbits {
@@ -9320,13 +9320,13 @@ fn collect_guards(
                     .collect()
             };
 
-            // Build virtual_layouts from rd_virtuals_info or rd_virtuals.
+            // Build virtual_layouts from rd_virtuals or rd_virtuals.
             recovery_layout.virtual_layouts.clear();
             if let Some(rd_vi_slice) = rd_vi {
                 for (vidx, entry) in rd_vi_slice.iter().enumerate() {
                     let target_slot = vidx_to_slot.get(&vidx).copied();
                     let layout = match entry {
-                        majit_ir::RdVirtualInfo::Instance {
+                        majit_ir::RdVirtualInfo::VirtualInfo {
                             descr,
                             descr_index,
                             known_class,
@@ -9345,7 +9345,7 @@ fn collect_guards(
                                 descr_size: *descr_size,
                             }
                         }
-                        majit_ir::RdVirtualInfo::Struct {
+                        majit_ir::RdVirtualInfo::VStructInfo {
                             typedescr,
                             type_id,
                             descr_index,
@@ -9364,21 +9364,33 @@ fn collect_guards(
                                 descr_size: *descr_size,
                             }
                         }
-                        majit_ir::RdVirtualInfo::Array {
+                        majit_ir::RdVirtualInfo::VArrayInfoClear {
                             descr_index,
-                            clear,
                             kind,
                             fieldnums,
                         } => ExitVirtualLayout::Array {
                             descr_index: *descr_index,
-                            clear: *clear,
+                            clear: true,
                             kind: *kind,
                             items: fieldnums
                                 .iter()
                                 .map(|&fnum| resolve_fieldnum(fnum))
                                 .collect(),
                         },
-                        majit_ir::RdVirtualInfo::ArrayStruct {
+                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                            descr_index,
+                            kind,
+                            fieldnums,
+                        } => ExitVirtualLayout::Array {
+                            descr_index: *descr_index,
+                            clear: false,
+                            kind: *kind,
+                            items: fieldnums
+                                .iter()
+                                .map(|&fnum| resolve_fieldnum(fnum))
+                                .collect(),
+                        },
+                        majit_ir::RdVirtualInfo::VArrayStructInfo {
                             descr_index,
                             size,
                             fielddescr_indices,
@@ -9408,7 +9420,7 @@ fn collect_guards(
                                     .collect(),
                             }
                         }
-                        majit_ir::RdVirtualInfo::RawBuffer {
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
                             size,
                             offsets,
                             entry_sizes,
@@ -9427,7 +9439,7 @@ fn collect_guards(
                                 })
                                 .collect(),
                         },
-                        majit_ir::RdVirtualInfo::RawSlice { offset, fieldnums } => {
+                        majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
                             ExitVirtualLayout::RawSlice {
                                 offset: *offset,
                                 base: fieldnums

@@ -1261,7 +1261,7 @@ impl<S: JitState> JitDriver<S> {
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
                 let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
-                    exit_layout.rd_virtuals_info.as_ref().map(|rd_virts| {
+                    exit_layout.rd_virtuals.as_ref().map(|rd_virts| {
                         let count = raw_values.len() as i32;
                         rd_virts
                             .iter()
@@ -2765,7 +2765,7 @@ impl<S: JitState> JitDriver<S> {
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
                 let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
-                    exit_layout.rd_virtuals_info.as_ref().map(|rd_virts| {
+                    exit_layout.rd_virtuals.as_ref().map(|rd_virts| {
                         let count = raw_values.len() as i32;
                         rd_virts
                             .iter()
