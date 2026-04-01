@@ -141,6 +141,10 @@ pub struct JitCode {
     /// Reverse PC map: sorted (jitcode_pc, py_pc) pairs for binary search.
     /// Used by handle_exception_in_frame to determine faulting Python PC (lasti).
     pub jit_to_py_pc: Vec<(usize, usize)>,
+    /// Forward PC map: py_pc → jitcode_pc. Used by get_list_of_active_boxes
+    /// to look up LivenessInfo at the current Python bytecode position.
+    /// RPython: pc → offset into all_liveness (embedded in jitcode bytecodes).
+    pub py_to_jit_pc: Vec<usize>,
     /// True if BC_ABORT was emitted (not BC_ABORT_PERMANENT).
     /// Set by JitCodeBuilder::abort(), not by raw byte scan.
     pub has_abort: bool,

@@ -173,9 +173,6 @@ pub(crate) fn build_guard_metadata(
         }
 
         // RPython Box.type parity: exit_types from fail_args (liveboxes).
-        // After store_final_boxes normalization, fail_args contain only
-        // live boxes. exit_types determines dead frame slot types for
-        // the backend — one per live box.
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
