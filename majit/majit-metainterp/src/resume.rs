@@ -5279,6 +5279,15 @@ pub trait BlackholeAllocator {
     fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
         self.setarrayitem_int(array, index, value, descr);
     }
+    /// Pyre-specific: box a raw int to a PyObject ref.
+    ///
+    /// RPython equivalent: cpu.get_ref_value always returns GCREF because
+    /// the jitframe stores typed values. Pyre's deadframe is untyped i64;
+    /// when adapt-live stores a raw Int in a slot that decode_ref reads,
+    /// this method wraps it into a valid GCREF (W_IntObject).
+    fn box_int(&self, value: i64) -> i64 {
+        value // default: return raw value (override in pyre allocator)
+    }
 }
 
 /// Default no-op allocator.
@@ -5882,7 +5891,17 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                let raw = self.deadframe[idx as usize];
+                // RPython: cpu.get_ref_value returns GCREF from typed slot.
+                // Pyre: deadframe is untyped; exit_types distinguishes
+                // Int vs Ref. adapt-live may store raw Int where GCREF is
+                // expected — box it so the blackhole ref register gets a
+                // valid pointer.
+                if let Some(&majit_ir::Type::Int) = self.exit_types.get(idx as usize) {
+                    self.allocator.box_int(raw)
+                } else {
+                    raw
+                }
             }
             TAGINT => {
                 // pyre parity: all values are in ref registers (no typed
