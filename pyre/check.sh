@@ -139,7 +139,7 @@ printf "$(dim done)\n"
 run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""       1       1.5
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""       1
 run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""       1       1.5
-run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       3
+run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       2.5
 run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       10
 run_bench       "fannkuch"       "$BENCH/fannkuch.py"          5
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     5
