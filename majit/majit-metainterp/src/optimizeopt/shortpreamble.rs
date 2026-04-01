@@ -1357,28 +1357,28 @@ impl ShortPreambleBuilder {
     }
 }
 
-/// shortpreamble.py: ExtendedShortPreambleBuilder
+/// shortpreamble.py:448-482: ExtendedShortPreambleBuilder
 ///
-/// Keeps the existing short preamble stable while allowing inline replay to
-/// discover additional required producers and append them to the loop label /
-/// jump contract.
+/// RPython parity: single `short` list with JUMP sentinel at end.
+/// `use_box()` pops JUMP, appends deps/guards/op, re-appends JUMP.
 #[derive(Clone, Debug)]
 pub struct ExtendedShortPreambleBuilder {
     produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
     short_inputargs: Vec<OpRef>,
-    base_short_ops: Vec<Op>,
-    base_results: HashSet<OpRef>,
+    /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
+    short: Vec<Op>,
+    /// Tracks which OpRefs are already in `short` (for dedup).
+    short_results: HashSet<OpRef>,
+    /// Constants tracked for RPython isinstance(arg, Const) checks.
+    known_constants: HashSet<OpRef>,
+    extra_same_as: Vec<Op>,
+    short_preamble_jump: Vec<Op>,
     base_extra_same_as: Vec<Op>,
-    extra_state: AbstractShortPreambleBuilderState,
     label_args: Vec<OpRef>,
     used_boxes: Vec<OpRef>,
     short_jump_args: Vec<OpRef>,
     pub target_token: u64,
     /// RPython parity: remap Phase 1 preamble OpRefs → current inputarg OpRefs.
-    /// In RPython, produce_arg returns renamed inputargs (new Box objects), so
-    /// short ops always reference the renamed args. In majit, short ops keep
-    /// original preamble OpRefs. This map bridges the Phase 1 → current gap
-    /// when the Extended builder rebuilds with different inputargs.
     phase1_to_inputarg: HashMap<OpRef, OpRef>,
 }
 
@@ -1387,15 +1387,12 @@ impl ExtendedShortPreambleBuilder {
         ExtendedShortPreambleBuilder {
             produced_short_boxes: sb.produced_short_boxes.clone(),
             short_inputargs: sb.short_inputargs().to_vec(),
-            base_short_ops: Vec::new(),
-            base_results: HashSet::new(),
+            short: Vec::new(),
+            short_results: HashSet::new(),
+            known_constants: HashSet::new(),
+            extra_same_as: sb.extra_same_as().to_vec(),
+            short_preamble_jump: Vec::new(),
             base_extra_same_as: sb.extra_same_as().to_vec(),
-            extra_state: AbstractShortPreambleBuilderState {
-                label_args: Vec::new(),
-                short_inputargs: sb.short_inputargs().to_vec(),
-                extra_same_as: sb.extra_same_as().to_vec(),
-                ..AbstractShortPreambleBuilderState::default()
-            },
             label_args: Vec::new(),
             used_boxes: Vec::new(),
             short_jump_args: Vec::new(),
@@ -1404,10 +1401,13 @@ impl ExtendedShortPreambleBuilder {
         }
     }
 
+    /// shortpreamble.py:458-461: setup(jump_args, short, label_args)
+    ///
+    /// RPython parity: builds single `short` list from base ops + JUMP sentinel.
+    /// For each base op, ensures missing deps from produced_short_boxes are
+    /// inserted before the consumer (RPython use_box arg-handling parity).
     pub fn setup(&mut self, short_preamble: &ShortPreamble, label_args: &[OpRef]) {
         // Build Phase 1 → current inputarg remap from arg_mapping.
-        // arg_mapping: (arg_position, label_arg_index) — maps op arg positions
-        // to inputarg indices. We invert this to get: Phase 1 OpRef → current inputarg.
         self.phase1_to_inputarg.clear();
         for entry in &short_preamble.ops {
             for &(arg_pos, label_idx) in &entry.arg_mapping {
@@ -1420,40 +1420,8 @@ impl ExtendedShortPreambleBuilder {
                 }
             }
         }
-        // Copy base_short_ops and apply Phase 1 → current remap
-        self.base_short_ops = short_preamble
-            .ops
-            .iter()
-            .map(|entry| {
-                let mut op = entry.op.clone();
-                for arg in &mut op.args {
-                    if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
-                        *arg = remapped;
-                    }
-                }
-                op
-            })
-            .collect();
-        self.base_results = self.base_short_ops.iter().map(|op| op.pos).collect();
-        self.extra_state.short.clear();
-        self.extra_state.used_boxes.clear();
-        self.extra_state.short_preamble_jump.clear();
-        self.extra_state.extra_same_as = self.base_extra_same_as.clone();
-        self.extra_state.label_args = label_args.to_vec();
-        self.extra_state.short_inputargs = self.short_inputargs.clone();
-        self.label_args = label_args.to_vec();
-        self.used_boxes = short_preamble.used_boxes.clone();
-        // Also remap jump_args
-        self.short_jump_args = short_preamble
-            .jump_args
-            .iter()
-            .map(|arg| self.phase1_to_inputarg.get(arg).copied().unwrap_or(*arg))
-            .collect();
-        // Remap produced_short_boxes args: Phase 1 inputarg OpRefs → current
-        // inputarg OpRefs. This ensures use_box-added ops (extra short ops)
-        // also reference current inputargs, not stale Phase 1 OpRefs.
-        // Only inputarg refs change; op result refs (produced_short_boxes
-        // keys) are Phase 1 results, not inputargs, so lookup is unaffected.
+        // Remap produced_short_boxes args: Phase 1 → current inputargs
+        // Must happen BEFORE building short list, so deps have correct args.
         if !self.phase1_to_inputarg.is_empty() {
             for produced in self.produced_short_boxes.values_mut() {
                 for arg in &mut produced.preamble_op.args {
@@ -1463,135 +1431,102 @@ impl ExtendedShortPreambleBuilder {
                 }
             }
         }
-        // shortpreamble.py:393 parity: resolve missing deps in base_short_ops.
-        // In RPython, use_box adds deps to the SAME self.short list, so deps
-        // always precede their consumers. In majit, base_short_ops (from the
-        // previous ShortPreamble) and extra_state.short (from use_box) are
-        // separate. Deps added by use_box during replay appear AFTER all base
-        // ops, causing ordering violations.
-        //
-        // Fix: after produced_short_boxes remap, scan base_short_ops for args
-        // that reference produced ops not yet in base. Recursively collect
-        // transitive deps and insert them before their first consumer.
-        // produced_short_boxes args are already remapped at this point.
-        self.resolve_base_deps();
-    }
-
-    /// Recursively collect transitive deps for `opref` from produced_short_boxes.
-    /// Deps are collected in dependency order (deps before consumers).
-    fn collect_transitive_deps(
-        &self,
-        opref: OpRef,
-        base_set: &HashSet<OpRef>,
-        collected: &mut Vec<Op>,
-        visited: &mut HashSet<OpRef>,
-    ) {
-        if !visited.insert(opref) {
-            return;
-        }
-        if let Some(produced) = self.produced_short_boxes.get(&opref) {
-            // Recurse into this dep's own args first (transitive)
-            for &arg in &produced.preamble_op.args {
-                if !base_set.contains(&arg)
-                    && !self.extra_state.short_inputargs.contains(&arg)
-                    && !self.extra_state.known_constants.contains(&arg)
-                    && self.produced_short_boxes.contains_key(&arg)
-                    && !visited.contains(&arg)
-                {
-                    self.collect_transitive_deps(arg, base_set, collected, visited);
+        // Build single short list with inline dep resolution.
+        // RPython use_box parity: for each op, ensure all args that reference
+        // produced ops are already in the list. If not, insert them first.
+        let inputargs_set: HashSet<OpRef> = label_args.iter().copied().collect();
+        let constants_set: HashSet<u32> = short_preamble.constants.keys().copied().collect();
+        self.short.clear();
+        self.short_results.clear();
+        for entry in &short_preamble.ops {
+            let mut op = entry.op.clone();
+            for arg in &mut op.args {
+                if let Some(&remapped) = self.phase1_to_inputarg.get(arg) {
+                    *arg = remapped;
                 }
             }
-            collected.push(produced.preamble_op.clone());
-        }
-    }
-
-    fn resolve_base_deps(&mut self) {
-        let base_set: HashSet<OpRef> = self.base_short_ops.iter().map(|op| op.pos).collect();
-        // Collect all args from base ops that need deps not in base
-        let needed: HashSet<OpRef> = self
-            .base_short_ops
-            .iter()
-            .flat_map(|op| op.args.iter().copied())
-            .filter(|arg| {
-                !base_set.contains(arg)
-                    && !self.extra_state.short_inputargs.contains(arg)
-                    && !self.extra_state.known_constants.contains(arg)
-                    && self.produced_short_boxes.contains_key(arg)
-            })
-            .collect();
-        if needed.is_empty() {
-            return;
-        }
-        // Collect transitive deps in order
-        let mut all_deps: Vec<Op> = Vec::new();
-        let mut visited: HashSet<OpRef> = HashSet::new();
-        for &opref in &needed {
-            self.collect_transitive_deps(opref, &base_set, &mut all_deps, &mut visited);
-        }
-        if all_deps.is_empty() {
-            return;
-        }
-        let dep_set: HashSet<OpRef> = all_deps.iter().map(|op| op.pos).collect();
-        // Insert deps before their first consumer in base_short_ops
-        let mut new_base = Vec::with_capacity(self.base_short_ops.len() + all_deps.len());
-        let mut inserted: HashSet<OpRef> = HashSet::new();
-        for op in &self.base_short_ops {
+            // RPython use_box arg loop: insert missing deps before this op
             for &arg in &op.args {
-                if dep_set.contains(&arg) && !inserted.contains(&arg) {
-                    for dep in &all_deps {
-                        if !inserted.contains(&dep.pos) && self.is_dep_of(dep.pos, arg, &dep_set) {
-                            new_base.push(dep.clone());
-                            inserted.insert(dep.pos);
+                if self.short_results.contains(&arg)
+                    || inputargs_set.contains(&arg)
+                    || self.known_constants.contains(&arg)
+                    || constants_set.contains(&arg.0)
+                {
+                    continue;
+                }
+                if let Some(dep) = self.produced_short_boxes.get(&arg) {
+                    let dep_pos = dep.preamble_op.pos;
+                    if !self.short_results.contains(&dep_pos) {
+                        self.short_results.insert(dep_pos);
+                        self.short.push(dep.preamble_op.clone());
+                        if dep.preamble_op.opcode.is_ovf() {
+                            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
                         }
                     }
                 }
             }
-            new_base.push(op.clone());
+            self.short_results.insert(op.pos);
+            self.short.push(op);
         }
-        self.base_short_ops = new_base;
-        self.base_results = self.base_short_ops.iter().map(|op| op.pos).collect();
-    }
-
-    /// Check if `dep_pos` is a transitive dep of `target` within `dep_set`.
-    fn is_dep_of(&self, dep_pos: OpRef, target: OpRef, dep_set: &HashSet<OpRef>) -> bool {
-        if dep_pos == target {
-            return true;
-        }
-        if let Some(produced) = self.produced_short_boxes.get(&target) {
-            for &arg in &produced.preamble_op.args {
-                if dep_set.contains(&arg) && self.is_dep_of(dep_pos, arg, dep_set) {
-                    return true;
-                }
-            }
-        }
-        false
+        // JUMP sentinel at end (RPython: short[-1] is always JUMP)
+        let jump_args: Vec<OpRef> = short_preamble
+            .jump_args
+            .iter()
+            .map(|arg| self.phase1_to_inputarg.get(arg).copied().unwrap_or(*arg))
+            .collect();
+        self.short.push(Op::new(OpCode::Jump, &jump_args));
+        // Reset state
+        self.extra_same_as = self.base_extra_same_as.clone();
+        self.short_preamble_jump.clear();
+        self.label_args = label_args.to_vec();
+        self.used_boxes = short_preamble.used_boxes.clone();
+        self.short_jump_args = jump_args;
     }
 
     fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         let canonical_result = produced.preamble_op.pos;
-        if self.extra_state.short_results.contains(&canonical_result)
-            || self.base_results.contains(&canonical_result)
-        {
+        if self.short_results.contains(&canonical_result) {
             return Some(produced.preamble_op);
         }
         if !visiting.insert(result) {
             return None;
         }
         for &arg in &produced.preamble_op.args {
+            if self.known_constants.contains(&arg) {
+                continue;
+            }
             if self.produced_short_boxes.contains_key(&arg) {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
         visiting.remove(&result);
-        Some(self.extra_state.append_to_short(result, &produced))
+        // Append to self.short directly
+        let preamble_op = produced.preamble_op.clone();
+        self.short_results.insert(canonical_result);
+        self.short.push(preamble_op.clone());
+        if preamble_op.opcode.is_ovf() {
+            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+        }
+        Some(preamble_op)
     }
 
+    /// shortpreamble.py:471-477: add_preamble_op
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
+        let current_result = produced.preamble_op.pos;
+        if produced.invented_name {
+            let source = produced.same_as_source.unwrap_or(result);
+            let mut op = Op::new(
+                OpCode::same_as_for_type(produced.preamble_op.result_type()),
+                &[source],
+            );
+            op.pos = current_result;
+            self.extra_same_as.push(op);
+        }
         self.label_args.push(result);
-        self.used_boxes.push(result);
+        self.used_boxes.push(current_result);
         self.short_jump_args.push(produced.preamble_op.pos);
-        self.extra_state.record_preamble_use(result, &produced);
+        self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
     pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
@@ -1607,8 +1542,8 @@ impl ExtendedShortPreambleBuilder {
         self.use_box_recursive(result, &mut HashSet::new())
     }
 
-    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
-    /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
+    /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
+    /// Called by force_op_from_preamble (unroll.py:32).
     pub fn use_box(
         &mut self,
         result: OpRef,
@@ -1616,15 +1551,49 @@ impl ExtendedShortPreambleBuilder {
         result_guards: &[Op],
     ) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
-        let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
-        Some(self.extra_state.use_box(
-            &produced,
-            &self.base_results,
-            &self.produced_short_boxes,
-            &pos_to_key,
-            arg_guards,
-            result_guards,
-        ))
+        let canonical = produced.preamble_op.pos;
+        // shortpreamble.py:479: jump_op = self.short.pop()
+        let jump_op = self.short.pop();
+        // shortpreamble.py:480: AbstractShortPreambleBuilder.use_box(...)
+        if !self.short_results.contains(&canonical) {
+            let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
+            // Add deps for each arg
+            for &arg in &produced.preamble_op.args {
+                if self.short_results.contains(&arg)
+                    || self.short_inputargs.contains(&arg)
+                    || self.known_constants.contains(&arg)
+                {
+                    continue;
+                }
+                let dep = self.produced_short_boxes.get(&arg).or_else(|| {
+                    pos_to_key
+                        .get(&arg)
+                        .and_then(|key| self.produced_short_boxes.get(key))
+                });
+                if let Some(dep) = dep {
+                    let dep_pos = dep.preamble_op.pos;
+                    if !self.short_results.contains(&dep_pos) {
+                        self.short_results.insert(dep_pos);
+                        self.short.push(dep.preamble_op.clone());
+                        if dep.preamble_op.opcode.is_ovf() {
+                            self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+                        }
+                    }
+                }
+            }
+            self.short.extend_from_slice(arg_guards);
+            self.short_results.insert(canonical);
+            self.short.push(produced.preamble_op.clone());
+            if produced.preamble_op.opcode.is_ovf() {
+                self.short.push(Op::new(OpCode::GuardNoOverflow, &[]));
+            }
+            self.short.extend_from_slice(result_guards);
+        }
+        // shortpreamble.py:481: self.short.append(jump_op)
+        if let Some(jump) = jump_op {
+            self.short.push(jump);
+        }
+        Some(produced.preamble_op)
     }
 
     pub fn produced_short_op(&self, result: OpRef) -> Option<ProducedShortOp> {
@@ -1655,8 +1624,8 @@ impl ExtendedShortPreambleBuilder {
         loop_constants: &HashMap<u32, i64>,
         loop_constant_types: &HashMap<u32, majit_ir::Type>,
     ) -> ShortPreamble {
-        let mut ops = self.base_short_ops.clone();
-        ops.extend(self.extra_state.short.iter().cloned());
+        // short[..len-1] excludes the JUMP sentinel
+        let ops: Vec<Op> = self.short[..self.short_ops_len()].to_vec();
         let inputargs = if self.label_args.is_empty() {
             &self.short_inputargs
         } else {
@@ -1670,10 +1639,6 @@ impl ExtendedShortPreambleBuilder {
             loop_constants,
             loop_constant_types,
         );
-        // Preserve Phase 1 inputargs for inline_short_preamble mapping.
-        // RPython uses renamed inputargs that are stable across compilations.
-        // In majit, ops reference Phase 1 OpRefs, so we store Phase 1
-        // inputargs to ensure they're mapped even when current inputargs differ.
         if inputargs != &self.short_inputargs {
             sp.phase1_inputargs = Some(self.short_inputargs.clone());
         }
@@ -1681,7 +1646,7 @@ impl ExtendedShortPreambleBuilder {
     }
 
     pub fn extra_same_as(&self) -> &[Op] {
-        &self.extra_state.extra_same_as
+        &self.extra_same_as
     }
 
     pub fn label_args(&self) -> &[OpRef] {
@@ -1692,17 +1657,16 @@ impl ExtendedShortPreambleBuilder {
         &self.short_jump_args
     }
 
+    /// short ops length excluding JUMP sentinel.
     pub fn short_ops_len(&self) -> usize {
-        self.base_short_ops.len() + self.extra_state.short.len()
+        self.short.len().saturating_sub(1)
     }
 
     pub fn short_op(&self, index: usize) -> Option<&Op> {
-        if index < self.base_short_ops.len() {
-            self.base_short_ops.get(index)
+        if index < self.short_ops_len() {
+            self.short.get(index)
         } else {
-            self.extra_state
-                .short
-                .get(index.saturating_sub(self.base_short_ops.len()))
+            None
         }
     }
 }
