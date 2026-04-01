@@ -55,7 +55,8 @@ pub fn walk_virtuals(virtuals: &[(OpRef, PtrInfo)], visitor: &mut impl VirtualVi
             | PtrInfo::KnownClass { .. }
             | PtrInfo::Instance(_)
             | PtrInfo::Struct(_)
-            | PtrInfo::Array(_) => {}
+            | PtrInfo::Array(_)
+            | PtrInfo::Str(_) => {}
         }
     }
 }

@@ -1443,7 +1443,7 @@ mod tests {
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
-        opt.optimize(ops)
+        opt.propagate_all_forward(ops)
     }
 
     /// Create an OptIntBounds with specific bounds pre-set and run it on ops.

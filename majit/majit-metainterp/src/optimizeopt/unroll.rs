@@ -127,7 +127,7 @@ impl UnrollOptimizer {
     pub fn optimize_preamble(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.add_pass(Box::new(OptUnroll::new()));
-        optimizer.optimize(ops)
+        optimizer.propagate_all_forward(ops)
     }
 
     /// unroll.py: optimize_peeled_loop(trace)
@@ -136,7 +136,7 @@ impl UnrollOptimizer {
     /// information; this method optimizes the repeating body.
     pub fn optimize_peeled_loop(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
-        optimizer.optimize(ops)
+        optimizer.propagate_all_forward(ops)
     }
 
     /// unroll.py:238-242: jump_to_preamble(cell_token, jump_op).
@@ -2678,6 +2678,14 @@ impl OptUnroll {
             }
             PtrInfo::Virtualizable(info) => {
                 ctx.set_ptr_info(opref, PtrInfo::Virtualizable(info));
+            }
+            PtrInfo::Str(info) => {
+                // unroll.py:85-89: StrPtrInfo — clone lenbound
+                let mut new_info = info.clone();
+                if let Some(ref bound) = info.lenbound {
+                    new_info.lenbound = Some(bound.clone());
+                }
+                ctx.set_ptr_info(opref, PtrInfo::Str(new_info));
             }
         }
     }

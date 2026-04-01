@@ -587,7 +587,7 @@ impl VirtualState {
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (field_idx, field_state) in fields {
                     let field_ref = ptr_info
-                        .and_then(|info| info.get_field(*field_idx))
+                        .and_then(|info| info.getfield(*field_idx))
                         .map(|f| ctx.get_box_replacement(f))
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_for_entry(
@@ -604,7 +604,7 @@ impl VirtualState {
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = ptr_info
-                        .and_then(|info| info.get_item(index))
+                        .and_then(|info| info.getitem(index))
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_for_entry(item_state, item_ref, ctx, boxes, next_slot);
                 }
@@ -616,7 +616,7 @@ impl VirtualState {
                 for fields in element_fields {
                     for (_, field_state) in fields {
                         let item_ref = ptr_info
-                            .and_then(|info| info.get_item(flat_index))
+                            .and_then(|info| info.getitem(flat_index))
                             .unwrap_or(OpRef::NONE);
                         Self::enum_forced_boxes_for_entry(
                             field_state,
@@ -757,7 +757,7 @@ impl VirtualState {
                     .iter()
                     .map(|(field_idx, _)| {
                         ctx.get_ptr_info(resolved)
-                            .and_then(|info| info.get_field(*field_idx))
+                            .and_then(|info| info.getfield(*field_idx))
                             .map(|f| ctx.get_box_replacement(f))
                             .unwrap_or(OpRef::NONE)
                     })
@@ -780,7 +780,7 @@ impl VirtualState {
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = ctx
                         .get_ptr_info(resolved)
-                        .and_then(|info| info.get_item(index))
+                        .and_then(|info| info.getitem(index))
                         .unwrap_or(OpRef::NONE);
                     Self::enum_forced_boxes_for_entry_with_optimizer(
                         item_state,
@@ -801,7 +801,7 @@ impl VirtualState {
                     for (_, field_state) in fields {
                         let item_ref = ctx
                             .get_ptr_info(resolved)
-                            .and_then(|info| info.get_item(flat_index))
+                            .and_then(|info| info.getitem(flat_index))
                             .unwrap_or(OpRef::NONE);
                         Self::enum_forced_boxes_for_entry_with_optimizer(
                             field_state,
@@ -1328,7 +1328,7 @@ impl VirtualState {
     }
 
     /// Get the lenbound of a virtual array at the given index, if any.
-    pub fn get_lenbound(&self, index: usize) -> Option<&IntBound> {
+    pub fn getlenbound(&self, index: usize) -> Option<&IntBound> {
         match self.state.get(index) {
             Some(VirtualStateInfo::VArray { lenbound, .. }) => lenbound.as_ref(),
             _ => None,
@@ -1673,6 +1673,9 @@ fn export_single_value(
                 return VirtualStateInfo::NonNull;
             }
             PtrInfo::Instance(_) | PtrInfo::Struct(_) | PtrInfo::Array(_) => {
+                return VirtualStateInfo::NonNull;
+            }
+            PtrInfo::Str(_) => {
                 return VirtualStateInfo::NonNull;
             }
         }

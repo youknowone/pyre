@@ -179,6 +179,22 @@ pub enum PtrInfo {
     VirtualRawBuffer(VirtualRawBufferInfo),
     /// Virtualizable object (interpreter frame).
     Virtualizable(VirtualizableFieldState),
+    /// vstring.py:50: StrPtrInfo — string with known length bounds.
+    /// Tracks lenbound (IntBound) and mode (string vs unicode).
+    Str(StrPtrInfo),
+}
+
+/// vstring.py:50-140: StrPtrInfo
+#[derive(Clone, Debug)]
+pub struct StrPtrInfo {
+    /// vstring.py: self.lenbound — IntBound for string length.
+    pub lenbound: Option<IntBound>,
+    /// vstring.py: self.mode — 0 = mode_string, 1 = mode_unicode.
+    pub mode: u8,
+    /// vstring.py: self.length — known exact length (-1 if unknown).
+    pub length: i32,
+    /// info.py:91-92: last_guard_pos
+    pub last_guard_pos: i32,
 }
 
 impl PtrInfo {
@@ -205,6 +221,7 @@ impl PtrInfo {
             PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos,
             PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos,
             PtrInfo::Virtualizable(v) => v.last_guard_pos,
+            PtrInfo::Str(s) => s.last_guard_pos,
             PtrInfo::Constant(_) => return None, // ConstPtrInfo has no last_guard_pos
         };
         if pos < 0 { None } else { Some(pos as usize) }
@@ -224,6 +241,7 @@ impl PtrInfo {
             PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos = pos,
             PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos = pos,
             PtrInfo::Virtualizable(v) => v.last_guard_pos = pos,
+            PtrInfo::Str(s) => s.last_guard_pos = pos,
             PtrInfo::Constant(_) => {} // ConstPtrInfo: no-op
         }
     }
@@ -328,7 +346,8 @@ impl PtrInfo {
             | PtrInfo::VirtualStruct(_)
             | PtrInfo::VirtualArrayStruct(_)
             | PtrInfo::VirtualRawBuffer(_)
-            | PtrInfo::Virtualizable(_) => true,
+            | PtrInfo::Virtualizable(_)
+            | PtrInfo::Str(_) => true,
         }
     }
 
@@ -412,6 +431,27 @@ impl PtrInfo {
             PtrInfo::Array(_) => {
                 // info.py:632-633: ArrayPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
+            }
+            PtrInfo::Str(sinfo) => {
+                // vstring.py:116-126: StrPtrInfo.make_guards
+                short.push(Op::new(OpCode::GuardNonnull, &[op]));
+                if let Some(ref bound) = sinfo.lenbound {
+                    if bound.lower >= 1 {
+                        let lenop_code = if sinfo.mode == 0 {
+                            OpCode::Strlen
+                        } else {
+                            OpCode::Unicodelen
+                        };
+                        let lenop = Op::new(lenop_code, &[op]);
+                        let lenop_pos = lenop.pos;
+                        short.push(lenop);
+                        // intutils.py: IntBound.make_guards → generate bound guards
+                        for (guard_opcode, value) in bound.make_guards() {
+                            let c = Self::alloc_guard_const(const_pool, Value::Int(value));
+                            short.push(Op::new(guard_opcode, &[lenop_pos, c]));
+                        }
+                    }
+                }
             }
             // Virtuals/Virtualizable: no guards needed in short preamble
             _ => {}
@@ -548,7 +588,7 @@ impl PtrInfo {
     /// info.py:137-160 / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     ///
-    /// Generated ops are routed via emit_through_passes_after() (RPython
+    /// Generated ops are routed via emit_extra() (RPython
     /// emit_extra parity) so downstream passes can observe them.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
         self.force_box_impl(opref, ctx, false)
@@ -595,7 +635,7 @@ impl PtrInfo {
                 // OptVirtualize from re-absorbing the materialized New().
                 // The non-virtual PtrInfo (Struct/Instance) set on alloc_ref
                 // tells downstream passes this is materialized.
-                ctx.emit_through_passes_after(ctx.current_pass_idx, op)
+                ctx.emit_extra(ctx.current_pass_idx, op)
             }
         };
 
@@ -837,7 +877,7 @@ impl PtrInfo {
     }
 
     /// info.py: getlenbound() on ArrayPtrInfo.
-    pub fn get_lenbound(&self) -> Option<&IntBound> {
+    pub fn getlenbound(&self) -> Option<&IntBound> {
         match self {
             PtrInfo::Array(v) => Some(&v.lenbound),
             _ => None,
@@ -849,7 +889,7 @@ impl PtrInfo {
     /// RPython: _fields[fielddescr.get_index()] = op. In majit, fields
     /// is a (field_idx, OpRef) list; field_descrs is managed separately
     /// by OptVirtualize (optimize_setfield_gc).
-    pub fn set_field(&mut self, field_idx: u32, value: OpRef) {
+    pub fn setfield(&mut self, field_idx: u32, value: OpRef) {
         match self {
             PtrInfo::Instance(v) => {
                 for entry in &mut v.fields {
@@ -994,7 +1034,7 @@ impl PtrInfo {
     }
 
     /// info.py: getfield(field_descr) — get a field from a virtual object.
-    pub fn get_field(&self, field_idx: u32) -> Option<OpRef> {
+    pub fn getfield(&self, field_idx: u32) -> Option<OpRef> {
         match self {
             PtrInfo::Instance(v) => v
                 .fields
@@ -1021,7 +1061,7 @@ impl PtrInfo {
     }
 
     /// info.py: setitem(index, value) — set an item in a virtual array.
-    pub fn set_item(&mut self, index: usize, value: OpRef) {
+    pub fn setitem(&mut self, index: usize, value: OpRef) {
         match self {
             PtrInfo::Array(v) => {
                 if index >= v.items.len() {
@@ -1039,7 +1079,7 @@ impl PtrInfo {
     }
 
     /// info.py: getitem(index) — get an item from a virtual array.
-    pub fn get_item(&self, index: usize) -> Option<OpRef> {
+    pub fn getitem(&self, index: usize) -> Option<OpRef> {
         match self {
             PtrInfo::Array(v) => v.items.get(index).copied(),
             PtrInfo::VirtualArray(v) => v.items.get(index).copied(),
@@ -1551,30 +1591,30 @@ mod tests {
     }
 
     #[test]
-    fn test_ptr_info_set_get_field() {
+    fn test_ptr_info_set_getfield() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
 
-        assert_eq!(info.get_field(0), None);
-        info.set_field(0, OpRef(10));
-        assert_eq!(info.get_field(0), Some(OpRef(10)));
-        info.set_field(0, OpRef(20)); // overwrite
-        assert_eq!(info.get_field(0), Some(OpRef(20)));
-        info.set_field(1, OpRef(30));
-        assert_eq!(info.get_field(1), Some(OpRef(30)));
+        assert_eq!(info.getfield(0), None);
+        info.setfield(0, OpRef(10));
+        assert_eq!(info.getfield(0), Some(OpRef(10)));
+        info.setfield(0, OpRef(20)); // overwrite
+        assert_eq!(info.getfield(0), Some(OpRef(20)));
+        info.setfield(1, OpRef(30));
+        assert_eq!(info.getfield(1), Some(OpRef(30)));
     }
 
     #[test]
-    fn test_ptr_info_set_get_item() {
+    fn test_ptr_info_set_getitem() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_array(descr, 3, false);
 
-        assert_eq!(info.get_item(0), Some(OpRef::NONE)); // initialized to NONE
-        info.set_item(0, OpRef(10));
-        assert_eq!(info.get_item(0), Some(OpRef(10)));
-        info.set_item(2, OpRef(30));
-        assert_eq!(info.get_item(2), Some(OpRef(30)));
-        assert_eq!(info.get_item(5), None); // out of bounds
+        assert_eq!(info.getitem(0), Some(OpRef::NONE)); // initialized to NONE
+        info.setitem(0, OpRef(10));
+        assert_eq!(info.getitem(0), Some(OpRef(10)));
+        info.setitem(2, OpRef(30));
+        assert_eq!(info.getitem(2), Some(OpRef(30)));
+        assert_eq!(info.getitem(5), None); // out of bounds
     }
 
     #[test]
@@ -1596,8 +1636,8 @@ mod tests {
     fn test_ptr_info_visitor_walk() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.set_field(0, OpRef(10));
-        info.set_field(1, OpRef(20));
+        info.setfield(0, OpRef(10));
+        info.setfield(1, OpRef(20));
         let refs = info.visitor_walk_recursive();
         assert_eq!(refs, vec![OpRef(10), OpRef(20)]);
     }
