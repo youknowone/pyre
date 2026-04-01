@@ -3,7 +3,17 @@ use pyre_interpreter::*;
 fn main() {
     pyre_interpreter::importing::install_builtin_modules();
 
-    let source = "print(1 + 2)";
+    let source = r#"
+def fib(n):
+    a, b = 0, 1
+    i = 0
+    while i < n:
+        a, b = b, a + b
+        i = i + 1
+    return a
+
+print(fib(201))
+"#;
     let code = match compile_source(source, Mode::Exec) {
         Ok(code) => code,
         Err(e) => {
