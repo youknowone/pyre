@@ -12,6 +12,7 @@ pub mod frame_layout;
 pub mod helpers;
 pub mod metainterp;
 pub mod state;
+pub use state::set_majit_jitcode;
 pub mod trace;
 pub mod virtualizable_spec;
 
