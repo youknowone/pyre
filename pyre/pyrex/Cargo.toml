@@ -13,6 +13,6 @@ path = "src/main.rs"
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
-pyre-jit = { path = "../pyre-jit" }
-majit-metainterp = { path = "../../majit/majit-metainterp" }
+pyre-jit = { workspace = true }
+majit-metainterp = { workspace = true }
 lexopt = "0.3"

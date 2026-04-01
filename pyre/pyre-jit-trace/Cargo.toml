@@ -7,18 +7,18 @@ repository.workspace = true
 description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 
 [dependencies]
-pyre-object = { path = "../pyre-object" }
-pyre-interpreter = { path = "../pyre-interpreter" }
-majit-ir = { path = "../../majit/majit-ir" }
-majit-metainterp = { path = "../../majit/majit-metainterp" }
-majit-backend = { path = "../../majit/majit-backend" }
-majit-trace = { path = "../../majit/majit-trace" }
-majit-gc = { path = "../../majit/majit-gc" }
+pyre-object = { workspace = true }
+pyre-interpreter = { workspace = true }
+majit-ir = { workspace = true }
+majit-metainterp = { workspace = true }
+majit-backend = { workspace = true }
+majit-trace = { workspace = true }
+majit-gc = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-majit-backend-cranelift = { path = "../../majit/majit-backend-cranelift" }
+majit-backend-cranelift = { workspace = true }
 
 [build-dependencies]
-majit-codewriter = { path = "../../majit/majit-codewriter" }
+majit-codewriter = { workspace = true }
 serde_json = "1"
 syn = { version = "2", features = ["full", "visit"] }

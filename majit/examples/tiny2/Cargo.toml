@@ -2,8 +2,9 @@
 name = "tiny2"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-majit-ir = { path = "../../majit-ir" }
-majit-macros = { path = "../../majit-macros" }
-majit-metainterp = { path = "../../majit-metainterp" }
+majit-ir = { workspace = true }
+majit-macros = { workspace = true }
+majit-metainterp = { workspace = true }

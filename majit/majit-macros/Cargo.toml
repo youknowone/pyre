@@ -15,5 +15,4 @@ quote = "1"
 proc-macro2 = "1"
 
 [dev-dependencies]
-majit-ir = { path = "../majit-ir" }
-majit-metainterp = { path = "../majit-metainterp" }
+majit-ir = { workspace = true }

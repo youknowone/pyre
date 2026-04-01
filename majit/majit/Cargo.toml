@@ -7,10 +7,10 @@ repository.workspace = true
 description = "Meta-tracing JIT compiler framework"
 
 [dependencies]
-majit-ir = { path = "../majit-ir" }
-majit-metainterp = { path = "../majit-metainterp" }
-majit-trace = { path = "../majit-trace" }
-majit-backend = { path = "../majit-backend" }
-majit-backend-cranelift = { path = "../majit-backend-cranelift" }
-majit-gc = { path = "../majit-gc" }
-majit-macros = { path = "../majit-macros" }
+majit-ir = { workspace = true }
+majit-metainterp = { workspace = true }
+majit-trace = { workspace = true }
+majit-backend = { workspace = true }
+majit-backend-cranelift = { workspace = true }
+majit-gc = { workspace = true }
+majit-macros = { workspace = true }

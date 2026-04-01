@@ -196,7 +196,7 @@ pub extern "C" fn majit_shadow_stack_push(gcref_raw: i64) -> i64 {
 
 /// Pop shadow stack to depth and return the value at given index.
 #[unsafe(no_mangle)]
-pub extern "C" fn majit_shadow_stack_pop_and_get(depth: i64, index: i64) -> i64 {
+pub extern "C" fn majit_shadow_stack_pop_and_get(_depth: i64, index: i64) -> i64 {
     SHADOW_STACK.with(|ss| {
         let ss = ss.borrow();
         let idx = index as usize;
