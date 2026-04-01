@@ -5573,6 +5573,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.decode_float(tagged)
     }
 
+    /// resume.py:1410-1421 load_next_value_of_type
+    pub fn next_value_of_type(&mut self, tp: majit_ir::Type) -> i64 {
+        match tp {
+            majit_ir::Type::Int => self.next_int(),
+            majit_ir::Type::Ref => self.next_ref(),
+            majit_ir::Type::Float => self.next_float(),
+            _ => self.next_int(),
+        }
+    }
+
     /// resume.py:942 done_reading
     pub fn done_reading(&self) -> bool {
         self.resumecodereader.items_read >= self.items_resume_section as usize
