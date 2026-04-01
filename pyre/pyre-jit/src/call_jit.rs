@@ -1662,6 +1662,8 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1312-1343 blackhole_from_resumedata:
     // ResumeDataDirectReader decodes rd_numb, builds BH chain.
+    // compile.py:990: vinfo = self.jitdriver_sd.virtualizable_info
+    let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
     let allocator = resume::NullAllocator;
     let bh = resume::blackhole_from_resumedata(
         builder,
@@ -1673,8 +1675,8 @@ pub fn blackhole_resume_via_rd_numb(
         None,                   // rd_pendingfields
         rd_guard_pendingfields, // rd_guard_pendingfields
         None,                   // vrefinfo
-        None,                   // vinfo
-        None,                   // ginfo
+        Some(&vinfo as &dyn resume::VirtualizableInfo),
+        None, // ginfo
         &allocator,
     );
 
