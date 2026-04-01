@@ -7,6 +7,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
+# Trigger release workflow via workflow_dispatch so a wrapper can normalize repo-specific tags
+dispatch-releases = true
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
