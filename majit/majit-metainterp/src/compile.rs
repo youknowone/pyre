@@ -172,7 +172,6 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
-        // RPython Box.type parity: exit_types from fail_args (liveboxes).
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
