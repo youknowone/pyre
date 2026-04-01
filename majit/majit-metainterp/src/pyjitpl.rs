@@ -3027,10 +3027,9 @@ impl<M: Clone> MetaInterp<M> {
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
         // LivenessInfo has precise per-local liveness (liveness.py parity).
-        // Blocked: fib_recursive blackhole_from_resumedata path crashes
-        // with compact fail_args — blackhole registers get wrong values.
-        // Fix: align blackhole_from_resumedata with compact layout or
-        // ensure all eval.rs guard failure paths handle compact correctly.
+        // Blocked: fib_recursive SEGFAULT in blackhole_from_resumedata —
+        // decode_ref(TAGINT) boxes via w_int_new but the boxed object
+        // may be reclaimed before BH returns (GC/lifetime issue).
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,

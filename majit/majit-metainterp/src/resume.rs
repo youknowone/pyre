@@ -5275,6 +5275,12 @@ pub trait BlackholeAllocator {
     fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
         self.setarrayitem_int(array, index, value, descr);
     }
+    /// Pyre-specific: box a raw int to a PyObject ref.
+    /// Called by decode_ref when TAGINT appears in a ref-register slot
+    /// (pyre has no typed register files — optimizer may unbox Ref→Int).
+    fn box_int(&self, value: i64) -> i64 {
+        value // default: return raw value (override in pyre allocator)
+    }
 }
 
 /// Default no-op allocator.
@@ -5882,8 +5888,9 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // pyre parity: all values are in ref registers (no typed
                 // register files). Optimizer may unbox Ref→Int, producing
                 // TAGINT in snapshot numbering for a ref-register slot.
-                // Return the raw int value (RPython decode_int path).
-                num as i64
+                // Box the int back to a PyObject because ref registers
+                // store pointers. The allocator handles boxing.
+                self.allocator.box_int(num as i64)
             }
             _ => {
                 panic!("decode_ref: unexpected tag {tag}")

@@ -2734,9 +2734,9 @@ fn build_resumed_frames(
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][resume] exit_types={} dead_frame={} vable={} frames={}",
-            exit_layout.exit_types.len(),
-            dead_frame_typed.len(),
+            "[jit][resume] exit_types={:?} dead_frame={:?} vable={} frames={}",
+            exit_layout.exit_types,
+            dead_frame_typed,
             vable_values.len(),
             frames.len()
         );
