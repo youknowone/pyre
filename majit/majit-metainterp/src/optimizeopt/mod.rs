@@ -2055,6 +2055,9 @@ impl OptContext {
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         op.rd_numb = Some(numb_state.create_numbering());
         op.rd_consts = Some(memo.consts().to_vec());
+
+        // Note: store_final_boxes (line above) already sets op.fail_args
+        // and op.fail_arg_types (via new_types). No additional setting needed.
     }
 
     /// resume.py:560-568 _gettagged — tag an OpRef for pendingfield encoding.

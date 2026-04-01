@@ -2065,16 +2065,19 @@ impl OptUnroll {
                 if new_op.opcode.is_guard() {
                     // unroll.py:405-411: copy_and_change with ResumeAtPositionDescr.
                     // RPython: guard.rd_resume_position = patchguardop.rd_resume_position
-                    // guard is sent through optimizer → store_final_boxes_in_guard
-                    // builds resume data from patchguardop's snapshot.
+                    // then send_extra_operation routes through optimizer which calls
+                    // store_final_boxes_in_guard → finish() to build resume data.
                     //
-                    // Status: patchguardop IS valid (GUARD_FUTURE_CONDITION emitted
-                    // in pyre traces). snapshot_boxes ARE populated. Guard replay
-                    // correctly generates rd_numb in snapshot path. However, guard
-                    // failure in compiled code doesn't correctly resume — likely
-                    // because Cranelift fail_descr for replayed guards lacks proper
-                    // exit_types or the blackhole resume path reads wrong PC from
-                    // the shared patchguardop snapshot.
+                    // Guard replay infrastructure is complete:
+                    // - GUARD_FUTURE_CONDITION emitted by pyre trace recording
+                    // - patchguardop valid in final_ctx with correct rd_resume_position
+                    // - snapshot_boxes populated from Phase 2 body
+                    // - store_final_boxes_in_guard snapshot path builds rd_numb/rd_consts
+                    // - store_final_boxes sets fail_args from liveboxes
+                    //
+                    // Remaining issue: nbody inner-loop guard replay causes compiled
+                    // code infinite loop — guard args mapping produces always-failing
+                    // conditions. Needs per-benchmark debugging of mapping correctness.
                     replay_index += 1;
                     continue;
                 } else if let Some(ref mut fail_args) = new_op.fail_args {
