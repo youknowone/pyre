@@ -1305,7 +1305,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // ginfo
                     allocator,
                 );
-                if let Some(bh) = bh {
+                if let Some((bh, _vable_ptr)) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
                     let jit_exc = crate::blackhole::run_forever_with_portal(
@@ -2812,7 +2812,7 @@ impl<S: JitState> JitDriver<S> {
                     None, // ginfo
                     allocator,
                 );
-                if let Some(bh) = bh {
+                if let Some((bh, _vable_ptr)) = bh {
                     let exc =
                         crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(0);
                     let jit_exc = crate::blackhole::run_forever_with_portal(

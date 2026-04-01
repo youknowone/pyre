@@ -2241,7 +2241,7 @@ pub fn resume_in_blackhole(
         &null_alloc,
     );
 
-    let Some(bh) = bh else {
+    let Some((bh, _virtualizable_ptr)) = bh else {
         return JitException::DoneWithThisFrameVoid;
     };
 

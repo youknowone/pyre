@@ -1694,17 +1694,18 @@ pub fn blackhole_resume_via_rd_numb(
         &allocator,
     );
 
-    let Some(mut bh) = bh else {
+    let Some((mut bh, virtualizable_ptr)) = bh else {
         return BlackholeResult::Failed;
     };
 
-    // Pyre-specific: initialize frame_reg (int register 3) with the frame
-    // pointer from deadframe[0]. The rd_numb only carries ref registers
-    // (locals); the frame pointer is not in the rd_numb because it is a
-    // Ref value that may be virtualized, incompatible with decode_int.
-    // RPython handles this via the virtualizable mechanism; pyre uses a
-    // direct int register for residual call arguments.
-    if !deadframe.is_empty() {
+    // resume.py:1404: virtualizable_ptr was read by consume_vable_info
+    // from the vable section. Store it in int register 3 (pyre's codewriter
+    // convention for frame_reg). This replaces the previous manual injection
+    // from deadframe[0].
+    if virtualizable_ptr != 0 && 3 < bh.registers_i.len() {
+        bh.setarg_i(3, virtualizable_ptr);
+    } else if !deadframe.is_empty() && 3 < bh.registers_i.len() {
+        // Fallback for guards without vable section.
         bh.setarg_i(3, deadframe[0]);
     }
 
