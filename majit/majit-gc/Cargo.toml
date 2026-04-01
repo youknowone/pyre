@@ -7,4 +7,4 @@ repository.workspace = true
 description = "Garbage collector for majit JIT runtime"
 
 [dependencies]
-majit-ir = { path = "../majit-ir" }
+majit-ir = { workspace = true }

@@ -27,12 +27,10 @@ static mut NURSERY_TOP_ADDR: *const u8 = std::ptr::null();
 /// Get the stable addresses of the nursery free/top pointers
 /// for Cranelift inline bump allocation.
 pub fn nursery_global_addrs() -> (usize, usize) {
-    unsafe {
-        (
-            std::ptr::addr_of!(NURSERY_FREE_ADDR) as usize,
-            std::ptr::addr_of!(NURSERY_TOP_ADDR) as usize,
-        )
-    }
+    (
+        std::ptr::addr_of!(NURSERY_FREE_ADDR) as usize,
+        std::ptr::addr_of!(NURSERY_TOP_ADDR) as usize,
+    )
 }
 
 /// Default nursery size: 896KB, matching incminimark's TRANSLATION_PARAMS.

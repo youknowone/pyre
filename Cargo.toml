@@ -3,6 +3,7 @@ version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/youknowone/pyre"
+homepage = "https://github.com/youknowone/pyre"
 
 [workspace]
 resolver = "2"
@@ -40,17 +41,29 @@ members = [
 
 [workspace.dependencies]
 # pyre internal crates
-pyre-object = { path = "pyre/pyre-object" }
-pyre-interpreter = { path = "pyre/pyre-interpreter" }
+pyre-object = { version = "0.0.1", path = "pyre/pyre-object" }
+pyre-interpreter = { version = "0.0.1", path = "pyre/pyre-interpreter" }
+pyre-module = { version = "0.0.1", path = "pyre/pyre-module" }
+pyre-jit = { version = "0.0.1", path = "pyre/pyre-jit" }
+pyre-jit-trace = { version = "0.0.1", path = "pyre/pyre-jit-trace" }
+pyre-wasm = { version = "0.0.1", path = "pyre/pyre-wasm" }
+pyrex = { version = "0.0.1", path = "pyre/pyrex" }
 
 # RustPython compiler toolchain
 rustpython-compiler = "0.5.0"
 rustpython-compiler-core = "0.5.0"
 
 # majit JIT framework
-majit-metainterp = { path = "majit/majit-metainterp" }
-majit-ir = { path = "majit/majit-ir" }
-majit-trace = { path = "majit/majit-trace" }
+majit = { version = "0.0.1", path = "majit/majit" }
+majit-metainterp = { version = "0.0.1", path = "majit/majit-metainterp" }
+majit-ir = { version = "0.0.1", path = "majit/majit-ir" }
+majit-trace = { version = "0.0.1", path = "majit/majit-trace" }
+majit-backend = { version = "0.0.1", path = "majit/majit-backend" }
+majit-backend-cranelift = { version = "0.0.1", path = "majit/majit-backend-cranelift" }
+majit-backend-wasm = { version = "0.0.1", path = "majit/majit-backend-wasm" }
+majit-gc = { version = "0.0.1", path = "majit/majit-gc" }
+majit-macros = { version = "0.0.1", path = "majit/majit-macros" }
+majit-codewriter = { version = "0.0.1", path = "majit/majit-codewriter" }
 
 # shared dependencies
 malachite-bigint = "0.9"

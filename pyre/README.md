@@ -6,28 +6,28 @@
 
 PyPy proved that a meta-tracing JIT can make Python fast. pyre takes that proven architecture and rebuilds it in Rust — gaining memory safety, no GIL, and a modern toolchain, while keeping the same optimization pipeline that makes PyPy fast.
 
-The key insight: pyre's JIT framework [majit](../majit/) handles all the tracing, optimization, and native code generation. This means the pyre interpreter itself is just a straightforward Rust program that executes Python bytecodes — majit turns it into a JIT compiler automatically. In the same way that PyPy is "just a Python interpreter" that RPython makes fast, pyre is "just a Rust interpreter" that majit makes fast.
+The key insight: pyre's JIT framework [MaJIT](../majit/) handles tracing, optimization, and native code generation. This means the pyre interpreter itself can stay close to a straightforward Rust program that executes Python bytecodes, while MaJIT provides the tracing JIT machinery around it. In the same way that PyPy is "just a Python interpreter" that RPython makes fast, pyre is "just a Rust interpreter" that MaJIT makes fast.
 
 ## Status
 
-pyre is under active development. Loop tracing and function inlining work. Integer-heavy benchmarks already match or approach PyPy performance. Many Python features are not yet implemented.
+pyre is under active development. Loop tracing and function inlining work. On integer-heavy workloads, current results still trail PyPy but increasingly follow it. Many Python features are not yet implemented.
 
 ## Benchmarks
 
 Measured on Apple M-series, single core:
 
-| Benchmark | pyre (JIT) | PyPy 7.3 | CPython 3.14 | vs CPython |
-|-----------|-----------|----------|--------------|------------|
-| int_loop | 0.05s | 0.04s | 1.72s | **34x** |
-| fib_loop | 0.07s | 0.05s | 0.09s | **1.3x** |
-| inline_helper | 0.00s | 0.01s | 0.36s | **∞** |
-| fib_recursive | 0.21s | 0.07s | 0.81s | **3.9x** |
-| nbody | 1.63s | 0.02s | 0.19s | — |
-| fannkuch | 2.14s | 0.04s | 0.23s | — |
-| raise_catch | 0.30s | 0.01s | 0.05s | — |
-| spectral_norm | 0.21s | 0.01s | 0.03s | — |
+| Benchmark | pyre (JIT) | PyPy 7.3 | CPython 3.14 | vs PyPy | vs CPython |
+|-----------|-----------|----------|--------------|---------|-------------|
+| int_loop | 0.06s | 0.04s | 1.86s | 1.5x slower | 31.0x faster |
+| fib_loop | 0.08s | 0.06s | 0.11s | 1.3x slower | 1.4x faster |
+| inline_helper | 0.04s | 0.04s | 1.45s | parity | 36.3x faster |
+| fib_recursive | 0.16s | 0.08s | 0.87s | 2.0x slower | 5.4x faster |
+| nbody | 1.90s | 0.03s | 0.21s | 63.3x slower | 9.0x slower |
+| fannkuch | 2.37s | 0.05s | 0.26s | 47.4x slower | 9.1x slower |
+| raise_catch | 0.34s | 0.01s | 0.06s | 34.0x slower | 5.7x slower |
+| spectral_norm | 0.24s | 0.01s | 0.04s | 24.0x slower | 6.0x slower |
 
-Integer-heavy benchmarks where the JIT fires are competitive with PyPy. Float-heavy workloads (nbody, spectral_norm) and exception-heavy paths (raise_catch) run correctly but are not yet JIT-compiled — they fall back to the interpreter.
+Integer-heavy benchmarks where the JIT fires still trail PyPy, but the gap is smaller there than on float-heavy or exception-heavy workloads. Float-heavy workloads (nbody, spectral_norm) and exception-heavy paths (raise_catch) run correctly but are not yet JIT-compiled — they fall back to the interpreter.
 
 Run `pyre/check.sh` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
@@ -43,7 +43,7 @@ cargo build --release -p pyrex
 pyre follows PyPy's meta-tracing approach:
 
 1. The **interpreter** (`pyre-interpreter`) executes Python bytecodes normally.
-2. When a loop or function becomes hot, **majit** records the interpreter's execution as a linear trace of IR operations.
+2. When a loop or function becomes hot, **MaJIT** records the interpreter's execution as a linear trace of IR operations.
 3. The trace passes through an **8-pass optimizer** — the same pipeline as PyPy: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap.
 4. The optimized IR is compiled to **native machine code** via Cranelift.
 5. Subsequent executions of that path run the compiled code directly. Guard failures fall back to the interpreter.
@@ -78,9 +78,9 @@ pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/o
 - **No GIL.** pyre is free-threaded from day one. GIL-dependent code paths in PyPy (heapcache resets on GIL release, `release_gil` effect info, etc.) simply don't exist.
 - **Python 3.14, not 2.7.** PyPy's main branch targets Python 2.7/3.10. pyre targets CPython 3.14 bytecodes directly, using RustPython's compiler frontend.
 
-## Relationship to majit
+## Relationship to MaJIT
 
-[majit](../majit/) (**M**eta-tr**A**cing **JIT**) is a standalone Rust port of RPython's JIT infrastructure. It is a general-purpose framework — any Rust bytecode interpreter annotated with `#[jit_interp]` gets a tracing JIT for free. pyre is majit's primary consumer, but majit has no dependency on pyre.
+[MaJIT](../majit/) (**M**eta-tr**A**cing **JIT**) is a standalone Rust port of RPython's JIT infrastructure. It is a general-purpose framework for Rust bytecode interpreters that integrate with its tracing interface. pyre is MaJIT's primary consumer, but MaJIT has no dependency on pyre.
 
 ## Roadmap
 

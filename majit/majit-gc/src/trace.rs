@@ -153,7 +153,7 @@ impl TypeInfo {
         // RPython custom_trace_hook parity: if a custom trace function
         // is registered, use it instead of generic offset-based tracing.
         if let Some(trace_fn) = self.custom_trace {
-            trace_fn(obj_addr, &mut f);
+            unsafe { trace_fn(obj_addr, &mut f) };
             return;
         }
 

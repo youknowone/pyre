@@ -2,12 +2,13 @@
 name = "pyre-wasm-test"
 version = "0.0.1"
 edition = "2024"
+publish = false
 
 [[bin]]
 name = "pyre-wasm-test"
 path = "src/main.rs"
 
 [dependencies]
-pyre-object = { path = "../pyre-object" }
-pyre-interpreter = { path = "../pyre-interpreter", default-features = false }
-pyre-jit = { path = "../pyre-jit" }
+pyre-object = { workspace = true }
+pyre-interpreter = { workspace = true }
+pyre-jit = { workspace = true }

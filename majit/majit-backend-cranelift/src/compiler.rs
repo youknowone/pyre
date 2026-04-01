@@ -944,7 +944,7 @@ fn lookup_force_frame(handle: u64) -> Option<Arc<ActiveForceFrame>> {
 }
 
 fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
-    let mut saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
+    let saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
     if let Some(saved_data) = saved_data_root.as_mut() {
         if let Some(runtime_id) = frame.gc_runtime_id {
             unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
@@ -1448,7 +1448,7 @@ fn get_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
 }
 
 fn take_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
-    let mut saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
+    let saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
     let mut saved_data = saved_data_root.take()?;
     if let Some(runtime_id) = frame.gc_runtime_id {
         unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
@@ -1529,8 +1529,8 @@ pub fn register_call_assembler_blackhole(
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> bool> =
     OnceLock::new();
 
-/// Thread-local: raw local0 value from CallAssemblerI inputs,
-/// for force_fn to re-box before interpreter execution.
+// Thread-local raw local0 value from CallAssemblerI inputs,
+// for force_fn to re-box before interpreter execution.
 thread_local! {
     static PENDING_FORCE_LOCAL0: std::cell::Cell<Option<i64>> =
         const { std::cell::Cell::new(None) };
@@ -2243,7 +2243,7 @@ extern "C" fn begin_may_force_call_shim(fail_index: u64, values_ptr: u64, num_va
         .to_vec()
     };
     let preview = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
-    let mut pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
+    let pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
     pending_may_force.push(PendingMayForceFrame {
         preview,
         was_forced: false,
@@ -2289,7 +2289,7 @@ extern "C" fn record_guard_not_forced_2_shim(fail_index: u64, values_ptr: u64, n
     };
     let pending = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
     let previous = {
-        let mut pending_force = unsafe { &mut *frame.pending_force.get() };
+        let pending_force = unsafe { &mut *frame.pending_force.get() };
         pending_force.replace(pending)
     };
     if let Some(previous) = previous {
@@ -2304,7 +2304,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     };
 
     {
-        let mut pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
+        let pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
         if let Some(pending) = pending_may_force.last_mut() {
             assert!(
                 !pending.was_forced,
@@ -2514,7 +2514,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         }
 
         let fail_descr = &target.fail_descrs[fail_index as usize];
-        let fail_count = fail_descr.increment_fail_count();
+        let _fail_count = fail_descr.increment_fail_count();
         ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
@@ -2534,7 +2534,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     &mat_outputs,
                     &fail_descr.fail_arg_types,
                 );
-                drop(bridge_guard);
+                let _ = bridge_guard;
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 if bridge_descr.is_finish() {
@@ -2555,7 +2555,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 &fail_descr.fail_arg_types,
             );
         }
-        drop(bridge_guard);
+        let _ = bridge_guard;
 
         // Bridge compilation is decided by MetaInterp.must_compile()
         // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
@@ -2846,7 +2846,7 @@ fn call_assembler_fast_path(
         }
         return 0;
     }
-    drop(bridge_guard);
+    let _ = bridge_guard;
 
     release_force_token(handle);
 
@@ -2972,7 +2972,7 @@ fn call_assembler_fast_path_heap(
         }
         return 0;
     }
-    drop(bridge_guard);
+    let _ = bridge_guard;
 
     release_force_token(handle);
 
@@ -3165,7 +3165,7 @@ extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     unsafe { std::alloc::alloc_zeroed(layout) as u64 }
 }
 
-extern "C" fn gc_alloc_typed_nursery_shim(runtime_id: u64, type_id: u64, size: u64) -> u64 {
+extern "C" fn gc_alloc_typed_nursery_shim(runtime_id: u64, _type_id: u64, size: u64) -> u64 {
     // RPython rewrite.py: CALL_MALLOC_NURSERY fallback path.
     // Use no-collect allocation to avoid triggering GC during compiled code
     // execution. When nursery is full, falls back to old-gen allocation.
@@ -3674,7 +3674,7 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
 fn normalize_ops_for_codegen(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &HashMap<u32, i64>,
+    _constants: &HashMap<u32, i64>,
 ) -> (Vec<Op>, std::collections::HashMap<u32, u32>) {
     let num_inputs = inputargs.len() as u32;
 
@@ -4241,7 +4241,7 @@ fn emit_indirect_call_from_parts(
     call_descr: &dyn CallDescr,
     call_conv: cranelift_codegen::isa::CallConv,
     ptr_type: cranelift_codegen::ir::Type,
-    gc_runtime_id: Option<u64>,
+    _gc_runtime_id: Option<u64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
@@ -4656,10 +4656,10 @@ fn run_compiled_code(
     let result_jf = jitframe_resolve(result_jf);
 
     // llmodel.py:412-420 get_latest_descr: read jf_descr from returned frame.
-    let mut result_jf = result_jf;
+    let result_jf = result_jf;
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    let mut fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+    let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         CALL_ASSEMBLER_DEADFRAME_SENTINEL
     } else if jf_descr_raw == 0 {
         0u32
@@ -5102,7 +5102,7 @@ impl CraneliftBackend {
 
             // Increment guard failure count.
             fail_descr.increment_fail_count();
-            let fail_count = fail_descr.get_fail_count();
+            let _fail_count = fail_descr.get_fail_count();
             ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
             // If a bridge is attached to this guard, execute it.
@@ -5119,7 +5119,7 @@ impl CraneliftBackend {
                 if bridge.loop_reentry {
                     let bridge_frame =
                         Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
-                    drop(bridge_guard);
+                    let _ = bridge_guard;
                     let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
@@ -5137,7 +5137,7 @@ impl CraneliftBackend {
                 }
                 return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             }
-            drop(bridge_guard);
+            let _ = bridge_guard;
 
             let saved_data = if let Some(ref ff) = force_frame {
                 take_force_frame_saved_data(ff)
@@ -5233,7 +5233,7 @@ impl CraneliftBackend {
             release_force_token(handle);
             return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
         }
-        drop(bridge_guard);
+        let _ = bridge_guard;
 
         // compile.py:701-717: handle_fail / must_compile — trigger bridge
         // compilation for bridge guards just like for loop guards.
@@ -9929,7 +9929,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_finish: descr.fail_descr.is_finish(),
             };
         }
-        drop(bridge_guard);
+        let _ = bridge_guard;
 
         // No bridge — skip DeadFrame, return outputs directly.
         let savedata = if let Some(ref ff) = force_frame {

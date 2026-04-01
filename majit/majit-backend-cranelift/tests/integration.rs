@@ -14,8 +14,36 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
 };
-use majit_metainterp::optimizeopt::intdiv::magic_numbers;
 use majit_trace::recorder::Trace;
+
+fn magic_numbers(m: i64) -> (u64, u32) {
+    debug_assert!(m >= 3);
+    debug_assert!(m & (m - 1) != 0, "m must not be a power of two");
+
+    let m_u = m as u64;
+    let mut i: u32 = 1;
+    while (1u64 << (i + 1)) < m_u {
+        i += 1;
+    }
+
+    let high_word_dividend = 1u64 << i;
+    let mut quotient: u64 = 0;
+    for bit in (0..64).rev() {
+        let t = quotient + (1u64 << bit);
+        let (_, high) = full_mul_u64(t, m_u);
+        if high < high_word_dividend {
+            quotient = t;
+        }
+    }
+
+    (quotient + 1, i)
+}
+
+#[inline]
+fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
+    let result = (a as u128) * (b as u128);
+    (result as u64, (result >> 64) as u64)
+}
 
 // ---------------------------------------------------------------------------
 // Test helpers

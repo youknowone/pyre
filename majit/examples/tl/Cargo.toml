@@ -2,8 +2,9 @@
 name = "tl"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
-majit-ir = { path = "../../majit-ir" }
-majit-metainterp = { path = "../../majit-metainterp" }
-majit-macros = { path = "../../majit-macros" }
+majit-ir = { workspace = true }
+majit-metainterp = { workspace = true }
+majit-macros = { workspace = true }

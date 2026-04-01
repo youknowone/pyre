@@ -317,7 +317,7 @@ impl MiniMarkGC {
         // copy_nursery_object mutates oldgen/nursery.
         // Pinned objects are left in place (not copied to old gen).
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-        for (root_idx, root_ptr) in roots.iter().enumerate() {
+        for (_root_idx, root_ptr) in roots.iter().enumerate() {
             let root_ptr = *root_ptr;
             let gcref = unsafe { *root_ptr };
             if !gcref.is_null() && self.is_nursery_object_start(gcref.0) {
