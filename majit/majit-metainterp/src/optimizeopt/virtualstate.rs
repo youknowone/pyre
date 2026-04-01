@@ -129,22 +129,22 @@ pub enum VirtualStateInfo {
         /// Original field descriptors for each field index.
         field_descrs: Vec<(u32, DescrRef)>,
     },
-    /// Value is a virtual array with known elements.
-    VirtualArray {
+    /// virtualstate.py: VArrayStateInfo — virtual array with known elements.
+    VArray {
         descr: DescrRef,
         items: Vec<Box<VirtualStateInfo>>,
         /// virtualstate.py: lenbound — known bounds on array length.
         /// None means unbounded.
         lenbound: Option<IntBound>,
     },
-    /// Value is a virtual struct.
-    VirtualStruct {
+    /// virtualstate.py: VStructStateInfo — virtual struct.
+    VStruct {
         descr: DescrRef,
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
         field_descrs: Vec<(u32, DescrRef)>,
     },
-    /// Value is a virtual array of structs.
-    VirtualArrayStruct {
+    /// virtualstate.py: VArrayStructStateInfo — virtual array of structs.
+    VArrayStruct {
         descr: DescrRef,
         element_fields: Vec<Vec<(u32, Box<VirtualStateInfo>)>>,
     },
@@ -221,12 +221,12 @@ impl VirtualStateInfo {
 
             // Virtual array: must match length and each element
             (
-                VirtualStateInfo::VirtualArray {
+                VirtualStateInfo::VArray {
                     descr: d1,
                     items: i1,
                     ..
                 },
-                VirtualStateInfo::VirtualArray {
+                VirtualStateInfo::VArray {
                     descr: d2,
                     items: i2,
                     ..
@@ -240,12 +240,12 @@ impl VirtualStateInfo {
 
             // Virtual struct: same as virtual instance
             (
-                VirtualStateInfo::VirtualStruct {
+                VirtualStateInfo::VStruct {
                     descr: d1,
                     fields: f1,
                     ..
                 },
-                VirtualStateInfo::VirtualStruct {
+                VirtualStateInfo::VStruct {
                     descr: d2,
                     fields: f2,
                     ..
@@ -270,11 +270,11 @@ impl VirtualStateInfo {
 
             // Virtual array struct
             (
-                VirtualStateInfo::VirtualArrayStruct {
+                VirtualStateInfo::VArrayStruct {
                     descr: d1,
                     element_fields: ef1,
                 },
-                VirtualStateInfo::VirtualArrayStruct {
+                VirtualStateInfo::VArrayStruct {
                     descr: d2,
                     element_fields: ef2,
                 },
@@ -335,9 +335,9 @@ impl VirtualStateInfo {
                 VirtualStateInfo::NonNull
                 | VirtualStateInfo::KnownClass { .. }
                 | VirtualStateInfo::Virtual { .. }
-                | VirtualStateInfo::VirtualArray { .. }
-                | VirtualStateInfo::VirtualStruct { .. }
-                | VirtualStateInfo::VirtualArrayStruct { .. }
+                | VirtualStateInfo::VArray { .. }
+                | VirtualStateInfo::VStruct { .. }
+                | VirtualStateInfo::VArrayStruct { .. }
                 | VirtualStateInfo::VirtualRawBuffer { .. } => true,
                 VirtualStateInfo::Constant(Value::Ref(r)) => !r.is_null(),
                 _ => false,
@@ -362,9 +362,9 @@ impl VirtualStateInfo {
         matches!(
             self,
             VirtualStateInfo::Virtual { .. }
-                | VirtualStateInfo::VirtualArray { .. }
-                | VirtualStateInfo::VirtualStruct { .. }
-                | VirtualStateInfo::VirtualArrayStruct { .. }
+                | VirtualStateInfo::VArray { .. }
+                | VirtualStateInfo::VStruct { .. }
+                | VirtualStateInfo::VArrayStruct { .. }
                 | VirtualStateInfo::VirtualRawBuffer { .. }
         )
     }
@@ -398,16 +398,17 @@ impl VirtualState {
     fn count_forced_boxes_for_entry(info: &VirtualStateInfo) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
-            VirtualStateInfo::Virtual { fields, .. }
-            | VirtualStateInfo::VirtualStruct { fields, .. } => fields
-                .iter()
-                .map(|(_, child)| Self::count_forced_boxes_for_entry(child))
-                .sum(),
-            VirtualStateInfo::VirtualArray { items, .. } => items
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+                fields
+                    .iter()
+                    .map(|(_, child)| Self::count_forced_boxes_for_entry(child))
+                    .sum()
+            }
+            VirtualStateInfo::VArray { items, .. } => items
                 .iter()
                 .map(|child| Self::count_forced_boxes_for_entry(child))
                 .sum(),
-            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => element_fields
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => element_fields
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, child)| child))
                 .map(|child| Self::count_forced_boxes_for_entry(child))
@@ -581,8 +582,7 @@ impl VirtualState {
     ) {
         match info {
             VirtualStateInfo::Constant(_) => {}
-            VirtualStateInfo::Virtual { fields, .. }
-            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
                 let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (field_idx, field_state) in fields {
@@ -599,7 +599,7 @@ impl VirtualState {
                     );
                 }
             }
-            VirtualStateInfo::VirtualArray { items, .. } => {
+            VirtualStateInfo::VArray { items, .. } => {
                 let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 for (index, item_state) in items.iter().enumerate() {
@@ -609,7 +609,7 @@ impl VirtualState {
                     Self::enum_forced_boxes_for_entry(item_state, item_ref, ctx, boxes, next_slot);
                 }
             }
-            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                 let resolved = ctx.get_box_replacement(opref);
                 let ptr_info = ctx.get_ptr_info(resolved);
                 let mut flat_index = 0usize;
@@ -675,8 +675,7 @@ impl VirtualState {
     ) {
         match info {
             VirtualStateInfo::Constant(_) => {}
-            VirtualStateInfo::Virtual { fields, .. }
-            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
                 for (_, field_state) in fields {
                     Self::enum_inputarg_source_slots(
                         field_state,
@@ -687,7 +686,7 @@ impl VirtualState {
                     );
                 }
             }
-            VirtualStateInfo::VirtualArray { items, .. } => {
+            VirtualStateInfo::VArray { items, .. } => {
                 for item_state in items {
                     Self::enum_inputarg_source_slots(
                         item_state,
@@ -698,7 +697,7 @@ impl VirtualState {
                     );
                 }
             }
-            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                 for fields in element_fields {
                     for (_, field_state) in fields {
                         Self::enum_inputarg_source_slots(
@@ -745,8 +744,7 @@ impl VirtualState {
     ) -> Result<(), ()> {
         match info {
             VirtualStateInfo::Constant(_) => Ok(()),
-            VirtualStateInfo::Virtual { fields, .. }
-            | VirtualStateInfo::VirtualStruct { fields, .. } => {
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
                 // RPython virtualstate.py:185: if not info.is_virtual() → VirtualStatesCantMatch
                 let resolved = ctx.get_box_replacement(opref);
                 let is_virtual = ctx
@@ -777,7 +775,7 @@ impl VirtualState {
                 }
                 Ok(())
             }
-            VirtualStateInfo::VirtualArray { items, .. } => {
+            VirtualStateInfo::VArray { items, .. } => {
                 let resolved = ctx.get_box_replacement(opref);
                 for (index, item_state) in items.iter().enumerate() {
                     let item_ref = ctx
@@ -796,7 +794,7 @@ impl VirtualState {
                 }
                 Ok(())
             }
-            VirtualStateInfo::VirtualArrayStruct { element_fields, .. } => {
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                 let resolved = ctx.get_box_replacement(opref);
                 let mut flat_index = 0usize;
                 for fields in element_fields {
@@ -1183,9 +1181,9 @@ impl VirtualState {
             let kind = match info {
                 VirtualStateInfo::Constant(_) => "Constant",
                 VirtualStateInfo::Virtual { .. } => "Virtual",
-                VirtualStateInfo::VirtualArray { .. } => "VArray",
-                VirtualStateInfo::VirtualStruct { .. } => "VStruct",
-                VirtualStateInfo::VirtualArrayStruct { .. } => "VArrayStruct",
+                VirtualStateInfo::VArray { .. } => "VArray",
+                VirtualStateInfo::VStruct { .. } => "VStruct",
+                VirtualStateInfo::VArrayStruct { .. } => "VArrayStruct",
                 VirtualStateInfo::VirtualRawBuffer { .. } => "VRawBuf",
                 VirtualStateInfo::KnownClass { .. } => "KnownClass",
                 VirtualStateInfo::NonNull => "NonNull",
@@ -1332,7 +1330,7 @@ impl VirtualState {
     /// Get the lenbound of a virtual array at the given index, if any.
     pub fn get_lenbound(&self, index: usize) -> Option<&IntBound> {
         match self.state.get(index) {
-            Some(VirtualStateInfo::VirtualArray { lenbound, .. }) => lenbound.as_ref(),
+            Some(VirtualStateInfo::VArray { lenbound, .. }) => lenbound.as_ref(),
             _ => None,
         }
     }
@@ -1601,7 +1599,7 @@ fn export_single_value(
                     })
                     .collect();
                 let len = items.len();
-                return VirtualStateInfo::VirtualArray {
+                return VirtualStateInfo::VArray {
                     descr: vinfo.descr.clone(),
                     items,
                     lenbound: Some(IntBound::from_constant(len as i64)),
@@ -1616,7 +1614,7 @@ fn export_single_value(
                         (*field_idx, Box::new(field_state))
                     })
                     .collect();
-                return VirtualStateInfo::VirtualStruct {
+                return VirtualStateInfo::VStruct {
                     descr: vinfo.descr.clone(),
                     fields,
                     field_descrs: vinfo.field_descrs.clone(),
@@ -1636,7 +1634,7 @@ fn export_single_value(
                             .collect()
                     })
                     .collect();
-                return VirtualStateInfo::VirtualArrayStruct {
+                return VirtualStateInfo::VArrayStruct {
                     descr: vinfo.descr.clone(),
                     element_fields,
                 };
@@ -1738,7 +1736,7 @@ fn import_single_value(
                 last_guard_pos: -1,
             }));
         }
-        VirtualStateInfo::VirtualArray { descr, items, .. } => {
+        VirtualStateInfo::VArray { descr, items, .. } => {
             let mut vitems = Vec::new();
             for item_info in items {
                 let item_opref =
@@ -1753,7 +1751,7 @@ fn import_single_value(
                 last_guard_pos: -1,
             }));
         }
-        VirtualStateInfo::VirtualStruct {
+        VirtualStateInfo::VStruct {
             descr,
             fields,
             field_descrs,
@@ -1772,7 +1770,7 @@ fn import_single_value(
                 last_guard_pos: -1,
             }));
         }
-        VirtualStateInfo::VirtualArrayStruct {
+        VirtualStateInfo::VArrayStruct {
             descr,
             element_fields,
         } => {
@@ -1943,7 +1941,7 @@ mod tests {
     #[test]
     fn test_virtual_array_compatibility() {
         let descr = test_descr(1);
-        let a1 = VirtualStateInfo::VirtualArray {
+        let a1 = VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
                 Box::new(VirtualStateInfo::Constant(Value::Int(1))),
@@ -1951,7 +1949,7 @@ mod tests {
             ],
             lenbound: None,
         };
-        let a2 = VirtualStateInfo::VirtualArray {
+        let a2 = VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
                 Box::new(VirtualStateInfo::Constant(Value::Int(1))),
@@ -1959,7 +1957,7 @@ mod tests {
             ],
             lenbound: None,
         };
-        let a3 = VirtualStateInfo::VirtualArray {
+        let a3 = VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![Box::new(VirtualStateInfo::Constant(Value::Int(1)))],
             lenbound: None,
@@ -2146,7 +2144,7 @@ mod tests {
         );
 
         assert!(
-            VirtualStateInfo::VirtualArray {
+            VirtualStateInfo::VArray {
                 descr: descr.clone(),
                 items: vec![],
                 lenbound: None,
@@ -2163,7 +2161,7 @@ mod tests {
         let descr = test_descr(7);
         let state = VirtualState::new(vec![
             VirtualStateInfo::Unknown,
-            VirtualStateInfo::VirtualStruct {
+            VirtualStateInfo::VStruct {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
@@ -2181,7 +2179,7 @@ mod tests {
         let descr = test_descr(9);
         let state = VirtualState::new(vec![
             VirtualStateInfo::Unknown,
-            VirtualStateInfo::VirtualStruct {
+            VirtualStateInfo::VStruct {
                 descr,
                 fields: vec![],
                 field_descrs: Vec::new(),
@@ -2201,7 +2199,7 @@ mod tests {
         let descr = test_descr(11);
         let field_value = OpRef(21);
         let virtual_ref = OpRef(20);
-        let state = VirtualState::new(vec![VirtualStateInfo::VirtualStruct {
+        let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),
             fields: vec![
                 (0, Box::new(VirtualStateInfo::Constant(Value::Int(7)))),
@@ -2235,7 +2233,7 @@ mod tests {
                 field_descrs: Vec::new(),
             },
             VirtualStateInfo::NonNull,
-            VirtualStateInfo::VirtualArray {
+            VirtualStateInfo::VArray {
                 descr,
                 items: vec![Box::new(VirtualStateInfo::Unknown)],
                 lenbound: None,

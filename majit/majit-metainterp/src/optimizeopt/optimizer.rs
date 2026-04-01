@@ -364,7 +364,7 @@ impl Optimizer {
                     ),
                 );
             }
-            VirtualStateInfo::VirtualArray { descr, items, .. } => {
+            VirtualStateInfo::VArray { descr, items, .. } => {
                 let imported_items = items
                     .iter()
                     .map(|item_info| Self::import_virtual_state_value(item_info, ctx))
@@ -381,7 +381,7 @@ impl Optimizer {
                     ),
                 );
             }
-            VirtualStateInfo::VirtualStruct {
+            VirtualStateInfo::VStruct {
                 descr,
                 fields,
                 field_descrs,
@@ -403,7 +403,7 @@ impl Optimizer {
                     ),
                 );
             }
-            VirtualStateInfo::VirtualArrayStruct {
+            VirtualStateInfo::VArrayStruct {
                 descr,
                 element_fields,
             } => {
@@ -687,7 +687,7 @@ impl Optimizer {
                 );
                 opref
             }
-            VirtualStateInfo::VirtualArray { descr, items, .. } => {
+            VirtualStateInfo::VArray { descr, items, .. } => {
                 let opref = ctx.alloc_op_position();
                 let imported_items = items
                     .iter()
@@ -713,7 +713,7 @@ impl Optimizer {
                 );
                 opref
             }
-            VirtualStateInfo::VirtualStruct {
+            VirtualStateInfo::VStruct {
                 descr,
                 fields,
                 field_descrs,
@@ -746,7 +746,7 @@ impl Optimizer {
                 );
                 opref
             }
-            VirtualStateInfo::VirtualArrayStruct {
+            VirtualStateInfo::VArrayStruct {
                 descr,
                 element_fields,
             } => {

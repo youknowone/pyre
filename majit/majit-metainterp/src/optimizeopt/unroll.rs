@@ -2181,7 +2181,7 @@ impl OptUnroll {
                 //   op = get_box_replacement(op)
                 // Follow forwarding so info is set on TARGET, not source.
                 let resolved = ctx.get_box_replacement(source);
-                self.apply_exported_info_recursive(
+                self.setinfo_from_preamble_recursive(
                     resolved,
                     info,
                     &exported_state.exported_infos,
@@ -2289,7 +2289,7 @@ impl OptUnroll {
         }
     }
 
-    fn apply_exported_info(
+    fn setinfo_from_preamble(
         &self,
         opref: OpRef,
         info: &ExportedValueInfo,
@@ -2297,10 +2297,10 @@ impl OptUnroll {
         ctx: &mut OptContext,
     ) {
         let mut seen = std::collections::HashSet::new();
-        self.apply_exported_info_recursive(opref, info, exported_infos, ctx, &mut seen);
+        self.setinfo_from_preamble_recursive(opref, info, exported_infos, ctx, &mut seen);
     }
 
-    fn apply_exported_info_recursive(
+    fn setinfo_from_preamble_recursive(
         &self,
         opref: OpRef,
         info: &ExportedValueInfo,
@@ -2474,7 +2474,7 @@ impl OptUnroll {
                         continue;
                     }
                     if let Some(field_info) = exported_infos.get(&old) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             fresh,
                             field_info,
                             exported_infos,
@@ -2502,7 +2502,7 @@ impl OptUnroll {
                         continue;
                     }
                     if let Some(field_info) = exported_infos.get(&old) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             fresh,
                             field_info,
                             exported_infos,
@@ -2530,7 +2530,7 @@ impl OptUnroll {
                         continue;
                     }
                     if let Some(item_info) = exported_infos.get(&old) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             fresh,
                             item_info,
                             exported_infos,
@@ -2557,7 +2557,7 @@ impl OptUnroll {
                         continue;
                     }
                     if let Some(field_info) = exported_infos.get(&old) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             fresh,
                             field_info,
                             exported_infos,
@@ -2585,7 +2585,7 @@ impl OptUnroll {
                         continue;
                     }
                     if let Some(entry_info) = exported_infos.get(&old) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             fresh,
                             entry_info,
                             exported_infos,
@@ -2599,7 +2599,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Instance(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             field_ref,
                             field_info,
                             exported_infos,
@@ -2613,7 +2613,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Struct(info.clone()));
                 for &(_, field_ref) in &info.fields {
                     if let Some(field_info) = exported_infos.get(&field_ref) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             field_ref,
                             field_info,
                             exported_infos,
@@ -2627,7 +2627,7 @@ impl OptUnroll {
                 ctx.set_ptr_info(opref, PtrInfo::Array(info.clone()));
                 for &item_ref in &info.items {
                     if let Some(item_info) = exported_infos.get(&item_ref) {
-                        self.apply_exported_info_recursive(
+                        self.setinfo_from_preamble_recursive(
                             item_ref,
                             item_info,
                             exported_infos,
@@ -3172,7 +3172,7 @@ fn build_imported_virtuals_from_state(
                     head_load_descr_index: None,
                 });
             }
-            VirtualStateInfo::VirtualStruct {
+            VirtualStateInfo::VStruct {
                 descr,
                 fields,
                 field_descrs,

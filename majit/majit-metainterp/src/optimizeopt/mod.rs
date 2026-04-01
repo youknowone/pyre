@@ -1196,8 +1196,8 @@ impl OptContext {
 
     /// RPython unroll.py: source.set_forwarded(target)
     /// Sets forwarding from Phase 2 source to Phase 1 export target.
-    /// apply_exported_info_recursive then sets PtrInfo on the TARGET
-    /// (via get_replacement), matching RPython's setinfo_from_preamble.
+    /// setinfo_from_preamble_recursive then sets PtrInfo on the TARGET
+    /// (via get_replacement).
     pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
         self.replace_op(source, target);
     }
