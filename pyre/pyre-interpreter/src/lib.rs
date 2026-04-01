@@ -55,4 +55,26 @@ pub use pyopcode::*;
 pub use runtime_ops::*;
 pub use shared_opcode::*;
 
+// ── Print hook for wasm (stdout capture) ──
+use std::cell::RefCell;
+thread_local! {
+    static PRINT_HOOK: RefCell<Option<fn(&str)>> = RefCell::new(None);
+}
+
+/// Set a hook that receives all `print()` output instead of stdout.
+pub fn set_print_hook(hook: fn(&str)) {
+    PRINT_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+/// Write a string through the print hook (if set) or stdout.
+pub fn print_output(s: &str) {
+    PRINT_HOOK.with(|h| {
+        if let Some(hook) = *h.borrow() {
+            hook(s);
+        } else {
+            print!("{s}");
+        }
+    });
+}
+
 // baseobjspace call helpers are re-exported from `baseobjspace`.

@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "host_env")]
 use std::path::{Path, PathBuf};
 
 use crate::{CodeObject, Mode, compile_source_with_filename};
@@ -25,6 +26,7 @@ use crate::pyframe::PyFrame;
 thread_local! {
     static SYS_MODULES: RefCell<HashMap<String, PyObjectRef>> = RefCell::new(HashMap::new());
     /// sys.path equivalent — list of directories to search for modules.
+    #[cfg(feature = "host_env")]
     static SYS_PATH: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
     /// Builtin modules registry — PyPy equivalent: space.builtin_modules
     ///
@@ -429,6 +431,7 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
 ///
 /// PyPy equivalent: sys.path is populated at startup with the script
 /// directory, then PYTHONPATH entries, then the stdlib.
+#[cfg(feature = "host_env")]
 pub fn init_sys_path(script_dir: &Path) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
@@ -453,6 +456,7 @@ pub fn init_sys_path(script_dir: &Path) {
 /// Detect CPython stdlib path via `python3 -c "import sysconfig; ..."`.
 ///
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
+#[cfg(feature = "host_env")]
 fn detect_stdlib_path() -> Option<PathBuf> {
     // Try PYRE_STDLIB env var first
     if let Ok(p) = std::env::var("PYRE_STDLIB") {
@@ -478,6 +482,7 @@ fn detect_stdlib_path() -> Option<PathBuf> {
 }
 
 /// Add a directory to sys.path.
+#[cfg(feature = "host_env")]
 pub fn add_sys_path(dir: &Path) {
     SYS_PATH.with(|p| {
         let mut path = p.borrow_mut();
@@ -508,14 +513,17 @@ fn set_sys_module(name: &str, module: PyObjectRef) {
 #[derive(Debug)]
 enum FindInfo {
     /// A .py source file was found.
+    #[cfg(feature = "host_env")]
     SourceFile { pathname: PathBuf },
     /// A package directory with __init__.py was found.
+    #[cfg(feature = "host_env")]
     Package { dirpath: PathBuf },
     /// A builtin (Rust-implemented) module was found.
     /// PyPy equivalent: C_BUILTIN modtype in find_module()
     Builtin,
 }
 
+#[cfg(feature = "host_env")]
 fn find_module(partname: &str) -> Option<FindInfo> {
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
     let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
@@ -533,7 +541,17 @@ fn find_module(partname: &str) -> Option<FindInfo> {
     return find_in_sys_path(partname);
 }
 
+#[cfg(not(feature = "host_env"))]
+fn find_module(partname: &str) -> Option<FindInfo> {
+    let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(partname));
+    if is_builtin {
+        return Some(FindInfo::Builtin);
+    }
+    None
+}
+
 /// Detect and add CPython stdlib to sys.path (once).
+#[cfg(feature = "host_env")]
 fn ensure_stdlib_path() {
     thread_local! {
         static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -549,6 +567,7 @@ fn ensure_stdlib_path() {
     });
 }
 
+#[cfg(feature = "host_env")]
 fn find_in_sys_path(partname: &str) -> Option<FindInfo> {
     SYS_PATH.with(|p| {
         let path = p.borrow();
@@ -599,6 +618,7 @@ fn exec_code_module(
 //
 // Parse + execute a .py source file, producing a module object.
 
+#[cfg(feature = "host_env")]
 fn load_source_module(
     modulename: &str,
     pathname: &Path,
@@ -659,6 +679,7 @@ fn load_source_module(
 // ── load_package ─────────────────────────────────────────────────────
 // PyPy equivalent: load_module with PKG_DIRECTORY modtype
 
+#[cfg(feature = "host_env")]
 fn load_package(
     modulename: &str,
     dirpath: &Path,
@@ -708,9 +729,11 @@ fn load_part(
     };
 
     let module = match info {
+        #[cfg(feature = "host_env")]
         FindInfo::SourceFile { pathname } => {
             load_source_module(modulename, &pathname, execution_context)?
         }
+        #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
         FindInfo::Builtin => {
             // PyPy: getbuiltinmodule() path

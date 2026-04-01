@@ -322,6 +322,7 @@ static mut ARENA_INITIALIZED: usize = 0;
 
 /// Returns addresses of the global arena state variables and frame
 /// layout constants needed by Cranelift to inline arena take/put.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn arena_global_info() -> majit_backend_cranelift::InlineFrameArenaInfo {
     use majit_metainterp::jitframe::*;
     majit_backend_cranelift::InlineFrameArenaInfo {
@@ -471,8 +472,12 @@ extern "C" fn jit_call_user_function_from_frame(
 
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
+    #[cfg(not(target_arch = "wasm32"))]
     let _ = majit_backend_cranelift::take_pending_frame_restore();
+    #[cfg(not(target_arch = "wasm32"))]
     let pending = majit_backend_cranelift::take_pending_force_local0();
+    #[cfg(target_arch = "wasm32")]
+    let pending: Option<i64> = None;
 
     // Lazy frame (RPython parity): when CallR(create_frame) is elided,
     // frame_ptr is the CALLER frame. pending_force_local0 contains the
@@ -550,7 +555,10 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     let raw_arg = unsafe { JitFrame::get_int_value(jf, 0) };
 
     // Step 2: get caller frame from the force context
+    #[cfg(not(target_arch = "wasm32"))]
     let pending = majit_backend_cranelift::take_pending_force_local0();
+    #[cfg(target_arch = "wasm32")]
+    let pending: Option<i64> = None;
     let raw_local0 = pending.unwrap_or(raw_arg as i64);
 
     // Step 3: create a PyFrame and run it
@@ -578,6 +586,7 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
         for i in 0..nlocals {
             inputs.push(frame.locals_cells_stack_w[i] as i64);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(raw) = majit_backend_cranelift::execute_call_assembler_direct(
             token_num,
             &inputs,
@@ -1503,10 +1512,15 @@ pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
-        majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
-        majit_backend_cranelift::register_call_assembler_bridge(jit_ca_handle_guard_failure);
-        majit_backend_cranelift::register_call_assembler_blackhole(jit_blackhole_resume_from_guard);
-        majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
+            majit_backend_cranelift::register_call_assembler_bridge(jit_ca_handle_guard_failure);
+            majit_backend_cranelift::register_call_assembler_blackhole(
+                jit_blackhole_resume_from_guard,
+            );
+            majit_backend_cranelift::register_inline_frame_arena(arena_global_info());
+        }
     });
 }
 
@@ -1928,8 +1942,14 @@ pub fn trace_and_compile_from_bridge(
     // RESTORE_EXCEPTION before the guard. The exception class/value
     // are read from the TLS exception state set by Cranelift codegen.
     if driver.last_bridge_is_exception_guard {
+        #[cfg(not(target_arch = "wasm32"))]
         let exc_class = majit_backend_cranelift::jit_exc_class_raw();
+        #[cfg(target_arch = "wasm32")]
+        let exc_class: i64 = 0;
+        #[cfg(not(target_arch = "wasm32"))]
         let exc_value = majit_backend_cranelift::jit_exc_value_raw();
+        #[cfg(target_arch = "wasm32")]
+        let exc_value: i64 = 0;
         if exc_class != 0 {
             // RPython pyjitpl.py:3125-3126 + 3138:
             // SAVE_EXC_CLASS, SAVE_EXCEPTION, RESTORE_EXCEPTION

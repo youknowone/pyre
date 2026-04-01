@@ -10,8 +10,13 @@ description = "Meta-interpreter and optimizer for majit JIT compiler"
 majit-ir = { path = "../majit-ir" }
 majit-trace = { path = "../majit-trace" }
 majit-backend = { path = "../majit-backend" }
-majit-backend-cranelift = { path = "../majit-backend-cranelift" }
 majit-gc = { path = "../majit-gc" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+majit-backend-cranelift = { path = "../majit-backend-cranelift" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+majit-backend-wasm = { path = "../majit-backend-wasm" }
 
 [dev-dependencies]
 majit-macros = { path = "../majit-macros" }

@@ -1,0 +1,796 @@
+/// IR → wasm bytecode compilation.
+///
+/// Generates a wasm module from majit IR ops using `wasm-encoder`.
+/// Generated function signature: `(param $frame_ptr i32) (result i32)`
+///
+/// Frame layout in shared linear memory:
+///   offset 0:       fail_index (i64)
+///   offset 8:       slot[0] (i64)
+///   offset 16:      slot[1] (i64)
+///   ...
+///   CALL_AREA_OFS:  func_ptr (i64)   — used by jit_call trampoline
+///   CALL_AREA_OFS+8: num_args (i64)
+///   CALL_AREA_OFS+16: arg[0] (i64)
+///   CALL_AREA_OFS+24: arg[1] (i64)
+///   ...
+///   CALL_RESULT_OFS: result (i64)    — written by host after call
+use std::collections::HashMap;
+
+use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use wasm_encoder::{
+    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,
+};
+
+/// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
+const FRAME_SLOT_BASE: u64 = 8;
+const SLOT_SIZE: u64 = 8;
+
+/// Call area layout (fixed offsets from frame_ptr).
+const CALL_RESULT_OFS: u64 = 2000;
+const CALL_FUNC_OFS: u64 = 2008;
+const CALL_NARGS_OFS: u64 = 2016;
+const CALL_ARGS_OFS: u64 = 2024;
+
+/// Minimum frame allocation size in bytes to accommodate the call area.
+pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
+
+fn mem64(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// Information about a guard exit collected during pre-scan.
+pub struct GuardExit {
+    pub fail_index: u32,
+    pub fail_arg_refs: Vec<OpRef>,
+    pub fail_arg_types: Vec<Type>,
+    pub is_finish: bool,
+}
+
+/// Check if any op in the trace is a CALL variant.
+fn has_call_ops(ops: &[Op]) -> bool {
+    ops.iter().any(|op| op.opcode.is_call())
+}
+
+fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit>, u32) {
+    let mut guards = Vec::new();
+    let mut max_var: u32 = 0;
+
+    for ia in inputargs {
+        if ia.index + 1 > max_var {
+            max_var = ia.index + 1;
+        }
+    }
+
+    let mut fail_index = 0u32;
+    for op in ops {
+        if op.pos != OpRef::NONE && op.pos.0 < OpRef::CONST_BASE && op.pos.0 + 1 > max_var {
+            max_var = op.pos.0 + 1;
+        }
+        if op.opcode == OpCode::Label {
+            for &a in &op.args {
+                if a != OpRef::NONE && a.0 < OpRef::CONST_BASE && a.0 + 1 > max_var {
+                    max_var = a.0 + 1;
+                }
+            }
+        }
+
+        if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+            let fail_args = op
+                .fail_args
+                .as_ref()
+                .map(|fa| fa.as_slice())
+                .unwrap_or(&op.args);
+            let fail_arg_types = op
+                .fail_arg_types
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
+
+            guards.push(GuardExit {
+                fail_index,
+                fail_arg_refs: fail_args.to_vec(),
+                fail_arg_types,
+                is_finish: op.opcode == OpCode::Finish,
+            });
+            fail_index += 1;
+        }
+    }
+
+    (guards, max_var)
+}
+
+/// Build a wasm module from majit IR.
+pub fn build_wasm_module(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+) -> (Vec<u8>, Vec<GuardExit>) {
+    let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+    let needs_call = has_call_ops(ops);
+
+    let mut module = Module::new();
+
+    // Type section
+    let mut types = TypeSection::new();
+    // Type 0: trace function (param i32) -> (result i32)
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
+    if needs_call {
+        // Type 1: jit_call trampoline (param i32) -> ()
+        types.ty().function(vec![ValType::I32], vec![]);
+    }
+    module.section(&types);
+
+    // Import section
+    let mut imports = ImportSection::new();
+    imports.import(
+        "env",
+        "memory",
+        MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        },
+    );
+    if needs_call {
+        // Import jit_call trampoline as function index 0
+        imports.import("env", "jit_call", EntityType::Function(1));
+    }
+    module.section(&imports);
+
+    // Function section
+    let mut functions = FunctionSection::new();
+    functions.function(0); // type 0
+    module.section(&functions);
+
+    // Export section: trace function index depends on whether we imported jit_call
+    let trace_func_idx = if needs_call { 1 } else { 0 };
+    let mut exports = ExportSection::new();
+    exports.export("trace", ExportKind::Func, trace_func_idx);
+    module.section(&exports);
+
+    // Code section
+    let mut codes = CodeSection::new();
+    let jit_call_idx = if needs_call { Some(0u32) } else { None };
+    let func = build_function(inputargs, ops, constants, num_vars, jit_call_idx);
+    codes.function(&func);
+    module.section(&codes);
+
+    (module.finish(), guards)
+}
+
+fn build_function(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &HashMap<u32, i64>,
+    num_vars: u32,
+    jit_call_idx: Option<u32>,
+) -> Function {
+    let mut func = Function::new(vec![(num_vars, ValType::I64)]);
+    let mut sink = func.instructions();
+
+    // Load inputs from frame into locals
+    for ia in inputargs {
+        let local_idx = 1 + ia.index;
+        let offset = FRAME_SLOT_BASE + ia.index as u64 * SLOT_SIZE;
+        sink.local_get(0)
+            .i64_load(mem64(offset))
+            .local_set(local_idx);
+    }
+
+    let has_loop = ops.iter().any(|op| op.opcode == OpCode::Label);
+    if has_loop {
+        sink.block(BlockType::Empty);
+        sink.loop_(BlockType::Empty);
+    }
+
+    let mut guard_idx = 0u32;
+
+    for op in ops {
+        match op.opcode {
+            OpCode::Label => {}
+
+            OpCode::Jump => {
+                let label_args = find_label_args(ops);
+                for (i, &jump_arg) in op.args.iter().enumerate() {
+                    if i < label_args.len() {
+                        let target_local = 1 + label_args[i].0;
+                        emit_resolve(&mut sink, constants, jump_arg);
+                        sink.local_set(target_local);
+                    }
+                }
+                sink.br(0);
+            }
+
+            OpCode::Finish => {
+                emit_guard_exit(&mut sink, constants, guard_idx, op);
+                if has_loop {
+                    sink.br(1);
+                }
+                guard_idx += 1;
+            }
+
+            // ── Guards ──
+            OpCode::GuardTrue => {
+                emit_guard_true(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardFalse => {
+                emit_guard_false(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardValue => {
+                emit_resolve(&mut sink, constants, op.arg(0));
+                emit_resolve(&mut sink, constants, op.arg(1));
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardNonnull => {
+                emit_resolve(&mut sink, constants, op.arg(0));
+                sink.i64_eqz();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardIsnull => {
+                emit_resolve(&mut sink, constants, op.arg(0));
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardClass | OpCode::GuardNonnullClass => {
+                // guard_class(obj, expected_class): fail if obj.class != expected_class
+                // For wasm MVP: read ob_type at offset 0, compare with expected
+                emit_resolve(&mut sink, constants, op.arg(0)); // obj ptr
+                sink.i64_load(mem64(0)); // load ob_type (first field)
+                emit_resolve(&mut sink, constants, op.arg(1)); // expected class
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardNoOverflow => {
+                // overflow flag is in the preceding IntAddOvf/IntSubOvf/IntMulOvf op
+                // Convention: op.arg(0) holds the overflow flag variable
+                emit_resolve(&mut sink, constants, op.arg(0));
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            OpCode::GuardOverflow => {
+                emit_resolve(&mut sink, constants, op.arg(0));
+                sink.i64_eqz();
+                emit_guard_if_exit(&mut sink, constants, guard_idx, op, has_loop);
+                guard_idx += 1;
+            }
+            // Guards that always pass in wasm MVP
+            OpCode::GuardNotInvalidated
+            | OpCode::GuardNotForced
+            | OpCode::GuardNotForced2
+            | OpCode::GuardNoException
+            | OpCode::GuardException => {
+                // No-op: these guards are about runtime state that
+                // the wasm backend doesn't track yet.
+                guard_idx += 1;
+            }
+
+            // ── Integer arithmetic ──
+            OpCode::IntAdd => emit_binop(&mut sink, constants, op, BinOp::I64Add),
+            OpCode::IntSub => emit_binop(&mut sink, constants, op, BinOp::I64Sub),
+            OpCode::IntMul => emit_binop(&mut sink, constants, op, BinOp::I64Mul),
+            OpCode::IntFloorDiv => emit_binop(&mut sink, constants, op, BinOp::I64DivS),
+            OpCode::IntMod => emit_binop(&mut sink, constants, op, BinOp::I64RemS),
+            OpCode::IntAnd => emit_binop(&mut sink, constants, op, BinOp::I64And),
+            OpCode::IntOr => emit_binop(&mut sink, constants, op, BinOp::I64Or),
+            OpCode::IntXor => emit_binop(&mut sink, constants, op, BinOp::I64Xor),
+            OpCode::IntLshift => emit_binop(&mut sink, constants, op, BinOp::I64Shl),
+            OpCode::IntRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrS),
+            OpCode::UintRshift => emit_binop(&mut sink, constants, op, BinOp::I64ShrU),
+
+            // Overflow variants: compute result + overflow flag
+            OpCode::IntAddOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Add),
+            OpCode::IntSubOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Sub),
+            OpCode::IntMulOvf => emit_ovf_binop(&mut sink, constants, op, BinOp::I64Mul),
+
+            // ── Integer comparisons ──
+            OpCode::IntLt => emit_cmp(&mut sink, constants, op, CmpOp::I64LtS),
+            OpCode::IntLe => emit_cmp(&mut sink, constants, op, CmpOp::I64LeS),
+            OpCode::IntEq => emit_cmp(&mut sink, constants, op, CmpOp::I64Eq),
+            OpCode::IntNe => emit_cmp(&mut sink, constants, op, CmpOp::I64Ne),
+            OpCode::IntGt => emit_cmp(&mut sink, constants, op, CmpOp::I64GtS),
+            OpCode::IntGe => emit_cmp(&mut sink, constants, op, CmpOp::I64GeS),
+
+            // ── Pointer comparisons ──
+            OpCode::PtrEq => emit_cmp(&mut sink, constants, op, CmpOp::I64Eq),
+            OpCode::PtrNe => emit_cmp(&mut sink, constants, op, CmpOp::I64Ne),
+
+            // ── Unary ops ──
+            OpCode::IntNeg => emit_unary_vi(
+                &mut sink,
+                constants,
+                op,
+                |s| {
+                    s.i64_const(0);
+                },
+                |s| {
+                    s.i64_sub();
+                },
+            ),
+            OpCode::IntInvert => emit_unary_vi(
+                &mut sink,
+                constants,
+                op,
+                |s| {
+                    s.i64_const(-1);
+                },
+                |s| {
+                    s.i64_xor();
+                },
+            ),
+            OpCode::IntIsTrue => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i64_const(0);
+                    sink.i64_ne();
+                    sink.i64_extend_i32_u();
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::IntIsZero => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i64_eqz();
+                    sink.i64_extend_i32_u();
+                    sink.local_set(1 + vi);
+                }
+            }
+
+            // ── SameAs (forwarding) ──
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.local_set(1 + vi);
+                }
+            }
+
+            // ── Field access (direct memory operations) ──
+            OpCode::GetfieldGcI | OpCode::GetfieldGcPureI | OpCode::GetfieldRawI => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0)); // struct ptr (i64)
+                    sink.i32_wrap_i64(); // convert to i32 address
+                    let field_offset = field_offset_from_descr(op);
+                    sink.i64_load(mem64(field_offset));
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::GetfieldGcR | OpCode::GetfieldGcPureR | OpCode::GetfieldRawR => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.i32_wrap_i64();
+                    let field_offset = field_offset_from_descr(op);
+                    // Load as i32 (pointer on wasm32) and extend to i64
+                    sink.i32_load(MemArg {
+                        offset: field_offset,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i64_extend_i32_u();
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                emit_resolve(&mut sink, constants, op.arg(0)); // struct ptr
+                sink.i32_wrap_i64();
+                let field_offset = field_offset_from_descr(op);
+                emit_resolve(&mut sink, constants, op.arg(1)); // value
+                sink.i64_store(mem64(field_offset));
+            }
+
+            // ── CALL operations (via trampoline) ──
+            OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallN
+            | OpCode::CallF
+            | OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureN
+            | OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceN
+            | OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerN
+            | OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilR
+            | OpCode::CallReleaseGilN
+            | OpCode::CondCallValueI
+            | OpCode::CondCallValueR => {
+                let vi = op.pos.0;
+                let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
+
+                // args[0] = func_ptr, args[1..] = call arguments
+                let func_ptr_ref = op.arg(0);
+                let call_args = &op.args[1..];
+
+                // Store func_ptr to call area
+                sink.local_get(0);
+                emit_resolve(&mut sink, constants, func_ptr_ref);
+                sink.i64_store(mem64(CALL_FUNC_OFS));
+
+                // Store num_args
+                sink.local_get(0);
+                sink.i64_const(call_args.len() as i64);
+                sink.i64_store(mem64(CALL_NARGS_OFS));
+
+                // Store each arg
+                for (i, &arg) in call_args.iter().enumerate() {
+                    sink.local_get(0);
+                    emit_resolve(&mut sink, constants, arg);
+                    sink.i64_store(mem64(CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                }
+
+                // Call trampoline
+                sink.local_get(0);
+                sink.call(jit_call);
+
+                // Read result (for non-void calls)
+                let is_void = matches!(
+                    op.opcode,
+                    OpCode::CallN
+                        | OpCode::CallPureN
+                        | OpCode::CallMayForceN
+                        | OpCode::CallAssemblerN
+                        | OpCode::CallReleaseGilN
+                );
+                if vi < OpRef::CONST_BASE && !is_void {
+                    sink.local_get(0);
+                    sink.i64_load(mem64(CALL_RESULT_OFS));
+                    sink.local_set(1 + vi);
+                }
+            }
+
+            // ── Allocation (via trampoline — treated as CALL) ──
+            OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
+                // These are handled by the optimizer and shouldn't normally
+                // appear in optimized traces (they become virtuals).
+                // If they do appear, skip — the host will handle on guard failure.
+            }
+
+            // ── Misc ──
+            OpCode::ForceToken => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    sink.i64_const(0); // sentinel force token
+                    sink.local_set(1 + vi);
+                }
+            }
+
+            // Float operations
+            OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    // Values stored as i64 (bitcast from f64)
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.f64_reinterpret_i64();
+                    emit_resolve(&mut sink, constants, op.arg(1));
+                    sink.f64_reinterpret_i64();
+                    match op.opcode {
+                        OpCode::FloatAdd => {
+                            sink.f64_add();
+                        }
+                        OpCode::FloatSub => {
+                            sink.f64_sub();
+                        }
+                        OpCode::FloatMul => {
+                            sink.f64_mul();
+                        }
+                        OpCode::FloatTrueDiv => {
+                            sink.f64_div();
+                        }
+                        _ => unreachable!(),
+                    }
+                    sink.i64_reinterpret_f64();
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::FloatNeg => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.f64_reinterpret_i64();
+                    sink.f64_neg();
+                    sink.i64_reinterpret_f64();
+                    sink.local_set(1 + vi);
+                }
+            }
+            OpCode::FloatAbs => {
+                let vi = op.pos.0;
+                if vi < OpRef::CONST_BASE {
+                    emit_resolve(&mut sink, constants, op.arg(0));
+                    sink.f64_reinterpret_i64();
+                    sink.f64_abs();
+                    sink.i64_reinterpret_f64();
+                    sink.local_set(1 + vi);
+                }
+            }
+
+            // Debug / no-op
+            OpCode::DebugMergePoint
+            | OpCode::IncrementDebugCounter
+            | OpCode::EnterPortalFrame
+            | OpCode::LeavePortalFrame
+            | OpCode::VirtualRefFinish => {}
+
+            _ => {
+                // Unsupported opcode — skip silently.
+            }
+        }
+    }
+
+    if has_loop {
+        sink.end(); // end loop
+        sink.end(); // end block
+    }
+
+    sink.local_get(0);
+    sink.end(); // end function
+
+    func
+}
+
+// ── Helpers ──
+
+fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
+    for op in ops {
+        if op.opcode == OpCode::Label {
+            return op.args.clone().to_vec();
+        }
+    }
+    Vec::new()
+}
+
+fn emit_resolve(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, opref: OpRef) {
+    if opref.is_constant() {
+        let val = constants.get(&opref.0).copied().unwrap_or(0);
+        sink.i64_const(val);
+    } else {
+        sink.local_get(1 + opref.0);
+    }
+}
+
+/// Extract field offset from op's descr (FieldDescr).
+fn field_offset_from_descr(op: &Op) -> u64 {
+    if let Some(ref descr) = op.descr {
+        if let Some(fd) = descr.as_field_descr() {
+            return fd.offset() as u64;
+        }
+    }
+    0
+}
+
+// ── Guard emission helpers ──
+
+fn emit_guard_true(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    guard_idx: u32,
+    op: &Op,
+    has_loop: bool,
+) {
+    emit_resolve(sink, constants, op.arg(0));
+    sink.i64_eqz();
+    emit_guard_if_exit(sink, constants, guard_idx, op, has_loop);
+}
+
+fn emit_guard_false(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    guard_idx: u32,
+    op: &Op,
+    has_loop: bool,
+) {
+    emit_resolve(sink, constants, op.arg(0));
+    sink.i64_const(0);
+    sink.i64_ne();
+    emit_guard_if_exit(sink, constants, guard_idx, op, has_loop);
+}
+
+/// Common guard exit: condition is on stack (i32), emit if + exit.
+fn emit_guard_if_exit(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    guard_idx: u32,
+    op: &Op,
+    has_loop: bool,
+) {
+    sink.if_(BlockType::Empty);
+    emit_guard_exit(sink, constants, guard_idx, op);
+    if has_loop {
+        sink.br(2); // if=0, loop=1, block=2
+    }
+    sink.end();
+}
+
+fn emit_guard_exit(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    guard_idx: u32,
+    op: &Op,
+) {
+    let fail_args = op
+        .fail_args
+        .as_ref()
+        .map(|fa| fa.as_slice())
+        .unwrap_or(&op.args);
+
+    for (i, &arg_ref) in fail_args.iter().enumerate() {
+        let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
+        sink.local_get(0);
+        emit_resolve(sink, constants, arg_ref);
+        sink.i64_store(mem64(offset));
+    }
+
+    sink.local_get(0);
+    sink.i64_const(guard_idx as i64);
+    sink.i64_store(mem64(0));
+}
+
+// ── Binary ops ──
+
+enum BinOp {
+    I64Add,
+    I64Sub,
+    I64Mul,
+    I64DivS,
+    I64RemS,
+    I64And,
+    I64Or,
+    I64Xor,
+    I64Shl,
+    I64ShrS,
+    I64ShrU,
+}
+
+fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
+    match op {
+        BinOp::I64Add => {
+            sink.i64_add();
+        }
+        BinOp::I64Sub => {
+            sink.i64_sub();
+        }
+        BinOp::I64Mul => {
+            sink.i64_mul();
+        }
+        BinOp::I64DivS => {
+            sink.i64_div_s();
+        }
+        BinOp::I64RemS => {
+            sink.i64_rem_s();
+        }
+        BinOp::I64And => {
+            sink.i64_and();
+        }
+        BinOp::I64Or => {
+            sink.i64_or();
+        }
+        BinOp::I64Xor => {
+            sink.i64_xor();
+        }
+        BinOp::I64Shl => {
+            sink.i64_shl();
+        }
+        BinOp::I64ShrS => {
+            sink.i64_shr_s();
+        }
+        BinOp::I64ShrU => {
+            sink.i64_shr_u();
+        }
+    }
+}
+
+fn emit_binop(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    op: &Op,
+    binop: BinOp,
+) {
+    let vi = op.pos.0;
+    if vi >= OpRef::CONST_BASE {
+        return;
+    }
+    emit_resolve(sink, constants, op.arg(0));
+    emit_resolve(sink, constants, op.arg(1));
+    apply_binop(sink, binop);
+    sink.local_set(1 + vi);
+}
+
+/// Overflow binary op: stores result in pos, overflow flag convention.
+/// The overflow flag is not stored separately — GuardNoOverflow/GuardOverflow
+/// is handled by checking after the fact (simplified for wasm MVP).
+fn emit_ovf_binop(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    op: &Op,
+    binop: BinOp,
+) {
+    // For wasm MVP, just compute the result without overflow detection.
+    // GuardNoOverflow/GuardOverflow are treated as always-pass.
+    emit_binop(sink, constants, op, binop);
+}
+
+// ── Comparison ops ──
+
+enum CmpOp {
+    I64LtS,
+    I64LeS,
+    I64Eq,
+    I64Ne,
+    I64GtS,
+    I64GeS,
+}
+
+fn apply_cmp(sink: &mut InstructionSink<'_>, op: CmpOp) {
+    match op {
+        CmpOp::I64LtS => {
+            sink.i64_lt_s();
+        }
+        CmpOp::I64LeS => {
+            sink.i64_le_s();
+        }
+        CmpOp::I64Eq => {
+            sink.i64_eq();
+        }
+        CmpOp::I64Ne => {
+            sink.i64_ne();
+        }
+        CmpOp::I64GtS => {
+            sink.i64_gt_s();
+        }
+        CmpOp::I64GeS => {
+            sink.i64_ge_s();
+        }
+    }
+}
+
+fn emit_cmp(sink: &mut InstructionSink<'_>, constants: &HashMap<u32, i64>, op: &Op, cmpop: CmpOp) {
+    let vi = op.pos.0;
+    if vi >= OpRef::CONST_BASE {
+        return;
+    }
+    emit_resolve(sink, constants, op.arg(0));
+    emit_resolve(sink, constants, op.arg(1));
+    apply_cmp(sink, cmpop);
+    sink.i64_extend_i32_u();
+    sink.local_set(1 + vi);
+}
+
+// ── Unary op helper ──
+
+fn emit_unary_vi(
+    sink: &mut InstructionSink<'_>,
+    constants: &HashMap<u32, i64>,
+    op: &Op,
+    prefix: impl FnOnce(&mut InstructionSink<'_>),
+    suffix: impl FnOnce(&mut InstructionSink<'_>),
+) {
+    let vi = op.pos.0;
+    if vi < OpRef::CONST_BASE {
+        prefix(sink);
+        emit_resolve(sink, constants, op.arg(0));
+        suffix(sink);
+        sink.local_set(1 + vi);
+    }
+}

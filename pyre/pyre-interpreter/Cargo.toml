@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Python bytecode interpreter for pyre"
 
+[features]
+default = ["host_env"]
+host_env = []
+
 [dependencies]
 pyre-object = { workspace = true }
 rustpython-compiler = { workspace = true }

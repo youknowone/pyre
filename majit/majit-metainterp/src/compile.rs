@@ -1750,7 +1750,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
-    backend: &mut majit_backend_cranelift::CraneliftBackend,
+    backend: &mut crate::pyjitpl::BackendImpl,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
@@ -1773,7 +1773,7 @@ pub(crate) fn patch_backend_guard_recovery_layouts_for_trace(
 }
 
 pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
-    backend: &mut majit_backend_cranelift::CraneliftBackend,
+    backend: &mut crate::pyjitpl::BackendImpl,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
     terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
