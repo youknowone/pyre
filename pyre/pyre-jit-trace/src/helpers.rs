@@ -472,11 +472,12 @@ pub trait TraceHelperAccess {
     }
 }
 
-/// Emit inline W_Int creation (New + SetfieldGc) instead of CallI.
+/// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
-/// This allows the optimizer to virtualize the W_Int allocation:
-/// if the intval field is read back later, the optimizer returns
-/// the original raw int directly without allocating.
+/// Uses NewWithVtable (not New) because W_IntObject has ob_type (vtable).
+/// virtualize.py:208: optimize_NEW_WITH_VTABLE → VirtualInfo with
+/// known_class = descr.get_vtable(). New (no vtable) would produce
+/// VirtualStruct, losing ob_type during virtual materialization.
 pub fn emit_box_int_inline(
     ctx: &mut TraceCtx,
     raw_int: OpRef,
@@ -485,8 +486,8 @@ pub fn emit_box_int_inline(
     intval_descr: majit_ir::DescrRef,
     int_type_addr: i64,
 ) -> OpRef {
-    // Emit: v = New(W_Int)
-    let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    // Emit: v = NewWithVtable(W_Int)
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     // heapcache: track allocation as unescaped
     ctx.heap_cache_mut().new_object(new_op);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)
@@ -507,6 +508,7 @@ pub fn emit_box_int_inline(
     new_op
 }
 
+/// Emit inline W_Float creation (NewWithVtable + SetfieldGc).
 pub fn emit_box_float_inline(
     ctx: &mut TraceCtx,
     raw_float: OpRef,
@@ -515,7 +517,7 @@ pub fn emit_box_float_inline(
     floatval_descr: majit_ir::DescrRef,
     float_type_addr: i64,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
     let type_const = ctx.const_int(float_type_addr);
     ctx.mark_const_type(type_const, majit_ir::Type::Ref);

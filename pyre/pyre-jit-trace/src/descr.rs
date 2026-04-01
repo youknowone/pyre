@@ -204,6 +204,9 @@ pub fn make_quasi_immutable_field_descr(
 pub struct PyreSizeDescr {
     obj_size: usize,
     type_id: u32,
+    /// descr.get_vtable() parity: ob_type pointer for NewWithVtable.
+    /// optimize_new_with_vtable reads this to set VirtualInfo.known_class.
+    vtable: usize,
 }
 
 pub const W_INT_GC_TYPE_ID: u32 = 0;
@@ -230,6 +233,10 @@ impl SizeDescr for PyreSizeDescr {
         self.type_id
     }
 
+    fn vtable(&self) -> usize {
+        self.vtable
+    }
+
     fn is_immutable(&self) -> bool {
         false
     }
@@ -240,11 +247,16 @@ pub fn make_size_descr(obj_size: usize) -> DescrRef {
     Arc::new(PyreSizeDescr {
         obj_size,
         type_id: 0,
+        vtable: 0,
     })
 }
 
 pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
-    Arc::new(PyreSizeDescr { obj_size, type_id })
+    Arc::new(PyreSizeDescr {
+        obj_size,
+        type_id,
+        vtable: 0,
+    })
 }
 
 /// Create an array descriptor for a pointer-backed array field.
@@ -277,6 +289,7 @@ use pyre_object::{
     INT_INTVAL_OFFSET, PYOBJECT_ARRAY_HEAP_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
     W_ListObject, W_TupleObject,
 };
+use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
 /// Field descriptor for `W_RangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {
@@ -440,14 +453,24 @@ pub fn ob_type_descr() -> DescrRef {
     make_immutable_field_descr(OB_TYPE_OFFSET, 8, Type::Int, false)
 }
 
-/// Size descriptor for W_IntObject allocation via `New`.
+/// Size descriptor for W_IntObject allocation via NewWithVtable.
+/// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
-    make_size_descr_with_type(std::mem::size_of::<W_IntObject>(), W_INT_GC_TYPE_ID)
+    Arc::new(PyreSizeDescr {
+        obj_size: std::mem::size_of::<W_IntObject>(),
+        type_id: W_INT_GC_TYPE_ID,
+        vtable: &INT_TYPE as *const _ as usize,
+    })
 }
 
-/// Size descriptor for W_FloatObject allocation via `New`.
+/// Size descriptor for W_FloatObject allocation via NewWithVtable.
+/// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
-    make_size_descr_with_type(std::mem::size_of::<W_FloatObject>(), W_FLOAT_GC_TYPE_ID)
+    Arc::new(PyreSizeDescr {
+        obj_size: std::mem::size_of::<W_FloatObject>(),
+        type_id: W_FLOAT_GC_TYPE_ID,
+        vtable: &FLOAT_TYPE as *const _ as usize,
+    })
 }
 
 #[cfg(test)]
