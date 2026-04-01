@@ -885,37 +885,55 @@ pub fn resume_in_blackhole(
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][blackhole-section] idx={} frame={:#x} py_pc={} vsd={} nvals={}",
+                "[jit][blackhole-section] idx={} frame={:#x} py_pc={} vsd={} nvals={} vals={:?}",
                 sec_idx,
                 frame_ptr as usize,
                 py_pc,
                 vsd,
                 section.values.len(),
+                section.values.iter().take(5).collect::<Vec<_>>(),
             );
         }
 
         // resume.py:1381 consume_one_section → 1017 _prepare_next_section
         // → jitcode.py:147 enumerate_vars(info, liveness_info, cb_r)
-        // → liveness.py:170 LivenessIterator: compact values consumed
-        //   in liveness order. Dead registers keep setposition() defaults.
-        let live = pyre_jit_trace::state::liveness_for(section.code);
-        // resume.py:1383: info = blackholeinterp.get_current_position_info()
-        // The liveness PC must match the encoder's orgpc (= snapshot PC
-        // stored in rd_numb). section.rd_numb_pc is this value.
-        // section.py_pc may differ for after_residual_call guards
-        // (encoder uses fallthrough_pc, not orgpc).
+        // RPython: both encoder (get_list_of_active_boxes) and decoder
+        // use the SAME all_liveness data. Use JitCode.liveness (same
+        // source as get_list_of_active_boxes) via majit_jitcode pointer.
         let live_pc = section.rd_numb_pc.unwrap_or(section.py_pc);
-        // resume.py:1017-1026 _prepare_next_section: count BOTH
-        // live locals AND live stack slots — the encoder (pyjitpl.py:177
-        // get_list_of_active_boxes) compacts both in liveness order.
-        let max_stack = vsd.saturating_sub(nlocals);
-        let n_live_locals = (0..nlocals)
-            .filter(|&i| live.is_local_live(live_pc, i))
-            .count();
-        let n_live_stack = (0..max_stack)
-            .filter(|&i| live.is_stack_live(live_pc, i))
-            .count();
-        let n_live = n_live_locals + n_live_stack;
+        // Look up LivenessInfo from JitCode (same data as capture side).
+        let writer = crate::jit::codewriter::CodeWriter::new(
+            bh_call_fn,
+            bh_load_global_fn,
+            bh_compare_fn,
+            bh_binary_op_fn,
+            bh_box_int_fn,
+            bh_truth_fn,
+            bh_load_const_fn,
+            bh_store_subscr_fn,
+            crate::call_jit::bh_build_list_fn,
+        );
+        let code_ref = unsafe { &*section.code };
+        let pyjitcode = crate::jit::codewriter::get_jitcode(code_ref, &writer);
+        let jc = &pyjitcode.jitcode;
+        let liveness_info = jc
+            .py_to_jit_pc
+            .get(live_pc)
+            .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc));
+        let n_live = liveness_info
+            .map(|info| info.live_r_regs.len())
+            .unwrap_or_else(|| {
+                // Fallback to LiveVars when JitCode liveness unavailable.
+                let live = pyre_jit_trace::state::liveness_for(section.code);
+                let max_stack = vsd.saturating_sub(nlocals);
+                let n_live_locals = (0..nlocals)
+                    .filter(|&i| live.is_local_live(live_pc, i))
+                    .count();
+                let n_live_stack = (0..max_stack)
+                    .filter(|&i| live.is_stack_live(live_pc, i))
+                    .count();
+                n_live_locals + n_live_stack
+            });
         // RPython parity: values = active boxes only (no header).
         let n_vals = section.values.len();
         let use_liveness = n_live == n_vals;
@@ -935,22 +953,46 @@ pub fn resume_in_blackhole(
             );
         }
         // RPython parity: values = slot registers only (no header offset).
+        // Use the SAME LivenessInfo as capture (get_list_of_active_boxes).
         if use_liveness {
-            let mut val_idx = 0;
-            for i in 0..nlocals {
-                if live.is_local_live(live_pc, i) {
+            if let Some(info) = liveness_info {
+                // RPython parity: iterate live_r_regs (same order as capture).
+                let stack_base = info
+                    .live_r_regs
+                    .iter()
+                    .find(|&&idx| idx as usize >= nlocals)
+                    .map(|&idx| idx as usize)
+                    .unwrap_or(nlocals);
+                for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
+                    let idx = reg_idx as usize;
                     if let Some(val) = section.values.get(val_idx) {
-                        bh.setarg_r(i, materialize_virtual(val));
+                        if idx < nlocals {
+                            bh.setarg_r(idx, materialize_virtual(val));
+                        } else {
+                            bh.runtime_stack_push(0, materialize_virtual(val));
+                        }
                     }
-                    val_idx += 1;
                 }
-            }
-            for i in 0..max_stack {
-                if live.is_stack_live(live_pc, i) {
-                    if let Some(val) = section.values.get(val_idx) {
-                        bh.runtime_stack_push(0, materialize_virtual(val));
+            } else {
+                // Fallback: LiveVars path
+                let live = pyre_jit_trace::state::liveness_for(section.code);
+                let max_stack = vsd.saturating_sub(nlocals);
+                let mut val_idx = 0;
+                for i in 0..nlocals {
+                    if live.is_local_live(live_pc, i) {
+                        if let Some(val) = section.values.get(val_idx) {
+                            bh.setarg_r(i, materialize_virtual(val));
+                        }
+                        val_idx += 1;
                     }
-                    val_idx += 1;
+                }
+                for i in 0..max_stack {
+                    if live.is_stack_live(live_pc, i) {
+                        if let Some(val) = section.values.get(val_idx) {
+                            bh.runtime_stack_push(0, materialize_virtual(val));
+                        }
+                        val_idx += 1;
+                    }
                 }
             }
         } else {
@@ -1683,7 +1725,14 @@ pub fn blackhole_resume_via_rd_numb(
     // ResumeDataDirectReader decodes rd_numb, builds BH chain.
     // compile.py:990: vinfo = self.jitdriver_sd.virtualizable_info
     let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
-    let allocator = resume::NullAllocator;
+    /// Pyre allocator: box_int creates a W_IntObject for ref-register TAGINT.
+    struct PyreAllocator;
+    impl resume::BlackholeAllocator for PyreAllocator {
+        fn box_int(&self, value: i64) -> i64 {
+            pyre_object::intobject::w_int_new(value) as i64
+        }
+    }
+    let allocator = PyreAllocator;
     let bh = resume::blackhole_from_resumedata(
         builder,
         &resolve_jitcode,
