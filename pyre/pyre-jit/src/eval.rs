@@ -2751,10 +2751,11 @@ fn build_resumed_frames(
         }
     }
     // resume.py:1045 consume_vref_and_vable: vable header is extracted
-    // AFTER _prepare_next_section materializes virtuals. The pre-section
-    // resolve here is only used for _prepare_next_section's own needs
-    // (frame counting, etc.). The authoritative vable header extraction
-    // happens after all_values are built (see below).
+    // AFTER _prepare_next_section materializes virtuals. The post-section
+    // block below is the authoritative extraction. vable_values is always
+    // non-empty for guards with complete resume data (resume.py:397 asserts
+    // resume_position >= 0). The no-snapshot fallback in store_final_boxes_in_guard
+    // now encodes fail_args[0..3] as vable_array to maintain this invariant.
 
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
