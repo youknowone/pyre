@@ -220,6 +220,10 @@ pub struct JitDriver<S: JitState> {
     epoch_qmut: std::sync::Arc<std::sync::Mutex<crate::quasiimmut::QuasiImmut>>,
     /// Handle for the background invalidation thread.
     _invalidation_thread: Option<std::thread::JoinHandle<()>>,
+    /// RPython parity: retrace_limit for incompatible-state re-entries.
+    /// Counts per green_key to prevent infinite retrace loops when
+    /// compiled code entry is incompatible with current state.
+    incompatible_retries: std::collections::HashMap<u64, u32>,
     /// RPython metainterp_sd.jitcodes parity: factory callback that
     /// produces JitCode for a given (program, pc, op) triple.
     /// Used by BlackholeInterpreter to resume from guard failure points.
@@ -285,6 +289,7 @@ impl<S: JitState> JitDriver<S> {
             _invalidation_thread: Some(invalidation_thread),
             #[cfg(target_arch = "wasm32")]
             _invalidation_thread: None,
+            incompatible_retries: std::collections::HashMap::new(),
             jitcode_factory: None,
             blackhole_allocator: None,
             portal_runner: None,
@@ -2015,17 +2020,32 @@ impl<S: JitState> JitDriver<S> {
         // slot reads. Remove when virtualizable field access uses
         // descriptor-based addressing (RPython virtualizable.py parity).
         if !state.is_compatible(&meta) {
+            // RPython: target_tokens dispatch selects the right entry point.
+            // majit: single entry point → incompatible state causes retrace.
+            // Limit retries to prevent infinite retrace loops.
+            let retries = self.incompatible_retries.entry(green_key).or_insert(0);
+            *retries += 1;
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit][run-compiled-skip] key={} reason=incompatible-state target_pc={}",
-                    green_key, target_pc
+                    "[jit][run-compiled-skip] key={} reason=incompatible-state target_pc={} retries={}",
+                    green_key, target_pc, retries
                 );
+            }
+            if *retries > 5 {
+                // Too many incompatible retries — stop retracing this key.
+                // RPython: warmstate.py retrace_limit achieves the same effect.
+                return DetailedDriverRunOutcome::Abort {
+                    restored: false,
+                    via_blackhole: true, // fall through to interpreter
+                };
             }
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
             };
         }
+        // Reset incompatible retries on successful entry
+        self.incompatible_retries.remove(&green_key);
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
             if crate::majit_log_enabled() {
                 eprintln!(
