@@ -298,6 +298,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if opref.is_constant() {
             return true;
         }
+        // optimizer.py:432: make_constant → Forwarded::Const terminal.
+        // resume.py:204: isinstance(box, Const)
+        if matches!(
+            self.ctx.forwarded.get(opref.0 as usize),
+            Some(crate::optimizeopt::info::Forwarded::Const(_))
+        ) {
+            return true;
+        }
         // info.py: ConstPtrInfo.is_constant() → True
         matches!(
             self.ctx.get_ptr_info(opref),
@@ -1237,13 +1245,43 @@ impl OptContext {
         }
     }
 
-    /// Record that an operation produces a known constant value.
-    pub fn make_constant(&mut self, opref: OpRef, value: Value) {
+    /// Store a constant value WITHOUT setting Forwarded::Const.
+    /// Used for pre-populating backend constants and call_pure_results.
+    pub fn seed_constant(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
         }
         self.constants[idx] = Some(value);
+    }
+
+    /// optimizer.py:410-432 make_constant(box, constbox).
+    ///
+    /// RPython: box = get_box_replacement(box); box.set_forwarded(constbox).
+    /// Forwarded::Const(value) is the terminal — get_box_replacement stops
+    /// here and returns the opref. is_const detects Forwarded::Const.
+    pub fn make_constant(&mut self, opref: OpRef, value: Value) {
+        use crate::optimizeopt::info::Forwarded;
+        // optimizer.py:412: box = get_box_replacement(box)
+        let replaced = self.get_box_replacement(opref);
+        // optimizer.py:427: if box.is_constant(): return
+        if replaced.is_constant() {
+            return;
+        }
+        // Store in constants array for get_constant() callers.
+        let idx = replaced.0 as usize;
+        if idx >= self.constants.len() {
+            self.constants.resize(idx + 1, None);
+        }
+        self.constants[idx] = Some(value.clone());
+        // optimizer.py:432: box.set_forwarded(constbox)
+        // Forwarded::Const is a terminal — no OpRef allocation needed.
+        // get_box_replacement returns `replaced` (stops at Const terminal).
+        // is_const checks forwarded[replaced] for Const variant.
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        self.forwarded[idx] = Forwarded::Const(value);
     }
 
     /// resume.py:157 getconst parity for synthetic rd_numb encoding.
@@ -1551,6 +1589,13 @@ impl OptContext {
                 if opref.is_constant() {
                     return true;
                 }
+                // optimizer.py:432: make_constant → Forwarded::Const.
+                if matches!(
+                    self.ctx.forwarded.get(opref.0 as usize),
+                    Some(crate::optimizeopt::info::Forwarded::Const(_))
+                ) {
+                    return true;
+                }
                 // info.py: ConstPtrInfo.is_constant() → True
                 matches!(
                     self.ctx.get_ptr_info(opref),
@@ -1559,14 +1604,34 @@ impl OptContext {
             }
             fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
                 // resume.py:204-205: box as Const → getconst(box)
-                // ob_type constants: Value::Int(ptr) with true type Ref.
+                // RPython: constbox carries intrinsic type (ConstInt='i',
+                // ConstPtr='r'). Pyre: Value carries type via get_type().
+                // Forwarded::Const stores the original Value with correct type.
+                if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
+                    self.ctx.forwarded.get(opref.0 as usize)
+                {
+                    let (raw, tp) = match val {
+                        Value::Int(v) => (*v, majit_ir::Type::Int),
+                        Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                        Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                        Value::Void => (0, majit_ir::Type::Int),
+                    };
+                    // constant_types_for_numbering override (ob_type Ref).
+                    let tp = self
+                        .ctx
+                        .constant_types_for_numbering
+                        .get(&opref.0)
+                        .copied()
+                        .unwrap_or(tp);
+                    return (raw, tp);
+                }
+                // Fallback for constant pool OpRefs (>= 10000).
                 let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
                 match self.ctx.get_constant(opref) {
                     Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
                     Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
                     Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
                     _ => {
-                        // info.py: ConstPtrInfo — GcRef constant in PtrInfo
                         if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
                             self.ctx.get_ptr_info(opref)
                         {

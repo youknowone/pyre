@@ -1473,7 +1473,7 @@ impl Optimizer {
         // Use constant_types to distinguish Ref from Int (GC pointers
         // are stored as i64 in the constants map).
         for (&idx, &val) in constants.iter() {
-            ctx.make_constant(
+            ctx.seed_constant(
                 OpRef(idx),
                 value_from_backend_constant_bits(OpRef(idx), val, ops),
             );
@@ -1510,7 +1510,7 @@ impl Optimizer {
                     for (args, value) in &self.call_pure_results {
                         if let majit_ir::Value::Int(v) = value {
                             if let Some(result_ref) = args.last() {
-                                ctx.make_constant(*result_ref, majit_ir::Value::Int(*v));
+                                ctx.seed_constant(*result_ref, majit_ir::Value::Int(*v));
                             }
                         }
                     }
