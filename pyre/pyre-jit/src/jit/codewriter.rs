@@ -64,19 +64,20 @@ pub struct CodeWriter {
     /// RPython: CallControl manages these via callinfocollection.
     /// In pyre, we store the concrete function pointers that the
     /// BlackholeInterpreter calls through JitCode.fn_ptrs.
-    /// blackhole.py bhimpl_residual_call: per-arity call helpers.
-    /// call_fn = nargs=1 (callable, arg0, frame_ptr).
-    /// call_fn_0..4 = nargs=0..4.
-    pub call_fn: extern "C" fn(i64, i64, i64) -> i64,
-    pub call_fn_0: extern "C" fn(i64, i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub load_global_fn: extern "C" fn(i64, i64) -> i64,
+    /// bhimpl_residual_call: per-arity call helpers.
+    /// Parent frame via BH_VABLE_PTR thread-local.
+    /// call_fn_0(callable) ... call_fn_8(callable, a0..a7).
+    pub call_fn: extern "C" fn(i64, i64) -> i64,
+    pub call_fn_0: extern "C" fn(i64) -> i64,
+    pub call_fn_2: extern "C" fn(i64, i64, i64) -> i64,
+    pub call_fn_3: extern "C" fn(i64, i64, i64, i64) -> i64,
+    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    /// jtransform.py: namespace+code from getfield_vable_r.
+    pub load_global_fn: extern "C" fn(i64, i64, i64) -> i64,
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Box a raw integer into a PyObject (w_int_new).
@@ -93,8 +94,8 @@ pub struct CodeWriter {
 
 impl CodeWriter {
     pub fn new(
-        call_fn: extern "C" fn(i64, i64, i64) -> i64,
-        load_global_fn: extern "C" fn(i64, i64) -> i64,
+        call_fn: extern "C" fn(i64, i64) -> i64,
+        load_global_fn: extern "C" fn(i64, i64, i64) -> i64,
         compare_fn: extern "C" fn(i64, i64, i64) -> i64,
         binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
         box_int_fn: extern "C" fn(i64) -> i64,
@@ -146,7 +147,10 @@ impl CodeWriter {
         let int_tmp0 = 0u16;
         let int_tmp1 = 1u16;
         let op_code_reg = 2u16;
-        let frame_reg = 3u16;
+        // jtransform.py: virtualizable field indices for getfield_vable_*
+        // interp_jit.py:25 parity: code=1, namespace=3
+        const VABLE_CODE_FIELD_IDX: u16 = 1;
+        const VABLE_NAMESPACE_FIELD_IDX: u16 = 3;
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
@@ -157,7 +161,7 @@ impl CodeWriter {
 
         // RPython regalloc.py: keep kind-separated register files.
         assembler.ensure_r_regs(null_ref_reg + 1);
-        assembler.ensure_i_regs(frame_reg + 1);
+        assembler.ensure_i_regs(op_code_reg + 1);
 
         // Register helper function pointers
         // RPython: CallControl manages fn addresses; assembler.finished()
@@ -298,11 +302,13 @@ impl CodeWriter {
 
                 Instruction::LoadConst { consti } => {
                     let idx = consti.get(op_arg).as_usize();
+                    // jtransform.py: getfield_vable_r for pycode (field 1)
+                    assembler.vable_getfield_ref(obj_tmp0, VABLE_CODE_FIELD_IDX);
                     assembler.load_const_i_value(int_tmp0, idx as i64);
                     assembler.call_ref_typed(
                         load_const_fn_idx,
                         &[
-                            majit_metainterp::jitcode::JitCallArg::int(frame_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         obj_tmp0,
@@ -466,11 +472,16 @@ impl CodeWriter {
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
                 Instruction::LoadGlobal { namei } => {
                     let raw_namei = namei.get(op_arg) as usize as i64;
+                    // jtransform.py: getfield_vable_r for w_globals (field 3)
+                    // and pycode (field 1) — namespace for lookup, code for names.
+                    assembler.vable_getfield_ref(obj_tmp0, VABLE_NAMESPACE_FIELD_IDX);
+                    assembler.vable_getfield_ref(obj_tmp1, VABLE_CODE_FIELD_IDX);
                     assembler.load_const_i_value(int_tmp0, raw_namei);
                     assembler.call_may_force_ref_typed(
                         load_global_fn_idx,
                         &[
-                            majit_metainterp::jitcode::JitCallArg::int(frame_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         obj_tmp0,
@@ -505,8 +516,9 @@ impl CodeWriter {
                     assembler.move_r(obj_tmp1, stack_base + current_depth); // callable
                     current_depth -= 1; // NULL (discard)
 
-                    // call_fn(callable, arg0, frame_ptr) → result
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
+                    // call_fn(callable, arg0, ...) → result
+                    // Parent frame accessed via BH_VABLE_PTR thread-local.
                     let mut call_args =
                         vec![majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)];
                     for i in 0..nargs {
@@ -514,7 +526,6 @@ impl CodeWriter {
                             arg_regs_start + i as u16,
                         ));
                     }
-                    call_args.push(majit_metainterp::jitcode::JitCallArg::int(frame_reg));
                     // Select the correct arity-specific call helper.
                     // RPython blackhole.py: call_int_function transmutes
                     // to the correct arity. Each nargs needs a matching

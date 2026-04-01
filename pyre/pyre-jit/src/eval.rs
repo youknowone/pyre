@@ -111,6 +111,14 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
+/// Return a raw pointer to the thread-local VirtualizableInfo.
+/// Used by the blackhole to implement BC_GETFIELD_VABLE_* bytecodes.
+pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable::VirtualizableInfo
+{
+    let pair = driver_pair();
+    &pair.1 as *const _
+}
+
 /// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).
 ///
 /// RPython: reds = ['frame', 'ec'], greens = ['next_instr', 'is_being_profiled', 'pycode'],

@@ -1148,4 +1148,32 @@ impl PyFrame {
     }
 }
 
+/// Load a constant from a CodeObject without a PyFrame.
+/// Used by the blackhole's bh_load_const_fn when the code pointer
+/// comes from a virtualizable field read.
+pub fn load_const_from_code(code: &CodeObject, idx: usize) -> PyObjectRef {
+    use crate::bytecode::ConstantData;
+    use num_traits::ToPrimitive;
+    let constants: &[ConstantData] = unsafe {
+        std::slice::from_raw_parts(
+            code.constants.as_ptr() as *const ConstantData,
+            code.constants.len(),
+        )
+    };
+    if idx >= constants.len() {
+        return pyre_object::w_none();
+    }
+    match &constants[idx] {
+        ConstantData::Integer { value } => {
+            pyre_object::intobject::w_int_new(value.to_i64().unwrap_or(0))
+        }
+        ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
+        ConstantData::Boolean { value } => {
+            pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
+        }
+        ConstantData::None => pyre_object::w_none(),
+        _ => pyre_object::w_none(),
+    }
+}
+
 // Virtualizable configuration is in jit/frame_layout.rs

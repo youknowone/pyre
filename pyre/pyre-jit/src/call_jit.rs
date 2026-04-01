@@ -714,21 +714,18 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
         }
     }
 
-    // pyre codewriter convention: frame_reg = int register 3.
-    // RPython uses opimpl_getfield_vable_* instead of a frame register.
-    // This is required until the codewriter is virtualizable-based.
-    const FRAME_REG: usize = 3;
-    if FRAME_REG < bh.registers_i.len() {
-        bh.setarg_i(FRAME_REG, frame as *mut PyFrame as i64);
-    }
+    // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
+    // RPython: the virtualizable ptr is the frame itself.
+    bh.virtualizable_ptr = frame as *mut PyFrame as i64;
+    bh.virtualizable_info = crate::eval::get_virtualizable_info();
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][blackhole] setup pc={} nlocals={} regs_r_len={} frame_reg={}",
+            "[jit][blackhole] setup pc={} nlocals={} regs_r_len={} vable_ptr={:#x}",
             py_pc,
             nlocals,
             bh.registers_r.len(),
-            bh.registers_i.get(3).copied().unwrap_or(-999),
+            bh.virtualizable_ptr as u64,
         );
     }
 
@@ -1008,10 +1005,9 @@ pub fn resume_in_blackhole(
                 }
             }
         }
-        // pyre convention: frame pointer in int register 3 for writeback.
-        if 3 < bh.registers_i.len() {
-            bh.setarg_i(3, frame_ptr as i64);
-        }
+        // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
+        bh.virtualizable_ptr = frame_ptr as i64;
+        bh.virtualizable_info = crate::eval::get_virtualizable_info();
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1256,10 +1252,9 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
             bh.runtime_stack_push(0, frame.locals_cells_stack_w[i] as i64);
         }
     }
-    // Frame pointer in int register 3 (same as resume_in_blackhole line 913).
-    if 3 < bh.registers_i.len() {
-        bh.setarg_i(3, frame as *mut PyFrame as i64);
-    }
+    // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
+    bh.virtualizable_ptr = frame as *mut PyFrame as i64;
+    bh.virtualizable_info = crate::eval::get_virtualizable_info();
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -1753,15 +1748,14 @@ pub fn blackhole_resume_via_rd_numb(
     };
 
     // resume.py:1404: virtualizable_ptr was read by consume_vable_info
-    // from the vable section. Store it in int register 3 (pyre's codewriter
-    // convention for frame_reg). This replaces the previous manual injection
-    // from deadframe[0].
-    if virtualizable_ptr != 0 && 3 < bh.registers_i.len() {
-        bh.setarg_i(3, virtualizable_ptr);
-    } else if !deadframe.is_empty() && 3 < bh.registers_i.len() {
+    // from the vable section. Set on the blackhole for vable bytecodes.
+    if virtualizable_ptr != 0 {
+        bh.virtualizable_ptr = virtualizable_ptr;
+    } else if !deadframe.is_empty() {
         // Fallback for guards without vable section.
-        bh.setarg_i(3, deadframe[0]);
+        bh.virtualizable_ptr = deadframe[0];
     }
+    bh.virtualizable_info = crate::eval::get_virtualizable_info();
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
@@ -2571,76 +2565,43 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 /// For nargs=3: fn(callable, arg0, arg1, arg2, frame_ptr) → 5 args
 /// etc.
 ///
+/// bhimpl_residual_call: parent frame via BH_VABLE_PTR.
 /// call_int_function in machine.rs transmutes to the correct arity.
-pub extern "C" fn bh_call_fn(callable: i64, arg0: i64, frame_ptr: i64) -> i64 {
-    // This is the 3-arg entry point (nargs=1). For other arities,
-    // call_int_function transmutes to bh_call_fn_N variants below.
-    bh_call_fn_impl(
-        callable as PyObjectRef,
-        &[arg0 as PyObjectRef],
-        frame_ptr as *const PyFrame,
-    )
+pub extern "C" fn bh_call_fn(callable: i64, arg0: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, &[arg0 as PyObjectRef])
 }
 
-pub extern "C" fn bh_call_fn_0(callable: i64, frame_ptr: i64) -> i64 {
-    bh_call_fn_impl(callable as PyObjectRef, &[], frame_ptr as *const PyFrame)
+pub extern "C" fn bh_call_fn_0(callable: i64) -> i64 {
+    bh_call_fn_impl(callable as PyObjectRef, &[])
 }
 
-pub extern "C" fn bh_call_fn_2(callable: i64, arg0: i64, arg1: i64, frame_ptr: i64) -> i64 {
+pub extern "C" fn bh_call_fn_2(callable: i64, arg0: i64, arg1: i64) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
         &[arg0 as PyObjectRef, arg1 as PyObjectRef],
-        frame_ptr as *const PyFrame,
     )
 }
 
-pub extern "C" fn bh_call_fn_3(
-    callable: i64,
-    arg0: i64,
-    arg1: i64,
-    arg2: i64,
-    frame_ptr: i64,
-) -> i64 {
+pub extern "C" fn bh_call_fn_3(callable: i64, a0: i64, a1: i64, a2: i64) -> i64 {
+    bh_call_fn_impl(
+        callable as PyObjectRef,
+        &[a0 as PyObjectRef, a1 as PyObjectRef, a2 as PyObjectRef],
+    )
+}
+
+pub extern "C" fn bh_call_fn_4(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
         &[
-            arg0 as PyObjectRef,
-            arg1 as PyObjectRef,
-            arg2 as PyObjectRef,
+            a0 as PyObjectRef,
+            a1 as PyObjectRef,
+            a2 as PyObjectRef,
+            a3 as PyObjectRef,
         ],
-        frame_ptr as *const PyFrame,
     )
 }
 
-pub extern "C" fn bh_call_fn_4(
-    callable: i64,
-    arg0: i64,
-    arg1: i64,
-    arg2: i64,
-    arg3: i64,
-    frame_ptr: i64,
-) -> i64 {
-    bh_call_fn_impl(
-        callable as PyObjectRef,
-        &[
-            arg0 as PyObjectRef,
-            arg1 as PyObjectRef,
-            arg2 as PyObjectRef,
-            arg3 as PyObjectRef,
-        ],
-        frame_ptr as *const PyFrame,
-    )
-}
-
-pub extern "C" fn bh_call_fn_5(
-    callable: i64,
-    a0: i64,
-    a1: i64,
-    a2: i64,
-    a3: i64,
-    a4: i64,
-    frame_ptr: i64,
-) -> i64 {
+pub extern "C" fn bh_call_fn_5(callable: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
         &[
@@ -2650,7 +2611,6 @@ pub extern "C" fn bh_call_fn_5(
             a3 as PyObjectRef,
             a4 as PyObjectRef,
         ],
-        frame_ptr as *const PyFrame,
     )
 }
 
@@ -2662,7 +2622,6 @@ pub extern "C" fn bh_call_fn_6(
     a3: i64,
     a4: i64,
     a5: i64,
-    frame_ptr: i64,
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
@@ -2674,7 +2633,6 @@ pub extern "C" fn bh_call_fn_6(
             a4 as PyObjectRef,
             a5 as PyObjectRef,
         ],
-        frame_ptr as *const PyFrame,
     )
 }
 
@@ -2687,7 +2645,6 @@ pub extern "C" fn bh_call_fn_7(
     a4: i64,
     a5: i64,
     a6: i64,
-    frame_ptr: i64,
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
@@ -2700,7 +2657,6 @@ pub extern "C" fn bh_call_fn_7(
             a5 as PyObjectRef,
             a6 as PyObjectRef,
         ],
-        frame_ptr as *const PyFrame,
     )
 }
 
@@ -2714,7 +2670,6 @@ pub extern "C" fn bh_call_fn_8(
     a5: i64,
     a6: i64,
     a7: i64,
-    frame_ptr: i64,
 ) -> i64 {
     bh_call_fn_impl(
         callable as PyObjectRef,
@@ -2728,15 +2683,12 @@ pub extern "C" fn bh_call_fn_8(
             a6 as PyObjectRef,
             a7 as PyObjectRef,
         ],
-        frame_ptr as *const PyFrame,
     )
 }
 
-fn bh_call_fn_impl(
-    callable: PyObjectRef,
-    args: &[PyObjectRef],
-    parent_frame: *const PyFrame,
-) -> i64 {
+/// bhimpl_residual_call: parent frame comes from BH_VABLE_PTR thread-local
+/// (set by blackhole.run() before dispatch).
+fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
@@ -2758,7 +2710,9 @@ fn bh_call_fn_impl(
             }
         }
     }
-    let parent_frame = unsafe { &*parent_frame };
+    let parent_frame_ptr =
+        majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+    let parent_frame = unsafe { &*parent_frame_ptr };
     match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
         Ok(result) => result as i64,
         Err(err) => {
@@ -2769,13 +2723,11 @@ fn bh_call_fn_impl(
     }
 }
 
-/// RPython: bhimpl_residual_call — LOAD_GLOBAL helper.
-///
-/// Loads a global name from the frame's namespace (globals + builtins).
+/// jtransform.py parity: namespace and code come from getfield_vable_r.
+/// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
 /// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
-pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
-    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
-    let code = unsafe { &*frame.code };
+pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, code_ptr: i64, namei: i64) -> i64 {
+    let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
     let raw = namei as usize;
     let idx = raw >> 1;
 
@@ -2784,10 +2736,7 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
     }
 
     let name = code.names[idx].as_ref();
-    // PyFrame.namespace = globals; look up name there.
-    // opcode_load_name dispatches through the NamespaceOpcodeHandler trait;
-    // for the blackhole we call the namespace directly.
-    let ns = unsafe { &*frame.namespace };
+    let ns = unsafe { &*(namespace_ptr as *const pyre_interpreter::PyNamespace) };
     match ns.get(name) {
         Some(&value) => value as i64,
         None => {
@@ -2803,11 +2752,11 @@ pub extern "C" fn bh_load_global_fn(frame_ptr: i64, namei: i64) -> i64 {
     }
 }
 
-/// Load a constant from the frame's code object.
-/// RPython assembler.py parity: constants are resolved at blackhole runtime.
-pub extern "C" fn bh_load_const_fn(frame_ptr: i64, consti: i64) -> i64 {
-    let frame = unsafe { &*(frame_ptr as *const PyFrame) };
-    frame.load_const_pyobj(consti as usize) as i64
+/// Load a constant from the code object.
+/// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
+pub extern "C" fn bh_load_const_fn(code_ptr: i64, consti: i64) -> i64 {
+    let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
+    pyre_interpreter::pyframe::load_const_from_code(code, consti as usize) as i64
 }
 
 /// Box a raw integer into a PyObject (w_int_new wrapper).
