@@ -2952,16 +2952,12 @@ fn build_resumed_frames(
         );
     }
 
-    // pyjitpl.py:3419-3430 + 3446-3450 synchronize_virtualizable:
-    // RPython's blackhole path calls write_from_resume_data_partial to write
-    // ALL vable fields to the heap virtualizable BEFORE blackhole execution.
-    //
-    // In pyre, the blackhole handles frame restoration independently via
-    // frame section values. synchronize_virtualizable is not called here
-    // because the blackhole overwrites frame slots from its own registers,
-    // and any sync'd values for untouched slots may conflict with the
-    // blackhole's state. The PyFrame is updated by the blackhole's
-    // writeback at merge point or ContinueRunningNormally.
+    // pyjitpl.py:3419-3430 synchronize_virtualizable:
+    // RPython calls write_from_resume_data_partial via consume_vable_info
+    // inside blackhole_from_resumedata (resume.py:1399-1408). This is now
+    // handled by passing real vinfo to blackhole_from_resumedata in
+    // call_jit.rs, which calls consume_vref_and_vable → consume_vable_info
+    // → write_from_resume_data_partial automatically.
 
     result
 }

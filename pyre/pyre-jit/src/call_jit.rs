@@ -1731,18 +1731,31 @@ pub fn blackhole_resume_via_rd_numb(
             continue;
         }
 
-        // blackhole.py:1636-1640: get_tmpreg_r() for ref return.
-        let return_value = bh.get_tmpreg_r();
+        // blackhole.py:1632-1644: pass return value to caller by _return_type.
+        use majit_metainterp::blackhole::BhReturnType;
+        let rt = bh.return_type;
         let next = bh.nextblackholeinterp.take();
+        let caller = next.map(|b| *b);
+        if caller.is_none() {
+            // blackhole.py:1634-1635 _done_with_this_frame
+            let result = match rt {
+                BhReturnType::Int => bh.get_tmpreg_i() as pyre_object::PyObjectRef,
+                BhReturnType::Ref => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
+                BhReturnType::Float => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
+                BhReturnType::Void => pyre_object::PY_NULL,
+            };
+            builder.release_interp(bh);
+            return BlackholeResult::DoneWithThisFrame(Ok(result));
+        }
+        let mut caller_bh = caller.unwrap();
+        // blackhole.py:1637-1644: dispatch by _return_type
+        match rt {
+            BhReturnType::Int => caller_bh.setup_return_value_i(bh.get_tmpreg_i()),
+            BhReturnType::Ref => caller_bh.setup_return_value_r(bh.get_tmpreg_r()),
+            BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
+            BhReturnType::Void => {}
+        }
         builder.release_interp(bh);
-        let Some(mut caller_bh) = next.map(|b| *b) else {
-            // blackhole.py:1664-1672 _done_with_this_frame
-            return BlackholeResult::DoneWithThisFrame(
-                Ok(return_value as pyre_object::PyObjectRef),
-            );
-        };
-        // blackhole.py:1657-1659 _setup_return_value_r
-        caller_bh.setup_return_value_r(return_value);
         bh = caller_bh;
     }
 }
