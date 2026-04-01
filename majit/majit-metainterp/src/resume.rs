@@ -2903,12 +2903,15 @@ impl ResumeDataLoopMemo {
         if opref.is_none() {
             return UNINITIALIZED_TAG;
         }
+        // RPython resume.py:566-567: liveboxes_from_env check before
+        // isinstance(Const). Preserves TAGBOX for OpRefs that are in
+        // both liveboxes and the constant map.
+        if let Some(tagged) = liveboxes_from_env.get(opref.0) {
+            return tagged;
+        }
         if env.is_const(opref) {
             let (val, tp) = env.get_const(opref);
             return self.getconst(val, tp);
-        }
-        if let Some(tagged) = liveboxes_from_env.get(opref.0) {
-            return tagged;
         }
         if let Some(tagged) = new_liveboxes.get(opref.0) {
             // Resolve UNASSIGNED to real cached number
@@ -2955,13 +2958,17 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            if env.is_const(opref) {
-                let (val, tp) = env.get_const(opref);
-                let tagged = self.getconst(val, tp);
+            // RPython resume.py:206-208: liveboxes_from_env check before
+            // isinstance(Const). In RPython, Const and liveboxes are disjoint.
+            // In pyre, is_const() can overlap with liveboxes (via make_constant).
+            // Check liveboxes first to preserve existing TAGBOX/TAGVIRTUAL tags.
+            if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
                 numb_state.append_short(tagged);
                 continue;
             }
-            if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
+            if env.is_const(opref) {
+                let (val, tp) = env.get_const(opref);
+                let tagged = self.getconst(val, tp);
                 numb_state.append_short(tagged);
                 continue;
             }
@@ -3231,13 +3238,16 @@ impl ResumeDataLoopMemo {
                             if opref.is_none() {
                                 return UNINITIALIZED_TAG;
                             }
+                            // RPython: liveboxes check before isinstance(Const).
+                            // In pyre, is_const() can return true for OpRefs
+                            // that are also in liveboxes (via make_constant).
+                            // liveboxes priority preserves TAGBOX encoding.
+                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
+                                return t;
+                            }
                             if env.is_const(opref) {
                                 let (val, tp) = env.get_const(opref);
                                 return self.getconst(val, tp);
-                            }
-                            // Check liveboxes_from_env first
-                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
-                                return t;
                             }
                             // Then check new_liveboxes
                             if let Some(t) = new_liveboxes.get(opref.0) {
