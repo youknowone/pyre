@@ -2815,46 +2815,15 @@ impl Optimizer {
         if has_snapshot {
             // optimizer.py:732-748 + resume.py:389-452:
             // RPython finish() handles virtuals without forcing.
-            //
-            // Majit deviation: collect_virtual_field_values forces nested
-            // virtuals. RPython's _number_virtuals only collects.
-            //
-            // install_imported_virtuals emits SameAs ops for virtual field
-            // values (Box identity parity). The remaining blocker for
-            // forcing removal is fib_loop label_args aliasing (OpRef(22)
-            // duplicated in make_inputargs) and raise_catch guard recovery.
-            let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
-            let mut extra_fail_args: Vec<OpRef> = Vec::new();
-            let original_len = fail_args.len();
-            for fa_idx in 0..original_len {
-                if fail_args[fa_idx].is_none() {
-                    continue;
+            // _number_boxes tags virtual fail_args as TAGVIRTUAL,
+            // _number_virtuals builds rd_virtuals_info from PtrInfo.
+            // No pre-forcing or extra_fail_args needed.
+            for fa_idx in 0..fail_args.len() {
+                if !fail_args[fa_idx].is_none() {
+                    fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
                 }
-                let resolved = ctx.get_box_replacement(fail_args[fa_idx]);
-                if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
-                    if info.is_virtual() {
-                        if Self::collect_virtual_field_values(
-                            &info,
-                            original_len,
-                            &mut extra_fail_args,
-                            ctx,
-                        ) {
-                            virtual_slots.push((fa_idx, resolved));
-                            fail_args[fa_idx] = OpRef::NONE;
-                        } else {
-                            let forced = info.force_box_direct(resolved, ctx);
-                            fail_args[fa_idx] = ctx.get_box_replacement(forced);
-                        }
-                        continue;
-                    }
-                }
-                fail_args[fa_idx] = resolved;
             }
-            if !extra_fail_args.is_empty() {
-                let fa = op.fail_args.as_mut().unwrap();
-                fa.extend(extra_fail_args);
-            }
-            ctx.finalize_guard_resume_data(&mut op, &virtual_slots);
+            ctx.finalize_guard_resume_data(&mut op, &[]);
             return op;
         }
         let original_len = fail_args.len();
