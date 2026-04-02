@@ -691,10 +691,10 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-    // resume.py:1381 consume_one_section / write_a_ref:
-    // RPython dispatches to write_an_int/write_a_ref/write_a_float by type.
-    // pyre: all Python locals are PyObjectRef (GCREF) → always ref bank.
-    // codewriter emits move_r for LOAD_FAST.
+    // Direct PyFrame loading (not resume data — no enumerate_vars dispatch).
+    // frame.locals_cells_stack_w is always PyObjectRef → write_a_ref only.
+    // RPython's resume path uses enumerate_vars typed callbacks, but this
+    // pyre-specific path loads from the concrete frame directly.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
@@ -732,10 +732,25 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: _run_forever(blackholeinterp, current_exc)
     bh.run();
 
-    // blackhole.py:1664-1672 _done_with_this_frame:
-    // RPython dispatches by _return_type. pyre codewriter only emits
-    // ref_return (all Python values are boxed GCREF), so Ref is correct.
-    let result = bh.get_tmpreg_r() as PyObjectRef;
+    // blackhole.py:1664-1677 _done_with_this_frame:
+    // RPython dispatches by _return_type (i/r/f/v).
+    use majit_metainterp::blackhole::BhReturnType;
+    let result = match bh.return_type {
+        BhReturnType::Int => {
+            // blackhole.py:1671 DoneWithThisFrameInt(get_tmpreg_i)
+            pyre_object::intobject::w_int_new(bh.get_tmpreg_i()) as PyObjectRef
+        }
+        BhReturnType::Ref => {
+            // blackhole.py:1673 DoneWithThisFrameRef(get_tmpreg_r)
+            bh.get_tmpreg_r() as PyObjectRef
+        }
+        BhReturnType::Float => {
+            // blackhole.py:1675 DoneWithThisFrameFloat(get_tmpreg_f)
+            let bits = bh.get_tmpreg_f() as u64;
+            pyre_object::floatobject::w_float_new(f64::from_bits(bits)) as PyObjectRef
+        }
+        BhReturnType::Void => std::ptr::null_mut(),
+    };
 
     // RPython: builder.release_interp(blackholeinterp) — return to pool
     builder.release_interp(bh);
@@ -949,17 +964,14 @@ pub fn resume_in_blackhole(
                 },
             );
         }
-        // RPython parity: values = slot registers only (no header offset).
-        // Use the SAME LivenessInfo as capture (get_list_of_active_boxes).
+        // resume.py:1017-1038 _prepare_next_section:
+        // RPython dispatches typed callbacks: _callback_i → write_an_int,
+        // _callback_r → write_a_ref, _callback_f → write_a_float.
+        // pyre: all Python locals are PyObjectRef (GCREF) → write_a_ref only.
+        // codewriter regalloc puts all locals in ref registers (move_r).
         if use_liveness {
             if let Some(info) = liveness_info {
-                // RPython parity: iterate live_r_regs (same order as capture).
-                let stack_base = info
-                    .live_r_regs
-                    .iter()
-                    .find(|&&idx| idx as usize >= nlocals)
-                    .map(|&idx| idx as usize)
-                    .unwrap_or(nlocals);
+                // enumerate_vars: iterate live_r_regs (same order as capture).
                 for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
                     let idx = reg_idx as usize;
                     if let Some(val) = section.values.get(val_idx) {
@@ -1234,9 +1246,8 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
     bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
 
-    // RPython blackhole.py _prepare_next_section parity:
-    // pyre locals are PyObjectRef → ref register bank (setarg_r).
-    // resume_in_blackhole (line 892) uses setarg_r — this must match.
+    // Direct PyFrame loading (not resume data — no enumerate_vars dispatch).
+    // frame.locals_cells_stack_w is always PyObjectRef → write_a_ref only.
     // The writeback (line 950) reads from registers_r.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
@@ -2683,8 +2694,8 @@ pub extern "C" fn bh_call_fn_8(
     )
 }
 
-/// bhimpl_residual_call: parent frame comes from BH_VABLE_PTR thread-local
-/// (set by blackhole.run() before dispatch).
+/// bhimpl_residual_call: parent frame from BH_VABLE_PTR thread-local.
+/// RPython: bhimpl_residual_call dispatches via cpu.bh_call_*.
 fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
