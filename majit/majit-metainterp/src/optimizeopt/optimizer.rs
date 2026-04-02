@@ -2795,7 +2795,7 @@ impl Optimizer {
             // provides the sole source of fail_args via _number_boxes.
             if op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position)
             {
-                ctx.finalize_guard_resume_data(&mut op, &[]);
+                ctx.finalize_guard_resume_data(&mut op);
             }
             return op;
         };
@@ -2820,7 +2820,7 @@ impl Optimizer {
                     fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
                 }
             }
-            ctx.finalize_guard_resume_data(&mut op, &[]);
+            ctx.finalize_guard_resume_data(&mut op);
             return op;
         }
         let original_len = fail_args.len();
@@ -2929,7 +2929,7 @@ impl Optimizer {
         // resume.py ResumeDataVirtualAdder.finish() parity:
         // Generate rd_numb + rd_consts + rd_virtuals in the SAME call as
         // fail_args finalization. RPython does not defer to a later phase.
-        ctx.finalize_guard_resume_data(&mut op, &virtual_slots);
+        ctx.finalize_guard_resume_data(&mut op);
 
         op
     }
