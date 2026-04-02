@@ -319,7 +319,19 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             // Complex number stub → just the real part
             handler.float_constant(value.re)
         }
-        _ => Err(PyError::type_error("unsupported constant")),
+        ConstantData::Frozenset { elements } => {
+            // frozenset → tuple (stub: proper frozenset not yet available)
+            let mut items = Vec::with_capacity(elements.len());
+            for element in elements {
+                items.push(load_const_value(handler, element)?);
+            }
+            handler.build_tuple(&items)
+        }
+        ConstantData::Slice { elements } => {
+            // Slice constants not yet supported; push None
+            let _ = elements;
+            handler.none_constant()
+        }
     }
 }
 
@@ -1632,13 +1644,19 @@ where
 
         // ── None comparison jumps ──
         Instruction::PopJumpIfNone { delta } => {
-            let target = u32::from(delta.get(op_arg)) as usize;
-            executor.pop_jump_if_none(target)?;
+            executor.pop_jump_if_none(jump_target_forward(
+                &code.instructions,
+                next_instr,
+                delta.get(op_arg).as_usize(),
+            ))?;
             Ok(StepResult::Continue)
         }
         Instruction::PopJumpIfNotNone { delta } => {
-            let target = u32::from(delta.get(op_arg)) as usize;
-            executor.pop_jump_if_not_none(target)?;
+            executor.pop_jump_if_not_none(jump_target_forward(
+                &code.instructions,
+                next_instr,
+                delta.get(op_arg).as_usize(),
+            ))?;
             Ok(StepResult::Continue)
         }
 

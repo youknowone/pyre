@@ -556,8 +556,9 @@ fn type_descr_new_with_metaclass(
             for (k, v) in entries {
                 if unsafe { is_str(k) } {
                     if let Ok(set_name) = crate::baseobjspace::getattr(v, "__set_name__") {
-                        // Call: descriptor.__set_name__(self, owner, name)
-                        let _ = crate::call_function(set_name, &[v, w_type, k]);
+                        // getattr returns a bound method, so self is already bound.
+                        // Call: bound_set_name(owner, name)
+                        let _ = crate::call_function(set_name, &[w_type, k]);
                     }
                 }
             }
