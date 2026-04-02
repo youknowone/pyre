@@ -948,3 +948,22 @@ pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode
         unsafe { &*(entry as *const PyJitCode) }
     })
 }
+
+/// RPython parity: codewriter.make_jitcodes() runs before tracing.
+/// In pyre, JitCode compilation is lazy. This function ensures the
+/// JitCode (with liveness info) exists for a CodeObject so that
+/// get_list_of_active_boxes can use it during tracing.
+pub fn ensure_jitcode_for(code: &pyre_interpreter::CodeObject) {
+    let writer = CodeWriter::new(
+        crate::call_jit::bh_call_fn,
+        crate::call_jit::bh_load_global_fn,
+        crate::call_jit::bh_compare_fn,
+        crate::call_jit::bh_binary_op_fn,
+        crate::call_jit::bh_box_int_fn,
+        crate::call_jit::bh_truth_fn,
+        crate::call_jit::bh_load_const_fn,
+        crate::call_jit::bh_store_subscr_fn,
+        crate::call_jit::bh_build_list_fn,
+    );
+    let _ = get_jitcode(code, &writer);
+}

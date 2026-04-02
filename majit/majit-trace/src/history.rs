@@ -395,10 +395,9 @@ impl TreeLoop {
                                 } else {
                                     // opencoder.py:287-288: _get(i) asserts
                                     // _cache[i] is not None. An unmapped pre-cut
-                                    // Box has no entry in the post-cut namespace
-                                    // and would assert-fail in RPython. Map to
-                                    // NONE (UNINITIALIZED) so _number_boxes skips
-                                    // it rather than producing a stale TAGBOX.
+                                    // Box has no entry in the post-cut namespace.
+                                    // Map to NONE so _number_boxes emits
+                                    // UNINITIALIZED rather than a stale TAGBOX.
                                     crate::recorder::SnapshotTagged::Box(OpRef::NONE.0, *tp)
                                 }
                             }
