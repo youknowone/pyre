@@ -5190,6 +5190,11 @@ pub struct ResumeDataDirectReader<'a> {
     // ResumeDataDirectReader fields (resume.py:1364-1367)
     /// resume.py:1366 deadframe — raw fail_args values
     pub deadframe: &'a [i64],
+    /// pyre flat-deadframe adaptation: original type of each deadframe slot.
+    /// RPython's CPU exposes typed getters (get_ref_value/get_int_value/...);
+    /// pyre passes a flat raw slice and needs slot kinds to emulate
+    /// load_box_from_cpu(kind) for TAGBOX decode.
+    pub deadframe_types: Option<&'a [majit_ir::Type]>,
 
     // resume.py:1358 resume_after_guard_not_forced
     //   0: not a GUARD_NOT_FORCED
@@ -5276,10 +5281,17 @@ pub trait BlackholeAllocator {
         self.setarrayitem_int(array, index, value, descr);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
-    /// Called by decode_ref when TAGINT appears in a ref-register slot
-    /// (pyre has no typed register files — optimizer may unbox Ref→Int).
+    ///
+    /// RPython equivalent: cpu.get_ref_value always returns GCREF because
+    /// the jitframe stores typed values. Pyre's deadframe is untyped i64;
+    /// when a slot typed as Int is read through decode_ref, this method
+    /// wraps it into a valid GCREF (W_IntObject).
     fn box_int(&self, value: i64) -> i64 {
         value // default: return raw value (override in pyre allocator)
+    }
+    /// Pyre-specific: box raw float bits to a PyObject ref.
+    fn box_float(&self, value: i64) -> i64 {
+        value
     }
 }
 
@@ -5390,6 +5402,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_numb: &'a [u8],
         rd_consts: &'a [i64],
         deadframe: &'a [i64],
+        deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
     ) -> Self {
@@ -5413,6 +5426,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe,
+            deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
             virtuals_cache_ptr,
@@ -5882,7 +5896,18 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                let value = self.deadframe[idx as usize];
+                match self
+                    .deadframe_types
+                    .and_then(|tys| tys.get(idx as usize))
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Ref)
+                {
+                    majit_ir::Type::Ref => value,
+                    majit_ir::Type::Int => self.allocator.box_int(value),
+                    majit_ir::Type::Float => self.allocator.box_float(value),
+                    majit_ir::Type::Void => value,
+                }
             }
             TAGINT => {
                 // pyre parity: all values are in ref registers (no typed
@@ -5968,6 +5993,7 @@ pub fn blackhole_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [i64],
     deadframe: &'a [i64],
+    deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_pendingfields: Option<&[PendingFieldInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
@@ -5977,8 +6003,14 @@ pub fn blackhole_from_resumedata<'a>(
     allocator: &'a dyn BlackholeAllocator,
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1317-1321
-    let mut resumereader =
-        ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
+    let mut resumereader = ResumeDataDirectReader::new(
+        rd_numb,
+        rd_consts,
+        deadframe,
+        deadframe_types,
+        None,
+        allocator,
+    );
 
     // resume.py:1324
     resumereader.prepare(rd_virtuals, rd_pendingfields, rd_guard_pendingfields);
@@ -6027,14 +6059,21 @@ pub fn force_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [i64],
     deadframe: &'a [i64],
+    deadframe_types: Option<&'a [majit_ir::Type]>,
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> (Vec<i64>, Vec<i64>) {
     // resume.py:1347-1348
-    let mut resumereader =
-        ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
+    let mut resumereader = ResumeDataDirectReader::new(
+        rd_numb,
+        rd_consts,
+        deadframe,
+        deadframe_types,
+        None,
+        allocator,
+    );
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

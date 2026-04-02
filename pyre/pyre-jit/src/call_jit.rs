@@ -1729,6 +1729,7 @@ pub fn blackhole_resume_via_rd_numb(
         rd_numb,
         rd_consts,
         deadframe,
+        None,                   // deadframe_types
         rd_virtuals_slice,      // rd_virtuals
         None,                   // rd_pendingfields
         rd_guard_pendingfields, // rd_guard_pendingfields
