@@ -244,8 +244,6 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
-    /// RPython Box identity: separate non-chaining import_box map.
-    pub import_box_map: HashMap<u32, OpRef>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
@@ -434,7 +432,6 @@ impl OptContext {
             current_pass_idx: 0,
 
             in_final_emission: false,
-            import_box_map: HashMap::new(),
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
@@ -486,7 +483,6 @@ impl OptContext {
             current_pass_idx: 0,
 
             in_final_emission: false,
-            import_box_map: HashMap::new(),
             pending_for_guard: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
@@ -1167,21 +1163,14 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// Record that `old` should be replaced by `new` wherever it appears.
-    /// RPython set_forwarded parity: setting forwarding from old → new.
-    /// RPython Box identity: when a Box is forwarded, its PtrInfo (if any)
-    /// lives on the terminal Box in the chain. In majit, when we overwrite
-    /// forwarded[old] from Info(X) or Op(→Info(X)) to Op(new), we must
-    /// propagate the existing PtrInfo to `new` so get_ptr_info(old) still
-    /// reaches it via the new chain old→new→...→Info.
+    /// resoperation.py:240-242: set_forwarded(forwarded_to) — store the
+    /// forwarding target on this box. Info is set separately by setinfo /
+    /// setinfo_from_preamble.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
-        // Before overwriting, check if `old` carried PtrInfo (directly or
-        // through its forwarding chain). If so, propagate to `new`.
-        let old_info = self.get_ptr_info(old).cloned();
         let idx = old.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
@@ -1191,29 +1180,6 @@ impl OptContext {
         } else {
             self.forwarded[idx] = Forwarded::Op(new);
         }
-        // RPython Box identity parity: propagate PtrInfo to the terminal
-        // of the new forwarding chain so get_ptr_info(old) reaches it.
-        if let Some(info) = old_info {
-            let terminal = self.get_box_replacement(new);
-            if self.get_ptr_info(terminal).is_none() {
-                let tidx = terminal.0 as usize;
-                if tidx >= self.forwarded.len() {
-                    self.forwarded.resize(tidx + 1, Forwarded::None);
-                }
-                if matches!(self.forwarded[tidx], Forwarded::None) {
-                    self.forwarded[tidx] = Forwarded::Info(info);
-                }
-            }
-        }
-    }
-
-    /// RPython unroll.py: source.set_forwarded(target)
-    /// Sets forwarding from Phase 2 source to Phase 1 export target.
-    /// setinfo_from_preamble_recursive then sets PtrInfo on the TARGET
-    /// (via get_replacement).
-    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
-        self.import_box_map.insert(source.0, target);
-        self.replace_op(source, target);
     }
 
     /// RPython get_box_replacement: follow forwarding chain, stop when the
@@ -1250,14 +1216,6 @@ impl OptContext {
     /// follows the _forwarded chain on the box itself.
     pub fn get_box_replacement(&self, mut opref: OpRef) -> OpRef {
         use crate::optimizeopt::info::Forwarded;
-        // RPython Box identity: check import_box_map FIRST for a non-chaining
-        // one-step lookup. This prevents chains where import_box(a→b) and
-        // import_box(b→c) would make get_replacement(a) skip b entirely.
-        // RPython stops at PtrInfo terminals; here we stop by using the map
-        // instead of following forwarded[] which may be overwritten.
-        if let Some(&target) = self.import_box_map.get(&opref.0) {
-            opref = target;
-        }
         loop {
             let idx = opref.0 as usize;
             if idx >= self.forwarded.len() {
