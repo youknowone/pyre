@@ -691,10 +691,10 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: blackholeinterp.setposition(jitcode, pc)
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
 
-    // resume.py:1028-1038 _callback_r → write_a_ref:
-    // RPython dispatches typed callbacks (write_an_int/write_a_ref/write_a_float).
-    // pyre: all Python locals are PyObjectRef (GCREF) → write_a_ref only.
-    // codewriter regalloc puts all locals in ref registers (move_r).
+    // resume.py:1381 consume_one_section / write_a_ref:
+    // RPython dispatches to write_an_int/write_a_ref/write_a_float by type.
+    // pyre: all Python locals are PyObjectRef (GCREF) → always ref bank.
+    // codewriter emits move_r for LOAD_FAST.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
@@ -732,25 +732,10 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
     // RPython: _run_forever(blackholeinterp, current_exc)
     bh.run();
 
-    // blackhole.py:1664-1677 _done_with_this_frame:
-    // RPython dispatches by _return_type (i/r/f/v).
-    use majit_metainterp::blackhole::BhReturnType;
-    let result = match bh.return_type {
-        BhReturnType::Int => {
-            // blackhole.py:1671 DoneWithThisFrameInt(get_tmpreg_i)
-            pyre_object::intobject::w_int_new(bh.get_tmpreg_i()) as PyObjectRef
-        }
-        BhReturnType::Ref => {
-            // blackhole.py:1673 DoneWithThisFrameRef(get_tmpreg_r)
-            bh.get_tmpreg_r() as PyObjectRef
-        }
-        BhReturnType::Float => {
-            // blackhole.py:1675 DoneWithThisFrameFloat(get_tmpreg_f)
-            let bits = bh.get_tmpreg_f() as u64;
-            pyre_object::floatobject::w_float_new(f64::from_bits(bits)) as PyObjectRef
-        }
-        BhReturnType::Void => std::ptr::null_mut(),
-    };
+    // blackhole.py:1664-1672 _done_with_this_frame:
+    // RPython dispatches by _return_type. pyre codewriter only emits
+    // ref_return (all Python values are boxed GCREF), so Ref is correct.
+    let result = bh.get_tmpreg_r() as PyObjectRef;
 
     // RPython: builder.release_interp(blackholeinterp) — return to pool
     builder.release_interp(bh);
@@ -964,19 +949,21 @@ pub fn resume_in_blackhole(
                 },
             );
         }
-        // resume.py:1017-1038 _prepare_next_section:
-        // RPython dispatches typed callbacks: _callback_i → write_an_int,
-        // _callback_r → write_a_ref, _callback_f → write_a_float.
-        // pyre: all Python locals are PyObjectRef (GCREF) → write_a_ref only.
-        // codewriter regalloc puts all locals in ref registers (move_r).
+        // RPython parity: values = slot registers only (no header offset).
+        // Use the SAME LivenessInfo as capture (get_list_of_active_boxes).
         if use_liveness {
             if let Some(info) = liveness_info {
-                // enumerate_vars: iterate live_r_regs (same order as capture).
+                // RPython parity: iterate live_r_regs (same order as capture).
+                let stack_base = info
+                    .live_r_regs
+                    .iter()
+                    .find(|&&idx| idx as usize >= nlocals)
+                    .map(|&idx| idx as usize)
+                    .unwrap_or(nlocals);
                 for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
                     let idx = reg_idx as usize;
                     if let Some(val) = section.values.get(val_idx) {
                         if idx < nlocals {
-                            // write_a_ref(register_index, value)
                             bh.setarg_r(idx, materialize_virtual(val));
                         } else {
                             bh.runtime_stack_push(0, materialize_virtual(val));
@@ -984,14 +971,13 @@ pub fn resume_in_blackhole(
                     }
                 }
             } else {
-                // Fallback: LiveVars path (same data as JitCode liveness)
+                // Fallback: LiveVars path
                 let live = pyre_jit_trace::state::liveness_for(section.code);
                 let max_stack = vsd.saturating_sub(nlocals);
                 let mut val_idx = 0;
                 for i in 0..nlocals {
                     if live.is_local_live(live_pc, i) {
                         if let Some(val) = section.values.get(val_idx) {
-                            // write_a_ref(register_index, value)
                             bh.setarg_r(i, materialize_virtual(val));
                         }
                         val_idx += 1;
@@ -1247,9 +1233,10 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
     bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
     bh.merge_point_jitcode_pc = Some(merge_jitcode_pc);
 
-    // resume.py:1028-1038 _callback_r → write_a_ref:
-    // RPython dispatches typed callbacks (write_an_int/write_a_ref/write_a_float).
-    // pyre: all Python locals are PyObjectRef (GCREF) → write_a_ref only.
+    // RPython blackhole.py _prepare_next_section parity:
+    // pyre locals are PyObjectRef → ref register bank (setarg_r).
+    // resume_in_blackhole (line 892) uses setarg_r — this must match.
+    // The writeback (line 950) reads from registers_r.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
@@ -1742,12 +1729,12 @@ pub fn blackhole_resume_via_rd_numb(
         rd_numb,
         rd_consts,
         deadframe,
-        rd_virtuals_slice,
-        None, // rd_pendingfields
-        rd_guard_pendingfields,
-        None, // vrefinfo (pyre: no virtualref)
+        rd_virtuals_slice,      // rd_virtuals
+        None,                   // rd_pendingfields
+        rd_guard_pendingfields, // rd_guard_pendingfields
+        None,                   // vrefinfo — pyre has no virtualref mechanism
         Some(&vinfo as &dyn resume::VirtualizableInfo),
-        None, // ginfo (pyre: no greenfield)
+        None, // ginfo — pyre has no greenfield mechanism
         &allocator,
     );
 
@@ -2718,11 +2705,6 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
             }
         }
     }
-    // RPython blackhole.py:1095 bhimpl_residual_call → portal_ptr.
-    // call_user_function_plain bypasses EVAL_OVERRIDE for THIS frame.
-    // Nested calls from the callee go through normal call_user_function
-    // which respects EVAL_OVERRIDE (eval_with_jit), allowing JIT re-entry
-    // for compiled code — matching RPython's portal_runner behavior.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };

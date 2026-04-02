@@ -156,10 +156,6 @@ pub(crate) fn build_guard_metadata(
     let mut resume_memo = ResumeDataLoopMemo::new();
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
-    // Merge constant types so fail_arg_type can resolve constant OpRefs.
-    for (&idx, &tp) in constant_types {
-        value_types.entry(idx).or_insert(tp);
-    }
 
     for (op_idx, op) in ops.iter().enumerate() {
         if !op.pos.is_none() && op.result_type() != Type::Void {
