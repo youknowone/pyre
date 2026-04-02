@@ -1463,8 +1463,7 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
 
 /// pyre slots are always GCREF (Ref) at the concrete frame level.
 /// Even W_IntObject values are stored as Ref pointers — the trace
-/// unboxes via GetfieldGcPureI. adapt_live_values_to_trace_types
-/// converts Ref→Int at compiled entry to match trace-internal types.
+/// unboxes via GetfieldGcPureI.
 fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
@@ -2691,17 +2690,12 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // Derive slot types from concrete Box values (no concrete_frame read).
+            // All slots are Ref — no concrete type inference.
             if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types = s.concrete_locals.iter().map(|cv| cv.ir_type()).collect();
+                s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
             }
             if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types = s
-                    .concrete_stack
-                    .iter()
-                    .take(stack_only)
-                    .map(|cv| cv.ir_type())
-                    .collect();
+                s.symbolic_stack_types = vec![Type::Ref; stack_only];
             }
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
@@ -4103,6 +4097,7 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+                    this.remember_value_type(truth, Type::Int);
                     // RPython goto_if_not fusion: cache truth for
                     // the next POP_JUMP_IF to consume directly.
                     this.sym_mut().last_comparison_truth = Some(truth);
@@ -4152,6 +4147,7 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+                    this.remember_value_type(truth, Type::Int);
                     this.sym_mut().last_comparison_truth = Some(truth);
                     this.sym_mut().last_comparison_concrete_truth =
                         Some(objspace_compare_floats(lhs_obj, rhs_obj, op));
@@ -7730,25 +7726,22 @@ impl JitState for PyreJitState {
             Value::Int(meta.merge_pc as i64),
             Value::Int(self.valuestackdepth as i64),
         ];
+        // All locals/stack are Ref — RPython parity: MIFrame has typed
+        // registers, pyre always passes PyObjectRef (boxed).
         for i in 0..nlocals {
             let value = self.local_at(i).unwrap_or(PY_NULL);
-            let slot_type = meta.slot_types.get(i).copied().unwrap_or(Type::Ref);
-            vals.push(extract_concrete_typed_value(slot_type, value));
+            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
         }
         for i in 0..stack_only {
             let value = self.stack_at(i).unwrap_or(PY_NULL);
-            let slot_type = meta
-                .slot_types
-                .get(nlocals + i)
-                .copied()
-                .unwrap_or(Type::Ref);
-            vals.push(extract_concrete_typed_value(slot_type, value));
+            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
         }
         vals
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        virtualizable_fail_arg_types(meta.slot_types.iter().copied())
+        // All slots are Ref — no Int unboxing at trace entry.
+        virtualizable_fail_arg_types(std::iter::repeat(Type::Ref).take(meta.slot_types.len()))
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
@@ -7759,10 +7752,9 @@ impl JitState for PyreJitState {
         sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
-        sym.symbolic_local_types =
-            _meta.slot_types[.._meta.num_locals.min(_meta.slot_types.len())].to_vec();
+        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
         sym.symbolic_stack_types =
-            _meta.slot_types[_meta.num_locals.min(_meta.slot_types.len())..].to_vec();
+            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
         // Pre-size symbolic_stack with OpRef::NONE for lazy loading from
         // the concrete frame (RPython rebuild_state_after_failure parity:
         // bridge traces start mid-execution with values on the stack).
@@ -7784,15 +7776,12 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        // RPython resume.py:1042: bridge tracing always has rd_numb and
-        // rebuilds the full frame state. This fallback runs when rd_numb
-        // is absent (pyre-specific). Update valuestackdepth and slot_types
-        // from the guard's fail_arg_types to avoid stale metadata.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         if fail_arg_types.len() >= 3 {
             let new_vsd = fail_arg_types.len() - 3;
             meta.valuestackdepth = new_vsd;
-            meta.slot_types = fail_arg_types[3..].to_vec();
+            // All slots Ref — no Int unboxing.
+            meta.slot_types = vec![Type::Ref; new_vsd];
         }
     }
 
@@ -7895,7 +7884,7 @@ impl JitState for PyreJitState {
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         let slot_types = if original_box_types.len() >= 3 {
-            original_box_types[3..].to_vec()
+            vec![Type::Ref; original_box_types.len() - 3]
         } else {
             Vec::new()
         };

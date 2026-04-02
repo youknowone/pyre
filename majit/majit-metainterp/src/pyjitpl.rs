@@ -4293,10 +4293,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyre-specific: unbox Ref→Int where compiled trace expects Int.
-    /// pyre traces start with all-Ref locals (PyObjectRef) but trace-internal
-    /// operations unbox to Int/Float. At compiled entry, live_values carry
-    /// Ref pointers that must be unboxed to match the trace's typed label.
-    /// RPython doesn't need this because wrap() sets Box types before tracing.
+    /// With Phase 1 (all slot types → Ref), this is effectively a no-op
+    /// because the first guard's fail_arg_types also have Ref for all slots.
     pub fn adapt_live_values_to_trace_types(
         &self,
         green_key: u64,
@@ -4321,11 +4319,6 @@ impl<M: Clone> MetaInterp<M> {
                     })
             })
             .unwrap_or_default();
-        let before = if crate::majit_log_enabled() {
-            Some(values.clone())
-        } else {
-            None
-        };
         for (i, tp) in types.iter().enumerate() {
             if i >= values.len() {
                 break;
@@ -4338,12 +4331,6 @@ impl<M: Clone> MetaInterp<M> {
                     values[i] = Value::Int(ptr as i64);
                 }
             }
-        }
-        if let Some(before) = before {
-            eprintln!(
-                "[jit][adapt-live] key={} types={:?} before={:?} after={:?}",
-                green_key, types, before, values
-            );
         }
         values
     }
