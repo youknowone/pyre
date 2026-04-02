@@ -1567,8 +1567,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
-        // Gate on merge_pc match: cross-loop-cut traces are stored under
-        // the trace-start PC but have a different loop-closure PC.
+        // Same gate as maybe_compile_and_run: only enter compiled code
+        // when the compiled loop's merge_pc matches the current PC.
+        // Cross-loop-cut traces get stored under the trace-start PC
+        // but have a different loop-closure PC (merge_pc). Skip entry
+        // to avoid incompatible-state and let counter tick instead.
         let compatible = driver
             .get_compiled_meta(green_key)
             .map_or(false, |meta| meta.merge_pc == frame.next_instr);
