@@ -317,16 +317,6 @@ pub struct Op {
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.
     pub fail_args: Option<SmallVec<[OpRef; 3]>>,
-    /// Rust port adaptation: backend value sources parallel to `fail_args`.
-    ///
-    /// RPython's Box object carries both identity (for resume numbering) and
-    /// runtime value source (for backend failargs).  Pyre sometimes uses
-    /// synthetic OpRefs to preserve distinct box identity for rd_numb
-    /// numbering (notably virtualizable read_boxes()/wrap() parity).  Those
-    /// synthetic OpRefs have no backend SSA value, so guards keep the
-    /// identity list in `fail_args` and store the concrete value-producing
-    /// OpRefs here for deadframe writes.
-    pub fail_arg_value_sources: Option<SmallVec<[OpRef; 3]>>,
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     pub fail_arg_types: Option<Vec<Type>>,
@@ -425,7 +415,6 @@ impl Op {
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
-            fail_arg_value_sources: None,
             fail_arg_types: None,
 
             rd_pendingfields: None,
@@ -444,7 +433,6 @@ impl Op {
             descr: Some(descr),
             pos: OpRef::NONE,
             fail_args: None,
-            fail_arg_value_sources: None,
             fail_arg_types: None,
 
             rd_pendingfields: None,
@@ -482,7 +470,6 @@ impl Op {
             }
         }
         self.fail_args = Some(boxes.into());
-        self.fail_arg_value_sources = None;
     }
 }
 
