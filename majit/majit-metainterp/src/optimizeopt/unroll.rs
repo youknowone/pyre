@@ -593,26 +593,17 @@ impl UnrollOptimizer {
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
         //
-        // Performance guard: if the body has too many guards AND the target
-        // tokens are from a previous compilation (cross-function), the
-        // make_inputargs_and_virtuals materialization can be extremely slow.
-        // In RPython this works because same-function JIT cells share targets.
-        // In majit with Cranelift, cross-function jumps are rejected later
-        // anyway (line ~732), so skip the expensive matching altogether.
-        let skip_jump_to_existing = self.retraced_count == u32::MAX
-            && self.target_tokens.len() > 1
-            && self
-                .target_tokens
-                .first()
-                .map(|t| t.as_jump_target_descr().index())
-                != self
-                    .target_tokens
-                    .last()
-                    .map(|t| t.as_jump_target_descr().index());
+        // Safety: skip jump_to_existing_trace when Phase 2 body has many
+        // guards. make_inputargs_and_virtuals_with_optimizer is O(n²+) for
+        // large bodies, causing hangs. jump_to_preamble is used instead.
+        // RPython doesn't have this issue because same-function target tokens
+        // make VirtualState matching fast.
+        let p2_guard_count = p2_ops.iter().filter(|o| o.opcode.is_guard()).count();
+        let skip_jump_to_existing = p2_guard_count > 30;
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] post-finalize: entering jump_to_existing_trace section (skip={})",
-                skip_jump_to_existing
+                "[jit] post-finalize: entering jump_to_existing_trace section (p2_guards={}, skip={})",
+                p2_guard_count, skip_jump_to_existing
             );
         }
         let mut body_ops = p2_ops;
@@ -794,6 +785,13 @@ impl UnrollOptimizer {
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                let body_jump_arity = body_terminal_op.as_ref().map(|j| j.args.len()).unwrap_or(0);
+                eprintln!(
+                    "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
+                    body_jump_arity, preamble_arity, exported_renamed_inputargs,
+                );
+            }
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
                 // Truncate Jump args to match preamble start Label arity.
