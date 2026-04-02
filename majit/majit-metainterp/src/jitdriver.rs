@@ -2088,12 +2088,9 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        // Pyre-specific: unbox Ref→Int to match compiled trace types.
-        // RPython has no adapt-live because MIFrame registers are typed.
-        // In pyre, all values are Ref — the compiled trace may expect Int
-        // at positions where the optimizer unboxed (e.g. finish_and_compile
-        // traces have no preamble). compile_loop traces with preamble
-        // peeling do NOT need this (preamble handles conversion).
+        // adapt-live is effectively a no-op when Phase 1 forces all
+        // slot types to Ref — but keep the call for safety until all
+        // downstream paths are verified.
         let live_values = if target_pc == 0 {
             self.meta
                 .adapt_live_values_to_trace_types(green_key, live_values)
