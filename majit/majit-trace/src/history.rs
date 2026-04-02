@@ -373,12 +373,54 @@ impl TreeLoop {
         }
 
         // opencoder.py parity: carry snapshots through cut_trace_from.
-        // RPython's CutTrace wraps the original trace and adjusts iteration
-        // start, preserving snapshot access for the optimizer's
-        // store_final_boxes_in_guard (resume.py:ResumeDataVirtualAdder.finish).
-        // Without snapshots, bridge/loop guards fall back to fail_args-only
-        // rd_numb (fewer slots than the full frame → SIGSEGV on recovery).
-        TreeLoop::with_snapshots(new_inputargs, new_ops, self.snapshots.clone())
+        // RPython's CutTrace wraps the original trace and iterates from the
+        // cut point — the TraceIterator._cache remaps old Box positions to
+        // new InputArgs automatically. In pyre, snapshots store raw OpRef
+        // indices that must be explicitly remapped to match the post-cut
+        // OpRef namespace.
+        let remapped_snapshots: Vec<crate::recorder::Snapshot> = self
+            .snapshots
+            .iter()
+            .map(|snap| {
+                let remap_tagged =
+                    |t: &crate::recorder::SnapshotTagged| -> crate::recorder::SnapshotTagged {
+                        match t {
+                            crate::recorder::SnapshotTagged::Box(n, tp) => {
+                                let old_ref = OpRef(*n);
+                                if let Some(&new_ref) = remap.get(&old_ref) {
+                                    crate::recorder::SnapshotTagged::Box(new_ref.0, *tp)
+                                } else if old_ref.is_none() || old_ref.0 >= 10_000 {
+                                    // Constants and NONE pass through unchanged.
+                                    t.clone()
+                                } else {
+                                    // opencoder.py:287-288: _get(i) asserts
+                                    // _cache[i] is not None. An unmapped pre-cut
+                                    // Box has no entry in the post-cut namespace
+                                    // and would assert-fail in RPython. Map to
+                                    // NONE (UNINITIALIZED) so _number_boxes skips
+                                    // it rather than producing a stale TAGBOX.
+                                    crate::recorder::SnapshotTagged::Box(OpRef::NONE.0, *tp)
+                                }
+                            }
+                            other => other.clone(),
+                        }
+                    };
+                crate::recorder::Snapshot {
+                    frames: snap
+                        .frames
+                        .iter()
+                        .map(|f| crate::recorder::SnapshotFrame {
+                            jitcode_index: f.jitcode_index,
+                            pc: f.pc,
+                            boxes: f.boxes.iter().map(&remap_tagged).collect(),
+                        })
+                        .collect(),
+                    vable_boxes: snap.vable_boxes.iter().map(&remap_tagged).collect(),
+                    vref_boxes: snap.vref_boxes.iter().map(&remap_tagged).collect(),
+                }
+            })
+            .collect();
+        TreeLoop::with_snapshots(new_inputargs, new_ops, remapped_snapshots)
     }
 }
 
