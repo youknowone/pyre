@@ -1038,7 +1038,8 @@ pub fn resume_in_blackhole(
             // jit_merge_point, carrying live values to warmspot.py
             // which calls portal_runner. pyre writes live values
             // back to the frame and returns ContinueRunningNormally.
-            let frame_ptr = bh.registers_i.get(3).copied().unwrap_or(0) as *mut PyFrame;
+            // RPython blackhole.py:1068 — virtualizable_ptr IS the frame.
+            let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &mut *frame_ptr };
                 let code = unsafe { &*frame.code };
