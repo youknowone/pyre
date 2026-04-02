@@ -36,15 +36,6 @@ use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-/// Hash the argument OpRefs of an operation for loop-invariant call caching.
-fn hash_args(args: &[OpRef]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for arg in args {
-        arg.0.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 /// Cache key for a field access: (struct OpRef, field descriptor index).
 type FieldKey = (OpRef, u32);
 
@@ -362,10 +353,6 @@ pub struct OptHeap {
     /// all its dependencies are transitively escaped.
     heapc_deps: HashMap<u32, Vec<OpRef>>,
 
-    /// Cache for loop-invariant call results: (descr_index, args_hash) -> result OpRef.
-    /// Survives calls and side-effecting operations (only cleared on setup).
-    loopinvariant_cache: HashMap<(u32, u64), OpRef>,
-
     /// Whether the last call is known to not raise (for GUARD_NO_EXCEPTION dedup).
     /// RPython heap.py: consecutive GUARD_NO_EXCEPTION can be deduplicated.
     last_call_did_not_raise: bool,
@@ -400,7 +387,6 @@ impl OptHeap {
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
             heapc_deps: HashMap::new(),
-            loopinvariant_cache: HashMap::new(),
             last_call_did_not_raise: false,
             quasi_immut_cache: HashMap::new(),
             field_descr_map: HashMap::new(),
@@ -1488,30 +1474,6 @@ impl OptHeap {
         OptimizationResult::Remove
     }
 
-    /// Handle CALL_LOOPINVARIANT_*: cache the result by (descr_index, args_hash).
-    ///
-    /// If the same call (same descriptor + same arguments) was already seen,
-    /// replace with the cached result. Otherwise, emit and cache the result.
-    fn optimize_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
-        let args_hash = hash_args(&op.args);
-        let cache_key = (descr_idx, args_hash);
-
-        if let Some(&cached_result) = self.loopinvariant_cache.get(&cache_key) {
-            let cached_result = ctx.get_box_replacement(cached_result);
-            ctx.replace_op(op.pos, cached_result);
-            return OptimizationResult::Remove;
-        }
-
-        // First time: cache the result, then treat as a normal call for
-        // heap cache purposes (force lazy sets, invalidate mutable caches).
-        self.loopinvariant_cache.insert(cache_key, op.pos);
-        self.mark_escaped_varargs(op, ctx);
-        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-        self.clean_caches();
-        OptimizationResult::Emit(op.clone())
-    }
-
     /// Handle operations that may have side effects.
     /// Forces lazy sets and invalidates caches as needed.
     /// Tracks allocations for aliasing analysis.
@@ -1947,12 +1909,6 @@ impl OptHeap {
                 OptimizationResult::Emit(op.clone())
             }
 
-            // ── Loop-invariant calls: cache results across the trace ──
-            OpCode::CallLoopinvariantI
-            | OpCode::CallLoopinvariantR
-            | OpCode::CallLoopinvariantF
-            | OpCode::CallLoopinvariantN => self.optimize_call_loopinvariant(op, ctx),
-
             // ── Everything else: check for side effects ──
             _ => self.handle_side_effects(op, ctx),
         }
@@ -1996,7 +1952,6 @@ impl Optimization for OptHeap {
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
-        self.loopinvariant_cache.clear();
         self.last_call_did_not_raise = false;
         self.quasi_immut_cache.clear();
         self.cached_arraylens.clear();
@@ -3339,126 +3294,6 @@ mod tests {
         assert!(
             !opcodes.contains(&OpCode::GetfieldGcI),
             "GETFIELD should be eliminated for unescaped object across multiple calls, got: {opcodes:?}"
-        );
-    }
-
-    // ── Loop-invariant call caching tests ──
-
-    // ── Test 33: Two identical CallLoopinvariantI → second removed ──
-
-    #[test]
-    fn test_loopinvariant_call_cached() {
-        let d = descr(10);
-        let mut ops = vec![
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d.clone(),
-            ),
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d.clone(),
-            ),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        // Only the first CallLoopinvariantI + Jump.
-        let loopinv_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
-            .count();
-        assert_eq!(
-            loopinv_count, 1,
-            "second identical loopinvariant call should be eliminated"
-        );
-        assert_eq!(result.last().unwrap().opcode, OpCode::Jump);
-    }
-
-    // ── Test 34: Different args → both kept ──
-
-    #[test]
-    fn test_loopinvariant_different_args_not_cached() {
-        let d = descr(10);
-        let mut ops = vec![
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d.clone(),
-            ),
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(102)],
-                d.clone(),
-            ),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        let loopinv_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
-            .count();
-        assert_eq!(loopinv_count, 2, "different args should keep both calls");
-    }
-
-    // ── Test 35: Cache survives intervening CallN ──
-
-    #[test]
-    fn test_loopinvariant_survives_call() {
-        let d = descr(10);
-        let mut ops = vec![
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d.clone(),
-            ),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(
-                OpCode::CallLoopinvariantI,
-                &[OpRef(100), OpRef(101)],
-                d.clone(),
-            ),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        // CallLoopinvariantI + CallN + Jump. Second loopinvariant removed.
-        let loopinv_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
-            .count();
-        assert_eq!(
-            loopinv_count, 1,
-            "loopinvariant cache should survive intervening calls"
-        );
-        assert!(
-            result.iter().any(|o| o.opcode == OpCode::CallN),
-            "the intervening CallN should remain"
-        );
-    }
-
-    // ── Test 36: Different descriptor → both kept ──
-
-    #[test]
-    fn test_loopinvariant_different_descr_not_cached() {
-        let d1 = descr(10);
-        let d2 = descr(20);
-        let mut ops = vec![
-            Op::with_descr(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)], d1),
-            Op::with_descr(OpCode::CallLoopinvariantI, &[OpRef(100), OpRef(101)], d2),
-            Op::new(OpCode::Jump, &[]),
-        ];
-        let result = run_heap_opt(&mut ops);
-
-        let loopinv_count = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CallLoopinvariantI)
-            .count();
-        assert_eq!(
-            loopinv_count, 2,
-            "different descriptors should keep both calls"
         );
     }
 
