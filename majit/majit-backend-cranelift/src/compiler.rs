@@ -6015,6 +6015,9 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardClass => {
+                    // pyre's tracing extracts ob_type via GetfieldGcPureI BEFORE
+                    // the guard, so arg0 IS the ob_type value (not the object).
+                    // Direct comparison: ob_type == expected_class.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
