@@ -11,7 +11,6 @@
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 #[inline(always)]
 fn vb_set(v: &mut Vec<bool>, i: u32) {
