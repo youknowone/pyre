@@ -1793,8 +1793,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardClass => {
-                // rewrite.py: optimize_GUARD_CLASS
-                // If the class is already known, check match → Remove or abort.
+                // rewrite.py:397-428 optimize_GUARD_CLASS
                 let obj = ctx.get_box_replacement(op.arg(0));
                 if let Some(known_class) = ctx
                     .get_ptr_info(obj)
@@ -1806,13 +1805,39 @@ impl Optimization for OptRewrite {
                             if known_class.0 as i64 == expected {
                                 return OptimizationResult::Remove;
                             }
-                            // Different class → guard will always fail.
-                            // RPython raises InvalidLoop; we abort.
                             return OptimizationResult::PassOn;
                         }
                     }
                 }
-                // postprocess_GUARD_CLASS: record known class for arg(0)
+                // rewrite.py:408-427: guard strengthening.
+                // If there was a previous GUARD_NONNULL on the same value,
+                // replace it with GUARD_NONNULL_CLASS (combining both checks).
+                if let Some(old_guard) = ctx.get_last_guard(obj) {
+                    if old_guard.opcode == OpCode::GuardNonnull && op.num_args() >= 2 {
+                        let old_pos = ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
+                        if let Some(old_idx) = old_pos {
+                            let mut combined =
+                                Op::new(OpCode::GuardNonnullClass, &[old_guard.arg(0), op.arg(1)]);
+                            combined.pos = old_guard.pos;
+                            combined.descr = old_guard.descr.clone();
+                            combined.fail_args = old_guard.fail_args.clone();
+                            combined.rd_resume_position = old_guard.rd_resume_position;
+                            ctx.new_operations[old_idx] = combined;
+                            // postprocess: record known class
+                            if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
+                                ctx.set_ptr_info(
+                                    obj,
+                                    crate::optimizeopt::info::PtrInfo::known_class(
+                                        majit_ir::GcRef(class_val as usize),
+                                        true,
+                                    ),
+                                );
+                            }
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                }
+                // postprocess_GUARD_CLASS: record known class
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
                         let should_record = ctx
