@@ -1158,7 +1158,13 @@ fn build_class_inner(
         // type.__new__ internally if needed.
         let name_obj = pyre_object::w_str_new(name);
         let result = if let Some(kw) = extra_kwargs {
-            call_metaclass_with_kwargs(w_metaclass, name_obj, bases, w_namespace_dict, kw)
+            // Only use kwargs path if there are actual extra kwargs
+            let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
+            if has_extra {
+                call_metaclass_with_kwargs(w_metaclass, name_obj, bases, w_namespace_dict, kw)
+            } else {
+                crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
+            }
         } else {
             crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
         };
