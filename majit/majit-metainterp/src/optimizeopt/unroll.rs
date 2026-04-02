@@ -2216,18 +2216,7 @@ impl OptUnroll {
             "import_state: next_iteration_args mismatch"
         );
 
-        // unroll.py:483-490: source.set_forwarded(target)
-        //
-        // RPython Box identity: import_boxes maps source → target with
-        // per-value forwarding (not the flat table). get_replacement
-        // checks import_boxes first and returns target directly —
-        // target's own forwarding is NOT followed, matching RPython
-        // where v5_box has no _forwarded set.
-        // RPython Box identity: when multiple sources map to the same target,
-        // skip import_box for duplicates so each source has independent PtrInfo.
-        let mut seen_targets: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-        // RPython Box identity: shared seen across all imports so that
-        // duplicate virtual field OpRefs are detected and given fresh positions.
+        // unroll.py:483-490: source.set_forwarded(target) + setinfo_from_preamble
         let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!(
@@ -2237,14 +2226,22 @@ impl OptUnroll {
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            let is_dup = !seen_targets.insert(*target);
-            if !is_dup {
-                ctx.set_import_box(source, *target);
+            // XXX RPython incompatibility (part of OpRef identity gap):
+            // unroll.py:485 asserts source is not target, then always
+            // calls source.set_forwarded(target). RPython guarantees
+            // distinct identity via per-Box allocation (opencoder.py:259).
+            // majit's flat OpRef namespace means source == target when
+            // both phases share the same trace position — forwarding
+            // would create a self-loop, so we skip. This is a partial
+            // workaround, not RPython parity. See also optimizer.rs
+            // cross-slot fresh allocation (same root cause).
+            if source != *target {
+                // unroll.py:486: source.set_forwarded(target)
+                ctx.replace_op(source, *target);
             }
+            // unroll.py:487-490
             if let Some(info) = exported_state.exported_infos.get(target) {
-                // RPython unroll.py:53-54: setinfo_from_preamble does
-                //   op = get_box_replacement(op)
-                // Follow forwarding so info is set on TARGET, not source.
+                // unroll.py:53-54: op = get_box_replacement(op)
                 let resolved = ctx.get_box_replacement(source);
                 self.setinfo_from_preamble_recursive(
                     resolved,
@@ -2373,15 +2370,7 @@ impl OptUnroll {
         ctx: &mut OptContext,
         seen: &mut std::collections::HashSet<OpRef>,
     ) {
-        // RPython setinfo_from_preamble parity:
-        //   op = get_box_replacement(source)  → follow forwarding to TARGET
-        //   op.set_forwarded(info)            → set info ON TARGET
-        //
-        // In pyre, set_import_box(source, target) creates forwarding[source] = target.
-        // Info must be set on the TARGET (via get_replacement) so that each
-        // target carries its own info. Without this, forwarding[A] → B where
-        // B later gets a different slot's info causes get_replacement(A) to
-        // stop at B's wrong info.
+        // unroll.py:53-54: op = get_box_replacement(op)
         let target = ctx.get_box_replacement(opref);
         if !seen.insert(target) {
             return;
