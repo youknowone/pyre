@@ -1204,6 +1204,8 @@ impl OptContext {
 
     /// RPython unroll.py: source.set_forwarded(target)
     /// Sets forwarding from Phase 2 source to Phase 1 export target.
+    /// setinfo_from_preamble_recursive then sets PtrInfo on the TARGET
+    /// (via get_replacement).
     pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
         self.replace_op(source, target);
     }
@@ -1476,6 +1478,12 @@ impl OptContext {
         // Pyre: optimizer-created guards (VirtualState, inline_short_preamble)
         // may have rd_resume_position=-1. Use patchguardop's position as
         // fallback — RPython does this implicitly via patchguardop chain.
+        // resume.py:396-397: resume_position = self.guard_op.rd_resume_position
+        // assert resume_position >= 0
+        // RPython: every guard has a valid snapshot from capture_resumedata.
+        // pyre: optimizer-created guards may have rd_resume_position=-1.
+        // Fall back to patchguardop (unroll.py:336), then to the highest
+        // snapshot index (last capture_resumedata from tracing).
         let mut resume_pos = op.rd_resume_position;
         if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
             if let Some(ref patch) = self.patchguardop {
@@ -1562,8 +1570,6 @@ impl OptContext {
                 if opref.is_constant() {
                     return true;
                 }
-                // optimizer.py:432: make_constant → set_forwarded(constbox).
-                // Blocked by Ref-as-Int gap (see make_constant doc).
                 // info.py: ConstPtrInfo.is_constant() → True
                 matches!(
                     self.ctx.get_ptr_info(opref),
