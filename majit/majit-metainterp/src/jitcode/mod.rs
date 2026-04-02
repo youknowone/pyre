@@ -107,6 +107,34 @@ pub struct LivenessInfo {
     pub live_f_regs: Vec<u16>,
 }
 
+impl LivenessInfo {
+    /// jitcode.py:146-167 enumerate_vars parity.
+    /// Iterates live registers in typed order: int, then ref, then float.
+    /// Both encoder (get_list_of_active_boxes) and decoder (consume_one_section)
+    /// MUST use this same iteration order.
+    pub fn enumerate_vars(
+        &self,
+        mut callback_i: impl FnMut(u16),
+        mut callback_r: impl FnMut(u16),
+        mut callback_f: impl FnMut(u16),
+    ) {
+        for &idx in &self.live_i_regs {
+            callback_i(idx);
+        }
+        for &idx in &self.live_r_regs {
+            callback_r(idx);
+        }
+        for &idx in &self.live_f_regs {
+            callback_f(idx);
+        }
+    }
+
+    /// Total number of live registers across all typed banks.
+    pub fn total_live(&self) -> usize {
+        self.live_i_regs.len() + self.live_r_regs.len() + self.live_f_regs.len()
+    }
+}
+
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
 /// at a much smaller subset for the current proc-macro tracing surface.
 #[derive(Clone, Debug, Default)]
