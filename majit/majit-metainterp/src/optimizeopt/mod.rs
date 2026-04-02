@@ -1265,7 +1265,16 @@ impl OptContext {
         // optimizer.py:412: box = get_box_replacement(box)
         let replaced = self.get_box_replacement(opref);
         // optimizer.py:427: if box.is_constant(): return
-        if replaced.is_constant() {
+        // RPython: box.is_constant() is True for Const objects AND for boxes
+        // whose forwarded IS a Const. get_box_replacement stops at
+        // Forwarded::Const, so `replaced` still points to the original box.
+        // Check both constant-pool refs and Forwarded::Const.
+        if replaced.is_constant()
+            || matches!(
+                self.forwarded.get(replaced.0 as usize),
+                Some(Forwarded::Const(_))
+            )
+        {
             return;
         }
         // Store in constants array for get_constant() callers.

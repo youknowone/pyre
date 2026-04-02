@@ -319,19 +319,7 @@ impl Optimizer {
 
         match info {
             VirtualStateInfo::Constant(value) => {
-                // RPython parity: GcRef constants must be stored as Int in the
-                // constant map (Cranelift uses Int, no GC root tracking) but
-                // registered as Ref in constant_types_for_numbering (resume data).
-                match value {
-                    majit_ir::Value::Ref(r) => {
-                        ctx.make_constant(opref, majit_ir::Value::Int(r.0 as i64));
-                        ctx.constant_types_for_numbering
-                            .insert(opref.0, majit_ir::Type::Ref);
-                    }
-                    _ => {
-                        ctx.make_constant(opref, value.clone());
-                    }
-                }
+                ctx.make_constant(opref, value.clone());
             }
             VirtualStateInfo::Virtual {
                 descr,
