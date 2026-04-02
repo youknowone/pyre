@@ -1411,6 +1411,10 @@ impl Optimization for OptIntBounds {
             }
         }
 
+        // optimizer.py:415-426 parity: sync bounds to OptContext so that
+        // later passes calling make_constant can validate int ranges.
+        ctx.int_bounds.clone_from(&self.bounds);
+
         result
     }
 
