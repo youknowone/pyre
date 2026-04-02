@@ -265,12 +265,6 @@ impl ResumeDataLoopMemo {
             if env.is_const(opref) {
                 let (val, tp) = env.get_const(opref);
                 let tagged = self.getconst(val, tp);
-                if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!(
-                        "[jit][number-box] raw={:?} resolved={:?} const=({:?},{:?}) tagged={}",
-                        raw_opref, opref, val, tp, tagged
-                    );
-                }
                 numb_state.append_short(tagged);
                 continue;
             }
@@ -295,16 +289,6 @@ impl ResumeDataLoopMemo {
                 numb_state.num_boxes += 1;
                 t
             };
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][number-box] raw={:?} resolved={:?} type={:?} virtual={} tagged={}",
-                    raw_opref,
-                    opref,
-                    env.get_type(opref),
-                    is_virtual,
-                    tagged
-                );
-            }
             numb_state.liveboxes.insert(opref.0, tagged);
             numb_state.append_short(tagged);
         }
