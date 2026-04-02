@@ -749,12 +749,20 @@ pub fn call_with_kwargs(
     // For type objects: allocate via __new__ then call __init__ with kwargs.
     // PyPy: typeobject.py descr_call → __new__ + __init__
     if unsafe { pyre_object::is_type(callable) } {
+        // Calculate the winning metaclass from bases.
+        // type(name, bases, dict, **kw) needs to find the correct metaclass
+        // and call its __new__ with the kwargs.
+        let w_metaclass = if pos_args.len() >= 2 && unsafe { pyre_object::is_tuple(pos_args[1]) } {
+            calculate_metaclass(callable, pos_args[1]).unwrap_or(callable)
+        } else {
+            callable
+        };
         // Step 1: __new__(cls, *args, **kwargs)
         let instance = if let Some(new_fn) =
-            unsafe { crate::baseobjspace::lookup_in_type(callable, "__new__") }
+            unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
         {
             let mut new_args = Vec::with_capacity(1 + pos_args.len());
-            new_args.push(callable);
+            new_args.push(w_metaclass);
             new_args.extend_from_slice(pos_args);
             if unsafe { crate::is_function(new_fn) } && !kwargs.is_empty() {
                 call_with_kwargs(frame, new_fn, &new_args, kwargs)?
