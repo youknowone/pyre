@@ -16,13 +16,6 @@ use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
 
-/// Transient metadata for a virtual in guard fail_args.
-/// Transient record of a virtual fail_arg slot. Used only within
-/// store_final_boxes_in_guard → finalize_guard_resume_data; never stored on Op.
-/// The fallback numbering path looks up PtrInfo(virtual_opref) to build
-/// RdVirtualInfo — no pre-computed field metadata needed.
-pub(crate) type VirtualFailArgSlot = (usize, OpRef); // (fail_arg_index, virtual_opref)
-
 /// bridgeopt.py: serialized optimizer knowledge for guard resume data.
 ///
 /// Captures the optimizer's knowledge at each guard point so that bridges
@@ -2627,11 +2620,9 @@ impl Optimizer {
                 }
             }
 
-            // RPython parity: fail_arg_types are set by store_final_boxes_in_guard
-            // (both snapshot path and no-snapshot path). No separate re-inference
-            // needed here — RPython's typed Box objects carry type information
-            // intrinsically. pyre's store_final_boxes_in_guard sets fail_arg_types
-            // via infer_fail_arg_type (no-snapshot) or snapshot-based type inference.
+            // RPython parity: fail_arg_types are set by store_final_boxes_in_guard.
+            // RPython's typed Box objects carry type information intrinsically.
+            // Snapshot-based type inference resolves types during numbering.
 
             // optimizer.py:630-631: pendingfields → rd_pendingfields
             // resume.py:428-445: encode pending SetfieldGc/SetarrayitemGc
@@ -2729,13 +2720,10 @@ impl Optimizer {
 
     /// optimizer.py:722-752 store_final_boxes_in_guard
     ///
-    /// Encode virtual objects in guard fail_args via rd_virtuals for lazy
-    /// reconstruction on guard failure. Resolves all fail_args through
-    /// get_box_replacement, replaces virtual OpRefs with NONE, appends
-    /// virtual field values. finalize_guard_resume_data builds rd_virtuals.
+    /// Resolve fail_args through get_box_replacement and delegate to
+    /// finalize_guard_resume_data for snapshot-based virtual encoding
+    /// (rd_numb, rd_consts, rd_virtuals).
     fn store_final_boxes_in_guard(mut op: Op, ctx: &mut OptContext) -> Op {
-        use crate::optimizeopt::info::PtrInfo;
-
         let Some(ref mut fail_args) = op.fail_args else {
             // RPython optimizer.py:722-752: store_final_boxes_in_guard
             // calls modifier.finish() even when fail_args is initially None
@@ -2748,206 +2736,18 @@ impl Optimizer {
             return op;
         };
 
-        // optimizer.py:722-752: store_final_boxes_in_guard always delegates
-        // to ResumeDataVirtualAdder.finish() which uses snapshot-based numbering.
-        let has_snapshot =
-            op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
-        if has_snapshot {
-            // optimizer.py:732-748 + resume.py:389-452:
-            // finish() handles virtuals without forcing via TAGVIRTUAL.
-            for fa_idx in 0..fail_args.len() {
-                if !fail_args[fa_idx].is_none() {
-                    fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
-                }
-            }
-            ctx.finalize_guard_resume_data(&mut op);
-            return op;
-        }
-        let original_len = fail_args.len();
-        let mut virtual_slots: Vec<VirtualFailArgSlot> = Vec::new();
-        let mut extra_fail_args: Vec<OpRef> = Vec::new();
-
-        for fa_idx in 0..original_len {
-            if fail_args[fa_idx].is_none() {
-                // RPython parity: Box forwarding resolves NONE slots
-                // automatically via set_forwarded. In pyre, use body
-                // label args to find the current Phase 2 OpRef.
-                if !virtual_slots.iter().any(|(idx, _)| *idx == fa_idx) {
-                    let label_ref = ctx
-                        .imported_label_args
-                        .as_ref()
-                        .and_then(|la| la.get(fa_idx).copied());
-                    let resolved = label_ref.map(|r| ctx.get_box_replacement(r));
-                    if let Some(resolved) = resolved {
-                        if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
-                            if info.is_virtual() {
-                                if Self::collect_virtual_field_values(
-                                    &info,
-                                    original_len,
-                                    &mut extra_fail_args,
-                                    &mut virtual_slots,
-                                    ctx,
-                                ) {
-                                    virtual_slots.push((fa_idx, resolved));
-                                } else {
-                                    // Unsupported virtual kind (Array etc.) → force.
-                                    let forced = info.force_box(resolved, ctx);
-                                    fail_args[fa_idx] = ctx.get_box_replacement(forced);
-                                }
-                            } else {
-                                fail_args[fa_idx] = resolved;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let resolved = ctx.get_box_replacement(fail_args[fa_idx]);
-            let info = ctx.get_ptr_info(resolved).cloned();
-            let Some(info) = info else {
-                fail_args[fa_idx] = resolved;
-                continue;
-            };
-            if !info.is_virtual() || matches!(info, PtrInfo::Virtualizable(_)) {
-                fail_args[fa_idx] = resolved;
-                continue;
-            }
-
-            // Virtual fail_arg → NONE + collect field values as extra fail_args.
-            if Self::collect_virtual_field_values(
-                &info,
-                original_len,
-                &mut extra_fail_args,
-                &mut virtual_slots,
-                ctx,
-            ) {
-                virtual_slots.push((fa_idx, resolved));
-                fail_args[fa_idx] = OpRef::NONE;
-            } else {
-                // Unsupported virtual kind (Array etc.) → force to concrete.
-                let mut info_mut = info;
-                let forced = info_mut.force_box(resolved, ctx);
-                fail_args[fa_idx] = ctx.get_box_replacement(forced);
+        // optimizer.py:732-748 + resume.py:389-452:
+        // RPython finish() handles virtuals without forcing.
+        // _number_boxes tags virtual fail_args as TAGVIRTUAL,
+        // _number_virtuals builds rd_virtuals from PtrInfo.
+        for fa_idx in 0..fail_args.len() {
+            if !fail_args[fa_idx].is_none() {
+                fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
             }
         }
-
-        if !extra_fail_args.is_empty() {
-            // store_final_boxes_in_guard parity: RPython reads types from
-            // box.type, not from the MetaFailDescr. Re-infer base types
-            // from the optimizer context so that unboxed Int values in
-            // formerly-Ref slots get the correct type after preamble peeling.
-            if let Some(ref descr) = op.descr {
-                if let Some(fd) = descr.as_fail_descr() {
-                    let mut types: Vec<majit_ir::Type> = fail_args[..original_len]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &opref)| {
-                            if opref.is_none() {
-                                // Virtual slot — type from original descriptor.
-                                fd.fail_arg_types()
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(majit_ir::Type::Ref)
-                            } else {
-                                Self::infer_fail_arg_type(opref, fd, i, ctx)
-                            }
-                        })
-                        .collect();
-                    for _ in 0..extra_fail_args.len() {
-                        types.push(majit_ir::Type::Int);
-                    }
-                    let new_descr =
-                        majit_ir::SimpleFailDescr::new(descr.index(), fd.fail_index(), types);
-                    op.descr = Some(std::sync::Arc::new(new_descr));
-                }
-            }
-            for extra in extra_fail_args {
-                fail_args.push(extra);
-            }
-        }
-
-        // resume.py ResumeDataVirtualAdder.finish() parity:
-        // Generate rd_numb + rd_consts + rd_virtuals in the SAME call as
-        // fail_args finalization. RPython does not defer to a later phase.
         ctx.finalize_guard_resume_data(&mut op);
 
         op
-    }
-
-    /// resume.py: register_virtual_fields / visitor_walk_recursive parity.
-    /// Collect a virtual's field values WITHOUT forcing nested virtuals.
-    /// Nested virtuals are added to virtual_slots recursively.
-    /// Returns true if field values were collected (Instance/Struct).
-    fn collect_virtual_field_values(
-        info: &crate::optimizeopt::info::PtrInfo,
-        _original_len: usize,
-        extra_fail_args: &mut Vec<OpRef>,
-        virtual_slots: &mut Vec<VirtualFailArgSlot>,
-        ctx: &mut OptContext,
-    ) -> bool {
-        use crate::optimizeopt::info::PtrInfo;
-        let fields_vec = match info {
-            PtrInfo::Virtual(v) => &v.fields,
-            PtrInfo::VirtualStruct(v) => &v.fields,
-            _ => return false,
-        };
-        for &(_field_idx, value_ref) in fields_vec {
-            let final_ref = ctx.get_box_replacement(value_ref);
-            // resume.py: register_box — record field value in extra_fail_args.
-            // If field is a nested virtual, record it as a virtual_slot
-            // (RPython: _gettagged returns TAGVIRTUAL for nested virtuals).
-            if let Some(nested) = ctx.get_ptr_info(final_ref).cloned() {
-                if nested.is_virtual() && !matches!(nested, PtrInfo::Virtualizable(_)) {
-                    // Check if this nested virtual is already registered
-                    let already = virtual_slots.iter().any(|(_, vr)| *vr == final_ref);
-                    if !already {
-                        // Register nested virtual — fail_args slot is at the
-                        // position where this field will be appended.
-                        let slot_idx = _original_len + extra_fail_args.len();
-                        extra_fail_args.push(OpRef::NONE); // placeholder for virtual
-                        virtual_slots.push((slot_idx, final_ref));
-                        // Recursively collect nested virtual's fields
-                        Self::collect_virtual_field_values(
-                            &nested,
-                            _original_len,
-                            extra_fail_args,
-                            virtual_slots,
-                            ctx,
-                        );
-                    } else {
-                        extra_fail_args.push(final_ref);
-                    }
-                    continue;
-                }
-            }
-            extra_fail_args.push(final_ref);
-        }
-        true
-    }
-
-    fn infer_fail_arg_type(
-        opref: OpRef,
-        fd: &dyn majit_ir::descr::FailDescr,
-        slot: usize,
-        ctx: &OptContext,
-    ) -> majit_ir::Type {
-        let resolved = ctx.get_box_replacement(opref);
-        // Constants carry explicit types.
-        if let Some(val) = ctx.get_constant(resolved) {
-            return val.get_type();
-        }
-        // PtrInfo indicates Ref (Virtual, Instance, KnownClass, etc.)
-        // BUT: after preamble peeling, an OpRef may have KnownClass PtrInfo
-        // while carrying an unboxed Int value in the body loop. Check if
-        // the OpRef was produced by an Int-typed operation.
-        if let Some(result_type) = ctx.get_op_result_type(resolved) {
-            return result_type;
-        }
-        // Fallback: original descriptor type.
-        fd.fail_arg_types()
-            .get(slot)
-            .copied()
-            .unwrap_or(majit_ir::Type::Ref)
     }
 }
 
