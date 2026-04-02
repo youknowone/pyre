@@ -6742,11 +6742,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 // The compiled code will contain both loops in one function,
                 // avoiding cross-function jump limitations.
                 let root_key = ctx.root_green_key();
-                // TODO: enable once guard resume data for inlined inner
-                // loop bodies is correct. Currently SEGFAULT at 50+ iterations
-                // because the i-loop body's guards don't capture the j-loop's
-                // execution state correctly.
-                let inner_already_compiled = false && {
+                let inner_already_compiled = {
                     let (driver, _) = crate::driver::driver_pair();
                     back_edge_key != root_key
                         && driver.meta_interp().has_compiled_targets(back_edge_key)

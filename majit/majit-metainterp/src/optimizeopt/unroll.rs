@@ -684,7 +684,7 @@ impl UnrollOptimizer {
                 );
             }
 
-            if !jumped {
+            if !jumped && !skip_jump_to_existing {
                 // unroll.py:214-230: retrace_limit check
                 if self.retraced_count < self.retrace_limit {
                     self.retraced_count += 1;
