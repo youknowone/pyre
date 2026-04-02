@@ -292,13 +292,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
-        // resume.py:204: isinstance(box, Const)
+        // RPython resume.py:204: isinstance(box, Const)
+        // True Const = constant pool entry (>= CONST_BASE) or PtrInfo::Constant.
+        // NOT optimizer-known values from make_constant() on operation results.
         if opref.is_constant() {
             return true;
         }
-        // optimizer.py:432: make_constant → box.set_forwarded(constbox)
-        // makes isinstance(box, Const) true. Blocked by Ref-as-Int gap
-        // (see make_constant doc). No-op until set_forwarded is implemented.
         // info.py: ConstPtrInfo.is_constant() → True
         matches!(
             self.ctx.get_ptr_info(opref),
@@ -1163,14 +1162,21 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// resoperation.py:240-242: set_forwarded(forwarded_to) — store the
-    /// forwarding target on this box. Info is set separately by setinfo /
-    /// setinfo_from_preamble.
+    /// Record that `old` should be replaced by `new` wherever it appears.
+    /// RPython set_forwarded parity: setting forwarding from old → new.
+    /// RPython Box identity: when a Box is forwarded, its PtrInfo (if any)
+    /// lives on the terminal Box in the chain. In majit, when we overwrite
+    /// forwarded[old] from Info(X) or Op(→Info(X)) to Op(new), we must
+    /// propagate the existing PtrInfo to `new` so get_ptr_info(old) still
+    /// reaches it via the new chain old→new→...→Info.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
+        // Before overwriting, check if `old` carried PtrInfo (directly or
+        // through its forwarding chain). If so, propagate to `new`.
+        let old_info = self.get_ptr_info(old).cloned();
         let idx = old.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
@@ -1180,6 +1186,26 @@ impl OptContext {
         } else {
             self.forwarded[idx] = Forwarded::Op(new);
         }
+        // RPython Box identity parity: propagate PtrInfo to the terminal
+        // of the new forwarding chain so get_ptr_info(old) reaches it.
+        if let Some(info) = old_info {
+            let terminal = self.get_box_replacement(new);
+            if self.get_ptr_info(terminal).is_none() {
+                let tidx = terminal.0 as usize;
+                if tidx >= self.forwarded.len() {
+                    self.forwarded.resize(tidx + 1, Forwarded::None);
+                }
+                if matches!(self.forwarded[tidx], Forwarded::None) {
+                    self.forwarded[tidx] = Forwarded::Info(info);
+                }
+            }
+        }
+    }
+
+    /// RPython unroll.py: source.set_forwarded(target)
+    /// Sets forwarding from Phase 2 source to Phase 1 export target.
+    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
+        self.replace_op(source, target);
     }
 
     /// RPython get_box_replacement: follow forwarding chain, stop when the
@@ -1228,17 +1254,7 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:410-432 make_constant(box, constbox).
-    ///
-    /// RPython: `box = get_box_replacement(box); box.set_forwarded(constbox)`.
-    /// set_forwarded makes `get_box_replacement` return the Const, so
-    /// `isinstance(box, Const)` becomes True in `_number_boxes`.
-    ///
-    /// Pyre gap: pyre stores Ref pointers as Value::Int (no ConstPtr type).
-    /// Until Value carries an explicit type or set_forwarded is implemented
-    /// with real Const OpRefs (>= 10000), `is_const` cannot safely recognize
-    /// make_constant'd values — Ref pointers would be TAGINT'd, corrupting
-    /// resume data. This is the make_constant forwarding gap.
+    /// Record that an operation produces a known constant value.
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
         let idx = opref.0 as usize;
         if idx >= self.constants.len() {
