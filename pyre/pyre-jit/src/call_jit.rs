@@ -1649,17 +1649,12 @@ fn jit_blackhole_resume_from_guard(
         // blackhole_from_resumedata returns None (→ Failed) for pc=-1
         // (no-snapshot) frames. Failed → None → force_fn fallback in
         // the caller, which is faster than jitcode-level BH dispatch.
-        // Get exit_types for TAGBOX type-aware decode (adapt-live Int slots).
-        let exit_types_vec = driver
-            .get_exit_types(actual_green_key, trace_id, fail_index)
-            .unwrap_or_default();
         let result = blackhole_resume_via_rd_numb(
             &rd_numb,
             &rd_consts,
             raw_deadframe,
             None,
             rd_virtuals_ref,
-            &exit_types_vec,
         );
         return handle_blackhole_result(result, fail_values);
     }
@@ -1678,7 +1673,6 @@ pub fn blackhole_resume_via_rd_numb(
     deadframe: &[i64],
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
-    exit_types: &[majit_ir::Type],
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
@@ -1755,7 +1749,6 @@ pub fn blackhole_resume_via_rd_numb(
         Some(&vinfo as &dyn resume::VirtualizableInfo),
         None, // ginfo (pyre: no greenfield)
         &allocator,
-        exit_types,
     );
 
     let Some((mut bh, virtualizable_ptr)) = bh else {

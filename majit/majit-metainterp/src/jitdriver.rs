@@ -467,15 +467,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
     }
 
-    pub fn get_exit_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        self.meta.get_exit_types(green_key, trace_id, fail_index)
-    }
-
     /// compile.py:710 recovery_layout header_pc parity: get the merge point
     /// PC for blackhole resume from a guard exit.
     pub fn get_merge_point_pc(
@@ -1313,7 +1304,6 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &exit_layout.exit_types,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
@@ -2088,9 +2078,12 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        // adapt-live is effectively a no-op when Phase 1 forces all
-        // slot types to Ref — but keep the call for safety until all
-        // downstream paths are verified.
+        // Pyre-specific: unbox Ref→Int to match compiled trace types.
+        // RPython has no adapt-live because MIFrame registers are typed.
+        // In pyre, all values are Ref — the compiled trace may expect Int
+        // at positions where the optimizer unboxed (e.g. finish_and_compile
+        // traces have no preamble). compile_loop traces with preamble
+        // peeling do NOT need this (preamble handles conversion).
         let live_values = if target_pc == 0 {
             self.meta
                 .adapt_live_values_to_trace_types(green_key, live_values)
@@ -2818,7 +2811,6 @@ impl<S: JitState> JitDriver<S> {
                     None, // vinfo
                     None, // ginfo
                     allocator,
-                    &exit_layout.exit_types,
                 );
                 if let Some((bh, _vable_ptr)) = bh {
                     let exc =
