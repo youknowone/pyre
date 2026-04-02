@@ -281,6 +281,15 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn str_constant(&mut self, value: &str) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
+    fn slice_constant(
+        &mut self,
+        start: Self::Value,
+        stop: Self::Value,
+        step: Self::Value,
+    ) -> Result<Self::Value, PyError> {
+        // Default: build as tuple. PyFrame overrides to create W_SliceObject.
+        self.build_tuple(&[start, stop, step])
+    }
 }
 
 fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
@@ -328,9 +337,13 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             handler.build_tuple(&items)
         }
         ConstantData::Slice { elements } => {
-            // Slice constants not yet supported; push None
-            let _ = elements;
-            handler.none_constant()
+            // Slice constant → build start/stop/step via handler, then create slice.
+            // Default: push as tuple. PyFrame overrides load_const to create W_SliceObject.
+            let mut items = Vec::with_capacity(3);
+            for element in elements.iter() {
+                items.push(load_const_value(handler, element)?);
+            }
+            handler.build_tuple(&items)
         }
     }
 }
@@ -1027,6 +1040,14 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("store_slice not implemented").into())
     }
 
+    // Common constants (CPython LOAD_COMMON_CONSTANT)
+    fn load_common_constant(
+        &mut self,
+        _cc: crate::bytecode::CommonConstant,
+    ) -> Result<(), Self::Error> {
+        Err(crate::PyError::type_error("load_common_constant not implemented").into())
+    }
+
     // Boolean
     fn to_bool(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("to_bool not implemented").into())
@@ -1688,6 +1709,13 @@ where
         }
         Instruction::CallFunctionEx => {
             executor.call_function_ex()?;
+            Ok(StepResult::Continue)
+        }
+
+        // ── Common constants ──
+        Instruction::LoadCommonConstant { idx } => {
+            let cc = idx.get(op_arg);
+            executor.load_common_constant(cc)?;
             Ok(StepResult::Continue)
         }
 

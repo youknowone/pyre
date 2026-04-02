@@ -1195,6 +1195,11 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::superobject::w_super_new(cls, obj));
     }
     // Zero-arg super(): find __class__ cell and first arg from calling frame
+    //
+    // IMPORTANT: CURRENT_FRAME points to the frame that is currently
+    // executing the `super()` CALL.  For zero-arg super the __class__
+    // cell lives in the *caller* of super(), which IS the current frame
+    // (super is a builtin, not a user function that gets its own frame).
     crate::eval::CURRENT_FRAME.with(|current| {
         let frame_ptr = current.get();
         if frame_ptr.is_null() {
@@ -1680,6 +1685,9 @@ fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `any(iterable)` — PyPy: operation.py any
 /// `any(iterable)` — PyPy: baseobjspace.py any_w
+pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_any(args)
+}
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "any() takes exactly one argument");
     let items = collect_iterable(args[0])?;
@@ -1693,6 +1701,9 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `all(iterable)` — PyPy: operation.py all
 /// `all(iterable)` — PyPy: baseobjspace.py all_w
+pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_all(args)
+}
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty(), "all() takes exactly one argument");
     let items = collect_iterable(args[0])?;

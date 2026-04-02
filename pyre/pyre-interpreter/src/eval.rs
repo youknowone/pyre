@@ -47,7 +47,7 @@ thread_local! {
 }
 use crate::pyframe::PyFrame;
 
-struct CurrentFrameGuard {
+pub struct CurrentFrameGuard {
     previous: *mut PyFrame,
 }
 
@@ -57,7 +57,7 @@ impl Drop for CurrentFrameGuard {
     }
 }
 
-fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
+pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
         current.set(frame as *mut PyFrame);
@@ -577,6 +577,44 @@ impl ConstantOpcodeHandler for PyFrame {
 
 impl OpcodeStepExecutor for PyFrame {
     type Error = PyError;
+
+    // ── LoadCommonConstant ──
+    fn load_common_constant(
+        &mut self,
+        cc: crate::bytecode::CommonConstant,
+    ) -> Result<(), Self::Error> {
+        use crate::bytecode::CommonConstant;
+        let val = match cc {
+            CommonConstant::AssertionError => crate::builtin_code_new("AssertionError", |_args| {
+                Err(crate::PyError::new(
+                    crate::PyErrorKind::AssertionError,
+                    "assertion error".to_string(),
+                ))
+            }),
+            CommonConstant::NotImplementedError => {
+                crate::builtin_code_new("NotImplementedError", |_args| {
+                    Err(crate::PyError::type_error("not implemented"))
+                })
+            }
+            CommonConstant::BuiltinTuple => {
+                crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
+            }
+            CommonConstant::BuiltinAll => {
+                crate::builtin_code_new("all", crate::builtins::builtin_all_fn)
+            }
+            CommonConstant::BuiltinAny => {
+                crate::builtin_code_new("any", crate::builtins::builtin_any_fn)
+            }
+            CommonConstant::BuiltinList => {
+                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+            }
+            CommonConstant::BuiltinSet => {
+                crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
+            }
+        };
+        self.push(val);
+        Ok(())
+    }
 
     // ── PopJumpIfNone / PopJumpIfNotNone ──
     // CPython 3.13: replaces IS_OP + POP_JUMP_IF_TRUE/FALSE for None checks
@@ -1263,12 +1301,17 @@ impl OpcodeStepExecutor for PyFrame {
         let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
         let result = crate::baseobjspace::getattr(proxy, name)?;
 
-        // CPython LOAD_SUPER_ATTR:
-        //   is_method=true  → push [attr, self] (method call convention)
-        //   is_method=false → push [attr] only (PUSH_NULL follows separately)
-        self.push(result);
+        // CPython _PySuper_Lookup: determines whether the resolved attr
+        // is an unbound method (needs self binding) or a staticmethod /
+        // classmethod (no self binding / bind class).
         if is_method {
-            self.push(self_obj);
+            // Check the raw descriptor in MRO to decide binding.
+            let null_or_self =
+                unsafe { crate::baseobjspace::super_lookup_binding(cls, self_obj, name) };
+            self.push(result);
+            self.push(null_or_self);
+        } else {
+            self.push(result);
         }
         Ok(())
     }

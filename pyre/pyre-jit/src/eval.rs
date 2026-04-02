@@ -777,6 +777,8 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     #[cfg(not(target_arch = "wasm32"))]
     majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
     frame.fix_array_ptrs();
+    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
 
     // RPython blackhole.py parity: during bridge tracing, concrete
     // (force helper) calls must use the plain interpreter to avoid
