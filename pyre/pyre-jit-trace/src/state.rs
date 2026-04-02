@@ -2120,8 +2120,10 @@ impl MIFrame {
         };
         if let Some(info) = liveness_info {
             // pyjitpl.py:216-233: iterate live registers via LivenessIterator.
-            // live_r_regs contains precise register indices (now with
-            // backward-analysis liveness for locals, not all-locals-live).
+            // RPython dispatches _callback_i/_callback_r/_callback_f to
+            // typed register banks. pyre: all Python locals are PyObjectRef
+            // (GCREF) → only live_r_regs is populated. live_i_regs and
+            // live_f_regs are always empty.
             let stack_base = info
                 .live_r_regs
                 .iter()
@@ -2139,6 +2141,11 @@ impl MIFrame {
                 };
                 boxes.push(val);
             }
+            // live_i_regs and live_f_regs are empty — no int/float
+            // register bank in pyre's codewriter. When typed registers
+            // are added, this must dispatch to the correct bank.
+            debug_assert!(info.live_i_regs.is_empty());
+            debug_assert!(info.live_f_regs.is_empty());
             boxes
         } else {
             // Fallback: no majit JitCode (proc-macro path).
@@ -7733,11 +7740,13 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
+        // warmstate.py:505-507: unspecialize_value(args[i])
+        // RPython reads from the actual interpreter state, not from meta.
         let nlocals = meta.num_locals;
         let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
         let mut vals = vec![
             Value::Ref(majit_ir::GcRef(self.frame)),
-            Value::Int(meta.merge_pc as i64),
+            Value::Int(self.next_instr as i64),
             Value::Int(self.valuestackdepth as i64),
         ];
         for i in 0..nlocals {
