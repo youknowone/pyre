@@ -1033,7 +1033,10 @@ fn build_class_inner(
         None
     };
 
-    // Create class namespace — use __prepare__ result or fresh namespace
+    // Create class namespace — use __prepare__ result or fresh namespace.
+    // __prepare__ may return a dict subclass (e.g. EnumDict).
+    // dict subclass instances created by w_instance_new store entries in
+    // ATTR_TABLE, not in W_DictObject.entries. We handle both cases.
     let mut class_ns = Box::new(PyNamespace::new());
     if let Some(w_prepared_dict) = w_namespace {
         if unsafe { pyre_object::is_dict(w_prepared_dict) } {
@@ -1046,6 +1049,22 @@ fn build_class_inner(
                         unsafe { pyre_object::w_str_get_value(key) },
                         value,
                     );
+                }
+            }
+        }
+        // dict subclass instance (e.g. EnumDict): backing dict via __dict_data__
+        if unsafe { pyre_object::is_instance(w_prepared_dict) } {
+            let backing = crate::type_methods::resolve_dict_backing(w_prepared_dict);
+            if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
+                let dict = unsafe { &*(backing as *const pyre_object::dictobject::W_DictObject) };
+                for &(key, value) in unsafe { &*dict.entries } {
+                    if !value.is_null() && unsafe { pyre_object::is_str(key) } {
+                        crate::namespace_store(
+                            &mut class_ns,
+                            unsafe { pyre_object::w_str_get_value(key) },
+                            value,
+                        );
+                    }
                 }
             }
         }

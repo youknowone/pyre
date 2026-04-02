@@ -1262,14 +1262,13 @@ impl OpcodeStepExecutor for PyFrame {
         let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
         let result = crate::baseobjspace::getattr(proxy, name)?;
 
-        // CALL convention: stack = [callable, null_or_self, args...]
-        // load_method pushes [attr, bound] where TOS=bound, TOS1=attr
+        // CPython LOAD_SUPER_ATTR:
+        //   is_method=true  → push [attr, self] (method call convention)
+        //   is_method=false → push [attr] only (PUSH_NULL follows separately)
         self.push(result);
-        self.push(if is_method {
-            self_obj
-        } else {
-            pyre_object::PY_NULL
-        });
+        if is_method {
+            self.push(self_obj);
+        }
         Ok(())
     }
 
@@ -1305,7 +1304,6 @@ impl OpcodeStepExecutor for PyFrame {
                     Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                     // PyPy: ClassMethod.__get__ → Method(func, klass)
                     Some(d) if pyre_object::is_classmethod(d) => w_type,
-                    Some(d) if crate::is_builtin_code(d) => PY_NULL,
                     Some(_) => obj, // found in type MRO → bind self (method)
                     None => {
                         // Not found in type MRO → found in instance __dict__.

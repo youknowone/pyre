@@ -1849,8 +1849,11 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 if let Some(result) = get(descr, obj, w_type) {
                     return Ok(result);
                 }
-                // Step 5: return descriptor as-is (e.g. builtin_function_or_method
-                // does not bind self when accessed on an instance)
+                // Step 5: builtin methods found in base type MRO need binding
+                // CPython: PyFunction_GET_CODE slot → bound method
+                if crate::is_builtin_code(descr) {
+                    return Ok(pyre_object::w_method_new(descr, obj, w_type));
+                }
                 return Ok(descr);
             }
 
