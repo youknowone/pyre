@@ -6706,10 +6706,10 @@ impl ControlFlowOpcodeHandler for MIFrame {
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
-            // pyjitpl.py:2979-2983 / 2999-3007: compile_trace or compile_retrace
-            // — attempt to connect to the ROOT loop's existing compiled targets.
-            // For bridge traces, pass bridge_origin so compile_trace routes to
-            // compile_bridge (RPython compile_retrace parity).
+            // pyjitpl.py:2978-2983: get_procedure_token(greenboxes)
+            // RPython uses the current merge point's green key to check for
+            // compiled targets. For same-loop closes, root_key == back_edge_key.
+            // For nested loops, the inner loop is under back_edge_key.
             {
                 let root_key = ctx.root_green_key();
                 let (driver, _) = crate::driver::driver_pair();
@@ -6722,7 +6722,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
-                                "[jit][reached_loop_header] compile_trace success: root={} pc={} bridge={:?}",
+                                "[jit][reached_loop_header] compile_trace success: key={} pc={} bridge={:?}",
                                 root_key, target, bridge_origin
                             );
                         }
