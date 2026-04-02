@@ -1326,15 +1326,15 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // warmstate.py:387-423: RPython's blackhole never
-                            // fails (rd_numb is always complete). pyre's rd_numb
-                            // can be incomplete, causing blackhole failure.
-                            // Invalidate to prevent re-entering the broken guard,
-                            // but don't retrace immediately — let the counter
-                            // accumulate naturally.
+                            // resume.py:1312: blackhole_from_resumedata never
+                            // fails in upstream — it's a contract. This path
+                            // means a pyre resume data bug. Invalidate to
+                            // prevent re-entering the broken guard. Remove
+                            // once blackhole resume is fully sound.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][WARN] blackhole resume incomplete key={}",
+                                    "[jit][BUG] blackhole failed key={} — \
+                                     invalidating compiled loop",
                                     green_key,
                                 );
                             }
@@ -2202,13 +2202,8 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
         {
-            // W_IntObject fast path: find the intval field by offset (8),
-            // not by index — VirtualInfo fields include ob_type at offset 0.
-            let intval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == 8)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(intval_idx) {
+            // W_IntObject fast path: fieldnums[0] = intval (offset 8)
+            if let Some(&tagged) = fieldnums.first() {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -2232,12 +2227,8 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
         {
-            // W_FloatObject fast path: find floatval field by offset (8).
-            let floatval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == 8)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(floatval_idx) {
+            // W_FloatObject fast path: fieldnums[0] = floatval (offset 8)
+            if let Some(&tagged) = fieldnums.first() {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -2786,64 +2777,12 @@ fn build_resumed_frames(
             _ => Value::Int(0),
         }
     }
-    // opencoder.py:722 _list_of_boxes_virtualizable: virtualizable_ptr
-    // moved from boxes[-1] to snapshot[0].
-    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
-    // Per-frame values contain slot registers only (no header prepend).
-    let (vable_frame_ptr, _vable_ni, vable_vsd) = if vable_values.len() >= 5 {
-        let frame_val = resolve_rebuilt_value(
-            &vable_values[0],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        let ni_val = resolve_rebuilt_value(
-            &vable_values[1], // ni
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[2]=code (immutable)
-        let vsd_val = resolve_rebuilt_value(
-            &vable_values[3], // vsd
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        );
-        // skip vable_values[4]=namespace (immutable)
-        let fp = match &frame_val {
-            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let ni = match &ni_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match &vsd_val {
-            Value::Int(v) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    } else {
-        // vable_values empty: no-snapshot guard. Fall back to
-        // deadframe header [Ref(frame), Int(ni), Int(vsd), ...].
-        // RPython never hits this (all guards have snapshots).
-        let fp = match dead_frame_typed.first() {
-            Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
-        let ni = match dead_frame_typed.get(1) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        let vsd = match dead_frame_typed.get(2) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        (fp, ni, vsd)
-    };
+    // resume.py:1045 consume_vref_and_vable: vable header is extracted
+    // AFTER _prepare_next_section materializes virtuals. The post-section
+    // block below is the authoritative extraction. vable_values is always
+    // non-empty for guards with complete resume data (resume.py:397 asserts
+    // resume_position >= 0). The no-snapshot fallback in store_final_boxes_in_guard
+    // now encodes fail_args[0..3] as vable_array to maintain this invariant.
 
     let mut all_values: Vec<Vec<Value>> = Vec::with_capacity(frames.len());
     for frame in &frames {
@@ -3521,18 +3460,11 @@ pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
+        // resume.py:1437-1439 allocate_with_vtable
+        // pyre objects are GC-managed; allocation requires type_id → gc.alloc.
+        // Delegate to GC allocator when available.
         let _ = descr_index;
         0 // TODO: gc.alloc_with_type_id(descr_index)
-    }
-
-    fn box_int(&self, raw: i64) -> i64 {
-        let obj = Box::new(pyre_object::intobject::W_IntObject {
-            ob_header: pyre_object::pyobject::PyObject {
-                ob_type: &pyre_object::INT_TYPE as *const _ as *const pyre_object::pyobject::PyType,
-            },
-            intval: raw,
-        });
-        Box::into_raw(obj) as i64
     }
 
     fn setfield_typed(
