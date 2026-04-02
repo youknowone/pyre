@@ -1062,6 +1062,18 @@ impl<M: Clone> MetaInterp<M> {
                 }
 
                 let mut ctx = TraceCtx::new(recorder, green_key);
+                ctx.initial_inputarg_consts = live_values
+                    .iter()
+                    .map(|v| {
+                        let (bits, tp) = match v {
+                            Value::Int(i) => (*i, Type::Int),
+                            Value::Float(f) => (f.to_bits() as i64, Type::Float),
+                            Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
+                            Value::Void => (0, Type::Void),
+                        };
+                        ctx.constants.get_or_insert_typed(bits, tp)
+                    })
+                    .collect();
                 if let Some(descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor);
                 }
@@ -1191,6 +1203,18 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             TraceCtx::new(recorder, green_key)
         };
+        ctx.initial_inputarg_consts = live_values
+            .iter()
+            .map(|v| {
+                let (bits, tp) = match v {
+                    Value::Int(i) => (*i, Type::Int),
+                    Value::Float(f) => (f.to_bits() as i64, Type::Float),
+                    Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
+                    Value::Void => (0, Type::Void),
+                };
+                ctx.constants.get_or_insert_typed(bits, tp)
+            })
+            .collect();
         if let Some(descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor);
         }
@@ -1848,7 +1872,12 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.header_pc,
                 );
             }
-            trace.cut_trace_from(start, original_boxes, original_box_types)
+            trace.cut_trace_from_with_consts(
+                start,
+                original_boxes,
+                original_box_types,
+                &ctx.initial_inputarg_consts,
+            )
         } else {
             trace
         };

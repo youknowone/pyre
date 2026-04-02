@@ -74,6 +74,13 @@ pub struct TraceCtx {
     /// pyjitpl.py:2594 frame.pc: last bytecode pc passed to trace_fn.
     /// Used by force_finish_trace segmenting to record the guard-point pc.
     pub last_traced_pc: usize,
+    /// GC-safe constant OpRefs for each initial inputarg at trace start.
+    /// Each entry is a ConstantPool-allocated OpRef whose value is kept
+    /// up-to-date by the shadow stack (Ref constants survive GC moves).
+    /// Used by cut_trace_from to remap escaped original inputargs to
+    /// existing pool constants, avoiding both stale pointers and
+    /// entry-contract mismatches.
+    pub initial_inputarg_consts: Vec<majit_ir::OpRef>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -267,6 +274,7 @@ impl TraceCtx {
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
+            initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
         }
     }
@@ -306,6 +314,7 @@ impl TraceCtx {
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
+            initial_inputarg_consts: vec![],
             pending_guard_not_invalidated_pc: None,
         }
     }
