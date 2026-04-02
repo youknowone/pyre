@@ -1317,11 +1317,17 @@ impl OptRewrite {
             raise_invalid_loop("GUARD_TRUE proven to always fail");
         }
 
+        // NOTE: RPython postprocess_GUARD_TRUE makes arg0 constant 1 via
+        // make_constant(box, CONST_1). In RPython this works because each loop
+        // iteration creates NEW Box objects — the old Box's forwarded pointer
+        // is irrelevant. In majit, OpRef is a stable identifier reused across
+        // iterations, so make_constant here would break loop variables.
+        // The IntBounds pass already narrows guard_true/false args through
+        // its own bounds mechanism (postprocess_guard_true/false).
         OptimizationResult::PassOn
     }
 
     /// Optimize GUARD_FALSE following RPython rewrite.py: optimize_guard(op, CONST_0).
-    /// If the condition is a known constant nonzero, the trace is impossible and must abort.
     fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
