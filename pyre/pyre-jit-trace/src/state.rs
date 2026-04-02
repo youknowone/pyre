@@ -4091,6 +4091,7 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+                    this.remember_value_type(truth, Type::Int);
                     // RPython goto_if_not fusion: cache truth for
                     // the next POP_JUMP_IF to consume directly.
                     this.sym_mut().last_comparison_truth = Some(truth);
@@ -4140,6 +4141,7 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
+                    this.remember_value_type(truth, Type::Int);
                     this.sym_mut().last_comparison_truth = Some(truth);
                     this.sym_mut().last_comparison_concrete_truth =
                         Some(objspace_compare_floats(lhs_obj, rhs_obj, op));
