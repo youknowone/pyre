@@ -1,0 +1,50 @@
+name: Publish to crates.io
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  publish:
+    name: Publish crates
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'release-pyre-') }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish in dependency order with retry for index propagation
+          for crate in \
+            majit-ir \
+            majit-backend \
+            majit-gc \
+            majit-macros \
+            majit-trace \
+            majit-backend-cranelift \
+            majit-backend-wasm \
+            majit-codewriter \
+            majit-metainterp \
+            majit \
+            pyre-object \
+            pyre-interpreter \
+            pyre-module \
+            pyre-jit-trace \
+            pyre-jit \
+            pyrex \
+            pyre-wasm \
+          ; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --no-verify || {
+              echo "Retrying $crate in 30s (waiting for index)..."
+              sleep 30
+              cargo publish -p "$crate" --no-verify
+            }
+            sleep 10
+          done
