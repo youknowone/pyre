@@ -6707,9 +6707,6 @@ impl ControlFlowOpcodeHandler for MIFrame {
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
             // pyjitpl.py:2978-2983: get_procedure_token(greenboxes)
-            // RPython uses the current merge point's green key to check for
-            // compiled targets. For same-loop closes, root_key == back_edge_key.
-            // For nested loops, the inner loop is under back_edge_key.
             {
                 let root_key = ctx.root_green_key();
                 let (driver, _) = crate::driver::driver_pair();
@@ -6722,7 +6719,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
-                                "[jit][reached_loop_header] compile_trace success: key={} pc={} bridge={:?}",
+                                "[jit][reached_loop_header] compile_trace success: root={} pc={} bridge={:?}",
                                 root_key, target, bridge_origin
                             );
                         }
@@ -6742,15 +6739,21 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 // The compiled code will contain both loops in one function,
                 // avoiding cross-function jump limitations.
                 let root_key = ctx.root_green_key();
+                // pyjitpl.py:2978-2983 + Cranelift single-function constraint:
+                // When an inner loop is already compiled (back_edge_key !=
+                // root_key), skip merge point registration. The trace will
+                // pass through the inner loop body and close at the outer
+                // loop header, compiling both loops in one Cranelift function.
                 let inner_already_compiled = {
                     let (driver, _) = crate::driver::driver_pair();
+                    let root_key = ctx.root_green_key();
                     back_edge_key != root_key
                         && driver.meta_interp().has_compiled_targets(back_edge_key)
                 };
                 if inner_already_compiled {
                     if majit_metainterp::majit_log_enabled() {
                         eprintln!(
-                            "[jit][reached_loop_header] inner loop already compiled, skip merge point: key={} pc={}",
+                            "[jit][reached_loop_header] inner loop compiled, skip merge: key={} pc={}",
                             back_edge_key, target
                         );
                     }
