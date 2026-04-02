@@ -337,13 +337,16 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             handler.build_tuple(&items)
         }
         ConstantData::Slice { elements } => {
-            // Slice constant → build start/stop/step via handler, then create slice.
-            // Default: push as tuple. PyFrame overrides load_const to create W_SliceObject.
+            // Slice constant → build start/stop/step via handler.slice_constant()
             let mut items = Vec::with_capacity(3);
             for element in elements.iter() {
                 items.push(load_const_value(handler, element)?);
             }
-            handler.build_tuple(&items)
+            if items.len() == 3 {
+                handler.slice_constant(items[0], items[1], items[2])
+            } else {
+                handler.build_tuple(&items)
+            }
         }
     }
 }

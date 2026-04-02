@@ -573,6 +573,15 @@ impl ConstantOpcodeHandler for PyFrame {
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {
         Ok(w_none())
     }
+
+    fn slice_constant(
+        &mut self,
+        start: Self::Value,
+        stop: Self::Value,
+        step: Self::Value,
+    ) -> Result<Self::Value, PyError> {
+        Ok(pyre_object::w_slice_new(start, stop, step))
+    }
 }
 
 impl OpcodeStepExecutor for PyFrame {
@@ -1423,7 +1432,7 @@ impl OpcodeStepExecutor for PyFrame {
         let _null = self.pop();
         let callable = self.pop();
 
-        let args: Vec<PyObjectRef> = unsafe {
+        let mut args: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_tuple(args_obj) {
                 let t = &*(args_obj as *const pyre_object::tupleobject::W_TupleObject);
                 t.items.as_slice().to_vec()
@@ -1435,7 +1444,16 @@ impl OpcodeStepExecutor for PyFrame {
             }
         };
 
-        let _ = kwargs_or_null;
+        // Merge kwargs dict into call.
+        // PyPy: argument.py Arguments.prepend + unpack_combined_starstarargs
+        if !kwargs_or_null.is_null() && unsafe { pyre_object::is_dict(kwargs_or_null) } {
+            let entries = unsafe { pyre_object::w_dict_str_entries(kwargs_or_null) };
+            if !entries.is_empty() {
+                let result = crate::call::call_with_kwargs(self, callable, &args, &entries)?;
+                self.push(result);
+                return Ok(());
+            }
+        }
 
         let result = call_callable(self, callable, &args)?;
         self.push(result);
@@ -1468,9 +1486,39 @@ impl OpcodeStepExecutor for PyFrame {
             args.insert(0, self_or_null);
         }
 
+        // For type objects with kwargs: use call_with_kwargs which handles
+        // __new__/__init__ kwargs forwarding correctly.
+        let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
+        if unsafe { pyre_object::is_type(callable_unwrapped) } {
+            let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
+                unsafe { pyre_object::w_tuple_len(kwarg_names) }
+            } else {
+                0
+            };
+            if nkw > 0 {
+                let n_pos = args.len() - nkw;
+                let pos_args = args[..n_pos].to_vec();
+                let mut kw_entries = Vec::with_capacity(nkw);
+                for ki in 0..nkw {
+                    let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
+                    if let Some(name_obj) = name {
+                        let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                        kw_entries.push((key, args[n_pos + ki]));
+                    }
+                }
+                let result = crate::call::call_with_kwargs(
+                    self,
+                    callable_unwrapped,
+                    &pos_args,
+                    &kw_entries,
+                )?;
+                self.push(result);
+                return Ok(());
+            }
+        }
+
         // Resolve keyword args into positional order.
         // PyPy: argument.py _match_signature step: match keywords to argnames
-        let callable_unwrapped = crate::baseobjspace::unwrap_cell(callable);
         let resolved = if unsafe { crate::is_builtin_code(callable_unwrapped) } {
             // Builtin functions: pack kwargs into a dict as last arg
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {

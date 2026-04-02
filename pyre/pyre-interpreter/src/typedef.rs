@@ -599,6 +599,11 @@ fn init_str_type(ns: &mut PyNamespace) {
     );
     namespace_store(
         ns,
+        "isidentifier",
+        builtin_code_new("isidentifier", crate::type_methods::str_method_isidentifier),
+    );
+    namespace_store(
+        ns,
         "zfill",
         builtin_code_new("zfill", crate::type_methods::str_method_zfill),
     );

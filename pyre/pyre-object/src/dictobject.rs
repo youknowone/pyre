@@ -134,6 +134,16 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     (*(obj as *const W_DictObject)).len
 }
 
+/// Iterate over (key_str, value) pairs. Keys must be str objects.
+pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
+    let dict = &*(obj as *const W_DictObject);
+    let entries = &*dict.entries;
+    entries
+        .iter()
+        .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
