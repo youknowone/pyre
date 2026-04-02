@@ -426,6 +426,28 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
+/// PyPy: unicodeobject.py descr_isidentifier
+pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty());
+    let s = unsafe { w_str_get_value(args[0]) };
+    Ok(w_bool_from(is_identifier(s)))
+}
+
+/// Check if a string is a valid Python identifier.
+/// Python 3 identifiers: ID_Start ID_Continue*
+/// Simplified: accepts ASCII identifiers + Unicode letters/digits.
+fn is_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2);
     let s = unsafe { w_str_get_value(args[0]) };
