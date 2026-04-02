@@ -2459,7 +2459,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Snapshot the trace ops (including JUMP) for bridge compilation.
-        let mut bridge_ops = ctx.recorder.ops().to_vec();
+        let bridge_ops = ctx.recorder.ops().to_vec();
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputarg_types()
@@ -2467,50 +2467,6 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
-        // RPython parity: bridge ops reference the tracer's OpRef space.
-        // When snapshot numbering produces compact fail_args, the bridge's
-        // inputargs are re-indexed (OpRef(0..n) for n liveboxes). The ops
-        // may reference the ORIGINAL trace's OpRef indices. Remap to match.
-        if let Some((trace_id, fail_index)) = bridge_origin {
-            let guard_fail_args: Option<Vec<OpRef>> = self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| {
-                    let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-                    compiled.traces.get(&norm_tid)
-                })
-                .and_then(|trace| {
-                    let guard_idx = trace.guard_op_indices.get(&fail_index)?;
-                    let guard_op = trace.ops.get(*guard_idx)?;
-                    guard_op.fail_args.as_ref().map(|fa| fa.to_vec())
-                });
-            if let Some(fail_args) = guard_fail_args {
-                // Build remap: fail_args[i].0 → i (compact index).
-                let mut remap: std::collections::HashMap<u32, u32> =
-                    std::collections::HashMap::new();
-                for (compact_idx, &opref) in fail_args.iter().enumerate() {
-                    if !opref.is_none() {
-                        remap.insert(opref.0, compact_idx as u32);
-                    }
-                }
-                if !remap.is_empty() {
-                    for op in &mut bridge_ops {
-                        for arg in &mut op.args {
-                            if let Some(&new_idx) = remap.get(&arg.0) {
-                                *arg = OpRef(new_idx);
-                            }
-                        }
-                        if let Some(ref mut fa) = op.fail_args {
-                            for arg in fa.iter_mut() {
-                                if let Some(&new_idx) = remap.get(&arg.0) {
-                                    *arg = OpRef(new_idx);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
@@ -3070,12 +3026,10 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constant_types,
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
-        // Blocked: snapshot_boxes activation in finish_and_compile causes
-        // fib_recursive SEGFAULT. The vable_array_len mismatch (state.rs)
-        // is fixed, but the snapshot-based rd_numb produces deadframe
-        // values that crash the blackhole. compile_loop (with unroll)
-        // activates snapshot_boxes successfully; this path needs further
-        // debugging of the blackhole resume flow.
+        // LivenessInfo has precise per-local liveness (liveness.py parity).
+        // Blocked: fib_recursive SEGFAULT in blackhole_from_resumedata —
+        // decode_ref(TAGINT) boxes via w_int_new but the boxed object
+        // may be reclaimed before BH returns (GC/lifetime issue).
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
@@ -4293,8 +4247,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyre-specific: unbox Ref→Int where compiled trace expects Int.
-    /// With Phase 1 (all slot types → Ref), this is effectively a no-op
-    /// because the first guard's fail_arg_types also have Ref for all slots.
+    /// pyre traces start with all-Ref locals (PyObjectRef) but trace-internal
+    /// operations unbox to Int/Float. At compiled entry, live_values carry
+    /// Ref pointers that must be unboxed to match the trace's typed label.
+    /// RPython doesn't need this because wrap() sets Box types before tracing.
     pub fn adapt_live_values_to_trace_types(
         &self,
         green_key: u64,
@@ -4319,6 +4275,11 @@ impl<M: Clone> MetaInterp<M> {
                     })
             })
             .unwrap_or_default();
+        let before = if crate::majit_log_enabled() {
+            Some(values.clone())
+        } else {
+            None
+        };
         for (i, tp) in types.iter().enumerate() {
             if i >= values.len() {
                 break;
@@ -4331,6 +4292,12 @@ impl<M: Clone> MetaInterp<M> {
                     values[i] = Value::Int(ptr as i64);
                 }
             }
+        }
+        if let Some(before) = before {
+            eprintln!(
+                "[jit][adapt-live] key={} types={:?} before={:?} after={:?}",
+                green_key, types, before, values
+            );
         }
         values
     }
@@ -5236,20 +5203,6 @@ impl<M: Clone> MetaInterp<M> {
         let rd_numb = exit_layout.rd_numb.as_ref()?.clone();
         let rd_consts = exit_layout.rd_consts.as_ref()?.clone();
         Some((rd_numb, rd_consts))
-    }
-
-    /// Get exit_types for a guard failure (adapt-live type info).
-    pub fn get_exit_types(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<Type>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
-        Some(exit_layout.exit_types.clone())
     }
 
     /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
