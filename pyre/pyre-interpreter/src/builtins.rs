@@ -1184,15 +1184,98 @@ fn builtin_object(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 ///
 /// Returns a proxy that looks up methods in cls's MRO starting after cls.
 /// `getattr` handles the super proxy via `is_super` check.
+///
+/// Zero-arg super() finds __class__ and self from the calling frame.
+/// CPython: Objects/typeobject.c super_init
 fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error(
-            "super(): requires at least 2 arguments (zero-arg super not yet supported)",
-        ));
+    if args.len() >= 2 {
+        let cls = args[0];
+        let obj = args[1];
+        return Ok(pyre_object::superobject::w_super_new(cls, obj));
     }
-    let cls = args[0];
-    let obj = args[1];
-    Ok(pyre_object::superobject::w_super_new(cls, obj))
+    // Zero-arg super(): find __class__ cell and first arg from calling frame
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame_ptr = current.get();
+        if frame_ptr.is_null() {
+            return Err(crate::PyError::runtime_error("super(): no current frame"));
+        }
+        let frame = unsafe { &*frame_ptr };
+        let code = frame.code();
+
+        // Find __class__ in freevars (it's a cell variable from the enclosing class scope)
+        let num_locals = code.varnames.len();
+        let cellvars_only = code
+            .cellvars
+            .iter()
+            .filter(|c| !code.varnames.contains(c))
+            .count();
+        let locals = frame.locals_cells_stack_w.as_slice();
+
+        let mut w_class = pyre_object::PY_NULL;
+
+        // Check freevars for __class__
+        for (slot, name) in code.freevars.iter().enumerate() {
+            if name == "__class__" {
+                let idx = num_locals + cellvars_only + slot;
+                if idx < locals.len() {
+                    let cell = locals[idx];
+                    if !cell.is_null() {
+                        if unsafe { pyre_object::is_cell(cell) } {
+                            w_class = unsafe { pyre_object::w_cell_get(cell) };
+                        } else {
+                            w_class = cell;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Also check cellvars for __class__
+        if w_class.is_null() {
+            for (slot, name) in code.cellvars.iter().enumerate() {
+                if name == "__class__" {
+                    let idx = if code.varnames.iter().any(|v| v == name) {
+                        code.varnames.iter().position(|v| v == name).unwrap()
+                    } else {
+                        num_locals + slot
+                    };
+                    if idx < locals.len() {
+                        let cell = locals[idx];
+                        if !cell.is_null() {
+                            if unsafe { pyre_object::is_cell(cell) } {
+                                w_class = unsafe { pyre_object::w_cell_get(cell) };
+                            } else {
+                                w_class = cell;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if w_class.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "super(): __class__ cell not found",
+            ));
+        }
+
+        // First argument is self/cls/mcs (locals[0])
+        let w_self = if locals.is_empty() {
+            pyre_object::PY_NULL
+        } else {
+            locals[0]
+        };
+
+        if w_self.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "super(): no first argument found",
+            ));
+        }
+
+        Ok(pyre_object::superobject::w_super_new(w_class, w_self))
+    })
 }
 
 /// `iter(obj)` — PyPy: baseobjspace.py iter
