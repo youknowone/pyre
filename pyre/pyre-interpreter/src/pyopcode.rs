@@ -1161,6 +1161,11 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 self.push_value(none).map_err(Into::into)?;
                 Ok(())
             }
+            IntrinsicFunction1::StopIterationError => {
+                // CPython: convert StopIteration to RuntimeError in generator context.
+                // For now, just leave the value on the stack unchanged.
+                Ok(())
+            }
             _ => Err(crate::PyError::type_error(&format!(
                 "intrinsic function {:?} not implemented",
                 func
