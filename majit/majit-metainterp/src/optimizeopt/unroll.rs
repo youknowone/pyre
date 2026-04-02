@@ -2084,18 +2084,11 @@ impl OptUnroll {
                 // unroll.py:404: _map_args(mapping, sop.getarglist())
                 // Const passes through unchanged, non-Const must be in mapping.
                 for arg in &mut new_op.args {
-                    // unroll.py:367: if not isinstance(box, Const): box = mapping[box]
-                    // RPython: isinstance(box, Const) — Const objects pass through.
-                    // Pyre: OpRef >= 10000 (constant pool), Forwarded::Const
-                    // (make_constant'd), or constants table entry.
-                    if arg.is_constant()
-                        || short_preamble.constants.contains_key(&arg.0)
-                        || ctx.get_constant(*arg).is_some()
-                        || matches!(
-                            ctx.forwarded.get(arg.0 as usize),
-                            Some(crate::optimizeopt::info::Forwarded::Const(_))
-                        )
-                    {
+                    // unroll.py:367: isinstance(box, Const) — true Const objects
+                    // only (ConstInt/ConstPtr/ConstFloat). make_constant'd values
+                    // are NOT Const objects — they are regular boxes with forwarded
+                    // set to a Const, so they must go through the mapping.
+                    if arg.is_constant() || short_preamble.constants.contains_key(&arg.0) {
                         continue;
                     }
                     // unroll.py:404: _map_args — non-Const must be in mapping.

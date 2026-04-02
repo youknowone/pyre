@@ -1264,11 +1264,19 @@ impl OptContext {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:412: box = get_box_replacement(box)
         let replaced = self.get_box_replacement(opref);
+        // optimizer.py:415-426: safety check — if the box has an IntBound
+        // forwarded and the constant is Int, validate range.
+        // Cross-pass: check imported_int_bounds (Phase 2 bounds from Phase 1).
+        if let Value::Int(intval) = value {
+            if let Some(bound) = self.imported_int_bounds.get(&replaced) {
+                if !bound.contains(intval) {
+                    std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                        "constant int is outside the range allowed for that box",
+                    ));
+                }
+            }
+        }
         // optimizer.py:427: if box.is_constant(): return
-        // RPython: box.is_constant() is True for Const objects AND for boxes
-        // whose forwarded IS a Const. get_box_replacement stops at
-        // Forwarded::Const, so `replaced` still points to the original box.
-        // Check both constant-pool refs and Forwarded::Const.
         if replaced.is_constant()
             || matches!(
                 self.forwarded.get(replaced.0 as usize),
@@ -1277,6 +1285,26 @@ impl OptContext {
         {
             return;
         }
+        // optimizer.py:429-431: copy_fields_to_const — preserve heap cache
+        // fields from the existing PtrInfo onto the const's info (const_infos).
+        if let Value::Ref(gcref) = value {
+            if let Some(Forwarded::Info(info)) = self.forwarded.get(replaced.0 as usize) {
+                match info {
+                    crate::optimizeopt::info::PtrInfo::Instance(inst)
+                        if !inst.fields.is_empty() =>
+                    {
+                        self.const_infos.insert(gcref.as_usize(), info.clone());
+                    }
+                    crate::optimizeopt::info::PtrInfo::Struct(st) if !st.fields.is_empty() => {
+                        self.const_infos.insert(gcref.as_usize(), info.clone());
+                    }
+                    crate::optimizeopt::info::PtrInfo::Array(arr) if !arr.items.is_empty() => {
+                        self.const_infos.insert(gcref.as_usize(), info.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Store in constants array for get_constant() callers.
         let idx = replaced.0 as usize;
         if idx >= self.constants.len() {
@@ -1284,9 +1312,6 @@ impl OptContext {
         }
         self.constants[idx] = Some(value.clone());
         // optimizer.py:432: box.set_forwarded(constbox)
-        // Forwarded::Const is a terminal — no OpRef allocation needed.
-        // get_box_replacement returns `replaced` (stops at Const terminal).
-        // is_const checks forwarded[replaced] for Const variant.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
