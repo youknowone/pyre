@@ -1267,6 +1267,7 @@ impl OptContext {
     /// RPython: box = get_box_replacement(box); box.set_forwarded(constbox).
     /// Forwarded::Const(value) is the terminal — get_box_replacement stops
     /// here and returns the opref. is_const detects Forwarded::Const.
+    /// optimizer.py:410-432: make_constant(box, constbox)
     pub fn make_constant(&mut self, opref: OpRef, value: Value) {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:412: box = get_box_replacement(box)
