@@ -1741,7 +1741,7 @@ pub fn blackhole_resume_via_rd_numb(
     let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
     // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
     // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
-    let allocator = resume::NullAllocator;
+    let allocator = crate::eval::PyreBlackholeAllocator;
     let bh = resume::blackhole_from_resumedata(
         builder,
         &resolve_jitcode,
@@ -1817,7 +1817,7 @@ pub fn blackhole_resume_via_rd_numb(
         if caller.is_none() {
             // blackhole.py:1664-1677 _done_with_this_frame
             let result = match rt {
-                BhReturnType::Int => bh.get_tmpreg_i() as pyre_object::PyObjectRef,
+                BhReturnType::Int => pyre_object::intobject::w_int_new(bh.get_tmpreg_i()),
                 BhReturnType::Ref => bh.get_tmpreg_r() as pyre_object::PyObjectRef,
                 BhReturnType::Float => {
                     // blackhole.py:1674-1675: DoneWithThisFrameFloat(get_tmpreg_f())
