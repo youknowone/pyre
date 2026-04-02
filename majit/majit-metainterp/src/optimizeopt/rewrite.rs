@@ -55,10 +55,13 @@ pub struct OptRewrite {
     /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
     bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
-    /// rewrite.py: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
+    /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
     loop_invariant_results: std::collections::HashMap<i64, LoopInvariantEntry>,
+    /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
+    /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
+    loop_invariant_producer: std::collections::HashMap<i64, Op>,
 }
 
 impl OptRewrite {
@@ -67,6 +70,7 @@ impl OptRewrite {
             last_op_removed: false,
             bool_result_cache: std::collections::HashMap::new(),
             loop_invariant_results: std::collections::HashMap::new(),
+            loop_invariant_producer: std::collections::HashMap::new(),
         }
     }
 
@@ -2132,6 +2136,12 @@ impl Optimization for OptRewrite {
                     // Cache miss: demote and record result
                     self.loop_invariant_results
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos));
+                    // rewrite.py:30-31: _callback records producer op
+                    let call_opcode = OpCode::call_for_type(op.result_type());
+                    let mut producer = Op::new(call_opcode, &op.args);
+                    producer.pos = op.pos;
+                    producer.descr = op.descr.clone();
+                    self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let mut new_op = Op::new(call_opcode, &op.args);
@@ -2178,10 +2188,22 @@ impl Optimization for OptRewrite {
         self.last_op_removed = false;
         self.bool_result_cache.clear();
         self.loop_invariant_results.clear();
+        self.loop_invariant_producer.clear();
     }
 
     fn name(&self) -> &'static str {
         "rewrite"
+    }
+
+    /// rewrite.py:45-47: produce_potential_short_preamble_ops
+    fn produce_potential_short_preamble_ops(
+        &self,
+        sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        _ctx: &OptContext,
+    ) {
+        for op in self.loop_invariant_producer.values() {
+            sb.add_loopinvariant_op(op.clone());
+        }
     }
 
     /// rewrite.py: serialize_optrewrite — export loopinvariant results.
