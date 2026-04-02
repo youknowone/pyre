@@ -169,14 +169,11 @@ impl RecentPureOps {
 ///
 /// Also handles:
 /// - CALL_PURE -> CALL demotion when arguments aren't all constant.
-/// - CALL_LOOPINVARIANT_* caching (result persists for entire loop iteration).
 /// - OVF operation postponement (INT_ADD_OVF etc. are deferred until GUARD_NO_OVERFLOW).
 /// - GUARD_NO_EXCEPTION removal after eliminated CALL_PURE.
 /// - RECORD_KNOWN_RESULT for pre-recorded call_pure results.
 pub struct OptPure {
     cache: RecentPureOps,
-    /// Per-loop-iteration cache for CALL_LOOPINVARIANT_* results.
-    loopinvariant_cache: HashMap<PureOpKey, OpRef>,
     /// Postponed OVF operation: INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF.
     /// pure.py: postponed_op — deferred until GUARD_NO_OVERFLOW is seen.
     postponed_op: Option<Op>,
@@ -187,9 +184,6 @@ pub struct OptPure {
     /// able to reproduce from the preamble via optimizer state, not by
     /// textual body replay.
     short_preamble_pure_ops: Vec<Op>,
-    /// RPython shortpreamble.py: CALL_LOOPINVARIANT ops tracked separately
-    /// from regular pure ops and re-imported into rewrite state.
-    short_preamble_loopinvariant_ops: Vec<Op>,
     /// Whether the last emitted operation was removed (for GUARD_NO_EXCEPTION elimination).
     /// pure.py: last_emitted_operation is REMOVED check.
     last_emitted_was_removed: bool,
@@ -223,11 +217,9 @@ impl OptPure {
     pub fn new() -> Self {
         OptPure {
             cache: RecentPureOps::new(4096),
-            loopinvariant_cache: HashMap::new(),
             postponed_op: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),
-            short_preamble_loopinvariant_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
@@ -386,35 +378,7 @@ impl OptPure {
         None
     }
 
-    /// Handle CALL_LOOPINVARIANT_*: cache the result for the loop iteration.
-    fn handle_call_loopinvariant(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let key = PureOpKey::from_op(op);
-
-        // Check if we've already computed this loop-invariant call.
-        if let Some(cached_ref) = self.loopinvariant_cache.get(&key).copied() {
-            let cached_ref = ctx.get_box_replacement(cached_ref);
-            ctx.replace_op(op.pos, cached_ref);
-            return OptimizationResult::Remove;
-        }
-
-        // Also check the commutative case (unlikely for calls, but consistent).
-        // Not applicable for calls — skip.
-
-        // Cache the result and demote to plain CALL_*.
-        self.loopinvariant_cache.insert(key, op.pos);
-
-        let new_op = self.demote_call_loopinvariant(op);
-        self.short_preamble_loopinvariant_ops.push(new_op.clone());
-        OptimizationResult::Emit(new_op)
-    }
-
     fn demote_call_pure(&self, op: &Op) -> Op {
-        let mut new_op = op.clone();
-        new_op.opcode = OpCode::call_for_type(op.result_type());
-        new_op
-    }
-
-    fn demote_call_loopinvariant(&self, op: &Op) -> Op {
         let mut new_op = op.clone();
         new_op.opcode = OpCode::call_for_type(op.result_type());
         new_op
@@ -849,11 +813,6 @@ impl Optimization for OptPure {
             return OptimizationResult::Emit(op.clone());
         }
 
-        // CALL_LOOPINVARIANT_* -> cache result, demote to CALL_*.
-        if op.opcode.is_call_loopinvariant() {
-            return self.handle_call_loopinvariant(op, ctx);
-        }
-
         // pure.py: COND_CALL_VALUE_I/R — treated like CALL_PURE but
         // with args starting at index 1 (index 0 is the condition).
         if op.opcode == OpCode::CondCallValueI || op.opcode == OpCode::CondCallValueR {
@@ -881,11 +840,9 @@ impl Optimization for OptPure {
     fn setup(&mut self) {
         let limit = self.cache.lst.len();
         self.cache = RecentPureOps::new(limit);
-        self.loopinvariant_cache.clear();
         self.postponed_op = None;
         self.call_pure_positions.clear();
         self.short_preamble_pure_ops.clear();
-        self.short_preamble_loopinvariant_ops.clear();
         self.last_emitted_was_removed = false;
         self.known_result_call_pure.clear();
         // Note: extra_call_pure is NOT cleared on setup — it persists
@@ -955,9 +912,6 @@ impl Optimization for OptPure {
     ) {
         for op in &self.short_preamble_pure_ops {
             sb.add_pure_op(op.clone());
-        }
-        for op in &self.short_preamble_loopinvariant_ops {
-            sb.add_loopinvariant_op(op.clone());
         }
     }
 }
@@ -1217,11 +1171,9 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptPure {
             cache: RecentPureOps::new(16),
-            loopinvariant_cache: HashMap::new(),
             postponed_op: None,
             call_pure_positions: Vec::new(),
             short_preamble_pure_ops: Vec::new(),
-            short_preamble_loopinvariant_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
