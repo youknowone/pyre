@@ -6744,7 +6744,11 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 // root_key), skip merge point registration. The trace will
                 // pass through the inner loop body and close at the outer
                 // loop header, compiling both loops in one Cranelift function.
-                let inner_already_compiled = {
+                // TODO: enable once Cranelift backend supports per-guard
+                // fail_args (not just inputargs). Currently, guard failure
+                // in composite traces only saves inputargs, missing inner
+                // loop body variables → SEGFAULT in resume_in_blackhole.
+                let inner_already_compiled = false && {
                     let (driver, _) = crate::driver::driver_pair();
                     let root_key = ctx.root_green_key();
                     back_edge_key != root_key
