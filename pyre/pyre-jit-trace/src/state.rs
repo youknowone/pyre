@@ -6734,6 +6734,29 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
             }
             if !ctx.has_merge_point(back_edge_key) {
+                // pyjitpl.py:2978-2983: if an inner loop is already compiled,
+                // DON'T register it as a merge point. This prevents
+                // cut_trace_from from creating a redundant recompilation of
+                // the inner loop. Instead, the trace continues through the
+                // inner loop body and closes at the outer loop header.
+                // The compiled code will contain both loops in one function,
+                // avoiding cross-function jump limitations.
+                let root_key = ctx.root_green_key();
+                let inner_already_compiled = {
+                    let (driver, _) = crate::driver::driver_pair();
+                    back_edge_key != root_key
+                        && driver.meta_interp().has_compiled_targets(back_edge_key)
+                };
+                if inner_already_compiled {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][reached_loop_header] inner loop already compiled, skip merge point: key={} pc={}",
+                            back_edge_key, target
+                        );
+                    }
+                    MIFrame::set_next_instr(this, ctx, target);
+                    return Ok(None);
+                }
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
                     let s = this.sym();
@@ -6749,12 +6772,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 };
                 // Register under back_edge_key for close detection on next visit.
                 ctx.add_merge_point(back_edge_key, live_args.clone(), live_types.clone(), target);
-                // RPython pyjitpl.py:3036: live_arg_boxes contains the outer
-                // loop's green boxes, so same_greenkey() matches on the root key.
-                // Register under root_green_key too so compile_loop's
-                // get_merge_point_at(green_key, header_pc) finds this merge point
-                // when the trace closes at a cross-loop cut header.
-                let root_key = ctx.root_green_key();
+                // pyjitpl.py:3036: also register under root_green_key
                 if root_key != back_edge_key {
                     ctx.add_merge_point(root_key, live_args, live_types, target);
                 }
