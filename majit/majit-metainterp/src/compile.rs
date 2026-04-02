@@ -22,8 +22,11 @@ use crate::resume::{
 fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
     if *opref == OpRef::NONE {
         Type::Ref
+    } else if opref.is_constant() {
+        // Constants default to Int (numeric literals). Ref constants (GcRef)
+        // must be explicitly registered in value_types or constant_types.
+        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
     } else {
-        // resoperation.py Box.type parity: default to Ref (GCREF).
         value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
     }
 }
