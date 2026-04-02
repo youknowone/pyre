@@ -2194,7 +2194,18 @@ impl OptUnroll {
             "import_state: next_iteration_args mismatch"
         );
 
-        // unroll.py:483-490: source.set_forwarded(target) + setinfo_from_preamble
+        // unroll.py:483-490: source.set_forwarded(target)
+        //
+        // RPython Box identity: import_boxes maps source → target with
+        // per-value forwarding (not the flat table). get_replacement
+        // checks import_boxes first and returns target directly —
+        // target's own forwarding is NOT followed, matching RPython
+        // where v5_box has no _forwarded set.
+        // RPython Box identity: when multiple sources map to the same target,
+        // skip import_box for duplicates so each source has independent PtrInfo.
+        let mut seen_targets: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        // RPython Box identity: shared seen across all imports so that
+        // duplicate virtual field OpRefs are detected and given fresh positions.
         let mut import_seen: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!(
@@ -2204,18 +2215,14 @@ impl OptUnroll {
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            // unroll.py:485: assert source is not target
-            // RPython uses distinct Box objects per phase, so source != target
-            // always holds. In majit, OpRef indices can be shared across phases,
-            // so source == target means "already at the right position" — skip
-            // the forwarding (set_forwarded would create a self-loop).
-            if source != *target {
-                // unroll.py:486: source.set_forwarded(target)
-                ctx.replace_op(source, *target);
+            let is_dup = !seen_targets.insert(*target);
+            if !is_dup {
+                ctx.set_import_box(source, *target);
             }
-            // unroll.py:487-490
             if let Some(info) = exported_state.exported_infos.get(target) {
-                // unroll.py:53-54: op = get_box_replacement(op)
+                // RPython unroll.py:53-54: setinfo_from_preamble does
+                //   op = get_box_replacement(op)
+                // Follow forwarding so info is set on TARGET, not source.
                 let resolved = ctx.get_box_replacement(source);
                 self.setinfo_from_preamble_recursive(
                     resolved,
