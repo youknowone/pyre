@@ -1162,21 +1162,20 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// Record that `old` should be replaced by `new` wherever it appears.
-    /// RPython set_forwarded parity: setting forwarding from old → new.
-    /// RPython Box identity: when a Box is forwarded, its PtrInfo (if any)
-    /// lives on the terminal Box in the chain. In majit, when we overwrite
-    /// forwarded[old] from Info(X) or Op(→Info(X)) to Op(new), we must
-    /// propagate the existing PtrInfo to `new` so get_ptr_info(old) still
-    /// reaches it via the new chain old→new→...→Info.
+    /// resoperation.py:240-242: set_forwarded(forwarded_to) — store the
+    /// forwarding target on this box. Info is set separately by setinfo /
+    /// setinfo_from_preamble.
+    ///
+    /// NOTE: This function now matches RPython's set_forwarded semantics,
+    /// but the full import/export cycle that calls it (import_state,
+    /// cross-slot fresh allocation) still operates on majit's flat OpRef
+    /// model, not RPython's per-Box identity. See XXX comments in
+    /// unroll.rs:import_state and optimizer.rs:imported_loop_state.
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
-        // Before overwriting, check if `old` carried PtrInfo (directly or
-        // through its forwarding chain). If so, propagate to `new`.
-        let old_info = self.get_ptr_info(old).cloned();
         let idx = old.0 as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
@@ -1186,30 +1185,12 @@ impl OptContext {
         } else {
             self.forwarded[idx] = Forwarded::Op(new);
         }
-        // RPython Box identity parity: propagate PtrInfo to the terminal
-        // of the new forwarding chain so get_ptr_info(old) reaches it.
-        if let Some(info) = old_info {
-            let terminal = self.get_box_replacement(new);
-            if self.get_ptr_info(terminal).is_none() {
-                let tidx = terminal.0 as usize;
-                if tidx >= self.forwarded.len() {
-                    self.forwarded.resize(tidx + 1, Forwarded::None);
-                }
-                if matches!(self.forwarded[tidx], Forwarded::None) {
-                    self.forwarded[tidx] = Forwarded::Info(info);
-                }
-            }
-        }
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
     /// Sets forwarding from Phase 2 source to Phase 1 export target.
     /// setinfo_from_preamble_recursive then sets PtrInfo on the TARGET
     /// (via get_replacement).
-    pub fn set_import_box(&mut self, source: OpRef, target: OpRef) {
-        self.replace_op(source, target);
-    }
-
     /// RPython get_box_replacement: follow forwarding chain, stop when the
     /// NEXT position has ptr_info set (it's a terminal, like RPython's
     /// get_box_replacement stopping at _forwarded=Info).

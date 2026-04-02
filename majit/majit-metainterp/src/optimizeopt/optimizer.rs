@@ -599,7 +599,14 @@ impl Optimizer {
         }
 
         // Install PtrInfo for each virtual.
+        // RPython unroll.py:55: if op.get_forwarded() is not None: return
+        // Skip heads that already have PtrInfo (duplicate entries from
+        // aliased JUMP args sharing the same VirtualState position).
+        let mut installed_heads = std::collections::HashSet::new();
         for entry in entries {
+            if !installed_heads.insert(entry.head) {
+                continue; // duplicate — already installed
+            }
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",
@@ -1513,42 +1520,33 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            // RPython uses distinct Box objects for Phase 2 targetargs,
-            // so forwarding from source → target never collides with
-            // another slot's PtrInfo. In pyre's flat OpRef namespace,
-            // collision occurs when target[i] == source[j] for i≠j.
-            // Allocate fresh OpRefs for colliding positions only,
-            // forwarding the original position to the fresh one.
+            // XXX RPython incompatibility (part of OpRef identity gap):
+            // RPython's per-Box identity (opencoder.py:259 allocates fresh
+            // InputArg per iteration) makes import_state trivially safe —
+            // source is never target, and cross-slot collision cannot occur.
+            // majit's flat OpRef model shares indices across phases, so:
+            //   - source == target is possible (handled in unroll.rs)
+            //   - target[i] == source[j] (i!=j) causes forwarding overwrite
+            // This block allocates fresh OpRef for the latter case only.
+            // Neither this block nor the source==target guard in import_state
+            // achieves RPython parity — they are partial corrections for
+            // majit's shared OpRef namespace. Full fix requires Phase 2
+            // trace remapping (opencoder.py TraceIterator equivalent).
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
             let source_set: std::collections::HashSet<OpRef> =
                 (0..n).map(|i| OpRef(i as u32)).collect();
-            // Track which targets have been seen to detect duplicates.
-            // RPython: each JUMP arg is a distinct Box, so duplicates
-            // (same Box in two slots) share identity naturally.
-            // pyre: same OpRef in two slots causes forwarding collision.
-            // Allocate fresh OpRef for duplicates after the first.
-            let mut seen_targets: std::collections::HashMap<OpRef, usize> =
-                std::collections::HashMap::new();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
                     let source = OpRef(i as u32);
                     let target = nia[i];
-                    // Skip constants (>= 10000)
+                    // Constants (>= 10000) don't collide.
                     if target.0 >= 10000 {
                         return source;
                     }
-                    let needs_fresh =
-                        // Case 1: target is another slot's source
-                        (target != source && source_set.contains(&target))
-                        // Case 2: same target used by a previous slot
-                        || seen_targets.contains_key(&target);
-                    seen_targets.insert(target, i);
-                    if needs_fresh {
+                    // Cross-slot: target is another slot's source
+                    if target != source && source_set.contains(&target) {
                         let fresh = ctx.alloc_op_position();
-                        // RPython Box type parity: fresh OpRef inherits the
-                        // source's type. RPython Box objects carry type
-                        // intrinsically; fresh majit OpRefs need explicit copy.
                         if let Some(&tp) = ctx.value_types.get(&source.0) {
                             ctx.value_types.insert(fresh.0, tp);
                         }
@@ -1584,58 +1582,6 @@ impl Optimizer {
 
         if !self.imported_virtuals.is_empty() {
             self.install_imported_virtuals(&mut ctx);
-        }
-
-        // RPython Box identity: for each inputarg that shares a target
-        // with an installed virtual but didn't get its own PtrInfo
-        // (because import_box was skipped for duplicates), clone the
-        // virtual with independent field OpRefs.
-        if let Some(ref exported) = self.imported_loop_state {
-            let nargs = exported.next_iteration_args.len();
-            let mut target_to_first_source: std::collections::HashMap<OpRef, OpRef> =
-                std::collections::HashMap::new();
-            for i in 0..nargs {
-                let source = OpRef(i as u32);
-                let target = exported.next_iteration_args[i];
-                if let Some(&first) = target_to_first_source.get(&target) {
-                    // Duplicate: `source` shares target with `first`.
-                    // `first` got import_box forwarding → get_replacement → target head.
-                    // `source` was skipped → get_replacement = source itself.
-                    let first_head = ctx.get_box_replacement(first);
-                    if crate::optimizeopt::majit_log_enabled() {
-                        let has_info = ctx.get_ptr_info(first_head).is_some();
-                        let is_virt = ctx
-                            .get_ptr_info(first_head)
-                            .map_or(false, |p| p.is_virtual());
-                        eprintln!(
-                            "[jit] dup_clone: source={source:?} first={first:?} first_head={first_head:?} has_info={has_info} is_virt={is_virt}"
-                        );
-                    }
-                    if let Some(info) = ctx.get_ptr_info(first_head).cloned() {
-                        if info.is_virtual() {
-                            // Clone with fresh field OpRefs (no forwarding).
-                            let fresh_info = match info {
-                                crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
-                                    for field in &mut vinfo.fields {
-                                        let old_field = field.1;
-                                        let fresh = ctx.alloc_op_position();
-                                        // RPython Box type parity: copy type
-                                        if let Some(&tp) = ctx.value_types.get(&old_field.0) {
-                                            ctx.value_types.insert(fresh.0, tp);
-                                        }
-                                        field.1 = fresh;
-                                    }
-                                    crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
-                                }
-                                other => other,
-                            };
-                            ctx.set_ptr_info(source, fresh_info);
-                        }
-                    }
-                } else {
-                    target_to_first_source.insert(target, source);
-                }
-            }
         }
 
         // RPython shortpreamble.py: PureOp.produce_op stores PreambleOp

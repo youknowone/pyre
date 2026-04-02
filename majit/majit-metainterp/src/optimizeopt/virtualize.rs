@@ -1609,15 +1609,10 @@ impl Optimization for OptVirtualize {
         match op.opcode {
             // Allocation — create virtual
             // virtualize.py:207-209: optimize_NEW_WITH_VTABLE → make_virtual.
-            // Routed to optimize_new (VirtualStruct) because Phase 1 JUMP
-            // goes through passes and forces all virtuals (optimizer.py:536
-            // parity gap: RPython uses flush=False). With PtrInfo::Virtual,
-            // the forced W_IntObject produces NewWithVtable + SetfieldGc in
-            // the Phase 1 output. With VirtualStruct, it stays virtual
-            // longer (VirtualStruct is not forced by JUMP when ob_type is
-            // the only "escaping" field and the optimizer recognizes it as
-            // a constant). The export path extracts known_class from ob_type
-            // field → correct RdVirtualInfo::Instance encoding.
+            // XXX RPython incompatibility: should be optimize_new_with_vtable
+            // (virtualize.py:207-209), but PtrInfo::Virtual export/import is
+            // not yet fully wired. Using optimize_new (VirtualStruct) as
+            // workaround until export_state handles Virtual correctly.
             OpCode::NewWithVtable => self.optimize_new(op, ctx),
             OpCode::New => self.optimize_new(op, ctx),
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
