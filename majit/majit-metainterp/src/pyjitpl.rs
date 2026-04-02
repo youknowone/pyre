@@ -3682,13 +3682,11 @@ impl<M: Clone> MetaInterp<M> {
     /// Allows the interpreter to check preconditions (e.g., whether the
     /// current state matches the compiled loop's assumptions) before calling
     /// `run_compiled`.
-    /// Follows cross-loop cut aliases.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
     /// Get num_inputs of the compiled loop.
-    /// Follows cross-loop cut aliases.
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
         self.compiled_loops.get(&green_key).map(|e| e.num_inputs)
     }
@@ -4806,8 +4804,6 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Check whether a compiled loop exists for a given green key.
-    /// Check whether a compiled loop exists for a given green key.
-    /// Follows cross-loop cut aliases (inner_key → outer_key).
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.compiled_loops

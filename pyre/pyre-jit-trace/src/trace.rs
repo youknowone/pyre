@@ -66,21 +66,18 @@ pub fn trace_bytecode(
         .pop()
         .and_then(|f| f.owned_concrete_frame);
 
-    // RPython pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
-    // — always uses the OUTER (start) key, never retargets to inner loop.
-    // header_pc records the actual close position for cut_trace_from.
+    // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
+    // original_boxes comes from the merge point where the loop closes,
+    // which may differ from start_pc when cut_trace_from retargets.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
             ..
         } if *target_pc != start_pc => {
-            let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
-            ctx.set_green_key(key);
+            let target_key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
+            ctx.set_green_key(target_key);
             ctx.header_pc = *target_pc;
-            ctx.cut_inner_green_key = Some(crate::driver::make_green_key(
-                code as *const CodeObject,
-                *target_pc,
-            ));
+            ctx.cut_inner_green_key = Some(target_key);
         }
         TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);

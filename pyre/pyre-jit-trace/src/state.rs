@@ -6705,26 +6705,26 @@ impl ControlFlowOpcodeHandler for MIFrame {
 
     fn close_loop_args(&mut self, target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
         self.with_ctx(|this, ctx| {
-            // RPython reached_loop_header (pyjitpl.py:2973-3036):
+            // pyjitpl.py:2950-3036: reached_loop_header
             let code_ptr = unsafe { (*this.sym().jitcode).code };
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951: self.heapcache.reset()
             ctx.reset_heap_cache();
             // pyjitpl.py:2978-2983: get_procedure_token(greenboxes)
+            // RPython uses the CURRENT greenboxes (back_edge_key), not root_key.
             {
-                let root_key = ctx.root_green_key();
                 let (driver, _) = crate::driver::driver_pair();
                 let bridge_origin = driver.bridge_origin();
-                if driver.meta_interp().has_compiled_targets(root_key) {
+                if driver.meta_interp().has_compiled_targets(back_edge_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
-                        .compile_trace(root_key, &jump_args, bridge_origin);
+                        .compile_trace(back_edge_key, &jump_args, bridge_origin);
                     if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
-                                "[jit][reached_loop_header] compile_trace success: root={} pc={} bridge={:?}",
-                                root_key, target, bridge_origin
+                                "[jit][reached_loop_header] compile_trace success: key={} pc={} bridge={:?}",
+                                back_edge_key, target, bridge_origin
                             );
                         }
                         MIFrame::set_next_instr(this, ctx, target);
@@ -6734,40 +6734,9 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     }
                 }
             }
+            // pyjitpl.py:2994-3036: search current_merge_points
             if !ctx.has_merge_point(back_edge_key) {
-                // pyjitpl.py:2978-2983: if an inner loop is already compiled,
-                // DON'T register it as a merge point. This prevents
-                // cut_trace_from from creating a redundant recompilation of
-                // the inner loop. Instead, the trace continues through the
-                // inner loop body and closes at the outer loop header.
-                // The compiled code will contain both loops in one function,
-                // avoiding cross-function jump limitations.
-                let root_key = ctx.root_green_key();
-                // pyjitpl.py:2978-2983 + Cranelift single-function constraint:
-                // When an inner loop is already compiled (back_edge_key !=
-                // root_key), skip merge point registration. The trace will
-                // pass through the inner loop body and close at the outer
-                // loop header, compiling both loops in one Cranelift function.
-                // TODO: enable once Cranelift backend supports per-guard
-                // fail_args (not just inputargs). Currently, guard failure
-                // in composite traces only saves inputargs, missing inner
-                // loop body variables → SEGFAULT in resume_in_blackhole.
-                let inner_already_compiled = false && {
-                    let (driver, _) = crate::driver::driver_pair();
-                    let root_key = ctx.root_green_key();
-                    back_edge_key != root_key
-                        && driver.meta_interp().has_compiled_targets(back_edge_key)
-                };
-                if inner_already_compiled {
-                    if majit_metainterp::majit_log_enabled() {
-                        eprintln!(
-                            "[jit][reached_loop_header] inner loop compiled, skip merge: key={} pc={}",
-                            back_edge_key, target
-                        );
-                    }
-                    MIFrame::set_next_instr(this, ctx, target);
-                    return Ok(None);
-                }
+                // pyjitpl.py:3034-3036: no loop found → register and continue
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
                     let s = this.sym();
@@ -6781,12 +6750,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                     );
                     types
                 };
-                // Register under back_edge_key for close detection on next visit.
-                ctx.add_merge_point(back_edge_key, live_args.clone(), live_types.clone(), target);
-                // pyjitpl.py:3036: also register under root_green_key
-                if root_key != back_edge_key {
-                    ctx.add_merge_point(root_key, live_args, live_types, target);
-                }
+                ctx.add_merge_point(back_edge_key, live_args, live_types, target);
                 MIFrame::set_next_instr(this, ctx, target);
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -6796,6 +6760,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 }
                 return Ok(None);
             }
+            // pyjitpl.py:3002-3030: Found! Compile it as a loop.
             MIFrame::set_next_instr(this, ctx, target);
             let oprefs = MIFrame::close_loop_args(this, ctx);
             Ok(Some(

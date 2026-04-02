@@ -1326,11 +1326,12 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // resume.py:1312: blackhole_from_resumedata never
-                            // fails in upstream — it's a contract. This path
-                            // means a pyre resume data bug. Invalidate to
-                            // prevent re-entering the broken guard. Remove
-                            // once blackhole resume is fully sound.
+                            // RPython: resume_in_blackhole never fails — it
+                            // always runs _run_forever until ContinueRunningNormally
+                            // or DoneWithThisFrame. This Failed path indicates
+                            // incomplete rd_numb (empty frame from guards whose
+                            // snapshot had no live boxes at capture time).
+                            // Invalidate to prevent re-entering with stale state.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — \
