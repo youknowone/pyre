@@ -819,15 +819,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let mut frame =
         PyFrame::new_for_call_with_closure(func_code, &final_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
-    match eval_frame_plain(&mut frame) {
-        Ok(v) => v,
-        Err(e) => {
-            if std::env::var("PYRE_DEBUG_CALL").is_ok() {
-                eprintln!("[call_user_function_with_args] error: {e}");
-            }
-            PY_NULL
-        }
-    }
+    eval_frame_plain(&mut frame).unwrap_or(PY_NULL)
 }
 
 /// Call a metaclass with extra keyword arguments.

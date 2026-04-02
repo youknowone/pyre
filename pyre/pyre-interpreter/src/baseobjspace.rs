@@ -2220,6 +2220,59 @@ unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObje
     None
 }
 
+/// Determine what `self` value to bind for a super-resolved attribute.
+///
+/// Walks the MRO of `self_obj` starting after `super_type`, finds the
+/// raw descriptor for `name`, and returns:
+///   - PY_NULL       if it is a staticmethod (no binding)
+///   - the class obj if it is a classmethod  (bind class)
+///   - `self_obj`    otherwise                (bind instance)
+pub unsafe fn super_lookup_binding(
+    super_type: PyObjectRef,
+    self_obj: PyObjectRef,
+    name: &str,
+) -> PyObjectRef {
+    use pyre_object::*;
+    let w_obj_type = if is_instance(self_obj) {
+        w_instance_get_type(self_obj)
+    } else if is_type(self_obj) {
+        self_obj
+    } else {
+        return self_obj;
+    };
+    let mro_ptr = w_type_get_mro(w_obj_type);
+    if !mro_ptr.is_null() {
+        let mro = &*mro_ptr;
+        let mut past_super = false;
+        for &t in mro {
+            if std::ptr::eq(t, super_type) {
+                past_super = true;
+                continue;
+            }
+            if !past_super {
+                continue;
+            }
+            if is_type(t) {
+                if let Some(raw) = lookup_in_type_where(t, name) {
+                    if is_staticmethod(raw) {
+                        return PY_NULL;
+                    }
+                    if is_classmethod(raw) {
+                        return w_obj_type;
+                    }
+                    // `__new__` is implicitly static (type.__new__ is a
+                    // builtin_function_or_method, not a Python function)
+                    if name == "__new__" {
+                        return PY_NULL;
+                    }
+                    return self_obj;
+                }
+            }
+        }
+    }
+    self_obj
+}
+
 /// C3 linearization — PyPy: typeobject.py `compute_default_mro`.
 ///
 /// Computes the Method Resolution Order for a type following the C3
