@@ -2567,21 +2567,10 @@ impl Optimizer {
             }
         }
 
-        // RPython optimizer.py:623-625: _emit_operation calls force_box on
-        // every arg before emission, not just virtual ones. This is also what
-        // promotes imported short-preamble producers into the loop-header
-        // contract when a later guard/JUMP still references them.
-        if !matches!(
-            op.opcode,
-            OpCode::SetfieldGc
-                | OpCode::SetfieldRaw
-                | OpCode::SetarrayitemGc
-                | OpCode::SetarrayitemRaw
-        ) {
-            for i in 0..op.num_args() {
-                let arg = ctx.get_box_replacement(op.arg(i));
-                op.args[i] = self.force_box(arg, ctx);
-            }
+        // optimizer.py:623-625: force_box on every arg unconditionally.
+        for i in 0..op.num_args() {
+            let arg = ctx.get_box_replacement(op.arg(i));
+            op.args[i] = self.force_box(arg, ctx);
         }
         if op.opcode.is_guard() {
             // optimizer.py:652-686 emit_guard_operation
