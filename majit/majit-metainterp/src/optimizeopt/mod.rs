@@ -1981,13 +1981,21 @@ impl OptContext {
                     return majit_ir::Type::Ref;
                 }
                 let resolved = self.get_box_replacement(*opref);
+                // constant_types_for_numbering has the authoritative type
+                // for constants stored as Value::Int but actually Ref
+                // (GcRef pointers stored as i64 for Cranelift compatibility).
+                // Check this BEFORE get_constant to avoid Int/Ref confusion.
+                if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
+                    return tp;
+                }
+                if resolved != *opref {
+                    if let Some(&tp) = self.constant_types_for_numbering.get(&opref.0) {
+                        return tp;
+                    }
+                }
                 // Constants carry explicit types.
                 if let Some(val) = self.get_constant(resolved) {
                     return val.get_type();
-                }
-                // constant_types_for_numbering (ob_type overrides etc.)
-                if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
-                    return tp;
                 }
                 // value_types: seeded from inputargs, trace ops, previous phase.
                 // RPython equivalent: box.type on the Box object.
@@ -2003,6 +2011,18 @@ impl OptContext {
                 // Operation result type (covers new_operations).
                 if let Some(tp) = self.get_op_result_type(resolved) {
                     return tp;
+                }
+                // RPython Box.type parity: snapshot_box_types captures the
+                // type of each Box at snapshot capture time. This is the
+                // definitive type for boxes that don't appear in value_types
+                // (e.g., inner loop body variables in a cross-loop trace).
+                if let Some(&tp) = self.snapshot_box_types.get(&resolved.0) {
+                    return tp;
+                }
+                if resolved != *opref {
+                    if let Some(&tp) = self.snapshot_box_types.get(&opref.0) {
+                        return tp;
+                    }
                 }
                 // PtrInfo indicates Ref.
                 if self.get_ptr_info(resolved).is_some() {
