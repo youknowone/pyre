@@ -2745,12 +2745,17 @@ impl Optimizer {
             if opcode == OpCode::GuardException {
                 self.last_guard_op = None;
             }
-        } else if !op.opcode.has_no_side_effect()
-            && !op.opcode.is_ovf()
-            && !op.opcode.is_jit_debug()
-        {
-            // Side-effecting ops reset last_guard_op
-            self.last_guard_op = None;
+        } else {
+            // optimizer.py:639-644: preserve last_guard_op for guard chaining
+            // unless the op has side effects or is a call_pure that can raise.
+            let preserves_chain = (op.opcode.has_no_side_effect()
+                || op.opcode.is_guard()
+                || op.opcode.is_jit_debug()
+                || op.opcode.is_ovf())
+                && !Self::is_call_pure_pure_canraise(&op);
+            if !preserves_chain {
+                self.last_guard_op = None;
+            }
         }
         let emitted = ctx.emit(op.clone());
         if std::env::var_os("MAJIT_LOG").is_some()
