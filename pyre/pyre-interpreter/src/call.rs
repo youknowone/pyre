@@ -1193,10 +1193,11 @@ fn build_class_inner(
         for (attr_name, value) in entries {
             if !value.is_null() {
                 if let Ok(set_name) = crate::baseobjspace::getattr(value, "__set_name__") {
-                    // Call: descriptor.__set_name__(self, owner, name)
+                    // getattr returns a bound method, so self is already bound.
+                    // Call: bound_set_name(owner, name)
                     let _ = crate::call_function(
                         set_name,
-                        &[value, w_type, pyre_object::w_str_new(&attr_name)],
+                        &[w_type, pyre_object::w_str_new(&attr_name)],
                     );
                 }
             }

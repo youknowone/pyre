@@ -578,6 +578,25 @@ impl ConstantOpcodeHandler for PyFrame {
 impl OpcodeStepExecutor for PyFrame {
     type Error = PyError;
 
+    // ── PopJumpIfNone / PopJumpIfNotNone ──
+    // CPython 3.13: replaces IS_OP + POP_JUMP_IF_TRUE/FALSE for None checks
+
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let val = self.pop();
+        if unsafe { pyre_object::is_none(val) } || val.is_null() {
+            self.next_instr = target;
+        }
+        Ok(())
+    }
+
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let val = self.pop();
+        if !val.is_null() && !unsafe { pyre_object::is_none(val) } {
+            self.next_instr = target;
+        }
+        Ok(())
+    }
+
     // ── Closures / cells ──
 
     /// PyPy: pyopcode.py LOAD_DEREF
@@ -807,24 +826,6 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         let truth = crate::baseobjspace::is_true(val);
         self.push(pyre_object::w_bool_from(truth));
-        Ok(())
-    }
-
-    // ── PopJumpIfNone / PopJumpIfNotNone ──
-
-    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
-        let val = self.pop();
-        if unsafe { pyre_object::is_none(val) } {
-            self.next_instr = target;
-        }
-        Ok(())
-    }
-
-    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
-        let val = self.pop();
-        if !unsafe { pyre_object::is_none(val) } {
-            self.next_instr = target;
-        }
         Ok(())
     }
 
