@@ -2574,6 +2574,8 @@ impl Optimizer {
         }
         if op.opcode.is_guard() {
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
+            // If this guard should replace a previously emitted guard, do it
+            // now and return — skip all guard processing.
             if self.can_replace_guards {
                 if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
                     let target_pos = replacement.pos.0 as usize;
@@ -2800,21 +2802,13 @@ impl Optimizer {
             return op;
         };
 
-        // RPython optimizer.py:722-752 parity: store_final_boxes_in_guard
-        // calls ResumeDataVirtualAdder.finish() which handles virtual encoding
-        // via snapshot-based numbering. When a snapshot exists (rd_resume_position >= 0
-        // AND snapshot_boxes has the key), the snapshot path in
-        // finalize_guard_resume_data handles everything: _number_boxes resolves
-        // virtuals to TAGVIRTUAL, builds rd_virtuals, and
-        // store_final_boxes(liveboxes) replaces fail_args with concrete liveboxes.
+        // optimizer.py:722-752: store_final_boxes_in_guard always delegates
+        // to ResumeDataVirtualAdder.finish() which uses snapshot-based numbering.
         let has_snapshot =
             op.rd_resume_position >= 0 && ctx.snapshot_boxes.contains_key(&op.rd_resume_position);
         if has_snapshot {
             // optimizer.py:732-748 + resume.py:389-452:
-            // RPython finish() handles virtuals without forcing.
-            // _number_boxes tags virtual fail_args as TAGVIRTUAL,
-            // _number_virtuals builds rd_virtuals from PtrInfo.
-            // No pre-forcing or extra_fail_args needed.
+            // finish() handles virtuals without forcing via TAGVIRTUAL.
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
                     fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
