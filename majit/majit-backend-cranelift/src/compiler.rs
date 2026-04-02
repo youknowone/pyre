@@ -5076,7 +5076,27 @@ impl CraneliftBackend {
                 );
             }
 
-            let fail_descr = &compiled.fail_descrs[fail_index as usize];
+            // Bridge guard failures may return fail_index values from
+            // the bridge's fail_descrs namespace, not the parent loop's.
+            // When fail_index is out of range, search attached bridges.
+            let fail_descr = if (fail_index as usize) < compiled.fail_descrs.len() {
+                compiled.fail_descrs[fail_index as usize].clone()
+            } else {
+                let found = compiled.fail_descrs.iter().find_map(|d| {
+                    let guard = d.bridge_ref();
+                    guard.as_ref().and_then(|b| {
+                        find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
+                    })
+                });
+                found.unwrap_or_else(|| {
+                    compiled
+                        .fail_descrs
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| compiled.fail_descrs[0].clone())
+                })
+            };
+            let fail_descr = &fail_descr;
             // Finish exits return directly — no bridge dispatch.
             if fail_descr.is_finish {
                 let saved_data = if let Some(ref ff) = force_frame {
