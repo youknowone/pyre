@@ -1892,11 +1892,24 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         // history.py: carry retraced_count across recompilations
-        unroll_opt.retraced_count = self
+        let prior_retraced_count = self
             .compiled_loops
             .get(&green_key)
             .map(|compiled| compiled.retraced_count)
             .unwrap_or(0);
+        // RPython parity: if retracing was already disabled for this key
+        // (too many guards from a previous compilation), skip recompilation.
+        // The existing compiled code handles this loop. Recompiling with
+        // different context (e.g., cut_trace_from) would produce equally
+        // heavy traces that hang in jump_to_existing_trace.
+        if prior_retraced_count == u32::MAX && !prior_front_target_tokens.is_empty() {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] skipping recompile: retraced_count=MAX for key={green_key}");
+            }
+            self.warm_state.abort_tracing(green_key, true);
+            return CompileOutcome::Cancelled;
+        }
+        unroll_opt.retraced_count = prior_retraced_count;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
