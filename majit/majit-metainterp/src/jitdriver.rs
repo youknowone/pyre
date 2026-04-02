@@ -1297,6 +1297,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
+                    Some(&exit_layout.exit_types),
                     rd_virtuals_slice,
                     None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
@@ -2550,30 +2551,22 @@ impl<S: JitState> JitDriver<S> {
             if !bfm.constants.is_empty() {
                 self.meta.inject_bridge_constants(&bfm.constants);
             }
-            // resume.py:1047: virtualizable_boxes consumed by
-            // pyjitpl.py:3420 self.virtualizable_boxes = virtualizable_boxes.
-            // Store in resume_data_result for the trace state to pick up.
-            // resume.py:1054-1055: consume_boxes fills register types.
-            // Update trace_meta slot_types from the innermost frame's
-            // decoded values if available.
-            if let Some(innermost) = bfm.frames.first() {
-                let new_types: Vec<Type> = innermost
-                    .values
-                    .iter()
-                    .map(|rv| match rv {
-                        majit_ir::resumedata::RebuiltValue::Box(_) => Type::Ref,
-                        majit_ir::resumedata::RebuiltValue::Int(_) => Type::Int,
-                        majit_ir::resumedata::RebuiltValue::Const(_, tp) => *tp,
-                        majit_ir::resumedata::RebuiltValue::Virtual(_) => Type::Ref,
-                        _ => Type::Ref,
-                    })
-                    .collect();
-                if !new_types.is_empty() {
-                    if let Some(ref mut tm) = self.trace_meta {
-                        S::update_meta_for_bridge(tm, &new_types);
-                    }
-                }
-            }
+            // resume.py:1047-1055 parity:
+            //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
+            //   and bridge tracing continues from that restored interpreter
+            //   frame.  The authoritative slot metadata is therefore the
+            //   state rebuilt by `state.build_meta(resume_pc, env)`, not the
+            //   raw `RebuiltFrame.values` section.
+            //
+            // `RebuiltFrame.values` contains only the frame's register slots;
+            // it does NOT have the synthetic [frame, ni, vsd] header used by
+            // pyre's fallback `update_meta_for_bridge()` path.  Reinterpreting
+            // those slot values as header-prefixed fail_arg types shifts the
+            // frame layout and can mis-bind bridge return values.
+            //
+            // Keep `trace_meta` as built from the restored state when rd_numb
+            // is available; only the no-rd_numb fallback should call
+            // `update_meta_for_bridge()`.
         }
         self.resume_data_result = resume_data_result;
         let code_ptr = state.code_ptr();
@@ -2804,6 +2797,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     &rd_consts_i64,
                     &raw_values,
+                    Some(exit_layout.exit_types.as_slice()),
                     rd_virtuals_slice,
                     None, // rd_pendingfields (PendingFieldInfo)
                     exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields

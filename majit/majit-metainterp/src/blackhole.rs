@@ -2346,6 +2346,7 @@ pub fn resume_in_blackhole(
         rd_numb,
         rd_consts,
         deadframe,
+        None, // deadframe_types
         None, // rd_virtuals
         None, // rd_pendingfields (PendingFieldInfo)
         None, // rd_guard_pendingfields

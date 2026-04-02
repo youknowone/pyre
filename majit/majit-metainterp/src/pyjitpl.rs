@@ -5741,6 +5741,7 @@ impl<M: Clone> MetaInterp<M> {
             rd_numb,
             &rd_consts,
             fail_values,
+            None, // deadframe_types
             None, // vrefinfo — pyre has no vref mechanism
             vinfo.map(|v| v as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
