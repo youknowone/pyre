@@ -67,8 +67,9 @@ pub fn trace_bytecode(
         .and_then(|f| f.owned_concrete_frame);
 
     // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
-    // original_boxes comes from the merge point where the loop closes,
-    // which may differ from start_pc when cut_trace_from retargets.
+    // original_boxes comes from the merge point where the loop closes
+    // (pyjitpl.py:2995), which may differ from start_pc when
+    // cut_trace_from retargets to an inner loop.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
