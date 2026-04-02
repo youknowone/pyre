@@ -1393,7 +1393,11 @@ fn bound_reached(
     }
     // warmstate.py:482-511 + warmstate.py:437-444 combined:
     // compiled code → run, else → start tracing.
-    let outcome = if driver.has_compiled_loop(green_key) {
+    let has_compatible_loop = driver.has_compiled_loop(green_key)
+        && driver
+            .get_compiled_meta(green_key)
+            .map_or(false, |meta| meta.merge_pc == loop_header_pc);
+    let outcome = if has_compatible_loop {
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
@@ -1408,7 +1412,11 @@ fn bound_reached(
         driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
         // force_start_tracing may return RunCompiled (retargeted trace
         // already compiled for this cell). In that case, enter compiled.
-        if !driver.is_tracing() && driver.has_compiled_loop(green_key) {
+        let post_compatible = driver.has_compiled_loop(green_key)
+            && driver
+                .get_compiled_meta(green_key)
+                .map_or(false, |meta| meta.merge_pc == loop_header_pc);
+        if !driver.is_tracing() && post_compatible {
             Some(driver.run_compiled_detailed_with_bridge_keyed(
                 green_key,
                 loop_header_pc,
@@ -1559,6 +1567,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
+        // Gate on merge_pc match: cross-loop-cut traces are stored under
+        // the trace-start PC but have a different loop-closure PC.
+        let compatible = driver
+            .get_compiled_meta(green_key)
+            .map_or(false, |meta| meta.merge_pc == frame.next_instr);
+        if !compatible {
+            return None;
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
