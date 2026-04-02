@@ -1463,7 +1463,8 @@ fn concrete_value_type(value: PyObjectRef) -> Type {
 
 /// pyre slots are always GCREF (Ref) at the concrete frame level.
 /// Even W_IntObject values are stored as Ref pointers — the trace
-/// unboxes via GetfieldGcPureI.
+/// unboxes via GetfieldGcPureI. adapt_live_values_to_trace_types
+/// converts Ref→Int at compiled entry to match trace-internal types.
 fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
@@ -2690,12 +2691,17 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // All slots are Ref — no concrete type inference.
+            // Derive slot types from concrete Box values (no concrete_frame read).
             if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
+                s.symbolic_local_types = s.concrete_locals.iter().map(|cv| cv.ir_type()).collect();
             }
             if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types = vec![Type::Ref; stack_only];
+                s.symbolic_stack_types = s
+                    .concrete_stack
+                    .iter()
+                    .take(stack_only)
+                    .map(|cv| cv.ir_type())
+                    .collect();
             }
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
@@ -3080,27 +3086,15 @@ impl MIFrame {
             ctx,
         ));
         boxes.push(Self::opref_to_snapshot_tagged(sym.vable_namespace, ctx));
-        // Array items: locals + stack (virtualizable.py:94-98 read_boxes).
-        // RPython: len(lst) = runtime array length, always consistent
-        // with get_total_size(). Use vable_array_len for the same effect.
+        // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
         } else {
             None
         };
-        let vinfo = crate::frame_layout::build_pyframe_virtualizable_info();
-        let full_array_len = if !sym.concrete_vable_ptr.is_null() && !vinfo.array_fields.is_empty()
-        {
-            // virtualizable.py:94: len(lst) — runtime array length.
-            unsafe {
-                majit_metainterp::virtualizable::vable_array_len(
-                    sym.concrete_vable_ptr as *const u8,
-                    &vinfo.array_fields[0],
-                )
-            }
-        } else {
-            sym.symbolic_locals.len() + stack_only
-        };
+        let full_array_len = concrete_frame
+            .map(|f| f.locals_cells_stack_w.len())
+            .unwrap_or(sym.symbolic_locals.len() + stack_only);
         for i in 0..full_array_len {
             let opref = if i < sym.symbolic_locals.len() {
                 sym.symbolic_locals[i]
@@ -4097,7 +4091,6 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-                    this.remember_value_type(truth, Type::Int);
                     // RPython goto_if_not fusion: cache truth for
                     // the next POP_JUMP_IF to consume directly.
                     this.sym_mut().last_comparison_truth = Some(truth);
@@ -4147,7 +4140,6 @@ impl MIFrame {
                         )
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-                    this.remember_value_type(truth, Type::Int);
                     this.sym_mut().last_comparison_truth = Some(truth);
                     this.sym_mut().last_comparison_concrete_truth =
                         Some(objspace_compare_floats(lhs_obj, rhs_obj, op));
@@ -7726,22 +7718,25 @@ impl JitState for PyreJitState {
             Value::Int(meta.merge_pc as i64),
             Value::Int(self.valuestackdepth as i64),
         ];
-        // All locals/stack are Ref — RPython parity: MIFrame has typed
-        // registers, pyre always passes PyObjectRef (boxed).
         for i in 0..nlocals {
             let value = self.local_at(i).unwrap_or(PY_NULL);
-            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
+            let slot_type = meta.slot_types.get(i).copied().unwrap_or(Type::Ref);
+            vals.push(extract_concrete_typed_value(slot_type, value));
         }
         for i in 0..stack_only {
             let value = self.stack_at(i).unwrap_or(PY_NULL);
-            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
+            let slot_type = meta
+                .slot_types
+                .get(nlocals + i)
+                .copied()
+                .unwrap_or(Type::Ref);
+            vals.push(extract_concrete_typed_value(slot_type, value));
         }
         vals
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        // All slots are Ref — no Int unboxing at trace entry.
-        virtualizable_fail_arg_types(std::iter::repeat(Type::Ref).take(meta.slot_types.len()))
+        virtualizable_fail_arg_types(meta.slot_types.iter().copied())
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
@@ -7752,9 +7747,10 @@ impl JitState for PyreJitState {
         sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
-        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
+        sym.symbolic_local_types =
+            _meta.slot_types[.._meta.num_locals.min(_meta.slot_types.len())].to_vec();
         sym.symbolic_stack_types =
-            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
+            _meta.slot_types[_meta.num_locals.min(_meta.slot_types.len())..].to_vec();
         // Pre-size symbolic_stack with OpRef::NONE for lazy loading from
         // the concrete frame (RPython rebuild_state_after_failure parity:
         // bridge traces start mid-execution with values on the stack).
@@ -7776,12 +7772,15 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
+        // RPython resume.py:1042: bridge tracing always has rd_numb and
+        // rebuilds the full frame state. This fallback runs when rd_numb
+        // is absent (pyre-specific). Update valuestackdepth and slot_types
+        // from the guard's fail_arg_types to avoid stale metadata.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         if fail_arg_types.len() >= 3 {
             let new_vsd = fail_arg_types.len() - 3;
             meta.valuestackdepth = new_vsd;
-            // All slots Ref — no Int unboxing.
-            meta.slot_types = vec![Type::Ref; new_vsd];
+            meta.slot_types = fail_arg_types[3..].to_vec();
         }
     }
 
@@ -7884,7 +7883,7 @@ impl JitState for PyreJitState {
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         let slot_types = if original_box_types.len() >= 3 {
-            vec![Type::Ref; original_box_types.len() - 3]
+            original_box_types[3..].to_vec()
         } else {
             Vec::new()
         };
@@ -8056,11 +8055,6 @@ impl JitState for PyreJitState {
         //
         // values[3..] = compact active_boxes from get_list_of_active_boxes,
         // which filters by liveness. Use the same liveness table to restore.
-        // resume.py:1383: info = blackholeinterp.get_current_position_info()
-        // Use next_instr (already set from values[1]) as the liveness PC.
-        // RPython parity: use JitCode.liveness (same source as
-        // get_list_of_active_boxes and consume_one_section).
-        let live_pc = self.next_instr;
         let code_ptr = if self.frame != 0 {
             unsafe {
                 *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_CODE_OFFSET)
@@ -8069,68 +8063,35 @@ impl JitState for PyreJitState {
         } else {
             std::ptr::null()
         };
-        // Look up JitCode LivenessInfo via majit_jitcode pointer.
-        let majit_jc = if !code_ptr.is_null() {
-            let state_jc = jitcode_for(code_ptr);
-            unsafe { (*state_jc).majit_jitcode }
-        } else {
-            std::ptr::null()
-        };
-        let liveness_info = if !majit_jc.is_null() {
-            let jc = unsafe { &*majit_jc };
-            jc.py_to_jit_pc
-                .get(live_pc)
-                .and_then(|&jit_pc| jc.liveness.iter().find(|info| info.pc as usize == jit_pc))
+        let live = if !code_ptr.is_null() {
+            Some(liveness_for(code_ptr))
         } else {
             None
         };
+        // resume.py:1383: info = blackholeinterp.get_current_position_info()
+        // Use next_instr (already set from values[1]) as the liveness PC.
+        let live_pc = self.next_instr;
         let mut idx = 3;
-        if let Some(info) = liveness_info {
-            // RPython parity: iterate live_r_regs (same order as capture).
-            let stack_base = info
-                .live_r_regs
-                .iter()
-                .find(|&&r| r as usize >= nlocals)
-                .map(|&r| r as usize)
-                .unwrap_or(nlocals);
-            for &reg_idx in &info.live_r_regs {
-                let r = reg_idx as usize;
+        for local_idx in 0..nlocals {
+            // resume.py:1077: only live registers consume a value from the
+            // compact array. Dead registers keep their previous contents.
+            let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
+            if is_live {
                 if let Some(value) = values.get(idx) {
                     let boxed = virtualizable_box_value(value);
-                    if r < nlocals {
-                        let _ = self.set_local_at(r, boxed);
-                    } else {
-                        let _ = self.set_stack_at(r - stack_base, boxed);
-                    }
+                    let _ = self.set_local_at(local_idx, boxed);
                 }
                 idx += 1;
             }
-        } else {
-            // Fallback: LiveVars path
-            let live = if !code_ptr.is_null() {
-                Some(liveness_for(code_ptr))
-            } else {
-                None
-            };
-            for local_idx in 0..nlocals {
-                let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
-                if is_live {
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        let _ = self.set_local_at(local_idx, boxed);
-                    }
-                    idx += 1;
+        }
+        for stack_idx in 0..stack_only {
+            let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
+            if is_live {
+                if let Some(value) = values.get(idx) {
+                    let boxed = virtualizable_box_value(value);
+                    let _ = self.set_stack_at(stack_idx, boxed);
                 }
-            }
-            for stack_idx in 0..stack_only {
-                let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
-                if is_live {
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        let _ = self.set_stack_at(stack_idx, boxed);
-                    }
-                    idx += 1;
-                }
+                idx += 1;
             }
         }
 
