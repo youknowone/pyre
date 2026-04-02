@@ -196,6 +196,20 @@ impl TreeLoop {
         original_boxes: &[OpRef],
         original_box_types: &[majit_ir::Type],
     ) -> TreeLoop {
+        self.cut_trace_from_with_consts(start, original_boxes, original_box_types, &[])
+    }
+
+    /// Like `cut_trace_from`, but with pre-allocated constant OpRefs for each
+    /// original inputarg.  Escaped original inputargs are remapped to these
+    /// pool-managed constants (already GC-rooted), preventing both stale
+    /// pointers and entry-contract mismatches at compiled-code entry.
+    pub fn cut_trace_from_with_consts(
+        &self,
+        start: crate::recorder::TracePosition,
+        original_boxes: &[OpRef],
+        original_box_types: &[majit_ir::Type],
+        inputarg_consts: &[OpRef],
+    ) -> TreeLoop {
         use std::collections::{HashMap, HashSet, VecDeque};
 
         let num_original_inputargs = self.inputargs.len() as u32;
@@ -273,13 +287,22 @@ impl TreeLoop {
         orig_inputarg_escaped.sort_by_key(|r| r.0);
         op_escaped.sort_by_key(|r| r.0); // preserve original order
 
-        // Phase 4: Build new inputargs = original_boxes + escaped inputargs.
+        // Phase 4: Build new inputargs.
+        // If concrete initial values are available, escaped original inputargs
+        // become typed constants (avoiding entry-contract mismatch at runtime).
+        // Otherwise, they become additional inputargs (original behavior).
         let mut new_ia_boxes = original_boxes.to_vec();
         let mut new_ia_types = original_box_types.to_vec();
         for &r in &orig_inputarg_escaped {
-            remap.insert(r, OpRef(new_ia_boxes.len() as u32));
-            new_ia_boxes.push(r);
-            new_ia_types.push(self.inputargs[r.0 as usize].tp);
+            if let Some(&const_opref) = inputarg_consts.get(r.0 as usize) {
+                // Remap to the pre-allocated pool constant (already GC-rooted).
+                remap.insert(r, const_opref);
+            } else {
+                // No pool constant available: fall back to new inputarg.
+                remap.insert(r, OpRef(new_ia_boxes.len() as u32));
+                new_ia_boxes.push(r);
+                new_ia_types.push(self.inputargs[r.0 as usize].tp);
+            }
         }
         let new_inputargs_count = new_ia_boxes.len() as u32;
 
