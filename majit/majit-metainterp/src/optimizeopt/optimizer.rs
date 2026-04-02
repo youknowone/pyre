@@ -2573,6 +2573,27 @@ impl Optimizer {
             op.args[i] = self.force_box(arg, ctx);
         }
         if op.opcode.is_guard() {
+            // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
+            if self.can_replace_guards {
+                if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
+                    let target_pos = replacement.pos.0 as usize;
+                    if target_pos < ctx.new_operations.len() {
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
+                                op.opcode,
+                                op.pos,
+                                target_pos,
+                                ctx.new_operations.len()
+                            );
+                        }
+                        ctx.new_operations[target_pos] = op.clone();
+                        ctx.in_final_emission = false;
+                        return;
+                    }
+                }
+            }
+
             // optimizer.py:652-686 emit_guard_operation
             let opcode = op.opcode;
 
@@ -2716,27 +2737,6 @@ impl Optimizer {
                 );
             }
 
-            // optimizer.py: if orig_op in replaces_guard → replace_guard_op
-            if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
-                    let target_pos = replacement.pos.0 as usize;
-                    if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!(
-                            "[opt] guard replacement op={:?} pos={:?} replacement_pos={:?} target_index={} len={}",
-                            op.opcode,
-                            op.pos,
-                            replacement.pos,
-                            target_pos,
-                            ctx.new_operations.len()
-                        );
-                    }
-                    if target_pos < ctx.new_operations.len() {
-                        ctx.new_operations[target_pos] = op.clone();
-                        ctx.in_final_emission = false;
-                        return;
-                    }
-                }
-            }
             // optimizer.py:679: update last_guard_op only for fresh guards
             // (not shared). optimizer.py:684-685: GUARD_EXCEPTION breaks chain.
             if !shared {
