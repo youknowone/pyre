@@ -230,6 +230,7 @@ impl LiveVars {
                     }
                 }
                 // GEN/KILL for locals.
+                // GEN (use) and KILL (def) for locals.
                 match instr {
                     Instruction::LoadFast { var_num }
                     | Instruction::LoadFastBorrow { var_num }
@@ -2118,7 +2119,7 @@ impl MIFrame {
         } else {
             None
         };
-        if let Some(info) = liveness_info {
+        if let Some(info) = liveness_info.filter(|i| !i.live_r_regs.is_empty()) {
             // pyjitpl.py:216-233: iterate live registers via LivenessIterator.
             // RPython dispatches _callback_i/_callback_r/_callback_f to
             // typed register banks. pyre: all Python locals are PyObjectRef
@@ -2141,14 +2142,12 @@ impl MIFrame {
                 };
                 boxes.push(val);
             }
-            // live_i_regs and live_f_regs are empty — no int/float
-            // register bank in pyre's codewriter. When typed registers
-            // are added, this must dispatch to the correct bank.
-            debug_assert!(info.live_i_regs.is_empty());
-            debug_assert!(info.live_f_regs.is_empty());
             boxes
         } else {
-            // Fallback: no majit JitCode (proc-macro path).
+            // pyjitpl.py:177-234 parity: RPython's get_list_of_active_boxes
+            // NEVER returns empty for a guard inside a loop — the codewriter
+            // guarantees liveness at every guard position. When majit JitCode
+            // liveness is empty or unavailable, fall back to LiveVars.
             let code_ptr = unsafe { (*self.sym().jitcode).code };
             let live = if !code_ptr.is_null() {
                 Some(liveness_for(code_ptr))

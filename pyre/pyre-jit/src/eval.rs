@@ -1040,6 +1040,11 @@ fn jit_merge_point_hook(
         |ctx, sym| {
             let (driver, _) = driver_pair();
             driver.meta_interp_mut().tracing_call_depth = Some(current_depth);
+            // RPython parity: codewriter.make_jitcodes() runs before tracing
+            // starts, populating all_liveness. In pyre, JitCode compilation is
+            // lazy — ensure the code's JitCode (with liveness) exists before
+            // tracing so get_list_of_active_boxes can use it.
+            crate::jit::codewriter::ensure_jitcode_for(code);
             let snapshot = Box::new(frame.snapshot_for_tracing());
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
@@ -1443,6 +1448,7 @@ fn bound_reached(
                 || {},
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
+                    crate::jit::codewriter::ensure_jitcode_for(code);
                     let (action, _) =
                         trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);
                     action
