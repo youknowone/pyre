@@ -113,8 +113,30 @@ impl OptIntBounds {
         let _ = b.intersect(bound);
     }
 
-    /// Make an op a known constant integer.
+    /// optimizer.py:434: make_constant_int(box, intvalue)
+    /// Validates that the constant value is within the existing IntBound
+    /// range before making the box constant. Raises InvalidLoop if not.
     fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
+        // optimizer.py:415-426: safety check — if the box already has an
+        // IntBound, verify the constant is within that range.
+        let replaced = ctx.get_box_replacement(op.pos);
+        let existing = self.getintbound(replaced, ctx);
+        if !existing.is_unbounded() {
+            if !existing.contains(value) {
+                std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                    "constant int is outside the range allowed for that box",
+                ));
+            }
+            // intutils.py:412-423: make_eq_const — narrow the shared bound
+            // to the constant value. Important when the bound is shared
+            // (e.g., with an array length).
+            let idx = replaced.0 as usize;
+            if idx < self.bounds.len() {
+                if let Some(ref mut b) = self.bounds[idx] {
+                    let _ = b.make_eq_const(value);
+                }
+            }
+        }
         ctx.make_constant(op.pos, Value::Int(value));
         self.setintbound(op.pos, IntBound::from_constant(value));
     }
