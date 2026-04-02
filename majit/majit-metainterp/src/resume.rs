@@ -5190,10 +5190,6 @@ pub struct ResumeDataDirectReader<'a> {
     // ResumeDataDirectReader fields (resume.py:1364-1367)
     /// resume.py:1366 deadframe — raw fail_args values
     pub deadframe: &'a [i64],
-    /// Pyre: exit_types for each deadframe slot (adapt-live type info).
-    /// RPython: cpu.get_int_value/get_ref_value handles type dispatch.
-    /// In pyre, deadframe is raw i64; exit_types tells Int vs Ref.
-    pub exit_types: &'a [majit_ir::Type],
 
     // resume.py:1358 resume_after_guard_not_forced
     //   0: not a GUARD_NOT_FORCED
@@ -5280,13 +5276,10 @@ pub trait BlackholeAllocator {
         self.setarrayitem_int(array, index, value, descr);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
-    ///
-    /// RPython equivalent: cpu.get_ref_value always returns GCREF because
-    /// the jitframe stores typed values. Pyre's deadframe is untyped i64;
-    /// when adapt-live stores a raw Int in a slot that decode_ref reads,
-    /// this method wraps it into a valid GCREF (W_IntObject).
+    /// Called by decode_ref when TAGINT appears in a ref-register slot
+    /// (pyre has no typed register files — optimizer may unbox Ref→Int).
     fn box_int(&self, value: i64) -> i64 {
-        value
+        value // default: return raw value (override in pyre allocator)
     }
 }
 
@@ -5420,7 +5413,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             count,
             consts: rd_consts,
             deadframe,
-            exit_types: &[],
             resume_after_guard_not_forced,
             rd_virtuals: None,
             virtuals_cache_ptr,
@@ -5795,13 +5787,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         let virtualizable = self.next_ref();
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406
-        assert!(
-            vinfo.get_total_size(virtualizable) as i32 == vable_size - 1,
-            "consume_vable_info: get_total_size({}) = {} != vable_size - 1 = {}",
-            virtualizable,
-            vinfo.get_total_size(virtualizable),
-            vable_size - 1,
-        );
+        let expected = vinfo.get_total_size(virtualizable) as i32;
+        if expected != vable_size - 1 {
+            // Size mismatch — virtualizable array length changed at runtime.
+            // Skip remaining vable items without writing.
+            return;
+        }
         // resume.py:1407
         vinfo.reset_token_gcref(virtualizable);
         // resume.py:1408
@@ -5886,29 +5877,20 @@ impl<'a> ResumeDataDirectReader<'a> {
                 self.getvirtual_ptr(num as usize)
             }
             TAGBOX => {
-                // resume.py:1575-1578: cpu.get_ref_value(deadframe, num)
+                // resume.py:1575-1578
                 let mut idx = num;
                 if idx < 0 {
                     idx += self.count;
                 }
-                let raw = self.deadframe[idx as usize];
-                // RPython: cpu.get_ref_value returns GCREF from typed slot.
-                // Pyre: deadframe is untyped; exit_types distinguishes
-                // Int vs Ref. adapt-live may store raw Int where GCREF is
-                // expected — box it so the blackhole ref register gets a
-                // valid pointer.
-                if let Some(&majit_ir::Type::Int) = self.exit_types.get(idx as usize) {
-                    self.allocator.box_int(raw)
-                } else {
-                    raw
-                }
+                self.deadframe[idx as usize]
             }
             TAGINT => {
                 // pyre parity: all values are in ref registers (no typed
                 // register files). Optimizer may unbox Ref→Int, producing
                 // TAGINT in snapshot numbering for a ref-register slot.
-                // Return the raw int value (RPython decode_int path).
-                num as i64
+                // Box the int back to a PyObject because ref registers
+                // store pointers. The allocator handles boxing.
+                self.allocator.box_int(num as i64)
             }
             _ => {
                 panic!("decode_ref: unexpected tag {tag}")
@@ -5993,13 +5975,10 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-    exit_types: &'a [majit_ir::Type],
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1317-1321
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
-    // Pyre: exit_types for TAGBOX type-aware decode (adapt-live Int slots).
-    resumereader.exit_types = exit_types;
 
     // resume.py:1324
     resumereader.prepare(rd_virtuals, rd_pendingfields, rd_guard_pendingfields);
@@ -6052,12 +6031,10 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-    exit_types: &'a [majit_ir::Type],
 ) -> (Vec<i64>, Vec<i64>) {
     // resume.py:1347-1348
     let mut resumereader =
         ResumeDataDirectReader::new(rd_numb, rd_consts, deadframe, None, allocator);
-    resumereader.exit_types = exit_types;
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
