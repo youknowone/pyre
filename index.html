@@ -358,8 +358,7 @@
       line-height: 1.75;
     }
 
-    .install-grid,
-    .link-grid {
+    .install-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 16px;
@@ -421,8 +420,7 @@
       .hero-grid,
       .meta-grid,
       .playground-grid,
-      .install-grid,
-      .link-grid {
+      .install-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -557,24 +555,12 @@ print(fib(100))</textarea>
           <article class="section-card">
             <h2 class="section-title">Repository</h2>
             <p>
-              The source lives on GitHub. The main repository contains the interpreter and runtime crates, while MaJIT is the tracing JIT framework underneath.
+              The source lives in a single repository. It contains the pyre runtime, the MaJIT tracing JIT framework, documentation, and release metadata in one place.
             </p>
-            <div class="link-grid">
-              <div class="link-card">
-                <h3>pyre</h3>
-                <p>Main project repository, source, docs, and issue tracking.</p>
-                <a href="https://github.com/youknowone/pyre">github.com/youknowone/pyre</a>
-              </div>
-              <div class="link-card">
-                <h3>MaJIT</h3>
-                <p>Tracing, optimization, and backend support used by pyre.</p>
-                <a href="https://github.com/youknowone/pyre/tree/main/majit">Open MaJIT in repo</a>
-              </div>
-              <div class="link-card">
-                <h3>Releases</h3>
-                <p>Prebuilt binaries and release artifacts.</p>
-                <a href="https://github.com/youknowone/pyre/releases">Open releases</a>
-              </div>
+            <div class="link-card" style="margin-top: 18px;">
+              <h3>GitHub</h3>
+              <p>Main repository, source, docs, issue tracking, and releases.</p>
+              <a href="https://github.com/youknowone/pyre">github.com/youknowone/pyre</a>
             </div>
           </article>
         </div>
