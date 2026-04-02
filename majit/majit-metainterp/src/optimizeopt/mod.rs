@@ -150,6 +150,11 @@ pub struct OptContext {
     /// an ARRAYLEN_GC result >= index+1. intbounds.py uses this to
     /// eliminate redundant length guards.
     pub int_lower_bounds: HashMap<OpRef, i64>,
+    /// optimizer.py:415-426 parity: per-OpRef IntBound from the IntBounds pass.
+    /// Synced at the end of each IntBounds.propagate_forward so that later
+    /// passes (Rewrite, Pure, etc.) calling make_constant can validate that
+    /// the constant is within the known range.
+    pub int_bounds: Vec<Option<IntBound>>,
     /// RPython unroll.py: widened integer knowledge imported from the preamble.
     /// OptIntBounds intersects these with freshly discovered facts in phase 2.
     pub imported_int_bounds: HashMap<OpRef, IntBound>,
@@ -413,6 +418,7 @@ impl OptContext {
             next_pos: 0,
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
+            int_bounds: Vec::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
@@ -464,6 +470,7 @@ impl OptContext {
             next_pos: num_inputs as u32,
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
+            int_bounds: Vec::new(),
             imported_int_bounds: HashMap::new(),
             imported_short_arrayitems: HashMap::new(),
             imported_short_arrayitem_descrs: HashMap::new(),
@@ -1264,10 +1271,25 @@ impl OptContext {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:412: box = get_box_replacement(box)
         let replaced = self.get_box_replacement(opref);
-        // optimizer.py:415-426: safety check — if the box has an IntBound
-        // forwarded and the constant is Int, validate range.
-        // Cross-pass: check imported_int_bounds (Phase 2 bounds from Phase 1).
+        // optimizer.py:415-426: safety check — if the box has an IntBound,
+        // validate that the constant is within the known range.
+        // Check both current-phase bounds (from IntBounds pass) and
+        // imported bounds (Phase 2 from Phase 1).
         if let Value::Int(intval) = value {
+            let ridx = replaced.0 as usize;
+            if ridx < self.int_bounds.len() {
+                if let Some(ref mut bound) = self.int_bounds[ridx] {
+                    if !bound.contains(intval) {
+                        std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                            "constant int is outside the range allowed for that box",
+                        ));
+                    }
+                    // intutils.py:412-423: make_eq_const — narrow the shared
+                    // bound to the constant value (important when the bound
+                    // is shared, e.g. with an array length).
+                    let _ = bound.make_eq_const(intval);
+                }
+            }
             if let Some(bound) = self.imported_int_bounds.get(&replaced) {
                 if !bound.contains(intval) {
                     std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
@@ -1285,23 +1307,26 @@ impl OptContext {
         {
             return;
         }
-        // optimizer.py:429-431: copy_fields_to_const — preserve heap cache
-        // fields from the existing PtrInfo onto the const's info (const_infos).
+        // optimizer.py:429-431 + info.py:194-198,533-538: copy_fields_to_const
+        // Preserve heap cache fields from the existing PtrInfo onto the
+        // const's info. Covers AbstractStructPtrInfo hierarchy (Instance,
+        // Struct, Virtual, VirtualStruct) and ArrayPtrInfo (Array, VirtualArray,
+        // VirtualArrayStruct).
         if let Value::Ref(gcref) = value {
             if let Some(Forwarded::Info(info)) = self.forwarded.get(replaced.0 as usize) {
-                match info {
-                    crate::optimizeopt::info::PtrInfo::Instance(inst)
-                        if !inst.fields.is_empty() =>
-                    {
-                        self.const_infos.insert(gcref.as_usize(), info.clone());
-                    }
-                    crate::optimizeopt::info::PtrInfo::Struct(st) if !st.fields.is_empty() => {
-                        self.const_infos.insert(gcref.as_usize(), info.clone());
-                    }
-                    crate::optimizeopt::info::PtrInfo::Array(arr) if !arr.items.is_empty() => {
-                        self.const_infos.insert(gcref.as_usize(), info.clone());
-                    }
-                    _ => {}
+                use crate::optimizeopt::info::PtrInfo;
+                let has_cached_fields = match info {
+                    PtrInfo::Instance(v) => !v.fields.is_empty(),
+                    PtrInfo::Struct(v) => !v.fields.is_empty(),
+                    PtrInfo::Virtual(v) => !v.fields.is_empty(),
+                    PtrInfo::VirtualStruct(v) => !v.fields.is_empty(),
+                    PtrInfo::Array(v) => !v.items.is_empty(),
+                    PtrInfo::VirtualArray(v) => !v.items.is_empty(),
+                    PtrInfo::VirtualArrayStruct(v) => !v.element_fields.is_empty(),
+                    _ => false,
+                };
+                if has_cached_fields {
+                    self.const_infos.insert(gcref.as_usize(), info.clone());
                 }
             }
         }
@@ -2357,6 +2382,7 @@ impl OptContext {
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
         self.next_pos = self.num_inputs;
+        self.int_bounds.clear();
         self.imported_int_bounds.clear();
         self.const_infos.clear();
     }
