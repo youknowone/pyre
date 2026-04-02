@@ -2091,7 +2091,20 @@ impl OptUnroll {
                     {
                         continue; // Const: pass through (isinstance(box, Const))
                     }
-                    *arg = mapping[arg];
+                    // unroll.py:404: _map_args — non-Const must be in mapping.
+                    // RPython: mapping is complete (seeded from short_inputargs →
+                    // jump_args, extended by mapping[sop] = op). Missing keys
+                    // indicate a structural mismatch (e.g., cross-loop bridge
+                    // with incompatible short preamble). Raise InvalidLoop.
+                    match mapping.get(arg) {
+                        Some(&mapped) => *arg = mapped,
+                        None => {
+                            panic!(
+                                "inline_short_preamble: unmapped arg {:?} in {:?}",
+                                arg, new_op.opcode
+                            );
+                        }
+                    }
                 }
                 // unroll.py:405-414: unified guard/non-guard handling.
                 // RPython: both guards and non-guards follow the same path:
