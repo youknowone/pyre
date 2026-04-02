@@ -1374,7 +1374,7 @@ impl OptContext {
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
             // optimizer.py:678: store_final_boxes_in_guard
-            self.store_final_boxes_in_guard(op, &[]);
+            self.store_final_boxes_in_guard(op);
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
@@ -1440,19 +1440,11 @@ impl OptContext {
     /// Generate rd_numb + rd_consts + rd_virtuals for a guard.
     /// Called from store_final_boxes_in_guard in optimizer.rs.
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
-    pub fn finalize_guard_resume_data(
-        &self,
-        op: &mut Op,
-        virtual_slots: &[crate::optimizeopt::optimizer::VirtualFailArgSlot],
-    ) {
-        self.store_final_boxes_in_guard(op, virtual_slots);
+    pub fn finalize_guard_resume_data(&self, op: &mut Op) {
+        self.store_final_boxes_in_guard(op);
     }
 
-    fn store_final_boxes_in_guard(
-        &self,
-        op: &mut Op,
-        virtual_slots: &[crate::optimizeopt::optimizer::VirtualFailArgSlot],
-    ) {
+    fn store_final_boxes_in_guard(&self, op: &mut Op) {
         use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
 
         // resume.py:397: assert not storage.rd_numb
