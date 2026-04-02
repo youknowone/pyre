@@ -3498,7 +3498,7 @@ fn sync_jit_state_to_frame(
 /// Used by ResumeDataDirectReader during guard failure blackhole resume
 /// to allocate virtual objects and replay pending field writes.
 /// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
-struct PyreBlackholeAllocator;
+pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
