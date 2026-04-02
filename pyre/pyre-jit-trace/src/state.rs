@@ -2691,17 +2691,12 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // Derive slot types from concrete Box values (no concrete_frame read).
+            // All slot types forced to Ref (PyObjectRef).
             if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types = s.concrete_locals.iter().map(|cv| cv.ir_type()).collect();
+                s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
             }
             if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types = s
-                    .concrete_stack
-                    .iter()
-                    .take(stack_only)
-                    .map(|cv| cv.ir_type())
-                    .collect();
+                s.symbolic_stack_types = vec![Type::Ref; stack_only];
             }
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
@@ -7747,23 +7742,17 @@ impl JitState for PyreJitState {
         ];
         for i in 0..nlocals {
             let value = self.local_at(i).unwrap_or(PY_NULL);
-            let slot_type = meta.slot_types.get(i).copied().unwrap_or(Type::Ref);
-            vals.push(extract_concrete_typed_value(slot_type, value));
+            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
         }
         for i in 0..stack_only {
             let value = self.stack_at(i).unwrap_or(PY_NULL);
-            let slot_type = meta
-                .slot_types
-                .get(nlocals + i)
-                .copied()
-                .unwrap_or(Type::Ref);
-            vals.push(extract_concrete_typed_value(slot_type, value));
+            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
         }
         vals
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        virtualizable_fail_arg_types(meta.slot_types.iter().copied())
+        virtualizable_fail_arg_types(std::iter::repeat(Type::Ref).take(meta.slot_types.len()))
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
@@ -7774,10 +7763,9 @@ impl JitState for PyreJitState {
         sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
-        sym.symbolic_local_types =
-            _meta.slot_types[.._meta.num_locals.min(_meta.slot_types.len())].to_vec();
+        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
         sym.symbolic_stack_types =
-            _meta.slot_types[_meta.num_locals.min(_meta.slot_types.len())..].to_vec();
+            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
         // Pre-size symbolic_stack with OpRef::NONE for lazy loading from
         // the concrete frame (RPython rebuild_state_after_failure parity:
         // bridge traces start mid-execution with values on the stack).
@@ -7807,7 +7795,7 @@ impl JitState for PyreJitState {
         if fail_arg_types.len() >= 3 {
             let new_vsd = fail_arg_types.len() - 3;
             meta.valuestackdepth = new_vsd;
-            meta.slot_types = fail_arg_types[3..].to_vec();
+            meta.slot_types = vec![Type::Ref; new_vsd];
         }
     }
 
@@ -7910,7 +7898,7 @@ impl JitState for PyreJitState {
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
         let slot_types = if original_box_types.len() >= 3 {
-            original_box_types[3..].to_vec()
+            vec![Type::Ref; original_box_types.len() - 3]
         } else {
             Vec::new()
         };
