@@ -176,18 +176,29 @@ pub(crate) fn build_guard_metadata(
         }
 
         // RPython Box.type parity: exit_types from fail_args (liveboxes).
+        // exit_types length MUST match fail_args length — the Cranelift
+        // backend writes fail_args values to jitframe slots and reads
+        // them back using exit_types for type dispatch.
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
+        } else if let Some(ref fail_args) = op.fail_args {
+            // Derive types from fail_args OpRefs. Use fail_arg_types
+            // only when its length matches (RPython: types always match
+            // because constants are included in fail_args).
+            let fa_types = op.fail_arg_types.as_ref();
+            if fa_types.map_or(false, |t| t.len() == fail_args.len()) {
+                fa_types.unwrap().clone()
+            } else {
+                fail_args
+                    .iter()
+                    .map(|opref| fail_arg_type(opref, &value_types))
+                    .collect()
+            }
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
-        } else if let Some(ref fail_args) = op.fail_args {
-            fail_args
-                .iter()
-                .map(|opref| fail_arg_type(opref, &value_types))
-                .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };
