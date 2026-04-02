@@ -592,8 +592,28 @@ impl UnrollOptimizer {
         // ── unroll.py:207-230: jump_to_existing_trace / retrace_limit ──
         // Try to match the body's JUMP virtual state to an existing target.
         // RPython: new_virtual_state = jump_to_existing_trace(end_jump, ...)
+        //
+        // Performance guard: if the body has too many guards AND the target
+        // tokens are from a previous compilation (cross-function), the
+        // make_inputargs_and_virtuals materialization can be extremely slow.
+        // In RPython this works because same-function JIT cells share targets.
+        // In majit with Cranelift, cross-function jumps are rejected later
+        // anyway (line ~732), so skip the expensive matching altogether.
+        let skip_jump_to_existing = self.retraced_count == u32::MAX
+            && self.target_tokens.len() > 1
+            && self
+                .target_tokens
+                .first()
+                .map(|t| t.as_jump_target_descr().index())
+                != self
+                    .target_tokens
+                    .last()
+                    .map(|t| t.as_jump_target_descr().index());
         if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!("[jit] post-finalize: entering jump_to_existing_trace section");
+            eprintln!(
+                "[jit] post-finalize: entering jump_to_existing_trace section (skip={})",
+                skip_jump_to_existing
+            );
         }
         let mut body_ops = p2_ops;
         let mut redirected_tail_ops = Vec::new();
@@ -642,17 +662,21 @@ impl UnrollOptimizer {
             // runtime_boxes: in loop optimization, the JUMP args ARE the
             // runtime boxes (they represent live values at the back-edge).
             let runtime_boxes = body_jump_args.clone();
-            let mut jumped = opt_unroll
-                .jump_to_existing_trace(
-                    &body_jump_args,
-                    Some(&current_label_args),
-                    &mut self.target_tokens,
-                    &mut opt_p2,
-                    &mut jump_ctx,
-                    false,
-                    Some(&runtime_boxes),
-                )
-                .is_none(); // None = jumped successfully
+            let mut jumped = if skip_jump_to_existing {
+                false
+            } else {
+                opt_unroll
+                    .jump_to_existing_trace(
+                        &body_jump_args,
+                        Some(&current_label_args),
+                        &mut self.target_tokens,
+                        &mut opt_p2,
+                        &mut jump_ctx,
+                        false,
+                        Some(&runtime_boxes),
+                    )
+                    .is_none() // None = jumped successfully
+            };
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] jump_to_existing_trace(force_boxes=false) result: jumped={}",
@@ -2038,8 +2062,19 @@ impl OptUnroll {
         }
 
         // unroll.py:398-427: fix-point loop, runs only once in almost all cases.
-        // No artificial iteration cap — RPython uses `while 1:` until convergence.
+        // RPython uses `while 1:` until convergence, but in practice it should
+        // converge in very few iterations. Add a safety cap to prevent hangs.
+        let mut fixpoint_iter = 0u32;
         loop {
+            fixpoint_iter += 1;
+            if fixpoint_iter > 20 {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[jit][inline_short_preamble] fixpoint loop exceeded 20 iterations, breaking"
+                    );
+                }
+                break;
+            }
             // unroll.py:402: while i < len(short) - 1
             // Use LIVE length — newly added ops (from use_box during
             // send_extra_operation) are replayed in the same iteration.
