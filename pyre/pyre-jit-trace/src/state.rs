@@ -7577,6 +7577,12 @@ impl PyreJitState {
             return;
         };
         let arr_len = frame_arr.len();
+        assert!(
+            values.len() >= idx + arr_len,
+            "restore_virtualizable_i64: values.len()={} < expected {}",
+            values.len(),
+            idx + arr_len,
+        );
         let arr_slice = frame_arr.as_mut_slice();
         for j in 0..arr_len {
             arr_slice[j] = values[idx] as PyObjectRef;

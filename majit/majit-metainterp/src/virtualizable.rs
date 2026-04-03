@@ -731,30 +731,20 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(
-        &self,
-        obj_ptr: *mut u8,
-        boxes: &[i64],
-        array_lengths: &[usize],
-    ) {
-        // virtualizable.py:126-137 write_from_resume_data_partial parity:
-        // all entries must be present.
-        let expected_total: usize = self.static_fields.len() + array_lengths.iter().sum::<usize>();
-        assert!(
-            boxes.len() >= expected_total,
-            "write_boxes_to_heap: boxes.len()={} < expected {}",
-            boxes.len(),
-            expected_total,
-        );
-
-        // Static fields
+    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        // virtualizable.py:131-133: static fields.
         for i in 0..self.static_fields.len() {
             self.write_field(obj_ptr, i, boxes[i]);
         }
 
-        // Array elements
+        // virtualizable.py:134-137:
+        //   lst = getattr(virtualizable, fieldname)
+        //   for j in range(len(lst)):
+        //       lst[j] = ...
+        // Array length from heap object (len(lst)), not caller-provided.
         let mut idx = self.static_fields.len();
-        for (ai, &len) in array_lengths.iter().enumerate() {
+        for ai in 0..self.array_fields.len() {
+            let len = self.get_array_length(obj_ptr as *const u8, ai);
             for ei in 0..len {
                 self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
                 idx += 1;
@@ -785,13 +775,8 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn force_from_boxes(
-        &self,
-        obj_ptr: *mut u8,
-        boxes: &[i64],
-        array_lengths: &[usize],
-    ) {
-        self.write_boxes_to_heap(obj_ptr, boxes, array_lengths);
+    pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        self.write_boxes_to_heap(obj_ptr, boxes);
         self.reset_vable_token(obj_ptr);
     }
 }
@@ -1733,7 +1718,7 @@ mod tests {
         let lengths = vec![2];
 
         unsafe {
-            info.force_from_boxes(obj, &boxes, &lengths);
+            info.force_from_boxes(obj, &boxes);
 
             assert_eq!(frame.x, 42);
             assert_eq!(arr.items[0], 100);
