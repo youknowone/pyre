@@ -59,14 +59,14 @@ pub fn generate_from_pipeline(result: &crate::passes::ProgramPipelineResult) -> 
     generate_canonical_dispatch_table(&mut out, result);
     generate_trace_functions(&mut out);
 
-    let canonical_classified = result
+    let flattened_count = result
         .opcode_dispatch
         .iter()
-        .filter(|a| a.classified_pattern.is_some())
+        .filter(|a| a.flattened.is_some())
         .count();
     out.push_str(&format!(
-        "// Canonical analysis summary: {}/{} graph-classified\n",
-        canonical_classified,
+        "// Canonical analysis summary: {}/{} flattened\n",
+        flattened_count,
         result.opcode_dispatch.len(),
     ));
 
@@ -94,54 +94,20 @@ fn generate_canonical_dispatch_table(
     out: &mut String,
     result: &crate::passes::ProgramPipelineResult,
 ) {
-    out.push_str("/// Canonical graph-derived trace classification for each opcode.\n");
+    out.push_str("/// Canonical analysis summary: opcode → flattened op count.\n");
     out.push_str("pub const CANONICAL_TRACE_PATTERNS: &[(&str, &str)] = &[\n");
     for arm in &result.opcode_dispatch {
-        let pattern_str = match &arm.classified_pattern {
-            Some(p) => trace_pattern_kind(p).to_string(),
-            None => "Unclassified".to_string(),
+        let status = match &arm.flattened {
+            Some(f) => format!("Flattened({}ops)", f.ops.len()),
+            None => "Unflattened".to_string(),
         };
         out.push_str(&format!(
             "    (\"{}\", \"{}\"),\n",
             arm.selector.canonical_key().replace('"', "\\\""),
-            pattern_str.replace('"', "\\\""),
+            status.replace('"', "\\\""),
         ));
     }
     out.push_str("];\n\n");
-}
-
-fn trace_pattern_kind(pattern: &crate::TracePattern) -> &'static str {
-    match pattern {
-        crate::TracePattern::UnboxIntBinop { .. } => "UnboxIntBinop",
-        crate::TracePattern::UnboxFloatBinop { .. } => "UnboxFloatBinop",
-        crate::TracePattern::UnboxIntCompare { .. } => "UnboxIntCompare",
-        crate::TracePattern::LocalRead => "LocalRead",
-        crate::TracePattern::LocalWrite => "LocalWrite",
-        crate::TracePattern::ConstLoad => "ConstLoad",
-        crate::TracePattern::TruthCheck => "TruthCheck",
-        crate::TracePattern::RangeIterNext => "RangeIterNext",
-        crate::TracePattern::UnboxIntUnary { .. } => "UnboxIntUnary",
-        crate::TracePattern::SequenceGetitem => "SequenceGetitem",
-        crate::TracePattern::FunctionCall => "FunctionCall",
-        crate::TracePattern::StackManip => "StackManip",
-        crate::TracePattern::Jump => "Jump",
-        crate::TracePattern::ConditionalJump => "ConditionalJump",
-        crate::TracePattern::Return => "Return",
-        crate::TracePattern::NamespaceAccess { .. } => "NamespaceAccess",
-        crate::TracePattern::IterCleanup => "IterCleanup",
-        crate::TracePattern::Noop => "Noop",
-        crate::TracePattern::BuildCollection { .. } => "BuildCollection",
-        crate::TracePattern::UnpackSequence => "UnpackSequence",
-        crate::TracePattern::SequenceSetitem => "SequenceSetitem",
-        crate::TracePattern::CollectionAppend => "CollectionAppend",
-        crate::TracePattern::VableFieldRead { .. } => "VableFieldRead",
-        crate::TracePattern::VableFieldWrite { .. } => "VableFieldWrite",
-        crate::TracePattern::VableArrayRead { .. } => "VableArrayRead",
-        crate::TracePattern::VableArrayWrite { .. } => "VableArrayWrite",
-        crate::TracePattern::VableArrayLen { .. } => "VableArrayLen",
-        crate::TracePattern::Residual { .. } => "Residual",
-        crate::TracePattern::Unknown => "Unknown",
-    }
 }
 
 fn generate_trace_functions(out: &mut String) {
@@ -432,7 +398,6 @@ mod tests {
                     "Instruction",
                     "Add",
                 ])),
-                classified_pattern: None,
                 flattened: None,
             }],
             total_blocks: 0,
@@ -447,7 +412,6 @@ mod tests {
             vable_rewrites: 0,
             calls_classified: 0,
             transform_notes: Vec::new(),
-            classified_pattern: None,
             flattened: crate::passes::FlattenedFunction {
                 name: "add".into(),
                 ops: Vec::new(),

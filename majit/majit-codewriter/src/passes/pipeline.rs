@@ -15,47 +15,42 @@ use crate::passes::annotate::{AnnotationState, annotate};
 use crate::passes::flatten::{self, FlattenedFunction};
 use crate::passes::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 use crate::passes::rtype::{TypeResolutionState, resolve_types};
-use crate::patterns::TracePattern;
 
 /// Configuration for the full analysis pipeline.
+///
+/// RPython: implicit in `CodeWriter.__init__` + `CallControl.__init__`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// jtransform configuration (virtualizable fields, call classification).
     pub transform: GraphTransformConfig,
-    /// Interpreter-owned pattern roles used by canonical trace classification.
-    #[serde(default)]
-    pub classify: crate::patterns::ClassificationConfig,
 }
 
 /// Result of running the full pipeline on a single function.
+///
+/// RPython: the result of `transform_graph_to_jitcode()` — one per function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineResult {
     pub name: String,
-    /// Original graph (before transforms).
     pub original_blocks: usize,
-    /// Annotation pass results.
     pub annotations_count: usize,
-    /// Type resolution results.
     pub concrete_types_count: usize,
-    /// jtransform results.
     pub vable_rewrites: usize,
     pub calls_classified: usize,
     pub transform_notes: Vec<super::jtransform::GraphTransformNote>,
-    /// Canonical graph-derived trace classification for this function.
-    pub classified_pattern: Option<TracePattern>,
-    /// Flattened output.
+    /// RPython: the SSARepr produced by flatten_graph().
     pub flattened: FlattenedFunction,
 }
 
-/// Canonical opcode dispatch metadata derived for generated consumers.
+/// Canonical opcode dispatch metadata.
+///
+/// RPython: each opcode handler's graph is transformed and flattened
+/// into a JitCode instruction sequence. The `flattened` field holds
+/// the result of inline → jtransform → flatten.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineOpcodeArm {
     pub selector: OpcodeDispatchSelector,
-    pub classified_pattern: Option<TracePattern>,
-    /// Inlined + jtransform'd + flattened output (RPython-orthodox path).
-    /// When available, this is the authoritative representation — the
-    /// `classified_pattern` field is for backward compatibility only.
-    #[serde(default)]
+    /// Inlined + jtransform'd + flattened output.
+    /// None if the opcode handler was too trivial or unsupported.
     pub flattened: Option<FlattenedFunction>,
 }
 
@@ -90,8 +85,6 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
-    let classified_pattern =
-        crate::patterns::classify_from_graph_with_config(&transform_result.graph, &config.classify);
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     let flattened = flatten::flatten_with_types(&transform_result.graph, &types);
@@ -104,7 +97,6 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         vable_rewrites,
         calls_classified,
         transform_notes,
-        classified_pattern,
         flattened,
     }
 }
