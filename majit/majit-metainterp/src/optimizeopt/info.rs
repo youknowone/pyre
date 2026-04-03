@@ -22,12 +22,15 @@ pub enum Forwarded {
     None,
     /// Forwarding to another OpRef (RPython: _forwarded = other_box).
     Op(OpRef),
-    /// Terminal info (RPython: _forwarded = info_instance).
+    /// Terminal info (RPython: _forwarded = PtrInfo instance).
     Info(PtrInfo),
     /// Terminal constant (RPython: _forwarded = constbox).
     /// optimizer.py:432: box.set_forwarded(constbox).
-    /// get_box_replacement stops here; is_const returns true.
     Const(majit_ir::Value),
+    /// Terminal IntBound (RPython: _forwarded = IntBound instance).
+    /// intutils.py:73: IntBound(AbstractInfo) — stored directly in
+    /// _forwarded, retrieved by optimizer.py:99 getintbound().
+    IntBound(crate::optimizeopt::intutils::IntBound),
 }
 
 impl Default for Forwarded {
