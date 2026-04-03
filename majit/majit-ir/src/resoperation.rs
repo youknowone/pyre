@@ -303,6 +303,15 @@ pub trait BoxEnv {
     fn get_virtual_fields(&self, _opref: OpRef) -> Option<VirtualFieldsInfo> {
         None
     }
+    /// resume.py:307-315 make_virtual_info(info, fieldnums) parity.
+    ///
+    /// Creates an `RdVirtualInfo` for a virtual OpRef with given fieldnums.
+    /// Dispatches on the virtual type (Virtual, VStruct, VArray, etc.)
+    /// to produce the correct variant — matching RPython's
+    /// `info.visitor_dispatch_virtual_type(self)` + `vinfo.set_content(fieldnums)`.
+    fn make_rd_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
+        None
+    }
 }
 
 /// A single IR operation.
