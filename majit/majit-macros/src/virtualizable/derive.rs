@@ -556,11 +556,10 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 __boxes
             }
 
-            /// Write state-backed fields from static boxes
-            /// (RPython: write_from_resume_data_partial, static part).
-            ///
-            /// Validates that `static_boxes` covers all declared fields.
-            /// Returns false on short/corrupt resume-data.
+            /// Write ALL static fields from resume data to heap + state.
+            /// virtualizable.py:126-133 write_from_resume_data_partial parity:
+            /// iterates ALL static fields via set_static_field (type-aware).
+            /// State-backed fields also update `self`.
             pub fn virt_import_static_boxes(
                 &mut self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -569,6 +568,12 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 if static_boxes.len() < info.num_fields() {
                     return false;
                 }
+                // Write ALL static fields to heap (type-aware write).
+                let heap_ptr = self.#frame_ident as *mut u8;
+                if !heap_ptr.is_null() {
+                    unsafe { info.write_boxes(heap_ptr, static_boxes); }
+                }
+                // State-backed fields also update self.
                 #(#import_writes)*
                 true
             }
