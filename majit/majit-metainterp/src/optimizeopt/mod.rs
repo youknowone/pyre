@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::intutils::IntBound;
 use info::PtrInfo;
-use majit_ir::{DescrRef, Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
 use std::collections::VecDeque;
 
 pub(crate) fn majit_log_enabled() -> bool {
@@ -138,6 +138,8 @@ pub struct OptContext {
     num_inputs: u32,
     /// Next unique op position for newly emitted or queued extra operations.
     pub(crate) next_pos: u32,
+    /// Next unique constant position (OpRef >= CONST_BASE).
+    pub(crate) next_const_pos: u32,
     /// RPython emit_extra(op, emit=False) parity: ops queued to be
     /// processed starting from a specific pass index (skipping earlier passes).
     /// Used by heap's force_lazy_set to route ops through remaining passes
@@ -416,6 +418,7 @@ impl OptContext {
             forwarded: Vec::new(),
             num_inputs: 0,
             next_pos: 0,
+            next_const_pos: OpRef::CONST_BASE,
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
             int_bounds: Vec::new(),
@@ -468,6 +471,7 @@ impl OptContext {
             forwarded: Vec::new(),
             num_inputs: num_inputs as u32,
             next_pos: num_inputs as u32,
+            next_const_pos: OpRef::CONST_BASE,
             extra_operations_after: VecDeque::new(),
             int_lower_bounds: HashMap::new(),
             int_bounds: Vec::new(),
@@ -520,6 +524,25 @@ impl OptContext {
     /// Allocate a fresh OpRef position (for imported virtual heads).
     pub fn alloc_op_position(&mut self) -> OpRef {
         self.reserve_pos()
+    }
+
+    /// Allocate a fresh OpRef in the constant namespace (>= CONST_BASE).
+    pub(crate) fn reserve_const_pos(&mut self) -> OpRef {
+        while self
+            .constants
+            .get(self.next_const_pos as usize)
+            .is_some_and(|value| value.is_some())
+        {
+            self.next_const_pos += 1;
+        }
+        debug_assert!(
+            self.next_const_pos >= OpRef::CONST_BASE,
+            "reserve_const_pos allocated non-constant OpRef below constant namespace: {}",
+            self.next_const_pos
+        );
+        let pos_ref = OpRef(self.next_const_pos);
+        self.next_const_pos += 1;
+        pos_ref
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
@@ -2325,8 +2348,20 @@ impl OptContext {
     }
 
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
-        let pos = self.alloc_op_position();
+        let pos = self.reserve_const_pos();
         self.make_constant(pos, Value::Int(value));
+        pos
+    }
+
+    pub fn make_constant_ref(&mut self, value: GcRef) -> OpRef {
+        let pos = self.reserve_const_pos();
+        self.make_constant(pos, Value::Ref(value));
+        pos
+    }
+
+    pub fn make_constant_float(&mut self, value: f64) -> OpRef {
+        let pos = self.reserve_const_pos();
+        self.make_constant(pos, Value::Float(value));
         pos
     }
 
