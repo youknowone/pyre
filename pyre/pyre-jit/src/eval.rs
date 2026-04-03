@@ -2749,25 +2749,7 @@ fn build_resumed_frames(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx) => {
-                let val = dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0));
-                // decode_ref TAGBOX re-boxing parity (resume.rs:5890):
-                // optimizer may unbox Ref→Int, producing Value::Int in a
-                // slot that should hold a PyObjectRef. Re-box via w_int_new.
-                if let Value::Int(raw) = val {
-                    if *idx < exit_layout.exit_types.len()
-                        && exit_layout.exit_types[*idx] == majit_ir::Type::Int
-                    {
-                        Value::Ref(majit_ir::GcRef(
-                            pyre_object::intobject::w_int_new(raw) as usize
-                        ))
-                    } else {
-                        val
-                    }
-                } else {
-                    val
-                }
-            }
+            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
             RebuiltValue::Int(i) => Value::Int(*i as i64),
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
@@ -2859,21 +2841,12 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
-    // resume.py:consume_vref_and_vable parity: virtualizable fields
-    // (locals + stack) are stored in vable_values, NOT in frame.values.
-    // In pyre, the virtualizable IS the frame, so vable values after the
-    // header [frame_ptr, ni, code, vsd, ns] ARE the frame's locals+stack.
-    // Resolve all vable locals for merging into frame values below.
-    let _vable_locals: Vec<Value> = if vable_values.len() > 5 {
-        vable_values[5..]
-            .iter()
-            .map(|rv| {
-                resolve_rebuilt_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // TODO: resume.py:1399 consume_vable_info writes ALL vable fields
+    // back to the virtualizable (= PyFrame in pyre) BEFORE the blackhole
+    // runs. This is not yet implemented — blocked by OpRef dedup aliasing
+    // between vable and frame sections (see KNOWN DEVIATION in
+    // resumedata.rs:225). Until resolved, blackhole resume may produce
+    // null locals when frame section has partial liveness.
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
@@ -2911,11 +2884,6 @@ fn build_resumed_frames(
         } else {
             values.len()
         };
-        // resume.py:consume_vref_and_vable + consume_one_section parity:
-        // vable_locals provide ALL locals (written to virtualizable).
-        // frame section provides liveness-matched values at the guard point.
-        // When frame section is empty, use vable_locals as the full set.
-        let final_values = values;
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
@@ -2926,7 +2894,7 @@ fn build_resumed_frames(
             },
             frame_ptr,
             vsd,
-            values: final_values,
+            values,
         });
     }
 
