@@ -1330,12 +1330,11 @@ fn execute_assembler(
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // RPython: resume_in_blackhole never fails — it
-                            // always runs _run_forever until ContinueRunningNormally
-                            // or DoneWithThisFrame. This Failed path indicates
-                            // incomplete rd_numb (empty frame from guards whose
-                            // snapshot had no live boxes at capture time).
-                            // Invalidate to prevent re-entering with stale state.
+                            // resume.py:1312: blackhole_from_resumedata never
+                            // fails in upstream — it's a contract. This path
+                            // means a pyre resume data bug. Invalidate to
+                            // prevent re-entering the broken guard. Remove
+                            // once blackhole resume is fully sound.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — \
@@ -2750,7 +2749,25 @@ fn build_resumed_frames(
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
-            RebuiltValue::Box(idx) => dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0)),
+            RebuiltValue::Box(idx) => {
+                let val = dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0));
+                // decode_ref TAGBOX re-boxing parity (resume.rs:5890):
+                // optimizer may unbox Ref→Int, producing Value::Int in a
+                // slot that should hold a PyObjectRef. Re-box via w_int_new.
+                if let Value::Int(raw) = val {
+                    if *idx < exit_layout.exit_types.len()
+                        && exit_layout.exit_types[*idx] == majit_ir::Type::Int
+                    {
+                        Value::Ref(majit_ir::GcRef(
+                            pyre_object::intobject::w_int_new(raw) as usize
+                        ))
+                    } else {
+                        val
+                    }
+                } else {
+                    val
+                }
+            }
             RebuiltValue::Int(i) => Value::Int(*i as i64),
             RebuiltValue::Const(c, tp) => match tp {
                 majit_ir::Type::Int => Value::Int(*c),
