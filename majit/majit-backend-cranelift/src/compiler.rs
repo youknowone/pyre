@@ -2626,20 +2626,28 @@ extern "C" fn call_assembler_guard_failure(
     let fail_descr = &target.fail_descrs[fail_index as usize];
     let _fail_count = fail_descr.increment_fail_count();
 
-    // Fast bridge dispatch: zero-copy — pass the caller's jf_frame
-    // directly to the bridge. fail_args are already at the right offsets
-    // (callee wrote them on guard exit). No array allocation or copy needed.
+    // assembler.py:295-360 call_assembler parity:
+    // dispatch to bridge, check jf_descr, load result from returned frame.
     let bridge_ptr = fail_descr.bridge_code_ptr();
     if !bridge_ptr.is_null() {
         let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
             unsafe { std::mem::transmute(bridge_ptr) };
-        // outputs_ptr points to jf_frame items (offset 64 from jf_ptr start).
-        // Recover jf_ptr by subtracting the header size.
         let jf_ptr =
             unsafe { (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64 };
-        let _result_jf = unsafe { func(jf_ptr) };
-        // Result is at jf_frame[0] = outputs_ptr[0]
-        return unsafe { *outputs_ptr };
+        let result_jf = unsafe { func(jf_ptr) };
+        // _call_assembler_check_descr (x86/assembler.py:2274-2278):
+        // CMP [eax + jf_descr_ofs], done_descr → JE path B
+        let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+        if jf_descr_raw != 0 {
+            let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+            if descr.is_finish() {
+                // _call_assembler_load_result (x86/assembler.py:2291-2303):
+                // MOV eax, [eax + ofs] — load from returned frame, not original.
+                let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+                return unsafe { *result_jf.add(header_words) };
+            }
+        }
+        // Bridge didn't finish — fall through to blackhole/force.
     }
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
@@ -2655,7 +2663,7 @@ extern "C" fn call_assembler_guard_failure(
             outputs_ptr,
             raw_num,
         ) {
-            // Bridge compiled — dispatch to it immediately.
+            // Bridge compiled — dispatch with finish check.
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
             if !new_bridge_ptr.is_null() {
                 let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
@@ -2663,8 +2671,17 @@ extern "C" fn call_assembler_guard_failure(
                 let jf_ptr = unsafe {
                     (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64
                 };
-                let _result_jf = unsafe { func(jf_ptr) };
-                return unsafe { *outputs_ptr };
+                let result_jf = unsafe { func(jf_ptr) };
+                let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+                if jf_descr_raw != 0 {
+                    let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+                    if descr.is_finish() {
+                        // x86/assembler.py:2291-2303: load from returned frame.
+                        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+                        return unsafe { *result_jf.add(header_words) };
+                    }
+                }
+                // Bridge didn't finish — fall through to blackhole/force.
             }
         }
     }
@@ -4620,6 +4637,13 @@ fn run_compiled_code(
     for (i, &val) in inputs.iter().enumerate() {
         unsafe { *jf_ptr.add(header_words + i) = val };
     }
+    // Debug: verify first input (frame ptr) is valid
+    if std::env::var_os("MAJIT_VERIFY").is_some() && !inputs.is_empty() {
+        let frame_ptr = inputs[0];
+        if frame_ptr != 0 && (frame_ptr < 0x1000 || (frame_ptr as usize & 0x7) != 0) {
+            eprintln!("[VERIFY] BAD frame_ptr input[0]={:#x}", frame_ptr);
+        }
+    }
 
     // llmodel.py:322: llop.gc_writebarrier(ll_frame)
     if use_gc_alloc {
@@ -4683,10 +4707,14 @@ fn run_compiled_code(
         if descr.has_bridge() {
             let bridge = descr.bridge_ref().as_ref().unwrap();
             if std::env::var_os("MAJIT_LOG").is_some() {
+                let bi: Vec<i64> = (0..bridge.num_inputs.min(5))
+                    .map(|i| unsafe { *result_jf.add(header_words + i) })
+                    .collect();
                 eprintln!(
-                    "[exec] bridge dispatch: guard fail_idx={} → bridge trace={}",
+                    "[exec] bridge dispatch: guard fail_idx={} → bridge trace={} inputs={:?}",
                     descr.fail_index(),
-                    bridge.trace_id
+                    bridge.trace_id,
+                    bi,
                 );
             }
             // llgraph/runner.py:1190: values = [v for v in values if v is not None]
@@ -6785,6 +6813,9 @@ impl CraneliftBackend {
                             );
 
                             // ── Inline bridge dispatch (hot) ──
+                            // assembler.py:295-360 _call_assembler parity:
+                            // call bridge → check jf_descr → if finish, load
+                            // result; if not, fall through to extern helper.
                             builder.switch_to_block(inline_bridge_block);
                             builder.seal_block(inline_bridge_block);
                             let mut bridge_sig = Signature::new(call_conv);
@@ -6796,12 +6827,36 @@ impl CraneliftBackend {
                                 bridge_ptr_val,
                                 &[args_ptr],
                             );
-                            let _bridge_jf = builder.inst_results(bridge_call)[0];
-                            // load result from shared frame (args_ptr)
+                            let bridge_result_jf = builder.inst_results(bridge_call)[0];
+                            // _call_assembler_check_descr parity:
+                            // CMP [result_jf + jf_descr_ofs], done_descr
+                            let bridge_jf_descr = builder.ins().load(
+                                cl_types::I64,
+                                MemFlags::trusted(),
+                                bridge_result_jf,
+                                JF_DESCR_OFS,
+                            );
+                            let bridge_is_finish = builder.ins().icmp(
+                                IntCC::Equal,
+                                bridge_jf_descr,
+                                runtime_finish_descr,
+                            );
+                            let bridge_finish_block = builder.create_block();
+                            builder.ins().brif(
+                                bridge_is_finish,
+                                bridge_finish_block,
+                                &[],
+                                extern_helper_block,
+                                &[],
+                            );
+                            // x86/assembler.py:2291-2303 _call_assembler_load_result:
+                            // MOV eax, [eax + ofs] — load from RETURNED frame.
+                            builder.switch_to_block(bridge_finish_block);
+                            builder.seal_block(bridge_finish_block);
                             let bridge_result = builder.ins().load(
                                 cl_types::I64,
                                 MemFlags::trusted(),
-                                args_ptr,
+                                bridge_result_jf,
                                 JF_FRAME_ITEM0_OFS,
                             );
                             builder
@@ -8805,9 +8860,11 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("GC allocation helper must return a value");
-                        // TODO: _reload_frame_if_necessary — when nursery jitframe is supported
-                        // jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                        // outputs_ptr = jf_ptr;
+                        // assembler.py:405-412 _reload_frame_if_necessary:
+                        // GC may have moved the jitframe during allocation.
+                        // Reload jf_ptr so subsequent spill/reload use the correct address.
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        outputs_ptr = jf_ptr;
                         builder.def_var(var(vi), result);
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.

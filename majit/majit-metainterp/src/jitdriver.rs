@@ -1086,6 +1086,11 @@ impl<S: JitState> JitDriver<S> {
                 .tracing
                 .as_ref()
                 .map_or(false, |ctx| ctx.recorder.ops().len() > 0);
+            // pyjitpl.py:2979-2983 reached_loop_header parity:
+            // "if not self.partial_trace" — compile_trace is skipped
+            // only during retrace (partial_trace != None). Bridge tracing
+            // and normal tracing both attempt this path.
+            // pyre has no retrace yet, so the condition is always true.
             if has_trace_ops && self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
