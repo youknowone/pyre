@@ -148,6 +148,12 @@ fn analyze_pipeline_from_parsed(
             }
         }
     }
+    // Mark portal: execute_opcode_step is the JIT entry point.
+    // RPython: jd.portal_graph seeds the BFS in find_all_graphs().
+    let portal = parse::CallPath::from_segments(["execute_opcode_step"]);
+    if call_control.function_graphs().contains_key(&portal) {
+        call_control.mark_portal(portal);
+    }
     call_control.find_all_graphs();
 
     pipeline.opcode_dispatch = build_canonical_opcode_dispatch(
