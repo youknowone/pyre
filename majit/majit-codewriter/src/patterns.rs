@@ -50,6 +50,8 @@ pub enum CallPatternRole {
     TruthCheck,
     StackManip,
     ConstLoad,
+    Jump,
+    ConditionalJump,
     NamespaceLoadLocal,
     NamespaceLoadGlobal,
     NamespaceStoreLocal,
@@ -284,7 +286,9 @@ pub fn classify_from_graph_with_config(
                 }
                 CallPatternRole::TruthCheck => crate::call_match::is_truth_check_target(target),
                 CallPatternRole::StackManip => crate::call_match::is_stack_manip_target(target),
-                CallPatternRole::ConstLoad => false, // only via config call_roles
+                CallPatternRole::ConstLoad => false,
+                CallPatternRole::Jump => crate::call_match::is_jump_target(target),
+                CallPatternRole::ConditionalJump => false,
                 CallPatternRole::NamespaceLoadLocal => {
                     crate::call_match::namespace_access_kind(target)
                         == Some(crate::call_match::NamespaceAccessKind::LoadLocal)
@@ -518,6 +522,16 @@ pub fn classify_from_graph_with_config(
     // Return
     if any_call_has_role(CallPatternRole::Return) {
         return Some(TracePattern::Return);
+    }
+
+    // Conditional jump (call role or guard + pc write)
+    if any_call_has_role(CallPatternRole::ConditionalJump) {
+        return Some(TracePattern::ConditionalJump);
+    }
+
+    // Unconditional jump (call role or pc write)
+    if any_call_has_role(CallPatternRole::Jump) {
+        return Some(TracePattern::Jump);
     }
 
     // Jump detection: field write to InstructionPosition OR call to set_next_instr
