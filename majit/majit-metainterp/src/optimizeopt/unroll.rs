@@ -355,17 +355,28 @@ impl UnrollOptimizer {
                 .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
                 .collect();
         }
+        // RPython parity: Phase 2 needs patchguardop from Phase 1's
+        // GuardFutureCondition (unroll.py:333). Extract before dropping opt_p1.
+        let p1_patchguardop = exported_state.patchguardop.clone();
+
         self.ensure_preamble_target_token();
         // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
-        // RPython import_state: phase 2 starts from the original trace input
-        // contract. The optimizer state is imported from ExportedState; the
-        // trace itself is not rewritten to add synthetic field inputargs.
         let body_num_inputs = num_inputs;
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[jit] preamble peeling: phase1 end_args={}",
+                "[jit] preamble peeling: {} virtual(s), phase1 end_args={} p1_patchguardop={}",
+                exported_state
+                    .virtual_state
+                    .state
+                    .iter()
+                    .filter(|s| s.is_virtual())
+                    .count(),
                 exported_state.end_args.len(),
+                p1_patchguardop
+                    .as_ref()
+                    .map(|p| p.rd_resume_position)
+                    .unwrap_or(-99),
             );
         }
 
@@ -384,6 +395,14 @@ impl UnrollOptimizer {
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.original_trace_op_types = self.original_trace_op_types.clone();
+        // RPython parity: Phase 2 re-optimizes the original trace which
+        // includes GuardFutureCondition. Since pyre's Phase 2 uses Phase 1's
+        // output (already simplified), GuardFutureCondition was already removed.
+        // Propagate Phase 1's patchguardop so extra_guards from
+        // jump_to_existing_trace get a valid rd_resume_position.
+        // RPython: patchguardop is always set from GuardFutureCondition in
+        // the re-optimized trace (unroll.py:333).
+        opt_p2.patchguardop = p1_patchguardop;
         // Phase 1's emitted op types: Phase 2 references these via
         // imported_label_args (NONE resolution in store_final_boxes_in_guard).
         opt_p2.prev_phase_value_types = self.phase1_value_types.clone();
@@ -979,7 +998,9 @@ pub struct ExportedState {
     pub renamed_inputarg_types: Vec<Type>,
     /// Short inputargs for the short preamble.
     pub short_inputargs: Vec<OpRef>,
-    /// RPython: Optimizer.patchguardop persists across phases.
+    /// RPython parity: patchguardop from Phase 1's GuardFutureCondition.
+    /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
+    /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).

@@ -1837,6 +1837,11 @@ impl Optimizer {
                     .collect();
             }
         }
+        // RPython parity: propagate patchguardop to ExportedState so Phase 2
+        // can use it for extra_guards from virtualstate (unroll.py:333-336).
+        if let Some(ref mut es) = self.exported_loop_state {
+            es.patchguardop = self.patchguardop.clone();
+        }
 
         // RPython export_state() flushes force artifacts into the preamble
         // before building the exported loop state. If the loop header needs
