@@ -40,6 +40,8 @@ struct VableField {
     role: VableRole,
     /// For `#[vable(static_field = N)]`: the VirtualizableInfo field index.
     static_field_index: Option<usize>,
+    /// Field IR type: "int", "ref", or "float". Used for typed heap reads.
+    field_type: Option<String>,
 }
 
 fn parse_vable_role(s: &str) -> Option<VableRole> {
@@ -59,23 +61,49 @@ fn parse_vable_role(s: &str) -> Option<VableRole> {
     }
 }
 
+struct ParsedVableAttr {
+    role: VableRole,
+    static_field_index: Option<usize>,
+    field_type: Option<String>,
+}
+
 /// Parse `#[vable(...)]` attribute content. Supports:
 /// - Simple keyword: `#[vable(frame)]`, `#[vable(inputarg)]`
 /// - Key-value: `#[vable(static_field = 0)]`
-fn parse_vable_attr(tokens_str: &str) -> Option<(VableRole, Option<usize>)> {
+/// - Multi key-value: `#[vable(static_field = 0, type = ref)]`
+fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
     let s = tokens_str.trim();
-    // Try key = value format: "static_field = 0"
-    if let Some((key, val)) = s.split_once('=') {
-        let key = key.trim();
-        let val = val.trim();
-        if key == "static_field" {
-            let idx: usize = val.parse().ok()?;
-            return Some((VableRole::Frame, Some(idx))); // role overridden below
+    // Check if it contains '=' (key-value pairs)
+    if s.contains('=') {
+        let mut static_idx = None;
+        let mut field_type = None;
+        for part in s.split(',') {
+            let part = part.trim();
+            if let Some((key, val)) = part.split_once('=') {
+                let key = key.trim();
+                let val = val.trim();
+                match key {
+                    "static_field" => static_idx = val.parse().ok(),
+                    "type" => field_type = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        if static_idx.is_some() {
+            return Some(ParsedVableAttr {
+                role: VableRole::Frame, // overridden below
+                static_field_index: static_idx,
+                field_type,
+            });
         }
         return None;
     }
     // Simple keyword
-    parse_vable_role(s).map(|role| (role, None))
+    parse_vable_role(s).map(|role| ParsedVableAttr {
+        role,
+        static_field_index: None,
+        field_type: None,
+    })
 }
 
 fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
@@ -99,15 +127,15 @@ fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
                 continue;
             }
             let tokens_str = meta_list.tokens.to_string();
-            if let Some((mut role, static_idx)) = parse_vable_attr(&tokens_str) {
-                if static_idx.is_some() {
-                    // static_field = N → treat as a state-backed field
-                    role = VableRole::Inputarg; // state-backed
+            if let Some(mut parsed) = parse_vable_attr(&tokens_str) {
+                if parsed.static_field_index.is_some() {
+                    parsed.role = VableRole::Inputarg; // state-backed
                 }
                 result.push(VableField {
                     ident: ident.clone(),
-                    role,
-                    static_field_index: static_idx,
+                    role: parsed.role,
+                    static_field_index: parsed.static_field_index,
+                    field_type: parsed.field_type,
                 });
             }
         }
@@ -495,13 +523,15 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .collect();
 
     // ── import_static_boxes: write state-backed fields from boxes ──
-    let import_writes: Vec<TokenStream> = state_backed
+    // Fail if any required field is missing (RPython read_boxes parity).
+    let import_checks: Vec<TokenStream> = state_backed
         .iter()
         .map(|(ident, idx)| {
             quote! {
-                if let Some(&__v) = static_boxes.get(#idx) {
-                    self.#ident = __v as usize;
-                }
+                let Some(&__v) = static_boxes.get(#idx) else {
+                    return false;
+                };
+                self.#ident = __v as usize;
             }
         })
         .collect();
@@ -542,9 +572,10 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
             /// Import virtualizable static field values from boxes.
             ///
             /// Only writes state-backed fields. Heap-only (immutable) fields
-            /// are skipped.
-            pub fn virt_import_static_boxes(&mut self, static_boxes: &[i64]) {
-                #(#import_writes)*
+            /// are skipped. Returns false if any required field is missing.
+            pub fn virt_import_static_boxes(&mut self, static_boxes: &[i64]) -> bool {
+                #(#import_checks)*
+                true
             }
 
             /// Export full virtualizable state: (static_boxes, array_boxes).
