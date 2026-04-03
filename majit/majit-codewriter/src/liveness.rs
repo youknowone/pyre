@@ -26,7 +26,7 @@ pub fn compute_liveness(flattened: &mut FlattenedFunction) {
 
     // Iterate to fixpoint (RPython: while _compute_liveness_must_continue)
     loop {
-        if !compute_liveness_pass(&flattened.ops, &mut label2alive) {
+        if !compute_liveness_pass(&mut flattened.ops, &mut label2alive) {
             break;
         }
     }
@@ -36,23 +36,43 @@ pub fn compute_liveness(flattened: &mut FlattenedFunction) {
 /// Returns true if any label's alive set grew (needs another iteration).
 ///
 /// RPython: `_compute_liveness_must_continue(ssarepr, label2alive)`.
+///
+/// Walks backward through the instruction sequence. At each `-live-`
+/// marker, expands it to include all values alive at that point.
 fn compute_liveness_pass(
-    ops: &[FlatOp],
+    ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<ValueId>>,
 ) -> bool {
     let mut alive: HashSet<ValueId> = HashSet::new();
     let mut must_continue = false;
 
     // Walk backward through instructions
-    for op in ops.iter().rev() {
-        match op {
+    for i in (0..ops.len()).rev() {
+        match &ops[i] {
             FlatOp::Label(label) => {
-                let alive_at_point = label2alive.entry(label.clone()).or_default();
+                let label = *label;
+                let alive_at_point = label2alive.entry(label).or_default();
                 let prev_len = alive_at_point.len();
                 alive_at_point.extend(alive.iter());
                 if alive_at_point.len() != prev_len {
                     must_continue = true;
                 }
+            }
+            FlatOp::Live { live_values } => {
+                // RPython liveness.py:44-52: -live- markers are expanded
+                // to include all values currently alive at this point.
+                // Also union any explicitly-forced values from jtransform.
+                for v in live_values {
+                    alive.insert(*v);
+                }
+                // Expand: replace this Live marker with all alive values.
+                ops[i] = FlatOp::Live {
+                    live_values: alive.iter().copied().collect(),
+                };
+            }
+            FlatOp::Unreachable => {
+                // RPython: '---' resets the alive set.
+                alive.clear();
             }
             FlatOp::Op(inner_op) => {
                 // Result is defined here — remove from alive
@@ -65,26 +85,32 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::Jump(label) => {
-                // Follow label: union with alive set at target
-                if let Some(alive_at_target) = label2alive.get(label) {
+                let label = *label;
+                if let Some(alive_at_target) = label2alive.get(&label) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::JumpIfTrue { cond, target } => {
-                alive.insert(*cond);
-                if let Some(alive_at_target) = label2alive.get(target) {
+                let cond = *cond;
+                let target = *target;
+                alive.insert(cond);
+                if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::JumpIfFalse { cond, target } => {
-                alive.insert(*cond);
-                if let Some(alive_at_target) = label2alive.get(target) {
+                let cond = *cond;
+                let target = *target;
+                alive.insert(cond);
+                if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::Move { dst, src } => {
-                alive.remove(dst);
-                alive.insert(*src);
+                let dst = *dst;
+                let src = *src;
+                alive.remove(&dst);
+                alive.insert(src);
             }
         }
     }

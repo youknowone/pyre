@@ -609,14 +609,21 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → inline_call"),
         });
         self.calls_classified += 1;
-        RewriteResult::Replace(vec![Op {
-            result: op.result,
-            kind: OpKind::InlineCall {
-                target: target.clone(),
-                args: args.to_vec(),
-                result_ty: result_ty.clone(),
+        // RPython jtransform.py:480-481: inline_call always followed by -live-
+        RewriteResult::Replace(vec![
+            Op {
+                result: op.result,
+                kind: OpKind::InlineCall {
+                    target: target.clone(),
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
             },
-        }])
+            Op {
+                result: None,
+                kind: OpKind::Live,
+            },
+        ])
     }
 
     /// RPython: `Transformer.handle_recursive_call(op)`.
@@ -661,14 +668,24 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → residual", descriptor.target),
         });
         self.calls_classified += 1;
-        RewriteResult::Replace(vec![Op {
+        // RPython jtransform.py:469-470: residual_call followed by -live-
+        // if the call can raise or may call jitcodes.
+        let can_raise = descriptor.effect_info.check_can_raise(false);
+        let mut ops = vec![Op {
             result: op.result,
             kind: OpKind::CallResidual {
                 descriptor,
                 args: args.to_vec(),
                 result_ty: result_ty.clone(),
             },
-        }])
+        }];
+        if can_raise {
+            ops.push(Op {
+                result: None,
+                kind: OpKind::Live,
+            });
+        }
+        RewriteResult::Replace(ops)
     }
 
     /// RPython: elidable call — pure function, result depends only on args.
@@ -709,14 +726,21 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → may_force", descriptor.target),
         });
         self.calls_classified += 1;
-        RewriteResult::Replace(vec![Op {
-            result: op.result,
-            kind: OpKind::CallMayForce {
-                descriptor,
-                args: args.to_vec(),
-                result_ty: result_ty.clone(),
+        // RPython: call_may_force always followed by -live-
+        RewriteResult::Replace(vec![
+            Op {
+                result: op.result,
+                kind: OpKind::CallMayForce {
+                    descriptor,
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
             },
-        }])
+            Op {
+                result: None,
+                kind: OpKind::Live,
+            },
+        ])
     }
 }
 
@@ -742,6 +766,7 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::VableForce
+        | OpKind::Live
         | OpKind::Unknown { .. } => op.kind.clone(),
         OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
             base: remap_value(*base, aliases),

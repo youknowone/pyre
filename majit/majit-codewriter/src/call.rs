@@ -195,6 +195,7 @@ impl CallControl {
 
     fn find_all_graphs_bfs(&mut self) {
         // BFS from portal targets (RPython: call.py:49-92)
+        let initial_fn_count = self.function_graphs.len();
         let mut todo: Vec<CallPath> = self.portal_targets.iter().cloned().collect();
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
@@ -251,6 +252,13 @@ impl CallControl {
                 }
             }
         }
+        #[cfg(test)]
+        eprintln!(
+            "find_all_graphs_bfs: {} function_graphs, {} candidates (from {} portals)",
+            initial_fn_count,
+            self.candidate_graphs.len(),
+            self.portal_targets.len()
+        );
     }
 
     /// RPython: `CallControl.is_candidate(graph)`.

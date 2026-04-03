@@ -375,6 +375,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_ty: result_ty.clone(),
         },
         OpKind::VableForce => OpKind::VableForce,
+        OpKind::Live => OpKind::Live,
         OpKind::CallElidable {
             descriptor,
             args,
@@ -464,6 +465,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::VableForce
+        | OpKind::Live
         | OpKind::Unknown { .. } => {
             vec![]
         }

@@ -147,7 +147,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
                 ValueType::Int // Arithmetic defaults to Int
             }
         }
-        OpKind::VableForce => ValueType::Void,
+        OpKind::VableForce | OpKind::Live => ValueType::Void,
         OpKind::CallElidable { result_ty, .. }
         | OpKind::CallResidual { result_ty, .. }
         | OpKind::CallMayForce { result_ty, .. }

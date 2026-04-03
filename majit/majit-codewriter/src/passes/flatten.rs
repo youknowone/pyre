@@ -31,6 +31,21 @@ pub enum FlatOp {
     JumpIfFalse { cond: ValueId, target: Label },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     Move { dst: ValueId, src: ValueId },
+    /// Liveness marker — expanded by `compute_liveness()` to include
+    /// all values alive at this point.
+    ///
+    /// RPython: `-live-` operation. Inserted by jtransform after calls
+    /// that may need guard resumption (call_may_force, residual_call,
+    /// inline_call, recursive_call). The liveness pass expands the
+    /// `live_values` set to include all registers alive at this point.
+    Live {
+        /// Values known to be live (forced by jtransform).
+        /// `compute_liveness()` expands this set.
+        live_values: Vec<ValueId>,
+    },
+    /// Unreachable marker — marks the end of a code path.
+    /// RPython: `---` operation. Resets the alive set in liveness analysis.
+    Unreachable,
 }
 
 /// Register kind for a value (RPython regalloc).
@@ -84,7 +99,14 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
 
         // Ops
         for op in &block.ops {
-            ops.push(FlatOp::Op(op.clone()));
+            if matches!(&op.kind, crate::graph::OpKind::Live) {
+                // RPython: -live- op becomes FlatOp::Live marker
+                ops.push(FlatOp::Live {
+                    live_values: Vec::new(),
+                });
+            } else {
+                ops.push(FlatOp::Op(op.clone()));
+            }
         }
 
         // Terminator → jumps + moves (Phi resolution)
