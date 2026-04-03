@@ -199,7 +199,14 @@ impl CallControl {
     }
 
     fn find_all_graphs_bfs(&mut self) {
-        // BFS from portal targets (RPython: call.py:49-92)
+        // RPython call.py:49-92: BFS from portal targets.
+        // For each graph, scan all Call ops. If guess_call_kind would
+        // return 'regular' (i.e. graphs_from returns a graph AND it's
+        // a candidate), add the callee graph to candidates and continue.
+        //
+        // During BFS we use target_to_path + function_graphs directly
+        // (not graphs_from, which checks candidate_graphs — the set
+        // we're building).
         let mut todo: Vec<CallPath> = self.portal_targets.iter().cloned().collect();
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
@@ -210,59 +217,32 @@ impl CallControl {
                 Some(g) => g.clone(),
                 None => continue,
             };
+            // RPython call.py:77-90: scan all ops in graph
             for block in &graph.blocks {
                 for op in &block.ops {
-                    let callee_path = match &op.kind {
-                        // FunctionPath calls: direct function references.
-                        OpKind::Call {
-                            target: crate::graph::CallTarget::FunctionPath { segments },
-                            ..
-                        } => Some(CallPath::from_segments(segments.iter().map(String::as_str))),
-                        // Method calls: resolve through trait impls to find the
-                        // concrete function graph, matching RPython's treatment
-                        // of method dispatch in the flow graph.
-                        OpKind::Call {
-                            target:
-                                crate::graph::CallTarget::Method {
-                                    name,
-                                    receiver_root,
-                                },
-                            ..
-                        } => {
-                            // If the method resolves to a unique impl, treat
-                            // its graph as reachable. We use the method name as
-                            // a synthetic path since methods don't have CallPaths.
-                            if self
-                                .resolve_method(name, receiver_root.as_deref())
-                                .is_some()
-                            {
-                                Some(CallPath::from_segments([name.as_str()]))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
+                    let target = match &op.kind {
+                        OpKind::Call { target, .. } => target,
+                        _ => continue,
                     };
-
-                    if let Some(callee_path) = callee_path {
-                        if !self.candidate_graphs.contains(&callee_path) {
-                            // Only add if we actually have the graph
-                            if self.function_graphs.contains_key(&callee_path) {
-                                self.candidate_graphs.insert(callee_path.clone());
-                                todo.push(callee_path);
-                            }
-                        }
+                    // RPython call.py:80: kind = self.guess_call_kind(op, is_candidate)
+                    // During BFS, we check: is the callee graph available?
+                    // If yes, it's a candidate (we're discovering the full set).
+                    let callee_path = match self.target_to_path(target) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    if self.candidate_graphs.contains(&callee_path) {
+                        continue; // already discovered
+                    }
+                    // RPython call.py:84: for graph in self.graphs_from(op, is_candidate)
+                    // During BFS, we don't check is_candidate (we're building the set).
+                    if self.function_graphs.contains_key(&callee_path) {
+                        self.candidate_graphs.insert(callee_path.clone());
+                        todo.push(callee_path);
                     }
                 }
             }
         }
-        #[cfg(test)]
-        eprintln!(
-            "find_all_graphs_bfs: {} function_graphs, {} candidates (from {} portals)",
-            self.function_graphs.len(),
-            self.candidate_graphs.len(),
-            self.portal_targets.len()
-        );
     }
 
     /// RPython: `CallControl.is_candidate(graph)`.
@@ -297,67 +277,89 @@ impl CallControl {
 
     /// Classify a call target.
     ///
-    /// RPython: `CallControl.guess_call_kind(op)`.
+    /// RPython: `CallControl.guess_call_kind(op, is_candidate)` (call.py:116-139).
     ///
-    /// Decision logic (in priority order):
-    /// 1. Portal target → Recursive
-    /// 2. Builtin target → Builtin
-    /// 3. No graph available → Residual
-    /// 4. Is candidate → Regular
-    /// 5. Otherwise → Residual
+    /// Exact RPython decision logic:
+    /// 1. Is portal runner → 'recursive'
+    /// 2. Has oopspec → 'builtin'
+    /// 3. `graphs_from(target) is None` → 'residual'
+    /// 4. Otherwise → 'regular'
+    ///
+    /// Step 3 is the key: graphs_from returns None when the callee graph
+    /// is not available OR not a candidate.
     pub fn guess_call_kind(&self, target: &CallTarget) -> CallKind {
+        // Step 1: recursive (RPython call.py:119-120)
+        let path = self.target_to_path(target);
+        if let Some(ref p) = path {
+            if self.portal_targets.contains(p) {
+                return CallKind::Recursive;
+            }
+        }
+        // Step 2: builtin (RPython call.py:135-136)
+        if let Some(ref p) = path {
+            if self.builtin_targets.contains(p) {
+                return CallKind::Builtin;
+            }
+        }
+        // Step 3+4: graphs_from check (RPython call.py:137-139)
+        // graphs_from returns the graph ONLY if it's a candidate.
+        if self.graphs_from(target).is_none() {
+            CallKind::Residual
+        } else {
+            CallKind::Regular
+        }
+    }
+
+    /// Get the callee graph for a call target, but only if it is a candidate.
+    ///
+    /// RPython: `CallControl.graphs_from(op, is_candidate)` (call.py:94-114).
+    ///
+    /// Returns the graph only if:
+    /// 1. The graph exists (via function_graphs or resolve_method)
+    /// 2. The graph is a candidate (in candidate_graphs)
+    ///
+    /// This is the gatekeeper: if graphs_from returns None, the call
+    /// becomes residual. If it returns Some, the call is regular.
+    pub fn graphs_from(&self, target: &CallTarget) -> Option<&MajitGraph> {
+        let path = self.target_to_path(target)?;
+        // RPython call.py:100: is_candidate(graph)
+        if !self.candidate_graphs.contains(&path) {
+            return None;
+        }
+        self.function_graphs.get(&path)
+    }
+
+    /// Get the callee graph WITHOUT candidate check.
+    /// Used during BFS discovery (where we're building the candidate set).
+    fn graphs_from_unchecked(&self, target: &CallTarget) -> Option<&MajitGraph> {
+        let path = self.target_to_path(target)?;
+        self.function_graphs.get(&path)
+    }
+
+    /// Convert a CallTarget to a CallPath for lookup.
+    ///
+    /// FunctionPath → direct path.
+    /// Method → synthetic CallPath([method_name]) (registered by register_trait_method).
+    /// If the method doesn't resolve, returns None.
+    fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
             CallTarget::FunctionPath { segments } => {
-                let path = CallPath::from_segments(segments.iter().map(String::as_str));
-                if self.portal_targets.contains(&path) {
-                    return CallKind::Recursive;
-                }
-                if self.builtin_targets.contains(&path) {
-                    return CallKind::Builtin;
-                }
-                if self.candidate_graphs.contains(&path) {
-                    return CallKind::Regular;
-                }
-                CallKind::Residual
+                Some(CallPath::from_segments(segments.iter().map(String::as_str)))
             }
             CallTarget::Method {
                 name,
                 receiver_root,
             } => {
-                // RPython: method calls use the same graphs_from() + is_candidate
-                // logic as function calls. resolve_method() finds the graph;
-                // candidate_graphs membership determines regular vs residual.
+                // Check if this method resolves to a known impl
                 if self
                     .resolve_method(name, receiver_root.as_deref())
-                    .is_none()
+                    .is_some()
                 {
-                    return CallKind::Residual;
+                    Some(CallPath::from_segments([name.as_str()]))
+                } else {
+                    None
                 }
-                // Method graphs are registered in function_graphs under
-                // synthetic CallPath([method_name]) by register_trait_method().
-                let synthetic_path = CallPath::from_segments([name.as_str()]);
-                if self.candidate_graphs.contains(&synthetic_path) {
-                    return CallKind::Regular;
-                }
-                CallKind::Residual
             }
-            CallTarget::UnsupportedExpr => CallKind::Residual,
-        }
-    }
-
-    /// Get the callee graph for a call target.
-    ///
-    /// RPython: `CallControl.graphs_from(op)`.
-    pub fn graphs_from(&self, target: &CallTarget) -> Option<&MajitGraph> {
-        match target {
-            CallTarget::FunctionPath { segments } => {
-                let path = CallPath::from_segments(segments.iter().map(String::as_str));
-                self.function_graphs.get(&path)
-            }
-            CallTarget::Method {
-                name,
-                receiver_root,
-            } => self.resolve_method(name, receiver_root.as_deref()),
             CallTarget::UnsupportedExpr => None,
         }
     }
