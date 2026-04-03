@@ -1646,27 +1646,15 @@ fn one_arg_callee_frame_helper(arg_type: Type, is_self_recursive: bool) -> (*con
 }
 
 fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
-    let mut types = Vec::with_capacity(len);
-    for idx in 0..len {
-        if idx == 0 {
-            types.push(Type::Ref);
-        } else if idx < 3 {
-            types.push(Type::Int);
-        } else {
-            types.push(Type::Ref);
-        }
-    }
-    types
+    let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    crate::virtualizable_gen::virt_live_value_types(len.saturating_sub(n))
 }
 
 fn frame_entry_arg_types_from_slot_types(slot_types: &[Type]) -> Vec<Type> {
     if slot_types.is_empty() {
         vec![Type::Ref]
     } else {
-        let mut types = Vec::with_capacity(3 + slot_types.len());
-        types.push(Type::Ref);
-        types.push(Type::Int);
-        types.push(Type::Int);
+        let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         types.extend(slot_types.iter().copied());
         types
     }
@@ -1702,7 +1690,7 @@ fn synthesize_fresh_callee_entry_args(
     ];
     ca_args.extend(args.iter().copied().take(callee_nlocals));
     let null = ctx.const_int(PY_NULL as i64);
-    while ca_args.len() < 3 + callee_nlocals {
+    while ca_args.len() < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + callee_nlocals {
         ca_args.push(null);
     }
     ca_args
@@ -2771,7 +2759,10 @@ impl MIFrame {
         };
         let mut args = vec![frame, next_instr, stack_depth];
         for (idx, value) in locals.into_iter().enumerate() {
-            let target_type = inputarg_types.get(3 + idx).copied().unwrap_or(Type::Ref);
+            let target_type = inputarg_types
+                .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + idx)
+                .copied()
+                .unwrap_or(Type::Ref);
             // Materialize NONE slots from concrete frame before boxing.
             // RPython's live_arg_boxes never contains holes at loop closure
             // because MIFrame.run_one_step always updates all live registers.
@@ -2780,7 +2771,7 @@ impl MIFrame {
         }
         for (stack_idx, value) in stack.into_iter().enumerate() {
             let target_type = inputarg_types
-                .get(3 + nlocals + stack_idx)
+                .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + nlocals + stack_idx)
                 .copied()
                 .unwrap_or(Type::Ref);
             let value =
@@ -2895,7 +2886,12 @@ impl MIFrame {
             // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
                 // pfa = [frame, ni, vsd, active_boxes...]; snapshot gets [active_boxes...].
-                let parent_active = if pfa.len() > 3 { &pfa[3..] } else { &pfa[..] };
+                let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+                let parent_active = if pfa.len() > __n {
+                    &pfa[__n..]
+                } else {
+                    &pfa[..]
+                };
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
@@ -7347,13 +7343,10 @@ impl PyreJitState {
         if raw_values.is_empty() {
             return false;
         }
-        self.frame = raw_values[0] as usize;
-        self.next_instr = raw_values.get(1).copied().unwrap_or(0) as usize;
-        self.valuestackdepth = raw_values.get(2).copied().unwrap_or(0) as usize;
+        let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
-        let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for local_idx in 0..nlocals {
             if let Some(&raw) = raw_values.get(idx) {
                 let _ = self.set_local_at(local_idx, raw as PyObjectRef);
@@ -7547,17 +7540,7 @@ impl PyreJitState {
     /// Restore from virtualizable fail_args format:
     ///   [frame, next_instr, valuestackdepth, l0..lN-1, s0..sM-1]
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
-        let mut idx = 1;
-
-        // Static fields: next_instr, valuestackdepth
-        if idx < values.len() {
-            self.next_instr = values[idx] as usize;
-            idx += 1;
-        }
-        if idx < values.len() {
-            self.valuestackdepth = values[idx] as usize;
-            idx += 1;
-        }
+        let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
         let nlocals = self.local_count();
 
@@ -7586,15 +7569,15 @@ impl PyreJitState {
         array_boxes: &[Vec<i64>],
     ) -> bool {
         // virtualizable.py:86 read_boxes: all static fields in declared order.
-        // [0]=next_instr, [1]=code, [2]=valuestackdepth, [3]=namespace
-        let Some(&next_instr) = static_boxes.get(0) else {
+        let vf = crate::virtualizable_gen::VABLE_FIELD_SPECS;
+        let Some(&next_instr) = static_boxes.get(vf[0].1) else {
             return false;
         };
-        // [1]=code — immutable, no import needed
-        let Some(&valuestackdepth) = static_boxes.get(2) else {
+        // code — immutable, no import needed
+        let Some(&valuestackdepth) = static_boxes.get(vf[2].1) else {
             return false;
         };
-        // [3]=namespace — immutable, no import needed
+        // namespace — immutable, no import needed
         // Single unified array: locals_cells_stack_w
         let Some(unified) = array_boxes.first() else {
             return false;
@@ -8006,9 +7989,12 @@ impl JitState for PyreJitState {
 
         // virtualizable.py:126-133: write static fields from resumedata.
         // FIELDTYPE for next_instr = Signed, valuestackdepth = Signed.
-        self.next_instr = values.get(1).map(value_to_usize).unwrap_or(self.next_instr);
+        self.next_instr = values
+            .get(crate::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize)
+            .map(value_to_usize)
+            .unwrap_or(self.next_instr);
         self.valuestackdepth = values
-            .get(2)
+            .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
             .map(value_to_usize)
             .unwrap_or(self.valuestackdepth);
 
@@ -8592,11 +8578,12 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        use crate::virtualizable_gen::*;
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.vable_array_base = Some(3);
-        sym.vable_next_instr = OpRef(1);
-        sym.vable_valuestackdepth = OpRef(2);
+        let mut sym = PyreSym::new_uninit(OpRef(SYM_FRAME_IDX));
+        sym.vable_array_base = Some(SYM_ARRAY_BASE);
+        sym.vable_next_instr = OpRef(SYM_NEXT_INSTR_IDX);
+        sym.vable_valuestackdepth = OpRef(SYM_VALUESTACKDEPTH_IDX);
 
         sym.init_symbolic(&mut ctx, frame_ptr);
 
