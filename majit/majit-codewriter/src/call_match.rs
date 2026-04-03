@@ -159,113 +159,154 @@ const LOCAL_WRITE_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
 const FUNCTION_INVOKE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "call_callable",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "call_function_ex",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "call_kw",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    // FunctionPath variants — when the impl body calls these as free functions
+    CallTargetPattern::FunctionPath(&["call_callable"]),
+    CallTargetPattern::FunctionPath(&["call_function_ex"]),
+    CallTargetPattern::FunctionPath(&["call_kw"]),
+    CallTargetPattern::FunctionPath(&["opcode_call"]),
+    CallTargetPattern::FunctionPath(&["opcode_make_function"]),
 ];
 
 const TRUTH_CHECK_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "truth_value",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "bool_value_from_truth",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "concrete_truth_as_bool",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "to_bool",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::FunctionPath(&["truth_value"]),
+    CallTargetPattern::FunctionPath(&["bool_value_from_truth"]),
+    CallTargetPattern::FunctionPath(&["concrete_truth_as_bool"]),
 ];
 
 const STACK_MANIP_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "swap_values",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "copy_value",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::Method {
+        name: "push_value",
+        receiver_root: None,
+    },
+    CallTargetPattern::Method {
+        name: "pop_value",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["push_value"]),
+    CallTargetPattern::FunctionPath(&["pop_value"]),
 ];
 
 const PEEK_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
     name: "peek_at",
-    receiver_root: Some("PyFrame"),
+    receiver_root: None,
 }];
 
-const LOAD_GLOBAL_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "load_global",
-    receiver_root: Some("PyFrame"),
-}];
+const LOAD_GLOBAL_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "load_global",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["load_global"]),
+];
 
-const STORE_GLOBAL_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "store_global",
-    receiver_root: Some("PyFrame"),
-}];
+const STORE_GLOBAL_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "store_global",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["store_global"]),
+];
 
 const LOAD_LOCAL_NAMESPACE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "load_name",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "load_name_value",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "load_from_dict_or_globals",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "load_from_dict_or_deref",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::FunctionPath(&["load_name"]),
+    CallTargetPattern::FunctionPath(&["load_name_value"]),
 ];
 
 const STORE_LOCAL_NAMESPACE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "store_name",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "store_name_value",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::FunctionPath(&["store_name"]),
+    CallTargetPattern::FunctionPath(&["store_name_value"]),
 ];
 
 const RANGE_ITER_NEXT_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "iter_next_value",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "for_iter",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::Method {
+        name: "ensure_iter_value",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["iter_next_value"]),
+    CallTargetPattern::FunctionPath(&["ensure_iter_value"]),
 ];
 
 const ITER_CLEANUP_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "end_for",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "pop_iter",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::Method {
+        name: "on_iter_exhausted",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["end_for"]),
+    CallTargetPattern::FunctionPath(&["on_iter_exhausted"]),
 ];
 
 const JUMP_TARGETS: &[CallTargetPattern] = &[
@@ -282,44 +323,61 @@ const JUMP_TARGETS: &[CallTargetPattern] = &[
 const RETURN_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "return_value",
-        receiver_root: Some("PyFrame"),
-    },
-    CallTargetPattern::Method {
-        name: "return_value",
         receiver_root: None,
     },
+    CallTargetPattern::FunctionPath(&["return_value"]),
+    CallTargetPattern::FunctionPath(&["opcode_return_value"]),
 ];
 
-const BUILD_LIST_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "build_list",
-    receiver_root: Some("PyFrame"),
-}];
+const BUILD_LIST_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "build_list",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["build_list"]),
+    CallTargetPattern::FunctionPath(&["opcode_build_list"]),
+];
 
-const BUILD_TUPLE_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "build_tuple",
-    receiver_root: Some("PyFrame"),
-}];
+const BUILD_TUPLE_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "build_tuple",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["build_tuple"]),
+    CallTargetPattern::FunctionPath(&["opcode_build_tuple"]),
+];
 
 const UNPACK_SEQUENCE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "unpack_sequence",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
     CallTargetPattern::Method {
         name: "unpack_ex",
-        receiver_root: Some("PyFrame"),
+        receiver_root: None,
     },
+    CallTargetPattern::FunctionPath(&["unpack_sequence"]),
+    CallTargetPattern::FunctionPath(&["unpack_ex"]),
+    CallTargetPattern::FunctionPath(&["opcode_unpack_sequence"]),
 ];
 
-const SEQUENCE_SETITEM_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "store_subscr",
-    receiver_root: Some("PyFrame"),
-}];
+const SEQUENCE_SETITEM_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "store_subscr",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["store_subscr"]),
+    CallTargetPattern::FunctionPath(&["opcode_store_subscr"]),
+];
 
-const COLLECTION_APPEND_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "list_append",
-    receiver_root: Some("PyFrame"),
-}];
+const COLLECTION_APPEND_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "list_append",
+        receiver_root: None,
+    },
+    CallTargetPattern::FunctionPath(&["list_append"]),
+    CallTargetPattern::FunctionPath(&["opcode_list_append"]),
+];
 
 const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     CallDescriptorEntry {

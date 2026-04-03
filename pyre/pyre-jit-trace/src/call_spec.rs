@@ -21,6 +21,7 @@ pub enum CallPatternRole {
     FunctionCall,
     TruthCheck,
     StackManip,
+    ConstLoad,
     NamespaceLoadLocal,
     NamespaceLoadGlobal,
     NamespaceStoreLocal,
@@ -462,5 +463,194 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         },
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::IterCleanup),
+    },
+    // ── opcode_* free functions (FunctionPath targets) ──
+    // These are called by OpcodeStepExecutor default methods.
+    // Adding them here lets the classifier match at the default method
+    // graph level without needing to follow into the free function body.
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_call"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::FunctionCall),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_return_value"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::Return),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_const"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::ConstLoad),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_small_int"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::ConstLoad),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_fast_checked"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_fast_pair_checked"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_fast_load_fast"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_fast"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalWrite),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_fast_load_fast"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_fast_store_fast"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalWrite),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_name"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::NamespaceStoreLocal),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_name"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::NamespaceLoadLocal),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_global"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::NamespaceLoadGlobal),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_pop_top"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::StackManip),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_push_null"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::StackManip),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_copy_value"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::StackManip),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_swap"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::StackManip),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_binary_op"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_compare_op"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_unary_negative"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_unary_invert"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_unary_not"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::TruthCheck),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_jump_forward"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_jump_backward"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_pop_jump_if_false"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::TruthCheck),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_pop_jump_if_true"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::TruthCheck),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_list"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::BuildList),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_tuple"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::BuildTuple),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_map"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_subscr"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::SequenceSetitem),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_list_append"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::CollectionAppend),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_unpack_sequence"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::UnpackSequence),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_attr"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_store_attr"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_get_iter"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::RangeIterNext),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_for_iter"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::RangeIterNext),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_make_function"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::FunctionCall),
     },
 ];
