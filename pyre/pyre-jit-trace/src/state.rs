@@ -7560,7 +7560,9 @@ impl PyreJitState {
         array_boxes: &[Vec<i64>],
     ) -> bool {
         // State-backed fields: write from static_boxes.
-        self.virt_import_static_boxes(static_boxes);
+        if !self.virt_import_static_boxes(static_boxes) {
+            return false;
+        }
 
         // Array: write to frame heap.
         let Some(unified) = array_boxes.first() else {
