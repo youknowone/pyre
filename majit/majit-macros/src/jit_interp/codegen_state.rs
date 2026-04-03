@@ -1488,6 +1488,7 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 Some(
                     self.storage_layout
                         .iter()
+                        .take(self.meta_storage_count)
                         .map(|&(sidx, _)| self.stacks[&sidx].len())
                         .collect(),
                 )
