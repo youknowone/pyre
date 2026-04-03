@@ -3134,26 +3134,24 @@ impl ResumeDataLoopMemo {
     /// `env`: BoxEnv for resolving box properties (constants, types).
     ///   Virtual fields are discovered via `env.get_virtual_fields()`,
     ///   matching RPython's `visitor_walk_recursive` callback pattern.
-    /// `pending_setfields`: resume.py:428-442, 520-558 _add_pending_fields.
-    ///   Raw SetfieldGc/SetarrayitemGc ops — target and value are extracted
-    ///   inside finish(), matching RPython's `op.getarg()` pattern.
+    /// `pending_setfields`: resume.py:428-442 register_box + visitor_walk_recursive,
+    ///   resume.py:520-558 _add_pending_fields tagging.
+    ///   target_tagged/value_tagged are filled in-place.
     /// `optimizer_knowledge`: bridgeopt.py:63 serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
     ///
-    /// Returns `(rd_numb, rd_consts, rd_virtuals, rd_pendingfields, liveboxes)`.
+    /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes)`.
     pub fn finish(
         &mut self,
         mut numb_state: NumberingState,
         env: &dyn majit_ir::BoxEnv,
-        pending_setfields: &[majit_ir::Op],
+        pending_setfields: &mut [majit_ir::GuardPendingFieldEntry],
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> (
         Vec<u8>,
         Vec<(i64, majit_ir::Type)>,
         Vec<majit_ir::RdVirtualInfo>,
-        Vec<TaggedPendingField>,
         Vec<majit_ir::OpRef>,
-        LiveboxMap,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -3237,14 +3235,10 @@ impl ResumeDataLoopMemo {
 
         // resume.py:428-442: process pending_setfields — register_box on
         // target and value, then visitor_walk_recursive on virtual fieldbox.
-        for setfield_op in pending_setfields {
-            let box_opref = env.get_box_replacement(setfield_op.args[0]);
-            let (fieldbox, _item_index) = if setfield_op.opcode == majit_ir::OpCode::SetarrayitemGc
-            {
-                (env.get_box_replacement(setfield_op.args[2]), -1i32)
-            } else {
-                (env.get_box_replacement(setfield_op.args[1]), -1i32)
-            };
+        for pf in pending_setfields.iter() {
+            let box_opref = env.get_box_replacement(pf.target);
+            let fieldbox = env.get_box_replacement(pf.value);
+            // resume.py:438-439: self.register_box(box); self.register_box(fieldbox)
             self.register_box_in_new_liveboxes(
                 box_opref,
                 env,
@@ -3269,6 +3263,20 @@ impl ResumeDataLoopMemo {
                         &mut new_liveboxes,
                         &mut new_liveboxes_order,
                     );
+                    // Nested virtual discovery (same as main worklist above)
+                    let resolved = env.get_box_replacement(field_opref);
+                    if !resolved.is_none()
+                        && !virtual_fields.contains_key(&resolved.0)
+                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                    {
+                        if numb_state.liveboxes.get(resolved.0).is_none()
+                            && new_liveboxes.get(resolved.0).is_none()
+                        {
+                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.0);
+                        }
+                        virtual_worklist.push(resolved.0);
+                    }
                 }
                 virtual_fields.insert(fieldbox.0, vf);
             }
@@ -3390,32 +3398,12 @@ impl ResumeDataLoopMemo {
         }
 
         // resume.py:445, 520-558: _add_pending_fields(pending_setfields)
-        let mut rd_pendingfields_tagged = Vec::new();
-        for setfield_op in pending_setfields {
-            let target = env.get_box_replacement(setfield_op.args[0]);
-            let (value, item_index) = if setfield_op.opcode == majit_ir::OpCode::SetarrayitemGc {
-                let fieldbox = env.get_box_replacement(setfield_op.args[2]);
-                // resume.py:534: itemindex = boxindex.getint()
-                let idx_opref = env.get_box_replacement(setfield_op.args[1]);
-                let item_idx = if env.is_const(idx_opref) {
-                    let (v, _) = env.get_const(idx_opref);
-                    v as i32
-                } else {
-                    0
-                };
-                (fieldbox, item_idx)
-            } else {
-                (env.get_box_replacement(setfield_op.args[1]), -1i32)
-            };
-            let descr_index = setfield_op.descr.as_ref().map_or(0, |d| d.index());
-            let num = self._gettagged(target, env, &numb_state.liveboxes, &new_liveboxes);
-            let fieldnum = self._gettagged(value, env, &numb_state.liveboxes, &new_liveboxes);
-            rd_pendingfields_tagged.push(TaggedPendingField {
-                descr_index,
-                item_index,
-                num,
-                fieldnum,
-            });
+        // Tag target and value in-place on GuardPendingFieldEntry.
+        for pf in pending_setfields.iter_mut() {
+            let target = env.get_box_replacement(pf.target);
+            let value = env.get_box_replacement(pf.value);
+            pf.target_tagged = self._gettagged(target, env, &numb_state.liveboxes, &new_liveboxes);
+            pf.value_tagged = self._gettagged(value, env, &numb_state.liveboxes, &new_liveboxes);
         }
 
         // resume.py:447: numb_state.patch(1, len(liveboxes))
@@ -3496,20 +3484,7 @@ impl ResumeDataLoopMemo {
             })
             .collect();
 
-        // Merge numb_state.liveboxes + new_liveboxes for pending field tagging.
-        let mut combined_liveboxes = numb_state.liveboxes;
-        for (k, v) in new_liveboxes.iter() {
-            combined_liveboxes.insert(k, v);
-        }
-
-        (
-            rd_numb,
-            rd_consts,
-            rd_virtuals,
-            rd_pendingfields_tagged,
-            ordered_liveboxes,
-            combined_liveboxes,
-        )
+        (rd_numb, rd_consts, rd_virtuals, ordered_liveboxes)
     }
 
     /// resume.py:452-468 finish (on ResumeDataVirtualAdder) — encode with shared pool.
@@ -5230,8 +5205,8 @@ mod tests {
 
         let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
-        let (rd_numb, rd_consts, _rd_virtuals, _rd_pf, liveboxes, _liveboxes_map) =
-            memo.finish(numb_state, &env, &[], None);
+        let (rd_numb, rd_consts, _rd_virtuals, liveboxes) =
+            memo.finish(numb_state, &env, &mut [], None);
 
         // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)
         assert_eq!(liveboxes.len(), 2);

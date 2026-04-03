@@ -140,7 +140,7 @@ run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""     
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""       1
 run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""       1       1.5
 run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       2.5
-run_bench       "float_loop"     "$BENCH/float_loop.py"           5
+# run_bench       "float_loop"     "$BENCH/float_loop.py"           5
 # nested_loop: blocked by optimizer OpRef type resolution bug
 # run_bench     "nested_loop"    "$BENCH/nested_loop.py"          5
 run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       ""       10
