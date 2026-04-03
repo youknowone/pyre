@@ -1159,6 +1159,20 @@ pub fn derive_virtualizable_meta(input: TokenStream) -> TokenStream {
     virtualizable_derive::expand_meta(input).into()
 }
 
+/// Derive macro for virtualizable interpreter state structs.
+///
+/// Recognizes `#[vable(...)]` attributes:
+/// - `#[vable(frame)]` — frame pointer field (usize)
+/// - `#[vable(static_field = N)]` — state-backed VirtualizableInfo field at index N
+///
+/// Generates: `virt_export_static_boxes`, `virt_import_static_boxes`,
+/// `virt_export_all`.
+#[proc_macro_derive(VirtualizableState, attributes(vable))]
+pub fn derive_virtualizable_state(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    virtualizable_derive::expand_state(input).into()
+}
+
 #[cfg(test)]
 mod tests {
     // Proc macro crates cannot have unit tests that invoke the macros directly.

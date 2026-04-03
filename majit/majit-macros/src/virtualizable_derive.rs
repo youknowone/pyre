@@ -38,6 +38,8 @@ enum VableRole {
 struct VableField {
     ident: Ident,
     role: VableRole,
+    /// For `#[vable(static_field = N)]`: the VirtualizableInfo field index.
+    static_field_index: Option<usize>,
 }
 
 fn parse_vable_role(s: &str) -> Option<VableRole> {
@@ -55,6 +57,25 @@ fn parse_vable_role(s: &str) -> Option<VableRole> {
         "valuestackdepth" => Some(VableRole::Valuestackdepth),
         _ => None,
     }
+}
+
+/// Parse `#[vable(...)]` attribute content. Supports:
+/// - Simple keyword: `#[vable(frame)]`, `#[vable(inputarg)]`
+/// - Key-value: `#[vable(static_field = 0)]`
+fn parse_vable_attr(tokens_str: &str) -> Option<(VableRole, Option<usize>)> {
+    let s = tokens_str.trim();
+    // Try key = value format: "static_field = 0"
+    if let Some((key, val)) = s.split_once('=') {
+        let key = key.trim();
+        let val = val.trim();
+        if key == "static_field" {
+            let idx: usize = val.parse().ok()?;
+            return Some((VableRole::Frame, Some(idx))); // role overridden below
+        }
+        return None;
+    }
+    // Simple keyword
+    parse_vable_role(s).map(|role| (role, None))
 }
 
 fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
@@ -77,11 +98,16 @@ fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
             if !meta_list.path.is_ident("vable") {
                 continue;
             }
-            let role_str = meta_list.tokens.to_string();
-            if let Some(role) = parse_vable_role(role_str.trim()) {
+            let tokens_str = meta_list.tokens.to_string();
+            if let Some((mut role, static_idx)) = parse_vable_attr(&tokens_str) {
+                if static_idx.is_some() {
+                    // static_field = N → treat as a state-backed field
+                    role = VableRole::Inputarg; // state-backed
+                }
                 result.push(VableField {
                     ident: ident.clone(),
                     role,
+                    static_field_index: static_idx,
                 });
             }
         }
@@ -431,6 +457,123 @@ pub fn expand_meta(input: DeriveInput) -> TokenStream {
         impl #struct_name {
             #stack_only_depth
             #update_vsd
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// #[derive(VirtualizableState)]
+// ═══════════════════════════════════════════════════════════════
+
+pub fn expand_state(input: DeriveInput) -> TokenStream {
+    let struct_name = &input.ident;
+    let vable_fields = extract_vable_fields(&input);
+
+    let frame_field = vable_fields
+        .iter()
+        .find(|f| f.role == VableRole::Frame)
+        .map(|f| &f.ident);
+
+    // State-backed fields: those with static_field = N.
+    let state_backed: Vec<(&Ident, usize)> = vable_fields
+        .iter()
+        .filter_map(|f| f.static_field_index.map(|idx| (&f.ident, idx)))
+        .collect();
+
+    let frame_ident = frame_field
+        .cloned()
+        .unwrap_or_else(|| format_ident!("frame"));
+
+    // ── export_static_boxes: build Vec<i64> in VirtualizableInfo field order ──
+    // State-backed fields → read from self.
+    // Heap-only fields → read from frame via VirtualizableInfo offset.
+    let export_state_arms: Vec<TokenStream> = state_backed
+        .iter()
+        .map(|(ident, idx)| {
+            quote! { #idx => self.#ident as i64, }
+        })
+        .collect();
+
+    // ── import_static_boxes: write state-backed fields from boxes ──
+    let import_writes: Vec<TokenStream> = state_backed
+        .iter()
+        .map(|(ident, idx)| {
+            quote! {
+                if let Some(&__v) = static_boxes.get(#idx) {
+                    self.#ident = __v as usize;
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        impl #struct_name {
+            /// Export all virtualizable static field values as i64.
+            ///
+            /// State-backed fields (annotated with `#[vable(static_field = N)]`)
+            /// are read from `self`. Heap-only fields are read from the frame
+            /// via VirtualizableInfo field offsets.
+            pub fn virt_export_static_boxes(
+                &self,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> Vec<i64> {
+                let n = info.num_fields();
+                let heap_ptr = if self.#frame_ident != 0 {
+                    Some(self.#frame_ident as *const u8)
+                } else {
+                    None
+                };
+                let mut boxes = Vec::with_capacity(n);
+                for __i in 0..n {
+                    let val: i64 = match __i {
+                        #(#export_state_arms)*
+                        _ => {
+                            // Heap-only: read from frame via offset.
+                            heap_ptr.map_or(0, |ptr| unsafe {
+                                *(ptr.add(info.static_fields[__i].offset) as *const usize) as i64
+                            })
+                        }
+                    };
+                    boxes.push(val);
+                }
+                boxes
+            }
+
+            /// Import virtualizable static field values from boxes.
+            ///
+            /// Only writes state-backed fields. Heap-only (immutable) fields
+            /// are skipped.
+            pub fn virt_import_static_boxes(&mut self, static_boxes: &[i64]) {
+                #(#import_writes)*
+            }
+
+            /// Export full virtualizable state: (static_boxes, array_boxes).
+            ///
+            /// Reads state-backed fields from self, heap-only fields and arrays
+            /// from the frame.
+            pub fn virt_export_all(
+                &self,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> (Vec<i64>, Vec<Vec<i64>>) {
+                let static_boxes = self.virt_export_static_boxes(info);
+                let heap_ptr = if self.#frame_ident != 0 {
+                    Some(self.#frame_ident as *const u8)
+                } else {
+                    None
+                };
+                let array_boxes = if let Some(ptr) = heap_ptr {
+                    if info.can_read_all_array_lengths_from_heap() {
+                        let lengths = unsafe { info.read_array_lengths_from_heap(ptr) };
+                        let (_, arrays) = unsafe { info.read_all_boxes(ptr, &lengths) };
+                        arrays
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                (static_boxes, array_boxes)
+            }
         }
     }
 }

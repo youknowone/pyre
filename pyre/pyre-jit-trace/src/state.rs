@@ -721,14 +721,16 @@ use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_v
 ///
 /// Built from `PyFrame` before calling `back_edge`, and synced back
 /// after compiled code runs.
+#[derive(majit_macros::VirtualizableState)]
 pub struct PyreJitState {
-    /// Opaque pointer to the owning PyFrame heap object.
+    #[vable(frame)]
     pub frame: usize,
-    /// Current instruction index.
+    #[vable(static_field = 0)]
     pub next_instr: usize,
-    /// Absolute index into `locals_cells_stack_w` marking stack top.
-    /// Starts at `nlocals` (empty stack), grows upward on push.
+    // VirtualizableInfo fields[1] = code (heap-only, not in state)
+    #[vable(static_field = 2)]
     pub valuestackdepth: usize,
+    // VirtualizableInfo fields[3] = namespace (heap-only, not in state)
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -7557,24 +7559,13 @@ impl PyreJitState {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) -> bool {
-        // virtualizable.py:86 read_boxes: all static fields in declared order.
-        let vf = crate::virtualizable_gen::VABLE_FIELD_SPECS;
-        let Some(&next_instr) = static_boxes.get(vf[0].1) else {
-            return false;
-        };
-        // code — immutable, no import needed
-        let Some(&valuestackdepth) = static_boxes.get(vf[2].1) else {
-            return false;
-        };
-        // namespace — immutable, no import needed
-        // Single unified array: locals_cells_stack_w
+        // State-backed fields: write from static_boxes.
+        self.virt_import_static_boxes(static_boxes);
+
+        // Array: write to frame heap.
         let Some(unified) = array_boxes.first() else {
             return false;
         };
-
-        self.next_instr = next_instr as usize;
-        self.valuestackdepth = valuestackdepth as usize;
-
         let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
             return false;
         };
@@ -7595,20 +7586,8 @@ impl PyreJitState {
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
-        let code_ptr = self.read_frame_usize(PYFRAME_CODE_OFFSET).unwrap_or(0);
-        let ns_ptr = self.read_frame_usize(PYFRAME_NAMESPACE_OFFSET).unwrap_or(0);
-        let static_boxes = vec![
-            self.next_instr as i64,
-            code_ptr as i64,
-            self.valuestackdepth as i64,
-            ns_ptr as i64,
-        ];
-        let array_boxes = vec![
-            self.locals_cells_stack_array()
-                .map(|arr| arr.as_slice().iter().map(|&value| value as i64).collect())
-                .unwrap_or_default(),
-        ];
-        (static_boxes, array_boxes)
+        let info = crate::virtualizable_gen::build_virtualizable_info();
+        self.virt_export_all(&info)
     }
 
     pub fn sync_from_virtualizable(&mut self, info: &VirtualizableInfo) -> bool {
