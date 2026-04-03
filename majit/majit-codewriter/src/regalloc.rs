@@ -1,11 +1,11 @@
-//! Register allocation for flattened JitCode.
+//! Register allocation for flattened JitCode — scaffold.
 //!
 //! RPython equivalent: `rpython/jit/codewriter/regalloc.py`.
 //!
-//! Assigns register indices (colors) to each ValueId, separated by kind
-//! (int/ref/float). This is a thin wrapper around a graph-coloring
-//! algorithm that operates on the interference graph implied by the
-//! flattened instruction sequence.
+//! **Status: scaffold.** Currently assigns one register per value (no reuse).
+//! RPython's regalloc.py delegates to `rpython.tool.algo.regalloc` which does
+//! actual graph-coloring with interference analysis and register reuse.
+//! This module will need the same when JitCode bytecode encoding is implemented.
 
 use std::collections::HashMap;
 

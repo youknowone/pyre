@@ -1,13 +1,13 @@
-//! Graph inlining — substitute Call ops with callee body graphs.
+//! Graph inlining utility — substitute Call ops with callee body graphs.
 //!
-//! RPython equivalent: the flow space (`rpython/flowspace/`) auto-inlines
-//! function calls during abstract interpretation, producing flat graphs
-//! with low-level operations. Since Rust has no flow space, this module
-//! provides explicit graph-level inlining that achieves the same result.
+//! **Note:** RPython's codewriter does NOT inline callee bodies into callers.
+//! Instead, `jtransform.py` rewrites `direct_call` to `inline_call_*`
+//! (referencing the callee's JitCode) and the meta-interpreter descends
+//! into callee JitCode at runtime.
 //!
-//! After inlining, the graph contains raw `FieldRead`/`ArrayRead`/etc.
-//! operations from callee bodies, which `jtransform` can then rewrite
-//! to JIT-specific instructions (e.g. `VableFieldRead`, `VableArrayRead`).
+//! This module provides graph-level body splicing for use cases where
+//! actual body expansion is needed (e.g. analysis, testing). It is NOT
+//! part of the RPython-orthodox codewriter pipeline.
 
 use std::collections::HashMap;
 

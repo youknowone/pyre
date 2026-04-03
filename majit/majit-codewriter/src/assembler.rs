@@ -1,9 +1,11 @@
-//! JitCode assembler — converts flattened SSARepr to JitCode bytecode.
+//! JitCode assembler — scaffold for converting SSARepr to JitCode bytecode.
 //!
 //! RPython equivalent: `rpython/jit/codewriter/assembler.py` class `Assembler`.
 //!
-//! Takes a `FlattenedFunction` (the SSARepr) and register allocation results,
-//! and produces a `JitCode` containing bytecode, constant pools, and metadata.
+//! **Status: scaffold only.** Currently produces metadata-only JitCode (register
+//! counts, name). Full bytecode encoding (`write_insn`, `fix_labels`, liveness
+//! encoding) is not yet implemented — RPython assembler.py does ~300 lines of
+//! instruction encoding that this module does not replicate.
 
 use std::collections::HashMap;
 
