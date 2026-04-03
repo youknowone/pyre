@@ -106,7 +106,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalRead),
+        role: Some(CallPatternRole::StackManip),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -114,7 +114,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalWrite),
+        role: Some(CallPatternRole::StackManip),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {

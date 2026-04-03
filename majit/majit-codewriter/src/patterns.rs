@@ -511,28 +511,29 @@ pub fn classify_from_graph_with_config(
         return Some(TracePattern::IterCleanup);
     }
 
-    // Return (few ops ending in Return terminator)
-    if matches!(&entry.terminator, crate::graph::Terminator::Return(Some(_))) && ops.len() <= 5 {
-        if any_call_has_role(CallPatternRole::Return) {
-            return Some(TracePattern::Return);
-        }
+    // Return
+    if any_call_has_role(CallPatternRole::Return) {
+        return Some(TracePattern::Return);
     }
 
-    // Conditional jump (guard + pc/next_instr write)
-    if has_guard
-        && field_writes
+    // Jump detection: field write to InstructionPosition OR call to set_next_instr
+    let has_pc_write = field_writes
+        .iter()
+        .any(|field| field_has_role(config, field, FieldPatternRole::InstructionPosition))
+        || unclassified_call_targets
             .iter()
-            .any(|field| field_has_role(config, field, FieldPatternRole::InstructionPosition))
-    {
+            .any(|t| crate::call_match::is_jump_target(t))
+        || call_descriptors
+            .iter()
+            .any(|d| crate::call_match::is_jump_target(&d.target));
+
+    // Conditional jump (guard/truth check + pc write)
+    if (has_guard || any_call_has_role(CallPatternRole::TruthCheck)) && has_pc_write {
         return Some(TracePattern::ConditionalJump);
     }
 
     // Unconditional jump (pc write without guard)
-    if !has_guard
-        && field_writes
-            .iter()
-            .any(|field| field_has_role(config, field, FieldPatternRole::InstructionPosition))
-    {
+    if !has_guard && has_pc_write {
         return Some(TracePattern::Jump);
     }
 
