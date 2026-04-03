@@ -216,6 +216,22 @@ impl Snapshot {
         }
     }
 
+    /// Create a multi-frame snapshot from (jitcode_index, pc, boxes) tuples.
+    pub fn multi_frame(frames: Vec<(i32, i32, Vec<majit_ir::OpRef>)>) -> Self {
+        Snapshot {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            framestack: frames
+                .into_iter()
+                .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
+                    jitcode_index,
+                    pc,
+                    boxes,
+                })
+                .collect(),
+        }
+    }
+
     /// Estimated encoded size for NumberingState capacity hint.
     pub fn estimated_size(&self) -> usize {
         let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 2).sum();
@@ -3134,9 +3150,10 @@ impl ResumeDataLoopMemo {
     ) -> (
         Vec<u8>,
         Vec<(i64, majit_ir::Type)>,
-        Vec<VirtualFieldValues>,
+        Vec<majit_ir::RdVirtualInfo>,
         Vec<TaggedPendingField>,
         Vec<majit_ir::OpRef>,
+        LiveboxMap,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -3161,6 +3178,9 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern).
         let mut virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo> = HashMap::new();
 
+        // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
+        let mut virtual_worklist: Vec<u32> = Vec::new();
+
         for &(opref_id, tagged) in &sorted_liveboxes {
             let (i, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
@@ -3169,21 +3189,49 @@ impl ResumeDataLoopMemo {
                 }
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
-                // resume.py:419-426: info.visitor_walk_recursive(box, self)
-                if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
-                    // resume.py:362-368: register_virtual_fields
-                    for &field_opref in &vf.field_oprefs {
-                        // resume.py:370-374: register_box
-                        self.register_box_in_new_liveboxes(
-                            field_opref,
-                            env,
-                            &numb_state.liveboxes,
-                            &mut new_liveboxes,
-                            &mut new_liveboxes_order,
-                        );
+                virtual_worklist.push(opref_id);
+            }
+        }
+
+        // Worklist-based recursive virtual discovery (RPython visitor_walk_recursive).
+        // Process each virtual: register its field boxes, and if any field is
+        // itself a virtual, add it to the worklist for later processing.
+        let mut worklist_idx = 0;
+        while worklist_idx < virtual_worklist.len() {
+            let opref_id = virtual_worklist[worklist_idx];
+            worklist_idx += 1;
+
+            if virtual_fields.contains_key(&opref_id) {
+                continue; // already_seen_virtual
+            }
+            if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
+                // resume.py:362-368: register_virtual_fields
+                for &field_opref in &vf.field_oprefs {
+                    // resume.py:370-374: register_box
+                    self.register_box_in_new_liveboxes(
+                        field_opref,
+                        env,
+                        &numb_state.liveboxes,
+                        &mut new_liveboxes,
+                        &mut new_liveboxes_order,
+                    );
+                    // If field is a virtual, add to worklist for recursive processing
+                    let resolved = env.get_box_replacement(field_opref);
+                    if !resolved.is_none()
+                        && !virtual_fields.contains_key(&resolved.0)
+                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                    {
+                        // Assign TAGVIRTUAL to nested virtual
+                        if numb_state.liveboxes.get(resolved.0).is_none()
+                            && new_liveboxes.get(resolved.0).is_none()
+                        {
+                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.0);
+                        }
+                        virtual_worklist.push(resolved.0);
                     }
-                    virtual_fields.insert(opref_id, vf);
                 }
+                virtual_fields.insert(opref_id, vf);
             }
         }
 
@@ -3262,21 +3310,32 @@ impl ResumeDataLoopMemo {
         let nholes = new_boxes_list.len() - count;
 
         // resume.py:488-506: create rd_virtuals
-        let mut rd_virtuals = Vec::new();
+        // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
+        let mut rd_virtuals: Vec<majit_ir::RdVirtualInfo> = Vec::new();
         if !virtual_fields.is_empty() {
             let length = num_env_virtuals as usize + self.cached_virtuals.len();
-            rd_virtuals.resize_with(length, VirtualFieldValues::default);
+            rd_virtuals.resize(length, majit_ir::RdVirtualInfo::Empty);
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
 
             for (&opref_id, vf) in &virtual_fields {
                 // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
+                // Check both numb_state.liveboxes (env virtuals) and
+                // new_liveboxes (nested virtuals discovered via worklist).
                 let tagged = numb_state
                     .liveboxes
                     .get(opref_id)
+                    .or_else(|| new_liveboxes.get(opref_id))
                     .unwrap_or(UNASSIGNEDVIRTUAL);
                 let (num, _) = untag(tagged);
-                if num >= 0 && (num as usize) < rd_virtuals.len() {
+                // RPython uses Python negative indexing: virtuals[-1] = virtuals[len-1].
+                // Negative nums come from assign_number_to_virtual for nested virtuals.
+                let num_idx = if num >= 0 {
+                    num as usize
+                } else {
+                    (rd_virtuals.len() as i32 + num) as usize
+                };
+                if num_idx < rd_virtuals.len() {
                     // resume.py:500: fieldnums = [self._gettagged(box) for box in fieldboxes]
                     let fieldnums: Vec<i16> = vf
                         .field_oprefs
@@ -3313,11 +3372,12 @@ impl ResumeDataLoopMemo {
                             UNASSIGNED
                         })
                         .collect();
-                    rd_virtuals[num as usize] = VirtualFieldValues {
-                        descr: vf.descr.clone(),
-                        known_class: vf.known_class.map(|gc| gc.0 as i64),
-                        fieldnums,
-                    };
+                    // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
+                    if let Some(rd_virt) =
+                        env.make_rd_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
+                    {
+                        rd_virtuals[num_idx] = rd_virt;
+                    }
                 }
             }
         }
@@ -3436,12 +3496,19 @@ impl ResumeDataLoopMemo {
             })
             .collect();
 
+        // Merge numb_state.liveboxes + new_liveboxes for pending field tagging.
+        let mut combined_liveboxes = numb_state.liveboxes;
+        for (k, v) in new_liveboxes.iter() {
+            combined_liveboxes.insert(k, v);
+        }
+
         (
             rd_numb,
             rd_consts,
             rd_virtuals,
             rd_pendingfields_tagged,
             ordered_liveboxes,
+            combined_liveboxes,
         )
     }
 
@@ -5163,7 +5230,7 @@ mod tests {
 
         let snapshot = Snapshot::single_frame(8, vec![OpRef(10001), OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env).unwrap();
-        let (rd_numb, rd_consts, _rd_virtuals, _rd_pf, liveboxes) =
+        let (rd_numb, rd_consts, _rd_virtuals, _rd_pf, liveboxes, _liveboxes_map) =
             memo.finish(numb_state, &env, &[], None);
 
         // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)

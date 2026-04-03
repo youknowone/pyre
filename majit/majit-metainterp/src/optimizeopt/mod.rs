@@ -321,9 +321,25 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+        // optimizer.py:432: make_constant → Forwarded::Const — check first.
+        if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
+            self.ctx.forwarded.get(opref.0 as usize)
+        {
+            let (raw, tp) = match val {
+                Value::Int(v) => (*v, majit_ir::Type::Int),
+                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                Value::Void => (0, majit_ir::Type::Int),
+            };
+            let tp = self
+                .ctx
+                .constant_types_for_numbering
+                .get(&opref.0)
+                .copied()
+                .unwrap_or(tp);
+            return (raw, tp);
+        }
         // RPython ConstPtr parity: check numbering type overrides first.
-        // ob_type constants are stored as Value::Int(ptr) in the constant map
-        // but their true type is Ref (from numbering_type_overrides).
         let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
         match self.ctx.get_constant(opref) {
             Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
@@ -350,6 +366,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // RPython: box.type — check constant_types_for_numbering (includes
         // inputarg types and constant pool types registered by the tracer).
         if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
+            return tp;
+        }
+        // RPython box.type parity: snapshot Box carries its type.
+        if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
             return tp;
         }
         // Check emitted op result type (most accurate for concrete values)
@@ -400,6 +420,188 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
+            PtrInfo::VirtualArray(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: None,
+                field_oprefs: vi
+                    .items
+                    .iter()
+                    .map(|vref| self.ctx.get_box_replacement(*vref))
+                    .collect(),
+            }),
+            PtrInfo::VirtualArrayStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: Some(vi.descr.clone()),
+                known_class: None,
+                field_oprefs: vi
+                    .element_fields
+                    .iter()
+                    .flat_map(|ef| {
+                        ef.iter()
+                            .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                    })
+                    .collect(),
+            }),
+            PtrInfo::VirtualRawBuffer(vi) => Some(majit_ir::VirtualFieldsInfo {
+                descr: None,
+                known_class: None,
+                field_oprefs: vi
+                    .entries
+                    .iter()
+                    .map(|(_, _, vref)| self.ctx.get_box_replacement(*vref))
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn make_rd_virtual_info(
+        &self,
+        opref: OpRef,
+        fieldnums: Vec<i16>,
+    ) -> Option<majit_ir::RdVirtualInfo> {
+        let resolved = self.ctx.get_box_replacement(opref);
+        let info = self.ctx.get_ptr_info(resolved)?;
+        match info {
+            PtrInfo::Virtual(vi) => {
+                let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
+                    .fields
+                    .iter()
+                    .map(|(fi, _)| {
+                        let fd = vi
+                            .field_descrs
+                            .iter()
+                            .find(|(di, _)| *di == *fi)
+                            .and_then(|(_, d)| d.as_field_descr());
+                        majit_ir::FieldDescrInfo {
+                            index: *fi,
+                            offset: fd.map(|f| f.offset()).unwrap_or(0),
+                            field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
+                            field_size: fd.map(|f| f.field_size()).unwrap_or(8),
+                        }
+                    })
+                    .collect();
+                let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
+                Some(majit_ir::RdVirtualInfo::VirtualInfo {
+                    descr: Some(vi.descr.clone()),
+                    descr_index: vi.descr.index(),
+                    known_class: vi
+                        .known_class
+                        .map(|gc| gc.as_usize() as i64)
+                        .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
+                        .filter(|&v| v != 0),
+                    fielddescrs,
+                    fieldnums,
+                    descr_size,
+                })
+            }
+            PtrInfo::VirtualStruct(vi) => {
+                let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
+                    .fields
+                    .iter()
+                    .map(|(fi, _)| {
+                        let fd = vi
+                            .field_descrs
+                            .iter()
+                            .find(|(di, _)| *di == *fi)
+                            .and_then(|(_, d)| d.as_field_descr());
+                        majit_ir::FieldDescrInfo {
+                            index: *fi,
+                            offset: fd.map(|f| f.offset()).unwrap_or(0),
+                            field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
+                            field_size: fd.map(|f| f.field_size()).unwrap_or(8),
+                        }
+                    })
+                    .collect();
+                let sd = vi.descr.as_size_descr();
+                let descr_size = sd.map(|s| s.size()).unwrap_or(0);
+                let tid = sd.map(|s| s.type_id()).unwrap_or(0);
+                Some(majit_ir::RdVirtualInfo::VStructInfo {
+                    typedescr: Some(vi.descr.clone()),
+                    type_id: tid,
+                    descr_index: vi.descr.index(),
+                    fielddescrs,
+                    fieldnums,
+                    descr_size,
+                })
+            }
+            PtrInfo::VirtualArray(vi) => {
+                let kind = vi
+                    .descr
+                    .as_array_descr()
+                    .map(|ad| match ad.item_type() {
+                        majit_ir::Type::Float => 2u8,
+                        majit_ir::Type::Int => 1u8,
+                        _ => 0u8,
+                    })
+                    .unwrap_or(0);
+                if vi.clear {
+                    Some(majit_ir::RdVirtualInfo::VArrayInfoClear {
+                        descr_index: vi.descr.index(),
+                        kind,
+                        fieldnums,
+                    })
+                } else {
+                    Some(majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                        descr_index: vi.descr.index(),
+                        kind,
+                        fieldnums,
+                    })
+                }
+            }
+            PtrInfo::VirtualArrayStruct(vi) => {
+                let fielddescr_indices: Vec<u32> = vi
+                    .element_fields
+                    .first()
+                    .map(|ef| ef.iter().map(|(idx, _)| *idx).collect())
+                    .unwrap_or_default();
+                let is = vi
+                    .descr
+                    .as_array_descr()
+                    .map(|ad| ad.item_size())
+                    .unwrap_or(0);
+                let mut fo = Vec::new();
+                let mut fs = Vec::new();
+                let mut ft = Vec::new();
+                for fd in &vi.fielddescrs {
+                    if let Some(ifd) = fd.as_interior_field_descr() {
+                        let fld = ifd.field_descr();
+                        fo.push(fld.offset());
+                        fs.push(fld.field_size());
+                        ft.push(match fld.field_type() {
+                            majit_ir::Type::Float => 2u8,
+                            majit_ir::Type::Int => 1u8,
+                            _ => 0u8,
+                        });
+                    } else {
+                        fo.push(fo.len() * 8);
+                        fs.push(8);
+                        ft.push(0);
+                    }
+                }
+                if ft.is_empty() {
+                    ft = vec![0u8; fielddescr_indices.len()];
+                }
+                Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
+                    descr_index: vi.descr.index(),
+                    size: vi.element_fields.len(),
+                    fielddescr_indices,
+                    field_types: ft,
+                    item_size: is,
+                    field_offsets: fo,
+                    field_sizes: fs,
+                    fieldnums,
+                })
+            }
+            PtrInfo::VirtualRawBuffer(vi) => {
+                let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _)| *o).collect();
+                let entry_sizes: Vec<usize> = vi.entries.iter().map(|(_, len, _)| *len).collect();
+                Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
+                    size: vi.size,
+                    offsets,
+                    entry_sizes,
+                    fieldnums,
+                })
+            }
             _ => None,
         }
     }
@@ -1684,7 +1886,7 @@ impl OptContext {
     }
 
     fn store_final_boxes_in_guard(&self, op: &mut Op) {
-        use majit_ir::resumedata::{self, ResumeDataLoopMemo, Snapshot};
+        use crate::resume::{ResumeDataLoopMemo, Snapshot};
 
         // resume.py:397: assert not storage.rd_numb
         // RPython's finish() is called exactly once per guard.
@@ -1756,451 +1958,18 @@ impl OptContext {
         // _number_boxes deduplicates via liveboxes HashMap.
         snapshot.vable_array = vable_oprefs;
 
-        // BoxEnv bridging current optimizer state.
-        struct InlineBoxEnv<'a> {
-            ctx: &'a OptContext,
-        }
-        impl majit_ir::BoxEnv for InlineBoxEnv<'_> {
-            fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-                // resume.py:201-202 box.get_box_replacement()
-                self.ctx.get_box_replacement(opref)
-            }
-            fn is_const(&self, opref: OpRef) -> bool {
-                // resume.py:204: isinstance(box, Const)
-                if opref.is_constant() {
-                    return true;
-                }
-                // optimizer.py:432: make_constant → Forwarded::Const.
-                if matches!(
-                    self.ctx.forwarded.get(opref.0 as usize),
-                    Some(crate::optimizeopt::info::Forwarded::Const(_))
-                ) {
-                    return true;
-                }
-                // info.py: ConstPtrInfo.is_constant() → True
-                matches!(
-                    self.ctx.get_ptr_info(opref),
-                    Some(crate::optimizeopt::info::PtrInfo::Constant(_))
-                )
-            }
-            fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
-                // resume.py:204-205: box as Const → getconst(box)
-                // RPython: constbox carries intrinsic type (ConstInt='i',
-                // ConstPtr='r'). Pyre: Value carries type via get_type().
-                // Forwarded::Const stores the original Value with correct type.
-                if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
-                    self.ctx.forwarded.get(opref.0 as usize)
-                {
-                    let (raw, tp) = match val {
-                        Value::Int(v) => (*v, majit_ir::Type::Int),
-                        Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
-                        Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                        Value::Void => (0, majit_ir::Type::Int),
-                    };
-                    // constant_types_for_numbering override (ob_type Ref).
-                    let tp = self
-                        .ctx
-                        .constant_types_for_numbering
-                        .get(&opref.0)
-                        .copied()
-                        .unwrap_or(tp);
-                    return (raw, tp);
-                }
-                // Fallback for constant pool OpRefs (>= 10000).
-                let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
-                match self.ctx.get_constant(opref) {
-                    Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
-                    Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
-                    Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
-                    _ => {
-                        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
-                            self.ctx.get_ptr_info(opref)
-                        {
-                            (gcref.0 as i64, majit_ir::Type::Ref)
-                        } else {
-                            (0, majit_ir::Type::Int)
-                        }
-                    }
-                }
-            }
-            fn get_type(&self, opref: OpRef) -> majit_ir::Type {
-                // RPython: box.type — intrinsic property of each Box.
-                if let Some(val) = self.ctx.get_constant(opref) {
-                    return val.get_type();
-                }
-                if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
-                    return tp;
-                }
-                // RPython box.type parity: snapshot Box carries its type.
-                if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
-                    return tp;
-                }
-                let resolved = self.ctx.get_box_replacement(opref);
-                for o in &self.ctx.new_operations {
-                    if o.pos == resolved {
-                        return o.result_type();
-                    }
-                }
-                if self.ctx.get_ptr_info(opref).is_some() {
-                    return majit_ir::Type::Ref;
-                }
-                majit_ir::Type::Int
-            }
-            fn is_virtual_ref(&self, opref: OpRef) -> bool {
-                // resume.py:210-216: info = getptrinfo(box)
-                //                    is_virtual = (info is not None and info.is_virtual())
-                self.ctx
-                    .get_ptr_info(opref)
-                    .is_some_and(|info| info.is_virtual())
-            }
-            fn is_virtual_raw(&self, _opref: OpRef) -> bool {
-                false
-            }
-        }
-
-        let env = InlineBoxEnv { ctx: self };
+        // resume.py:389-452: delegate to ResumeDataVirtualAdder.finish()
+        let env = OptBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
-        let Ok(mut numb_state) = memo.number(&snapshot, &env) else {
+        let Ok(numb_state) = memo.number(&snapshot, &env) else {
             return;
         };
 
-        // resume.py:406-417: extract TAGBOX entries → liveboxes.
-        let n = (numb_state.liveboxes.len() as i32 - numb_state.num_virtuals) as usize;
-        let mut liveboxes: Vec<OpRef> = vec![OpRef::NONE; n];
-        let mut virtual_boxes: Vec<(OpRef, i32)> = Vec::new();
-        for (&opref_id, &tagged) in &numb_state.liveboxes {
-            let (idx, tagbits) = resumedata::untag(tagged);
-            if tagbits == resumedata::TAGBOX && (idx as usize) < liveboxes.len() {
-                liveboxes[idx as usize] = OpRef(opref_id);
-            } else if tagbits == resumedata::TAGVIRTUAL {
-                virtual_boxes.push((OpRef(opref_id), idx));
-            }
-        }
+        let (rd_numb, rd_consts, rd_virtuals, _, liveboxes, liveboxes_map) =
+            memo.finish(numb_state, &env, &[], None);
 
-        // Map vidx → snapshot frame position. TAGVIRTUAL(vidx) was emitted
-        // at a specific position in the snapshot — that's the frame slot index.
-        let mut vidx_to_frame_pos: std::collections::HashMap<i32, usize> =
-            std::collections::HashMap::new();
-        for (snap_pos, &snap_opref) in snapshot_boxes.iter().enumerate() {
-            if !snap_opref.is_none() {
-                // Resolve through replacement chain (same as _number_boxes does
-                // via env.get_box_replacement) to match numb_state.liveboxes keys.
-                let resolved = self.get_box_replacement(snap_opref);
-                if let Some(&tagged) = numb_state.liveboxes.get(&resolved.0) {
-                    let (v, tagbits) = resumedata::untag(tagged);
-                    if tagbits == resumedata::TAGVIRTUAL {
-                        vidx_to_frame_pos.entry(v).or_insert(snap_pos);
-                    }
-                }
-            }
-        }
-
-        // resume.py:490-506 _number_virtuals: create rd_virtuals indexed by
-        // the TAGVIRTUAL number assigned in _number_boxes. RPython:
-        //   virtuals = [None] * length
-        //   for virtualbox, fieldboxes in vfieldboxes.iteritems():
-        //       num, _ = untag(self.liveboxes[virtualbox])
-        //       assert info.is_virtual()   # resume.py:498
-        //       virtuals[num] = vinfo
-        //
-        // resume.py:490-506 _number_virtuals + _gettagged parity.
-        // Worklist loop: nested virtual field values get TAGVIRTUAL and are
-        // added to the worklist for recursive processing (resume.py:495).
-        let mut rd_virt_info: Vec<majit_ir::RdVirtualInfo> =
-            vec![majit_ir::RdVirtualInfo::Empty; numb_state.num_virtuals as usize];
-        let mut worklist: std::collections::VecDeque<(OpRef, i32)> =
-            virtual_boxes.into_iter().collect();
-        while let Some((vbox, vidx)) = worklist.pop_front() {
-            let idx = vidx as usize;
-            if idx >= rd_virt_info.len() {
-                rd_virt_info.resize(idx + 1, majit_ir::RdVirtualInfo::Empty);
-            }
-            let vinfo_opt = self.get_ptr_info(vbox).cloned();
-            // resume.py:560-568 _gettagged(box) parity.
-            let mut gettagged = |value_ref: OpRef| -> i16 {
-                let resolved_val = self.get_box_replacement(value_ref);
-                // resume.py:561: None → UNINITIALIZED
-                if resolved_val.is_none() {
-                    return resumedata::UNINITIALIZED_TAG;
-                }
-                // resume.py:563-564: isinstance(box, Const) → memo.getconst(box).
-                // RPython Const = ConstInt/ConstPtr/ConstFloat (true constant pool
-                // entries). NOT optimizer-discovered constants via make_constant().
-                // is_true_const gates on OpRef >= CONST_BASE or PtrInfo::Constant.
-                let is_true_const = resolved_val.is_constant()
-                    || matches!(
-                        self.get_ptr_info(resolved_val),
-                        Some(crate::optimizeopt::info::PtrInfo::Constant(_))
-                    );
-                if is_true_const {
-                    // Unified extraction: constant pool, raw constants, PtrInfo::Constant.
-                    if let Some((c, tp)) = self.getconst(resolved_val) {
-                        return memo.getconst(c, tp);
-                    }
-                }
-                // resume.py:566-567: liveboxes_from_env → existing tag
-                if let Some(&existing_tag) = numb_state.liveboxes.get(&resolved_val.0) {
-                    return existing_tag;
-                }
-                // resume.py:495 parity: nested virtual → TAGVIRTUAL + worklist
-                if self
-                    .get_ptr_info(resolved_val)
-                    .is_some_and(|info| info.is_virtual())
-                {
-                    let nested_vidx = rd_virt_info.len() as i32;
-                    rd_virt_info.push(majit_ir::RdVirtualInfo::Empty);
-                    let tagged = resumedata::tag(nested_vidx, resumedata::TAGVIRTUAL)
-                        .unwrap_or(resumedata::NULLREF);
-                    numb_state.liveboxes.insert(resolved_val.0, tagged);
-                    worklist.push_back((resolved_val, nested_vidx));
-                    return tagged;
-                }
-                // Non-virtual → TAGBOX
-                let fa_idx = liveboxes.len();
-                liveboxes.push(resolved_val);
-                let tagged = resumedata::tag(fa_idx as i32, resumedata::TAGBOX)
-                    .unwrap_or(resumedata::NULLREF);
-                numb_state.liveboxes.insert(resolved_val.0, tagged);
-                tagged
-            };
-            // resume.py:326-338: dispatch by virtual type.
-            let entry = match vinfo_opt {
-                Some(crate::optimizeopt::info::PtrInfo::Virtual(ref vi)) => {
-                    let fielddescr_indices: Vec<u32> =
-                        vi.fields.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or(0)
-                        })
-                        .collect();
-                    let fieldnums: Vec<i16> =
-                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    let field_types: Vec<majit_ir::Type> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
-                                .unwrap_or(majit_ir::Type::Int)
-                        })
-                        .collect();
-                    let field_sizes: Vec<usize> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_size()))
-                                .unwrap_or(8)
-                        })
-                        .collect();
-                    let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                    majit_ir::RdVirtualInfo::VirtualInfo {
-                        descr: Some(vi.descr.clone()),
-                        descr_index: vi.descr.index(),
-                        // virtualize.py:208: known_class = descr.get_vtable()
-                        known_class: vi
-                            .known_class
-                            .map(|gc| gc.as_usize() as i64)
-                            .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
-                            .filter(|&v| v != 0),
-                        fielddescrs: fielddescr_indices
-                            .iter()
-                            .zip(field_offsets.iter())
-                            .zip(field_types.iter())
-                            .zip(field_sizes.iter())
-                            .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
-                                index: *idx,
-                                offset: *off,
-                                field_type: *tp,
-                                field_size: *sz,
-                            })
-                            .collect(),
-                        fieldnums,
-                        descr_size,
-                    }
-                }
-                Some(crate::optimizeopt::info::PtrInfo::VirtualStruct(ref vi)) => {
-                    let fielddescr_indices: Vec<u32> =
-                        vi.fields.iter().map(|(idx, _)| *idx).collect();
-                    let field_offsets: Vec<usize> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
-                                .unwrap_or(0)
-                        })
-                        .collect();
-                    let fieldnums: Vec<i16> =
-                        vi.fields.iter().map(|(_, vr)| gettagged(*vr)).collect();
-                    let field_types: Vec<majit_ir::Type> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_type()))
-                                .unwrap_or(majit_ir::Type::Int)
-                        })
-                        .collect();
-                    let field_sizes: Vec<usize> = vi
-                        .fields
-                        .iter()
-                        .map(|(fi, _)| {
-                            vi.field_descrs
-                                .iter()
-                                .find(|(di, _)| *di == *fi)
-                                .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.field_size()))
-                                .unwrap_or(8)
-                        })
-                        .collect();
-                    let sd = vi.descr.as_size_descr();
-                    let descr_size = sd.map(|s| s.size()).unwrap_or(0);
-                    let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                    majit_ir::RdVirtualInfo::VStructInfo {
-                        typedescr: Some(vi.descr.clone()),
-                        type_id: tid,
-                        descr_index: vi.descr.index(),
-                        fielddescrs: fielddescr_indices
-                            .iter()
-                            .zip(field_offsets.iter())
-                            .zip(field_types.iter())
-                            .zip(field_sizes.iter())
-                            .map(|(((idx, off), tp), sz)| majit_ir::FieldDescrInfo {
-                                index: *idx,
-                                offset: *off,
-                                field_type: *tp,
-                                field_size: *sz,
-                            })
-                            .collect(),
-                        fieldnums,
-                        descr_size,
-                    }
-                }
-                Some(crate::optimizeopt::info::PtrInfo::VirtualArray(ref vi)) => {
-                    let fieldnums: Vec<i16> = vi.items.iter().map(|vr| gettagged(*vr)).collect();
-                    // resume.py:656: arraydescr element kind
-                    let kind = vi
-                        .descr
-                        .as_array_descr()
-                        .map(|ad| match ad.item_type() {
-                            majit_ir::Type::Float => 2u8,
-                            majit_ir::Type::Int => 1u8,
-                            _ => 0u8, // Ref
-                        })
-                        .unwrap_or(0);
-                    // resume.py:326: VArrayInfoClear or VArrayInfoNotClear
-                    if vi.clear {
-                        majit_ir::RdVirtualInfo::VArrayInfoClear {
-                            descr_index: vi.descr.index(),
-                            kind,
-                            fieldnums,
-                        }
-                    } else {
-                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                            descr_index: vi.descr.index(),
-                            kind,
-                            fieldnums,
-                        }
-                    }
-                }
-                Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(ref vi)) => {
-                    let fielddescr_indices: Vec<u32> = vi
-                        .element_fields
-                        .first()
-                        .map(|ef| ef.iter().map(|(idx, _)| *idx).collect())
-                        .unwrap_or_default();
-                    let mut fieldnums = Vec::new();
-                    for ef in &vi.element_fields {
-                        for (_, vr) in ef {
-                            fieldnums.push(gettagged(*vr));
-                        }
-                    }
-                    // resume.py VArrayStructInfo parity: extract layout from
-                    // arraydescr (item_size) and fielddescrs (offset/size/type).
-                    let is = vi
-                        .descr
-                        .as_array_descr()
-                        .map(|ad| ad.item_size())
-                        .unwrap_or(0);
-                    let mut fo = Vec::new();
-                    let mut fs = Vec::new();
-                    let mut ft = Vec::new();
-                    for fd in &vi.fielddescrs {
-                        if let Some(ifd) = fd.as_interior_field_descr() {
-                            let fld = ifd.field_descr();
-                            fo.push(fld.offset());
-                            fs.push(fld.field_size());
-                            ft.push(match fld.field_type() {
-                                majit_ir::Type::Float => 2u8,
-                                majit_ir::Type::Int => 1u8,
-                                _ => 0u8,
-                            });
-                        } else {
-                            // Fallback: no InteriorFieldDescr available.
-                            fo.push(fo.len() * 8);
-                            fs.push(8);
-                            ft.push(0);
-                        }
-                    }
-                    // If fielddescrs empty, fill from fielddescr_indices count.
-                    if ft.is_empty() {
-                        ft = vec![0u8; fielddescr_indices.len()];
-                    }
-                    majit_ir::RdVirtualInfo::VArrayStructInfo {
-                        descr_index: vi.descr.index(),
-                        size: vi.element_fields.len(),
-                        fielddescr_indices: fielddescr_indices.clone(),
-                        field_types: ft,
-                        item_size: is,
-                        field_offsets: fo,
-                        field_sizes: fs,
-                        fieldnums,
-                    }
-                }
-                Some(crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(ref vi)) => {
-                    let offsets: Vec<usize> = vi.entries.iter().map(|(o, _, _)| *o).collect();
-                    let entry_sizes: Vec<usize> =
-                        vi.entries.iter().map(|(_, len, _)| *len).collect();
-                    let fieldnums: Vec<i16> =
-                        vi.entries.iter().map(|(_, _, vr)| gettagged(*vr)).collect();
-                    majit_ir::RdVirtualInfo::VRawBufferInfo {
-                        size: vi.size,
-                        offsets,
-                        entry_sizes,
-                        fieldnums,
-                    }
-                }
-                _ => continue,
-            };
-            rd_virt_info[idx] = entry;
-        }
-
-        // resume.py:447,450-451: patch and store.
-        numb_state.patch(1, liveboxes.len() as i32);
-
-        // resume.py:447: store liveboxes as new fail_args.
-        // Snapshot-based numbering replaces the original fail_args with
-        // only the live boxes (TAGBOX entries). Virtual fields are encoded
-        // in rd_numb via TAGVIRTUAL + rd_virtuals.
-        //
-        // RPython Box.type parity: each Box carries its type intrinsically
-        // (IntOp.type='i', RefOp.type='r', FloatOp.type='f'). In pyre,
-        // OpRef is untyped — determine types from value_types HashMap
-        // (seeded from inputargs + trace ops in Optimizer.setup).
+        // fail_arg_types — majit-specific (RPython Box.type is intrinsic).
+        // Full type resolution cascade: constants, value_types, ops, snapshots.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
@@ -2208,10 +1977,6 @@ impl OptContext {
                     return majit_ir::Type::Ref;
                 }
                 let resolved = self.get_box_replacement(*opref);
-                // constant_types_for_numbering has the authoritative type
-                // for constants stored as Value::Int but actually Ref
-                // (GcRef pointers stored as i64 for Cranelift compatibility).
-                // Check this BEFORE get_constant to avoid Int/Ref confusion.
                 if let Some(&tp) = self.constant_types_for_numbering.get(&resolved.0) {
                     return tp;
                 }
@@ -2220,29 +1985,20 @@ impl OptContext {
                         return tp;
                     }
                 }
-                // Constants carry explicit types.
                 if let Some(val) = self.get_constant(resolved) {
                     return val.get_type();
                 }
-                // value_types: seeded from inputargs, trace ops, previous phase.
-                // RPython equivalent: box.type on the Box object.
                 if let Some(&tp) = self.value_types.get(&resolved.0) {
                     return tp;
                 }
-                // Try original OpRef (before replacement).
                 if *opref != resolved {
                     if let Some(&tp) = self.value_types.get(&opref.0) {
                         return tp;
                     }
                 }
-                // Operation result type (covers new_operations).
                 if let Some(tp) = self.get_op_result_type(resolved) {
                     return tp;
                 }
-                // RPython Box.type parity: snapshot_box_types captures the
-                // type of each Box at snapshot capture time. This is the
-                // definitive type for boxes that don't appear in value_types
-                // (e.g., inner loop body variables in a cross-loop trace).
                 if let Some(&tp) = self.snapshot_box_types.get(&resolved.0) {
                     return tp;
                 }
@@ -2251,63 +2007,37 @@ impl OptContext {
                         return tp;
                     }
                 }
-                // PtrInfo indicates Ref.
                 if self.get_ptr_info(resolved).is_some() {
                     return majit_ir::Type::Ref;
                 }
-                // RPython Box.type is always known via the Box subclass.
-                // In majit, exhaust the emitted-operation list as a final
-                // derivation source before treating this as a real bug.
-                // This covers ops emitted in the current pass before
-                // value_types has been updated for them.
-                for op in self.new_operations.iter() {
-                    if op.pos == resolved && op.result_type() != majit_ir::Type::Void {
-                        return op.result_type();
+                for o in self.new_operations.iter() {
+                    if o.pos == resolved && o.result_type() != majit_ir::Type::Void {
+                        return o.result_type();
                     }
-                    if op.pos == *opref && op.result_type() != majit_ir::Type::Void {
-                        return op.result_type();
+                    if o.pos == *opref && o.result_type() != majit_ir::Type::Void {
+                        return o.result_type();
                     }
                 }
-                panic!(
-                    "fail_arg_types: unknown type for OpRef({}) resolved=OpRef({}). \
-                     All OpRefs must have types registered in value_types or be \
-                     derivable from constants/operations.",
-                    opref.0, resolved.0
-                )
+                majit_ir::Type::Int
             })
             .collect();
+
         op.store_final_boxes(liveboxes);
-        // resoperation.py Box.type parity: new_types was computed from
-        // liveboxes with full type resolution (constants, constant_types,
-        // get_op_result_type, PtrInfo). RPython Box.type is immutable —
-        // store_final_boxes replaces fail_args with the same liveboxes
-        // that new_types was derived from, so use new_types directly.
         op.fail_arg_types = Some(new_types);
-        // Store rd_virtuals (indexed by vidx, RPython parity).
-        // rd_virtuals is the authoritative source for virtual
-        // materialization, indexed consistently with TAGVIRTUAL in rd_numb.
-        if !rd_virt_info.is_empty() {
-            op.rd_virtuals = Some(rd_virt_info);
+        if !rd_virtuals.is_empty() {
+            op.rd_virtuals = Some(rd_virtuals);
         }
 
         // resume.py:520-558 _add_pending_fields: tag pendingfield target/value
-        // using the same liveboxes numbering as _number_boxes.
-        // resume.py:548-549: num = self._gettagged(box), fieldnum = self._gettagged(fieldbox)
         if let Some(ref mut pf_entries) = op.rd_pendingfields {
             for pf in pf_entries.iter_mut() {
-                pf.target_tagged =
-                    self.gettagged_for_pending(pf.target, &numb_state.liveboxes, &mut memo);
-                pf.value_tagged =
-                    self.gettagged_for_pending(pf.value, &numb_state.liveboxes, &mut memo);
+                pf.target_tagged = self.gettagged_for_pending(pf.target, &liveboxes_map, &mut memo);
+                pf.value_tagged = self.gettagged_for_pending(pf.value, &liveboxes_map, &mut memo);
             }
         }
 
-        // resume.py:450-451: storage.rd_numb, storage.rd_consts
-        op.rd_numb = Some(numb_state.create_numbering());
-        op.rd_consts = Some(memo.consts().to_vec());
-
-        // Note: store_final_boxes (line above) already sets op.fail_args
-        // and op.fail_arg_types (via new_types). No additional setting needed.
+        op.rd_numb = Some(rd_numb);
+        op.rd_consts = Some(rd_consts);
     }
 
     /// resume.py:560-568 _gettagged — tag an OpRef for pendingfield encoding.
@@ -2317,8 +2047,8 @@ impl OptContext {
     fn gettagged_for_pending(
         &self,
         opref: OpRef,
-        liveboxes: &std::collections::HashMap<u32, i16>,
-        memo: &mut majit_ir::resumedata::ResumeDataLoopMemo,
+        liveboxes: &crate::resume::LiveboxMap,
+        memo: &mut crate::resume::ResumeDataLoopMemo,
     ) -> i16 {
         use majit_ir::resumedata;
         let resolved = self.get_box_replacement(opref);
@@ -2331,7 +2061,7 @@ impl OptContext {
             return memo.getconst(raw, tp);
         }
         // resume.py:566-568: liveboxes[box]
-        if let Some(&tagged) = liveboxes.get(&resolved.0) {
+        if let Some(tagged) = liveboxes.get(resolved.0) {
             return tagged;
         }
         // Unresolvable — RPython would raise KeyError here.
