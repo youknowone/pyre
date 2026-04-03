@@ -142,17 +142,28 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 /// - Hint calls → identity/VableForce
 /// - Call classification → CallElidable/CallResidual/CallMayForce
 pub struct Transformer<'a> {
-    /// RPython: Transformer.__init__ config
+    /// RPython: Transformer.callcontrol — passed via config for now.
     config: &'a GraphTransformConfig,
     /// RPython: Transformer.vable_array_vars
-    vable_array_values: std::collections::HashMap<ValueId, usize>,
-    /// Value aliases from identity rewrites
+    /// Maps ValueId (result of reading a virtualizable array field)
+    /// to (array_index) for downstream getarrayitem/setarrayitem rewriting.
+    vable_array_vars: std::collections::HashMap<ValueId, usize>,
+    /// RPython: Transformer.vable_flags
+    /// Tracks virtualizable flags (fresh_virtualizable, etc.) per value.
+    vable_flags: std::collections::HashMap<ValueId, VableFlag>,
+    /// Value aliases from identity rewrites (same_as / hint rewriting)
     aliases: std::collections::HashMap<ValueId, ValueId>,
     /// Transformation notes for debugging
     notes: Vec<GraphTransformNote>,
     /// Counters
     vable_rewrites: usize,
     calls_classified: usize,
+}
+
+/// RPython: jtransform.py vable_flags values
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VableFlag {
+    FreshVirtualizable,
 }
 
 /// Result of rewriting a single operation.
@@ -171,7 +182,8 @@ impl<'a> Transformer<'a> {
     pub fn new(config: &'a GraphTransformConfig) -> Self {
         Self {
             config,
-            vable_array_values: std::collections::HashMap::new(),
+            vable_array_vars: std::collections::HashMap::new(),
+            vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
             notes: Vec::new(),
             vable_rewrites: 0,
@@ -231,13 +243,9 @@ impl<'a> Transformer<'a> {
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
     fn rewrite_operation(&mut self, op: &Op, graph_name: &str) -> RewriteResult {
         match &op.kind {
-            // ── rewrite_op_hint (identity) ──
-            OpKind::Call { target, args, .. } if is_vable_identity_hint(target) => {
-                self.rewrite_op_hint_identity(op, target, args, graph_name)
-            }
-            // ── rewrite_op_hint (force_virtualizable) ──
-            OpKind::Call { target, args, .. } if is_vable_force_hint(target) => {
-                self.rewrite_op_hint_force(op, target, args, graph_name)
+            // ── rewrite_op_hint ──
+            OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
+                self.rewrite_op_hint(op, target, args, graph_name)
             }
             // ── rewrite_op_getfield ──
             OpKind::FieldRead { field, ty, .. } if self.config.lower_virtualizable => {
@@ -288,48 +296,53 @@ impl<'a> Transformer<'a> {
 
     // ── rewrite_op_* methods ──────────────────────────────────
 
-    /// RPython: rewrite_op_hint (access_directly / fresh_virtualizable)
-    fn rewrite_op_hint_identity(
+    /// RPython: `Transformer.rewrite_op_hint(op)`.
+    /// Dispatches based on the hint kind (access_directly, force_virtualizable,
+    /// fresh_virtualizable, promote, etc.)
+    fn rewrite_op_hint(
         &mut self,
         op: &Op,
         target: &CallTarget,
         args: &[ValueId],
         graph_name: &str,
     ) -> RewriteResult {
-        self.notes.push(GraphTransformNote {
-            function: graph_name.to_string(),
-            detail: format!("rewrite: {target}(...) → identity"),
-        });
-        if let Some(arg) = args.first().copied() {
-            RewriteResult::Identity(arg)
-        } else {
-            RewriteResult::Keep
-        }
-    }
-
-    /// RPython: rewrite_op_hint (force_virtualizable)
-    fn rewrite_op_hint_force(
-        &mut self,
-        op: &Op,
-        target: &CallTarget,
-        args: &[ValueId],
-        graph_name: &str,
-    ) -> RewriteResult {
-        self.notes.push(GraphTransformNote {
-            function: graph_name.to_string(),
-            detail: format!("rewrite: {target}(...) → VableForce"),
-        });
-        self.vable_rewrites += 1;
-        if let Some(arg) = args.first().copied() {
-            if let Some(result) = op.result {
-                self.aliases
-                    .insert(result, resolve_alias(arg, &self.aliases));
+        let hint_kind = match classify_vable_hint(target) {
+            Some(k) => k,
+            None => return RewriteResult::Keep,
+        };
+        match hint_kind {
+            crate::hints::VirtualizableHintKind::AccessDirectly
+            | crate::hints::VirtualizableHintKind::FreshVirtualizable => {
+                // RPython: consume as identity (same_as)
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("rewrite: {target}(...) → identity"),
+                });
+                if let Some(arg) = args.first().copied() {
+                    RewriteResult::Identity(arg)
+                } else {
+                    RewriteResult::Keep
+                }
+            }
+            crate::hints::VirtualizableHintKind::ForceVirtualizable => {
+                // RPython: emit hint_force_virtualizable, preserve value as identity
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("rewrite: {target}(...) → VableForce"),
+                });
+                self.vable_rewrites += 1;
+                if let Some(arg) = args.first().copied() {
+                    if let Some(result) = op.result {
+                        self.aliases
+                            .insert(result, resolve_alias(arg, &self.aliases));
+                    }
+                }
+                RewriteResult::Replace(vec![Op {
+                    result: None,
+                    kind: OpKind::VableForce,
+                }])
             }
         }
-        RewriteResult::Replace(vec![Op {
-            result: None,
-            kind: OpKind::VableForce,
-        }])
     }
 
     /// RPython: rewrite_op_getfield
@@ -343,7 +356,7 @@ impl<'a> Transformer<'a> {
         // Track virtualizable array field reads
         if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
             if let Some(result) = op.result {
-                self.vable_array_values.insert(result, array_field.index);
+                self.vable_array_vars.insert(result, array_field.index);
             }
         }
         // Virtualizable scalar field → VableFieldRead
@@ -406,7 +419,7 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        if let Some(&arr_idx) = self.vable_array_values.get(&base) {
+        if let Some(&arr_idx) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
@@ -434,7 +447,7 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        if let Some(&arr_idx) = self.vable_array_values.get(&base) {
+        if let Some(&arr_idx) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
@@ -453,7 +466,8 @@ impl<'a> Transformer<'a> {
         RewriteResult::Keep
     }
 
-    /// RPython: rewrite_op_direct_call → dispatches to handle_*_call
+    /// RPython: `Transformer.rewrite_op_direct_call(op)`.
+    /// Dispatches to `handle_*_call` based on call classification.
     fn rewrite_op_direct_call(
         &mut self,
         op: &Op,
@@ -463,34 +477,93 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
-            self.notes.push(GraphTransformNote {
-                function: graph_name.to_string(),
-                detail: format!("call {target} → {}", effect.as_str()),
-            });
-            self.calls_classified += 1;
-            let rewritten_kind = match effect {
-                CallEffectKind::Elidable => OpKind::CallElidable {
-                    descriptor,
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
-                },
-                CallEffectKind::Residual => OpKind::CallResidual {
-                    descriptor,
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
-                },
-                CallEffectKind::MayForce => OpKind::CallMayForce {
-                    descriptor,
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
-                },
-            };
-            return RewriteResult::Replace(vec![Op {
-                result: op.result,
-                kind: rewritten_kind,
-            }]);
+            match effect {
+                CallEffectKind::Elidable => {
+                    return self.handle_elidable_call(op, descriptor, args, result_ty, graph_name);
+                }
+                CallEffectKind::Residual => {
+                    return self.handle_residual_call(op, descriptor, args, result_ty, graph_name);
+                }
+                CallEffectKind::MayForce => {
+                    return self.handle_may_force_call(op, descriptor, args, result_ty, graph_name);
+                }
+            }
         }
+        // Unclassified call — keep as-is (future: handle_regular_call for inlined callees)
         RewriteResult::Keep
+    }
+
+    /// RPython: `Transformer.handle_residual_call(op)`.
+    /// Call that the JIT should NOT look inside — emit residual_call_*.
+    fn handle_residual_call(
+        &mut self,
+        op: &Op,
+        descriptor: CallDescriptor,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("call {} → residual", descriptor.target),
+        });
+        self.calls_classified += 1;
+        RewriteResult::Replace(vec![Op {
+            result: op.result,
+            kind: OpKind::CallResidual {
+                descriptor,
+                args: args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        }])
+    }
+
+    /// RPython: elidable call — pure function, result depends only on args.
+    fn handle_elidable_call(
+        &mut self,
+        op: &Op,
+        descriptor: CallDescriptor,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("call {} → elidable", descriptor.target),
+        });
+        self.calls_classified += 1;
+        RewriteResult::Replace(vec![Op {
+            result: op.result,
+            kind: OpKind::CallElidable {
+                descriptor,
+                args: args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        }])
+    }
+
+    /// RPython: may-force call — can trigger GC or force virtualizables.
+    fn handle_may_force_call(
+        &mut self,
+        op: &Op,
+        descriptor: CallDescriptor,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("call {} → may_force", descriptor.target),
+        });
+        self.calls_classified += 1;
+        RewriteResult::Replace(vec![Op {
+            result: op.result,
+            kind: OpKind::CallMayForce {
+                descriptor,
+                args: args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        }])
     }
 }
 
