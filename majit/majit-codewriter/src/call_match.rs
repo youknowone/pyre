@@ -71,8 +71,17 @@ impl CallTargetPattern {
                     receiver_root: target_root,
                 },
             ) => {
-                target_name == name
-                    && receiver_root.is_none_or(|root| target_root.as_deref() == Some(root))
+                if target_name != name {
+                    return false;
+                }
+                // If the pattern specifies a receiver type, check it matches.
+                // A target receiver that starts with lowercase (e.g. "handler",
+                // "self", "executor") is a variable/parameter name, not a type —
+                // treat it as matching any pattern receiver.
+                receiver_root.is_none_or(|root| {
+                    target_root.as_deref() == Some(root)
+                        || target_root.as_ref().is_some_and(|r| is_generic_receiver(r))
+                })
             }
             (CallTargetPattern::FunctionPath(path), CallTarget::FunctionPath { segments }) => {
                 segments.iter().map(String::as_str).eq(path.iter().copied())
@@ -80,6 +89,26 @@ impl CallTargetPattern {
             _ => false,
         }
     }
+}
+
+/// Detect generic type parameter or variable name used as receiver.
+///
+/// Generic: "H", "T", "handler", "self", "executor"
+/// Concrete: "PyFrame", "Code", "Vec"
+///
+/// Heuristic: single uppercase letter is a type parameter;
+/// starts with lowercase is a variable name.
+pub(crate) fn is_generic_receiver(receiver: &str) -> bool {
+    let mut chars = receiver.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if first.is_lowercase() {
+        return true; // variable name: "handler", "self", "executor"
+    }
+    // Single uppercase letter: "H", "T", "E" — type parameter
+    first.is_uppercase() && chars.next().is_none()
 }
 
 struct CallDescriptorEntry {

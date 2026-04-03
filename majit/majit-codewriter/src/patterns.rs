@@ -75,7 +75,29 @@ impl CallRoleDescriptor {
     }
 
     fn matches(&self, target: &crate::graph::CallTarget) -> bool {
-        &self.target == target
+        match (&self.target, target) {
+            (
+                crate::graph::CallTarget::Method {
+                    name: pattern_name,
+                    receiver_root: pattern_root,
+                },
+                crate::graph::CallTarget::Method {
+                    name: target_name,
+                    receiver_root: target_root,
+                },
+            ) => {
+                if pattern_name != target_name {
+                    return false;
+                }
+                // Accept generic receivers (lowercase variable names like
+                // "handler", "self") as matching any pattern receiver type.
+                match (pattern_root.as_deref(), target_root.as_deref()) {
+                    (Some(p), Some(t)) => p == t || crate::call_match::is_generic_receiver(t),
+                    _ => true,
+                }
+            }
+            _ => &self.target == target,
+        }
     }
 }
 
@@ -311,6 +333,9 @@ pub fn classify_from_graph_with_config(
     let mut array_reads = 0usize;
     let mut array_writes = 0usize;
     let mut call_descriptors: Vec<crate::call_match::CallDescriptor> = Vec::new();
+    // Unclassified Call targets — method calls from generic functions whose
+    // effect info was not resolved by jtransform. Still check their role.
+    let mut unclassified_call_targets: Vec<crate::graph::CallTarget> = Vec::new();
     let mut has_guard = false;
 
     let mut first_vable_field_read: Option<(usize, crate::graph::ValueType)> = None;
@@ -330,6 +355,9 @@ pub fn classify_from_graph_with_config(
                 | OpKind::CallResidual { descriptor, .. }
                 | OpKind::CallMayForce { descriptor, .. } => {
                     call_descriptors.push(descriptor.clone());
+                }
+                OpKind::Call { target, .. } => {
+                    unclassified_call_targets.push(target.clone());
                 }
                 OpKind::GuardTrue { .. } | OpKind::GuardFalse { .. } => has_guard = true,
                 OpKind::BinOp { .. } | OpKind::UnaryOp { .. } => {}
@@ -360,6 +388,19 @@ pub fn classify_from_graph_with_config(
         }
     }
 
+    // Helper: check whether any call (classified or unclassified) has the
+    // given semantic role.  Unclassified Call ops arise when method calls from
+    // generic functions (e.g. handler.binary_value()) were not resolved by
+    // jtransform's call_effects.
+    let any_call_has_role = |role: CallPatternRole| -> bool {
+        call_descriptors
+            .iter()
+            .any(|descriptor| call_has_role(config, &descriptor.target, role))
+            || unclassified_call_targets
+                .iter()
+                .any(|target| call_has_role(config, target, role))
+    };
+
     // Classify based on op patterns (RPython jtransform-level analysis)
     // Virtualizable-specialized ops come from the graph rewrite pass and
     // should take precedence over legacy local/heap classifications.
@@ -389,10 +430,7 @@ pub fn classify_from_graph_with_config(
     }
 
     // Integer binary operations
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::IntArithmetic))
-    {
+    if any_call_has_role(CallPatternRole::IntArithmetic) {
         return Some(TracePattern::UnboxIntBinop {
             op_name: "dispatch".into(),
             has_overflow_guard: true,
@@ -400,39 +438,28 @@ pub fn classify_from_graph_with_config(
     }
 
     // Float binary operations
-    if call_descriptors.iter().any(|descriptor| {
-        call_has_role(config, &descriptor.target, CallPatternRole::FloatArithmetic)
-    }) {
+    if any_call_has_role(CallPatternRole::FloatArithmetic) {
         return Some(TracePattern::UnboxFloatBinop {
             op_name: "FloatAdd".into(),
         });
     }
 
-    // Local read: reads from locals_w array (field read + array read, or push call)
+    // Local read: reads from locals_w array, or calls with LocalRead role
     if (field_reads
         .iter()
         .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
         && array_reads > 0)
-        || (array_reads > 0
-            && call_descriptors.iter().any(|descriptor| {
-                call_has_role(config, &descriptor.target, CallPatternRole::LocalRead)
-            }))
+        || any_call_has_role(CallPatternRole::LocalRead)
     {
         return Some(TracePattern::LocalRead);
     }
 
-    // Local write: writes to locals_w array (field write + array write, or pop call)
+    // Local write: writes to locals_w array, or calls with LocalWrite role
     if (field_writes
         .iter()
         .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
         && array_writes > 0)
-        || field_writes
-            .iter()
-            .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))
-        || (array_writes > 0
-            && call_descriptors.iter().any(|descriptor| {
-                call_has_role(config, &descriptor.target, CallPatternRole::LocalWrite)
-            }))
+        || any_call_has_role(CallPatternRole::LocalWrite)
     {
         return Some(TracePattern::LocalWrite);
     }
@@ -446,60 +473,25 @@ pub fn classify_from_graph_with_config(
     }
 
     // Function call
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::FunctionCall))
-    {
+    if any_call_has_role(CallPatternRole::FunctionCall) {
         return Some(TracePattern::FunctionCall);
     }
 
     // Truth check
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::TruthCheck))
-    {
+    if any_call_has_role(CallPatternRole::TruthCheck) {
         return Some(TracePattern::TruthCheck);
     }
 
     // Stack manipulation (pop/swap/peek without array access)
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::StackManip))
-        && array_reads == 0
-        && array_writes == 0
-    {
+    if any_call_has_role(CallPatternRole::StackManip) && array_reads == 0 && array_writes == 0 {
         return Some(TracePattern::StackManip);
     }
 
     // Namespace access (load/store name/global)
-    let has_namespace_load_local = call_descriptors.iter().any(|descriptor| {
-        call_has_role(
-            config,
-            &descriptor.target,
-            CallPatternRole::NamespaceLoadLocal,
-        )
-    });
-    let has_namespace_load_global = call_descriptors.iter().any(|descriptor| {
-        call_has_role(
-            config,
-            &descriptor.target,
-            CallPatternRole::NamespaceLoadGlobal,
-        )
-    });
-    let has_namespace_store_local = call_descriptors.iter().any(|descriptor| {
-        call_has_role(
-            config,
-            &descriptor.target,
-            CallPatternRole::NamespaceStoreLocal,
-        )
-    });
-    let has_namespace_store_global = call_descriptors.iter().any(|descriptor| {
-        call_has_role(
-            config,
-            &descriptor.target,
-            CallPatternRole::NamespaceStoreGlobal,
-        )
-    });
+    let has_namespace_load_local = any_call_has_role(CallPatternRole::NamespaceLoadLocal);
+    let has_namespace_load_global = any_call_has_role(CallPatternRole::NamespaceLoadGlobal);
+    let has_namespace_store_local = any_call_has_role(CallPatternRole::NamespaceStoreLocal);
+    let has_namespace_store_global = any_call_has_role(CallPatternRole::NamespaceStoreGlobal);
     if has_namespace_load_local
         || has_namespace_load_global
         || has_namespace_store_local
@@ -512,25 +504,16 @@ pub fn classify_from_graph_with_config(
     }
 
     // Iterator
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::RangeIterNext))
-    {
+    if any_call_has_role(CallPatternRole::RangeIterNext) {
         return Some(TracePattern::RangeIterNext);
     }
-    if call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::IterCleanup))
-    {
+    if any_call_has_role(CallPatternRole::IterCleanup) {
         return Some(TracePattern::IterCleanup);
     }
 
     // Return (few ops ending in Return terminator)
     if matches!(&entry.terminator, crate::graph::Terminator::Return(Some(_))) && ops.len() <= 5 {
-        if call_descriptors
-            .iter()
-            .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::Return))
-        {
+        if any_call_has_role(CallPatternRole::Return) {
             return Some(TracePattern::Return);
         }
     }
@@ -554,12 +537,8 @@ pub fn classify_from_graph_with_config(
     }
 
     // Build collection
-    let has_build_list = call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::BuildList));
-    let has_build_tuple = call_descriptors
-        .iter()
-        .any(|descriptor| call_has_role(config, &descriptor.target, CallPatternRole::BuildTuple));
+    let has_build_list = any_call_has_role(CallPatternRole::BuildList);
+    let has_build_tuple = any_call_has_role(CallPatternRole::BuildTuple);
     if has_build_list || has_build_tuple {
         return Some(TracePattern::BuildCollection {
             kind: if has_build_list { "list" } else { "tuple" }.into(),
@@ -567,23 +546,13 @@ pub fn classify_from_graph_with_config(
     }
 
     // Sequence operations
-    if call_descriptors.iter().any(|descriptor| {
-        call_has_role(config, &descriptor.target, CallPatternRole::UnpackSequence)
-    }) {
+    if any_call_has_role(CallPatternRole::UnpackSequence) {
         return Some(TracePattern::UnpackSequence);
     }
-    if call_descriptors.iter().any(|descriptor| {
-        call_has_role(config, &descriptor.target, CallPatternRole::SequenceSetitem)
-    }) {
+    if any_call_has_role(CallPatternRole::SequenceSetitem) {
         return Some(TracePattern::SequenceSetitem);
     }
-    if call_descriptors.iter().any(|descriptor| {
-        call_has_role(
-            config,
-            &descriptor.target,
-            CallPatternRole::CollectionAppend,
-        )
-    }) {
+    if any_call_has_role(CallPatternRole::CollectionAppend) {
         return Some(TracePattern::CollectionAppend);
     }
 

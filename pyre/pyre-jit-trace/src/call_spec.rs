@@ -340,4 +340,127 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::CollectionAppend),
     },
+    // ── Trait handler methods (called by opcode_* free functions) ──
+    // These have generic receivers (e.g. handler: &mut H) in the source,
+    // but receiver matching handles lowercase names as wildcards.
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "load_local_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "load_local_checked_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalRead),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "store_local_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::LocalWrite),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "binary_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "compare_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "unary_negative_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "unary_invert_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "set_next_instr",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "make_function",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::FunctionCall),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "load_attr",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "store_attr",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "build_map",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "build_set",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "ensure_iter_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::RangeIterNext),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "on_iter_exhausted",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IterCleanup),
+    },
 ];
