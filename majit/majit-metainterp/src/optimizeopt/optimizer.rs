@@ -1427,12 +1427,15 @@ impl Optimizer {
             ctx.value_types.insert(i as u32, tp);
         }
 
-        // RPython optimizer.py:293 patchguardop parity: propagate to Phase 2
+        // optimizer.py:293 patchguardop parity: propagate to Phase 2
         // OptContext so copy_and_change guards (unroll.py:409) can get
         // rd_resume_position before GUARD_FUTURE_CONDITION is re-encountered.
         if ctx.patchguardop.is_none() {
             ctx.patchguardop = self.patchguardop.clone();
         }
+        // optimizer.py:294: patchguardop is set by GUARD_FUTURE_CONDITION
+        // during optimization (rewrite.rs / simplify.rs). No synthetic
+        // fallback — RPython relies solely on the actual GFC from tracing.
 
         // RPython resume.py parity: pass snapshot_boxes and constant_types
         // to OptContext so emit() can call store_final_boxes_in_guard inline
@@ -1658,20 +1661,8 @@ impl Optimizer {
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
-        // RPython: patchguardop is set by GUARD_FUTURE_CONDITION.
-        // Fallback: if GUARD_FUTURE_CONDITION was not in the trace (e.g.
-        // very short traces), use the last emitted guard so
-        // inline_short_preamble guards get a valid rd_resume_position.
-        if ctx.patchguardop.is_none() {
-            if let Some(last) = ctx
-                .new_operations
-                .iter()
-                .rev()
-                .find(|op| op.opcode.is_guard() && op.rd_resume_position >= 0)
-            {
-                ctx.patchguardop = Some(last.clone());
-            }
-        }
+        // optimizer.py:294: patchguardop is set exclusively by
+        // GUARD_FUTURE_CONDITION during optimization. No fallback.
         self.patchguardop = ctx.patchguardop.clone();
         // JUMP location: in new_operations (flush=True path where JUMP was
         // processed through passes), or terminal_op (skip_flush path).

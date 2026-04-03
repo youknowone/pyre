@@ -1702,10 +1702,6 @@ impl OptContext {
         // invariant: rd_resume_position must be this guard's own snapshot).
         let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
         if !has_snapshot {
-            // resume.py:397: assert resume_position >= 0
-            // RPython: every guard has a valid snapshot from capture_resumedata.
-            // Guards without snapshots cannot be compiled — drop them.
-            // This matches RPython's giveup() on TagOverflow in finish().
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
