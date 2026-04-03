@@ -126,249 +126,371 @@ pub struct GraphTransformResult {
 
 /// Rewrite a semantic graph with JIT-specific transformations.
 ///
-/// RPython equivalent: jtransform.py `Transformer.optimize_block()`
-///
-/// This is the graph-based replacement for the old TracePattern →
-/// LoweringRecipe string-matching pipeline.
+/// Convenience wrapper that creates a `Transformer` and runs it.
+/// RPython equivalent: jtransform.py `transform_graph()`.
 pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> GraphTransformResult {
-    let mut notes = Vec::new();
-    let mut rewritten = graph.clone();
-    let mut vable_rewrites = 0usize;
-    let mut calls_classified = 0usize;
-    let mut aliases: std::collections::HashMap<ValueId, ValueId> = std::collections::HashMap::new();
+    let mut transformer = Transformer::new(config);
+    transformer.transform(graph)
+}
 
-    // Build lookup sets for virtualizable fields/arrays
-    // Track which ValueIds are results of reading a virtualizable array field.
-    // RPython jtransform.py tracks vable_array_vars for this purpose.
-    let mut vable_array_values: std::collections::HashMap<crate::graph::ValueId, usize> =
-        std::collections::HashMap::new();
+/// JIT graph transformer.
+///
+/// RPython equivalent: `jtransform.py` class `Transformer`.
+///
+/// Rewrites operations in a MajitGraph to JIT-specific instructions:
+/// - Virtualizable field/array access → VableFieldRead/VableArrayRead
+/// - Hint calls → identity/VableForce
+/// - Call classification → CallElidable/CallResidual/CallMayForce
+pub struct Transformer<'a> {
+    /// RPython: Transformer.__init__ config
+    config: &'a GraphTransformConfig,
+    /// RPython: Transformer.vable_array_vars
+    vable_array_values: std::collections::HashMap<ValueId, usize>,
+    /// Value aliases from identity rewrites
+    aliases: std::collections::HashMap<ValueId, ValueId>,
+    /// Transformation notes for debugging
+    notes: Vec<GraphTransformNote>,
+    /// Counters
+    vable_rewrites: usize,
+    calls_classified: usize,
+}
 
-    for block in &mut rewritten.blocks {
+/// Result of rewriting a single operation.
+///
+/// RPython: `rewrite_operation()` returns SpaceOperation, list, None, or Constant.
+enum RewriteResult {
+    /// Replace with these ops
+    Replace(Vec<Op>),
+    /// Remove the op (identity/alias: result remaps to the given value)
+    Identity(ValueId),
+    /// Keep the op unchanged
+    Keep,
+}
+
+impl<'a> Transformer<'a> {
+    pub fn new(config: &'a GraphTransformConfig) -> Self {
+        Self {
+            config,
+            vable_array_values: std::collections::HashMap::new(),
+            aliases: std::collections::HashMap::new(),
+            notes: Vec::new(),
+            vable_rewrites: 0,
+            calls_classified: 0,
+        }
+    }
+
+    /// RPython: Transformer.transform() — process all blocks in the graph.
+    pub fn transform(&mut self, graph: &MajitGraph) -> GraphTransformResult {
+        let mut rewritten = graph.clone();
+
+        for block in &mut rewritten.blocks {
+            self.optimize_block(block, &graph.name);
+        }
+
+        GraphTransformResult {
+            graph: rewritten,
+            notes: std::mem::take(&mut self.notes),
+            vable_rewrites: self.vable_rewrites,
+            calls_classified: self.calls_classified,
+        }
+    }
+
+    /// RPython: Transformer.optimize_block()
+    fn optimize_block(&mut self, block: &mut crate::graph::BasicBlock, graph_name: &str) {
         let mut new_ops = Vec::with_capacity(block.ops.len());
 
         for original_op in &block.ops {
-            let op = remap_op(original_op, &aliases);
-            match &op.kind {
-                // ── hint(access_directly=True) / hint(fresh_virtualizable=True) ──
-                // RPython jtransform.py:655 — consume as identity during translation.
-                OpKind::Call { target, args, .. } if is_vable_identity_hint(target) => {
-                    notes.push(GraphTransformNote {
-                        function: graph.name.clone(),
-                        detail: format!("rewrite: {target}(...) → identity"),
-                    });
-                    if let (Some(result), Some(arg)) = (op.result, args.first().copied()) {
-                        aliases.insert(result, resolve_alias(arg, &aliases));
-                    }
-                    continue;
+            let op = remap_op(original_op, &self.aliases);
+            match self.rewrite_operation(&op, graph_name) {
+                RewriteResult::Replace(ops) => {
+                    new_ops.extend(ops);
                 }
-
-                // ── hint(force_virtualizable=True) ──
-                // RPython jtransform.py:650 — emit hint_force_virtualizable op,
-                // preserving the value as an identity result.
-                OpKind::Call { target, args, .. } if is_vable_force_hint(target) => {
-                    notes.push(GraphTransformNote {
-                        function: graph.name.clone(),
-                        detail: format!("rewrite: {target}(...) → VableForce"),
-                    });
-                    vable_rewrites += 1;
-                    if let (Some(result), Some(arg)) = (op.result, args.first().copied()) {
-                        aliases.insert(result, resolve_alias(arg, &aliases));
-                    }
-                    new_ops.push(Op {
-                        result: None,
-                        kind: OpKind::VableForce,
-                    });
-                    continue;
-                }
-
-                // ── Virtualizable field read → VableFieldRead ──
-                // RPython jtransform.py:832 `rewrite_op_getfield`
-                OpKind::FieldRead { field, ty, .. } if config.lower_virtualizable => {
-                    // Track if this field read is on a virtualizable array
-                    if let Some(array_field) = config
-                        .vable_arrays
-                        .iter()
-                        .find(|candidate| candidate.matches(field))
-                    {
-                        if let Some(result) = op.result {
-                            vable_array_values.insert(result, array_field.index);
-                        }
-                    }
-                    if let Some(vable_field) = config
-                        .vable_fields
-                        .iter()
-                        .find(|candidate| candidate.matches(field))
-                    {
-                        notes.push(GraphTransformNote {
-                            function: graph.name.clone(),
-                            detail: format!(
-                                "rewrite: {} → VableFieldRead[{}]",
-                                field.name, vable_field.index
-                            ),
-                        });
-                        vable_rewrites += 1;
-                        new_ops.push(Op {
-                            result: op.result,
-                            kind: OpKind::VableFieldRead {
-                                field_index: vable_field.index,
-                                ty: ty.clone(),
-                            },
-                        });
-                        continue;
+                RewriteResult::Identity(alias_target) => {
+                    if let Some(result) = op.result {
+                        self.aliases
+                            .insert(result, resolve_alias(alias_target, &self.aliases));
                     }
                 }
-
-                // ── Virtualizable field write → VableFieldWrite ──
-                // RPython jtransform.py:923 `_rewrite_op_setfield`
-                OpKind::FieldWrite {
-                    field, value, ty, ..
-                } if config.lower_virtualizable => {
-                    if let Some(vable_field) = config
-                        .vable_fields
-                        .iter()
-                        .find(|candidate| candidate.matches(field))
-                    {
-                        notes.push(GraphTransformNote {
-                            function: graph.name.clone(),
-                            detail: format!(
-                                "rewrite: {} = ... → VableFieldWrite[{}]",
-                                field.name, vable_field.index
-                            ),
-                        });
-                        vable_rewrites += 1;
-                        new_ops.push(Op {
-                            result: op.result,
-                            kind: OpKind::VableFieldWrite {
-                                field_index: vable_field.index,
-                                value: *value,
-                                ty: ty.clone(),
-                            },
-                        });
-                        continue;
-                    }
+                RewriteResult::Keep => {
+                    new_ops.push(op);
                 }
-
-                // ── Virtualizable array read → VableArrayRead ──
-                // RPython jtransform.py:760 `getarrayitem_vable`
-                OpKind::ArrayRead {
-                    base,
-                    index,
-                    item_ty,
-                } if config.lower_virtualizable => {
-                    if let Some(&arr_idx) = vable_array_values.get(base) {
-                        notes.push(GraphTransformNote {
-                            function: graph.name.clone(),
-                            detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
-                        });
-                        vable_rewrites += 1;
-                        new_ops.push(Op {
-                            result: op.result,
-                            kind: OpKind::VableArrayRead {
-                                array_index: arr_idx,
-                                elem_index: *index,
-                                item_ty: item_ty.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                }
-
-                // ── Virtualizable array write → VableArrayWrite ──
-                // RPython jtransform.py:794 `setarrayitem_vable`
-                OpKind::ArrayWrite {
-                    base,
-                    index,
-                    value,
-                    item_ty,
-                } if config.lower_virtualizable => {
-                    if let Some(&arr_idx) = vable_array_values.get(base) {
-                        notes.push(GraphTransformNote {
-                            function: graph.name.clone(),
-                            detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
-                        });
-                        vable_rewrites += 1;
-                        new_ops.push(Op {
-                            result: op.result,
-                            kind: OpKind::VableArrayWrite {
-                                array_index: arr_idx,
-                                elem_index: *index,
-                                value: *value,
-                                item_ty: item_ty.clone(),
-                            },
-                        });
-                        continue;
-                    }
-                }
-
-                // ── Call classification → rewrite to typed call ──
-                // RPython jtransform.py: classify calls by effect info
-                OpKind::Call {
-                    target,
-                    args,
-                    result_ty,
-                } if config.classify_calls => {
-                    if let Some((descriptor, effect)) = classify_call(target, &config.call_effects)
-                    {
-                        notes.push(GraphTransformNote {
-                            function: graph.name.clone(),
-                            detail: format!("call {target} → {}", effect.as_str()),
-                        });
-                        calls_classified += 1;
-                        let rewritten_kind = match effect {
-                            CallEffectKind::Elidable => OpKind::CallElidable {
-                                descriptor,
-                                args: args.clone(),
-                                result_ty: result_ty.clone(),
-                            },
-                            CallEffectKind::Residual => OpKind::CallResidual {
-                                descriptor,
-                                args: args.clone(),
-                                result_ty: result_ty.clone(),
-                            },
-                            CallEffectKind::MayForce => OpKind::CallMayForce {
-                                descriptor,
-                                args: args.clone(),
-                                result_ty: result_ty.clone(),
-                            },
-                        };
-                        new_ops.push(Op {
-                            result: op.result,
-                            kind: rewritten_kind,
-                        });
-                        continue;
-                    }
-                }
-
-                // ── Unknown ops ──
-                OpKind::Unknown { kind } => {
-                    notes.push(GraphTransformNote {
-                        function: graph.name.clone(),
-                        detail: format!("unknown op: {:?}", kind),
-                    });
-                }
-
-                _ => {}
             }
-            new_ops.push(op);
         }
 
         block.ops = new_ops;
-
-        block.terminator = remap_terminator(&block.terminator, &aliases);
+        block.terminator = remap_terminator(&block.terminator, &self.aliases);
 
         if let Terminator::Abort { reason } = &block.terminator {
-            notes.push(GraphTransformNote {
-                function: graph.name.clone(),
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
                 detail: format!("abort: {reason}"),
             });
         }
     }
 
-    GraphTransformResult {
-        graph: rewritten,
-        notes,
-        vable_rewrites,
-        calls_classified,
+    /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
+    fn rewrite_operation(&mut self, op: &Op, graph_name: &str) -> RewriteResult {
+        match &op.kind {
+            // ── rewrite_op_hint (identity) ──
+            OpKind::Call { target, args, .. } if is_vable_identity_hint(target) => {
+                self.rewrite_op_hint_identity(op, target, args, graph_name)
+            }
+            // ── rewrite_op_hint (force_virtualizable) ──
+            OpKind::Call { target, args, .. } if is_vable_force_hint(target) => {
+                self.rewrite_op_hint_force(op, target, args, graph_name)
+            }
+            // ── rewrite_op_getfield ──
+            OpKind::FieldRead { field, ty, .. } if self.config.lower_virtualizable => {
+                self.rewrite_op_getfield(op, field, ty, graph_name)
+            }
+            // ── rewrite_op_setfield ──
+            OpKind::FieldWrite {
+                field, value, ty, ..
+            } if self.config.lower_virtualizable => {
+                self.rewrite_op_setfield(op, field, *value, ty, graph_name)
+            }
+            // ── rewrite_op_getarrayitem ──
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty,
+            } if self.config.lower_virtualizable => {
+                self.rewrite_op_getarrayitem(op, *base, *index, item_ty, graph_name)
+            }
+            // ── rewrite_op_setarrayitem ──
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty,
+            } if self.config.lower_virtualizable => {
+                self.rewrite_op_setarrayitem(op, *base, *index, *value, item_ty, graph_name)
+            }
+            // ── rewrite_op_direct_call ──
+            OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } if self.config.classify_calls => {
+                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name)
+            }
+            // ── unknown ops ──
+            OpKind::Unknown { kind } => {
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("unknown op: {:?}", kind),
+                });
+                RewriteResult::Keep
+            }
+            _ => RewriteResult::Keep,
+        }
+    }
+
+    // ── rewrite_op_* methods ──────────────────────────────────
+
+    /// RPython: rewrite_op_hint (access_directly / fresh_virtualizable)
+    fn rewrite_op_hint_identity(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: {target}(...) → identity"),
+        });
+        if let Some(arg) = args.first().copied() {
+            RewriteResult::Identity(arg)
+        } else {
+            RewriteResult::Keep
+        }
+    }
+
+    /// RPython: rewrite_op_hint (force_virtualizable)
+    fn rewrite_op_hint_force(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: {target}(...) → VableForce"),
+        });
+        self.vable_rewrites += 1;
+        if let Some(arg) = args.first().copied() {
+            if let Some(result) = op.result {
+                self.aliases
+                    .insert(result, resolve_alias(arg, &self.aliases));
+            }
+        }
+        RewriteResult::Replace(vec![Op {
+            result: None,
+            kind: OpKind::VableForce,
+        }])
+    }
+
+    /// RPython: rewrite_op_getfield
+    fn rewrite_op_getfield(
+        &mut self,
+        op: &Op,
+        field: &FieldDescriptor,
+        ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        // Track virtualizable array field reads
+        if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
+            if let Some(result) = op.result {
+                self.vable_array_values.insert(result, array_field.index);
+            }
+        }
+        // Virtualizable scalar field → VableFieldRead
+        if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: {} → VableFieldRead[{}]",
+                    field.name, vable_field.index
+                ),
+            });
+            self.vable_rewrites += 1;
+            return RewriteResult::Replace(vec![Op {
+                result: op.result,
+                kind: OpKind::VableFieldRead {
+                    field_index: vable_field.index,
+                    ty: ty.clone(),
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// RPython: rewrite_op_setfield
+    fn rewrite_op_setfield(
+        &mut self,
+        op: &Op,
+        field: &FieldDescriptor,
+        value: ValueId,
+        ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: {} = ... → VableFieldWrite[{}]",
+                    field.name, vable_field.index
+                ),
+            });
+            self.vable_rewrites += 1;
+            return RewriteResult::Replace(vec![Op {
+                result: op.result,
+                kind: OpKind::VableFieldWrite {
+                    field_index: vable_field.index,
+                    value,
+                    ty: ty.clone(),
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// RPython: rewrite_op_getarrayitem
+    fn rewrite_op_getarrayitem(
+        &mut self,
+        op: &Op,
+        base: ValueId,
+        index: ValueId,
+        item_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        if let Some(&arr_idx) = self.vable_array_values.get(&base) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
+            });
+            self.vable_rewrites += 1;
+            return RewriteResult::Replace(vec![Op {
+                result: op.result,
+                kind: OpKind::VableArrayRead {
+                    array_index: arr_idx,
+                    elem_index: index,
+                    item_ty: item_ty.clone(),
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// RPython: rewrite_op_setarrayitem
+    fn rewrite_op_setarrayitem(
+        &mut self,
+        op: &Op,
+        base: ValueId,
+        index: ValueId,
+        value: ValueId,
+        item_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        if let Some(&arr_idx) = self.vable_array_values.get(&base) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
+            });
+            self.vable_rewrites += 1;
+            return RewriteResult::Replace(vec![Op {
+                result: op.result,
+                kind: OpKind::VableArrayWrite {
+                    array_index: arr_idx,
+                    elem_index: index,
+                    value,
+                    item_ty: item_ty.clone(),
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// RPython: rewrite_op_direct_call → dispatches to handle_*_call
+    fn rewrite_op_direct_call(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("call {target} → {}", effect.as_str()),
+            });
+            self.calls_classified += 1;
+            let rewritten_kind = match effect {
+                CallEffectKind::Elidable => OpKind::CallElidable {
+                    descriptor,
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
+                CallEffectKind::Residual => OpKind::CallResidual {
+                    descriptor,
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
+                CallEffectKind::MayForce => OpKind::CallMayForce {
+                    descriptor,
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return RewriteResult::Replace(vec![Op {
+                result: op.result,
+                kind: rewritten_kind,
+            }]);
+        }
+        RewriteResult::Keep
     }
 }
 
