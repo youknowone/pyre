@@ -27,6 +27,15 @@ thread_local! {
         const { UnsafeCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, FinishProtocol, Option<u64>)>> =
         const { UnsafeCell::new(None) };
+    /// Stash Python exceptions from blackhole/force paths that cross
+    /// FFI boundaries (compiled code → callback → exception).
+    static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take stashed exception from blackhole/force FFI paths.
+pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
+    LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2707,6 +2716,12 @@ pub extern "C" fn bh_call_fn_8(
 /// pyre: dispatches builtin vs user function. Parent frame provides
 /// full call protocol (defaults, kw-only, varargs, generator).
 fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
+    // RPython bhimpl_residual_call parity: the direct call below uses
+    // call_user_function_plain, but the CALLED function's own recursive
+    // calls go through call_callable → call_user_function which checks
+    // EVAL_OVERRIDE. Without force_plain_eval, those nested calls would
+    // re-enter JIT compiled code, causing nested blackhole resume.
+    let _plain_guard = pyre_interpreter::call::force_plain_eval();
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,

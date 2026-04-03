@@ -458,6 +458,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_rd_numb(green_key, trace_id, fail_index)
     }
 
+    pub fn get_exit_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        self.meta.get_exit_types(green_key, trace_id, fail_index)
+    }
+
     pub fn get_rd_virtuals(
         &self,
         green_key: u64,
@@ -895,8 +904,9 @@ impl<S: JitState> JitDriver<S> {
                             bridge_key, bridge_trace_id, bridge_fail_index, finish_args
                         );
                     }
-                    self.sym = None;
-                    self.trace_meta = None;
+                    // compile.py:3198 compile_done_with_this_frame:
+                    // Bridge traces ending in FINISH are compiled and
+                    // attached to the failing guard via compile_bridge.
                     self.meta.compile_done_with_this_frame(
                         bridge_key,
                         bridge_trace_id,
@@ -904,8 +914,8 @@ impl<S: JitState> JitDriver<S> {
                         &finish_args,
                         finish_arg_types,
                     );
-                    // RPython parity: DoneWithThisFrame exits _interpret().
-                    // Explicitly end the trace so is_tracing() sees false.
+                    self.sym = None;
+                    self.trace_meta = None;
                     self.meta.abort_trace(false);
                     return;
                 }

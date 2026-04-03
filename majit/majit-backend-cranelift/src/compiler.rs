@@ -290,8 +290,11 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
 #[derive(Clone)]
 struct RegisteredLoopTarget {
     trace_id: u64,
+    /// RPython greenkey[1]: bytecode PC of the loop header.
+    /// 0 for FINISH traces (no JUMP/Label).
     header_pc: u64,
-    _green_key: u64,
+    /// RPython greenkey hash: function identifier for guard lookup.
+    green_key: u64,
     source_guard: Option<(u64, u32)>,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
@@ -1993,7 +1996,7 @@ fn register_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
-        _green_key: token.green_key,
+        green_key: token.green_key,
         source_guard: None,
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
@@ -2047,7 +2050,7 @@ pub fn register_pending_call_assembler_target(
     let target = RegisteredLoopTarget {
         trace_id: 0,
         header_pc: 0,
-        _green_key: 0,
+        green_key: 0,
         source_guard: None,
         caller_prefix_layout: None,
         code_ptr: std::ptr::null(),
@@ -2568,7 +2571,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             release_force_token(handle);
         }
 
-        DeadFrame {
+        return DeadFrame {
             data: Box::new(FrameData::new_with_savedata_and_exception(
                 outputs,
                 fail_descr.clone(),
@@ -2655,7 +2658,7 @@ extern "C" fn call_assembler_guard_failure(
     if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
         let raw_num = fail_descr.fail_arg_types.len();
         if bridge_fn(
-            target.header_pc,
+            target.green_key,
             target.trace_id,
             fail_index,
             outputs_ptr,
@@ -2687,7 +2690,7 @@ extern "C" fn call_assembler_guard_failure(
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.header_pc;
+        let green_key = target.green_key;
         let trace_id = target.trace_id;
         let raw_num = fail_descr.fail_arg_types.len();
         let mut bh_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) }.to_vec();
@@ -2868,7 +2871,7 @@ fn call_assembler_fast_path(
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.header_pc;
+        let green_key = target.green_key;
         let trace_id = target.trace_id;
         let raw_num = fail_descr.fail_arg_types.len();
         let raw_outputs = outputs.to_vec(); // raw deadframe before rebuild
@@ -2993,7 +2996,7 @@ fn call_assembler_fast_path_heap(
 
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.header_pc;
+        let green_key = target.green_key;
         let trace_id = target.trace_id;
         let raw_num = fail_descr.fail_arg_types.len();
         let raw_outputs = outputs.to_vec();
@@ -3126,7 +3129,7 @@ extern "C" fn call_assembler_shim(
         rebuild_state_after_failure(&mut bh_outputs, fail_types, recovery.as_ref(), raw_num);
         let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
-            target.header_pc,
+            target.green_key,
             target.trace_id,
             fail_index,
             bh_outputs.as_ptr(),
@@ -5386,6 +5389,12 @@ impl CraneliftBackend {
             caller_layout,
             &self.constants,
         )?;
+        // RPython jitframe layout parity: ref_root slots start AFTER all
+        // output slots. max_output_slots must be >= inputs.len() so that
+        // input loading (jf_frame[0..n]) and ref_root storage don't overlap.
+        // store_final_boxes_in_guard may reduce fail_args (snapshot liveboxes)
+        // below input count; ensure the minimum here.
+        max_output_slots = max_output_slots.max(inputargs.len());
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
             inputargs,

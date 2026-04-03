@@ -227,6 +227,18 @@ pub extern "C" fn majit_jf_shadow_stack_get_top_jf_ptr() -> i64 {
     jf_top_ptr().0 as i64
 }
 
+/// _call_header_shadowstack (assembler.py:1122-1128) parity.
+#[unsafe(no_mangle)]
+pub extern "C" fn majit_jf_shadow_stack_push(jf_ptr_raw: i64) -> i64 {
+    push_jf(crate::GcRef(jf_ptr_raw as usize)) as i64
+}
+
+/// _call_footer_shadowstack (assembler.py:1130-1136) parity.
+#[unsafe(no_mangle)]
+pub extern "C" fn majit_jf_shadow_stack_pop_to(depth: i64) {
+    pop_jf_to(depth as usize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
