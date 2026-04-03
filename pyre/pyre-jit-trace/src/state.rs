@@ -7351,23 +7351,24 @@ impl PyreJitState {
         if raw_values.is_empty() {
             return false;
         }
-        // virtualizable.py:126-137 parity: all entries must be present.
+        // virtualizable.py:131-133: static fields.
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
-        let nlocals = self.local_count();
-        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
+        // virtualizable.py:134-137: for j in range(len(lst)): lst[j] = ...
+        // Restores the ENTIRE array, not just the active portion.
+        let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
+            return false;
+        };
+        let arr_len = frame_arr.len();
         assert!(
-            raw_values.len() >= idx + nlocals + stack_only,
+            raw_values.len() >= idx + arr_len,
             "restore_virtualizable_from_raw: raw_values.len()={} < expected {}",
             raw_values.len(),
-            idx + nlocals + stack_only,
+            idx + arr_len,
         );
-        for local_idx in 0..nlocals {
-            let _ = self.set_local_at(local_idx, raw_values[idx] as PyObjectRef);
-            idx += 1;
-        }
-        for stack_idx in 0..stack_only {
-            let _ = self.set_stack_at(stack_idx, raw_values[idx] as PyObjectRef);
+        let arr_slice = frame_arr.as_mut_slice();
+        for j in 0..arr_len {
+            arr_slice[j] = raw_values[idx] as PyObjectRef;
             idx += 1;
         }
         true
@@ -7562,24 +7563,23 @@ impl PyreJitState {
     }
 
     /// Restore from virtualizable fail_args format:
-    ///   [frame, next_instr, valuestackdepth, l0..lN-1, s0..sM-1]
+    ///   [frame, scalars..., array_items[0..len(lst)]]
     ///
     /// virtualizable.py:126-137 write_from_resume_data_partial parity:
     /// all entries must be present — panics on short data.
+    /// Array is restored in full (len(lst)), not just the active portion.
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
+        // virtualizable.py:131-133: static fields.
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
-        let nlocals = self.local_count();
-
-        // virtualizable.py:134-137: array items are GCREF.
-        for i in 0..nlocals {
-            let _ = self.set_local_at(i, values[idx] as PyObjectRef);
-            idx += 1;
-        }
-
-        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
-        for i in 0..stack_only {
-            let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+        // virtualizable.py:134-137: for j in range(len(lst)): lst[j] = ...
+        let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
+            return;
+        };
+        let arr_len = frame_arr.len();
+        let arr_slice = frame_arr.as_mut_slice();
+        for j in 0..arr_len {
+            arr_slice[j] = values[idx] as PyObjectRef;
             idx += 1;
         }
     }
