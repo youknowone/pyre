@@ -725,6 +725,9 @@ impl<S: JitState> JitDriver<S> {
                                     self.bridge_info.take();
                                     self.sym = None;
                                     self.trace_meta = None;
+                                    // pyjitpl.py:3095-3099 raise_if_successful():
+                                    // successful bridge closure terminates tracing.
+                                    self.meta.abort_trace(false);
                                     return;
                                 }
                                 // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -817,6 +820,9 @@ impl<S: JitState> JitDriver<S> {
                                 self.bridge_info.take();
                                 self.sym = None;
                                 self.trace_meta = None;
+                                // pyjitpl.py:3095-3099 raise_if_successful():
+                                // successful bridge closure terminates tracing.
+                                self.meta.abort_trace(false);
                                 return;
                             }
                             // pyjitpl.py:2993-3007: after retrace_needed(),
