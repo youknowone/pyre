@@ -7590,7 +7590,7 @@ impl PyreJitState {
         array_boxes: &[Vec<i64>],
     ) -> bool {
         // virtualizable.py:126-137 write_from_resume_data_partial parity:
-        // write ALL static fields to heap + update state-backed self fields.
+        // write ALL static fields to heap via VirtualizableInfo.
         let info = crate::virtualizable_gen::build_virtualizable_info();
         if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
