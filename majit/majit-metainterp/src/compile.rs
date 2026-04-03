@@ -315,8 +315,15 @@ pub(crate) fn build_guard_metadata(
             let frames_layout =
                 if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                    let (_num_failargs, _vable_values, _vref_values, frames) =
+                    let (_num_failargs, _vable_values, vref_values, frames) =
                         rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                    // TODO: vref_array parity (resume.py:1386,1431).
+                    // pyre does not yet use virtual references.
+                    debug_assert!(
+                        vref_values.is_empty(),
+                        "vref_values not empty ({} entries) but vref recovery is not implemented",
+                        vref_values.len(),
+                    );
                     let to_exit_source = |val: &RebuiltValue| match val {
                         RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
                         RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
@@ -345,10 +352,13 @@ pub(crate) fn build_guard_metadata(
                 } else {
                     vec![]
                 };
-            let frame_slots = frames_layout
-                .last()
-                .map(|frame| frame.slots.clone())
-                .unwrap_or_default();
+            // Collect slots from ALL frames for virtual target_slot lookup.
+            // RPython resolves virtuals across the entire frame stack, not
+            // just the innermost frame (resume.py:1410).
+            let frame_slots: Vec<ExitValueSourceLayout> = frames_layout
+                .iter()
+                .flat_map(|frame| frame.slots.iter().cloned())
+                .collect();
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
             let resolve_fieldnums = |fieldnums: &[i16],
