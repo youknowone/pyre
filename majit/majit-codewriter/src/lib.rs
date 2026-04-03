@@ -199,32 +199,23 @@ fn build_canonical_opcode_dispatch(
                 &receiver_traits,
             );
 
-            // RPython codewriter path: jtransform → flatten.
+            // RPython codewriter path: jtransform → flatten on the handler's
+            // OWN graph (the match arm body), not a resolved callee.
             //
-            // RPython does NOT splice callee bodies into the caller.
-            // Instead, jtransform rewrites each `direct_call` to either
-            // `inline_call_*` (referencing the callee's JitCode) or
-            // `residual_call_*` (keeping the function pointer). The
-            // meta-interpreter then descends into callee JitCode at runtime.
-            //
-            // For each resolved handler, run jtransform + flatten on the
-            // handler's own graph. Call ops remain as Call/CallResidual/
-            // CallElidable — they are NOT expanded into callee bodies.
-            let flattened = resolved_calls.iter().find_map(|resolved| {
-                let graph = resolved.graph.as_ref()?;
-                let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
-                let flattened = passes::flatten_with_types(
+            // RPython processes the portal graph as a whole. We process per-
+            // opcode arm. The arm's body_graph IS the handler — jtransform
+            // rewrites its Call ops to inline_call_*/residual_call_* etc.
+            let flattened = arm.body_graph.as_ref().map(|handler_graph| {
+                let mut transformer = passes::Transformer::new(&pipeline_config.transform)
+                    .with_callcontrol(call_control);
+                let rewritten = transformer.transform(handler_graph);
+                passes::flatten_with_types(
                     &rewritten.graph,
                     &passes::resolve_types(
                         &rewritten.graph,
                         &passes::annotate_graph(&rewritten.graph),
                     ),
-                );
-                // Skip trivially empty graphs (only Input ops)
-                if flattened.ops.len() <= 1 {
-                    return None;
-                }
-                Some(flattened)
+                )
             });
 
             passes::PipelineOpcodeArm {
@@ -1190,7 +1181,7 @@ mod tests {
                 }
             }
         }
-        call_control.find_all_graphs();
+        call_control.find_all_graphs_for_tests();
 
         // Get opcode_load_fast_checked graph and inline it
         let path = parse::CallPath::from_segments(["opcode_load_fast_checked"]);

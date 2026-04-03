@@ -150,26 +150,37 @@ impl CallControl {
         self.builtin_targets.insert(path);
     }
 
-    /// Discover all candidate graphs reachable from portal.
+    /// Discover candidate graphs by BFS from portal targets.
     ///
-    /// RPython: `CallControl.find_all_graphs(policy)`.
+    /// RPython: `CallControl.find_all_graphs(policy)` (call.py:49-92).
     ///
-    /// Walks from portal graphs transitively: for each Call op in a
-    /// candidate graph, if the callee has a graph and passes the
-    /// candidate check, add it to the candidate set.
-    ///
-    /// If no portal is set, falls back to including all registered
-    /// function graphs (test-only convenience).
+    /// Walks from portal graphs transitively: for each Call op,
+    /// if the callee has a graph, add it to the candidate set.
+    /// Portal must be seeded via `mark_portal()` before calling.
     pub fn find_all_graphs(&mut self) {
+        assert!(
+            !self.portal_targets.is_empty(),
+            "find_all_graphs requires at least one portal target; \
+             use find_all_graphs_for_tests() if no portal is available"
+        );
+        self.find_all_graphs_bfs();
+    }
+
+    /// Test-only: include all registered function graphs as candidates.
+    /// Production code must use `find_all_graphs()` with portal seeded.
+    #[cfg(test)]
+    pub fn find_all_graphs_for_tests(&mut self) {
         if self.portal_targets.is_empty() {
-            // No portal set — include all graphs (test convenience).
             let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
             for path in all_paths {
                 self.candidate_graphs.insert(path);
             }
             return;
         }
+        self.find_all_graphs_bfs();
+    }
 
+    fn find_all_graphs_bfs(&mut self) {
         // BFS from portal targets (RPython: call.py:49-92)
         let mut todo: Vec<CallPath> = self.portal_targets.iter().cloned().collect();
         for path in &todo {
@@ -488,7 +499,7 @@ mod tests {
         let graph = MajitGraph::new("opcode_load_fast");
         let path = CallPath::from_segments(["opcode_load_fast"]);
         cc.register_function_graph(path, graph);
-        cc.find_all_graphs();
+        cc.find_all_graphs_for_tests();
 
         let target = CallTarget::function_path(["opcode_load_fast"]);
         assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);

@@ -627,7 +627,7 @@ mod tests {
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), callee);
-        cc.find_all_graphs();
+        cc.find_all_graphs_for_tests();
 
         let count = inline_graph(&mut caller, &cc, 3);
         assert_eq!(count, 1);
@@ -732,7 +732,7 @@ mod tests {
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), inner);
         cc.register_function_graph(CallPath::from_segments(["outer"]), outer);
-        cc.find_all_graphs();
+        cc.find_all_graphs_for_tests();
 
         let count = inline_graph(&mut caller, &cc, 3);
         assert!(count >= 2, "should inline at least 2 levels, got {count}");

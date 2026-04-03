@@ -62,9 +62,12 @@ impl Assembler {
         }
     }
 
-    /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
+    /// Scaffold: produces metadata-only JitCode (no bytecode).
     ///
-    /// Assemble a flattened function into a JitCode.
+    /// RPython equivalent: `Assembler.assemble()` which does full
+    /// instruction encoding, label fixup, and liveness encoding.
+    /// This scaffold returns register counts only — call sites
+    /// that need real bytecode should not use this yet.
     pub fn assemble(
         &mut self,
         flattened: &FlattenedFunction,

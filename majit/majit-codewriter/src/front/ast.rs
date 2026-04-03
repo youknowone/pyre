@@ -84,6 +84,19 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 }
 
 /// Public entry for building a graph from a single function AST node.
+/// Lower a standalone expression into an existing graph.
+/// Used to build semantic graphs from opcode match arm bodies.
+pub fn lower_expr_into_graph(graph: &mut MajitGraph, expr: &syn::Expr) {
+    let mut block = graph.entry;
+    let ctx = GraphBuildContext::default();
+    let result = lower_expr(graph, &mut block, expr, &AstGraphOptions::default(), &ctx);
+    if let Some(val) = result {
+        graph.set_terminator(block, crate::graph::Terminator::Return(Some(val)));
+    } else {
+        graph.set_terminator(block, crate::graph::Terminator::Return(None));
+    }
+}
+
 pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
     build_function_graph(func, &AstGraphOptions::default(), None)
 }
