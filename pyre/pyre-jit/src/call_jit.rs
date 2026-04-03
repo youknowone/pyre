@@ -810,6 +810,9 @@ pub fn resume_in_blackhole(
     use majit_ir::Value;
 
     if frames.is_empty() {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!("[jit][bh-fail] resume_in_blackhole: empty frames");
+        }
         return BlackholeResult::Failed;
     }
 
@@ -839,6 +842,12 @@ pub fn resume_in_blackhole(
 
     for (sec_idx, section) in frames.iter().enumerate().rev() {
         if section.frame_ptr.is_null() || section.code.is_null() {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bh-fail] resume_in_blackhole: null ptr at sec={} frame={:?} code={:?} py_pc={}",
+                    sec_idx, section.frame_ptr, section.code, section.py_pc,
+                );
+            }
             builder.release_chain(prev_bh);
             return BlackholeResult::Failed;
         }
@@ -965,13 +974,10 @@ pub fn resume_in_blackhole(
             );
         }
         // resume.py:1017-1038 _prepare_next_section:
-        // RPython dispatches typed callbacks: _callback_i → write_an_int,
-        // _callback_r → write_a_ref, _callback_f → write_a_float.
-        // pyre: all Python locals are PyObjectRef (GCREF) → write_a_ref only.
-        // codewriter regalloc puts all locals in ref registers (move_r).
+        // _callback_r → write_a_ref. pyre: all Python locals are
+        // PyObjectRef → ref bank only (codewriter uses move_r).
         if use_liveness {
             if let Some(info) = liveness_info {
-                // enumerate_vars: iterate live_r_regs (same order as capture).
                 for (val_idx, &reg_idx) in info.live_r_regs.iter().enumerate() {
                     let idx = reg_idx as usize;
                     if let Some(val) = section.values.get(val_idx) {
@@ -983,7 +989,7 @@ pub fn resume_in_blackhole(
                     }
                 }
             } else {
-                // Fallback: LiveVars path
+                // Fallback: LiveVars path — all slots ref.
                 let live = pyre_jit_trace::state::liveness_for(section.code);
                 let max_stack = vsd.saturating_sub(nlocals);
                 let mut val_idx = 0;
@@ -1248,7 +1254,6 @@ pub fn resume_in_blackhole_to_merge_point(frame: &mut PyFrame, merge_py_pc: usiz
 
     // Direct PyFrame loading (not resume data — no enumerate_vars dispatch).
     // frame.locals_cells_stack_w is always PyObjectRef → write_a_ref only.
-    // The writeback (line 950) reads from registers_r.
     let nlocals = code.varnames.len();
     for i in 0..nlocals {
         if i < frame.locals_cells_stack_w.len() {
@@ -1644,16 +1649,18 @@ fn jit_blackhole_resume_from_guard(
         // resume.py:924-926 _prepare: get rd_virtuals for TAGVIRTUAL materialization.
         let rd_virtuals = driver.get_rd_virtuals(actual_green_key, trace_id, fail_index);
         let rd_virtuals_ref = rd_virtuals.as_deref();
-        // rd_numb TAGBOX indices reference the raw deadframe (before rebuild).
-        // blackhole_from_resumedata returns None (→ Failed) for pc=-1
-        // (no-snapshot) frames. Failed → None → force_fn fallback in
-        // the caller, which is faster than jitcode-level BH dispatch.
+        // resume.py parity: deadframe_types tells decode_ref() whether a
+        // TAGBOX slot holds a raw int (needs boxing) or a GcRef (use as-is).
+        // Without this, unboxed ints are treated as pointers → SIGSEGV.
+        let deadframe_types =
+            driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index);
         let result = blackhole_resume_via_rd_numb(
             &rd_numb,
             &rd_consts,
             raw_deadframe,
             None,
             rd_virtuals_ref,
+            deadframe_types.as_deref(),
         );
         return handle_blackhole_result(result, fail_values);
     }
@@ -1672,6 +1679,7 @@ pub fn blackhole_resume_via_rd_numb(
     deadframe: &[i64],
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    deadframe_types: Option<&[majit_ir::Type]>,
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
@@ -1741,7 +1749,7 @@ pub fn blackhole_resume_via_rd_numb(
         rd_numb,
         rd_consts,
         deadframe,
-        None,                   // deadframe_types
+        deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
         rd_virtuals_slice,      // rd_virtuals
         None,                   // rd_pendingfields
         rd_guard_pendingfields, // rd_guard_pendingfields
@@ -2694,8 +2702,10 @@ pub extern "C" fn bh_call_fn_8(
     )
 }
 
-/// bhimpl_residual_call: parent frame from BH_VABLE_PTR thread-local.
+/// blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
 /// RPython: bhimpl_residual_call dispatches via cpu.bh_call_*.
+/// pyre: dispatches builtin vs user function. Parent frame provides
+/// full call protocol (defaults, kw-only, varargs, generator).
 fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     if callable.is_null() {
         let err = pyre_interpreter::PyError::new(
@@ -2718,6 +2728,9 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
             }
         }
     }
+    // blackhole.py bhimpl_residual_call: parent frame from BH_VABLE_PTR.
+    // call_user_function_plain handles full call protocol (defaults,
+    // kw-only, pack_varargs, generator/coroutine).
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };
