@@ -982,11 +982,7 @@ fn rebuild_state_after_failure(
     // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
     // Process ALL frames, not just frames[0].
     if let Some(recovery) = recovery {
-        if !recovery.frames.is_empty()
-            && (!recovery.virtual_layouts.is_empty()
-                || recovery.frames.len() > 1
-                || !recovery.pending_field_layouts.is_empty())
-        {
+        if !recovery.frames.is_empty() {
             // Step 1: materialize all virtuals referenced by any frame.
             // Keep materialized pointers indexed by vidx for pending fields.
             let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
