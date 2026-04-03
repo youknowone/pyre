@@ -484,6 +484,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.register_raw_int_box_helper(helper);
     }
 
+    /// Set the W_IntObject.intval field descriptor for Ref→Int unboxing in FINISH.
+    pub fn set_intval_descr(&mut self, descr: majit_ir::DescrRef) {
+        self.meta.set_intval_descr(descr);
+    }
+
     /// Register a recursive force helper that accepts a raw-int argument and
     /// can return a raw-int result for raw-int Finish traces.
     pub fn register_raw_int_force_helper(&mut self, helper: *const ()) {
