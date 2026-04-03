@@ -382,13 +382,34 @@ pub struct VirtualState {
     /// virtualstate.py: renum — maps virtual OpRef to numbering index.
     /// Used to ensure consistent virtual identity across loop iterations.
     pub renum: std::collections::HashMap<OpRef, usize>,
+    /// RPython virtualstate.py: position_in_notvirtuals encoded as a flat
+    /// traversal schedule. Each non-virtual leaf occurrence in `state`
+    /// records the slot it should write in `boxes[...]`.
+    slot_schedule: Vec<usize>,
+    numnotvirtuals: usize,
 }
 
 impl VirtualState {
     pub fn new(state: Vec<VirtualStateInfo>) -> Self {
+        let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&state);
         VirtualState {
             state,
             renum: std::collections::HashMap::new(),
+            slot_schedule,
+            numnotvirtuals,
+        }
+    }
+
+    fn new_with_slot_schedule(
+        state: Vec<VirtualStateInfo>,
+        slot_schedule: Vec<usize>,
+        numnotvirtuals: usize,
+    ) -> Self {
+        VirtualState {
+            state,
+            renum: std::collections::HashMap::new(),
+            slot_schedule,
+            numnotvirtuals,
         }
     }
 
@@ -427,10 +448,7 @@ impl VirtualState {
     /// Number of non-virtual values (need concrete OpRefs at loop entry).
     /// virtualstate.py: num_boxes()
     pub fn num_boxes(&self) -> usize {
-        self.state
-            .iter()
-            .map(Self::count_forced_boxes_for_entry)
-            .sum()
+        self.numnotvirtuals
     }
 
     /// Total number of entries (virtual + non-virtual).
@@ -457,50 +475,65 @@ impl VirtualState {
     /// recursively contribute the concrete boxes of their forced fields/items.
     pub fn make_inputargs(&self, concrete_refs: &[OpRef], ctx: &OptContext) -> Vec<OpRef> {
         // RPython VirtualState.make_inputargs: boxes array sized by
-        // numnotvirtuals. Aliased boxes (same resolved OpRef) share the
-        // same position_in_notvirtuals, so they write to the same slot.
+        // numnotvirtuals. Slot reuse is decided by each
+        // NotVirtualStateInfo.position_in_notvirtuals during virtual-state
+        // construction, not by runtime box equality at export time.
+        //
+        // pyre does not yet carry position_in_notvirtuals explicitly, so the
+        // closest parity is to enumerate the state tree in order and never
+        // merge slots just because two current OpRefs happen to resolve to the
+        // same runtime box. Dynamic dedup collapses distinct carried values
+        // when they are equal at trace time (e.g. two different loop vars both
+        // being 0), which is exactly the int_loop failure mode.
         let mut args = vec![OpRef::NONE; self.num_boxes()];
         let mut next_slot = 0usize;
-        // RPython create_state cache: track which resolved OpRef has
-        // already been assigned a slot. If two concrete_refs resolve to
-        // the same OpRef, they share the same slot (position_in_notvirtuals).
-        let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
+        let mut slot_cursor = 0usize;
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
-            let resolved = ctx.get_box_replacement(opref);
-            if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
-                if let Some(&existing_slot) = assigned_slots.get(&resolved) {
-                    // Same resolved box — reuse existing slot (RPython alias dedup)
-                    if let Some(slot) = args.get_mut(existing_slot) {
-                        *slot = resolved;
-                    }
-                    continue;
-                }
-                assigned_slots.insert(resolved, next_slot);
-            }
-            Self::enum_forced_boxes_for_entry(info, opref, ctx, &mut args, &mut next_slot);
+            Self::enum_forced_boxes_for_entry(
+                info,
+                opref,
+                ctx,
+                &mut args,
+                &mut next_slot,
+                &self.slot_schedule,
+                &mut slot_cursor,
+            );
         }
-        args.into_iter().filter(|opref| !opref.is_none()).collect()
+        // virtualstate.py:662-670 returns a fixed-size `boxes` list with
+        // positional correspondence preserved. Do not compact away interior
+        // holes here; later consumers must handle OpRef::NONE explicitly.
+        args
     }
 
     /// Return the original top-level input slots corresponding to each
     /// non-virtual inputarg produced by `make_inputargs()`.
     ///
-    /// This mirrors RPython's top-level inputarg ownership. Leaf boxes coming
-    /// out of virtual fields do not correspond to a stable original input slot,
-    /// so they are reported as `OpRef::NONE`.
-    pub fn make_inputarg_source_slots(&self, concrete_refs: &[OpRef]) -> Vec<OpRef> {
+    /// majit-only compensation for the lack of stable Box identity across
+    /// phases. The source-slot enumeration must mirror make_inputargs()
+    /// exactly, including nested virtual field/item traversal, or the
+    /// assembled peeled trace loses the original source boxes for carried
+    /// loop-header values.
+    pub fn make_inputarg_source_slots(
+        &self,
+        concrete_refs: &[OpRef],
+        ctx: &OptContext,
+    ) -> Vec<OpRef> {
         let mut sources = vec![OpRef::NONE; self.num_boxes()];
         let mut next_slot = 0usize;
+        let mut slot_cursor = 0usize;
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
-            Self::enum_inputarg_source_slots(info, opref, true, &mut sources, &mut next_slot);
+            Self::enum_inputarg_source_slots(
+                info,
+                opref,
+                ctx,
+                &mut sources,
+                &mut next_slot,
+                &self.slot_schedule,
+                &mut slot_cursor,
+            );
         }
-        // Keep NONE entries to maintain positional correspondence with
-        // make_inputargs(). Filtering them out made source_slots shorter
-        // than label_args, causing assemble_peeled_trace's input_remap to
-        // fall back to sequential OpRef(i)→label_args[i] mapping which
-        // produces false aliases when constants/virtuals are present.
         sources.truncate(next_slot);
         sources
     }
@@ -538,20 +571,9 @@ impl VirtualState {
     ) -> Result<(Vec<OpRef>, Vec<OpRef>), ()> {
         let mut args = vec![OpRef::NONE; self.num_boxes()];
         let mut next_slot = 0usize;
-        // RPython position_in_notvirtuals dedup: same resolved OpRef → same slot
-        let mut assigned_slots: HashMap<OpRef, usize> = HashMap::new();
+        let mut slot_cursor = 0usize;
         for (idx, info) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
-            let resolved = ctx.get_box_replacement(opref);
-            if !info.is_virtual() && !matches!(info, VirtualStateInfo::Constant(_)) {
-                if let Some(&existing_slot) = assigned_slots.get(&resolved) {
-                    if let Some(slot) = args.get_mut(existing_slot) {
-                        *slot = resolved;
-                    }
-                    continue;
-                }
-                assigned_slots.insert(resolved, next_slot);
-            }
             Self::enum_forced_boxes_for_entry_with_optimizer(
                 info,
                 opref,
@@ -560,6 +582,8 @@ impl VirtualState {
                 &mut args,
                 &mut next_slot,
                 force_boxes,
+                &self.slot_schedule,
+                &mut slot_cursor,
             )?;
         }
         let inputargs: Vec<OpRef> = args.into_iter().filter(|opref| !opref.is_none()).collect();
@@ -579,6 +603,8 @@ impl VirtualState {
         ctx: &OptContext,
         boxes: &mut [OpRef],
         next_slot: &mut usize,
+        slot_schedule: &[usize],
+        slot_cursor: &mut usize,
     ) {
         match info {
             VirtualStateInfo::Constant(_) => {}
@@ -596,6 +622,8 @@ impl VirtualState {
                         ctx,
                         boxes,
                         next_slot,
+                        slot_schedule,
+                        slot_cursor,
                     );
                 }
             }
@@ -606,7 +634,15 @@ impl VirtualState {
                     let item_ref = ptr_info
                         .and_then(|info| info.getitem(index))
                         .unwrap_or(OpRef::NONE);
-                    Self::enum_forced_boxes_for_entry(item_state, item_ref, ctx, boxes, next_slot);
+                    Self::enum_forced_boxes_for_entry(
+                        item_state,
+                        item_ref,
+                        ctx,
+                        boxes,
+                        next_slot,
+                        slot_schedule,
+                        slot_cursor,
+                    );
                 }
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
@@ -624,6 +660,8 @@ impl VirtualState {
                             ctx,
                             boxes,
                             next_slot,
+                            slot_schedule,
+                            slot_cursor,
                         );
                         flat_index += 1;
                     }
@@ -647,6 +685,8 @@ impl VirtualState {
                         ctx,
                         boxes,
                         next_slot,
+                        slot_schedule,
+                        slot_cursor,
                     );
                 }
             }
@@ -658,9 +698,14 @@ impl VirtualState {
                 // where box = get_box_replacement(box). Aliased boxes share
                 // the same position_in_notvirtuals via create_state cache,
                 // so they write to the same slot (dedup handled by caller).
-                if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_box_replacement(opref);
+                let slot = slot_schedule
+                    .get(*slot_cursor)
+                    .copied()
+                    .unwrap_or(*next_slot);
+                if let Some(dst) = boxes.get_mut(slot) {
+                    *dst = ctx.get_box_replacement(opref);
                 }
+                *slot_cursor += 1;
                 *next_slot += 1;
             }
         }
@@ -669,55 +714,88 @@ impl VirtualState {
     fn enum_inputarg_source_slots(
         info: &VirtualStateInfo,
         opref: OpRef,
-        top_level: bool,
+        ctx: &OptContext,
         sources: &mut [OpRef],
         next_slot: &mut usize,
+        slot_schedule: &[usize],
+        slot_cursor: &mut usize,
     ) {
         match info {
             VirtualStateInfo::Constant(_) => {}
             VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
-                for (_, field_state) in fields {
+                let resolved = ctx.get_box_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (field_idx, field_state) in fields {
                     Self::enum_inputarg_source_slots(
                         field_state,
-                        OpRef::NONE,
-                        false,
+                        ptr_info
+                            .and_then(|info| info.getfield(*field_idx))
+                            .unwrap_or(OpRef::NONE),
+                        ctx,
                         sources,
                         next_slot,
+                        slot_schedule,
+                        slot_cursor,
                     );
                 }
             }
             VirtualStateInfo::VArray { items, .. } => {
-                for item_state in items {
+                let resolved = ctx.get_box_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (index, item_state) in items.iter().enumerate() {
                     Self::enum_inputarg_source_slots(
                         item_state,
-                        OpRef::NONE,
-                        false,
+                        ptr_info
+                            .and_then(|info| info.getitem(index))
+                            .unwrap_or(OpRef::NONE),
+                        ctx,
                         sources,
                         next_slot,
+                        slot_schedule,
+                        slot_cursor,
                     );
                 }
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+                let resolved = ctx.get_box_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                let mut flat_index = 0usize;
                 for fields in element_fields {
                     for (_, field_state) in fields {
                         Self::enum_inputarg_source_slots(
                             field_state,
-                            OpRef::NONE,
-                            false,
+                            ptr_info
+                                .and_then(|info| info.getitem(flat_index))
+                                .unwrap_or(OpRef::NONE),
+                            ctx,
                             sources,
                             next_slot,
+                            slot_schedule,
+                            slot_cursor,
                         );
+                        flat_index += 1;
                     }
                 }
             }
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-                for (_, _, entry_state) in entries {
+                let resolved = ctx.get_box_replacement(opref);
+                let ptr_info = ctx.get_ptr_info(resolved);
+                for (index, (_, _, entry_state)) in entries.iter().enumerate() {
                     Self::enum_inputarg_source_slots(
                         entry_state,
-                        OpRef::NONE,
-                        false,
+                        ptr_info
+                            .and_then(|info| match info {
+                                PtrInfo::VirtualRawBuffer(vinfo) => {
+                                    vinfo.entries.get(index).map(|(_, _, value)| *value)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(OpRef::NONE),
+                        ctx,
                         sources,
                         next_slot,
+                        slot_schedule,
+                        slot_cursor,
                     );
                 }
             }
@@ -725,9 +803,18 @@ impl VirtualState {
             | VirtualStateInfo::NonNull
             | VirtualStateInfo::IntBounded(_)
             | VirtualStateInfo::Unknown => {
-                if let Some(slot) = sources.get_mut(*next_slot) {
-                    *slot = if top_level { opref } else { OpRef::NONE };
+                let slot = slot_schedule
+                    .get(*slot_cursor)
+                    .copied()
+                    .unwrap_or(*next_slot);
+                if let Some(dst) = sources.get_mut(slot) {
+                    // majit-only compensation for missing Box identity:
+                    // source slots must preserve the ORIGINAL incoming slot,
+                    // not the forwarded target. assemble_peeled_trace uses
+                    // these to map Phase-2 body sources back onto LABEL args.
+                    *dst = opref;
                 }
+                *slot_cursor += 1;
                 *next_slot += 1;
             }
         }
@@ -741,6 +828,8 @@ impl VirtualState {
         boxes: &mut [OpRef],
         next_slot: &mut usize,
         force_boxes: bool,
+        slot_schedule: &[usize],
+        slot_cursor: &mut usize,
     ) -> Result<(), ()> {
         match info {
             VirtualStateInfo::Constant(_) => Ok(()),
@@ -771,6 +860,8 @@ impl VirtualState {
                         boxes,
                         next_slot,
                         force_boxes,
+                        slot_schedule,
+                        slot_cursor,
                     )?;
                 }
                 Ok(())
@@ -790,6 +881,8 @@ impl VirtualState {
                         boxes,
                         next_slot,
                         force_boxes,
+                        slot_schedule,
+                        slot_cursor,
                     )?;
                 }
                 Ok(())
@@ -811,6 +904,8 @@ impl VirtualState {
                             boxes,
                             next_slot,
                             force_boxes,
+                            slot_schedule,
+                            slot_cursor,
                         )?;
                         flat_index += 1;
                     }
@@ -837,6 +932,8 @@ impl VirtualState {
                         boxes,
                         next_slot,
                         force_boxes,
+                        slot_schedule,
+                        slot_cursor,
                     )?;
                 }
                 Ok(())
@@ -860,9 +957,14 @@ impl VirtualState {
                 // RPython virtualstate.py:425: store resolved box.
                 // Aliased boxes are deduped by the caller via
                 // assigned_slots / position_in_notvirtuals.
-                if let Some(slot) = boxes.get_mut(*next_slot) {
-                    *slot = ctx.get_box_replacement(forced);
+                let slot = slot_schedule
+                    .get(*slot_cursor)
+                    .copied()
+                    .unwrap_or(*next_slot);
+                if let Some(dst) = boxes.get_mut(slot) {
+                    *dst = ctx.get_box_replacement(forced);
                 }
+                *slot_cursor += 1;
                 *next_slot += 1;
                 Ok(())
             }
@@ -1500,7 +1602,7 @@ pub fn export_state(
     // aliased boxes naturally dedup in make_inputargs because they write
     // to the same position_in_notvirtuals slot.
     let mut cache: HashMap<OpRef, VirtualStateInfo> = HashMap::new();
-    let state = oprefs
+    let state: Vec<VirtualStateInfo> = oprefs
         .iter()
         .map(|opref| {
             let resolved = ctx.get_box_replacement(*opref);
@@ -1512,7 +1614,8 @@ pub fn export_state(
             info
         })
         .collect();
-    VirtualState::new(state)
+    let (slot_schedule, numnotvirtuals) = build_export_slot_schedule(&state, oprefs, ctx);
+    VirtualState::new_with_slot_schedule(state, slot_schedule, numnotvirtuals)
 }
 
 pub(crate) fn export_value_state(
@@ -1684,6 +1787,146 @@ fn export_single_value(
     VirtualStateInfo::Unknown
 }
 
+fn build_sequential_slot_schedule(state: &[VirtualStateInfo]) -> (Vec<usize>, usize) {
+    let mut schedule = Vec::new();
+    let mut next_slot = 0usize;
+    for info in state {
+        append_sequential_slots(info, &mut schedule, &mut next_slot);
+    }
+    (schedule, next_slot)
+}
+
+fn append_sequential_slots(
+    info: &VirtualStateInfo,
+    schedule: &mut Vec<usize>,
+    next_slot: &mut usize,
+) {
+    match info {
+        VirtualStateInfo::Constant(_) => {}
+        VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+            for (_, child) in fields {
+                append_sequential_slots(child, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::VArray { items, .. } => {
+            for child in items {
+                append_sequential_slots(child, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+            for fields in element_fields {
+                for (_, child) in fields {
+                    append_sequential_slots(child, schedule, next_slot);
+                }
+            }
+        }
+        VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+            for (_, _, child) in entries {
+                append_sequential_slots(child, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::KnownClass { .. }
+        | VirtualStateInfo::NonNull
+        | VirtualStateInfo::IntBounded(_)
+        | VirtualStateInfo::Unknown => {
+            schedule.push(*next_slot);
+            *next_slot += 1;
+        }
+    }
+}
+
+fn build_export_slot_schedule(
+    state: &[VirtualStateInfo],
+    oprefs: &[OpRef],
+    ctx: &OptContext,
+) -> (Vec<usize>, usize) {
+    let mut cache: HashMap<OpRef, usize> = HashMap::new();
+    let mut schedule = Vec::new();
+    let mut next_slot = 0usize;
+    for (info, &opref) in state.iter().zip(oprefs.iter()) {
+        append_export_slots(info, opref, ctx, &mut cache, &mut schedule, &mut next_slot);
+    }
+    (schedule, next_slot)
+}
+
+fn append_export_slots(
+    info: &VirtualStateInfo,
+    opref: OpRef,
+    ctx: &OptContext,
+    cache: &mut HashMap<OpRef, usize>,
+    schedule: &mut Vec<usize>,
+    next_slot: &mut usize,
+) {
+    match info {
+        VirtualStateInfo::Constant(_) => {}
+        VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+            let resolved = ctx.get_box_replacement(opref);
+            let ptr_info = ctx.get_ptr_info(resolved);
+            for (field_idx, child) in fields {
+                let field_ref = ptr_info
+                    .and_then(|pi| pi.getfield(*field_idx))
+                    .map(|field| ctx.get_box_replacement(field))
+                    .unwrap_or(OpRef::NONE);
+                append_export_slots(child, field_ref, ctx, cache, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::VArray { items, .. } => {
+            let resolved = ctx.get_box_replacement(opref);
+            let ptr_info = ctx.get_ptr_info(resolved);
+            for (index, child) in items.iter().enumerate() {
+                let item_ref = ptr_info
+                    .and_then(|pi| pi.getitem(index))
+                    .map(|item| ctx.get_box_replacement(item))
+                    .unwrap_or(OpRef::NONE);
+                append_export_slots(child, item_ref, ctx, cache, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+            let resolved = ctx.get_box_replacement(opref);
+            let ptr_info = ctx.get_ptr_info(resolved);
+            let mut flat_index = 0usize;
+            for fields in element_fields {
+                for (_, child) in fields {
+                    let item_ref = ptr_info
+                        .and_then(|pi| pi.getitem(flat_index))
+                        .map(|item| ctx.get_box_replacement(item))
+                        .unwrap_or(OpRef::NONE);
+                    append_export_slots(child, item_ref, ctx, cache, schedule, next_slot);
+                    flat_index += 1;
+                }
+            }
+        }
+        VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+            let resolved = ctx.get_box_replacement(opref);
+            let ptr_info = ctx.get_ptr_info(resolved);
+            for (index, (_, _, child)) in entries.iter().enumerate() {
+                let entry_ref = ptr_info
+                    .and_then(|pi| match pi {
+                        PtrInfo::VirtualRawBuffer(vinfo) => {
+                            vinfo.entries.get(index).map(|(_, _, value)| *value)
+                        }
+                        _ => None,
+                    })
+                    .map(|entry| ctx.get_box_replacement(entry))
+                    .unwrap_or(OpRef::NONE);
+                append_export_slots(child, entry_ref, ctx, cache, schedule, next_slot);
+            }
+        }
+        VirtualStateInfo::KnownClass { .. }
+        | VirtualStateInfo::NonNull
+        | VirtualStateInfo::IntBounded(_)
+        | VirtualStateInfo::Unknown => {
+            let resolved = ctx.get_box_replacement(opref);
+            let slot = *cache.entry(resolved).or_insert_with(|| {
+                let slot = *next_slot;
+                *next_slot += 1;
+                slot
+            });
+            schedule.push(slot);
+        }
+    }
+}
+
 /// Import a virtual state: apply known info to the optimization context.
 ///
 /// For each loop-carried variable, set up the context so downstream passes
@@ -1708,6 +1951,28 @@ fn import_single_value(
     ctx: &mut OptContext,
     ptr_info: &mut Vec<Option<PtrInfo>>,
 ) {
+    fn import_child_placeholder(ctx: &mut OptContext, tp: majit_ir::Type) -> OpRef {
+        ctx.emit(majit_ir::Op::new(
+            majit_ir::OpCode::same_as_for_type(tp),
+            &[OpRef::NONE],
+        ))
+    }
+
+    fn imported_value_type(info: &VirtualStateInfo) -> majit_ir::Type {
+        match info {
+            VirtualStateInfo::Constant(val) => val.get_type(),
+            VirtualStateInfo::Virtual { .. }
+            | VirtualStateInfo::VArray { .. }
+            | VirtualStateInfo::VStruct { .. }
+            | VirtualStateInfo::VArrayStruct { .. }
+            | VirtualStateInfo::VirtualRawBuffer { .. }
+            | VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull => majit_ir::Type::Ref,
+            VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
+            VirtualStateInfo::Unknown => majit_ir::Type::Int,
+        }
+    }
+
     let idx = opref.0 as usize;
     if idx >= ptr_info.len() {
         ptr_info.resize(idx + 1, None);
@@ -1725,9 +1990,13 @@ fn import_single_value(
         } => {
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
-                // Create a synthetic OpRef for the field value
-                let field_opref =
-                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                let field_tp = field_descrs
+                    .iter()
+                    .find(|(idx, _)| idx == field_idx)
+                    .and_then(|(_, descr)| descr.as_field_descr())
+                    .map(|descr| descr.field_type())
+                    .unwrap_or_else(|| imported_value_type(field_info));
+                let field_opref = import_child_placeholder(ctx, field_tp);
                 import_single_value(field_info, field_opref, ctx, ptr_info);
                 vfields.push((*field_idx, field_opref));
             }
@@ -1742,8 +2011,11 @@ fn import_single_value(
         VirtualStateInfo::VArray { descr, items, .. } => {
             let mut vitems = Vec::new();
             for item_info in items {
-                let item_opref =
-                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                let item_tp = descr
+                    .as_array_descr()
+                    .map(|arraydescr| arraydescr.item_type())
+                    .unwrap_or_else(|| imported_value_type(item_info));
+                let item_opref = import_child_placeholder(ctx, item_tp);
                 import_single_value(item_info, item_opref, ctx, ptr_info);
                 vitems.push(item_opref);
             }
@@ -1761,8 +2033,13 @@ fn import_single_value(
         } => {
             let mut vfields = Vec::new();
             for (field_idx, field_info) in fields {
-                let field_opref =
-                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                let field_tp = field_descrs
+                    .iter()
+                    .find(|(idx, _)| idx == field_idx)
+                    .and_then(|(_, descr)| descr.as_field_descr())
+                    .map(|descr| descr.field_type())
+                    .unwrap_or_else(|| imported_value_type(field_info));
+                let field_opref = import_child_placeholder(ctx, field_tp);
                 import_single_value(field_info, field_opref, ctx, ptr_info);
                 vfields.push((*field_idx, field_opref));
             }
@@ -1782,7 +2059,7 @@ fn import_single_value(
                 let mut imported_fields = Vec::new();
                 for (field_idx, field_info) in fields {
                     let field_opref =
-                        ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                        import_child_placeholder(ctx, imported_value_type(field_info));
                     import_single_value(field_info, field_opref, ctx, ptr_info);
                     imported_fields.push((*field_idx, field_opref));
                 }
@@ -1798,8 +2075,7 @@ fn import_single_value(
         VirtualStateInfo::VirtualRawBuffer { size, entries } => {
             let mut imported_entries = Vec::new();
             for (offset, length, entry_info) in entries {
-                let entry_opref =
-                    ctx.emit(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::NONE]));
+                let entry_opref = import_child_placeholder(ctx, imported_value_type(entry_info));
                 import_single_value(entry_info, entry_opref, ctx, ptr_info);
                 imported_entries.push((*offset, *length, entry_opref));
             }

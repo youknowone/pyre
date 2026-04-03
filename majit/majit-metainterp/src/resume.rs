@@ -319,6 +319,7 @@ pub struct EncodedResumeData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodedResumeLayout {
+    vable_array: Vec<ResumeValueSource>,
     frames: Vec<FrameInfo>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
@@ -762,6 +763,7 @@ impl PendingFieldLayoutSummary {
 impl ResumeLayoutSummary {
     pub fn to_resume_data(&self) -> ResumeData {
         ResumeData {
+            vable_array: Vec::new(),
             frames: self
                 .frame_layouts
                 .iter()
@@ -1010,6 +1012,8 @@ pub struct FrameInfo {
 /// from the values stored in a DeadFrame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeData {
+    /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
+    pub vable_array: Vec<ResumeValueSource>,
     /// Stack of frames, outermost first.
     /// For a simple non-inlined trace, this has exactly one entry.
     pub frames: Vec<FrameInfo>,
@@ -1628,7 +1632,12 @@ pub struct EncodedPendingFieldWrite {
 
 impl EncodedResumeData {
     pub fn encode(rd: &ResumeData) -> Self {
-        Self::from_semantic(&rd.frames, &rd.virtuals, &rd.pending_fields)
+        Self::from_semantic(
+            &rd.vable_array,
+            &rd.frames,
+            &rd.virtuals,
+            &rd.pending_fields,
+        )
     }
 
     /// resume.py:231-267 number + resume.py:380-468 finish
@@ -1636,6 +1645,7 @@ impl EncodedResumeData {
     /// Walks all frames via _number_boxes, assigning compact sequential
     /// TAGBOX numbers to unique liveboxes (resume.py:199-226).
     fn from_semantic(
+        vable_array: &[ResumeValueSource],
         frames: &[FrameInfo],
         virtuals: &[VirtualInfo],
         pending_fields: &[PendingFieldInfo],
@@ -1651,6 +1661,18 @@ impl EncodedResumeData {
         // resume.py:234-235: reserve slots for items_resume_section and count.
         rd_numb.push(0); // [0] = items_resume_section (patched later)
         rd_numb.push(0); // [1] = count (patched later)
+        rd_numb.push(encode_len(vable_array.len()));
+        for source in vable_array {
+            let tagged = encode_tagged_source(
+                source,
+                &mut rd_consts,
+                &mut const_indices,
+                &mut liveboxes,
+                &mut box_map,
+            );
+            rd_numb.push(tagged);
+        }
+        rd_numb.push(encode_len(0));
         rd_numb.push(encode_len(frames.len()));
 
         // resume.py:249-258: per-frame encoding via _number_boxes
@@ -1736,6 +1758,15 @@ impl EncodedResumeData {
         // resume.py:921 self.count — number of liveboxes in the deadframe.
         let _count = decode_len(self.next_word(&mut cursor));
 
+        let vable_count = decode_len(self.next_word(&mut cursor));
+        let mut vable_array = Vec::with_capacity(vable_count);
+        for _ in 0..vable_count {
+            vable_array.push(self.decode_box(self.next_word(&mut cursor)));
+        }
+        let vref_count = decode_len(self.next_word(&mut cursor));
+        for _ in 0..(vref_count * 2) {
+            let _ = self.decode_box(self.next_word(&mut cursor));
+        }
         let num_frames = decode_len(self.next_word(&mut cursor));
         let mut frames = Vec::with_capacity(num_frames);
         for _ in 0..num_frames {
@@ -1768,6 +1799,7 @@ impl EncodedResumeData {
             })
             .collect();
         DecodedResumeLayout {
+            vable_array,
             frames,
             virtuals,
             pending_fields,
@@ -1816,6 +1848,7 @@ impl EncodedResumeData {
     pub fn decode(&self) -> ResumeData {
         let layout = self.decode_layout();
         ResumeData {
+            vable_array: layout.vable_array,
             frames: layout.frames,
             virtuals: layout.virtuals,
             pending_fields: layout.pending_fields,
@@ -1924,6 +1957,7 @@ impl ResumeData {
     pub fn simple(pc: u64, num_slots: usize) -> Self {
         let slot_map: Vec<FrameSlotSource> = (0..num_slots).map(FrameSlotSource::FailArg).collect();
         ResumeData {
+            vable_array: Vec::new(),
             frames: vec![FrameInfo { pc, slot_map }],
             virtuals: Vec::new(),
             pending_fields: Vec::new(),
@@ -1932,7 +1966,12 @@ impl ResumeData {
 
     /// Encode this resume snapshot into a compact RPython-style numbering.
     pub fn encode(&self) -> EncodedResumeData {
-        EncodedResumeData::from_semantic(&self.frames, &self.virtuals, &self.pending_fields)
+        EncodedResumeData::from_semantic(
+            &self.vable_array,
+            &self.frames,
+            &self.virtuals,
+            &self.pending_fields,
+        )
     }
 
     fn decode_layout(&self) -> DecodedResumeLayout {
@@ -2430,6 +2469,7 @@ impl MaterializedVirtual {
 /// - `store_final_boxes_in_guard` (mod.rs) — numbering + rd_numb/rd_consts
 /// - `store_final_boxes_in_guard` (optimizer.rs) — virtual expansion + rd_virtuals
 pub struct ResumeDataVirtualAdder {
+    vable_array: Vec<ResumeValueSource>,
     frames: Vec<FrameInfoBuilder>,
     virtuals: Vec<VirtualInfo>,
     pending_fields: Vec<PendingFieldInfo>,
@@ -2444,10 +2484,15 @@ impl ResumeDataVirtualAdder {
     /// Create a new builder.
     pub fn new() -> Self {
         ResumeDataVirtualAdder {
+            vable_array: Vec::new(),
             frames: Vec::new(),
             virtuals: Vec::new(),
             pending_fields: Vec::new(),
         }
+    }
+
+    pub fn set_vable_array(&mut self, values: Vec<ResumeValueSource>) {
+        self.vable_array = values;
     }
 
     /// Push a new frame onto the stack.
@@ -2666,6 +2711,7 @@ impl ResumeDataVirtualAdder {
     /// Build the final ResumeData.
     pub fn build(self) -> ResumeData {
         ResumeData {
+            vable_array: self.vable_array,
             frames: self
                 .frames
                 .into_iter()
@@ -3409,6 +3455,18 @@ impl ResumeDataLoopMemo {
         // resume.py:234-235: reserve slots
         rd_numb.push(0); // [0] = items_resume_section
         rd_numb.push(0); // [1] = count
+        rd_numb.push(encode_len(rd.vable_array.len()));
+        for source in &rd.vable_array {
+            let tagged = encode_tagged_source(
+                source,
+                &mut self.rd_consts_pool,
+                &mut self.const_indices,
+                &mut liveboxes,
+                &mut box_map,
+            );
+            rd_numb.push(tagged);
+        }
+        rd_numb.push(encode_len(0));
         rd_numb.push(encode_len(rd.frames.len()));
 
         // resume.py:249-258: per-frame via _number_boxes
@@ -3682,38 +3740,22 @@ fn decode_tagged(
 /// TAGVIRTUAL values are returned as `RebuiltValue::Virtual(index)`.
 /// Materialization is handled by materialize_from_recovery_layout
 /// in pyre-jit/eval.rs using the guard's rd_virtuals/ExitRecoveryLayout.
-/// Simplified rd_numb decoder (metainterp-local version).
-///
-/// Limitations vs upstream rebuild_from_resumedata (resume.py:1042):
-/// - Assumes flat format: [total_size, num_failargs, vable_len, vable...,
-///   vref_len, vref..., frames...]. Does not handle ginfo items between
-///   vable and vref sections.
-/// - Consumes all remaining tagged values into a single frame. Upstream
-///   reads per-frame sections guided by jitcode liveness info.
-///
-/// Returns `(num_failargs, vable_values, frames)`:
-/// - `vable_values`: tagged values from the vable section.
-/// - `frames`: per-frame state (jitcode_index, pc, slot values).
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
-) -> (i32, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
+) -> (i32, Vec<RebuiltFrame>) {
     let mut reader = crate::resumecode::Reader::new(rd_numb);
 
     let total_size = reader.next_item();
     let num_failargs = reader.next_item();
 
-    // resume.py:918-940 consume_vref_and_vable: decode virtualizable array.
-    // RPython writes these back to the virtualizable object via
-    // vinfo.write_from_resume_data. In pyre, vable = frame locals+stack.
+    // Virtualizable array (skip).
     let vable_len = reader.next_item();
-    let mut vable_values = Vec::with_capacity(vable_len as usize);
-    for _ in 0..vable_len {
-        let tagged = reader.next_item() as i16;
-        vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
+    if vable_len > 0 {
+        reader.jump(vable_len as usize);
     }
 
-    // Virtualref array (skip for now).
+    // Virtualref array (skip).
     let vref_len = reader.next_item();
     if vref_len > 0 {
         reader.jump((vref_len * 2) as usize);
@@ -3721,6 +3763,10 @@ pub fn rebuild_from_numbering(
 
     // Frames.
     // resume.py:1049-1055: read frames until done.
+    // RPython does NOT encode slot_count — it uses jitcode.position_info
+    // to know how many registers each frame has. For single-frame (all we
+    // support), after reading jitcode_index and pc, consume ALL remaining
+    // tagged values.
     let mut frames = Vec::new();
     if reader.has_more() {
         let jitcode_index = reader.next_item();
@@ -3738,7 +3784,7 @@ pub fn rebuild_from_numbering(
     }
 
     let _ = total_size;
-    (num_failargs, vable_values, frames)
+    (num_failargs, frames)
 }
 
 #[cfg(test)]

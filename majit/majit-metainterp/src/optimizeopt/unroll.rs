@@ -2257,7 +2257,7 @@ impl OptUnroll {
             .make_inputargs_and_virtuals(targetargs, ctx);
         let source_slots = exported_state
             .virtual_state
-            .make_inputarg_source_slots(targetargs);
+            .make_inputarg_source_slots(targetargs, ctx);
         let mut short_args = label_args.clone();
         short_args.extend(virtuals);
         if std::env::var_os("MAJIT_LOG").is_some() {
