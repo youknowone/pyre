@@ -404,19 +404,23 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_ty: result_ty.clone(),
         },
         OpKind::InlineCall {
+            jitcode_index,
             target,
             args,
             result_ty,
         } => OpKind::InlineCall {
+            jitcode_index: *jitcode_index,
             target: target.clone(),
             args: args.iter().map(remap).collect(),
             result_ty: result_ty.clone(),
         },
         OpKind::RecursiveCall {
+            jd_index,
             target,
             args,
             result_ty,
         } => OpKind::RecursiveCall {
+            jd_index: *jd_index,
             target: target.clone(),
             args: args.iter().map(remap).collect(),
             result_ty: result_ty.clone(),

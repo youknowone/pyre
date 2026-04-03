@@ -176,7 +176,7 @@ fn analyze_pipeline_from_parsed(
         &canonical_inherent_methods,
         &canonical_function_graphs,
         &config.pipeline,
-        &call_control,
+        &mut call_control,
     );
 
     pipeline
@@ -188,7 +188,7 @@ fn build_canonical_opcode_dispatch(
     inherent_methods: &[parse::InherentMethodInfo],
     function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
     pipeline_config: &passes::PipelineConfig,
-    call_control: &call::CallControl,
+    call_control: &mut call::CallControl,
 ) -> Vec<passes::PipelineOpcodeArm> {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
@@ -221,7 +221,7 @@ fn build_canonical_opcode_dispatch(
             // rewrites its Call ops to inline_call_*/residual_call_* etc.
             let flattened = arm.body_graph.as_ref().map(|handler_graph| {
                 let mut transformer = passes::Transformer::new(&pipeline_config.transform)
-                    .with_callcontrol(call_control);
+                    .with_callcontrol(&mut *call_control);
                 let rewritten = transformer.transform(handler_graph);
                 passes::flatten_with_types(
                     &rewritten.graph,

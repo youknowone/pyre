@@ -101,12 +101,16 @@ pub struct CallControl {
     /// RPython: detected via `funcobj.graph.func.oopspec`.
     builtin_targets: HashSet<CallPath>,
 
-    /// RPython: `CallControl.jitcodes` — map {graph_key: JitCode}.
+    /// RPython: `CallControl.jitcodes` — map {graph_key: jitcode_index}.
     /// Tracks which graphs have been assigned JitCode objects.
-    jitcodes: HashMap<CallPath, ()>,
+    /// The index is assigned sequentially and used by InlineCall ops.
+    jitcodes: HashMap<CallPath, usize>,
 
     /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
     unfinished_graphs: Vec<CallPath>,
+
+    /// Next JitCode index to assign.
+    next_jitcode_index: usize,
 }
 
 impl CallControl {
@@ -121,6 +125,7 @@ impl CallControl {
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
+            next_jitcode_index: 0,
         }
     }
 
@@ -254,7 +259,7 @@ impl CallControl {
         #[cfg(test)]
         eprintln!(
             "find_all_graphs_bfs: {} function_graphs, {} candidates (from {} portals)",
-            initial_fn_count,
+            self.function_graphs.len(),
             self.candidate_graphs.len(),
             self.portal_targets.len()
         );
@@ -267,14 +272,22 @@ impl CallControl {
     }
 
     /// RPython: `CallControl.get_jitcode(graph, called_from)`.
-    /// Retrieve or create a JitCode entry for the given graph.
-    /// Currently tracks presence only — full JitCode objects are
-    /// managed by the assembler (future).
-    pub fn get_jitcode(&mut self, path: CallPath) {
-        if !self.jitcodes.contains_key(&path) {
-            self.jitcodes.insert(path.clone(), ());
-            self.unfinished_graphs.push(path);
+    ///
+    /// Retrieve or create a JitCode index for the given graph.
+    /// Returns the index that should be embedded in `InlineCall` ops
+    /// so the meta-interpreter can find the callee's bytecode.
+    ///
+    /// RPython call.py:155-172: creates JitCode(graph.name, fnaddr, calldescr)
+    /// and adds graph to unfinished_graphs for later assembly.
+    pub fn get_jitcode(&mut self, path: &CallPath) -> usize {
+        if let Some(&index) = self.jitcodes.get(path) {
+            return index;
         }
+        let index = self.next_jitcode_index;
+        self.next_jitcode_index += 1;
+        self.jitcodes.insert(path.clone(), index);
+        self.unfinished_graphs.push(path.clone());
+        index
     }
 
     /// RPython: `CallControl.enum_pending_graphs()`.
