@@ -586,10 +586,58 @@ pub(crate) fn build_guard_metadata(
                         .collect()
                 })
                 .unwrap_or_default();
+            // resume.py:926,993: rd_pendingfields → pending_field_layouts.
+            let pending_field_layouts: Vec<majit_backend::ExitPendingFieldLayout> = op
+                .rd_pendingfields
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|pf| {
+                            let resolve_tagged = |tagged: i16| -> ExitValueSourceLayout {
+                                let (val, tagbits) = majit_ir::resumedata::untag(tagged);
+                                match tagbits {
+                                    majit_ir::resumedata::TAGBOX => {
+                                        ExitValueSourceLayout::ExitValue(val as usize)
+                                    }
+                                    majit_ir::resumedata::TAGVIRTUAL => {
+                                        ExitValueSourceLayout::Virtual(val as usize)
+                                    }
+                                    majit_ir::resumedata::TAGINT => {
+                                        ExitValueSourceLayout::Constant(val as i64)
+                                    }
+                                    majit_ir::resumedata::TAGCONST => {
+                                        let idx =
+                                            (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+                                        let c =
+                                            rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
+                                        ExitValueSourceLayout::Constant(c)
+                                    }
+                                    _ => ExitValueSourceLayout::Constant(0),
+                                }
+                            };
+                            majit_backend::ExitPendingFieldLayout {
+                                descr_index: pf.descr_index,
+                                item_index: if pf.item_index < 0 {
+                                    None
+                                } else {
+                                    Some(pf.item_index as usize)
+                                },
+                                is_array_item: pf.item_index >= 0,
+                                target: resolve_tagged(pf.target_tagged),
+                                value: resolve_tagged(pf.value_tagged),
+                                field_offset: pf.field_offset,
+                                field_size: pf.field_size,
+                                field_type: majit_ir::Type::Ref,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(ExitRecoveryLayout {
                 frames: frames_layout,
                 virtual_layouts,
-                pending_field_layouts: vec![],
+                pending_field_layouts,
             })
         } else {
             // No rd_numb: identity recovery layout.
