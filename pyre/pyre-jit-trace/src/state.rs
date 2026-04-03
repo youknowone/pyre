@@ -2774,6 +2774,26 @@ impl MIFrame {
                 self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
         }
+        // pyjitpl.py:2934-2940 remove_consts_and_duplicates:
+        // Replace constant or duplicate OpRefs with SameAs to give each
+        // JUMP arg slot a unique identity. The optimizer's unroll pass
+        // needs distinct identities to track values independently.
+        {
+            use std::collections::HashSet;
+            let header_len = 3; // [frame, next_instr, valuestackdepth]
+            let mut seen = HashSet::new();
+            for i in header_len..args.len() {
+                let opref = args[i];
+                if opref.is_constant() || !seen.insert(opref) {
+                    let tp = inputarg_types
+                        .get(i)
+                        .copied()
+                        .unwrap_or(majit_ir::Type::Ref);
+                    let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
+                    args[i] = ctx.record_op(same_as_op, &[opref]);
+                }
+            }
+        }
         // pyjitpl.py:2967-2969: generate a dummy GUARD_FUTURE_CONDITION
         // just before the JUMP so that unroll can use it when it's
         // creating artificial guards (patchguardop). record_guard calls
