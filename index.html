@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="pyre is a PyPy-style meta-tracing JIT Python implementation, reimplemented in Rust.">
+  <meta name="description" content="Pyre is a PyPy-style meta-tracing JIT Python implementation, reimplemented in Rust.">
   <meta name="theme-color" content="#0f1720">
   <title>pyre</title>
   <style>
@@ -478,7 +478,7 @@
         <div class="hero-copy">
           <h1>Python Rewritten</h1>
           <p>
-            pyre is a Python implementation with a PyPy-style meta-tracing JIT, built in Rust on top of MaJIT.
+            Pyre is a Python implementation with a PyPy-style meta-tracing JIT, built in Rust on top of MaJIT.
             The project aims to keep the original architecture recognizable while using a modern Rust toolchain and a no-GIL runtime.
           </p>
           <div class="hero-actions">
@@ -541,7 +541,7 @@ print(fib(100))</textarea>
           <article class="section-card">
             <h2 class="section-title">Project goals</h2>
             <p>
-              pyre is not trying to invent a totally innovative Python runtime. The short-term goal is to find out
+              Pyre is not trying to invent a totally innovative Python runtime. The short-term goal is to find out
               whether PyPy's structure can be reproduced on top of Rust, and if so, what that reproduction costs.
             </p>
             <ul class="goal-list">
@@ -598,7 +598,7 @@ print(fib(100))</textarea>
 
     <footer>
       <div class="footer-card">
-        pyre is under active development. For benchmarks, architecture notes, and source-level details, see the
+        Pyre is under active development. For benchmarks, architecture notes, and source-level details, see the
         <a href="https://github.com/youknowone/pyre">repository README</a>.
       </div>
     </footer>
@@ -635,7 +635,7 @@ print(total)`;
         runPython = run_python;
         runButton.disabled = false;
         setStatus("Ready", "ready");
-        setOutput("pyre is ready.\n\nPress Run to execute the example.");
+        setOutput("Pyre is ready.\n\nPress Run to execute the example.");
       } catch (error) {
         console.error(error);
         setStatus("Failed to load WebAssembly module", "error");
