@@ -20,7 +20,6 @@ use syn::{
 
 mod jit_interp;
 mod virtualizable;
-mod virtualizable_derive;
 
 struct JitInlineArgs {
     calls: Vec<(Path, Option<jit_interp::CallPolicyKind>)>,
@@ -1141,7 +1140,7 @@ pub fn virtualizable(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VirtualizableSym, attributes(vable))]
 pub fn derive_virtualizable_sym(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
-    virtualizable_derive::expand_sym(input).into()
+    virtualizable::expand_sym(input).into()
 }
 
 /// Derive macro for virtualizable meta structs.
@@ -1156,7 +1155,7 @@ pub fn derive_virtualizable_sym(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VirtualizableMeta, attributes(vable))]
 pub fn derive_virtualizable_meta(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
-    virtualizable_derive::expand_meta(input).into()
+    virtualizable::expand_meta(input).into()
 }
 
 /// Derive macro for virtualizable interpreter state structs.
@@ -1170,7 +1169,7 @@ pub fn derive_virtualizable_meta(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VirtualizableState, attributes(vable))]
 pub fn derive_virtualizable_state(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
-    virtualizable_derive::expand_state(input).into()
+    virtualizable::expand_state(input).into()
 }
 
 #[cfg(test)]
