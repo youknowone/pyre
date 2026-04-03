@@ -78,6 +78,7 @@ thread_local! {
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
         d.set_gc_allocator(Box::new(gc));
         d.register_raw_int_box_helper(pyre_object::intobject::jit_w_int_new as *const ());
+        d.set_intval_descr(pyre_jit_trace::descr::int_intval_descr());
         d.register_raw_int_force_helper(crate::call_jit::jit_force_recursive_call_raw_1 as *const ());
         d.register_raw_int_force_helper(crate::call_jit::jit_force_self_recursive_call_raw_1 as *const ());
         d.register_create_frame_raw(
