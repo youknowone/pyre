@@ -422,6 +422,17 @@ fn generate_layout_helpers(
             }
         })
         .collect();
+    let restore_scalars_raw: Vec<TokenStream> = inputargs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let name = &f.name;
+            let idx = i + 1;
+            quote! {
+                state.#name = raw.get(#idx).copied().unwrap_or(0) as usize;
+            }
+        })
+        .collect();
 
     quote! {
         // ── Layout constants ──
@@ -552,6 +563,22 @@ fn generate_layout_helpers(
             }
             state.#frame_ident = __value_to_usize(&values[0]);
             #(#restore_scalars)*
+            #num_scalars
+        }
+
+        /// Restore scalar fields from a raw i64 slice (virtualizable layout).
+        ///
+        /// Writes `state.frame`, `state.<inputarg>...` from `raw[0..]`.
+        /// Returns the index of the first array slot in `raw`.
+        pub fn virt_restore_scalars_raw(
+            state: &mut #state_type,
+            raw: &[i64],
+        ) -> usize {
+            if raw.is_empty() {
+                return 0;
+            }
+            state.#frame_ident = raw[0] as usize;
+            #(#restore_scalars_raw)*
             #num_scalars
         }
     }
