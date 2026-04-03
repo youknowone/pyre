@@ -7351,24 +7351,25 @@ impl PyreJitState {
         if raw_values.is_empty() {
             return false;
         }
-        // virtualizable.py:131-133: static fields.
+        // Fail_args layout: [frame, scalars..., active_locals..., active_stack...]
+        // This is the guard failure path — raw_values carries only ACTIVE
+        // slots, not the full backing array. RPython's full-array restore is
+        // write_from_resume_data_partial (virtualizable.py:126-137), which
+        // corresponds to import_virtualizable_state, not this function.
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
-        // virtualizable.py:134-137: for j in range(len(lst)): lst[j] = ...
-        // Restores the ENTIRE array, not just the active portion.
-        let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
-            return false;
-        };
-        let arr_len = frame_arr.len();
-        assert!(
-            raw_values.len() >= idx + arr_len,
-            "restore_virtualizable_from_raw: raw_values.len()={} < expected {}",
-            raw_values.len(),
-            idx + arr_len,
-        );
-        let arr_slice = frame_arr.as_mut_slice();
-        for j in 0..arr_len {
-            arr_slice[j] = raw_values[idx] as PyObjectRef;
+        let nlocals = self.local_count();
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
+        for local_idx in 0..nlocals {
+            if idx < raw_values.len() {
+                let _ = self.set_local_at(local_idx, raw_values[idx] as PyObjectRef);
+            }
+            idx += 1;
+        }
+        for stack_idx in 0..stack_only {
+            if idx < raw_values.len() {
+                let _ = self.set_stack_at(stack_idx, raw_values[idx] as PyObjectRef);
+            }
             idx += 1;
         }
         true
@@ -7563,29 +7564,28 @@ impl PyreJitState {
     }
 
     /// Restore from virtualizable fail_args format:
-    ///   [frame, scalars..., array_items[0..len(lst)]]
+    ///   [frame, scalars..., active_locals..., active_stack...]
     ///
-    /// virtualizable.py:126-137 write_from_resume_data_partial parity:
-    /// all entries must be present — panics on short data.
-    /// Array is restored in full (len(lst)), not just the active portion.
+    /// This is the guard failure / fail_args consumer path.
+    /// Carries only ACTIVE slots from current_fail_args(), not the full
+    /// backing array. The full-array restore path is
+    /// import_virtualizable_state (virtualizable.py:126-137 parity).
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
-        // virtualizable.py:131-133: static fields.
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
-        // virtualizable.py:134-137: for j in range(len(lst)): lst[j] = ...
-        let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
-            return;
-        };
-        let arr_len = frame_arr.len();
-        assert!(
-            values.len() >= idx + arr_len,
-            "restore_virtualizable_i64: values.len()={} < expected {}",
-            values.len(),
-            idx + arr_len,
-        );
-        let arr_slice = frame_arr.as_mut_slice();
-        for j in 0..arr_len {
-            arr_slice[j] = values[idx] as PyObjectRef;
+        let nlocals = self.local_count();
+        for i in 0..nlocals {
+            if idx < values.len() {
+                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+            }
+            idx += 1;
+        }
+
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
+        for i in 0..stack_only {
+            if idx < values.len() {
+                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+            }
             idx += 1;
         }
     }
