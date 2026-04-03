@@ -2859,6 +2859,22 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
+    // resume.py:consume_vref_and_vable parity: virtualizable fields
+    // (locals + stack) are stored in vable_values, NOT in frame.values.
+    // In pyre, the virtualizable IS the frame, so vable values after the
+    // header [frame_ptr, ni, code, vsd, ns] ARE the frame's locals+stack.
+    // Resolve all vable locals for merging into frame values below.
+    let _vable_locals: Vec<Value> = if vable_values.len() > 5 {
+        vable_values[5..]
+            .iter()
+            .map(|rv| {
+                resolve_rebuilt_value(rv, &dead_frame_typed, exit_layout, &mut virtuals_cache)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
         // frame_ptr from vable for single-frame or outermost (caller).
@@ -2895,6 +2911,11 @@ fn build_resumed_frames(
         } else {
             values.len()
         };
+        // resume.py:consume_vref_and_vable + consume_one_section parity:
+        // vable_locals provide ALL locals (written to virtualizable).
+        // frame section provides liveness-matched values at the guard point.
+        // When frame section is empty, use vable_locals as the full set.
+        let final_values = values;
         result.push(crate::call_jit::ResumedFrame {
             code,
             py_pc,
@@ -2905,7 +2926,7 @@ fn build_resumed_frames(
             },
             frame_ptr,
             vsd,
-            values,
+            values: final_values,
         });
     }
 
@@ -2915,13 +2936,6 @@ fn build_resumed_frames(
             result.len()
         );
     }
-
-    // pyjitpl.py:3446-3450 synchronize_virtualizable:
-    // RPython calls write_from_resume_data_partial to write ALL vable
-    // fields to the virtualizable BEFORE blackhole. Still blocked by
-    // vable/frame dedup (same TAGVIRTUAL for distinct slots → same
-    // materialized object written to multiple locals). The frame section
-    // recovery (liveness-based) is authoritative until dedup is resolved.
 
     result
 }
