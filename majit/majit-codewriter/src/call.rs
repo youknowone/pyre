@@ -91,7 +91,7 @@ pub struct CallControl {
 
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
-    candidate_targets: HashSet<CallPath>,
+    candidate_graphs: HashSet<CallPath>,
 
     /// Portal entry points (recursive call detection).
     /// RPython: `CallControl.jitdrivers_sd`.
@@ -100,6 +100,13 @@ pub struct CallControl {
     /// Builtin targets (oopspec operations).
     /// RPython: detected via `funcobj.graph.func.oopspec`.
     builtin_targets: HashSet<CallPath>,
+
+    /// RPython: `CallControl.jitcodes` — map {graph_key: JitCode}.
+    /// Tracks which graphs have been assigned JitCode objects.
+    jitcodes: HashMap<CallPath, ()>,
+
+    /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
+    unfinished_graphs: Vec<CallPath>,
 }
 
 impl CallControl {
@@ -109,9 +116,11 @@ impl CallControl {
             function_graphs: HashMap::new(),
             trait_method_graphs: HashMap::new(),
             trait_method_impls: HashMap::new(),
-            candidate_targets: HashSet::new(),
+            candidate_graphs: HashSet::new(),
             portal_targets: HashSet::new(),
             builtin_targets: HashSet::new(),
+            jitcodes: HashMap::new(),
+            unfinished_graphs: Vec::new(),
         }
     }
 
@@ -154,8 +163,30 @@ impl CallControl {
         // default policy where look_inside_function() returns True).
         let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
         for path in all_paths {
-            self.candidate_targets.insert(path);
+            self.candidate_graphs.insert(path);
         }
+    }
+
+    /// RPython: `CallControl.is_candidate(graph)`.
+    /// Used only after `find_all_graphs()`.
+    pub fn is_candidate(&self, path: &CallPath) -> bool {
+        self.candidate_graphs.contains(path)
+    }
+
+    /// RPython: `CallControl.get_jitcode(graph, called_from)`.
+    /// Retrieve or create a JitCode entry for the given graph.
+    /// Currently tracks presence only — full JitCode objects are
+    /// managed by the assembler (future).
+    pub fn get_jitcode(&mut self, path: CallPath) {
+        if !self.jitcodes.contains_key(&path) {
+            self.jitcodes.insert(path.clone(), ());
+            self.unfinished_graphs.push(path);
+        }
+    }
+
+    /// RPython: `CallControl.enum_pending_graphs()`.
+    pub fn enum_pending_graphs(&mut self) -> Vec<CallPath> {
+        std::mem::take(&mut self.unfinished_graphs)
     }
 
     /// Classify a call target.
@@ -178,7 +209,7 @@ impl CallControl {
                 if self.builtin_targets.contains(&path) {
                     return CallKind::Builtin;
                 }
-                if self.candidate_targets.contains(&path) {
+                if self.candidate_graphs.contains(&path) {
                     return CallKind::Regular;
                 }
                 CallKind::Residual
