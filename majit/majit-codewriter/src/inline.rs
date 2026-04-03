@@ -321,6 +321,10 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::GuardTrue { cond } => OpKind::GuardTrue { cond: remap(cond) },
         OpKind::GuardFalse { cond } => OpKind::GuardFalse { cond: remap(cond) },
+        OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
+            value: remap(value),
+            kind_char: *kind_char,
+        },
         OpKind::VableFieldRead { field_index, ty } => OpKind::VableFieldRead {
             field_index: *field_index,
             ty: ty.clone(),
@@ -491,6 +495,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         } => vec![*base, *index, *value],
         OpKind::Call { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![*cond],
+        OpKind::GuardValue { value, .. } => vec![*value],
         OpKind::VableFieldRead { .. } => vec![],
         OpKind::VableFieldWrite { value, .. } => vec![*value],
         OpKind::VableArrayRead { elem_index, .. } => vec![*elem_index],

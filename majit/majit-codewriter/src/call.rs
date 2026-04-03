@@ -269,25 +269,33 @@ impl CallControl {
                 Some(g) => g.clone(),
                 None => continue,
             };
-            // RPython call.py:77-90: scan all ops in graph
+            // RPython call.py:77-90: scan all Call ops in the graph.
+            // For each call, check guess_call_kind (with BFS-aware
+            // is_candidate that treats "has graph" as candidate).
             for block in &graph.blocks {
                 for op in &block.ops {
                     let target = match &op.kind {
                         OpKind::Call { target, .. } => target,
                         _ => continue,
                     };
-                    // RPython call.py:80: kind = self.guess_call_kind(op, is_candidate)
-                    // During BFS, we check: is the callee graph available?
-                    // If yes, it's a candidate (we're discovering the full set).
                     let callee_path = match self.target_to_path(target) {
                         Some(p) => p,
                         None => continue,
                     };
+                    // RPython call.py:80: kind = self.guess_call_kind(op, is_candidate)
+                    // Skip recursive (portal) and builtin calls — these are NOT
+                    // followed during BFS. Only "regular" calls are followed.
+                    if self.portal_targets.contains(&callee_path) {
+                        continue; // recursive — don't follow
+                    }
+                    if self.builtin_targets.contains(&callee_path) {
+                        continue; // builtin — don't follow
+                    }
                     if self.candidate_graphs.contains(&callee_path) {
                         continue; // already discovered
                     }
-                    // RPython call.py:84: for graph in self.graphs_from(op, is_candidate)
-                    // During BFS, we don't check is_candidate (we're building the set).
+                    // RPython call.py:84,87: callee must have a graph.
+                    // is_candidate during BFS = "has a graph" (default policy).
                     if self.function_graphs.contains_key(&callee_path) {
                         self.candidate_graphs.insert(callee_path.clone());
                         todo.push(callee_path);
