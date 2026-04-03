@@ -3682,11 +3682,17 @@ fn decode_tagged(
 /// TAGVIRTUAL values are returned as `RebuiltValue::Virtual(index)`.
 /// Materialization is handled by materialize_from_recovery_layout
 /// in pyre-jit/eval.rs using the guard's rd_virtuals/ExitRecoveryLayout.
-/// resume.py:1042-1057 rebuild_from_resumedata parity (metainterp-local version).
+/// Simplified rd_numb decoder (metainterp-local version).
+///
+/// Limitations vs upstream rebuild_from_resumedata (resume.py:1042):
+/// - Assumes flat format: [total_size, num_failargs, vable_len, vable...,
+///   vref_len, vref..., frames...]. Does not handle ginfo items between
+///   vable and vref sections.
+/// - Consumes all remaining tagged values into a single frame. Upstream
+///   reads per-frame sections guided by jitcode liveness info.
 ///
 /// Returns `(num_failargs, vable_values, frames)`:
-/// - `vable_values`: virtualizable field values (resume.py:918 consume_vref_and_vable).
-///   In pyre, the virtualizable IS the PyFrame, so vable values = locals + stack.
+/// - `vable_values`: tagged values from the vable section.
 /// - `frames`: per-frame state (jitcode_index, pc, slot values).
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
