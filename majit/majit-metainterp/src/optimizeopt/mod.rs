@@ -566,7 +566,7 @@ impl OptContext {
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
-        if op.pos.is_none() {
+        if op.pos.is_none() || op.pos.0 >= OpRef::CONST_BASE {
             op.pos = self.reserve_pos();
         } else if self.new_operations.iter().any(|e| e.pos == op.pos) {
             // RPython Box parity: reassign position to avoid collision.
