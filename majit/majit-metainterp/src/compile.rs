@@ -19,37 +19,34 @@ use crate::resume::{
 
 /// Resolve the type of an OpRef in guard fail_args.
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
-fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
+fn fail_arg_type(
+    opref: &OpRef,
+    value_types: &HashMap<u32, Type>,
+    constant_types: &HashMap<u32, Type>,
+) -> Type {
     if *opref == OpRef::NONE {
         Type::Ref
     } else if opref.is_constant() {
-        // Constants default to Int (numeric literals). Ref constants (GcRef)
-        // must be explicitly registered in value_types or constant_types.
-        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+        // RPython Box.type parity: constant type comes from constant_types
+        // (set by optimizer), then value_types, then default Int for
+        // numeric constants. Ref constants (GcRef/None) must appear in
+        // constant_types to avoid being mis-tagged as Int.
+        constant_types
+            .get(&opref.0)
+            .or_else(|| value_types.get(&opref.0))
+            .copied()
+            .unwrap_or(Type::Int)
     } else {
         value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
     }
 }
 
-/// Derive slot_types from ExitValueSourceLayout + exit_types.
-/// Rules: ExitValue(idx) → exit_types[idx], Virtual → Ref,
-/// Constant → Int, Uninitialized/Unavailable → Ref (conservative).
-fn derive_slot_types(
-    slots: &[majit_backend::ExitValueSourceLayout],
-    exit_types: &[Type],
-) -> Vec<Type> {
-    slots
-        .iter()
-        .map(|slot| match slot {
-            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                exit_types.get(*idx).copied().unwrap_or(Type::Ref)
-            }
-            majit_backend::ExitValueSourceLayout::Virtual(_) => Type::Ref,
-            majit_backend::ExitValueSourceLayout::Constant(_) => Type::Int,
-            majit_backend::ExitValueSourceLayout::Uninitialized
-            | majit_backend::ExitValueSourceLayout::Unavailable => Type::Ref,
-        })
-        .collect()
+/// Derive slot_types from ExitValueSourceLayout.
+/// RPython resume.py:1077 load_next_value_of_type parity:
+/// slot type is the DECLARED type of the variable, not the tag
+/// of the value. All pyre virtualizable locals/stack slots are Ref.
+fn derive_slot_types(slots: &[majit_backend::ExitValueSourceLayout]) -> Vec<Type> {
+    slots.iter().map(|_| Type::Ref).collect()
 }
 
 // ── Compilation result types (compile.py) ───────────────────────────────
@@ -175,22 +172,27 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
-        // RPython Box.type parity: exit_types from fail_arg_types.
-        // fail_arg_types always has the full layout [Ref, Int, Int, slots...].
-        // fail_args may be shorter (optimizer may drop constants), but
-        // exit_types must match fail_arg_types for correct blackhole resume.
+        // RPython Box.type parity: exit_types from fail_args (liveboxes).
+        // Prefer fail_arg_types when it already matches fail_args length.
+        // Otherwise reconstruct per-arg types from the current OpRefs,
+        // consulting constant_types for constant Ref boxes.
         let exit_types: Vec<Type> = if is_finish {
             op.args
                 .iter()
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
+        } else if let Some(ref fail_args) = op.fail_args {
+            let fa_types = op.fail_arg_types.as_ref();
+            if fa_types.map_or(false, |t| t.len() == fail_args.len()) {
+                fa_types.unwrap().clone()
+            } else {
+                fail_args
+                    .iter()
+                    .map(|opref| fail_arg_type(opref, &value_types, constant_types))
+                    .collect()
+            }
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
-        } else if let Some(ref fail_args) = op.fail_args {
-            fail_args
-                .iter()
-                .map(|opref| fail_arg_type(opref, &value_types))
-                .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };
@@ -522,7 +524,7 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
             {
-                let st = derive_slot_types(&frame_slots, &exit_types);
+                let st = derive_slot_types(&frame_slots);
                 Some(ExitRecoveryLayout {
                     frames: vec![majit_backend::ExitFrameLayout {
                         trace_id: None,
@@ -597,9 +599,10 @@ pub(crate) fn retag_fail_descrs_from_trace_types(inputargs: &[InputArg], ops: &m
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref fail_args) = op.fail_args {
+            let empty = HashMap::new();
             fail_args
                 .iter()
-                .map(|opref| fail_arg_type(opref, &value_types))
+                .map(|opref| fail_arg_type(opref, &value_types, &empty))
                 .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
