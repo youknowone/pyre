@@ -3682,22 +3682,32 @@ fn decode_tagged(
 /// TAGVIRTUAL values are returned as `RebuiltValue::Virtual(index)`.
 /// Materialization is handled by materialize_from_recovery_layout
 /// in pyre-jit/eval.rs using the guard's rd_virtuals/ExitRecoveryLayout.
+/// resume.py:1042-1057 rebuild_from_resumedata parity (metainterp-local version).
+///
+/// Returns `(num_failargs, vable_values, frames)`:
+/// - `vable_values`: virtualizable field values (resume.py:918 consume_vref_and_vable).
+///   In pyre, the virtualizable IS the PyFrame, so vable values = locals + stack.
+/// - `frames`: per-frame state (jitcode_index, pc, slot values).
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
-) -> (i32, Vec<RebuiltFrame>) {
+) -> (i32, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = crate::resumecode::Reader::new(rd_numb);
 
     let total_size = reader.next_item();
     let num_failargs = reader.next_item();
 
-    // Virtualizable array (skip).
+    // resume.py:918-940 consume_vref_and_vable: decode virtualizable array.
+    // RPython writes these back to the virtualizable object via
+    // vinfo.write_from_resume_data. In pyre, vable = frame locals+stack.
     let vable_len = reader.next_item();
-    if vable_len > 0 {
-        reader.jump(vable_len as usize);
+    let mut vable_values = Vec::with_capacity(vable_len as usize);
+    for _ in 0..vable_len {
+        let tagged = reader.next_item() as i16;
+        vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // Virtualref array (skip).
+    // Virtualref array (skip for now).
     let vref_len = reader.next_item();
     if vref_len > 0 {
         reader.jump((vref_len * 2) as usize);
@@ -3705,10 +3715,6 @@ pub fn rebuild_from_numbering(
 
     // Frames.
     // resume.py:1049-1055: read frames until done.
-    // RPython does NOT encode slot_count — it uses jitcode.position_info
-    // to know how many registers each frame has. For single-frame (all we
-    // support), after reading jitcode_index and pc, consume ALL remaining
-    // tagged values.
     let mut frames = Vec::new();
     if reader.has_more() {
         let jitcode_index = reader.next_item();
@@ -3726,7 +3732,7 @@ pub fn rebuild_from_numbering(
     }
 
     let _ = total_size;
-    (num_failargs, frames)
+    (num_failargs, vable_values, frames)
 }
 
 #[cfg(test)]
