@@ -1434,15 +1434,9 @@ pub(crate) fn record_current_state_guard(
     let mut fail_args = vec![frame, next_instr, stack_depth];
     fail_args.extend_from_slice(locals);
     fail_args.extend_from_slice(stack);
-    let slot_types = std::iter::repeat_n(Type::Ref, fail_args.len().saturating_sub(3));
-    let fail_arg_types = virtualizable_fail_arg_types(slot_types);
+    let num_slots = fail_args.len() - crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let fail_arg_types = crate::virtualizable_gen::virt_live_value_types(num_slots);
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
-}
-
-fn virtualizable_fail_arg_types(slot_types: impl IntoIterator<Item = Type>) -> Vec<Type> {
-    let mut types = vec![Type::Ref, Type::Int, Type::Int];
-    types.extend(slot_types);
-    types
 }
 
 fn concrete_value_type(value: PyObjectRef) -> Type {
@@ -2175,7 +2169,7 @@ impl MIFrame {
     /// active_boxes length. Each box carries its own immutable type.
     /// header = [Ref, Int, Int] (frame, next_instr, valuestackdepth).
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
-        let mut types = vec![Type::Ref, Type::Int, Type::Int];
+        let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
             types.push(self.value_type(opref));
         }
@@ -6739,7 +6733,7 @@ impl ControlFlowOpcodeHandler for MIFrame {
                 let live_args = MIFrame::close_loop_args(this, ctx);
                 let live_types = {
                     let s = this.sym();
-                    let mut types = vec![Type::Ref, Type::Int, Type::Int];
+                    let mut types = crate::virtualizable_gen::virt_live_value_types(0);
                     types.extend(s.symbolic_local_types.iter().copied());
                     let stack_only = s.stack_only_depth();
                     types.extend(
@@ -7359,7 +7353,7 @@ impl PyreJitState {
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
-        let mut idx = 3;
+        let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for local_idx in 0..nlocals {
             if let Some(&raw) = raw_values.get(idx) {
                 let _ = self.set_local_at(local_idx, raw as PyObjectRef);
@@ -7704,44 +7698,32 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
-        // warmstate.py:505-507: unspecialize_value(args[i])
-        // RPython reads from the actual interpreter state, not from meta.
-        let nlocals = meta.num_locals;
-        let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
-        let mut vals = vec![
-            Value::Ref(majit_ir::GcRef(self.frame)),
-            Value::Int(self.next_instr as i64),
-            Value::Int(self.valuestackdepth as i64),
-        ];
-        for i in 0..nlocals {
-            let value = self.local_at(i).unwrap_or(PY_NULL);
-            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
-        }
-        for i in 0..stack_only {
-            let value = self.stack_at(i).unwrap_or(PY_NULL);
-            vals.push(Value::Ref(majit_ir::GcRef(value as usize)));
-        }
-        vals
+        crate::virtualizable_gen::virt_extract_live_values(
+            self.frame,
+            self.next_instr,
+            self.valuestackdepth,
+            meta.num_locals,
+            meta.valuestackdepth,
+            |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
+            |i| self.stack_at(i).unwrap_or(PY_NULL) as usize,
+        )
     }
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        virtualizable_fail_arg_types(std::iter::repeat(Type::Ref).take(meta.slot_types.len()))
+        crate::virtualizable_gen::virt_live_value_types(meta.slot_types.len())
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.vable_next_instr = OpRef(1);
-        sym.vable_valuestackdepth = OpRef(2);
-        // Unified array: locals at base+0..base+nlocals, stack at base+nlocals..
-        sym.vable_array_base = Some(3); // starts after frame(0), ni(1), vsd(2)
+        use crate::virtualizable_gen::*;
+        let mut sym = PyreSym::new_uninit(OpRef(SYM_FRAME_IDX));
+        sym.vable_next_instr = OpRef(SYM_NEXT_INSTR_IDX);
+        sym.vable_valuestackdepth = OpRef(SYM_VALUESTACKDEPTH_IDX);
+        sym.vable_array_base = Some(SYM_ARRAY_BASE);
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
         sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
         sym.symbolic_stack_types =
             vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
-        // Pre-size symbolic_stack with OpRef::NONE for lazy loading from
-        // the concrete frame (RPython rebuild_state_after_failure parity:
-        // bridge traces start mid-execution with values on the stack).
         let stack_only = _meta.valuestackdepth.saturating_sub(_meta.num_locals);
         sym.symbolic_stack = vec![OpRef::NONE; stack_only];
         sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
@@ -7753,20 +7735,20 @@ impl JitState for PyreJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        self.next_instr == meta.merge_pc
-            && self.local_count() == meta.num_locals
-            && self.namespace_len() == meta.ns_keys.len()
-            && self.valuestackdepth == meta.valuestackdepth
+        crate::virtualizable_gen::virt_is_compatible(
+            self.local_count(),
+            meta.num_locals,
+            self.next_instr,
+            meta.merge_pc,
+            self.valuestackdepth,
+            meta.valuestackdepth,
+        ) && self.namespace_len() == meta.ns_keys.len()
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        // RPython resume.py:1042: bridge tracing always has rd_numb and
-        // rebuilds the full frame state. This fallback runs when rd_numb
-        // is absent (pyre-specific). Update valuestackdepth and slot_types
-        // from the guard's fail_arg_types to avoid stale metadata.
-        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
-        if fail_arg_types.len() >= 3 {
-            let new_vsd = fail_arg_types.len() - 3;
+        use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        if fail_arg_types.len() >= NUM_SCALAR_INPUTARGS {
+            let new_vsd = fail_arg_types.len() - NUM_SCALAR_INPUTARGS;
             meta.valuestackdepth = new_vsd;
             meta.slot_types = vec![Type::Ref; new_vsd];
         }
@@ -7849,9 +7831,9 @@ impl JitState for PyreJitState {
         // Update valuestackdepth from the merge point's box layout.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
-        if original_box_types.len() >= 3 {
-            let new_vsd = original_box_types.len() - 3;
-            // Adjust slot_types length if valuestackdepth changed.
+        use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
+            let new_vsd = original_box_types.len() - NUM_SCALAR_INPUTARGS;
             if new_vsd < meta.valuestackdepth && meta.slot_types.len() > new_vsd {
                 meta.slot_types.truncate(new_vsd);
             } else if new_vsd > meta.valuestackdepth && meta.slot_types.len() < new_vsd {
@@ -7866,17 +7848,14 @@ impl JitState for PyreJitState {
         header_pc: usize,
         original_box_types: &[Type],
     ) -> PyreMeta {
-        // pyjitpl.py:3158-3175 compile_loop parity:
-        // Build meta from MergePoint's original_box_types.
-        // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
-        // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
-        let slot_types = if original_box_types.len() >= 3 {
-            vec![Type::Ref; original_box_types.len() - 3]
+        use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let slot_types = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
+            vec![Type::Ref; original_box_types.len() - NUM_SCALAR_INPUTARGS]
         } else {
             Vec::new()
         };
-        let vsd = if original_box_types.len() >= 3 {
-            original_box_types.len() - 3
+        let vsd = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
+            original_box_types.len() - NUM_SCALAR_INPUTARGS
         } else {
             provisional.valuestackdepth
         };
@@ -7948,7 +7927,7 @@ impl JitState for PyreJitState {
             self.valuestackdepth = meta.valuestackdepth;
             let nlocals = self.local_count();
             let stack_only = self.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = 3;
+            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             for local_idx in 0..nlocals {
                 if let Some(value) = values.get(idx) {
                     let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
@@ -8059,7 +8038,7 @@ impl JitState for PyreJitState {
         // resume.py:1383: info = blackholeinterp.get_current_position_info()
         // Use next_instr (already set from values[1]) as the liveness PC.
         let live_pc = self.next_instr;
-        let mut idx = 3;
+        let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for local_idx in 0..nlocals {
             // resume.py:1077: only live registers consume a value from the
             // compact array. Dead registers keep their previous contents.
@@ -8111,9 +8090,9 @@ impl JitState for PyreJitState {
         let nlocals = meta.num_locals;
         let stack_only = self.valuestackdepth.saturating_sub(nlocals);
         // Header [frame_ptr=Ref, ni=Int, vsd=Int] + all locals/stack as Ref.
-        let mut types = vec![Type::Ref, Type::Int, Type::Int];
-        types.extend(std::iter::repeat_n(Type::Ref, nlocals + stack_only));
-        Some(types)
+        Some(crate::virtualizable_gen::virt_live_value_types(
+            nlocals + stack_only,
+        ))
     }
 
     /// resume.py:1049 parity: restore frame register state from decoded values.
@@ -8252,39 +8231,27 @@ impl JitState for PyreJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        let stack_only = sym.stack_only_depth();
-        let mut args = vec![sym.frame, sym.vable_next_instr, sym.vable_valuestackdepth];
-        args.extend_from_slice(&sym.symbolic_locals);
-        let stack_len = stack_only.min(sym.symbolic_stack.len());
-        args.extend_from_slice(&sym.symbolic_stack[..stack_len]);
-        args
+        crate::virtualizable_gen::virt_collect_jump_args(
+            sym.frame,
+            sym.vable_next_instr,
+            sym.vable_valuestackdepth,
+            &sym.symbolic_locals,
+            &sym.symbolic_stack,
+            sym.stack_only_depth(),
+        )
     }
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        let stack_only = sym.stack_only_depth();
-        let mut args = vec![
-            (sym.frame, Type::Ref),
-            (sym.vable_next_instr, Type::Int),
-            (sym.vable_valuestackdepth, Type::Int),
-        ];
-        for (i, &opref) in sym.symbolic_locals.iter().enumerate() {
-            let tp = sym
-                .symbolic_local_types
-                .get(i)
-                .copied()
-                .unwrap_or(Type::Ref);
-            args.push((opref, tp));
-        }
-        let stack_len = stack_only.min(sym.symbolic_stack.len());
-        for (i, &opref) in sym.symbolic_stack[..stack_len].iter().enumerate() {
-            let tp = sym
-                .symbolic_stack_types
-                .get(i)
-                .copied()
-                .unwrap_or(Type::Ref);
-            args.push((opref, tp));
-        }
-        args
+        crate::virtualizable_gen::virt_collect_typed_jump_args(
+            sym.frame,
+            sym.vable_next_instr,
+            sym.vable_valuestackdepth,
+            &sym.symbolic_locals,
+            &sym.symbolic_local_types,
+            &sym.symbolic_stack,
+            &sym.symbolic_stack_types,
+            sym.stack_only_depth(),
+        )
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -8310,7 +8277,7 @@ impl JitState for PyreJitState {
         // the retrace entry state's stack depth.  So for pyre's explicit
         // jump-arg model, the trace-start `meta.valuestackdepth` is not a
         // sound validator here.
-        jump_args.len() >= 3
+        jump_args.len() >= crate::virtualizable_gen::NUM_SCALAR_INPUTARGS
     }
 
     /// RPython resume.py: materialize a virtual object from resume data.
@@ -9689,7 +9656,10 @@ mod tests {
 
         // fail_args: [frame, pc_const, vsd_const, live_slots...]
         // Liveness-based: only slots live at orgpc are included.
-        assert!(fail_args.len() >= 3, "must have frame + ni + vsd header");
+        assert!(
+            fail_args.len() >= crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
+            "must have frame + ni + vsd header"
+        );
         assert_eq!(fail_args[0], frame_ref);
         assert!(
             fail_args.iter().all(|arg| !arg.is_none()),
