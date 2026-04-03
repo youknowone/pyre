@@ -663,11 +663,20 @@ impl VirtualizableInfo {
             .collect()
     }
 
-    /// RPython parity surface: write static boxes only.
+    /// virtualizable.py:101-113 write_boxes parity.
+    ///
+    /// Writes all static field values from `boxes` to the heap object.
+    /// `boxes` must contain at least `num_fields()` entries.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        assert!(
+            boxes.len() >= self.static_fields.len(),
+            "write_boxes: boxes.len()={} < num_fields={}",
+            boxes.len(),
+            self.static_fields.len(),
+        );
         for (index, &value) in boxes.iter().enumerate() {
             if index >= self.static_fields.len() {
                 break;

@@ -7560,27 +7560,24 @@ impl PyreJitState {
 
     /// Restore from virtualizable fail_args format:
     ///   [frame, next_instr, valuestackdepth, l0..lN-1, s0..sM-1]
+    ///
+    /// virtualizable.py:126-137 write_from_resume_data_partial parity:
+    /// all entries must be present — panics on short data.
     fn restore_virtualizable_i64(&mut self, values: &[i64]) {
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, values);
 
         let nlocals = self.local_count();
 
-        // virtualizable.py:126/139 parity: frame array items are always
-        // GCREF. i64 values from Cranelift output are raw pointers to
-        // boxed Python objects — write directly as PyObjectRef.
+        // virtualizable.py:134-137: array items are GCREF.
         for i in 0..nlocals {
-            if idx < values.len() {
-                let _ = self.set_local_at(i, values[idx] as PyObjectRef);
-                idx += 1;
-            }
+            let _ = self.set_local_at(i, values[idx] as PyObjectRef);
+            idx += 1;
         }
 
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for i in 0..stack_only {
-            if idx < values.len() {
-                let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
-                idx += 1;
-            }
+            let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
+            idx += 1;
         }
     }
 
