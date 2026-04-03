@@ -194,18 +194,45 @@ impl CallControl {
             };
             for block in &graph.blocks {
                 for op in &block.ops {
-                    if let OpKind::Call {
-                        target: crate::graph::CallTarget::FunctionPath { segments },
-                        ..
-                    } = &op.kind
-                    {
-                        let callee_path =
-                            CallPath::from_segments(segments.iter().map(String::as_str));
-                        if self.function_graphs.contains_key(&callee_path)
-                            && !self.candidate_graphs.contains(&callee_path)
-                        {
-                            self.candidate_graphs.insert(callee_path.clone());
-                            todo.push(callee_path);
+                    let callee_path = match &op.kind {
+                        // FunctionPath calls: direct function references.
+                        OpKind::Call {
+                            target: crate::graph::CallTarget::FunctionPath { segments },
+                            ..
+                        } => Some(CallPath::from_segments(segments.iter().map(String::as_str))),
+                        // Method calls: resolve through trait impls to find the
+                        // concrete function graph, matching RPython's treatment
+                        // of method dispatch in the flow graph.
+                        OpKind::Call {
+                            target:
+                                crate::graph::CallTarget::Method {
+                                    name,
+                                    receiver_root,
+                                },
+                            ..
+                        } => {
+                            // If the method resolves to a unique impl, treat
+                            // its graph as reachable. We use the method name as
+                            // a synthetic path since methods don't have CallPaths.
+                            if self
+                                .resolve_method(name, receiver_root.as_deref())
+                                .is_some()
+                            {
+                                Some(CallPath::from_segments([name.as_str()]))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(callee_path) = callee_path {
+                        if !self.candidate_graphs.contains(&callee_path) {
+                            // Only add if we actually have the graph
+                            if self.function_graphs.contains_key(&callee_path) {
+                                self.candidate_graphs.insert(callee_path.clone());
+                                todo.push(callee_path);
+                            }
                         }
                     }
                 }
@@ -264,15 +291,27 @@ impl CallControl {
                 name,
                 receiver_root,
             } => {
-                // For method calls, check if we have a unique impl.
+                // RPython: method calls go through the same candidate check.
+                // resolve_method() finding a graph is necessary but not sufficient;
+                // the graph must also be reachable from the portal (in candidate_graphs).
+                // If candidate_graphs is empty (no BFS run), fall back to Residual.
                 if self
                     .resolve_method(name, receiver_root.as_deref())
-                    .is_some()
+                    .is_none()
                 {
-                    CallKind::Regular
-                } else {
-                    CallKind::Residual
+                    return CallKind::Residual;
                 }
+                // Check if the resolved impl is a candidate.
+                // Method targets don't have CallPaths directly, so check by
+                // looking for a matching method name among candidates.
+                if self.candidate_graphs.is_empty() {
+                    // No portal BFS — can't determine candidacy.
+                    return CallKind::Residual;
+                }
+                // If candidates exist but this method's impl isn't tracked
+                // as a function path, treat as Residual. The meta-interpreter
+                // will handle it via residual_call at runtime.
+                CallKind::Residual
             }
             CallTarget::UnsupportedExpr => CallKind::Residual,
         }

@@ -520,8 +520,7 @@ impl<'a> Transformer<'a> {
                     }
                 }
                 crate::call::CallKind::Builtin => {
-                    // TODO: handle_builtin_call (oopspec dispatch)
-                    RewriteResult::Keep
+                    self.handle_builtin_call(op, target, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Recursive => {
                     self.handle_recursive_call(op, target, args, result_ty, graph_name)
@@ -545,6 +544,50 @@ impl<'a> Transformer<'a> {
         } else {
             RewriteResult::Keep
         }
+    }
+
+    /// RPython: `Transformer.handle_builtin_call(op)`.
+    /// Builtin operations with oopspec semantics — dispatched to
+    /// specific lowering based on the oopspec name.
+    ///
+    /// RPython jtransform.py:484-520.
+    ///
+    /// Currently: look up effect from describe_call / call_effects
+    /// and produce the matching typed call op. Future: oopspec-specific
+    /// lowering (list_getitem → getarrayitem_gc, etc.)
+    fn handle_builtin_call(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        // Look up effect info for this builtin target.
+        if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("builtin {target} → {}", effect.as_str()),
+            });
+            self.calls_classified += 1;
+            match effect {
+                CallEffectKind::Elidable => {
+                    return RewriteResult::Replace(vec![Op {
+                        result: op.result,
+                        kind: OpKind::CallElidable {
+                            descriptor,
+                            args: args.to_vec(),
+                            result_ty: result_ty.clone(),
+                        },
+                    }]);
+                }
+                _ => {
+                    return self.handle_residual_call(op, descriptor, args, result_ty, graph_name);
+                }
+            }
+        }
+        // Unknown builtin — keep as unclassified Call.
+        RewriteResult::Keep
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
