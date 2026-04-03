@@ -3418,7 +3418,10 @@ pub(crate) fn build_jit_state(
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
     };
-    let _ = jit_state.sync_from_virtualizable(virtualizable_info);
+    assert!(
+        jit_state.sync_from_virtualizable(virtualizable_info),
+        "build_jit_state: frame must be a valid PyFrame with readable fields"
+    );
     jit_state
 }
 
