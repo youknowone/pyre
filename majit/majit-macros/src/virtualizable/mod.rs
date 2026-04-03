@@ -574,13 +574,17 @@ fn generate_layout_helpers(
         ///
         /// Writes `state.frame`, `state.<inputarg>...` from `raw[0..]`.
         /// Returns the index of the first array slot in `raw`.
+        ///
+        /// virtualizable.py:126-137 parity: all entries must be present.
         pub fn virt_restore_scalars_raw(
             state: &mut #state_type,
             raw: &[i64],
         ) -> usize {
-            if raw.is_empty() {
-                return 0;
-            }
+            assert!(
+                raw.len() >= #num_scalars,
+                "virt_restore_scalars_raw: raw.len()={} < num_scalars={}",
+                raw.len(), #num_scalars,
+            );
             state.#frame_ident = raw[0] as usize;
             #(#restore_scalars_raw)*
             #num_scalars

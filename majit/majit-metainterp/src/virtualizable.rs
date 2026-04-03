@@ -737,20 +737,26 @@ impl VirtualizableInfo {
         boxes: &[i64],
         array_lengths: &[usize],
     ) {
+        // virtualizable.py:126-137 write_from_resume_data_partial parity:
+        // all entries must be present.
+        let expected_total: usize = self.static_fields.len() + array_lengths.iter().sum::<usize>();
+        assert!(
+            boxes.len() >= expected_total,
+            "write_boxes_to_heap: boxes.len()={} < expected {}",
+            boxes.len(),
+            expected_total,
+        );
+
         // Static fields
         for i in 0..self.static_fields.len() {
-            if i < boxes.len() {
-                self.write_field(obj_ptr, i, boxes[i]);
-            }
+            self.write_field(obj_ptr, i, boxes[i]);
         }
 
         // Array elements
         let mut idx = self.static_fields.len();
         for (ai, &len) in array_lengths.iter().enumerate() {
             for ei in 0..len {
-                if idx < boxes.len() {
-                    self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
-                }
+                self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
                 idx += 1;
             }
         }
