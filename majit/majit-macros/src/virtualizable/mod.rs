@@ -433,7 +433,7 @@ fn generate_layout_helpers(
             let setter = format_ident!("set_{}", f.name);
             let idx = i + 1;
             quote! {
-                state.#setter(raw.get(#idx).copied().unwrap_or(0) as usize);
+                state.#setter(raw[#idx] as usize);
             }
         })
         .collect();

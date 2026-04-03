@@ -1523,8 +1523,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
                 let mut values = Vec::new();
-                // tl.py:88 stackpos is a red inputarg (virtualizable field).
-                // First inputarg = stackpos of the selected storage.
+                // First inputarg = stackpos (length of selected storage).
+                // Corresponds to tl.py:88 promote(stack.stackpos).
                 values.push(self.#pool_field.get(self.#sel_field).len() as i64);
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
