@@ -15,6 +15,7 @@ use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
 use crate::resume::{
     ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
+    ResumeValueSource,
 };
 
 /// Resolve the type of an OpRef in guard fail_args.
@@ -212,7 +213,6 @@ pub(crate) fn build_guard_metadata(
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };
-
         let resume_layout;
         if is_guard {
             let mut builder = ResumeDataVirtualAdder::new();
@@ -224,13 +224,21 @@ pub(crate) fn build_guard_metadata(
             // Multi-frame: push_frame per frame with correct pc.
             if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_values, _vref_values, frames) =
+                let (_num_failargs, vable_values, _vref_values, frames) =
                     rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
-                // rd_numb encodes [callee(top), caller(parent)] order.
-                // resume_layout expects [outer, ..., innermost] order.
-                for frame in frames.iter().rev() {
-                    builder.push_frame(frame.pc as u64);
-                    for (slot_idx, val) in frame.values.iter().enumerate() {
+                let vable_array = vable_values
+                    .iter()
+                    .map(|val| match val {
+                        RebuiltValue::Box(idx) => ResumeValueSource::FailArg(*idx),
+                        RebuiltValue::Const(c, _tp) => ResumeValueSource::Constant(*c),
+                        RebuiltValue::Int(i) => ResumeValueSource::Constant(*i as i64),
+                        RebuiltValue::Virtual(vidx) => ResumeValueSource::Virtual(*vidx),
+                        RebuiltValue::Unassigned => ResumeValueSource::Unavailable,
+                    })
+                    .collect::<Vec<_>>();
+                builder.set_vable_array(vable_array);
+                let add_slot =
+                    |builder: &mut ResumeDataVirtualAdder, slot_idx: usize, val: &RebuiltValue| {
                         match val {
                             RebuiltValue::Box(idx) => {
                                 builder.map_slot(slot_idx, *idx);
@@ -248,6 +256,19 @@ pub(crate) fn build_guard_metadata(
                                 builder.set_slot_uninitialized(slot_idx);
                             }
                         }
+                    };
+                // rd_numb encodes [callee(top), caller(parent)] order.
+                // resume_layout expects [outer, ..., innermost] order.
+                //
+                // RPython resume.py keeps vable_array/vref_array/framestack
+                // as separate sections. Do not merge vable_array entries into
+                // the innermost frame slots here.
+                for (orig_idx, frame) in frames.iter().enumerate().rev() {
+                    builder.push_frame(frame.pc as u64);
+                    let mut slot_idx = 0usize;
+                    for val in &frame.values {
+                        add_slot(&mut builder, slot_idx, val);
+                        slot_idx += 1;
                     }
                 }
             } else {
@@ -275,33 +296,47 @@ pub(crate) fn build_guard_metadata(
         let rd_consts = op.rd_consts.clone();
         let rd_virtuals = op.rd_virtuals.clone();
         let rd_pendingfields = op.rd_pendingfields.clone();
-
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
             use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
-            let frame_slots = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-                (&op.rd_numb, &op.rd_consts)
-            {
-                use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let (_num_failargs, _vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
-                let mut slots = Vec::new();
-                for frame in &frames {
-                    for val in &frame.values {
-                        slots.push(match val {
-                            RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
-                            RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
-                            RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
-                            RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
-                            RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
-                        });
-                    }
-                }
-                slots
-            } else {
-                vec![]
-            };
+            let frames_layout =
+                if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+                    use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                    let (_num_failargs, _vable_values, _vref_values, frames) =
+                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                    let to_exit_source = |val: &RebuiltValue| match val {
+                        RebuiltValue::Box(idx) => ExitValueSourceLayout::ExitValue(*idx),
+                        RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
+                        RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
+                        RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                        RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
+                    };
+                    frames
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(orig_idx, frame)| {
+                            let mut slots = Vec::new();
+                            slots.extend(frame.values.iter().map(to_exit_source));
+                            let slot_types = derive_slot_types(&slots);
+                            majit_backend::ExitFrameLayout {
+                                trace_id: None,
+                                header_pc: Some(frame.pc as u64),
+                                source_guard: None,
+                                pc: frame.pc as u64,
+                                slots,
+                                slot_types: Some(slot_types),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+            let frame_slots = frames_layout
+                .last()
+                .map(|frame| frame.slots.clone())
+                .unwrap_or_default();
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
             let resolve_fieldnums = |fieldnums: &[i16],
@@ -539,21 +574,11 @@ pub(crate) fn build_guard_metadata(
                         .collect()
                 })
                 .unwrap_or_default();
-            {
-                let st = derive_slot_types(&frame_slots);
-                Some(ExitRecoveryLayout {
-                    frames: vec![majit_backend::ExitFrameLayout {
-                        trace_id: None,
-                        header_pc: Some(pc),
-                        source_guard: None,
-                        pc,
-                        slots: frame_slots,
-                        slot_types: Some(st),
-                    }],
-                    virtual_layouts,
-                    pending_field_layouts: vec![],
-                })
-            }
+            Some(ExitRecoveryLayout {
+                frames: frames_layout,
+                virtual_layouts,
+                pending_field_layouts: vec![],
+            })
         } else {
             // No rd_numb: identity recovery layout.
             // Every guard has at minimum an identity mapping from
@@ -1897,6 +1922,7 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
 mod tests {
     use super::*;
     use crate::fail_descr::make_fail_descr_with_index;
+    use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{Op, OpCode, OpRef};
 
     #[test]
@@ -1934,6 +1960,74 @@ mod tests {
                 .unwrap()
                 .fail_arg_types(),
             &[Type::Ref, Type::Int]
+        );
+    }
+
+    #[test]
+    fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
+        use majit_backend::ExitValueSourceLayout;
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.types.insert(0, Type::Ref);
+        env.types.insert(1, Type::Int);
+        env.constants.insert(10001, (8, Type::Int));
+        env.constants.insert(10002, (777, Type::Int)); // code object payload
+        env.constants.insert(10003, (2, Type::Int));
+        env.constants.insert(10004, (999, Type::Int)); // namespace payload
+
+        let snapshot = Snapshot {
+            vable_array: vec![
+                OpRef(0),
+                OpRef(10001),
+                OpRef(10002),
+                OpRef(10003),
+                OpRef(10004),
+            ],
+            vref_array: vec![],
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 8,
+                boxes: vec![OpRef(1)],
+            }],
+        };
+        let mut numb_state = memo.number(&snapshot, &env).unwrap();
+        numb_state.writer.patch(1, numb_state.num_boxes);
+        let rd_numb = numb_state.create_numbering();
+        let rd_consts = memo.consts().to_vec();
+
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(1)]);
+        guard.descr = Some(make_fail_descr_with_index(0, 2));
+        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
+        guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
+        guard.rd_numb = Some(rd_numb);
+        guard.rd_consts = Some(rd_consts);
+
+        let (_resume_data, _guard_indices, exit_layouts) =
+            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), &HashMap::new());
+        let exit = exit_layouts.get(&0).expect("guard exit layout");
+
+        let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
+        assert_eq!(resume_layout.frame_layouts.len(), 1);
+        assert_eq!(
+            resume_layout.frame_layouts[0]
+                .slot_layouts
+                .iter()
+                .map(|slot| slot.fail_arg_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let recovery = exit.recovery_layout.as_ref().expect("recovery_layout");
+        assert_eq!(recovery.frames.len(), 1);
+        assert_eq!(
+            recovery.frames[0].slots,
+            vec![ExitValueSourceLayout::ExitValue(1),]
+        );
+        assert_eq!(
+            recovery.frames[0].slot_types.as_ref().unwrap(),
+            &vec![Type::Int]
         );
     }
 }
