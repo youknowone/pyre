@@ -173,9 +173,17 @@ fn build_canonical_opcode_dispatch(
                 function_graphs,
                 &receiver_traits,
             );
-            let classified_pattern = resolved_calls.iter().find_map(|call| {
-                classify_resolved_call_graph(call, pipeline_config, function_graphs, 0)
-            });
+            let classified_pattern = if arm.handler_calls.is_empty() {
+                // No handler calls in the arm body (e.g. Nop, ExtendedArg, Cache)
+                Some(TracePattern::Noop)
+            } else if !arm.handler_calls.is_empty() && resolved_calls.is_empty() {
+                // Handler calls present but none could be resolved (wildcard arm etc.)
+                None
+            } else {
+                resolved_calls.iter().find_map(|call| {
+                    classify_resolved_call_graph(call, pipeline_config, function_graphs, 0)
+                })
+            };
 
             passes::PipelineOpcodeArm {
                 selector: arm.selector,
