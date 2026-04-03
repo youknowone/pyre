@@ -1221,7 +1221,6 @@ fn execute_assembler(
     frame.next_instr = entry_pc;
 
     let mut jit_state = build_jit_state(frame, info);
-    jit_state.next_instr = entry_pc;
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -1390,7 +1389,6 @@ fn bound_reached(
     // warmstate.py:437-444: MetaInterp.compile_and_run_once
     frame.next_instr = loop_header_pc;
     let mut jit_state = build_jit_state(frame, info);
-    jit_state.next_instr = loop_header_pc;
     // warmstate.py:473-477 JC_TRACING
     if driver.meta_interp().is_tracing_key(green_key) {
         return None;
@@ -2495,12 +2493,13 @@ pub(crate) fn decode_and_restore_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
-            jit_state.next_instr, jit_state.valuestackdepth,
+            jit_state.next_instr(),
+            jit_state.valuestackdepth(),
         );
     }
 
     if restored {
-        Some((typed, jit_state.next_instr))
+        Some((typed, jit_state.next_instr()))
     } else {
         None
     }
@@ -3418,13 +3417,8 @@ pub(crate) fn build_jit_state(
 ) -> PyreJitState {
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
-        next_instr: frame.next_instr,
-        valuestackdepth: frame.valuestackdepth,
     };
-    if !jit_state.sync_from_virtualizable(virtualizable_info) {
-        jit_state.next_instr = frame.next_instr;
-        jit_state.valuestackdepth = frame.valuestackdepth;
-    }
+    let _ = jit_state.sync_from_virtualizable(virtualizable_info);
     jit_state
 }
 
@@ -3433,12 +3427,10 @@ fn sync_jit_state_to_frame(
     frame: &mut PyFrame,
     virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) {
-    if !jit_state.sync_to_virtualizable(virtualizable_info) {
-        frame.next_instr = jit_state.next_instr;
-        frame.valuestackdepth = jit_state.valuestackdepth;
-    }
-    frame.next_instr = jit_state.next_instr;
-    frame.valuestackdepth = jit_state.valuestackdepth;
+    // Heap IS the source of truth — read back from the frame pointer.
+    let _ = jit_state.sync_to_virtualizable(virtualizable_info);
+    frame.next_instr = jit_state.next_instr();
+    frame.valuestackdepth = jit_state.valuestackdepth();
 }
 
 /// resume.py:1437-1541 — BlackholeAllocator for pyre's object model.

@@ -506,60 +506,27 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .cloned()
         .unwrap_or_else(|| format_ident!("frame"));
 
-    // State-backed fields: those mirrored in self (static_field = N).
-    let state_backed: Vec<(&Ident, usize)> = vable_fields
-        .iter()
-        .filter_map(|f| f.static_field_index.map(|idx| (&f.ident, idx)))
-        .collect();
-
-    // ── export: virtualizable.py:86-99 read_boxes parity ──
-    // read_boxes reads ALL fields from the heap virtualizable via getattr.
-    // We delegate to info.read_boxes(), then override state-backed positions
-    // because our architecture mirrors some fields in the state struct.
-    let export_overrides: Vec<TokenStream> = state_backed
-        .iter()
-        .map(|(ident, idx)| {
-            quote! { __boxes[#idx] = self.#ident as i64; }
-        })
-        .collect();
-
-    // ── import: virtualizable.py:126-137 write_from_resume_data_partial parity ──
-    // RPython iterates ALL fields via setattr to the heap virtualizable.
-    // We call info.write_boxes() for heap, then update state-backed self fields.
-    // If static_boxes is shorter than num_fields(), resume-data is corrupt.
-    let import_writes: Vec<TokenStream> = state_backed
-        .iter()
-        .map(|(ident, idx)| {
-            quote! { self.#ident = static_boxes[#idx] as usize; }
-        })
-        .collect();
-
+    // Pure VirtualizableInfo delegation (RPython parity).
+    // Heap is the single source of truth — no state-backed fields to override.
+    // All read/write goes through VirtualizableInfo which handles field types.
     quote! {
         impl #struct_name {
             /// virtualizable.py:86-99 read_boxes parity.
-            ///
-            /// Reads ALL fields from heap via `info.read_boxes()`, then
-            /// overrides state-backed positions with values from `self`
-            /// (our state struct mirrors some fields for fast access).
+            /// Reads ALL static fields from the heap via VirtualizableInfo.
             pub fn virt_export_static_boxes(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Vec<i64> {
                 let heap_ptr = self.#frame_ident as *const u8;
-                let mut __boxes = if !heap_ptr.is_null() {
+                if !heap_ptr.is_null() {
                     unsafe { info.read_boxes(heap_ptr) }
                 } else {
                     vec![0i64; info.num_fields()]
-                };
-                // State-backed fields override heap values.
-                #(#export_overrides)*
-                __boxes
+                }
             }
 
-            /// Write ALL static fields from resume data to heap + state.
-            /// virtualizable.py:126-133 write_from_resume_data_partial parity:
-            /// iterates ALL static fields via set_static_field (type-aware).
-            /// State-backed fields also update `self`.
+            /// virtualizable.py:126-137 write_from_resume_data_partial parity.
+            /// Writes ALL static fields to the heap via VirtualizableInfo.
             pub fn virt_import_static_boxes(
                 &mut self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -568,21 +535,16 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 if static_boxes.len() < info.num_fields() {
                     return false;
                 }
-                // Write ALL static fields to heap (type-aware write).
                 let heap_ptr = self.#frame_ident as *mut u8;
-                if !heap_ptr.is_null() {
-                    unsafe { info.write_boxes(heap_ptr, static_boxes); }
+                if heap_ptr.is_null() {
+                    return false;
                 }
-                // State-backed fields also update self.
-                #(#import_writes)*
+                unsafe { info.write_boxes(heap_ptr, static_boxes); }
                 true
             }
 
             /// virtualizable.py:86-99 read_boxes + array parity.
-            ///
-            /// Reads static + array fields from heap via
-            /// `info.read_all_boxes()`, overrides state-backed static
-            /// positions with values from `self`.
+            /// Reads ALL static + array fields from heap via VirtualizableInfo.
             pub fn virt_export_all(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -596,12 +558,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 } else {
                     vec![]
                 };
-                let (mut __boxes, __arrays) = unsafe {
-                    info.read_all_boxes(heap_ptr, &lengths)
-                };
-                // State-backed fields override heap values.
-                #(#export_overrides)*
-                (__boxes, __arrays)
+                unsafe { info.read_all_boxes(heap_ptr, &lengths) }
             }
         }
     }

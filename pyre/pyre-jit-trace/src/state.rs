@@ -721,16 +721,13 @@ use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_v
 ///
 /// Built from `PyFrame` before calling `back_edge`, and synced back
 /// after compiled code runs.
+/// Heap is the single source of truth (RPython parity).
+/// next_instr / valuestackdepth live on the PyFrame heap object
+/// and are accessed via read_frame_usize / write_frame_usize.
 #[derive(majit_macros::VirtualizableState)]
 pub struct PyreJitState {
     #[vable(frame)]
     pub frame: usize,
-    #[vable(static_field = 0)]
-    pub next_instr: usize,
-    // VirtualizableInfo fields[1] = code (heap-only, not in state)
-    #[vable(static_field = 2)]
-    pub valuestackdepth: usize,
-    // VirtualizableInfo fields[3] = namespace (heap-only, not in state)
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -7357,7 +7354,7 @@ impl PyreJitState {
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
         let nlocals = self.local_count();
-        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for local_idx in 0..nlocals {
             if let Some(&raw) = raw_values.get(idx) {
                 let _ = self.set_local_at(local_idx, raw as PyObjectRef);
@@ -7370,7 +7367,7 @@ impl PyreJitState {
             }
             idx += 1;
         }
-        self.sync_scalar_fields_to_frame()
+        true
     }
 
     /// Returns true if the optimizer virtualizable mechanism is active.
@@ -7446,14 +7443,13 @@ impl PyreJitState {
         };
         self.frame = frame as usize;
         if values.len() == 1 {
-            let _ = self.refresh_from_frame();
             return;
         }
         if meta.has_virtualizable {
             self.restore_virtualizable_i64(values);
         } else {
             let nlocals = self.local_count();
-            let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+            let stack_only = self.valuestackdepth().saturating_sub(nlocals);
             let mut idx = 1;
             for local_idx in 0..nlocals {
                 if idx < values.len() {
@@ -7475,8 +7471,6 @@ impl PyreJitState {
                 idx += 1;
             }
         }
-        // Write next_instr and valuestackdepth back to the concrete PyFrame.
-        let _ = self.sync_scalar_fields_to_frame();
     }
 
     pub fn local_at(&self, idx: usize) -> Option<PyObjectRef> {
@@ -7527,25 +7521,35 @@ impl PyreJitState {
         true
     }
 
-    fn sync_scalar_fields_to_frame(&mut self) -> bool {
-        self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, self.next_instr)
-            && self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, self.valuestackdepth)
+    // ── Heap accessors: single source of truth (RPython parity) ──
+    // RPython's virtualizable IS the heap object — getattr/setattr go
+    // directly to the heap.  These accessors do the same via frame_ptr.
+
+    pub fn next_instr(&self) -> usize {
+        self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET)
+            .unwrap_or(0)
     }
 
-    fn refresh_from_frame(&mut self) -> bool {
-        let Some(next_instr) = self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET) else {
-            return false;
-        };
-        let Some(valuestackdepth) = self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET) else {
-            return false;
-        };
-        if self.locals_cells_stack_array().is_none() {
-            return false;
-        }
+    pub fn set_next_instr(&mut self, value: usize) {
+        self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, value);
+    }
 
-        self.next_instr = next_instr;
-        self.valuestackdepth = valuestackdepth;
-        true
+    pub fn valuestackdepth(&self) -> usize {
+        self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
+            .unwrap_or(0)
+    }
+
+    pub fn set_valuestackdepth(&mut self, value: usize) {
+        self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value);
+    }
+
+    /// Validate that the frame pointer is usable (fields readable, array present).
+    fn validate_frame(&self) -> bool {
+        self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET).is_some()
+            && self
+                .read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
+                .is_some()
+            && self.locals_cells_stack_array().is_some()
     }
 
     /// Restore from virtualizable fail_args format:
@@ -7565,7 +7569,7 @@ impl PyreJitState {
             }
         }
 
-        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         for i in 0..stack_only {
             if idx < values.len() {
                 let _ = self.set_stack_at(i, values[idx] as PyObjectRef);
@@ -7609,12 +7613,8 @@ impl PyreJitState {
 
     pub fn sync_from_virtualizable(&mut self, info: &VirtualizableInfo) -> bool {
         let _ = info;
-        // RPython pre-run sync reads the live virtualizable state from the
-        // concrete frame; it does not materialize resume-data back into the
-        // frame before entering compiled code.  PyreJitState already uses the
-        // concrete PyFrame as the source of truth for locals/stack, so the
-        // entry sync only needs to refresh scalar fields from that frame.
-        self.refresh_from_frame()
+        // Heap IS the source of truth. Just validate the frame is usable.
+        self.validate_frame()
     }
 
     pub fn sync_to_virtualizable(&self, info: &VirtualizableInfo) -> bool {
@@ -7640,12 +7640,13 @@ impl JitState for PyreJitState {
 
     fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
         let num_locals = self.local_count();
-        let slot_types = concrete_slot_types(self.frame, num_locals, self.valuestackdepth);
+        let vsd = self.valuestackdepth();
+        let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
         PyreMeta {
             merge_pc: header_pc,
             num_locals,
             ns_keys: self.namespace_keys(),
-            valuestackdepth: self.valuestackdepth,
+            valuestackdepth: vsd,
             has_virtualizable: self.has_virtualizable_info(),
             slot_types,
         }
@@ -7666,8 +7667,8 @@ impl JitState for PyreJitState {
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
         crate::virtualizable_gen::virt_extract_live_values(
             self.frame,
-            self.next_instr,
-            self.valuestackdepth,
+            self.next_instr(),
+            self.valuestackdepth(),
             meta.num_locals,
             meta.valuestackdepth,
             |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
@@ -7869,22 +7870,15 @@ impl JitState for PyreJitState {
             );
         }
         if values.len() == 1 {
-            let _ = self.refresh_from_frame();
             return;
         }
 
         if meta.has_virtualizable {
-            // RPython parity:
-            // - normal compiled loop JUMPs resume at the loop header merge point
-            // - guard failures rebuild the current frame state separately via
-            //   restore_guard_failure_values()
-            //
-            // So restore_values() must treat virtualizable jump outcomes as
-            // loop-header state, not as "current opcode" state.
-            self.next_instr = meta.merge_pc;
-            self.valuestackdepth = meta.valuestackdepth;
+            // RPython parity: loop JUMPs resume at the loop header merge point.
+            self.set_next_instr(meta.merge_pc);
+            self.set_valuestackdepth(meta.valuestackdepth);
             let nlocals = self.local_count();
-            let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+            let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
             let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             for local_idx in 0..nlocals {
                 if let Some(value) = values.get(idx) {
@@ -7926,9 +7920,8 @@ impl JitState for PyreJitState {
                 let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
                 idx += 1;
             }
-            self.valuestackdepth = meta.valuestackdepth;
+            self.set_valuestackdepth(meta.valuestackdepth);
         }
-        let _ = self.sync_scalar_fields_to_frame();
         if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
@@ -7938,7 +7931,9 @@ impl JitState for PyreJitState {
             });
             eprintln!(
                 "[jit][restore_values] after arg0={:?} ni={} vsd={}",
-                arg0, self.next_instr, self.valuestackdepth
+                arg0,
+                self.next_instr(),
+                self.valuestackdepth()
             );
         }
     }
@@ -7959,22 +7954,25 @@ impl JitState for PyreJitState {
         };
         self.frame = value_to_usize(frame);
         if values.len() == 1 {
-            return self.refresh_from_frame();
+            return self.validate_frame();
         }
 
         // virtualizable.py:126-133: write static fields from resumedata.
-        // FIELDTYPE for next_instr = Signed, valuestackdepth = Signed.
-        self.next_instr = values
+        if let Some(ni) = values
             .get(crate::virtualizable_gen::SYM_NEXT_INSTR_IDX as usize)
             .map(value_to_usize)
-            .unwrap_or(self.next_instr);
-        self.valuestackdepth = values
+        {
+            self.set_next_instr(ni);
+        }
+        if let Some(vsd) = values
             .get(crate::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize)
             .map(value_to_usize)
-            .unwrap_or(self.valuestackdepth);
+        {
+            self.set_valuestackdepth(vsd);
+        }
 
         let nlocals = self.local_count();
-        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         // resume.py:1077 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
         // RPython's consume_boxes uses position_info (liveness at resume PC)
         // to map compact active_boxes back to register indices. Dead registers
@@ -7998,7 +7996,7 @@ impl JitState for PyreJitState {
         };
         // resume.py:1383: info = blackholeinterp.get_current_position_info()
         // Use next_instr (already set from values[1]) as the liveness PC.
-        let live_pc = self.next_instr;
+        let live_pc = self.next_instr();
         let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for local_idx in 0..nlocals {
             // resume.py:1077: only live registers consume a value from the
@@ -8024,14 +8022,13 @@ impl JitState for PyreJitState {
         }
 
         // Clear stale slots beyond valuestackdepth (blackhole fresh frame parity).
-        let vsd = self.valuestackdepth;
+        let vsd = self.valuestackdepth();
         if let Some(arr) = self.locals_cells_stack_array_mut() {
             for i in vsd..arr.len() {
                 arr[i] = pyre_object::PY_NULL;
             }
         }
-
-        self.sync_scalar_fields_to_frame()
+        true
     }
 
     /// resume.py:1077 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
@@ -8049,7 +8046,7 @@ impl JitState for PyreJitState {
         // resume.py:1077: consume_boxes fills boxes_i/boxes_r/boxes_f.
         // pyre frame slots (locals_cells_stack_w) are all GCREF (Ref).
         let nlocals = meta.num_locals;
-        let stack_only = self.valuestackdepth.saturating_sub(nlocals);
+        let stack_only = self.valuestackdepth().saturating_sub(nlocals);
         // Header [frame_ptr=Ref, ni=Int, vsd=Int] + all locals/stack as Ref.
         Some(crate::virtualizable_gen::virt_live_value_types(
             nlocals + stack_only,
@@ -8126,11 +8123,8 @@ impl JitState for PyreJitState {
         _virtualizable: &str,
         info: &VirtualizableInfo,
     ) -> bool {
-        // virtualizable.py:86 read_boxes parity: import heap state into
-        // jit_state scalars (next_instr, valuestackdepth) before JIT entry.
-        // RPython reads detached virtualizable_boxes; pyre reads from the
-        // concrete PyFrame (which IS the virtualizable).
-        if !self.refresh_from_frame() {
+        // Heap is source of truth — just validate the frame is usable.
+        if !self.validate_frame() {
             return false;
         }
         // virtualizable.py:170 force_token_before_residual_call parity:
@@ -8150,11 +8144,7 @@ impl JitState for PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return;
         };
-        // pyjitpl.py:3417 / virtualizable.py:101 write_boxes parity:
-        // write jit_state back to the virtualizable (PyFrame).
-        // RPython writes detached virtualizable_boxes; pyre writes
-        // scalars from jit_state to the concrete PyFrame.
-        let _ = self.sync_scalar_fields_to_frame();
+        // Heap is source of truth — nothing to sync. Just reset token.
         unsafe {
             info.reset_vable_token(frame_ptr);
         }
