@@ -10,6 +10,7 @@
 //! 5. Collects type layouts (struct fields, offsets)
 //! 6. Generates tracing code that mirrors the interpreter's execution
 
+pub mod call;
 mod call_match;
 mod codegen;
 pub mod codewriter;

@@ -92,13 +92,15 @@ impl CallTargetPattern {
 }
 
 /// Detect generic type parameter or variable name used as receiver.
-///
-/// Generic: "H", "T", "handler", "self", "executor"
-/// Concrete: "PyFrame", "Code", "Vec"
-///
-/// Heuristic: single uppercase letter is a type parameter;
-/// starts with lowercase is a variable name.
+/// Delegates to the canonical implementation in `call.rs`.
 pub(crate) fn is_generic_receiver(receiver: &str) -> bool {
+    crate::call::is_generic_receiver(receiver)
+}
+
+// Keep the old implementation as dead code reference to avoid breaking
+// any in-flight references during the transition.
+#[allow(dead_code)]
+fn _is_generic_receiver_old(receiver: &str) -> bool {
     let mut chars = receiver.chars();
     let first = match chars.next() {
         Some(c) => c,
