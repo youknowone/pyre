@@ -12,7 +12,6 @@
 
 pub mod assembler;
 pub mod call;
-mod call_match;
 mod codegen;
 pub mod codewriter;
 pub mod front;
@@ -270,7 +269,7 @@ fn resolve_handler_calls(
 
             let is_default_methods = impl_info.for_type.starts_with("<default methods of ");
             let is_generic = receiver_type_root
-                .is_some_and(|r| crate::call_match::is_generic_receiver(r))
+                .is_some_and(|r| crate::call::is_generic_receiver(r))
                 || receiver_type_root.is_none();
             let applies = if is_default_methods {
                 is_generic
@@ -283,7 +282,7 @@ fn resolve_handler_calls(
             } else {
                 // Concrete impls: match if the receiver type matches,
                 // OR if receiver is a generic type parameter (e.g. "E", "H")
-                receiver_type_root.is_some_and(|r| crate::call_match::is_generic_receiver(r))
+                receiver_type_root.is_some_and(|r| crate::call::is_generic_receiver(r))
                     || receiver_type_root.is_none()
                     || receiver_matches_root(receiver_type_root, &impl_info.self_ty_root)
             };
