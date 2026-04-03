@@ -135,12 +135,32 @@ fn analyze_pipeline_from_parsed(
         parse::collect_function_graphs(parsed, &mut canonical_function_graphs);
     }
 
+    // ── Build CallControl (RPython call.py) ──
+    // Populate with all discovered function graphs and trait impl methods.
+    let mut call_control = call::CallControl::new();
+    for (path, graph) in &canonical_function_graphs {
+        call_control.register_function_graph(path.clone(), graph.clone());
+    }
+    for impl_info in &canonical_trait_impls {
+        let impl_type = impl_info
+            .self_ty_root
+            .as_deref()
+            .unwrap_or(&impl_info.for_type);
+        for method in &impl_info.methods {
+            if let Some(graph) = &method.graph {
+                call_control.register_trait_method(&method.name, impl_type, graph.clone());
+            }
+        }
+    }
+    call_control.find_all_graphs();
+
     pipeline.opcode_dispatch = build_canonical_opcode_dispatch(
         parsed_files,
         &canonical_trait_impls,
         &canonical_inherent_methods,
         &canonical_function_graphs,
         &config.pipeline,
+        &call_control,
     );
 
     pipeline
@@ -152,6 +172,7 @@ fn build_canonical_opcode_dispatch(
     inherent_methods: &[parse::InherentMethodInfo],
     function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
     pipeline_config: &passes::PipelineConfig,
+    call_control: &call::CallControl,
 ) -> Vec<passes::PipelineOpcodeArm> {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
@@ -240,9 +261,40 @@ fn build_canonical_opcode_dispatch(
                 })
             };
 
+            // RPython-orthodox path: inline → jtransform → flatten
+            let flattened = resolved_calls.iter().find_map(|resolved| {
+                let graph = resolved.graph.as_ref()?;
+                let mut inlined = graph.clone();
+                let count = inline::inline_graph(&mut inlined, call_control, 3);
+                if count == 0
+                    && inlined.blocks.iter().all(|b| {
+                        b.ops.iter().all(|op| {
+                            matches!(
+                                &op.kind,
+                                graph::OpKind::Input { .. }
+                                    | graph::OpKind::Unknown { .. }
+                                    | graph::OpKind::Call { .. }
+                            )
+                        })
+                    })
+                {
+                    // No inlining happened and graph is trivial — skip
+                    return None;
+                }
+                let rewritten = passes::rewrite_graph(&inlined, &pipeline_config.transform);
+                Some(passes::flatten_with_types(
+                    &rewritten.graph,
+                    &passes::resolve_types(
+                        &rewritten.graph,
+                        &passes::annotate_graph(&rewritten.graph),
+                    ),
+                ))
+            });
+
             passes::PipelineOpcodeArm {
                 selector: arm.selector,
                 classified_pattern,
+                flattened,
             }
         })
         .collect()
@@ -651,6 +703,26 @@ mod tests {
         for arm in &result.opcode_dispatch {
             if let Some(ref pattern) = arm.classified_pattern {
                 eprintln!("  {} → {:?}", arm.selector.canonical_key(), pattern);
+            }
+        }
+
+        // Report flattened (inline→jtransform→flatten) stats
+        let flattened_count = result
+            .opcode_dispatch
+            .iter()
+            .filter(|a| a.flattened.is_some())
+            .count();
+        eprintln!(
+            "\nFlattened (inline pipeline): {flattened_count}/{}",
+            result.opcode_dispatch.len()
+        );
+        for arm in &result.opcode_dispatch {
+            if let Some(ref flat) = arm.flattened {
+                eprintln!(
+                    "  {} → {} flat ops",
+                    arm.selector.canonical_key(),
+                    flat.ops.len()
+                );
             }
         }
 
@@ -1246,5 +1318,80 @@ mod tests {
         );
         assert_eq!(resolved[0].impl_type.as_deref(), Some("PyFrame"));
         assert_eq!(resolved[0].trait_name.as_deref(), Some("TraitA"));
+    }
+
+    /// Integration test: CallControl + inline on real pyre sources.
+    ///
+    /// Verifies that the inline pass produces graphs with low-level ops
+    /// (FieldRead, ArrayRead) from inlined handler method bodies.
+    #[test]
+    fn test_inline_pipeline_integration() {
+        let sources = read_all_pyre_sources();
+        let source_refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let parsed_files: Vec<_> = source_refs.iter().map(|s| parse::parse_source(s)).collect();
+
+        // Build CallControl from parsed sources
+        let mut call_control = call::CallControl::new();
+        let mut function_graphs = std::collections::HashMap::new();
+        for parsed in &parsed_files {
+            parse::collect_function_graphs(parsed, &mut function_graphs);
+        }
+        for (path, graph) in &function_graphs {
+            call_control.register_function_graph(path.clone(), graph.clone());
+        }
+        let trait_impls: Vec<TraitImplInfo> = parsed_files
+            .iter()
+            .flat_map(parse::extract_trait_impls)
+            .collect();
+        for impl_info in &trait_impls {
+            let impl_type = impl_info
+                .self_ty_root
+                .as_deref()
+                .unwrap_or(&impl_info.for_type);
+            for method in &impl_info.methods {
+                if let Some(graph) = &method.graph {
+                    call_control.register_trait_method(&method.name, impl_type, graph.clone());
+                }
+            }
+        }
+        call_control.find_all_graphs();
+
+        // Get opcode_load_fast_checked graph and inline it
+        let path = parse::CallPath::from_segments(["opcode_load_fast_checked"]);
+        let graph = function_graphs.get(&path);
+        assert!(
+            graph.is_some(),
+            "opcode_load_fast_checked should exist in function_graphs"
+        );
+        let mut graph = graph.unwrap().clone();
+
+        let pre_inline_blocks = graph.blocks.len();
+        let inlined = inline::inline_graph(&mut graph, &call_control, 3);
+
+        eprintln!("=== Inline Integration Test ===");
+        eprintln!(
+            "  opcode_load_fast_checked: {pre_inline_blocks} blocks → {} blocks, {inlined} call sites inlined",
+            graph.blocks.len()
+        );
+        for block in &graph.blocks {
+            for op in &block.ops {
+                eprintln!("    {:?}", op.kind);
+            }
+        }
+
+        assert!(inlined > 0, "should inline at least one call site");
+
+        // After inlining, the graph should have low-level ops from callee bodies
+        let all_ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.ops).collect();
+        let has_low_level = all_ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { .. }
+                    | OpKind::ArrayRead { .. }
+                    | OpKind::ArrayWrite { .. }
+                    | OpKind::FieldWrite { .. }
+            )
+        });
+        eprintln!("  has low-level ops after inline: {has_low_level}");
     }
 }

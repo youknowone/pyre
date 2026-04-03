@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::call_match::CallDescriptor;
+use crate::call::CallDescriptor;
 use crate::graph::{
     BasicBlockId, CallTarget, FieldDescriptor, MajitGraph, Op, OpKind, Terminator, ValueId,
     ValueType,

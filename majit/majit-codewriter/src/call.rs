@@ -8,11 +8,41 @@
 
 use std::collections::{HashMap, HashSet};
 
+use majit_ir::descr::EffectInfo;
+use serde::{Deserialize, Serialize};
+
 use crate::graph::{CallTarget, MajitGraph, OpKind};
 use crate::parse::CallPath;
 
-// Re-export CallDescriptor so callers don't need call_match directly.
-pub use crate::call_match::CallDescriptor;
+/// Call descriptor — associates a call target with its effect info.
+///
+/// RPython equivalent: the combination of `CallDescr` + `EffectInfo`
+/// stored on call operations by `CallControl.getcalldescr()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallDescriptor {
+    pub target: CallTarget,
+    pub effect_info: EffectInfo,
+}
+
+impl CallDescriptor {
+    pub fn known(target: CallTarget, effect_info: EffectInfo) -> Self {
+        Self {
+            target,
+            effect_info,
+        }
+    }
+
+    pub fn override_effect(target: CallTarget, effect_info: EffectInfo) -> Self {
+        Self {
+            target,
+            effect_info,
+        }
+    }
+
+    pub fn effect_info(&self) -> EffectInfo {
+        self.effect_info.clone()
+    }
+}
 
 /// Call classification — RPython `guess_call_kind()` return values.
 ///
@@ -197,15 +227,23 @@ impl CallControl {
     /// we try all known impls and return the unique one.
     pub fn resolve_method(&self, name: &str, receiver_root: Option<&str>) -> Option<&MajitGraph> {
         let impls = self.trait_method_impls.get(name)?;
-        if impls.len() == 1 {
-            // Unique impl — use it regardless of receiver
-            let impl_type = &impls[0];
+
+        // Filter out default trait method entries (e.g. "<default methods of LocalOpcodeHandler>")
+        // — we prefer concrete impls when available.
+        let concrete_impls: Vec<&String> = impls
+            .iter()
+            .filter(|t| !t.starts_with("<default methods of"))
+            .collect();
+
+        if concrete_impls.len() == 1 {
+            // Unique concrete impl — use it regardless of receiver
+            let impl_type = concrete_impls[0];
             return self
                 .trait_method_graphs
                 .get(&(name.to_string(), impl_type.clone()));
         }
 
-        // Multiple impls — try to match by receiver root
+        // Multiple concrete impls — try to match by receiver root
         if let Some(receiver) = receiver_root {
             if !is_generic_receiver(receiver) {
                 // Concrete receiver — look for exact match
@@ -215,7 +253,15 @@ impl CallControl {
             }
         }
 
-        // Generic receiver or no receiver — can't resolve uniquely
+        // Generic receiver with multiple concrete impls — can't resolve uniquely.
+        // Fall back to default method if available.
+        if concrete_impls.is_empty() && impls.len() == 1 {
+            let impl_type = &impls[0];
+            return self
+                .trait_method_graphs
+                .get(&(name.to_string(), impl_type.clone()));
+        }
+
         None
     }
 
