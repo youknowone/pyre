@@ -441,7 +441,7 @@ fn remap_terminator(
 }
 
 /// Collect all ValueId references used in an OpKind (not including result).
-fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
+pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)

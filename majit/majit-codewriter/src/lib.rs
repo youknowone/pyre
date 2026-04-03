@@ -19,9 +19,11 @@ pub mod front;
 pub mod graph;
 pub mod hints;
 pub mod inline;
+pub mod liveness;
 mod parse;
 pub mod passes;
 mod patterns;
+pub mod regalloc;
 #[cfg(test)]
 mod test_support;
 
