@@ -242,6 +242,12 @@ pub enum OpKind {
         result_ty: ValueType,
     },
 
+    /// Liveness marker — RPython `-live-` operation.
+    /// Inserted by jtransform after calls that may need guard resumption.
+    /// Expanded by compute_liveness() to include all values alive at
+    /// this point. RPython: jtransform.py:469,481,533.
+    Live,
+
     Unknown {
         kind: UnknownKind,
     },
