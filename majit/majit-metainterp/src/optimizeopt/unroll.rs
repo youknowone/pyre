@@ -1797,23 +1797,10 @@ impl OptUnroll {
             };
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args, ctx) {
-                    // RPython unroll.py:336-337: copy rd_resume_position from
-                    // patchguardop and set descr to ResumeAtPositionDescr().
-                    // store_final_boxes_in_guard resolves fail_args from
-                    // patchguardop via rd_resume_position (snapshot lookup).
                     // unroll.py:336: guard.rd_resume_position = patchguardop.rd_resume_position
-                    // Fallback to last emitted guard when patchguardop is None.
-                    let resume_pos = ctx
-                        .patchguardop
-                        .as_ref()
-                        .map(|p| p.rd_resume_position)
-                        .or_else(|| {
-                            ctx.last_guard_idx.and_then(|idx| {
-                                ctx.new_operations.get(idx).map(|g| g.rd_resume_position)
-                            })
-                        });
-                    if let Some(pos) = resume_pos {
-                        guard_op.rd_resume_position = pos;
+                    // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
+                    if let Some(ref patch) = ctx.patchguardop {
+                        guard_op.rd_resume_position = patch.rd_resume_position;
                     }
                     guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
                     optimizer.send_extra_operation(&guard_op, ctx);
@@ -2129,11 +2116,10 @@ impl OptUnroll {
                     new_op.rd_pendingfields = None;
                     new_op.fail_arg_types = None;
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
-                    new_op.rd_resume_position = ctx
-                        .patchguardop
-                        .as_ref()
-                        .map(|p| p.rd_resume_position)
-                        .unwrap_or(-1);
+                    // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
+                    if let Some(ref patch) = ctx.patchguardop {
+                        new_op.rd_resume_position = patch.rd_resume_position;
+                    }
                     // Re-register guard constant args from preamble's constant pool.
                     for &arg in &new_op.args {
                         if let Some(&(val, tp)) = short_preamble.constants.get(&arg.0) {

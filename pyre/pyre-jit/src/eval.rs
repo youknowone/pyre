@@ -1103,16 +1103,11 @@ fn maybe_compile_and_run(
     if driver.is_tracing() {
         return None;
     }
-    // warmstate.py:482-511: RPython enters assembler unconditionally
-    // when procedure_token exists (line 511: EnterJitAssembler).
-    // compile.py:269: cross-loop cut traces are stored under the inner
-    // loop's green_key directly, so no alias resolution is needed.
+    // warmstate.py:503-511: procedure_token exists → EnterJitAssembler.
+    // RPython enters assembler unconditionally when a compiled loop is
+    // available for this green_key. No merge_pc compatibility check.
     if driver.has_compiled_loop(green_key) {
-        if let Some(meta) = driver.get_compiled_meta(green_key) {
-            if meta.merge_pc == loop_header_pc {
-                return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
-            }
-        }
+        return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
@@ -1402,13 +1397,8 @@ fn bound_reached(
     if driver.meta_interp().is_tracing_key(green_key) {
         return None;
     }
-    // warmstate.py:482-511 + warmstate.py:437-444 combined:
-    // compiled code → run, else → start tracing.
-    let has_compatible_loop = driver.has_compiled_loop(green_key)
-        && driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |meta| meta.merge_pc == loop_header_pc);
-    let outcome = if has_compatible_loop {
+    // warmstate.py:503-511: procedure_token → EnterJitAssembler.
+    let outcome = if driver.has_compiled_loop(green_key) {
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
@@ -1423,11 +1413,7 @@ fn bound_reached(
         driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
         // force_start_tracing may return RunCompiled (retargeted trace
         // already compiled for this cell). In that case, enter compiled.
-        let post_compatible = driver.has_compiled_loop(green_key)
-            && driver
-                .get_compiled_meta(green_key)
-                .map_or(false, |meta| meta.merge_pc == loop_header_pc);
-        if !driver.is_tracing() && post_compatible {
+        if !driver.is_tracing() && driver.has_compiled_loop(green_key) {
             Some(driver.run_compiled_detailed_with_bridge_keyed(
                 green_key,
                 loop_header_pc,
@@ -1581,15 +1567,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if driver.has_compiled_loop(green_key) {
         // Same gate as maybe_compile_and_run: only enter compiled code
         // when the compiled loop's merge_pc matches the current PC.
-        // Cross-loop-cut traces get stored under the trace-start PC
-        // but have a different loop-closure PC (merge_pc). Skip entry
-        // to avoid incompatible-state and let counter tick instead.
-        let compatible = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |meta| meta.merge_pc == frame.next_instr);
-        if !compatible {
-            return None;
-        }
+        // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
