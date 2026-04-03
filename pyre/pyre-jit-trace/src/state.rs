@@ -7627,11 +7627,10 @@ impl PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return false;
         };
-        let (static_boxes, array_boxes) = self.export_virtualizable_state();
+        // Heap is the single source of truth — no state-backed fields to
+        // flush.  Only the vable_token needs resetting (virtualizable.py:218
+        // force_now: set vable_token to TOKEN_NONE).
         unsafe {
-            info.write_from_resume_data_partial(frame_ptr, &static_boxes, &array_boxes);
-            // virtualizable.py:218 — heap is already up-to-date, just clear token.
-            // reset (not clear/force) because we already wrote the data above.
             info.reset_vable_token(frame_ptr);
         }
         true
@@ -8406,11 +8405,7 @@ mod tests {
     }
 
     fn empty_state() -> PyreJitState {
-        PyreJitState {
-            frame: 0,
-            next_instr: 0,
-            valuestackdepth: 0,
-        }
+        PyreJitState { frame: 0 }
     }
 
     #[test]
@@ -8668,7 +8663,7 @@ mod tests {
 
         let mut state = empty_state();
         state.frame = frame_ptr;
-        state.valuestackdepth = 2;
+        state.set_valuestackdepth(2);
         let info = crate::virtualizable_gen::build_virtualizable_info();
 
         // virtualizable.py:86 parity: full array length, not valuestackdepth.
@@ -8706,11 +8701,9 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            next_instr: 0,
-            valuestackdepth: 4,
-        };
+        let mut state = PyreJitState { frame: frame_ptr };
+        state.set_next_instr(0);
+        state.set_valuestackdepth(4);
         let meta = PyreMeta {
             merge_pc: 0,
             num_locals: 4,
@@ -8739,8 +8732,8 @@ mod tests {
             &majit_metainterp::blackhole::ExceptionState::default(),
         ));
 
-        assert_eq!(state.next_instr, 9);
-        assert_eq!(state.valuestackdepth, 4);
+        assert_eq!(state.next_instr(), 9);
+        assert_eq!(state.valuestackdepth(), 4);
         let restored_i = state.local_at(3).expect("local i should be restored");
         assert!(unsafe { is_int(restored_i) });
         assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
@@ -9939,13 +9932,9 @@ mod tests {
 
         let next = MIFrame::iter_next_value(&mut state, iter, range_iter)
             .expect("range iterator fast path should trace");
-        assert_eq!(state.value_type(next), Type::Int);
-        <MIFrame as IterOpcodeHandler>::guard_optional_value(
-            &mut state,
-            FrontendOp::opref_only(next),
-            true,
-        )
-        .expect("typed range next should not need optional guard");
+        assert_eq!(state.value_type(next.opref), Type::Int);
+        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
+            .expect("typed range next should not need optional guard");
 
         let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
