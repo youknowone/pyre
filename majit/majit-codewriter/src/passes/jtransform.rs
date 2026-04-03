@@ -302,6 +302,20 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    // ── helpers ──────────────────────────────────────────────
+
+    /// RPython: `Transformer.make_three_lists(vars)` (jtransform.py:437-445).
+    /// Split args into three lists by kind (int, ref, float).
+    /// Currently all args are treated as 'ref' (unknown type) since
+    /// full type resolution runs before jtransform in the pipeline.
+    fn make_three_lists(&self, args: &[ValueId]) -> (Vec<ValueId>, Vec<ValueId>, Vec<ValueId>) {
+        // With full type info, we would check each arg's concretetype.
+        // For now, place all args in the ref list (safe default — the
+        // assembler will correct based on regalloc kinds).
+        let args_r = args.to_vec();
+        (vec![], args_r, vec![])
+    }
+
     // ── rewrite_op_* methods ──────────────────────────────────
 
     /// RPython: `Transformer.rewrite_op_hint(op)`.
@@ -609,8 +623,13 @@ impl<'a> Transformer<'a> {
             let path = target_to_call_path(target);
             cc.get_jitcode(&path)
         } else {
-            0 // fallback for config-only mode
+            0
         };
+        // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
+        // Split args by kind (RPython make_three_lists)
+        let (args_i, args_r, args_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
+
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("call {target} → inline_call[jitcode={jitcode_index}]"),
@@ -622,9 +641,10 @@ impl<'a> Transformer<'a> {
                 result: op.result,
                 kind: OpKind::InlineCall {
                     jitcode_index,
-                    target: target.clone(),
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
+                    args_i,
+                    args_r,
+                    args_f,
+                    result_kind,
                 },
             },
             Op {
@@ -646,9 +666,19 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // RPython jtransform.py:522-534: jitdriver_sd.index + green/red layout
-        // Currently we use jd_index=0 (single jitdriver).
+        // RPython jtransform.py:522-534:
+        //   jd_index = jitdriver_sd.index
+        //   greens = args[1:1+num_green_args]
+        //   reds = args[1+num_green_args:]
+        //   recursive_call_{kind}(jd_index, [green_i],[green_r],[green_f],
+        //                                   [red_i],[red_r],[red_f])
         let jd_index = 0usize;
+        // Currently we don't distinguish green/red — all args are red.
+        // Green args require jitdriver metadata (greens list) which
+        // will be provided when jitdriver integration is complete.
+        let (reds_i, reds_r, reds_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
+
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("call {target} → recursive_call[jd={jd_index}]"),
@@ -660,9 +690,13 @@ impl<'a> Transformer<'a> {
                 result: op.result,
                 kind: OpKind::RecursiveCall {
                     jd_index,
-                    target: target.clone(),
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
+                    greens_i: vec![],
+                    greens_r: vec![],
+                    greens_f: vec![],
+                    reds_i,
+                    reds_r,
+                    reds_f,
+                    result_kind,
                 },
             },
             Op {
@@ -760,6 +794,17 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Live,
             },
         ])
+    }
+}
+
+/// RPython: `getkind(concretetype)[0]` → 'i', 'r', 'f', or 'v'.
+fn value_type_to_kind(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int | ValueType::State => 'i',
+        ValueType::Ref => 'r',
+        ValueType::Float => 'f',
+        ValueType::Void => 'v',
+        ValueType::Unknown => 'i', // default to int for unknown
     }
 }
 
@@ -944,33 +989,71 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
         },
         OpKind::InlineCall {
             jitcode_index,
-            target,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::InlineCall {
             jitcode_index: *jitcode_index,
-            target: target.clone(),
-            args: args
+            args_i: args_i
                 .iter()
                 .copied()
                 .map(|v| remap_value(v, aliases))
                 .collect(),
-            result_ty: result_ty.clone(),
+            args_r: args_r
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            args_f: args_f
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_kind: *result_kind,
         },
         OpKind::RecursiveCall {
             jd_index,
-            target,
-            args,
-            result_ty,
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            result_kind,
         } => OpKind::RecursiveCall {
             jd_index: *jd_index,
-            target: target.clone(),
-            args: args
+            greens_i: greens_i
                 .iter()
                 .copied()
                 .map(|v| remap_value(v, aliases))
                 .collect(),
-            result_ty: result_ty.clone(),
+            greens_r: greens_r
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            greens_f: greens_f
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            reds_i: reds_i
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            reds_r: reds_r
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            reds_f: reds_f
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_kind: *result_kind,
         },
     };
     Op {

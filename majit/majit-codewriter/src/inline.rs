@@ -405,25 +405,35 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::InlineCall {
             jitcode_index,
-            target,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::InlineCall {
             jitcode_index: *jitcode_index,
-            target: target.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
         },
         OpKind::RecursiveCall {
             jd_index,
-            target,
-            args,
-            result_ty,
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            result_kind,
         } => OpKind::RecursiveCall {
             jd_index: *jd_index,
-            target: target.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
+            greens_i: greens_i.iter().map(remap).collect(),
+            greens_r: greens_r.iter().map(remap).collect(),
+            greens_f: greens_f.iter().map(remap).collect(),
+            reds_i: reds_i.iter().map(remap).collect(),
+            reds_r: reds_r.iter().map(remap).collect(),
+            reds_f: reds_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
         },
         OpKind::Unknown { kind } => OpKind::Unknown { kind: kind.clone() },
     }
@@ -491,9 +501,35 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::UnaryOp { operand, .. } => vec![*operand],
         OpKind::CallElidable { args, .. }
         | OpKind::CallResidual { args, .. }
-        | OpKind::CallMayForce { args, .. }
-        | OpKind::InlineCall { args, .. }
-        | OpKind::RecursiveCall { args, .. } => args.clone(),
+        | OpKind::CallMayForce { args, .. } => args.clone(),
+        OpKind::InlineCall {
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut refs = args_i.clone();
+            refs.extend(args_r);
+            refs.extend(args_f);
+            refs
+        }
+        OpKind::RecursiveCall {
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            ..
+        } => {
+            let mut refs = greens_i.clone();
+            refs.extend(greens_r);
+            refs.extend(greens_f);
+            refs.extend(reds_i);
+            refs.extend(reds_r);
+            refs.extend(reds_f);
+            refs
+        }
     }
 }
 

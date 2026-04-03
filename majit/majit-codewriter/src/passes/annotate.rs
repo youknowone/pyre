@@ -150,10 +150,21 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::VableForce | OpKind::Live => ValueType::Void,
         OpKind::CallElidable { result_ty, .. }
         | OpKind::CallResidual { result_ty, .. }
-        | OpKind::CallMayForce { result_ty, .. }
-        | OpKind::InlineCall { result_ty, .. }
-        | OpKind::RecursiveCall { result_ty, .. } => result_ty.clone(),
+        | OpKind::CallMayForce { result_ty, .. } => result_ty.clone(),
+        OpKind::InlineCall { result_kind, .. } | OpKind::RecursiveCall { result_kind, .. } => {
+            kind_char_to_value_type(*result_kind)
+        }
         OpKind::Unknown { .. } => ValueType::Unknown,
+    }
+}
+
+fn kind_char_to_value_type(kind: char) -> ValueType {
+    match kind {
+        'i' => ValueType::Int,
+        'r' => ValueType::Ref,
+        'f' => ValueType::Float,
+        'v' => ValueType::Void,
+        _ => ValueType::Unknown,
     }
 }
 
