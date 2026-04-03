@@ -7579,12 +7579,14 @@ impl PyreJitState {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) -> bool {
+        // virtualizable.py:126-137 write_from_resume_data_partial parity:
+        // write ALL static fields to heap + update state-backed self fields.
         let info = crate::virtualizable_gen::build_virtualizable_info();
         if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
         }
 
-        // Array: write to frame heap.
+        // virtualizable.py:134-137: write array items to heap.
         let Some(unified) = array_boxes.first() else {
             return false;
         };
@@ -7597,14 +7599,7 @@ impl PyreJitState {
         for (dst, &src) in frame_arr.as_mut_slice().iter_mut().zip(unified) {
             *dst = src as PyObjectRef;
         }
-
-        self.sync_scalar_fields_to_frame()
-            && self
-                .read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET)
-                .is_some_and(|next_instr| next_instr == self.next_instr)
-            && self
-                .read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
-                .is_some_and(|vsd| vsd == self.valuestackdepth)
+        true
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {

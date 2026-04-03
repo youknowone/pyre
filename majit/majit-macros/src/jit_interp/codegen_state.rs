@@ -1445,7 +1445,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// tl.py:88 promote(stack.stackpos) → GUARD_VALUE on stacksize.
             ///
             /// pyjitpl.py:1916 implement_guard_value: if already Const, skip;
-            /// else emit GUARD_VALUE(box, Const(N)).
+            /// else emit GUARD_VALUE(box, Const(N)).  stacksize_opref is a red
+            /// inputarg (OpRef(0)), so the guard constrains a variable value.
             fn promote_stacksize(
                 &mut self,
                 ctx: &mut majit_metainterp::TraceCtx,
@@ -1454,14 +1455,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                 if self.stacksize_promoted {
                     return;
                 }
-                // First call: record a constant for the current stacksize and
-                // emit GUARD_VALUE.  Subsequent calls in the same trace position
-                // are no-ops (the optimizer CSEs duplicate guards).
-                let opref = if let Some(existing) = self.stacksize_opref {
-                    existing
-                } else {
-                    // No symbolic OpRef yet; create one from the concrete value.
-                    ctx.const_int(runtime_value)
+                let Some(opref) = self.stacksize_opref else {
+                    return;
                 };
                 let promoted = ctx.promote_int(opref, runtime_value, 0);
                 self.stacksize_opref = Some(promoted);
@@ -1479,6 +1474,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
                 let mut args = Vec::new();
+                // stackpos inputarg first.
+                if let Some(sp) = self.stacksize_opref {
+                    args.push(sp);
+                }
                 for &(sidx, _) in self.storage_layout.iter().take(self.meta_storage_count) {
                     args.extend(self.stacks[&sidx].to_jump_args());
                 }
@@ -1523,6 +1522,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn extract_live(&self, meta: &__JitMeta) -> Vec<i64> {
                 let mut values = Vec::new();
+                // tl.py:88 stackpos is a red inputarg (virtualizable field).
+                // First inputarg = stackpos of the selected storage.
+                values.push(self.#pool_field.get(self.#sel_field).len() as i64);
                 for &(sidx, num_slots) in &meta.storage_layout {
                     let store = self.#pool_field.get(sidx);
                     for i in 0..num_slots {
@@ -1534,7 +1536,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn create_sym(meta: &__JitMeta, header_pc: usize) -> __JitSym {
                 let mut stacks = std::collections::HashMap::new();
-                let mut offset = 0;
+                // OpRef(0) = stackpos inputarg; stack values start at offset 1.
+                let mut offset = 1;
                 for &(sidx, num_slots) in &meta.storage_layout {
                     stacks.insert(
                         sidx,
@@ -1552,7 +1555,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     trace_started: false,
                     meta_storage_count: meta.storage_layout.len(),
                     linked_list_heads: std::collections::HashMap::new(),
-                    stacksize_opref: None,
+                    // OpRef(0) = stackpos red variable, initially unpromoted.
+                    stacksize_opref: Some(majit_ir::OpRef(0)),
                     stacksize_promoted: false,
                 }
             }
@@ -1565,6 +1569,18 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
 
             fn restore(&mut self, meta: &__JitMeta, values: &[i64]) {
+                // values[0] = stackpos (red inputarg for promote).
+                // Rest: stack values, possibly with suffix.
+                if values.is_empty() {
+                    self.#sel_field = meta.initial_selected;
+                    return;
+                }
+                // values[0] = stackpos inputarg (promote target).
+                // The actual stack restore below resets storage length,
+                // so we don't need to explicitly write stackpos here.
+
+                let values = &values[1..]; // strip stackpos prefix
+
                 // Two possible formats:
                 // 1. JUMP args (loop finish): [stack_elems...] — length == sum(num_slots)
                 // 2. Guard fail_args: [stack_elems..., lengths..., selected, resume_pc]
@@ -1621,6 +1637,10 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn collect_jump_args(sym: &__JitSym) -> Vec<majit_ir::OpRef> {
                 let mut args = Vec::new();
+                // stackpos inputarg first (matches extract_live order).
+                if let Some(sp) = sym.stacksize_opref {
+                    args.push(sp);
+                }
                 // Only include original meta storages. Extra storages from
                 // trace-time OP_SEL are excluded — their state stays on the
                 // interpreter's heap and is not carried by the compiled loop.
