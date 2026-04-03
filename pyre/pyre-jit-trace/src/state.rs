@@ -7527,20 +7527,26 @@ impl PyreJitState {
 
     pub fn next_instr(&self) -> usize {
         self.read_frame_usize(PYFRAME_NEXT_INSTR_OFFSET)
-            .unwrap_or(0)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
     pub fn set_next_instr(&mut self, value: usize) {
-        self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, value);
+        assert!(
+            self.write_frame_usize(PYFRAME_NEXT_INSTR_OFFSET, value),
+            "PyreJitState.frame must point to a valid PyFrame"
+        );
     }
 
     pub fn valuestackdepth(&self) -> usize {
         self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
-            .unwrap_or(0)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
     pub fn set_valuestackdepth(&mut self, value: usize) {
-        self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value);
+        assert!(
+            self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value),
+            "PyreJitState.frame must point to a valid PyFrame"
+        );
     }
 
     /// Validate that the frame pointer is usable (fields readable, array present).
@@ -7624,10 +7630,9 @@ impl PyreJitState {
         let (static_boxes, array_boxes) = self.export_virtualizable_state();
         unsafe {
             info.write_from_resume_data_partial(frame_ptr, &static_boxes, &array_boxes);
-            info.clear_vable_token(frame_ptr, |_token| {
-                // Force callback — in RPython this forces the virtualizable.
-                // In pyre, the frame is already restored above.
-            });
+            // virtualizable.py:218 — heap is already up-to-date, just clear token.
+            // reset (not clear/force) because we already wrote the data above.
+            info.reset_vable_token(frame_ptr);
         }
         true
     }
