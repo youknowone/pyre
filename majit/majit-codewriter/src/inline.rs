@@ -402,6 +402,24 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args: args.iter().map(remap).collect(),
             result_ty: result_ty.clone(),
         },
+        OpKind::InlineCall {
+            target,
+            args,
+            result_ty,
+        } => OpKind::InlineCall {
+            target: target.clone(),
+            args: args.iter().map(remap).collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::RecursiveCall {
+            target,
+            args,
+            result_ty,
+        } => OpKind::RecursiveCall {
+            target: target.clone(),
+            args: args.iter().map(remap).collect(),
+            result_ty: result_ty.clone(),
+        },
         OpKind::Unknown { kind } => OpKind::Unknown { kind: kind.clone() },
     }
 }
@@ -467,7 +485,9 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::UnaryOp { operand, .. } => vec![*operand],
         OpKind::CallElidable { args, .. }
         | OpKind::CallResidual { args, .. }
-        | OpKind::CallMayForce { args, .. } => args.clone(),
+        | OpKind::CallMayForce { args, .. }
+        | OpKind::InlineCall { args, .. }
+        | OpKind::RecursiveCall { args, .. } => args.clone(),
     }
 }
 

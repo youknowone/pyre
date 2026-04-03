@@ -142,20 +142,20 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 /// - Hint calls → identity/VableForce
 /// - Call classification → CallElidable/CallResidual/CallMayForce
 pub struct Transformer<'a> {
-    /// RPython: Transformer.callcontrol — passed via config for now.
+    /// RPython: `Transformer.callcontrol`.
+    /// When present, `rewrite_op_direct_call` uses `guess_call_kind()`
+    /// to dispatch to handle_regular_call / handle_residual_call /
+    /// handle_builtin_call / handle_recursive_call.
+    callcontrol: Option<&'a crate::call::CallControl>,
+    /// RPython: `Transformer.__init__` config for virtualizable lowering.
     config: &'a GraphTransformConfig,
-    /// RPython: Transformer.vable_array_vars
-    /// Maps ValueId (result of reading a virtualizable array field)
-    /// to (array_index) for downstream getarrayitem/setarrayitem rewriting.
+    /// RPython: `Transformer.vable_array_vars`.
     vable_array_vars: std::collections::HashMap<ValueId, usize>,
-    /// RPython: Transformer.vable_flags
-    /// Tracks virtualizable flags (fresh_virtualizable, etc.) per value.
+    /// RPython: `Transformer.vable_flags`.
     vable_flags: std::collections::HashMap<ValueId, VableFlag>,
-    /// Value aliases from identity rewrites (same_as / hint rewriting)
+    /// Value aliases from identity rewrites (same_as / hint rewriting).
     aliases: std::collections::HashMap<ValueId, ValueId>,
-    /// Transformation notes for debugging
     notes: Vec<GraphTransformNote>,
-    /// Counters
     vable_rewrites: usize,
     calls_classified: usize,
 }
@@ -181,6 +181,7 @@ enum RewriteResult {
 impl<'a> Transformer<'a> {
     pub fn new(config: &'a GraphTransformConfig) -> Self {
         Self {
+            callcontrol: None,
             config,
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
@@ -189,6 +190,13 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
         }
+    }
+
+    /// Set the CallControl for call kind dispatch.
+    /// RPython: `Transformer.__init__(callcontrol=...)`.
+    pub fn with_callcontrol(mut self, cc: &'a crate::call::CallControl) -> Self {
+        self.callcontrol = Some(cc);
+        self
     }
 
     /// RPython: Transformer.transform() — process all blocks in the graph.
@@ -467,7 +475,13 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: `Transformer.rewrite_op_direct_call(op)`.
-    /// Dispatches to `handle_*_call` based on call classification.
+    ///
+    /// RPython jtransform.py:406-410:
+    /// ```python
+    /// def rewrite_op_direct_call(self, op):
+    ///     kind = self.callcontrol.guess_call_kind(op)
+    ///     return getattr(self, 'handle_%s_call' % kind)(op)
+    /// ```
     fn rewrite_op_direct_call(
         &mut self,
         op: &Op,
@@ -476,21 +490,117 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // RPython: guess_call_kind(op) → dispatch to handle_*_call
+        if let Some(cc) = self.callcontrol {
+            let kind = cc.guess_call_kind(target);
+            return match kind {
+                crate::call::CallKind::Regular => {
+                    self.handle_regular_call(op, target, args, result_ty, graph_name)
+                }
+                crate::call::CallKind::Residual => {
+                    // Residual: classify effect from call_effects/describe_call
+                    if let Some((descriptor, effect)) =
+                        classify_call(target, &self.config.call_effects)
+                    {
+                        match effect {
+                            CallEffectKind::Elidable => self
+                                .handle_elidable_call(op, descriptor, args, result_ty, graph_name),
+                            CallEffectKind::MayForce => self
+                                .handle_may_force_call(op, descriptor, args, result_ty, graph_name),
+                            CallEffectKind::Residual => self
+                                .handle_residual_call(op, descriptor, args, result_ty, graph_name),
+                        }
+                    } else {
+                        // No effect info — plain residual
+                        let descriptor = CallDescriptor::known(
+                            target.clone(),
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        );
+                        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+                    }
+                }
+                crate::call::CallKind::Builtin => {
+                    // TODO: handle_builtin_call (oopspec dispatch)
+                    RewriteResult::Keep
+                }
+                crate::call::CallKind::Recursive => {
+                    self.handle_recursive_call(op, target, args, result_ty, graph_name)
+                }
+            };
+        }
+
+        // Fallback when no CallControl: effect-only classification (legacy path)
         if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
             match effect {
                 CallEffectKind::Elidable => {
-                    return self.handle_elidable_call(op, descriptor, args, result_ty, graph_name);
+                    self.handle_elidable_call(op, descriptor, args, result_ty, graph_name)
                 }
                 CallEffectKind::Residual => {
-                    return self.handle_residual_call(op, descriptor, args, result_ty, graph_name);
+                    self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
                 }
                 CallEffectKind::MayForce => {
-                    return self.handle_may_force_call(op, descriptor, args, result_ty, graph_name);
+                    self.handle_may_force_call(op, descriptor, args, result_ty, graph_name)
                 }
             }
+        } else {
+            RewriteResult::Keep
         }
-        // Unclassified call — keep as-is (future: handle_regular_call for inlined callees)
-        RewriteResult::Keep
+    }
+
+    /// RPython: `Transformer.handle_regular_call(op)`.
+    /// Callee is a candidate graph — emit `inline_call_*` referencing
+    /// the callee's JitCode. The meta-interpreter will descend into
+    /// the callee JitCode at runtime.
+    ///
+    /// RPython jtransform.py:473-482.
+    fn handle_regular_call(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("call {target} → inline_call"),
+        });
+        self.calls_classified += 1;
+        RewriteResult::Replace(vec![Op {
+            result: op.result,
+            kind: OpKind::InlineCall {
+                target: target.clone(),
+                args: args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        }])
+    }
+
+    /// RPython: `Transformer.handle_recursive_call(op)`.
+    /// Recursive call back to the portal — emit `recursive_call_*`.
+    ///
+    /// RPython jtransform.py:522-534.
+    fn handle_recursive_call(
+        &mut self,
+        op: &Op,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("call {target} → recursive_call"),
+        });
+        self.calls_classified += 1;
+        RewriteResult::Replace(vec![Op {
+            result: op.result,
+            kind: OpKind::RecursiveCall {
+                target: target.clone(),
+                args: args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        }])
     }
 
     /// RPython: `Transformer.handle_residual_call(op)`.
@@ -727,6 +837,32 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty,
         } => OpKind::CallMayForce {
             descriptor: descriptor.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::InlineCall {
+            target,
+            args,
+            result_ty,
+        } => OpKind::InlineCall {
+            target: target.clone(),
+            args: args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
+        OpKind::RecursiveCall {
+            target,
+            args,
+            result_ty,
+        } => OpKind::RecursiveCall {
+            target: target.clone(),
             args: args
                 .iter()
                 .copied()

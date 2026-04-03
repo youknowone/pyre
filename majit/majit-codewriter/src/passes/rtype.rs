@@ -134,7 +134,9 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         OpKind::Call { result_ty, .. }
         | OpKind::CallElidable { result_ty, .. }
         | OpKind::CallResidual { result_ty, .. }
-        | OpKind::CallMayForce { result_ty, .. } => valuetype_to_concrete(result_ty),
+        | OpKind::CallMayForce { result_ty, .. }
+        | OpKind::InlineCall { result_ty, .. }
+        | OpKind::RecursiveCall { result_ty, .. } => valuetype_to_concrete(result_ty),
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             let c = valuetype_to_concrete(result_ty);
             if c != ConcreteType::Unknown {
