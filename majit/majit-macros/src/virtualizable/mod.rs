@@ -6,14 +6,17 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Expr, Ident, LitStr, Path, Token, braced,
+    Data, DeriveInput, Expr, Fields, Ident, LitStr, Meta, Path, Token, braced,
     ext::IdentExt,
     parse::{Parse, ParseStream},
 };
 
-use crate::jit_interp::{
-    VableArrayDecl, VableArrayLayoutDecl, VableFieldDecl, VirtualizableDecl, codegen_virtualizable,
-};
+use crate::jit_interp::{VableArrayDecl, VableArrayLayoutDecl, VableFieldDecl, VirtualizableDecl};
+
+pub(crate) mod codegen;
+mod derive;
+
+pub use derive::{expand_meta, expand_state, expand_sym};
 
 // ═══════════════════════════════════════════════════════════════
 // Input arg field: a scalar field included in extract_live / jump_args.
@@ -269,10 +272,10 @@ pub fn expand(input: VirtualizableMacroInput) -> TokenStream {
     let vable_name = decl.var_name.to_string();
 
     // 1. VirtualizableInfo builder
-    let info_fn = codegen_virtualizable::generate_vable_info_pub_fn(decl);
+    let info_fn = codegen::generate_vable_info_pub_fn(decl);
 
     // 2. Field/array spec constants
-    let specs = codegen_virtualizable::generate_vable_specs(decl);
+    let specs = codegen::generate_vable_specs(decl);
 
     // 3. Virtualizable state hooks (heap_ptr, sync, etc.)
     let hooks = generate_standalone_hooks(state_type, &vable_name, heap_ptr_expr);

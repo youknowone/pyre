@@ -6,7 +6,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use super::{VableArrayLayoutDecl, VirtualizableDecl};
+use crate::jit_interp::{VableArrayLayoutDecl, VirtualizableDecl};
 
 /// Map a field type identifier ("int", "ref", "float") to a `majit_ir::Type` token.
 fn type_token(field_type: &syn::Ident) -> TokenStream {

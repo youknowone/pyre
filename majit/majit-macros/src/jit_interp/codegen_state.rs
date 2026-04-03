@@ -4,8 +4,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Expr;
 
-use super::codegen_virtualizable;
 use super::{JitInterpConfig, StateFieldKind};
+use crate::virtualizable::codegen as codegen_virtualizable;
 
 /// Extract the member field name from a field access expression.
 /// e.g., `state.storage` → `storage`, `state.selected` → `selected`.

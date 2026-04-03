@@ -8,7 +8,6 @@
 mod classify;
 mod codegen_state;
 mod codegen_trace;
-pub(crate) mod codegen_virtualizable;
 pub(crate) mod jitcode_lower;
 
 use proc_macro2::TokenStream;
