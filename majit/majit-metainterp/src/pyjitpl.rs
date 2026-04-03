@@ -842,6 +842,11 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type = tp;
     }
 
+    /// warmspot.py:449 — the per-driver static result_type.
+    pub fn result_type(&self) -> Type {
+        self.result_type
+    }
+
     /// Cache the current virtualizable object pointer for trace-entry setup.
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
         self.vable_ptr = ptr;
@@ -3056,6 +3061,11 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.numbering_type_overrides = numbering_overrides;
         // RPython Box type parity: inputarg types from tracing.
         optimizer.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        // RPython Box.type parity: register inputarg types in constant_types
+        // so fail_arg_types inference can resolve them.
+        for ia in &trace.inputargs {
+            optimizer.constant_types.insert(ia.index, ia.tp);
+        }
         optimizer.original_trace_op_types = pre_cut_trace_op_types;
 
         // resume.py parity: convert tracing-time snapshots to flat OpRef
@@ -3447,6 +3457,10 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
+        // RPython Box.type parity: register inputarg types.
+        for ia in &trace.inputargs {
+            optimizer.constant_types.insert(ia.index, ia.tp);
+        }
 
         let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, _sbt) =
             snapshot_map_from_trace_snapshots(
@@ -5291,6 +5305,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut optimizer = self.make_optimizer();
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
+        // RPython Box.type parity: inputargs carry their types implicitly
+        // via Box subclass. In majit, register inputarg types explicitly
+        // so fail_arg_types inference can resolve them.
+        for arg in bridge_inputargs {
+            optimizer.constant_types.insert(arg.index, arg.tp);
+        }
         optimizer.snapshot_boxes = snapshot_boxes;
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
