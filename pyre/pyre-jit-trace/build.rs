@@ -189,6 +189,9 @@ fn build_classification_config() -> majit_codewriter::ClassificationConfig {
                     call_spec::CallPatternRole::StackManip => {
                         majit_codewriter::CallPatternRole::StackManip
                     }
+                    call_spec::CallPatternRole::ConstLoad => {
+                        majit_codewriter::CallPatternRole::ConstLoad
+                    }
                     call_spec::CallPatternRole::NamespaceLoadLocal => {
                         majit_codewriter::CallPatternRole::NamespaceLoadLocal
                     }

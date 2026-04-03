@@ -587,6 +587,12 @@ pub(crate) fn build_guard_metadata(
 
 pub(crate) fn retag_fail_descrs_from_trace_types(inputargs: &[InputArg], ops: &mut [majit_ir::Op]) {
     let (value_types, _) = build_trace_value_maps(inputargs, ops);
+    // Build constant_types from ops: constant OpRefs that produce Ref type.
+    let constant_types: HashMap<u32, Type> = ops
+        .iter()
+        .filter(|op| op.pos.is_constant() && op.result_type() != Type::Void)
+        .map(|op| (op.pos.0, op.result_type()))
+        .collect();
     let mut next_fail_index = 0u32;
     for op in ops.iter_mut() {
         let is_exit = op.opcode.is_guard() || op.opcode == OpCode::Finish;
@@ -599,10 +605,9 @@ pub(crate) fn retag_fail_descrs_from_trace_types(inputargs: &[InputArg], ops: &m
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref fail_args) = op.fail_args {
-            let empty = HashMap::new();
             fail_args
                 .iter()
-                .map(|opref| fail_arg_type(opref, &value_types, &empty))
+                .map(|opref| fail_arg_type(opref, &value_types, &constant_types))
                 .collect()
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()

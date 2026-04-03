@@ -173,6 +173,17 @@ fn build_canonical_opcode_dispatch(
                 function_graphs,
                 &receiver_traits,
             );
+            // Noop-eligible: arms with ONLY Ok/StepResult/Continue — no Err,
+            // no domain calls. Err/type_error indicate a stub that should stay
+            // Residual, not disappear into Noop.
+            let has_err_call = arm.handler_calls.iter().any(|c| match c {
+                parse::ExtractedHandlerCall::FunctionPath(p) => {
+                    let last = p.segments.last().map(String::as_str).unwrap_or("");
+                    matches!(last, "Err" | "type_error")
+                        || p.segments.iter().any(|s| s == "PyError")
+                }
+                _ => false,
+            });
             let has_meaningful_calls = arm.handler_calls.iter().any(|c| match c {
                 parse::ExtractedHandlerCall::Method { name, .. } => !matches!(
                     name.as_str(),
@@ -196,8 +207,8 @@ fn build_canonical_opcode_dispatch(
                 }
                 parse::ExtractedHandlerCall::UnsupportedFunctionExpr => false,
             });
-            let classified_pattern = if !has_meaningful_calls {
-                // Only trivial calls (Ok, Err, StepResult) — Noop
+            let classified_pattern = if !has_meaningful_calls && !has_err_call {
+                // Only trivial calls (Ok, StepResult) and no error paths — Noop
                 Some(TracePattern::Noop)
             } else {
                 let from_graph = resolved_calls.iter().find_map(|call| {
