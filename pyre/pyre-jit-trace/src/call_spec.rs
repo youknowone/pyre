@@ -22,6 +22,8 @@ pub enum CallPatternRole {
     TruthCheck,
     StackManip,
     ConstLoad,
+    Jump,
+    ConditionalJump,
     NamespaceLoadLocal,
     NamespaceLoadGlobal,
     NamespaceStoreLocal,
@@ -368,17 +370,16 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::LocalWrite),
     },
-    // binary_value, compare_value, unary_negative_value, unary_invert_value
-    // are generic object-space operations (space.add, space.neg, space.eq etc.).
-    // Type specialization happens at JIT trace time, not at codewriter
-    // classification time. These are NOT int-specific.
+    // binary_value / compare_value: type-generic operations (space.add etc.)
+    // Specialization to int/float happens at trace time, but codewriter still
+    // marks the semantic role for pattern classification.
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "binary_value",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -386,7 +387,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -394,7 +395,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -402,7 +403,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -565,26 +566,25 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::StackManip),
     },
-    // Generic object-space operations — type specialization at trace time.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_binary_op"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_compare_op"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_negative"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_invert"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::IntArithmetic),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_not"]),
@@ -594,22 +594,22 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_jump_forward"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::Jump),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_jump_backward"]),
         effect: CallEffectKind::Residual,
-        role: None,
+        role: Some(CallPatternRole::Jump),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_pop_jump_if_false"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::TruthCheck),
+        role: Some(CallPatternRole::ConditionalJump),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_pop_jump_if_true"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::TruthCheck),
+        role: Some(CallPatternRole::ConditionalJump),
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_build_list"]),
@@ -663,11 +663,79 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::RangeIterNext),
     },
-    // MAKE_FUNCTION creates a function object from code+defaults,
-    // it does NOT call a function. Residual, not FunctionCall.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_make_function"]),
         effect: CallEffectKind::Residual,
         role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_to_bool"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::TruthCheck),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_common_constant"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::ConstLoad),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_unpack_ex"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::UnpackSequence),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_from_dict_or_globals"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::NamespaceLoadLocal),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_load_from_dict_or_deref"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::NamespaceLoadLocal),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_contains_op"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_is_op"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::IntArithmetic),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_delete_subscript"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_set"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_slice"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_build_string"]),
+        effect: CallEffectKind::Residual,
+        role: None,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_list_extend"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::CollectionAppend),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_set_add"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::CollectionAppend),
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::FunctionPath(&["opcode_map_add"]),
+        effect: CallEffectKind::Residual,
+        role: Some(CallPatternRole::CollectionAppend),
     },
 ];

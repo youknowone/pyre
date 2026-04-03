@@ -121,6 +121,10 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
                         call_spec::CallPatternRole::IterCleanup => {
                             crate::CallPatternRole::IterCleanup
                         }
+                        call_spec::CallPatternRole::Jump => crate::CallPatternRole::Jump,
+                        call_spec::CallPatternRole::ConditionalJump => {
+                            crate::CallPatternRole::ConditionalJump
+                        }
                         call_spec::CallPatternRole::Return => crate::CallPatternRole::Return,
                         call_spec::CallPatternRole::BuildList => crate::CallPatternRole::BuildList,
                         call_spec::CallPatternRole::BuildTuple => {
