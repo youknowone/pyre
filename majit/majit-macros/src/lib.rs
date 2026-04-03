@@ -20,6 +20,7 @@ use syn::{
 
 mod jit_interp;
 mod virtualizable;
+mod virtualizable_derive;
 
 struct JitInlineArgs {
     calls: Vec<(Path, Option<jit_interp::CallPolicyKind>)>,
@@ -1121,6 +1122,41 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn virtualizable(input: TokenStream) -> TokenStream {
     virtualizable::parse_and_expand(input)
+}
+
+/// Derive macro for virtualizable symbolic state structs.
+///
+/// Recognizes `#[vable(...)]` attributes on fields:
+/// - `#[vable(frame)]` — frame pointer OpRef
+/// - `#[vable(field)]` — static virtualizable field OpRef
+/// - `#[vable(array_base)]` — array base index
+/// - `#[vable(locals)]` — symbolic locals Vec<OpRef>
+/// - `#[vable(stack)]` — symbolic stack Vec<OpRef>
+/// - `#[vable(local_types)]` / `#[vable(stack_types)]` — type vectors
+/// - `#[vable(nlocals)]` / `#[vable(valuestackdepth)]` — shape fields
+///
+/// Generates: `flush_vable_fields`, `vable_field_oprefs`,
+/// `init_vable_indices`, `vable_collect_jump_args`,
+/// `vable_collect_typed_jump_args`.
+#[proc_macro_derive(VirtualizableSym, attributes(vable))]
+pub fn derive_virtualizable_sym(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    virtualizable_derive::expand_sym(input).into()
+}
+
+/// Derive macro for virtualizable meta structs.
+///
+/// Recognizes `#[vable(...)]` attributes on fields:
+/// - `#[vable(merge_pc)]` — merge point PC
+/// - `#[vable(num_locals)]` — number of locals
+/// - `#[vable(valuestackdepth)]` — value stack depth
+/// - `#[vable(slot_types)]` — slot type vector
+///
+/// Generates: `vable_stack_only_depth`, `vable_update_vsd_from_len`.
+#[proc_macro_derive(VirtualizableMeta, attributes(vable))]
+pub fn derive_virtualizable_meta(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    virtualizable_derive::expand_meta(input).into()
 }
 
 #[cfg(test)]

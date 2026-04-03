@@ -732,22 +732,17 @@ pub struct PyreJitState {
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
-#[derive(Clone)]
+#[derive(Clone, majit_macros::VirtualizableMeta)]
 pub struct PyreMeta {
-    /// Instruction index at the merge point (green key).
+    #[vable(merge_pc)]
     pub merge_pc: usize,
-    /// Number of fast local variable slots.
+    #[vable(num_locals)]
     pub num_locals: usize,
-    /// Sorted namespace keys expected by this trace.
     pub ns_keys: Vec<String>,
-    /// Absolute valuestackdepth at the merge point.
+    #[vable(valuestackdepth)]
     pub valuestackdepth: usize,
-    /// Whether the optimizer uses the virtualizable mechanism.
-    /// When true, guard fail_args follow the layout:
-    ///   [frame, next_instr, valuestackdepth, l0..lN, s0..sM]
     pub has_virtualizable: bool,
-    /// RPython resume.py parity: typed live boxes for locals + stack.
-    /// Order is locals first, then stack-only slots.
+    #[vable(slot_types)]
     pub slot_types: Vec<Type>,
 }
 
@@ -757,33 +752,38 @@ pub struct PyreMeta {
 /// (locals, stack, valuestackdepth, next_instr) persists across instructions.
 /// Locals and stack are virtualized (carried through JUMP args);
 /// only next_instr and valuestackdepth are synced before guards / loop close.
-#[derive(Clone)]
+#[derive(Clone, majit_macros::VirtualizableSym)]
 pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
+    #[vable(frame)]
     pub frame: OpRef,
     // ── Persistent symbolic frame field tracking ──
-    // These fields survive across per-instruction MIFrame lifetimes.
+    #[vable(locals)]
     pub(crate) symbolic_locals: Vec<OpRef>,
+    #[vable(stack)]
     pub symbolic_stack: Vec<OpRef>,
+    #[vable(local_types)]
     pub(crate) symbolic_local_types: Vec<Type>,
+    #[vable(stack_types)]
     pub symbolic_stack_types: Vec<Type>,
     pub pending_next_instr: Option<usize>,
     pub(crate) locals_cells_stack_array_ref: OpRef,
-    /// Absolute index into the unified array (starts at nlocals).
+    #[vable(valuestackdepth)]
     pub(crate) valuestackdepth: usize,
-    /// Number of local variable slots (cached from code object).
+    #[vable(nlocals)]
     pub(crate) nlocals: usize,
     pub(crate) symbolic_initialized: bool,
     // virtualizable.py:86-93: static fields in declared order.
-    // interp_jit.py:25: last_instr, pycode, valuestackdepth, ..., w_globals
+    #[vable(inputarg)]
     pub(crate) vable_next_instr: OpRef,
+    #[vable(info_only)]
     pub(crate) vable_code: OpRef,
+    #[vable(inputarg)]
     pub(crate) vable_valuestackdepth: OpRef,
+    #[vable(info_only)]
     pub(crate) vable_namespace: OpRef,
     pub(crate) symbolic_namespace_slots: std::collections::HashMap<usize, OpRef>,
-    /// Base OpRef index for virtualizable array slots.
-    /// When set, symbolic_locals[i] = OpRef(vable_array_base + i),
-    /// symbolic_stack[j] = OpRef(vable_array_base + nlocals + j).
+    #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
     /// RPython goto_if_not fusion: cached raw truth OpRef from the
     /// most recent int/float comparison. POP_JUMP_IF_FALSE/TRUE
@@ -2480,12 +2480,9 @@ impl MIFrame {
             0
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
-        let s = self.sym_mut();
-        // virtualizable.py:86-93: all static fields in declared order.
-        s.vable_next_instr = ctx.const_int(resume_pc as i64);
-        s.vable_code = ctx.const_int(code_ptr as i64);
-        s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
-        s.vable_namespace = ctx.const_int(ns_ptr);
+        let vsd = self.sym().valuestackdepth as i64;
+        self.sym_mut()
+            .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
     }
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
@@ -2510,15 +2507,12 @@ impl MIFrame {
             0
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
-        let s = self.sym_mut();
-        s.vable_next_instr = ctx.const_int(resume_pc as i64);
-        s.vable_code = ctx.const_int(code_ptr as i64);
-        s.vable_namespace = ctx.const_int(ns_ptr);
-        if let Some(pre_vsd) = s.pre_opcode_vsd {
-            s.vable_valuestackdepth = ctx.const_int(pre_vsd as i64);
-        } else {
-            s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
-        }
+        let vsd = {
+            let s = self.sym();
+            s.pre_opcode_vsd.unwrap_or(s.valuestackdepth) as i64
+        };
+        self.sym_mut()
+            .flush_vable_fields(ctx, &[resume_pc as i64, code_ptr as i64, vsd, ns_ptr]);
     }
 
     fn sync_standard_virtualizable_before_residual_call(&mut self, ctx: &mut TraceCtx) {
@@ -3068,15 +3062,10 @@ impl MIFrame {
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
         boxes.push(Self::opref_to_snapshot_tagged(sym.frame, ctx));
-        // Static fields in declared order (virtualizable.py:90-93):
-        //   next_instr, code, valuestackdepth, namespace
-        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_next_instr, ctx));
-        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_code, ctx));
-        boxes.push(Self::opref_to_snapshot_tagged(
-            sym.vable_valuestackdepth,
-            ctx,
-        ));
-        boxes.push(Self::opref_to_snapshot_tagged(sym.vable_namespace, ctx));
+        // Static fields in declared order (virtualizable.py:90-93).
+        for opref in sym.vable_field_oprefs() {
+            boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
+        }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
@@ -7606,7 +7595,6 @@ impl PyreJitState {
     }
 
     fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
-        // virtualizable.py:101 write_boxes: all static fields in declared order.
         let code_ptr = self.read_frame_usize(PYFRAME_CODE_OFFSET).unwrap_or(0);
         let ns_ptr = self.read_frame_usize(PYFRAME_NAMESPACE_OFFSET).unwrap_or(0);
         let static_boxes = vec![
@@ -7615,7 +7603,6 @@ impl PyreJitState {
             self.valuestackdepth as i64,
             ns_ptr as i64,
         ];
-        // Single unified array
         let array_boxes = vec![
             self.locals_cells_stack_array()
                 .map(|arr| arr.as_slice().iter().map(|&value| value as i64).collect())
@@ -7697,17 +7684,14 @@ impl JitState for PyreJitState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        use crate::virtualizable_gen::*;
-        let mut sym = PyreSym::new_uninit(OpRef(SYM_FRAME_IDX));
-        sym.vable_next_instr = OpRef(SYM_NEXT_INSTR_IDX);
-        sym.vable_valuestackdepth = OpRef(SYM_VALUESTACKDEPTH_IDX);
-        sym.vable_array_base = Some(SYM_ARRAY_BASE);
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.init_vable_indices();
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
         sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
         sym.symbolic_stack_types =
             vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
-        let stack_only = _meta.valuestackdepth.saturating_sub(_meta.num_locals);
+        let stack_only = _meta.vable_stack_only_depth();
         sym.symbolic_stack = vec![OpRef::NONE; stack_only];
         sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
         sym
@@ -7729,12 +7713,10 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        if fail_arg_types.len() >= NUM_SCALAR_INPUTARGS {
-            let new_vsd = fail_arg_types.len() - NUM_SCALAR_INPUTARGS;
-            meta.valuestackdepth = new_vsd;
-            meta.slot_types = vec![Type::Ref; new_vsd];
-        }
+        meta.vable_update_vsd_from_len(
+            fail_arg_types.len(),
+            crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
+        );
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
@@ -8217,27 +8199,11 @@ impl JitState for PyreJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        crate::virtualizable_gen::virt_collect_jump_args(
-            sym.frame,
-            sym.vable_next_instr,
-            sym.vable_valuestackdepth,
-            &sym.symbolic_locals,
-            &sym.symbolic_stack,
-            sym.stack_only_depth(),
-        )
+        sym.vable_collect_jump_args()
     }
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        crate::virtualizable_gen::virt_collect_typed_jump_args(
-            sym.frame,
-            sym.vable_next_instr,
-            sym.vable_valuestackdepth,
-            &sym.symbolic_locals,
-            &sym.symbolic_local_types,
-            &sym.symbolic_stack,
-            &sym.symbolic_stack_types,
-            sym.stack_only_depth(),
-        )
+        sym.vable_collect_typed_jump_args()
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -8578,12 +8544,9 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        use crate::virtualizable_gen::*;
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = PyreSym::new_uninit(OpRef(SYM_FRAME_IDX));
-        sym.vable_array_base = Some(SYM_ARRAY_BASE);
-        sym.vable_next_instr = OpRef(SYM_NEXT_INSTR_IDX);
-        sym.vable_valuestackdepth = OpRef(SYM_VALUESTACKDEPTH_IDX);
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.init_vable_indices();
 
         sym.init_symbolic(&mut ctx, frame_ptr);
 
