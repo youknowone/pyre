@@ -10,6 +10,7 @@
 /// - #[jit_release_gil]: Mark a helper as a release-GIL call surface
 /// - #[jit_loop_invariant]: Mark a helper as a loop-invariant call surface
 /// - #[jit_module]: Module-level automatic helper discovery
+/// - virtualizable!: Standalone virtualizable field declaration
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
@@ -18,6 +19,7 @@ use syn::{
 };
 
 mod jit_interp;
+mod virtualizable;
 
 struct JitInlineArgs {
     calls: Vec<(Path, Option<jit_interp::CallPolicyKind>)>,
@@ -1085,6 +1087,40 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     module.content = Some((brace, new_items));
 
     quote! { #module }.into()
+}
+
+/// Standalone virtualizable field declaration macro.
+///
+/// Generates `VirtualizableInfo` builder, field spec constants, and
+/// JitState hook helper functions from a declarative specification.
+///
+/// # Example
+///
+/// ```ignore
+/// majit_macros::virtualizable! {
+///     state = MyState,
+///     name = "frame",
+///     heap_ptr = |s: &MyState| s.frame_ptr(),
+///     token_offset = VABLE_TOKEN_OFFSET,
+///
+///     fields = {
+///         next_instr: int @ NEXT_INSTR_OFFSET,
+///         code: ref @ CODE_OFFSET,
+///     },
+///
+///     arrays = {
+///         stack: ref @ STACK_OFFSET {
+///             embedded,
+///             ptr_offset: PTR_OFFSET,
+///             length_offset: LEN_OFFSET,
+///             items_offset: 0,
+///         },
+///     },
+/// }
+/// ```
+#[proc_macro]
+pub fn virtualizable(input: TokenStream) -> TokenStream {
+    virtualizable::parse_and_expand(input)
 }
 
 #[cfg(test)]

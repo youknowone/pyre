@@ -7,4 +7,5 @@ pub use pyre_jit_trace::helpers;
 pub use pyre_jit_trace::metainterp;
 pub use pyre_jit_trace::state;
 pub use pyre_jit_trace::trace;
+pub use pyre_jit_trace::virtualizable_gen;
 pub use pyre_jit_trace::virtualizable_spec;

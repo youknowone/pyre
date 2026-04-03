@@ -14,6 +14,7 @@ pub mod metainterp;
 pub mod state;
 pub use state::set_majit_jitcode;
 pub mod trace;
+pub mod virtualizable_gen;
 pub mod virtualizable_spec;
 
 /// Auto-generated trace functions from majit-codewriter.

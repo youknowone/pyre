@@ -49,7 +49,7 @@ enum JitAction {
 }
 
 use crate::jit::descr::{JITFRAME_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
-use crate::jit::frame_layout::build_pyframe_virtualizable_info;
+use crate::jit::virtualizable_gen::build_virtualizable_info;
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
 use pyre_object::floatobject::W_FloatObject;
@@ -64,7 +64,7 @@ type JitDriverPair = (
 
 thread_local! {
     static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
-        let info = build_pyframe_virtualizable_info();
+        let info = build_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
         d.set_virtualizable_info(info.clone());
         let mut gc = MiniMarkGC::new();
