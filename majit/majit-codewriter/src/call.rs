@@ -131,13 +131,26 @@ impl CallControl {
     }
 
     /// Register a trait impl method graph.
+    ///
+    /// Also registers the graph in function_graphs under a synthetic
+    /// CallPath so that BFS in find_all_graphs can discover it.
+    /// RPython: method graphs are reachable through funcptr._obj.graph
+    /// linkage — we emulate this by dual registration.
     pub fn register_trait_method(&mut self, method_name: &str, impl_type: &str, graph: MajitGraph) {
-        self.trait_method_graphs
-            .insert((method_name.to_string(), impl_type.to_string()), graph);
+        // Register in trait-specific lookup
+        self.trait_method_graphs.insert(
+            (method_name.to_string(), impl_type.to_string()),
+            graph.clone(),
+        );
         self.trait_method_impls
             .entry(method_name.to_string())
             .or_default()
             .push(impl_type.to_string());
+        // Also register in function_graphs for BFS reachability.
+        // RPython: funcptr._obj.graph makes method graphs discoverable
+        // through the same mechanism as free functions.
+        let synthetic_path = CallPath::from_segments([method_name]);
+        self.function_graphs.entry(synthetic_path).or_insert(graph);
     }
 
     /// Mark a target as the portal entry point.
@@ -291,26 +304,21 @@ impl CallControl {
                 name,
                 receiver_root,
             } => {
-                // RPython: method calls go through the same candidate check.
-                // resolve_method() finding a graph is necessary but not sufficient;
-                // the graph must also be reachable from the portal (in candidate_graphs).
-                // If candidate_graphs is empty (no BFS run), fall back to Residual.
+                // RPython: method calls use the same graphs_from() + is_candidate
+                // logic as function calls. resolve_method() finds the graph;
+                // candidate_graphs membership determines regular vs residual.
                 if self
                     .resolve_method(name, receiver_root.as_deref())
                     .is_none()
                 {
                     return CallKind::Residual;
                 }
-                // Check if the resolved impl is a candidate.
-                // Method targets don't have CallPaths directly, so check by
-                // looking for a matching method name among candidates.
-                if self.candidate_graphs.is_empty() {
-                    // No portal BFS — can't determine candidacy.
-                    return CallKind::Residual;
+                // Method graphs are registered in function_graphs under
+                // synthetic CallPath([method_name]) by register_trait_method().
+                let synthetic_path = CallPath::from_segments([name.as_str()]);
+                if self.candidate_graphs.contains(&synthetic_path) {
+                    return CallKind::Regular;
                 }
-                // If candidates exist but this method's impl isn't tracked
-                // as a function path, treat as Residual. The meta-interpreter
-                // will handle it via residual_call at runtime.
                 CallKind::Residual
             }
             CallTarget::UnsupportedExpr => CallKind::Residual,
