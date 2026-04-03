@@ -272,7 +272,10 @@ fn classify_resolved_call_graph(
         return None;
     }
 
-    for block in &graph.blocks {
+    // Iterate over the REWRITTEN graph so that calls classified by jtransform
+    // (CallResidual/CallElidable/CallMayForce) are NOT followed — their role
+    // designation in call_spec is authoritative.
+    for block in &rewritten.graph.blocks {
         for op in &block.ops {
             let callee_graph = match &op.kind {
                 graph::OpKind::Call {
@@ -282,17 +285,12 @@ fn classify_resolved_call_graph(
                     let path = parse::CallPath::from_segments(segments.iter().map(String::as_str));
                     function_graphs.get(&path)
                 }
-                graph::OpKind::CallResidual { descriptor, .. }
-                | graph::OpKind::CallElidable { descriptor, .. }
-                | graph::OpKind::CallMayForce { descriptor, .. } => {
-                    if let graph::CallTarget::FunctionPath { segments } = &descriptor.target {
-                        let path =
-                            parse::CallPath::from_segments(segments.iter().map(String::as_str));
-                        function_graphs.get(&path)
-                    } else {
-                        None
-                    }
-                }
+                // Do NOT follow CallResidual/CallElidable/CallMayForce — these
+                // are already classified by jtransform. Following them would
+                // bypass the explicit role=None designation in call_spec.
+                graph::OpKind::CallResidual { .. }
+                | graph::OpKind::CallElidable { .. }
+                | graph::OpKind::CallMayForce { .. } => None,
                 _ => None,
             };
 
