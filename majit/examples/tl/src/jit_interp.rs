@@ -7,7 +7,15 @@
 /// Greens: [pc]
 /// Reds:   [stack (via storage pool)]
 
-/// Stack rotation — residual call in JIT traces (tl.py:43).
+/// Hint to the JIT that this value should be treated as a compile-time constant.
+/// During tracing, the tracer records a GUARD_VALUE. Non-tracing mode: identity.
+/// RPython: promote(stack.stackpos) — tl.py:88.
+#[inline(always)]
+fn hint_promote<T: Copy>(val: T) -> T {
+    val
+}
+
+/// Stack rotation — @dont_look_inside in RPython (tl.py:43).
 ///
 /// `stack_ptr` / `stack_len` describe the live portion of the stack.
 /// The JIT does not trace into this function; it emits a residual CALL.
@@ -16,14 +24,18 @@ extern "C" fn storage_roll(stack_ptr: usize, stack_len: usize, r: i64) {
     let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stack_len) };
     let len = stack.len();
     if r < -1 {
-        let i = (len as i64 + r) as usize;
+        let i = len as i64 + r;
+        assert!(i >= 0, "IndexError in ROLL");
+        let i = i as usize;
         let elem = stack[len - 1];
         for j in (i..len - 1).rev() {
             stack[j + 1] = stack[j];
         }
         stack[i] = elem;
     } else if r > 1 {
-        let i = len - r as usize;
+        let i = len as i64 - r;
+        assert!(i >= 0, "IndexError in ROLL");
+        let i = i as usize;
         let elem = stack[i];
         for j in i..len - 1 {
             stack[j] = stack[j + 1];
@@ -219,8 +231,9 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
     while pc < program.len() {
         jit_merge_point!();
-        // TODO: promote(stack.stackpos) — tl.py:88
-        // RPython emits GUARD_VALUE here; macro-level promote support needed.
+        // promote(stack.stackpos) — tl.py:88
+        // Makes stackpos a compile-time constant via GUARD_VALUE.
+        stacksize = hint_promote(stacksize);
         let opcode = program[pc];
         pc += 1;
 

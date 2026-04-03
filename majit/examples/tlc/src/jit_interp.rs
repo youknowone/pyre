@@ -16,32 +16,6 @@
 ///   - Integer-only loop opcodes map directly to IR via #[jit_interp] binops.
 use crate::interp::{self, ConstantPool};
 
-/// Stack rotation — residual call in JIT traces (tlc.py, @dont_look_inside).
-#[majit_macros::dont_look_inside]
-extern "C" fn storage_roll(stack_ptr: usize, stack_len: usize, r: i64) {
-    let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stack_len) };
-    let len = stack.len();
-    if r < -1 {
-        let i = len as i64 + r;
-        assert!(i >= 0, "IndexError in ROLL");
-        let i = i as usize;
-        let elem = stack[len - 1];
-        for j in (i..len - 1).rev() {
-            stack[j + 1] = stack[j];
-        }
-        stack[i] = elem;
-    } else if r > 1 {
-        let i = len as i64 - r;
-        assert!(i >= 0, "IndexError in ROLL");
-        let i = i as usize;
-        let elem = stack[i];
-        for j in i..len - 1 {
-            stack[j] = stack[j + 1];
-        }
-        stack[len - 1] = elem;
-    }
-}
-
 // ── Storage pool types ──
 
 /// Single i64 stack storage.
@@ -112,8 +86,19 @@ impl TlcStorage {
         let b = self.pop();
         self.push(if b >= a { 1 } else { 0 });
     }
+    /// Stack rotation — inline in tlc.py:284 (no @dont_look_inside).
     pub fn roll(&mut self, r: i64) {
-        storage_roll(self.data_mut_ptr(), self.len(), r);
+        if r < -1 {
+            let i = self.stack.len() as i64 + r;
+            assert!(i >= 0, "IndexError in ROLL");
+            let val = self.stack.pop().unwrap();
+            self.stack.insert(i as usize, val);
+        } else if r > 1 {
+            let i = self.stack.len() as i64 - r;
+            assert!(i >= 0, "IndexError in ROLL");
+            let val = self.stack.remove(i as usize);
+            self.stack.push(val);
+        }
     }
     pub fn pick_at(&mut self, depth: usize) {
         let n = self.stack.len() - depth - 1;
@@ -139,9 +124,6 @@ impl TlcStorage {
     }
     pub fn data_ptr(&self) -> usize {
         self.stack.as_ptr() as usize
-    }
-    pub fn data_mut_ptr(&mut self) -> usize {
-        self.stack.as_mut_ptr() as usize
     }
 }
 
@@ -230,7 +212,6 @@ const DEFAULT_THRESHOLD: u32 = 3;
 #[majit_macros::jit_interp(
     state = TlcState,
     env = Bytecode,
-    auto_calls = true,
     storage = {
         pool: state.pool,
         pool_type: TlcPool,
@@ -291,8 +272,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             ROLL => {
                 let r = program[pc] as i8 as i64;
                 pc += 1;
-                let stk = state.pool.get_mut(state.selected);
-                storage_roll(stk.data_mut_ptr(), stk.len(), r);
+                state.pool.get_mut(state.selected).roll(r);
             }
             PICK => {
                 let i = program[pc] as usize;
