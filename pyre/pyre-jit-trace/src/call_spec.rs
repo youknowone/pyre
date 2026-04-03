@@ -412,13 +412,15 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: None,
     },
+    // MAKE_FUNCTION creates a function object from code+defaults — it does
+    // NOT call a function. Residual, not FunctionCall.
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "make_function",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::FunctionCall),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
