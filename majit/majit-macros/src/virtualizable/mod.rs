@@ -406,11 +406,12 @@ fn generate_layout_helpers(
         .collect();
 
     // ── restore_values helper ──
+    // Use set_ accessors to write through to heap (source of truth).
     let restore_scalars: Vec<TokenStream> = inputargs
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let name = &f.name;
+            let setter = format_ident!("set_{}", f.name);
             let idx = i + 1; // frame is values[0]
             let tp = &f.ir_type;
             let conv = match tp.to_string().as_str() {
@@ -421,7 +422,7 @@ fn generate_layout_helpers(
                 _ => quote! { __value_to_usize(&values[#idx]) },
             };
             quote! {
-                state.#name = #conv;
+                state.#setter(#conv);
             }
         })
         .collect();
@@ -429,10 +430,10 @@ fn generate_layout_helpers(
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let name = &f.name;
+            let setter = format_ident!("set_{}", f.name);
             let idx = i + 1;
             quote! {
-                state.#name = raw.get(#idx).copied().unwrap_or(0) as usize;
+                state.#setter(raw.get(#idx).copied().unwrap_or(0) as usize);
             }
         })
         .collect();
