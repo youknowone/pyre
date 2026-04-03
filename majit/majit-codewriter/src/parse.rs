@@ -12,6 +12,10 @@ use syn::{ExprMatch, File, Item, ItemFn, Pat, Path, visit::Visit};
 pub struct ExtractedOpcodeArm {
     pub selector: OpcodeDispatchSelector,
     pub handler_calls: Vec<ExtractedHandlerCall>,
+    /// Semantic graph of the match arm body.
+    /// This is the handler's own graph — the primary input for
+    /// jtransform/flatten. handler_calls are metadata only.
+    pub body_graph: Option<crate::graph::MajitGraph>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,9 +373,18 @@ impl<'ast> Visit<'ast> for MatchArmCollector {
     fn visit_expr_match(&mut self, expr: &'ast syn::ExprMatch) {
         for arm in &expr.arms {
             let handler_calls = extract_handler_calls(&arm.body);
+            let selector = extract_opcode_dispatch_selector(&arm.pat);
+            // Build semantic graph from the arm body expression.
+            let body_graph = {
+                let name = selector.canonical_key();
+                let mut graph = crate::graph::MajitGraph::new(name);
+                crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body);
+                Some(graph)
+            };
             self.arms.push(ExtractedOpcodeArm {
-                selector: extract_opcode_dispatch_selector(&arm.pat),
+                selector,
                 handler_calls,
+                body_graph,
             });
         }
     }

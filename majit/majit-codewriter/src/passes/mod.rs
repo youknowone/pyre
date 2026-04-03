@@ -14,7 +14,7 @@ pub use annotate::{AnnotationState, annotate as annotate_graph};
 pub use flatten::{FlatOp, FlattenedFunction, Label, RegKind, flatten, flatten_with_types};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformNote,
-    GraphTransformResult, VirtualizableFieldDescriptor, rewrite_graph,
+    GraphTransformResult, Transformer, VirtualizableFieldDescriptor, rewrite_graph,
 };
 pub use pipeline::{
     PipelineConfig, PipelineOpcodeArm, PipelineResult, ProgramPipelineResult, analyze_function,
