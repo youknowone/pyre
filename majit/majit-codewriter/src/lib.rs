@@ -18,6 +18,7 @@ mod field_match;
 pub mod front;
 pub mod graph;
 pub mod hints;
+pub mod inline;
 mod parse;
 pub mod passes;
 mod patterns;
