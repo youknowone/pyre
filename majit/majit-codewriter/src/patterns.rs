@@ -49,6 +49,7 @@ pub enum CallPatternRole {
     FunctionCall,
     TruthCheck,
     StackManip,
+    ConstLoad,
     NamespaceLoadLocal,
     NamespaceLoadGlobal,
     NamespaceStoreLocal,
@@ -283,6 +284,7 @@ pub fn classify_from_graph_with_config(
                 }
                 CallPatternRole::TruthCheck => crate::call_match::is_truth_check_target(target),
                 CallPatternRole::StackManip => crate::call_match::is_stack_manip_target(target),
+                CallPatternRole::ConstLoad => false, // only via config call_roles
                 CallPatternRole::NamespaceLoadLocal => {
                     crate::call_match::namespace_access_kind(target)
                         == Some(crate::call_match::NamespaceAccessKind::LoadLocal)
@@ -464,10 +466,11 @@ pub fn classify_from_graph_with_config(
         return Some(TracePattern::LocalWrite);
     }
 
-    // Constant load (reads from constants/co_consts)
+    // Constant load (reads from constants/co_consts or ConstLoad call role)
     if field_reads
         .iter()
         .any(|field| field_has_role(config, field, FieldPatternRole::ConstantPool))
+        || any_call_has_role(CallPatternRole::ConstLoad)
     {
         return Some(TracePattern::ConstLoad);
     }

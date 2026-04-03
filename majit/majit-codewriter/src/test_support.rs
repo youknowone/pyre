@@ -102,6 +102,7 @@ pub(crate) fn pyre_pipeline_config() -> crate::PipelineConfig {
                         call_spec::CallPatternRole::StackManip => {
                             crate::CallPatternRole::StackManip
                         }
+                        call_spec::CallPatternRole::ConstLoad => crate::CallPatternRole::ConstLoad,
                         call_spec::CallPatternRole::NamespaceLoadLocal => {
                             crate::CallPatternRole::NamespaceLoadLocal
                         }

@@ -207,6 +207,10 @@ fn classify_resolved_call_graph(
     if let Some(pattern) =
         patterns::classify_from_graph_with_config(&rewritten.graph, &pipeline_config.classify)
     {
+        // Noop from a callee graph should not prevent the parent from classifying
+        if depth > 0 && matches!(&pattern, TracePattern::Noop) {
+            return None;
+        }
         return Some(pattern);
     }
 
@@ -311,12 +315,16 @@ fn resolve_handler_calls(
 
             let is_default_methods = impl_info.for_type.starts_with("<default methods of ");
             let applies = if is_default_methods {
-                receiver_type_root.is_some_and(|receiver_ty| {
-                    trait_impls.iter().any(|candidate| {
-                        candidate.trait_name == impl_info.trait_name
-                            && candidate.self_ty_root.as_ref() == Some(receiver_ty)
+                // Default methods apply when either:
+                // 1. The receiver type has a concrete impl for this trait, OR
+                // 2. The receiver is generic (None) and allowed_traits matches
+                receiver_type_root.is_none()
+                    || receiver_type_root.is_some_and(|receiver_ty| {
+                        trait_impls.iter().any(|candidate| {
+                            candidate.trait_name == impl_info.trait_name
+                                && candidate.self_ty_root.as_ref() == Some(receiver_ty)
+                        })
                     })
-                })
             } else {
                 receiver_matches_root(receiver_type_root, &impl_info.self_ty_root)
             };
@@ -413,18 +421,40 @@ fn resolve_handler_calls(
                                 }
                             }
 
-                            if concrete_matches.len() == 1 {
-                                push_unique(&mut resolved_calls, concrete_matches.pop().unwrap());
-                            } else if concrete_matches.is_empty() {
-                                if let Some(default_match) = default_match {
-                                    push_unique(&mut resolved_calls, default_match);
-                                }
+                            // Push default method first (simple delegation like
+                            // `opcode_build_list(self, size).map_err(Into::into)`)
+                            // so the classifier tries it before complex concrete impls.
+                            if let Some(default_match) = default_match {
+                                push_unique(&mut resolved_calls, default_match);
+                            }
+                            for concrete in concrete_matches {
+                                push_unique(&mut resolved_calls, concrete);
                             }
                         }
                     }
                 }
             }
             parse::ExtractedHandlerCall::FunctionPath(path) => {
+                // Handle qualified trait calls like OpcodeStepExecutor::build_list(executor, ...)
+                // which parse as FunctionPath(["OpcodeStepExecutor", "build_list"]).
+                // Convert to a trait method resolution.
+                if path.segments.len() == 2 {
+                    let trait_name = &path.segments[0];
+                    let method_name = &path.segments[1];
+                    // Check if the first segment is a known trait name
+                    let is_trait = trait_impls.iter().any(|imp| imp.trait_name == *trait_name);
+                    if is_trait {
+                        let allowed = &[trait_name.clone()];
+                        push_matching_trait_methods(
+                            &mut resolved_calls,
+                            trait_impls,
+                            method_name,
+                            None, // generic receiver
+                            Some(allowed),
+                        );
+                        continue; // skip the function_graphs lookup
+                    }
+                }
                 if let Some(graph) = function_graphs.get(path) {
                     resolved_calls.push(ResolvedCall {
                         name: path.canonical_key(),
