@@ -318,6 +318,9 @@ const JUMP_TARGETS: &[CallTargetPattern] = &[
         name: "fallthrough_target",
         receiver_root: None,
     },
+    // Qualified trait calls: ControlFlowOpcodeHandler::set_next_instr(executor, ...)
+    CallTargetPattern::FunctionPath(&["ControlFlowOpcodeHandler", "set_next_instr"]),
+    CallTargetPattern::FunctionPath(&["set_next_instr"]),
 ];
 
 const RETURN_TARGETS: &[CallTargetPattern] = &[
