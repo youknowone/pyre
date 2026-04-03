@@ -174,7 +174,8 @@ const FUNCTION_INVOKE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["call_function_ex"]),
     CallTargetPattern::FunctionPath(&["call_kw"]),
     CallTargetPattern::FunctionPath(&["opcode_call"]),
-    CallTargetPattern::FunctionPath(&["opcode_make_function"]),
+    // opcode_make_function is NOT here — MAKE_FUNCTION creates a function
+    // object, it does not call a function.
 ];
 
 const TRUTH_CHECK_TARGETS: &[CallTargetPattern] = &[
@@ -199,6 +200,9 @@ const TRUTH_CHECK_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["concrete_truth_as_bool"]),
 ];
 
+// push_value/pop_value are NOT here — they appear in nearly every opcode
+// and would classify everything as StackManip. They are bookkeeping,
+// not the semantic operation.
 const STACK_MANIP_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "swap_values",
@@ -208,16 +212,6 @@ const STACK_MANIP_TARGETS: &[CallTargetPattern] = &[
         name: "copy_value",
         receiver_root: None,
     },
-    CallTargetPattern::Method {
-        name: "push_value",
-        receiver_root: None,
-    },
-    CallTargetPattern::Method {
-        name: "pop_value",
-        receiver_root: None,
-    },
-    CallTargetPattern::FunctionPath(&["push_value"]),
-    CallTargetPattern::FunctionPath(&["pop_value"]),
 ];
 
 const PEEK_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
@@ -275,6 +269,9 @@ const STORE_LOCAL_NAMESPACE_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["store_name_value"]),
 ];
 
+// FOR_ITER semantics: call next() and branch on StopIteration.
+// GET_ITER (ensure_iter_value, opcode_get_iter) is NOT here — it's
+// space.iter() (iterable → iterator conversion), not next/branch.
 const RANGE_ITER_NEXT_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::Method {
         name: "iter_next_value",
@@ -284,12 +281,7 @@ const RANGE_ITER_NEXT_TARGETS: &[CallTargetPattern] = &[
         name: "for_iter",
         receiver_root: None,
     },
-    CallTargetPattern::Method {
-        name: "ensure_iter_value",
-        receiver_root: None,
-    },
     CallTargetPattern::FunctionPath(&["iter_next_value"]),
-    CallTargetPattern::FunctionPath(&["ensure_iter_value"]),
 ];
 
 const ITER_CLEANUP_TARGETS: &[CallTargetPattern] = &[

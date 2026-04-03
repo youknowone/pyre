@@ -447,6 +447,7 @@ pub fn classify_from_graph_with_config(
     }
 
     // Local read: reads from locals_w array, or calls with LocalRead role
+    // Local read: reads from locals_w array, or calls with LocalRead role
     if (field_reads
         .iter()
         .any(|field| field_has_role(config, field, FieldPatternRole::LocalArray))

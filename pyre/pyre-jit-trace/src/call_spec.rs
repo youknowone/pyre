@@ -368,13 +368,17 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::LocalWrite),
     },
+    // binary_value, compare_value, unary_negative_value, unary_invert_value
+    // are generic object-space operations (space.add, space.neg, space.eq etc.).
+    // Type specialization happens at JIT trace time, not at codewriter
+    // classification time. These are NOT int-specific.
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "binary_value",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -382,7 +386,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -390,7 +394,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -398,7 +402,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -448,13 +452,15 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: None,
     },
+    // ensure_iter_value is GET_ITER semantics (iterable → iterator),
+    // not next/branch semantics. Residual, not RangeIterNext.
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "ensure_iter_value",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::RangeIterNext),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -493,15 +499,19 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::LocalRead),
     },
+    // Multi-local superinstructions: these are CPython 3.12+ fused opcodes
+    // with no PyPy equivalent. Cannot be represented as a single LocalRead
+    // or LocalWrite since they perform two distinct local operations.
+    // Classified as Residual — the JIT decomposes them at trace time.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_load_fast_pair_checked"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalRead),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_load_fast_load_fast"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalRead),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_store_fast"]),
@@ -511,12 +521,12 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_store_fast_load_fast"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalRead),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_store_fast_store_fast"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::LocalWrite),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_store_name"]),
@@ -553,25 +563,26 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::StackManip),
     },
+    // Generic object-space operations — type specialization at trace time.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_binary_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_compare_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_negative"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_invert"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_not"]),
@@ -638,19 +649,23 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: None,
     },
+    // GET_ITER is space.iter() — converts iterable to iterator.
+    // NOT next/branch semantics. Residual.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_get_iter"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::RangeIterNext),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_for_iter"]),
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::RangeIterNext),
     },
+    // MAKE_FUNCTION creates a function object from code+defaults,
+    // it does NOT call a function. Residual, not FunctionCall.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_make_function"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::FunctionCall),
+        role: None,
     },
 ];
