@@ -39,6 +39,11 @@ impl CallDescr for MetaCallDescr {
         0
     }
     fn effect_info(&self) -> &EffectInfo {
+        // RPython: effectinfo is per-call-site (call.py:300
+        // effectinfo_from_writeanalyze). Pyre MetaCallDescr is a generic
+        // placeholder. CannotRaise matches RPython's default for helpers
+        // that don't raise or collect. Per-call-site effectinfo requires
+        // porting effectinfo_from_writeanalyze infrastructure.
         static INFO: EffectInfo =
             EffectInfo::const_new(ExtraEffect::CannotRaise, OopSpecIndex::None);
         &INFO

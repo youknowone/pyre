@@ -156,6 +156,10 @@ pub(crate) fn build_guard_metadata(
     let mut resume_memo = ResumeDataLoopMemo::new();
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
+    // Merge constant types so fail_arg_type can resolve constant OpRefs.
+    for (&idx, &tp) in constant_types {
+        value_types.entry(idx).or_insert(tp);
+    }
 
     for (op_idx, op) in ops.iter().enumerate() {
         if !op.pos.is_none() && op.result_type() != Type::Void {
@@ -182,15 +186,27 @@ pub(crate) fn build_guard_metadata(
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref fail_args) = op.fail_args {
+            // RPython Box.type parity: derive exit_types from value_types
+            // (seeded from post-unbox ops). This ensures CallAssemblerI
+            // results are typed as Int, not stale Ref from optimization-time
+            // fail_arg_types. Fall back to fail_arg_types for OpRefs not in
+            // value_types (snapshot-only liveboxes).
             let fa_types = op.fail_arg_types.as_ref();
-            if fa_types.map_or(false, |t| t.len() == fail_args.len()) {
-                fa_types.unwrap().clone()
-            } else {
-                fail_args
-                    .iter()
-                    .map(|opref| fail_arg_type(opref, &value_types, constant_types))
-                    .collect()
-            }
+            fail_args
+                .iter()
+                .enumerate()
+                .map(|(i, opref)| {
+                    if let Some(&tp) = value_types.get(&opref.0) {
+                        return tp;
+                    }
+                    if let Some(types) = fa_types {
+                        if let Some(&tp) = types.get(i) {
+                            return tp;
+                        }
+                    }
+                    fail_arg_type(opref, &value_types, constant_types)
+                })
+                .collect()
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
         } else {
@@ -642,7 +658,12 @@ pub(crate) fn merge_backend_exit_layouts(
                     rd_pendingfields: None,
                 });
         entry.source_op_index = layout.source_op_index;
-        entry.exit_types = layout.fail_arg_types.clone();
+        // Preserve exit_types from build_guard_metadata (which reconciles
+        // optimizer types with inputarg types after unbox_call_assembler).
+        // Backend fail_arg_types may have stale Ref for unboxed CA results.
+        if entry.exit_types.is_empty() {
+            entry.exit_types = layout.fail_arg_types.clone();
+        }
         entry.is_finish = layout.is_finish;
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
@@ -1201,7 +1222,6 @@ pub(crate) fn unbox_call_assembler_results(mut ops: Vec<Op>) -> Vec<Op> {
 
     // Strip unboxing for CallAssemblerI results only.
     // CallAssemblerI returns raw int (compiled Finish is unboxed).
-    // CallMayForceI now returns boxed — its force_fn re-boxes the result.
     let ca_results: Vec<OpRef> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::CallAssemblerI)

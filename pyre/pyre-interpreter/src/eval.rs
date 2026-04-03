@@ -1413,7 +1413,6 @@ impl OpcodeStepExecutor for PyFrame {
         let result = if null_or_self.is_null() {
             call_callable(self, callable, &args)?
         } else {
-            // Method call: prepend self
             let mut full_args = Vec::with_capacity(1 + args.len());
             full_args.push(null_or_self);
             full_args.extend_from_slice(&args);

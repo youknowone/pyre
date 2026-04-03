@@ -109,6 +109,11 @@ impl Drop for ForcePlainEvalGuard {
     }
 }
 
+/// Check if force-plain-eval mode is active.
+pub fn is_force_plain_eval() -> bool {
+    FORCE_PLAIN_EVAL.with(|c| c.get() > 0)
+}
+
 /// Enter "force plain eval" mode. While active, `call_user_function` uses
 /// `eval_frame_plain` instead of the JIT-aware eval override.
 pub fn force_plain_eval() -> ForcePlainEvalGuard {

@@ -5860,11 +5860,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.virtualizable_ptr = virtualizable;
         // resume.py:1406
         let expected = vinfo.get_total_size(virtualizable) as i32;
-        if expected != vable_size - 1 {
-            // Size mismatch — virtualizable array length changed at runtime.
-            // Skip remaining vable items without writing.
-            return;
-        }
+        // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
+        assert_eq!(
+            expected,
+            vable_size - 1,
+            "consume_vable_info: vable size mismatch: expected={} actual={}",
+            expected,
+            vable_size - 1,
+        );
         // resume.py:1407
         vinfo.reset_token_gcref(virtualizable);
         // resume.py:1408

@@ -5296,6 +5296,20 @@ impl<M: Clone> MetaInterp<M> {
         Some((rd_numb, rd_consts))
     }
 
+    /// Get exit_types for a guard (for decode_ref type dispatch).
+    pub fn get_exit_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<Type>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        Some(exit_layout.exit_types.clone())
+    }
+
     /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
     /// for blackhole resume at a guard failure.
     pub fn get_rd_virtuals(
