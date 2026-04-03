@@ -14,7 +14,14 @@ pub enum KnownFieldKind {
 }
 
 fn owner_root_matches(owner_root: Option<&str>, allowed: &[&str]) -> bool {
-    owner_root.is_some_and(|root| allowed.iter().any(|candidate| root == *candidate))
+    owner_root.is_some_and(|root| {
+        allowed.iter().any(|candidate| root == *candidate)
+            // "self" / "Self" in method bodies match any allowed type
+            || root == "self"
+            || root == "Self"
+            // Single-letter generic type parameter (e.g. "H", "E")
+            || crate::call_match::is_generic_receiver(root)
+    })
 }
 
 pub fn describe_known_field(field: &FieldDescriptor) -> Option<KnownFieldKind> {

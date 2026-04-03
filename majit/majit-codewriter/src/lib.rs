@@ -173,15 +173,57 @@ fn build_canonical_opcode_dispatch(
                 function_graphs,
                 &receiver_traits,
             );
-            let classified_pattern = if arm.handler_calls.is_empty() {
-                // No handler calls in the arm body (e.g. Nop, ExtendedArg, Cache)
+            let has_meaningful_calls = arm.handler_calls.iter().any(|c| match c {
+                parse::ExtractedHandlerCall::Method { name, .. } => !matches!(
+                    name.as_str(),
+                    "into" | "map_err" | "unwrap" | "expect" | "as_ref" | "as_usize" | "get"
+                ),
+                parse::ExtractedHandlerCall::FunctionPath(p) => {
+                    let last = p.segments.last().map(String::as_str).unwrap_or("");
+                    !matches!(
+                        last,
+                        "Ok" | "Err"
+                            | "Some"
+                            | "None"
+                            | "into"
+                            | "from"
+                            | "type_error"
+                            | "Continue"
+                    ) && !p
+                        .segments
+                        .iter()
+                        .any(|s| s == "StepResult" || s == "PyError" || s == "u32" || s == "usize")
+                }
+                parse::ExtractedHandlerCall::UnsupportedFunctionExpr => false,
+            });
+            let classified_pattern = if !has_meaningful_calls {
+                // Only trivial calls (Ok, Err, StepResult) — Noop
                 Some(TracePattern::Noop)
-            } else if !arm.handler_calls.is_empty() && resolved_calls.is_empty() {
-                // Handler calls present but none could be resolved (wildcard arm etc.)
-                None
             } else {
-                resolved_calls.iter().find_map(|call| {
+                let from_graph = resolved_calls.iter().find_map(|call| {
                     classify_resolved_call_graph(call, pipeline_config, function_graphs, 0)
+                });
+                from_graph.or_else(|| {
+                    // RPython: unrecognized operations become residual calls.
+                    // Use the first resolved handler name, or the first handler call.
+                    let helper = resolved_calls
+                        .first()
+                        .map(|c| c.name.clone())
+                        .or_else(|| {
+                            arm.handler_calls.first().and_then(|c| match c {
+                                parse::ExtractedHandlerCall::Method { name, .. } => {
+                                    Some(name.clone())
+                                }
+                                parse::ExtractedHandlerCall::FunctionPath(p) => {
+                                    Some(p.canonical_key())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    Some(TracePattern::Residual {
+                        helper_name: helper,
+                    })
                 })
             };
 
@@ -322,11 +364,11 @@ fn resolve_handler_calls(
             }
 
             let is_default_methods = impl_info.for_type.starts_with("<default methods of ");
+            let is_generic = receiver_type_root
+                .is_some_and(|r| crate::call_match::is_generic_receiver(r))
+                || receiver_type_root.is_none();
             let applies = if is_default_methods {
-                // Default methods apply when either:
-                // 1. The receiver type has a concrete impl for this trait, OR
-                // 2. The receiver is generic (None) and allowed_traits matches
-                receiver_type_root.is_none()
+                is_generic
                     || receiver_type_root.is_some_and(|receiver_ty| {
                         trait_impls.iter().any(|candidate| {
                             candidate.trait_name == impl_info.trait_name
@@ -334,7 +376,11 @@ fn resolve_handler_calls(
                         })
                     })
             } else {
-                receiver_matches_root(receiver_type_root, &impl_info.self_ty_root)
+                // Concrete impls: match if the receiver type matches,
+                // OR if receiver is a generic type parameter (e.g. "E", "H")
+                receiver_type_root.is_some_and(|r| crate::call_match::is_generic_receiver(r))
+                    || receiver_type_root.is_none()
+                    || receiver_matches_root(receiver_type_root, &impl_info.self_ty_root)
             };
 
             if !applies {

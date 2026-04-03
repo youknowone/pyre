@@ -560,15 +560,42 @@ pub fn classify_from_graph_with_config(
         return Some(TracePattern::CollectionAppend);
     }
 
-    // Noop (empty or trivial ops only)
-    if ops
-        .iter()
-        .all(|op| matches!(&op.kind, OpKind::Input { .. } | OpKind::Unknown { .. }))
-    {
+    // Noop: graph has only trivial ops (Input, Unknown, and standard library
+    // calls like Ok/Err/Into/StepResult that carry no interpreter semantics).
+    let all_trivial = graph.blocks.iter().all(|block| {
+        block.ops.iter().all(|op| match &op.kind {
+            OpKind::Input { .. } | OpKind::Unknown { .. } => true,
+            OpKind::Call { target, .. } => is_trivial_call_target(target),
+            OpKind::ConstInt(_) => true,
+            _ => false,
+        })
+    });
+    if all_trivial {
         return Some(TracePattern::Noop);
     }
 
     None
+}
+
+/// Calls that have no interpreter semantics: Rust std constructors,
+/// type conversions. Note: `Err` and error constructors are NOT trivial —
+/// they indicate a stub implementation that should be classified as Residual,
+/// not Noop.
+fn is_trivial_call_target(target: &crate::graph::CallTarget) -> bool {
+    match target {
+        crate::graph::CallTarget::FunctionPath { segments } => {
+            let last = segments.last().map(String::as_str).unwrap_or("");
+            matches!(last, "Ok" | "Some" | "None" | "into" | "from")
+                || segments.iter().any(|s| s == "StepResult")
+        }
+        crate::graph::CallTarget::Method { name, .. } => {
+            matches!(
+                name.as_str(),
+                "into" | "from" | "map_err" | "unwrap" | "expect" | "as_ref" | "as_usize" | "get"
+            )
+        }
+        crate::graph::CallTarget::UnsupportedExpr => true,
+    }
 }
 
 fn value_type_name(ty: &crate::graph::ValueType) -> &'static str {
