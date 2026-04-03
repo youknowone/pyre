@@ -160,7 +160,7 @@ fn infer_call_result_type(
     _args: &[ValueId],
     _state: &AnnotationState,
 ) -> ValueType {
-    if crate::call_match::is_int_arithmetic_target(target) {
+    if crate::call::is_int_arithmetic_target(target) {
         return ValueType::Int;
     }
     ValueType::Unknown

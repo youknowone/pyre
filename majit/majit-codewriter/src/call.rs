@@ -328,6 +328,120 @@ pub fn is_generic_receiver(receiver: &str) -> bool {
     first.is_uppercase() && chars.next().is_none()
 }
 
+// ── Builtin call effect tables ──────────────────────────────────
+//
+// RPython equivalent: effect classification in `call.py::getcalldescr()`
+// combined with the builtin function tables.
+// These tables map known function targets to their effect info,
+// used by `jtransform::classify_call()` as a fallback when the
+// call is not in the explicit `call_effects` config.
+
+use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallTargetPattern {
+    Method {
+        name: &'static str,
+        receiver_root: Option<&'static str>,
+    },
+    FunctionPath(&'static [&'static str]),
+}
+
+impl CallTargetPattern {
+    fn matches(self, target: &CallTarget) -> bool {
+        match (self, target) {
+            (
+                CallTargetPattern::Method {
+                    name,
+                    receiver_root,
+                },
+                CallTarget::Method {
+                    name: target_name,
+                    receiver_root: target_root,
+                },
+            ) => {
+                if target_name != name {
+                    return false;
+                }
+                receiver_root.is_none_or(|root| {
+                    target_root.as_deref() == Some(root)
+                        || target_root.as_ref().is_some_and(|r| is_generic_receiver(r))
+                })
+            }
+            (CallTargetPattern::FunctionPath(path), CallTarget::FunctionPath { segments }) => {
+                segments.iter().map(String::as_str).eq(path.iter().copied())
+            }
+            _ => false,
+        }
+    }
+}
+
+struct CallDescriptorEntry {
+    targets: &'static [CallTargetPattern],
+    extra_effect: ExtraEffect,
+    oopspec_index: OopSpecIndex,
+}
+
+impl CallDescriptorEntry {
+    fn effect_info(&self) -> EffectInfo {
+        match self.extra_effect {
+            ExtraEffect::ElidableCannotRaise => EffectInfo::elidable(),
+            extra_effect => EffectInfo::new(extra_effect, self.oopspec_index),
+        }
+    }
+}
+
+const INT_ARITH_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["w_int_add"]),
+    CallTargetPattern::FunctionPath(&["w_int_sub"]),
+    CallTargetPattern::FunctionPath(&["w_int_mul"]),
+    CallTargetPattern::FunctionPath(&["crate", "math", "w_int_add"]),
+    CallTargetPattern::FunctionPath(&["crate", "math", "w_int_sub"]),
+    CallTargetPattern::FunctionPath(&["crate", "math", "w_int_mul"]),
+];
+
+const FLOAT_ARITH_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["w_float_add"]),
+    CallTargetPattern::FunctionPath(&["w_float_sub"]),
+];
+
+const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
+    CallDescriptorEntry {
+        targets: INT_ARITH_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: FLOAT_ARITH_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+];
+
+fn matches_any(target: &CallTarget, patterns: &[CallTargetPattern]) -> bool {
+    patterns
+        .iter()
+        .copied()
+        .any(|pattern| pattern.matches(target))
+}
+
+/// Check if a call target is a known int arithmetic function.
+/// Used by annotate pass for type inference.
+pub fn is_int_arithmetic_target(target: &CallTarget) -> bool {
+    matches_any(target, INT_ARITH_TARGETS)
+}
+
+/// Look up a call target in the builtin effect table.
+///
+/// RPython: part of `CallControl.getcalldescr()` — returns effect info
+/// for known functions like `w_int_add` (elidable), `w_float_sub` (elidable).
+pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
+    CALL_DESCRIPTOR_TABLE
+        .iter()
+        .find(|entry| matches_any(target, entry.targets))
+        .map(|entry| CallDescriptor::known(target.clone(), entry.effect_info()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

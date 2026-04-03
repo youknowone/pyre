@@ -834,7 +834,7 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
                 return false;
             }
             match (pr.as_deref(), tr.as_deref()) {
-                (Some(p), Some(t)) => p == t || crate::call_match::is_generic_receiver(t),
+                (Some(p), Some(t)) => p == t || crate::call::is_generic_receiver(t),
                 _ => true,
             }
         }
@@ -868,7 +868,7 @@ fn classify_call(
         let effect = classify_effect_info(&descriptor.effect_info());
         return Some((descriptor, effect));
     }
-    let descriptor = crate::call_match::describe_call(target)?;
+    let descriptor = crate::call::describe_call(target)?;
     let effect = classify_effect_info(&descriptor.effect_info());
     Some((descriptor, effect))
 }
