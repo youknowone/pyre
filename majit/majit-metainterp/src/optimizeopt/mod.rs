@@ -2257,11 +2257,19 @@ impl OptContext {
                 if self.get_ptr_info(resolved).is_some() {
                     return majit_ir::Type::Ref;
                 }
-                // RPython Box.type is always known via Box subclass.
-                // In majit, OpRef is untyped — hitting this means type
-                // propagation missed this OpRef (a real bug). Panic to
-                // expose the issue rather than silently mis-tagging Ref
-                // as Int (which corrupts GC root tracking).
+                // RPython Box.type is always known via the Box subclass.
+                // In majit, exhaust the emitted-operation list as a final
+                // derivation source before treating this as a real bug.
+                // This covers ops emitted in the current pass before
+                // value_types has been updated for them.
+                for op in self.new_operations.iter() {
+                    if op.pos == resolved && op.result_type() != majit_ir::Type::Void {
+                        return op.result_type();
+                    }
+                    if op.pos == *opref && op.result_type() != majit_ir::Type::Void {
+                        return op.result_type();
+                    }
+                }
                 panic!(
                     "fail_arg_types: unknown type for OpRef({}) resolved=OpRef({}). \
                      All OpRefs must have types registered in value_types or be \
