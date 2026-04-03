@@ -173,9 +173,9 @@ fn build_canonical_opcode_dispatch(
                 function_graphs,
                 &receiver_traits,
             );
-            let classified_pattern = resolved_calls
-                .iter()
-                .find_map(|call| classify_resolved_call_graph(call, pipeline_config));
+            let classified_pattern = resolved_calls.iter().find_map(|call| {
+                classify_resolved_call_graph(call, pipeline_config, function_graphs, 0)
+            });
 
             passes::PipelineOpcodeArm {
                 selector: arm.selector,
@@ -185,13 +185,83 @@ fn build_canonical_opcode_dispatch(
         .collect()
 }
 
+/// Classify a resolved call by jtransform-rewriting its graph.
+///
+/// RPython equivalent: the codewriter's transform_graph() + flatten sequence.
+/// When the graph contains a single delegation call to a known free function
+/// (e.g. OpcodeStepExecutor default method → opcode_load_fast_checked),
+/// follow that call chain into function_graphs to find the actual semantic
+/// content — up to MAX_FOLLOW_DEPTH levels.
+const MAX_FOLLOW_DEPTH: usize = 3;
+
 fn classify_resolved_call_graph(
     call: &ResolvedCall,
     pipeline_config: &passes::PipelineConfig,
+    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
+    depth: usize,
 ) -> Option<TracePattern> {
     let graph = call.graph.as_ref()?;
     let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
-    patterns::classify_from_graph_with_config(&rewritten.graph, &pipeline_config.classify)
+
+    // Try direct classification on this graph.
+    if let Some(pattern) =
+        patterns::classify_from_graph_with_config(&rewritten.graph, &pipeline_config.classify)
+    {
+        return Some(pattern);
+    }
+
+    // If no pattern matched, follow Call ops into function_graphs.
+    // This handles the common delegation pattern:
+    //   OpcodeStepExecutor::load_fast_checked() → opcode_load_fast_checked()
+    // where the default trait method just delegates to a free function.
+    if depth >= MAX_FOLLOW_DEPTH {
+        return None;
+    }
+
+    for block in &graph.blocks {
+        for op in &block.ops {
+            let callee_graph = match &op.kind {
+                graph::OpKind::Call {
+                    target: graph::CallTarget::FunctionPath { segments },
+                    ..
+                } => {
+                    let path = parse::CallPath::from_segments(segments.iter().map(String::as_str));
+                    function_graphs.get(&path)
+                }
+                graph::OpKind::CallResidual { descriptor, .. }
+                | graph::OpKind::CallElidable { descriptor, .. }
+                | graph::OpKind::CallMayForce { descriptor, .. } => {
+                    if let graph::CallTarget::FunctionPath { segments } = &descriptor.target {
+                        let path =
+                            parse::CallPath::from_segments(segments.iter().map(String::as_str));
+                        function_graphs.get(&path)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(callee_graph) = callee_graph {
+                let callee_call = ResolvedCall {
+                    name: call.name.clone(),
+                    impl_type: None,
+                    trait_name: None,
+                    graph: Some(callee_graph.clone()),
+                };
+                if let Some(pattern) = classify_resolved_call_graph(
+                    &callee_call,
+                    pipeline_config,
+                    function_graphs,
+                    depth + 1,
+                ) {
+                    return Some(pattern);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn resolve_handler_calls(

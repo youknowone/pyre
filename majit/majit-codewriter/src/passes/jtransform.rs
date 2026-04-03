@@ -621,6 +621,32 @@ impl CallEffectKind {
     }
 }
 
+/// Match CallTarget loosely: generic receivers (lowercase like "handler",
+/// "self") match any pattern receiver type.
+fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool {
+    match (pattern, target) {
+        (
+            CallTarget::Method {
+                name: pn,
+                receiver_root: pr,
+            },
+            CallTarget::Method {
+                name: tn,
+                receiver_root: tr,
+            },
+        ) => {
+            if pn != tn {
+                return false;
+            }
+            match (pr.as_deref(), tr.as_deref()) {
+                (Some(p), Some(t)) => p == t || crate::call_match::is_generic_receiver(t),
+                _ => true,
+            }
+        }
+        _ => pattern == target,
+    }
+}
+
 /// Classify a call's side-effect level.
 ///
 /// RPython equivalent: jtransform.py effect classification
@@ -641,7 +667,7 @@ fn classify_call(
 
     if let Some(descriptor) = overrides
         .iter()
-        .find(|override_| override_.descriptor.target == *target)
+        .find(|override_| call_target_matches_loose(&override_.descriptor.target, target))
         .map(|override_| override_.descriptor.clone())
     {
         let effect = classify_effect_info(&descriptor.effect_info());
