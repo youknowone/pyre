@@ -225,9 +225,11 @@ impl MiniMarkGC {
         self.nursery_object_starts.contains(&addr) || self.oldgen.contains(addr)
     }
 
+    /// incminimark.py:1208 is_in_nursery parity.
+    /// RPython has NO nursery_object_starts set — uses pure range check.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
-        self.nursery_object_starts.contains(&addr)
+        self.nursery.contains(addr)
     }
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
