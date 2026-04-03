@@ -5334,11 +5334,11 @@ impl VirtualInfo {
                 obj
             }
             VirtualInfo::VStruct {
-                descr_index,
-                fields,
-                ..
+                type_id, fields, ..
             } => {
-                let obj = allocator.allocate_struct(*descr_index);
+                // resume.py:632 allocate_struct(descr)
+                // Use type_id for pyre's GC allocation dispatch.
+                let obj = allocator.allocate_struct(*type_id);
                 decoder.virtuals_cache_ptr[index] = obj;
                 for (field_descr, source) in fields {
                     let value = decoder.decode_field_source(source);
