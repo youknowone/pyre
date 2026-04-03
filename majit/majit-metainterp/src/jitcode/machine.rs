@@ -17,11 +17,11 @@ use super::{
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
     BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F,
-    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
+    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JUMP, BC_JUMP_TARGET,
+    BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
     BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
     BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REQUIRE_STACK,
+    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REQUIRE_STACK,
     BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
     BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
     BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
@@ -70,6 +70,10 @@ pub trait JitCodeSym {
     /// RPython parity: jit.promote(storage).
     /// Emit GuardValue on pool_ref to make it a known constant.
     fn promote_pool_ref(&mut self, _ctx: &mut TraceCtx, _runtime_value: i64) {}
+    /// tl.py:88  promote(stack.stackpos).
+    /// Emit GuardValue on the stacksize inputarg to make it a compile-time constant.
+    /// Default no-op; storage modes that track stackpos override this.
+    fn promote_stacksize(&mut self, _ctx: &mut TraceCtx, _runtime_value: i64) {}
     /// Create a symbolic stack for a storage not in the initial layout.
     fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize);
     /// Full interpreter-visible state to materialize on guard failure.
@@ -2326,6 +2330,21 @@ where
                 let (src, src_value) = self.read_float_reg(src_idx);
                 let value = eval_unary_f(opcode, src_value);
                 self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+            }
+            // pyjitpl.py opimpl_int_guard_value → implement_guard_value
+            // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
+            BC_INT_GUARD_VALUE => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (opref, concrete) = self.read_int_reg(src);
+                let promoted = ctx.promote_int(opref, concrete, 0);
+                self.set_int_reg(src, Some(promoted), Some(concrete));
+            }
+            // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
+            BC_REF_GUARD_VALUE => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (opref, concrete) = self.read_ref_reg(src);
+                let promoted = ctx.promote_ref(opref, concrete, 0);
+                self.set_ref_reg(src, Some(promoted), Some(concrete));
             }
             BC_ABORT => return TraceAction::Abort,
             BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,

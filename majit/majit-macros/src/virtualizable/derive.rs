@@ -513,7 +513,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .collect();
 
     // ── export: read ALL fields from heap via info, override state-backed ──
-    // RPython parity: read_boxes() reads all fields from the virtualizable
+    // Modeled after read_boxes(): reads all fields from the virtualizable
     // heap object.  State-backed fields may be more up-to-date than heap,
     // so we patch those positions after the bulk read.
     let export_overrides: Vec<TokenStream> = state_backed
@@ -524,9 +524,9 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .collect();
 
     // ── import: validate total length, write state-backed fields ──
-    // RPython parity: write_from_resume_data_partial() iterates ALL
-    // declared fields.  If static_boxes is shorter than num_fields(),
-    // the resume-data is corrupt and we must reject it.
+    // Modeled after write_from_resume_data_partial() which iterates ALL
+    // declared fields in one stream.  Here static and array are split;
+    // if static_boxes is shorter than num_fields(), reject as corrupt.
     let import_writes: Vec<TokenStream> = state_backed
         .iter()
         .map(|(ident, idx)| {
@@ -536,11 +536,13 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
 
     quote! {
         impl #struct_name {
-            /// Read all virtualizable static boxes (RPython: read_boxes).
+            /// Read all virtualizable static boxes.
             ///
-            /// Reads ALL fields from the heap via `info.read_boxes()`,
-            /// then overrides state-backed positions with values from `self`.
-            /// Type handling (Int/Ref/Float) is delegated to VirtualizableInfo.
+            /// Approximates RPython read_boxes: reads ALL fields from the
+            /// heap via `info.read_boxes()`, then overrides state-backed
+            /// positions with values from `self`.
+            /// Note: RPython reads from a single virtualizable object;
+            /// here static and array paths are handled separately.
             pub fn virt_export_static_boxes(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -578,10 +580,11 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 true
             }
 
-            /// Read all virtualizable boxes (RPython: read_all_boxes).
+            /// Read all virtualizable boxes.
             ///
-            /// Reads static + array fields from heap, overrides state-backed
-            /// static positions with values from `self`.
+            /// Approximates RPython read_all_boxes: reads static + array
+            /// fields from heap, overrides state-backed static positions
+            /// with values from `self`.
             pub fn virt_export_all(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,

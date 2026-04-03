@@ -90,6 +90,10 @@ pub(crate) const BC_REF_RETURN: u8 = 76;
 pub(crate) const BC_RAISE: u8 = 77;
 /// blackhole.py bhimpl_reraise: re-raise exception_last_value.
 pub(crate) const BC_RERAISE: u8 = 78;
+/// pyjitpl.py opimpl_int_guard_value: promote int to constant via GUARD_VALUE.
+pub(crate) const BC_INT_GUARD_VALUE: u8 = 79;
+/// pyjitpl.py opimpl_ref_guard_value: promote ref to constant via GUARD_VALUE.
+pub(crate) const BC_REF_GUARD_VALUE: u8 = 80;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// GC liveness metadata at a specific bytecode PC.

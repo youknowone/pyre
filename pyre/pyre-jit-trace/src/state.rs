@@ -7580,7 +7580,6 @@ impl PyreJitState {
         array_boxes: &[Vec<i64>],
     ) -> bool {
         let info = crate::virtualizable_gen::build_virtualizable_info();
-        // RPython: write_from_resume_data_partial validates full coverage.
         if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
         }
