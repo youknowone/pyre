@@ -42,12 +42,24 @@ fn fail_arg_type(
     }
 }
 
-/// Derive slot_types from ExitValueSourceLayout.
-/// RPython resume.py:1077 load_next_value_of_type parity:
-/// slot type is the DECLARED type of the variable, not the tag
-/// of the value. All pyre virtualizable locals/stack slots are Ref.
-fn derive_slot_types(slots: &[majit_backend::ExitValueSourceLayout]) -> Vec<Type> {
-    slots.iter().map(|_| Type::Ref).collect()
+/// Derive slot_types from ExitValueSourceLayout + exit_types.
+/// RPython resume.py:1410 load_next_value_of_type parity:
+/// slot type is the DECLARED type of the variable.
+/// ExitValue(idx) → exit_types[idx]; Constant → Int; others → Ref.
+fn derive_slot_types(
+    slots: &[majit_backend::ExitValueSourceLayout],
+    exit_types: &[Type],
+) -> Vec<Type> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
+                exit_types.get(*idx).copied().unwrap_or(Type::Ref)
+            }
+            majit_backend::ExitValueSourceLayout::Constant(_) => Type::Int,
+            _ => Type::Ref,
+        })
+        .collect()
 }
 
 // ── Compilation result types (compile.py) ───────────────────────────────
@@ -319,7 +331,7 @@ pub(crate) fn build_guard_metadata(
                         .map(|(orig_idx, frame)| {
                             let mut slots = Vec::new();
                             slots.extend(frame.values.iter().map(to_exit_source));
-                            let slot_types = derive_slot_types(&slots);
+                            let slot_types = derive_slot_types(&slots, &exit_types);
                             majit_backend::ExitFrameLayout {
                                 trace_id: None,
                                 header_pc: Some(frame.pc as u64),
