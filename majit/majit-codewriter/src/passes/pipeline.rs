@@ -52,6 +52,11 @@ pub struct PipelineResult {
 pub struct PipelineOpcodeArm {
     pub selector: OpcodeDispatchSelector,
     pub classified_pattern: Option<TracePattern>,
+    /// Inlined + jtransform'd + flattened output (RPython-orthodox path).
+    /// When available, this is the authoritative representation — the
+    /// `classified_pattern` field is for backward compatibility only.
+    #[serde(default)]
+    pub flattened: Option<FlattenedFunction>,
 }
 
 /// Result of running the pipeline on a full program.

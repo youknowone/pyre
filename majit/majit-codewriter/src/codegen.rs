@@ -433,6 +433,7 @@ mod tests {
                     "Add",
                 ])),
                 classified_pattern: None,
+                flattened: None,
             }],
             total_blocks: 0,
             total_ops: 0,

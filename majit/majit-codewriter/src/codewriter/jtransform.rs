@@ -489,16 +489,19 @@ mod tests {
                         op_name: "add".into(),
                         has_overflow_guard: false,
                     }),
+                    flattened: None,
                 },
                 crate::passes::PipelineOpcodeArm {
                     selector: crate::OpcodeDispatchSelector::Path(crate::CallPath::from_segments(
                         ["Instruction", "LoadFast"],
                     )),
                     classified_pattern: Some(TracePattern::LocalRead),
+                    flattened: None,
                 },
                 crate::passes::PipelineOpcodeArm {
                     selector: crate::OpcodeDispatchSelector::Unsupported,
                     classified_pattern: None,
+                    flattened: None,
                 },
             ];
         let config = TransformConfig::default();

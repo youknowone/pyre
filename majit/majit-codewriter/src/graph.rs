@@ -206,21 +206,21 @@ pub enum OpKind {
     /// Elidable (pure) call — no side effects, result depends only on args.
     /// RPython: `call_elidable` / `EF_ELIDABLE`
     CallElidable {
-        descriptor: crate::call_match::CallDescriptor,
+        descriptor: crate::call::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
     /// Residual call — has side effects, must be preserved.
     /// RPython: `residual_call` / default effect
     CallResidual {
-        descriptor: crate::call_match::CallDescriptor,
+        descriptor: crate::call::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
     /// May-force call — can trigger GC or force virtualizables.
     /// RPython: `call_may_force` / `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
     CallMayForce {
-        descriptor: crate::call_match::CallDescriptor,
+        descriptor: crate::call::CallDescriptor,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },

@@ -23,31 +23,8 @@ pub(crate) enum BuildCollectionKind {
     Tuple,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallDescriptor {
-    pub target: CallTarget,
-    pub effect_info: EffectInfo,
-}
-
-impl CallDescriptor {
-    pub fn known(target: CallTarget, effect_info: EffectInfo) -> Self {
-        Self {
-            target,
-            effect_info,
-        }
-    }
-
-    pub fn override_effect(target: CallTarget, effect_info: EffectInfo) -> Self {
-        Self {
-            target,
-            effect_info,
-        }
-    }
-
-    pub fn effect_info(&self) -> EffectInfo {
-        self.effect_info.clone()
-    }
-}
+// CallDescriptor is now defined in call.rs — re-export for backward compat.
+pub use crate::call::CallDescriptor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallTargetPattern {
