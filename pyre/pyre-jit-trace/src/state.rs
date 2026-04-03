@@ -7351,20 +7351,23 @@ impl PyreJitState {
         if raw_values.is_empty() {
             return false;
         }
+        // virtualizable.py:126-137 parity: all entries must be present.
         let mut idx = crate::virtualizable_gen::virt_restore_scalars_raw(self, raw_values);
 
         let nlocals = self.local_count();
         let stack_only = self.valuestackdepth().saturating_sub(nlocals);
+        assert!(
+            raw_values.len() >= idx + nlocals + stack_only,
+            "restore_virtualizable_from_raw: raw_values.len()={} < expected {}",
+            raw_values.len(),
+            idx + nlocals + stack_only,
+        );
         for local_idx in 0..nlocals {
-            if let Some(&raw) = raw_values.get(idx) {
-                let _ = self.set_local_at(local_idx, raw as PyObjectRef);
-            }
+            let _ = self.set_local_at(local_idx, raw_values[idx] as PyObjectRef);
             idx += 1;
         }
         for stack_idx in 0..stack_only {
-            if let Some(&raw) = raw_values.get(idx) {
-                let _ = self.set_stack_at(stack_idx, raw as PyObjectRef);
-            }
+            let _ = self.set_stack_at(stack_idx, raw_values[idx] as PyObjectRef);
             idx += 1;
         }
         true
@@ -7594,8 +7597,12 @@ impl PyreJitState {
         }
 
         // virtualizable.py:134-137: write array items to heap.
-        let Some(unified) = array_boxes.first() else {
+        // Validate array structure matches VirtualizableInfo.
+        if array_boxes.len() != info.array_fields.len() {
             return false;
+        }
+        let Some(unified) = array_boxes.first() else {
+            return info.array_fields.is_empty();
         };
         let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
             return false;
