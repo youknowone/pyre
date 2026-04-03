@@ -354,6 +354,11 @@ impl MiniMarkGC {
                 if !self.pinned_objects.contains(&gcref.0) {
                     *gcref = self.copy_nursery_object(gcref.0);
                 }
+            } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
+                // RPython parity: old-gen jitframes need their interior
+                // nursery refs traced directly. The custom_trace hook
+                // walks gcmap bits to find Ref slots.
+                self.trace_and_update_object(gcref.0);
             }
         });
 
