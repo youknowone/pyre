@@ -154,16 +154,51 @@ impl CallControl {
     ///
     /// RPython: `CallControl.find_all_graphs(policy)`.
     ///
-    /// Walks from portal graphs transitively: for each Call op,
-    /// if `guess_call_kind() == Regular`, add the callee to candidates.
+    /// Walks from portal graphs transitively: for each Call op in a
+    /// candidate graph, if the callee has a graph and passes the
+    /// candidate check, add it to the candidate set.
+    ///
+    /// If no portal is set, falls back to including all registered
+    /// function graphs (test-only convenience).
     pub fn find_all_graphs(&mut self) {
-        // Start with all registered function graphs as candidates.
-        // In RPython, this is filtered by policy.look_inside_graph().
-        // Here, we include all graphs by default (equivalent to the
-        // default policy where look_inside_function() returns True).
-        let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
-        for path in all_paths {
-            self.candidate_graphs.insert(path);
+        if self.portal_targets.is_empty() {
+            // No portal set — include all graphs (test convenience).
+            let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
+            for path in all_paths {
+                self.candidate_graphs.insert(path);
+            }
+            return;
+        }
+
+        // BFS from portal targets (RPython: call.py:49-92)
+        let mut todo: Vec<CallPath> = self.portal_targets.iter().cloned().collect();
+        for path in &todo {
+            self.candidate_graphs.insert(path.clone());
+        }
+
+        while let Some(path) = todo.pop() {
+            let graph = match self.function_graphs.get(&path) {
+                Some(g) => g.clone(),
+                None => continue,
+            };
+            for block in &graph.blocks {
+                for op in &block.ops {
+                    if let OpKind::Call {
+                        target: crate::graph::CallTarget::FunctionPath { segments },
+                        ..
+                    } = &op.kind
+                    {
+                        let callee_path =
+                            CallPath::from_segments(segments.iter().map(String::as_str));
+                        if self.function_graphs.contains_key(&callee_path)
+                            && !self.candidate_graphs.contains(&callee_path)
+                        {
+                            self.candidate_graphs.insert(callee_path.clone());
+                            todo.push(callee_path);
+                        }
+                    }
+                }
+            }
         }
     }
 

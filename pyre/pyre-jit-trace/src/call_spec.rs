@@ -370,16 +370,16 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::LocalWrite),
     },
-    // binary_value / compare_value: type-generic operations (space.add etc.)
-    // Specialization to int/float happens at trace time, but codewriter still
-    // marks the semantic role for pattern classification.
+    // binary_value / compare_value / unary_*: type-generic object-space
+    // operations. NOT int-specific — they dispatch to int/float/str/object
+    // at runtime. Specialization happens at trace time, not codewriter time.
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "binary_value",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -387,7 +387,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -395,7 +395,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -403,7 +403,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
@@ -566,25 +566,26 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::StackManip),
     },
+    // Generic object-space operations — type specialization at trace time.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_binary_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_compare_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_negative"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_invert"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_unary_not"]),
@@ -693,15 +694,16 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         effect: CallEffectKind::Residual,
         role: Some(CallPatternRole::NamespaceLoadLocal),
     },
+    // contains_op / is_op: object identity/membership — NOT arithmetic.
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_contains_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_is_op"]),
         effect: CallEffectKind::Residual,
-        role: Some(CallPatternRole::IntArithmetic),
+        role: None,
     },
     CallEffectSpec {
         target: CallTargetSpec::FunctionPath(&["opcode_delete_subscript"]),

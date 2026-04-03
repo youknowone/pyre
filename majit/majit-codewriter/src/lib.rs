@@ -193,15 +193,20 @@ fn build_canonical_opcode_dispatch(
                 &receiver_traits,
             );
 
-            // RPython-orthodox path: inline → jtransform → flatten.
-            // For each resolved handler graph, try inlining callee bodies,
-            // then run jtransform + flatten to produce the JitCode-ready
-            // instruction sequence.
+            // RPython codewriter path: jtransform → flatten.
+            //
+            // RPython does NOT splice callee bodies into the caller.
+            // Instead, jtransform rewrites each `direct_call` to either
+            // `inline_call_*` (referencing the callee's JitCode) or
+            // `residual_call_*` (keeping the function pointer). The
+            // meta-interpreter then descends into callee JitCode at runtime.
+            //
+            // For each resolved handler, run jtransform + flatten on the
+            // handler's own graph. Call ops remain as Call/CallResidual/
+            // CallElidable — they are NOT expanded into callee bodies.
             let flattened = resolved_calls.iter().find_map(|resolved| {
                 let graph = resolved.graph.as_ref()?;
-                let mut inlined = graph.clone();
-                inline::inline_graph(&mut inlined, call_control, 3);
-                let rewritten = passes::rewrite_graph(&inlined, &pipeline_config.transform);
+                let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
                 let flattened = passes::flatten_with_types(
                     &rewritten.graph,
                     &passes::resolve_types(
@@ -209,6 +214,10 @@ fn build_canonical_opcode_dispatch(
                         &passes::annotate_graph(&rewritten.graph),
                     ),
                 );
+                // Skip trivially empty graphs (only Input ops)
+                if flattened.ops.len() <= 1 {
+                    return None;
+                }
                 Some(flattened)
             });
 
