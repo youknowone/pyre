@@ -1274,11 +1274,17 @@ impl OptContext {
         }
         let idx = replaced.0 as usize;
         if idx < self.forwarded.len() {
-            if let Forwarded::IntBound(ref b) = self.forwarded[idx] {
-                return b.clone();
+            match &self.forwarded[idx] {
+                // optimizer.py:106-107: isinstance(fw, IntBound) → return fw
+                Forwarded::IntBound(b) => return b.clone(),
+                // optimizer.py:108-109: fw is not None but not IntBound
+                // (rare: RawBufferPtrInfo etc.) → return unbounded, do NOT
+                // overwrite existing forwarding.
+                Forwarded::None => {}
+                _ => return crate::optimizeopt::intutils::IntBound::unbounded(),
             }
         }
-        // optimizer.py:111-112: intbound = IntBound.unbounded(); op.set_forwarded(intbound)
+        // optimizer.py:110-112: fw is None → create unbounded and store
         let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
@@ -1322,39 +1328,20 @@ impl OptContext {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:412: box = get_box_replacement(box)
         let replaced = self.get_box_replacement(opref);
-        // optimizer.py:415-426: safety check — if box._forwarded is IntBound
-        // and the constant is Int, validate contains() + make_eq_const().
+        // optimizer.py:415-426: safety check — if box.get_forwarded() is
+        // IntBound and the constant is Int, validate contains() + make_eq_const().
+        // RPython checks ONE authoritative source: box._forwarded.
         if let Value::Int(intval) = value {
             let ridx = replaced.0 as usize;
-            // Check Forwarded::IntBound (RPython: box.get_forwarded() → IntBound)
             if ridx < self.forwarded.len() {
-                if let Forwarded::IntBound(ref mut bound) = self.forwarded[ridx] {
+                if let Forwarded::IntBound(bound) = &mut self.forwarded[ridx] {
                     if !bound.contains(intval as i64) {
                         std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
                             "constant int is outside the range allowed for that box",
                         ));
                     }
-                    // optimizer.py:426: info.make_eq_const(value)
+                    // optimizer.py:424-426: info.make_eq_const(value)
                     let _ = bound.make_eq_const(intval as i64);
-                }
-            }
-            // Also check int_bounds mirror (OptIntBounds pass storage)
-            if ridx < self.int_bounds.len() {
-                if let Some(ref mut bound) = self.int_bounds[ridx] {
-                    if !bound.contains(intval) {
-                        std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
-                            "constant int is outside the range allowed for that box",
-                        ));
-                    }
-                    let _ = bound.make_eq_const(intval);
-                }
-            }
-            // Check imported bounds (Phase 2 from Phase 1)
-            if let Some(bound) = self.imported_int_bounds.get(&replaced) {
-                if !bound.contains(intval) {
-                    std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
-                        "constant int is outside the range allowed for that box",
-                    ));
                 }
             }
         }
