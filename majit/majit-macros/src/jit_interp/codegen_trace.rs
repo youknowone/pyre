@@ -19,6 +19,12 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             .to_compile_error();
     };
 
+    // jtransform.py:596 rewrite_op_hint — detect hint_promote() calls in
+    // pre-dispatch code.  When present, the trace function emits GUARD_VALUE
+    // before each arm's JitCode (pyjitpl.py:1916 implement_guard_value).
+    let has_pre_dispatch_promote = has_promote_before_match(&func.block);
+    let promote_preamble = quote! {}; // arm preamble not used; promote goes in trace fn
+
     let lowerer_config = LowererConfig::new(
         config.storage.as_ref().map(|s| &s.pool),
         config.storage.as_ref().map(|s| &s.selector),
@@ -38,7 +44,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let jitcode_arms = classified
         .iter()
-        .map(|arm| generate_jitcode_arm(arm, &lowerer_config));
+        .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble));
 
     let label_closure = if has_branch_group {
         quote! { |__jit_pc| program.get_label(__jit_pc) }
@@ -108,7 +114,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __storage: &#pool_type,
                 __selected: usize,
             ) -> majit_metainterp::TraceAction {
-                use majit_metainterp::TraceAction;
+                use majit_metainterp::{JitCodeSym, TraceAction};
 
                 let __op = program.get_op(pc);
                 let Some(__jitcode) = #jitcode_fn_name(program, pc, __op) else {
@@ -122,6 +128,17 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                     }
                     return TraceAction::AbortPermanent;
                 };
+
+                // tl.py:88 promote(stack.stackpos) — emit GUARD_VALUE on stacksize
+                // before each opcode's JitCode, matching RPython's per-dispatch
+                // promote.  pyjitpl.py:1916 implement_guard_value: if already
+                // Const, no guard needed; else emit GUARD_VALUE(box, Const(N)).
+                if #has_pre_dispatch_promote {
+                    __sym.promote_stacksize(
+                        __ctx,
+                        __storage.get(__selected).len() as i64,
+                    );
+                }
 
                 let __runtime = majit_metainterp::ClosureRuntime::new(
                     |__stack_index| __storage.get(__stack_index).len(),
@@ -168,6 +185,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 fn generate_jitcode_arm(
     arm: &super::classify::ClassifiedArm,
     config: &LowererConfig,
+    promote_preamble: &TokenStream,
 ) -> TokenStream {
     let pat = &arm.pat;
     let build = match &arm.pattern {
@@ -180,6 +198,7 @@ fn generate_jitcode_arm(
             match code {
                 Some(code) => quote! {
                     let mut __builder = majit_metainterp::JitCodeBuilder::new();
+                    #promote_preamble
                     #code
                     Some(__builder.finish())
                 },
@@ -286,4 +305,54 @@ fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
         }
         _ => None,
     }
+}
+
+/// Detect whether the function body contains `hint_promote()` calls before
+/// the dispatch match.  Returns `true` as a literal for codegen.
+///
+/// RPython: jtransform.py:596 — `hint(x, promote=True)` becomes
+/// `int_guard_value(x)`.  When detected, the trace function emits
+/// GUARD_VALUE via `promote_stacksize()` before each arm's JitCode.
+fn has_promote_before_match(block: &syn::Block) -> bool {
+    let mut promotes = Vec::new();
+    collect_promote_stmts(&block.stmts, &mut promotes);
+    !promotes.is_empty()
+}
+
+/// Collect variable names from `x = hint_promote(x)` patterns in statements.
+fn collect_promote_stmts(stmts: &[syn::Stmt], promotes: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            syn::Stmt::Expr(syn::Expr::While(w), _) => {
+                collect_promote_stmts(&w.body.stmts, promotes);
+            }
+            syn::Stmt::Expr(syn::Expr::Loop(l), _) => {
+                collect_promote_stmts(&l.body.stmts, promotes);
+            }
+            syn::Stmt::Expr(syn::Expr::Assign(assign), _) => {
+                if let Some(name) = extract_promote_assign(assign) {
+                    promotes.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check if `expr` is `x = hint_promote(x)` and return the variable name.
+fn extract_promote_assign(assign: &syn::ExprAssign) -> Option<String> {
+    let syn::Expr::Call(call) = &*assign.right else {
+        return None;
+    };
+    let syn::Expr::Path(func_path) = &*call.func else {
+        return None;
+    };
+    let func_name = func_path.path.get_ident()?.to_string();
+    if func_name != "hint_promote" {
+        return None;
+    }
+    let syn::Expr::Path(lhs_path) = &*assign.left else {
+        return None;
+    };
+    Some(lhs_path.path.get_ident()?.to_string())
 }

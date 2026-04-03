@@ -1392,6 +1392,9 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
             meta_storage_count: usize,
             /// Linked list head OpRef per storage (RPython Node virtualization).
             linked_list_heads: std::collections::HashMap<usize, majit_ir::OpRef>,
+            /// tl.py:88 promote(stack.stackpos) — tracked OpRef and promoted flag.
+            stacksize_opref: Option<majit_ir::OpRef>,
+            stacksize_promoted: bool,
         }
 
         #[allow(non_camel_case_types)]
@@ -1437,6 +1440,32 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn header_selected(&self) -> usize {
                 self.header_selected
+            }
+
+            /// tl.py:88 promote(stack.stackpos) → GUARD_VALUE on stacksize.
+            ///
+            /// pyjitpl.py:1916 implement_guard_value: if already Const, skip;
+            /// else emit GUARD_VALUE(box, Const(N)).
+            fn promote_stacksize(
+                &mut self,
+                ctx: &mut majit_metainterp::TraceCtx,
+                runtime_value: i64,
+            ) {
+                if self.stacksize_promoted {
+                    return;
+                }
+                // First call: record a constant for the current stacksize and
+                // emit GUARD_VALUE.  Subsequent calls in the same trace position
+                // are no-ops (the optimizer CSEs duplicate guards).
+                let opref = if let Some(existing) = self.stacksize_opref {
+                    existing
+                } else {
+                    // No symbolic OpRef yet; create one from the concrete value.
+                    ctx.const_int(runtime_value)
+                };
+                let promoted = ctx.promote_int(opref, runtime_value, 0);
+                self.stacksize_opref = Some(promoted);
+                self.stacksize_promoted = true;
             }
 
             fn ensure_stack(&mut self, selected: usize, offset: usize, len: usize) {
@@ -1523,6 +1552,8 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
                     trace_started: false,
                     meta_storage_count: meta.storage_layout.len(),
                     linked_list_heads: std::collections::HashMap::new(),
+                    stacksize_opref: None,
+                    stacksize_promoted: false,
                 }
             }
 

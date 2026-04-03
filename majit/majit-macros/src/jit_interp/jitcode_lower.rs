@@ -2128,9 +2128,51 @@ impl<'c> Lowerer<'c> {
             Expr::Match(expr_match) => self.lower_match_value(expr_match),
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
-            Expr::Call(call) => self.lower_call_value(call),
+            Expr::Call(call) => {
+                // jtransform.py:596 rewrite_op_hint: promote → int_guard_value
+                if let Some(binding) = self.lower_promote_call(call) {
+                    return Some(binding);
+                }
+                self.lower_call_value(call)
+            }
             _ => None,
         }
+    }
+
+    /// Lower `hint_promote(x)` → emit `int_guard_value(x_reg)`, return x binding.
+    ///
+    /// RPython: `hint(x, promote=True)` → `int_guard_value(x)` (jtransform.py:612).
+    /// Blackhole: no-op. Tracing: emits GUARD_VALUE to specialize on current value.
+    fn lower_promote_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        let func_name = match &*call.func {
+            Expr::Path(path) => path.path.get_ident()?.to_string(),
+            _ => return None,
+        };
+        if func_name != "hint_promote" {
+            return None;
+        }
+        if call.args.len() != 1 {
+            return None;
+        }
+        let binding = self.lower_value_expr(&call.args[0])?;
+        let reg = binding.reg;
+        match binding.kind {
+            BindingKind::Int => {
+                self.statements.push(quote! {
+                    __builder.int_guard_value(#reg);
+                });
+            }
+            BindingKind::Ref => {
+                self.statements.push(quote! {
+                    __builder.ref_guard_value(#reg);
+                });
+            }
+            BindingKind::Float => {
+                // float_guard_value not yet implemented
+                return None;
+            }
+        }
+        Some(binding)
     }
 
     fn lower_call_value(&mut self, call: &ExprCall) -> Option<Binding> {
