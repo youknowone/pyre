@@ -148,11 +148,20 @@ fn analyze_pipeline_from_parsed(
             }
         }
     }
-    // Mark portal: execute_opcode_step is the JIT entry point.
-    // RPython: jd.portal_graph seeds the BFS in find_all_graphs().
+    // RPython: setup_jitdriver(jitdriver_sd) — register portal + green/red layout.
+    // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
+    //                      reds = ['frame', 'ec']
     let portal = parse::CallPath::from_segments(["execute_opcode_step"]);
     if call_control.function_graphs().contains_key(&portal) {
-        call_control.mark_portal(portal);
+        call_control.setup_jitdriver(
+            portal,
+            vec![
+                "next_instr".to_string(),
+                "is_being_profiled".to_string(),
+                "pycode".to_string(),
+            ],
+            vec!["frame".to_string(), "ec".to_string()],
+        );
     }
     // Mark known builtins (elidable helpers).
     // RPython: detected via funcobj.graph.func.oopspec attribute.

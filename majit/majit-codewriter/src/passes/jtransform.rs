@@ -704,21 +704,40 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         // RPython jtransform.py:522-534:
-        //   jd_index = jitdriver_sd.index
+        //   jitdriver_sd = callcontrol.jitdriver_sd_from_portal_runner_ptr(funcptr)
+        //   num_green_args = len(jitdriver_sd.jitdriver.greens)
         //   greens = args[1:1+num_green_args]
         //   reds = args[1+num_green_args:]
-        //   recursive_call_{kind}(jd_index, [green_i],[green_r],[green_f],
-        //                                   [red_i],[red_r],[red_f])
-        let jd_index = 0usize;
-        // Currently we don't distinguish green/red — all args are red.
-        // Green args require jitdriver metadata (greens list) which
-        // will be provided when jitdriver integration is complete.
-        let (reds_i, reds_r, reds_f) = self.make_three_lists(args);
+        //   recursive_call_{kind}(jd_index, G_I, G_R, G_F, R_I, R_R, R_F)
+        let path = target_to_call_path(target);
+        let (jd_index, num_green_args) = self
+            .callcontrol
+            .as_ref()
+            .and_then(|cc| cc.jitdriver_sd_from_portal(&path))
+            .map(|sd| (sd.index, sd.greens.len()))
+            .unwrap_or((0, 0));
+
+        // RPython: skip funcptr (args[0]), split rest into green/red.
+        // In our AST, args don't include funcptr, so split directly.
+        let green_args = if num_green_args <= args.len() {
+            &args[..num_green_args]
+        } else {
+            args
+        };
+        let red_args = if num_green_args <= args.len() {
+            &args[num_green_args..]
+        } else {
+            &[]
+        };
+        let (greens_i, greens_r, greens_f) = self.make_three_lists(green_args);
+        let (reds_i, reds_r, reds_f) = self.make_three_lists(red_args);
         let result_kind = value_type_to_kind(result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {target} → recursive_call[jd={jd_index}]"),
+            detail: format!(
+                "call {target} → recursive_call[jd={jd_index}, greens={num_green_args}]"
+            ),
         });
         self.calls_classified += 1;
         // RPython jtransform.py:533: recursive_call followed by -live-
@@ -727,9 +746,9 @@ impl<'a> Transformer<'a> {
                 result: op.result,
                 kind: OpKind::RecursiveCall {
                     jd_index,
-                    greens_i: vec![],
-                    greens_r: vec![],
-                    greens_f: vec![],
+                    greens_i,
+                    greens_r,
+                    greens_f,
                     reds_i,
                     reds_r,
                     reds_f,

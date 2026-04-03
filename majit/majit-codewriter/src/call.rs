@@ -64,6 +64,22 @@ pub enum CallKind {
     Recursive,
 }
 
+/// RPython: `JitDriverStaticData` — per-jitdriver metadata.
+///
+/// RPython `metainterp/jitdriver.py`: stores green/red variable names,
+/// virtualizable info, portal graph reference, etc.
+#[derive(Debug, Clone)]
+pub struct JitDriverStaticData {
+    /// RPython: `jitdriver_sd.index`
+    pub index: usize,
+    /// RPython: `jitdriver.greens` — loop-invariant variable names.
+    pub greens: Vec<String>,
+    /// RPython: `jitdriver.reds` — loop-variant variable names.
+    pub reds: Vec<String>,
+    /// Portal graph path.
+    pub portal_graph: CallPath,
+}
+
 /// Call control — decides inline vs residual for each call target.
 ///
 /// RPython: `call.py::CallControl`.
@@ -97,6 +113,10 @@ pub struct CallControl {
     /// RPython: `CallControl.jitdrivers_sd`.
     portal_targets: HashSet<CallPath>,
 
+    /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
+    /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
+    jitdrivers_sd: Vec<JitDriverStaticData>,
+
     /// Builtin targets (oopspec operations).
     /// RPython: detected via `funcobj.graph.func.oopspec`.
     builtin_targets: HashSet<CallPath>,
@@ -122,6 +142,7 @@ impl CallControl {
             trait_method_impls: HashMap::new(),
             candidate_graphs: HashSet::new(),
             portal_targets: HashSet::new(),
+            jitdrivers_sd: Vec::new(),
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
@@ -159,8 +180,38 @@ impl CallControl {
     }
 
     /// Mark a target as the portal entry point.
+    ///
+    /// RPython: `setup_jitdriver(jitdriver_sd)` + `grab_initial_jitcodes()`.
     pub fn mark_portal(&mut self, path: CallPath) {
         self.portal_targets.insert(path);
+    }
+
+    /// Register a JitDriver with its green/red variable layout.
+    ///
+    /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py:96-99).
+    /// Each jitdriver gets a sequential index.
+    pub fn setup_jitdriver(
+        &mut self,
+        portal_graph: CallPath,
+        greens: Vec<String>,
+        reds: Vec<String>,
+    ) {
+        let index = self.jitdrivers_sd.len();
+        self.jitdrivers_sd.push(JitDriverStaticData {
+            index,
+            greens,
+            reds,
+            portal_graph: portal_graph.clone(),
+        });
+        self.portal_targets.insert(portal_graph);
+    }
+
+    /// RPython: `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
+    /// Find the jitdriver that owns a given portal target.
+    pub fn jitdriver_sd_from_portal(&self, path: &CallPath) -> Option<&JitDriverStaticData> {
+        self.jitdrivers_sd
+            .iter()
+            .find(|sd| &sd.portal_graph == path)
     }
 
     /// Mark a target as a builtin (oopspec) operation.
