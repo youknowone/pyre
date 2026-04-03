@@ -497,6 +497,21 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
     let struct_name = &input.ident;
     let vable_fields = extract_vable_fields(&input);
 
+    // Reject #[vable(static_field = N)] — heap is the single source of truth.
+    // State-backed field mirroring was removed; all field access goes through
+    // VirtualizableInfo on the heap. If static_field annotations are present,
+    // emit a compile error instead of silently ignoring them.
+    for f in &vable_fields {
+        if f.static_field_index.is_some() {
+            return syn::Error::new_spanned(
+                &f.ident,
+                "#[vable(static_field = N)] is no longer supported in VirtualizableState. \
+                 Heap is the single source of truth; use heap accessors instead.",
+            )
+            .to_compile_error();
+        }
+    }
+
     let frame_field = vable_fields
         .iter()
         .find(|f| f.role == VableRole::Frame)
@@ -507,7 +522,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .unwrap_or_else(|| format_ident!("frame"));
 
     // Pure VirtualizableInfo delegation (RPython parity).
-    // Heap is the single source of truth — no state-backed fields to override.
+    // Heap is the single source of truth — no state-backed fields.
     // All read/write goes through VirtualizableInfo which handles field types.
     quote! {
         impl #struct_name {
