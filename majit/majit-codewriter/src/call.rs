@@ -163,7 +163,6 @@ impl CallControl {
     /// RPython: method graphs are reachable through funcptr._obj.graph
     /// linkage — we emulate this by dual registration.
     pub fn register_trait_method(&mut self, method_name: &str, impl_type: &str, graph: MajitGraph) {
-        // Register in trait-specific lookup
         self.trait_method_graphs.insert(
             (method_name.to_string(), impl_type.to_string()),
             graph.clone(),
@@ -172,11 +171,13 @@ impl CallControl {
             .entry(method_name.to_string())
             .or_default()
             .push(impl_type.to_string());
-        // Also register in function_graphs for BFS reachability.
-        // RPython: funcptr._obj.graph makes method graphs discoverable
-        // through the same mechanism as free functions.
-        let synthetic_path = CallPath::from_segments([method_name]);
-        self.function_graphs.entry(synthetic_path).or_insert(graph);
+        // Register in function_graphs for BFS reachability.
+        // RPython: each graph has its own identity via funcptr._obj.graph.
+        // We emulate this with CallPath([impl_type, method_name]) —
+        // each impl gets its own distinct path, preventing name collisions
+        // (e.g. PyFrame::push_value vs MIFrame::push_value).
+        let qualified_path = CallPath::from_segments([impl_type, method_name]);
+        self.function_graphs.entry(qualified_path).or_insert(graph);
     }
 
     /// Mark a target as the portal entry point.
@@ -393,8 +394,11 @@ impl CallControl {
     /// Convert a CallTarget to a CallPath for lookup.
     ///
     /// FunctionPath → direct path.
-    /// Method → synthetic CallPath([method_name]) (registered by register_trait_method).
-    /// If the method doesn't resolve, returns None.
+    /// Method → qualified CallPath([impl_type, method_name]).
+    ///
+    /// RPython: graph identity is by object pointer, not name.
+    /// We emulate this with qualified paths that include the impl type,
+    /// so different impls of the same method get distinct paths.
     fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
             CallTarget::FunctionPath { segments } => {
@@ -404,15 +408,10 @@ impl CallControl {
                 name,
                 receiver_root,
             } => {
-                // Check if this method resolves to a known impl
-                if self
-                    .resolve_method(name, receiver_root.as_deref())
-                    .is_some()
-                {
-                    Some(CallPath::from_segments([name.as_str()]))
-                } else {
-                    None
-                }
+                // resolve_method finds the concrete impl type.
+                // We use that type to build a qualified path.
+                let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
+                Some(CallPath::from_segments([impl_type, name.as_str()]))
             }
             CallTarget::UnsupportedExpr => None,
         }
@@ -462,6 +461,38 @@ impl CallControl {
                 .get(&(name.to_string(), impl_type.clone()));
         }
 
+        None
+    }
+
+    /// Like `resolve_method`, but returns the impl type name instead of the graph.
+    /// Used by `target_to_path` to build qualified CallPaths.
+    /// Like `resolve_method`, but returns the impl type name.
+    /// All returned references borrow from `self`, not from `receiver_root`.
+    fn resolve_method_impl_type<'b>(
+        &'b self,
+        name: &str,
+        receiver_root: Option<&str>,
+    ) -> Option<&'b str> {
+        let impls = self.trait_method_impls.get(name)?;
+        let concrete_impls: Vec<&String> = impls
+            .iter()
+            .filter(|t| !t.starts_with("<default methods of"))
+            .collect();
+
+        if concrete_impls.len() == 1 {
+            return Some(concrete_impls[0]);
+        }
+        if let Some(receiver) = receiver_root {
+            if !is_generic_receiver(receiver) {
+                // Find the matching impl owned by self
+                if let Some(impl_name) = impls.iter().find(|t| t.as_str() == receiver) {
+                    return Some(impl_name);
+                }
+            }
+        }
+        if concrete_impls.is_empty() && impls.len() == 1 {
+            return Some(&impls[0]);
+        }
         None
     }
 
