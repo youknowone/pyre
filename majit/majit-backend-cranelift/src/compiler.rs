@@ -2489,7 +2489,7 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut current_inputs = inputs.to_vec();
     loop {
-        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+        let (fail_index, outputs, handle, force_frame, direct_descr) = run_compiled_code(
             target.code_ptr,
             &target.fail_descrs,
             target.gc_runtime_id,
@@ -2513,7 +2513,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             );
         }
 
-        let fail_descr = &target.fail_descrs[fail_index as usize];
+        let fail_descr_arc =
+            direct_descr.unwrap_or_else(|| target.fail_descrs[fail_index as usize].clone());
+        let fail_descr = &fail_descr_arc;
         let _fail_count = fail_descr.increment_fail_count();
         ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
@@ -2920,7 +2922,7 @@ fn call_assembler_fast_path_heap(
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
     let actual_outputs = target.max_output_slots.max(1);
-    let (fail_index, outputs, handle, _force_frame) = run_compiled_code(
+    let (fail_index, outputs, handle, _force_frame, _direct_descr) = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
         target.gc_runtime_id,
@@ -4586,7 +4588,13 @@ fn run_compiled_code(
     max_output_slots: usize,
     inputs: &[i64],
     needs_force_frame: bool,
-) -> (u32, Vec<i64>, u64, Option<Arc<ActiveForceFrame>>) {
+) -> (
+    u32,
+    Vec<i64>,
+    u64,
+    Option<Arc<ActiveForceFrame>>,
+    Option<Arc<CraneliftFailDescr>>,
+) {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
     let depth = max_output_slots.max(inputs.len()).max(1);
@@ -4679,16 +4687,26 @@ fn run_compiled_code(
     // (nursery) jf_ptr, but the jitframe has been forwarded to old gen.
     let result_jf = jitframe_resolve(result_jf);
 
-    // llmodel.py:412-420 get_latest_descr: read jf_descr from returned frame.
+    // llmodel.py:412-420 get_latest_descr: read jf_descr pointer from frame.
+    // RPython stores actual descr object pointer in jf_descr field and
+    // retrieves it via get_latest_descr() — no index lookup needed.
+    // We extract both the integer fail_index (for sentinel checks) and
+    // the Arc pointer (for direct descr propagation).
     let result_jf = result_jf;
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-        CALL_ASSEMBLER_DEADFRAME_SENTINEL
+    let (fail_index, direct_descr) = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+        (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
     } else if jf_descr_raw == 0 {
-        0u32
+        (0u32, None)
     } else {
-        unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
+        let descr_ptr = jf_descr_raw as *const CraneliftFailDescr;
+        let fi = unsafe { &*descr_ptr }.fail_index();
+        let arc = fail_descrs
+            .iter()
+            .find(|d| Arc::as_ptr(d) as usize == jf_descr_raw as usize)
+            .cloned();
+        (fi, arc)
     };
 
     // llgraph/runner.py:1184-1191 — bridge dispatch.
@@ -4725,7 +4743,7 @@ fn run_compiled_code(
             // llgraph/runner.py:1191: raise Jump(target, values)
             // run_compiled_code handles nested bridges internally via
             // its own bridge dispatch check (recursive).
-            let (b_fi, b_out, _b_handle, _b_ff) = run_compiled_code(
+            let (b_fi, b_out, _b_handle, _b_ff, b_descr) = run_compiled_code(
                 bridge.code_ptr,
                 &bridge.fail_descrs,
                 bridge.gc_runtime_id,
@@ -4736,7 +4754,7 @@ fn run_compiled_code(
             );
 
             drop(_jitted_guard);
-            return (b_fi, b_out, handle, force_frame);
+            return (b_fi, b_out, handle, force_frame, b_descr);
         }
     }
 
@@ -4746,7 +4764,7 @@ fn run_compiled_code(
     }
 
     drop(_jitted_guard);
-    (fail_index, outputs, handle, force_frame)
+    (fail_index, outputs, handle, force_frame, direct_descr)
 }
 
 struct GuardInfo {
@@ -5078,7 +5096,7 @@ impl CraneliftBackend {
         // code buffer. Avoids stack growth on repeated bridge → re-enter cycles.
         let mut current_inputs = inputs.to_vec();
         loop {
-            let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
+            let (fail_index, mut outputs, handle, force_frame, direct_descr) = run_compiled_code(
                 compiled.code_ptr,
                 &compiled.fail_descrs,
                 compiled.gc_runtime_id,
@@ -5104,10 +5122,13 @@ impl CraneliftBackend {
                 );
             }
 
-            // Bridge guard failures may return fail_index values from
-            // the bridge's fail_descrs namespace, not the parent loop's.
-            // When fail_index is out of range, search attached bridges.
-            let fail_descr = if (fail_index as usize) < compiled.fail_descrs.len() {
+            // RPython jf_descr parity: use the direct descr pointer from
+            // jf_descr when available (same as RPython's get_latest_descr()).
+            // Fall back to index lookup only for sentinel values (0,
+            // CALL_ASSEMBLER_DEADFRAME_SENTINEL) where direct_descr is None.
+            let fail_descr = if let Some(descr) = direct_descr {
+                descr
+            } else if (fail_index as usize) < compiled.fail_descrs.len() {
                 compiled.fail_descrs[fail_index as usize].clone()
             } else {
                 let found = compiled.fail_descrs.iter().find_map(|d| {
@@ -5222,7 +5243,7 @@ impl CraneliftBackend {
         let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
         let bridge_inputs = &parent_outputs[..num_bridge_inputs];
 
-        let (fail_index, outputs, handle, force_frame) = run_compiled_code(
+        let (fail_index, outputs, handle, force_frame, direct_descr) = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
             bridge.gc_runtime_id,
@@ -5246,7 +5267,9 @@ impl CraneliftBackend {
             );
         }
 
-        let fail_descr = &bridge.fail_descrs[fail_index as usize];
+        let fail_descr_arc =
+            direct_descr.unwrap_or_else(|| bridge.fail_descrs[fail_index as usize].clone());
+        let fail_descr = &fail_descr_arc;
 
         // RPython parity: FINISH exits in bridges return directly,
         // just like in execute_with_inputs. Without this, the FINISH
@@ -9872,7 +9895,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        let (fail_index, mut outputs, handle, force_frame) = run_compiled_code(
+        let (fail_index, mut outputs, handle, force_frame, direct_descr) = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
@@ -9947,7 +9970,9 @@ impl majit_backend::Backend for CraneliftBackend {
             };
         }
 
-        let fail_descr = &compiled.fail_descrs[fail_index as usize];
+        let fail_descr_arc =
+            direct_descr.unwrap_or_else(|| compiled.fail_descrs[fail_index as usize].clone());
+        let fail_descr = &fail_descr_arc;
         fail_descr.increment_fail_count();
 
         // If a bridge is attached, dispatch to it.
