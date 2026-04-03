@@ -441,6 +441,8 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) result_type: Type,
     /// Helper function pointers that box raw ints into interpreter objects.
     pub(crate) raw_int_box_helpers: HashSet<i64>,
+    /// W_IntObject.intval field descriptor for unboxing Ref→Int in FINISH.
+    pub(crate) intval_descr: Option<majit_ir::DescrRef>,
     /// Helper function pointers that take a raw int argument and return a
     /// raw-int result when the callee's Finish protocol is raw.
     pub(crate) raw_int_force_helpers: HashSet<i64>,
@@ -819,6 +821,7 @@ impl<M: Clone> MetaInterp<M> {
             forced_virtualizable: None,
             result_type: Type::Ref,
             raw_int_box_helpers: HashSet::new(),
+            intval_descr: None,
             raw_int_force_helpers: HashSet::new(),
             create_frame_raw_map: HashMap::new(),
             tracing_call_depth: None,
@@ -6891,6 +6894,11 @@ impl<M: Clone> MetaInterp<M> {
     /// that are safe to peel away for the raw-int call_assembler protocol.
     pub fn register_raw_int_box_helper(&mut self, helper: *const ()) {
         self.raw_int_box_helpers.insert(helper as i64);
+    }
+
+    /// Set the W_IntObject.intval field descriptor for Ref→Int unboxing in FINISH.
+    pub fn set_intval_descr(&mut self, descr: majit_ir::DescrRef) {
+        self.intval_descr = Some(descr);
     }
 
     /// Register a recursive force helper that takes a raw-int argument and
