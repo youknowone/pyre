@@ -6043,9 +6043,11 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardClass => {
-                    // pyre's tracing extracts ob_type via GetfieldGcPureI BEFORE
-                    // the guard, so arg0 IS the ob_type value (not the object).
+                    // pyre convention: GuardClass arg0 is the ob_type value
+                    // (already extracted by GetfieldGcPureI or constant-folded).
                     // Direct comparison: ob_type == expected_class.
+                    // Note: GuardNonnullClass takes the OBJECT as arg0 and the
+                    // backend loads ob_type. GuardClass is always post-extraction.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
