@@ -1307,26 +1307,103 @@ impl OptContext {
         {
             return;
         }
-        // optimizer.py:429-431 + info.py:194-198,533-538: copy_fields_to_const
-        // Preserve heap cache fields from the existing PtrInfo onto the
-        // const's info. Covers AbstractStructPtrInfo hierarchy (Instance,
-        // Struct, Virtual, VirtualStruct) and ArrayPtrInfo (Array, VirtualArray,
-        // VirtualArrayStruct).
+        // optimizer.py:429-431 + info.py:194-198,533-538,718-736:
+        // copy_fields_to_const — create a concrete (non-virtual) info on
+        // the const and copy only the field/item cache.
+        // ConstPtrInfo._get_info → StructPtrInfo(descr)
+        // ConstPtrInfo._get_array_info → ArrayPtrInfo(descr)
         if let Value::Ref(gcref) = value {
             if let Some(Forwarded::Info(info)) = self.forwarded.get(replaced.0 as usize) {
-                use crate::optimizeopt::info::PtrInfo;
-                let has_cached_fields = match info {
-                    PtrInfo::Instance(v) => !v.fields.is_empty(),
-                    PtrInfo::Struct(v) => !v.fields.is_empty(),
-                    PtrInfo::Virtual(v) => !v.fields.is_empty(),
-                    PtrInfo::VirtualStruct(v) => !v.fields.is_empty(),
-                    PtrInfo::Array(v) => !v.items.is_empty(),
-                    PtrInfo::VirtualArray(v) => !v.items.is_empty(),
-                    PtrInfo::VirtualArrayStruct(v) => !v.element_fields.is_empty(),
-                    _ => false,
-                };
-                if has_cached_fields {
-                    self.const_infos.insert(gcref.as_usize(), info.clone());
+                use crate::optimizeopt::info::{ArrayPtrInfo, PtrInfo, StructPtrInfo};
+                let key = gcref.as_usize();
+                match info {
+                    // AbstractStructPtrInfo hierarchy → concrete StructPtrInfo
+                    PtrInfo::Instance(v) if !v.fields.is_empty() => {
+                        if let Some(descr) = v.descr.clone() {
+                            let ci = self.const_infos.entry(key).or_insert_with(|| {
+                                PtrInfo::Struct(StructPtrInfo {
+                                    descr,
+                                    fields: Vec::new(),
+                                    field_descrs: Vec::new(),
+                                    preamble_fields: Vec::new(),
+                                    last_guard_pos: -1,
+                                })
+                            });
+                            if let PtrInfo::Struct(s) = ci {
+                                s.fields = v.fields.clone();
+                            }
+                        }
+                    }
+                    PtrInfo::Struct(v) if !v.fields.is_empty() => {
+                        let ci = self.const_infos.entry(key).or_insert_with(|| {
+                            PtrInfo::Struct(StructPtrInfo {
+                                descr: v.descr.clone(),
+                                fields: Vec::new(),
+                                field_descrs: Vec::new(),
+                                preamble_fields: Vec::new(),
+                                last_guard_pos: -1,
+                            })
+                        });
+                        if let PtrInfo::Struct(s) = ci {
+                            s.fields = v.fields.clone();
+                        }
+                    }
+                    PtrInfo::Virtual(v) if !v.fields.is_empty() => {
+                        let ci = self.const_infos.entry(key).or_insert_with(|| {
+                            PtrInfo::Struct(StructPtrInfo {
+                                descr: v.descr.clone(),
+                                fields: Vec::new(),
+                                field_descrs: Vec::new(),
+                                preamble_fields: Vec::new(),
+                                last_guard_pos: -1,
+                            })
+                        });
+                        if let PtrInfo::Struct(s) = ci {
+                            s.fields = v.fields.clone();
+                        }
+                    }
+                    PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
+                        let ci = self.const_infos.entry(key).or_insert_with(|| {
+                            PtrInfo::Struct(StructPtrInfo {
+                                descr: v.descr.clone(),
+                                fields: Vec::new(),
+                                field_descrs: Vec::new(),
+                                preamble_fields: Vec::new(),
+                                last_guard_pos: -1,
+                            })
+                        });
+                        if let PtrInfo::Struct(s) = ci {
+                            s.fields = v.fields.clone();
+                        }
+                    }
+                    // ArrayPtrInfo hierarchy → concrete ArrayPtrInfo
+                    PtrInfo::Array(v) if !v.items.is_empty() => {
+                        let ci = self.const_infos.entry(key).or_insert_with(|| {
+                            PtrInfo::Array(ArrayPtrInfo {
+                                descr: v.descr.clone(),
+                                lenbound: v.lenbound.clone(),
+                                items: Vec::new(),
+                                last_guard_pos: -1,
+                            })
+                        });
+                        if let PtrInfo::Array(a) = ci {
+                            a.items = v.items.clone();
+                        }
+                    }
+                    PtrInfo::VirtualArray(v) if !v.items.is_empty() => {
+                        let ci = self.const_infos.entry(key).or_insert_with(|| {
+                            PtrInfo::Array(ArrayPtrInfo {
+                                descr: v.descr.clone(),
+                                lenbound: IntBound::from_constant(v.items.len() as i64),
+                                items: Vec::new(),
+                                last_guard_pos: -1,
+                            })
+                        });
+                        if let PtrInfo::Array(a) = ci {
+                            a.items = v.items.clone();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
