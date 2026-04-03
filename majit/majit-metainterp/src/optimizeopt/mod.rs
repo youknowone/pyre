@@ -556,6 +556,11 @@ impl OptContext {
         {
             self.next_pos += 1;
         }
+        debug_assert!(
+            self.next_pos < OpRef::CONST_BASE,
+            "reserve_pos in constant namespace: {}",
+            self.next_pos
+        );
         let pos_ref = OpRef(self.next_pos);
         self.next_pos += 1;
         pos_ref
