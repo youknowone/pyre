@@ -146,7 +146,7 @@ pub struct Transformer<'a> {
     /// When present, `rewrite_op_direct_call` uses `guess_call_kind()`
     /// to dispatch to handle_regular_call / handle_residual_call /
     /// handle_builtin_call / handle_recursive_call.
-    callcontrol: Option<&'a crate::call::CallControl>,
+    callcontrol: Option<&'a mut crate::call::CallControl>,
     /// RPython: `Transformer.__init__` config for virtualizable lowering.
     config: &'a GraphTransformConfig,
     /// RPython: `Transformer.vable_array_vars`.
@@ -194,7 +194,7 @@ impl<'a> Transformer<'a> {
 
     /// Set the CallControl for call kind dispatch.
     /// RPython: `Transformer.__init__(callcontrol=...)`.
-    pub fn with_callcontrol(mut self, cc: &'a crate::call::CallControl) -> Self {
+    pub fn with_callcontrol(mut self, cc: &'a mut crate::call::CallControl) -> Self {
         self.callcontrol = Some(cc);
         self
     }
@@ -491,7 +491,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
-        if let Some(cc) = self.callcontrol {
+        if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(target);
             return match kind {
                 crate::call::CallKind::Regular => {
@@ -604,9 +604,16 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // RPython jtransform.py:477-478: get_jitcode(targetgraph)
+        let jitcode_index = if let Some(cc) = self.callcontrol.as_mut() {
+            let path = target_to_call_path(target);
+            cc.get_jitcode(&path)
+        } else {
+            0 // fallback for config-only mode
+        };
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {target} → inline_call"),
+            detail: format!("call {target} → inline_call[jitcode={jitcode_index}]"),
         });
         self.calls_classified += 1;
         // RPython jtransform.py:480-481: inline_call always followed by -live-
@@ -614,6 +621,7 @@ impl<'a> Transformer<'a> {
             Op {
                 result: op.result,
                 kind: OpKind::InlineCall {
+                    jitcode_index,
                     target: target.clone(),
                     args: args.to_vec(),
                     result_ty: result_ty.clone(),
@@ -638,19 +646,30 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // RPython jtransform.py:522-534: jitdriver_sd.index + green/red layout
+        // Currently we use jd_index=0 (single jitdriver).
+        let jd_index = 0usize;
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {target} → recursive_call"),
+            detail: format!("call {target} → recursive_call[jd={jd_index}]"),
         });
         self.calls_classified += 1;
-        RewriteResult::Replace(vec![Op {
-            result: op.result,
-            kind: OpKind::RecursiveCall {
-                target: target.clone(),
-                args: args.to_vec(),
-                result_ty: result_ty.clone(),
+        // RPython jtransform.py:533: recursive_call followed by -live-
+        RewriteResult::Replace(vec![
+            Op {
+                result: op.result,
+                kind: OpKind::RecursiveCall {
+                    jd_index,
+                    target: target.clone(),
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
             },
-        }])
+            Op {
+                result: None,
+                kind: OpKind::Live,
+            },
+        ])
     }
 
     /// RPython: `Transformer.handle_residual_call(op)`.
@@ -741,6 +760,17 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Live,
             },
         ])
+    }
+}
+
+/// Convert a CallTarget to a CallPath for jitcode lookup.
+fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
+    match target {
+        CallTarget::FunctionPath { segments } => {
+            crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
+        }
+        CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
+        CallTarget::UnsupportedExpr => crate::parse::CallPath::from_segments(["<unsupported>"]),
     }
 }
 
@@ -913,10 +943,12 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty: result_ty.clone(),
         },
         OpKind::InlineCall {
+            jitcode_index,
             target,
             args,
             result_ty,
         } => OpKind::InlineCall {
+            jitcode_index: *jitcode_index,
             target: target.clone(),
             args: args
                 .iter()
@@ -926,10 +958,12 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_ty: result_ty.clone(),
         },
         OpKind::RecursiveCall {
+            jd_index,
             target,
             args,
             result_ty,
         } => OpKind::RecursiveCall {
+            jd_index: *jd_index,
             target: target.clone(),
             args: args
                 .iter()

@@ -229,14 +229,22 @@ pub enum OpKind {
     /// Inline call — callee is a regular candidate, meta-interpreter descends
     /// into its JitCode at runtime.
     /// RPython: `inline_call_ir_i` / `inline_call_r_v` etc.
+    ///
+    /// `jitcode_index`: index into CallControl.jitcodes, referencing
+    /// the callee's assembled JitCode. RPython jtransform.py:478-480.
     InlineCall {
+        jitcode_index: usize,
         target: CallTarget,
         args: Vec<ValueId>,
         result_ty: ValueType,
     },
     /// Recursive call — back to the portal entry point.
     /// RPython: `recursive_call_i` etc.
+    ///
+    /// `jd_index`: jitdriver index (RPython: jitdriver_sd.index).
+    /// RPython jtransform.py:522-534.
     RecursiveCall {
+        jd_index: usize,
         target: CallTarget,
         args: Vec<ValueId>,
         result_ty: ValueType,
