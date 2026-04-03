@@ -140,14 +140,20 @@ const FLOAT_ARITH_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["w_float_sub"]),
 ];
 
-const LOCAL_READ_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "push_value",
-    receiver_root: Some("PyFrame"),
-}];
+const LOCAL_READ_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "load_local_value",
+        receiver_root: None,
+    },
+    CallTargetPattern::Method {
+        name: "load_local_checked_value",
+        receiver_root: None,
+    },
+];
 
 const LOCAL_WRITE_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "pop_value",
-    receiver_root: Some("PyFrame"),
+    name: "store_local_value",
+    receiver_root: None,
 }];
 
 const FUNCTION_INVOKE_TARGETS: &[CallTargetPattern] = &[
@@ -262,10 +268,27 @@ const ITER_CLEANUP_TARGETS: &[CallTargetPattern] = &[
     },
 ];
 
-const RETURN_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
-    name: "return_value",
-    receiver_root: Some("PyFrame"),
-}];
+const JUMP_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "set_next_instr",
+        receiver_root: None,
+    },
+    CallTargetPattern::Method {
+        name: "fallthrough_target",
+        receiver_root: None,
+    },
+];
+
+const RETURN_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::Method {
+        name: "return_value",
+        receiver_root: Some("PyFrame"),
+    },
+    CallTargetPattern::Method {
+        name: "return_value",
+        receiver_root: None,
+    },
+];
 
 const BUILD_LIST_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::Method {
     name: "build_list",
@@ -366,6 +389,10 @@ pub(crate) fn is_range_iter_next_target(target: &CallTarget) -> bool {
 
 pub(crate) fn is_iter_cleanup_target(target: &CallTarget) -> bool {
     matches_any(target, ITER_CLEANUP_TARGETS)
+}
+
+pub(crate) fn is_jump_target(target: &CallTarget) -> bool {
+    matches_any(target, JUMP_TARGETS)
 }
 
 pub(crate) fn is_return_target(target: &CallTarget) -> bool {
