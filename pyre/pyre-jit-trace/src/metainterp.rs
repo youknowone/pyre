@@ -407,9 +407,13 @@ impl PyreMetaInterp {
             }
         }
 
-        // Push concrete result to parent's owned PyFrame
-        if let Some(ref mut pcf) = parent.owned_concrete_frame {
-            pcf.push(concrete_result);
+        // Keep concrete stack in sync only for inline parents.
+        // Root frames are traced symbolically against a snapshot and are
+        // not concrete-stepped instruction-by-instruction.
+        if parent.is_inline() {
+            if let Some(ref mut pcf) = parent.owned_concrete_frame {
+                pcf.push(concrete_result);
+            }
         }
 
         // No pending_concrete_push needed — concrete_stack[result_idx] already updated above.
