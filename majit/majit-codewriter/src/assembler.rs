@@ -141,21 +141,50 @@ mod tests {
 
     #[test]
     fn assemble_with_registers() {
-        let mut flat = FlattenedFunction {
+        use crate::graph::{Op, OpKind, ValueType};
+        let flat = FlattenedFunction {
             name: "add".into(),
-            ops: vec![],
+            ops: vec![
+                FlatOp::Op(Op {
+                    result: Some(ValueId(0)),
+                    kind: OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Int,
+                    },
+                }),
+                FlatOp::Op(Op {
+                    result: Some(ValueId(1)),
+                    kind: OpKind::BinOp {
+                        op: "add".into(),
+                        lhs: ValueId(0),
+                        rhs: ValueId(0),
+                        result_ty: ValueType::Int,
+                    },
+                }),
+                FlatOp::Op(Op {
+                    result: Some(ValueId(2)),
+                    kind: OpKind::Input {
+                        name: "r".into(),
+                        ty: ValueType::Ref,
+                    },
+                }),
+            ],
             num_values: 3,
             num_blocks: 1,
-            value_kinds: HashMap::new(),
+            value_kinds: {
+                let mut m = HashMap::new();
+                m.insert(ValueId(0), RegKind::Int);
+                m.insert(ValueId(1), RegKind::Int);
+                m.insert(ValueId(2), RegKind::Ref);
+                m
+            },
         };
-        flat.value_kinds.insert(ValueId(0), RegKind::Int);
-        flat.value_kinds.insert(ValueId(1), RegKind::Int);
-        flat.value_kinds.insert(ValueId(2), RegKind::Ref);
 
         let regallocs = regalloc::perform_all_register_allocations(&flat);
         let mut asm = Assembler::new();
         let jitcode = asm.assemble(&flat, &regallocs);
 
+        // v0 and v1 interfere (v1 uses v0), so they need different regs
         assert_eq!(jitcode.num_regs_i, 2);
         assert_eq!(jitcode.num_regs_r, 1);
         assert_eq!(jitcode.num_regs_f, 0);
