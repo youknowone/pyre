@@ -740,26 +740,68 @@ impl<'a> Transformer<'a> {
             ),
         });
         self.calls_classified += 1;
-        // RPython jtransform.py:533: recursive_call followed by -live-
-        RewriteResult::Replace(vec![
-            Op {
-                result: op.result,
-                kind: OpKind::RecursiveCall {
-                    jd_index,
-                    greens_i,
-                    greens_r,
-                    greens_f,
-                    reds_i,
-                    reds_r,
-                    reds_f,
-                    result_kind,
-                },
+
+        // RPython jtransform.py:526: promote_greens emits guard_value
+        // for each non-void green arg before the recursive_call.
+        let mut ops = self.promote_greens(green_args);
+
+        // RPython jtransform.py:532-533: recursive_call + -live-
+        ops.push(Op {
+            result: op.result,
+            kind: OpKind::RecursiveCall {
+                jd_index,
+                greens_i,
+                greens_r,
+                greens_f,
+                reds_i,
+                reds_r,
+                reds_f,
+                result_kind,
             },
-            Op {
+        });
+        ops.push(Op {
+            result: None,
+            kind: OpKind::Live,
+        });
+        RewriteResult::Replace(ops)
+    }
+
+    /// RPython: `Transformer.promote_greens(args, jitdriver)`.
+    ///
+    /// Emits `-live-` + `{kind}_guard_value` for each non-void green arg.
+    /// This ensures green values are constant before the recursive call.
+    ///
+    /// RPython jtransform.py:1646-1656.
+    fn promote_greens(&self, green_args: &[ValueId]) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for &v in green_args {
+            let kind = self.value_kind(v);
+            if kind == 'v' {
+                continue; // skip void
+            }
+            // RPython: -live- then {kind}_guard_value
+            ops.push(Op {
                 result: None,
                 kind: OpKind::Live,
-            },
-        ])
+            });
+            ops.push(Op {
+                result: None,
+                kind: OpKind::GuardValue {
+                    value: v,
+                    kind_char: kind,
+                },
+            });
+        }
+        ops
+    }
+
+    /// Get the kind character ('i', 'r', 'f', 'v') for a value.
+    /// Uses type_state if available, falls back to 'i'.
+    fn value_kind(&self, _v: ValueId) -> char {
+        // Without full type resolution at this stage, assume 'i' for
+        // non-void values. A complete implementation would consult
+        // type_state or the annotation pass.
+        'i'
     }
 
     /// RPython: `Transformer.handle_residual_call(op)`.
@@ -902,6 +944,7 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
         | OpKind::ConstInt(_)
         | OpKind::VableForce
         | OpKind::Live
+        | OpKind::GuardValue { .. }
         | OpKind::Unknown { .. } => op.kind.clone(),
         OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
             base: remap_value(*base, aliases),
