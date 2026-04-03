@@ -2526,8 +2526,17 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.recorder.snapshots().to_vec();
-        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs, _sbt) =
-            snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &mut constant_types);
+        let (
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_frame_pcs,
+            snapshot_box_types,
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.recorder.unfinalize();
@@ -2570,6 +2579,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_frame_pcs,
+                    snapshot_box_types.clone(),
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -2599,6 +2609,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_frame_pcs,
+                    snapshot_box_types,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -5324,6 +5335,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
         snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
         snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+        snapshot_box_types: HashMap<u32, Type>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -5343,6 +5355,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        // RPython Box.type parity: snapshot_box_types maps OpRef→Type for
+        // boxes captured in trace snapshots. Without this, bridge optimizer
+        // cannot resolve types for OpRefs in store_final_boxes_in_guard.
+        optimizer.snapshot_box_types = snapshot_box_types;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
