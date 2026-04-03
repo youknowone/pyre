@@ -502,108 +502,100 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         .find(|f| f.role == VableRole::Frame)
         .map(|f| &f.ident);
 
-    // State-backed fields: those with static_field = N.
+    let frame_ident = frame_field
+        .cloned()
+        .unwrap_or_else(|| format_ident!("frame"));
+
+    // State-backed fields: those mirrored in self (static_field = N).
     let state_backed: Vec<(&Ident, usize)> = vable_fields
         .iter()
         .filter_map(|f| f.static_field_index.map(|idx| (&f.ident, idx)))
         .collect();
 
-    let frame_ident = frame_field
-        .cloned()
-        .unwrap_or_else(|| format_ident!("frame"));
-
-    // ── export_static_boxes: build Vec<i64> in VirtualizableInfo field order ──
-    // State-backed fields → read from self.
-    // Heap-only fields → read from frame via VirtualizableInfo offset.
-    let export_state_arms: Vec<TokenStream> = state_backed
+    // ── export: read ALL fields from heap via info, override state-backed ──
+    // RPython parity: read_boxes() reads all fields from the virtualizable
+    // heap object.  State-backed fields may be more up-to-date than heap,
+    // so we patch those positions after the bulk read.
+    let export_overrides: Vec<TokenStream> = state_backed
         .iter()
         .map(|(ident, idx)| {
-            quote! { #idx => self.#ident as i64, }
+            quote! { __boxes[#idx] = self.#ident as i64; }
         })
         .collect();
 
-    // ── import_static_boxes: write state-backed fields from boxes ──
-    // Fail if any required field is missing (RPython read_boxes parity).
-    let import_checks: Vec<TokenStream> = state_backed
+    // ── import: validate total length, write state-backed fields ──
+    // RPython parity: write_from_resume_data_partial() iterates ALL
+    // declared fields.  If static_boxes is shorter than num_fields(),
+    // the resume-data is corrupt and we must reject it.
+    let import_writes: Vec<TokenStream> = state_backed
         .iter()
         .map(|(ident, idx)| {
-            quote! {
-                let Some(&__v) = static_boxes.get(#idx) else {
-                    return false;
-                };
-                self.#ident = __v as usize;
-            }
+            quote! { self.#ident = static_boxes[#idx] as usize; }
         })
         .collect();
 
     quote! {
         impl #struct_name {
-            /// Export all virtualizable static field values as i64.
+            /// Read all virtualizable static boxes (RPython: read_boxes).
             ///
-            /// State-backed fields (annotated with `#[vable(static_field = N)]`)
-            /// are read from `self`. Heap-only fields are read from the frame
-            /// via VirtualizableInfo field offsets.
+            /// Reads ALL fields from the heap via `info.read_boxes()`,
+            /// then overrides state-backed positions with values from `self`.
+            /// Type handling (Int/Ref/Float) is delegated to VirtualizableInfo.
             pub fn virt_export_static_boxes(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Vec<i64> {
-                let n = info.num_fields();
-                let heap_ptr = if self.#frame_ident != 0 {
-                    Some(self.#frame_ident as *const u8)
+                let heap_ptr = self.#frame_ident as *const u8;
+                let mut __boxes = if !heap_ptr.is_null() {
+                    unsafe { info.read_boxes(heap_ptr) }
                 } else {
-                    None
+                    vec![0i64; info.num_fields()]
                 };
-                let mut boxes = Vec::with_capacity(n);
-                for __i in 0..n {
-                    let val: i64 = match __i {
-                        #(#export_state_arms)*
-                        _ => {
-                            // Heap-only: read from frame via offset.
-                            heap_ptr.map_or(0, |ptr| unsafe {
-                                *(ptr.add(info.static_fields[__i].offset) as *const usize) as i64
-                            })
-                        }
-                    };
-                    boxes.push(val);
-                }
-                boxes
+                // State-backed fields override heap values.
+                #(#export_overrides)*
+                __boxes
             }
 
-            /// Import virtualizable static field values from boxes.
+            /// Write state-backed fields from static boxes
+            /// (RPython: write_from_resume_data_partial, static part).
             ///
-            /// Only writes state-backed fields. Heap-only (immutable) fields
-            /// are skipped. Returns false if any required field is missing.
-            pub fn virt_import_static_boxes(&mut self, static_boxes: &[i64]) -> bool {
-                #(#import_checks)*
+            /// Validates that `static_boxes` covers all declared fields.
+            /// Returns false on short/corrupt resume-data.
+            pub fn virt_import_static_boxes(
+                &mut self,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
+                static_boxes: &[i64],
+            ) -> bool {
+                if static_boxes.len() < info.num_fields() {
+                    return false;
+                }
+                #(#import_writes)*
                 true
             }
 
-            /// Export full virtualizable state: (static_boxes, array_boxes).
+            /// Read all virtualizable boxes (RPython: read_all_boxes).
             ///
-            /// Reads state-backed fields from self, heap-only fields and arrays
-            /// from the frame.
+            /// Reads static + array fields from heap, overrides state-backed
+            /// static positions with values from `self`.
             pub fn virt_export_all(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> (Vec<i64>, Vec<Vec<i64>>) {
-                let static_boxes = self.virt_export_static_boxes(info);
-                let heap_ptr = if self.#frame_ident != 0 {
-                    Some(self.#frame_ident as *const u8)
-                } else {
-                    None
-                };
-                let array_boxes = if let Some(ptr) = heap_ptr {
-                    if info.can_read_all_array_lengths_from_heap() {
-                        let lengths = unsafe { info.read_array_lengths_from_heap(ptr) };
-                        let (_, arrays) = unsafe { info.read_all_boxes(ptr, &lengths) };
-                        arrays
-                    } else {
-                        vec![]
-                    }
+                let heap_ptr = self.#frame_ident as *const u8;
+                if heap_ptr.is_null() {
+                    return (vec![0i64; info.num_fields()], vec![]);
+                }
+                let lengths = if info.can_read_all_array_lengths_from_heap() {
+                    unsafe { info.read_array_lengths_from_heap(heap_ptr) }
                 } else {
                     vec![]
                 };
-                (static_boxes, array_boxes)
+                let (mut __boxes, __arrays) = unsafe {
+                    info.read_all_boxes(heap_ptr, &lengths)
+                };
+                // State-backed fields override heap values.
+                #(#export_overrides)*
+                (__boxes, __arrays)
             }
         }
     }

@@ -7559,8 +7559,9 @@ impl PyreJitState {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) -> bool {
-        // State-backed fields: write from static_boxes.
-        if !self.virt_import_static_boxes(static_boxes) {
+        let info = crate::virtualizable_gen::build_virtualizable_info();
+        // RPython: write_from_resume_data_partial validates full coverage.
+        if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
         }
 
