@@ -8,14 +8,8 @@
 //! ```
 
 pub mod codegen;
-#[cfg(test)]
-pub mod jtransform;
 
 pub use codegen::{
     BinopMapping, CodegenValueKind, IoShim, JitDriverConfig, StorageConfig,
     VirtualizableCodegenConfig, generate_jitcode,
 };
-#[cfg(test)]
-pub use jtransform::transform_all;
-#[cfg(test)]
-pub use jtransform::{LoweringRecipe, TransformConfig, transform_pattern};

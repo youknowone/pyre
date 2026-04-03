@@ -15,7 +15,6 @@ pub mod call;
 mod call_match;
 mod codegen;
 pub mod codewriter;
-mod field_match;
 pub mod front;
 pub mod graph;
 pub mod hints;
@@ -23,12 +22,11 @@ pub mod inline;
 pub mod liveness;
 mod parse;
 pub mod passes;
-mod patterns;
 pub mod regalloc;
 #[cfg(test)]
 mod test_support;
 
-pub use call_match::CallDescriptor;
+pub use call::CallDescriptor;
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
@@ -44,10 +42,6 @@ pub use passes::{
     GraphTransformConfig, GraphTransformResult, Label, PipelineConfig, PipelineOpcodeArm,
     PipelineResult, ProgramPipelineResult, TypeResolutionState, VirtualizableFieldDescriptor,
     analyze_function, analyze_program, annotate_graph, resolve_types, rewrite_graph,
-};
-pub use patterns::{
-    CallPatternRole, CallRoleDescriptor, ClassificationConfig, FieldPatternRole,
-    FieldRoleDescriptor, TracePattern, classify_from_graph, classify_from_graph_with_config,
 };
 
 use serde::{Deserialize, Serialize};
@@ -199,104 +193,28 @@ fn build_canonical_opcode_dispatch(
                 function_graphs,
                 &receiver_traits,
             );
-            // Noop-eligible: arms with ONLY Ok/StepResult/Continue — no Err,
-            // no domain calls. Err/type_error indicate a stub that should stay
-            // Residual, not disappear into Noop.
-            let has_err_call = arm.handler_calls.iter().any(|c| match c {
-                parse::ExtractedHandlerCall::FunctionPath(p) => {
-                    let last = p.segments.last().map(String::as_str).unwrap_or("");
-                    matches!(last, "Err" | "type_error")
-                        || p.segments.iter().any(|s| s == "PyError")
-                }
-                _ => false,
-            });
-            let has_meaningful_calls = arm.handler_calls.iter().any(|c| match c {
-                parse::ExtractedHandlerCall::Method { name, .. } => !matches!(
-                    name.as_str(),
-                    "into" | "map_err" | "unwrap" | "expect" | "as_ref" | "as_usize" | "get"
-                ),
-                parse::ExtractedHandlerCall::FunctionPath(p) => {
-                    let last = p.segments.last().map(String::as_str).unwrap_or("");
-                    !matches!(
-                        last,
-                        "Ok" | "Err"
-                            | "Some"
-                            | "None"
-                            | "into"
-                            | "from"
-                            | "type_error"
-                            | "Continue"
-                    ) && !p
-                        .segments
-                        .iter()
-                        .any(|s| s == "StepResult" || s == "PyError" || s == "u32" || s == "usize")
-                }
-                parse::ExtractedHandlerCall::UnsupportedFunctionExpr => false,
-            });
-            let classified_pattern = if !has_meaningful_calls && !has_err_call {
-                // Only trivial calls (Ok, StepResult) and no error paths — Noop
-                Some(TracePattern::Noop)
-            } else {
-                let from_graph = resolved_calls.iter().find_map(|call| {
-                    classify_resolved_call_graph(call, pipeline_config, function_graphs, 0)
-                });
-                from_graph.or_else(|| {
-                    // RPython: unrecognized operations become residual calls.
-                    // Use the first resolved handler name, or the first handler call.
-                    let helper = resolved_calls
-                        .first()
-                        .map(|c| c.name.clone())
-                        .or_else(|| {
-                            arm.handler_calls.first().and_then(|c| match c {
-                                parse::ExtractedHandlerCall::Method { name, .. } => {
-                                    Some(name.clone())
-                                }
-                                parse::ExtractedHandlerCall::FunctionPath(p) => {
-                                    Some(p.canonical_key())
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    Some(TracePattern::Residual {
-                        helper_name: helper,
-                    })
-                })
-            };
 
-            // RPython-orthodox path: inline → jtransform → flatten
+            // RPython-orthodox path: inline → jtransform → flatten.
+            // For each resolved handler graph, try inlining callee bodies,
+            // then run jtransform + flatten to produce the JitCode-ready
+            // instruction sequence.
             let flattened = resolved_calls.iter().find_map(|resolved| {
                 let graph = resolved.graph.as_ref()?;
                 let mut inlined = graph.clone();
-                let count = inline::inline_graph(&mut inlined, call_control, 3);
-                if count == 0
-                    && inlined.blocks.iter().all(|b| {
-                        b.ops.iter().all(|op| {
-                            matches!(
-                                &op.kind,
-                                graph::OpKind::Input { .. }
-                                    | graph::OpKind::Unknown { .. }
-                                    | graph::OpKind::Call { .. }
-                            )
-                        })
-                    })
-                {
-                    // No inlining happened and graph is trivial — skip
-                    return None;
-                }
+                inline::inline_graph(&mut inlined, call_control, 3);
                 let rewritten = passes::rewrite_graph(&inlined, &pipeline_config.transform);
-                Some(passes::flatten_with_types(
+                let flattened = passes::flatten_with_types(
                     &rewritten.graph,
                     &passes::resolve_types(
                         &rewritten.graph,
                         &passes::annotate_graph(&rewritten.graph),
                     ),
-                ))
+                );
+                Some(flattened)
             });
 
             passes::PipelineOpcodeArm {
                 selector: arm.selector,
-                classified_pattern,
                 flattened,
             }
         })
@@ -304,80 +222,6 @@ fn build_canonical_opcode_dispatch(
 }
 
 /// Classify a resolved call by jtransform-rewriting its graph.
-///
-/// RPython equivalent: the codewriter's transform_graph() + flatten sequence.
-/// When the graph contains a single delegation call to a known free function
-/// (e.g. OpcodeStepExecutor default method → opcode_load_fast_checked),
-/// follow that call chain into function_graphs to find the actual semantic
-/// content — up to MAX_FOLLOW_DEPTH levels.
-const MAX_FOLLOW_DEPTH: usize = 3;
-
-fn classify_resolved_call_graph(
-    call: &ResolvedCall,
-    pipeline_config: &passes::PipelineConfig,
-    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
-    depth: usize,
-) -> Option<TracePattern> {
-    let graph = call.graph.as_ref()?;
-    let rewritten = passes::rewrite_graph(graph, &pipeline_config.transform);
-
-    // Try direct classification on this graph.
-    if let Some(pattern) =
-        patterns::classify_from_graph_with_config(&rewritten.graph, &pipeline_config.classify)
-    {
-        // Noop from a callee graph should not prevent the parent from classifying
-        if depth > 0 && matches!(&pattern, TracePattern::Noop) {
-            return None;
-        }
-        return Some(pattern);
-    }
-
-    // If no pattern matched, follow Call ops into function_graphs.
-    // This handles the common delegation pattern:
-    //   OpcodeStepExecutor::load_fast_checked() → opcode_load_fast_checked()
-    // where the default trait method just delegates to a free function.
-    if depth >= MAX_FOLLOW_DEPTH {
-        return None;
-    }
-
-    // Iterate over the ORIGINAL graph (before jtransform) to find function
-    // calls to follow. The jtransform rewrites Calls → CallResidual etc.,
-    // which would prevent the follow step from reaching callee graphs.
-    for block in &graph.blocks {
-        for op in &block.ops {
-            let segments = match &op.kind {
-                graph::OpKind::Call {
-                    target: graph::CallTarget::FunctionPath { segments },
-                    ..
-                } => Some(segments),
-                _ => None,
-            };
-            let callee_graph = segments.and_then(|segments| {
-                let path = parse::CallPath::from_segments(segments.iter().map(String::as_str));
-                function_graphs.get(&path)
-            });
-
-            if let Some(callee_graph) = callee_graph {
-                let callee_call = ResolvedCall {
-                    name: call.name.clone(),
-                    impl_type: None,
-                    trait_name: None,
-                    graph: Some(callee_graph.clone()),
-                };
-                if let Some(pattern) = classify_resolved_call_graph(
-                    &callee_call,
-                    pipeline_config,
-                    function_graphs,
-                    depth + 1,
-                ) {
-                    return Some(pattern);
-                }
-            }
-        }
-    }
-
-    None
-}
 
 fn resolve_handler_calls(
     handler_calls: &[parse::ExtractedHandlerCall],
@@ -657,7 +501,7 @@ mod tests {
             eprintln!(
                 "  [{i}] {} → {:?}",
                 arm.selector.canonical_key(),
-                arm.classified_pattern
+                arm.flattened.as_ref().map(|f| f.ops.len())
             );
         }
     }
@@ -701,11 +545,15 @@ mod tests {
             }
         }
 
-        // Should have resolved opcode patterns
+        // Should have resolved opcode patterns (flattened op counts)
         eprintln!("\nOpcode patterns:");
         for arm in &result.opcode_dispatch {
-            if let Some(ref pattern) = arm.classified_pattern {
-                eprintln!("  {} → {:?}", arm.selector.canonical_key(), pattern);
+            if let Some(ref flat) = arm.flattened {
+                eprintln!(
+                    "  {} → {} flat ops",
+                    arm.selector.canonical_key(),
+                    flat.ops.len()
+                );
             }
         }
 
@@ -729,49 +577,26 @@ mod tests {
             }
         }
 
-        // Verify canonical graph/pipeline dispatch still classifies a useful subset.
-        let classified_count = result
+        // Verify canonical graph/pipeline dispatch flattens a useful subset.
+        let flattened_dispatch_count = result
             .opcode_dispatch
             .iter()
-            .filter(|a| a.classified_pattern.is_some())
+            .filter(|a| a.flattened.is_some())
             .count();
         assert!(
-            classified_count >= 10,
-            "expected >=10 canonical graph-classified arms, got {}",
-            classified_count
+            flattened_dispatch_count >= 10,
+            "expected >=10 flattened opcode arms, got {}",
+            flattened_dispatch_count
         );
 
+        // Verify flattened arms produce non-empty op sequences.
         assert!(
-            result.opcode_dispatch.iter().any(|arm| {
-                matches!(
-                    arm.classified_pattern,
-                    Some(TracePattern::Jump)
-                        | Some(TracePattern::ConditionalJump)
-                        | Some(TracePattern::VableFieldWrite { .. })
-                )
-            }),
-            "missing Jump/ConditionalJump/VableFieldWrite pattern"
-        );
-        assert!(
-            result.opcode_dispatch.iter().any(|arm| {
-                matches!(
-                    arm.classified_pattern,
-                    Some(TracePattern::LocalRead) | Some(TracePattern::VableArrayRead { .. })
-                )
-            }),
-            "missing LocalRead/VableArrayRead pattern"
-        );
-        assert!(
-            result.opcode_dispatch.iter().any(|arm| {
-                matches!(
-                    arm.classified_pattern,
-                    Some(TracePattern::FunctionCall)
-                        | Some(TracePattern::RangeIterNext)
-                        | Some(TracePattern::VableArrayWrite { .. })
-                        | Some(TracePattern::Noop)
-                )
-            }),
-            "missing canonical call/iter/vable/noop pattern"
+            result
+                .opcode_dispatch
+                .iter()
+                .filter_map(|arm| arm.flattened.as_ref())
+                .all(|f| f.ops.len() > 0),
+            "all flattened arms should have non-empty op sequences"
         );
     }
 
@@ -784,10 +609,10 @@ mod tests {
             &crate::test_support::pyre_analyze_config(),
         );
         let code = generate_trace_code_from_pipeline(&result);
-        let canonical_patterns: Vec<_> = result
+        let flattened_arms: Vec<_> = result
             .opcode_dispatch
             .iter()
-            .filter_map(|arm| arm.classified_pattern.as_ref())
+            .filter(|arm| arm.flattened.is_some())
             .collect();
 
         // Should contain canonical dispatch table
@@ -803,21 +628,7 @@ mod tests {
             code.contains("Canonical analysis summary:"),
             "missing canonical summary"
         );
-        assert!(
-            !canonical_patterns.is_empty(),
-            "expected canonical graph-derived patterns"
-        );
-        assert!(
-            canonical_patterns.iter().any(|pattern| {
-                matches!(
-                    pattern,
-                    TracePattern::Jump
-                        | TracePattern::ConditionalJump
-                        | TracePattern::VableFieldWrite { .. }
-                )
-            }),
-            "missing canonical graph-derived control-flow/vable-field pattern"
-        );
+        assert!(!flattened_arms.is_empty(), "expected flattened opcode arms");
 
         eprintln!("=== Generated Code ({} bytes) ===", code.len());
         // Print first 50 lines
@@ -876,14 +687,17 @@ mod tests {
             result.notes
         );
 
-        // Step 3: graph-based classification
-        let pattern = patterns::classify_from_graph(load_fast_graph);
+        // Step 3: flatten the rewritten graph
+        let flattened = passes::flatten_with_types(
+            &result.graph,
+            &passes::resolve_types(&result.graph, &passes::annotate_graph(&result.graph)),
+        );
         eprintln!(
             "load_fast graph ops: {:?}",
             load_fast_graph.block(load_fast_graph.entry).ops
         );
-        eprintln!("load_fast classified as: {:?}", pattern);
-        // load_fast reads a field + reads array → should be detectable
+        eprintln!("load_fast flattened: {} ops", flattened.ops.len());
+        assert!(flattened.ops.len() > 0, "load_fast should produce flat ops");
     }
 
     #[test]
@@ -993,12 +807,13 @@ mod tests {
             .iter()
             .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
             .expect("LoadFast opcode arm");
-        assert_eq!(
-            load_fast.classified_pattern,
-            Some(TracePattern::VableArrayRead {
-                array_index: 0,
-                item_type: "unknown".into(),
-            })
+        assert!(
+            load_fast.flattened.is_some(),
+            "LoadFast should be flattened"
+        );
+        assert!(
+            load_fast.flattened.as_ref().unwrap().ops.len() > 0,
+            "LoadFast flattened should have ops"
         );
     }
 
@@ -1058,12 +873,13 @@ mod tests {
             result.total_vable_rewrites > 0,
             "graph pipeline should perform vable rewrites"
         );
-        assert_eq!(
-            canonical_load_fast.classified_pattern,
-            Some(TracePattern::VableArrayRead {
-                array_index: 0,
-                item_type: "unknown".into(),
-            })
+        assert!(
+            canonical_load_fast.flattened.is_some(),
+            "canonical LoadFast should be flattened"
+        );
+        assert!(
+            canonical_load_fast.flattened.as_ref().unwrap().ops.len() > 0,
+            "canonical LoadFast flattened should have ops"
         );
     }
 
@@ -1091,7 +907,10 @@ mod tests {
             .iter()
             .find(|arm| arm.selector.canonical_key() == "Instruction::LoadFast")
             .expect("LoadFast opcode arm");
-        assert_eq!(arm.classified_pattern, Some(TracePattern::Noop));
+        assert!(
+            arm.flattened.is_some(),
+            "trait-bound default method should produce a flattened result"
+        );
     }
 
     #[test]
