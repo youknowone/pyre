@@ -7684,14 +7684,11 @@ impl JitState for PyreJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        crate::virtualizable_gen::virt_is_compatible(
-            self.local_count(),
-            meta.num_locals,
-            self.next_instr,
-            meta.merge_pc,
-            self.valuestackdepth,
-            meta.valuestackdepth,
-        ) && self.namespace_len() == meta.ns_keys.len()
+        // warmstate.py:503-511: RPython enters assembler unconditionally
+        // when procedure_token exists. No next_instr/merge_pc check —
+        // the compiled code's preamble handles entry from any PC.
+        // Shape checks (nlocals, namespace) ensure frame layout matches.
+        self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_keys.len()
     }
 
     fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {

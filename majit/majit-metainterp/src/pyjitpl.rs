@@ -889,11 +889,10 @@ impl<M: Clone> MetaInterp<M> {
     /// closes at a different loop header than where it started.
     pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<Type>)> {
         let ctx = self.tracing.as_ref()?;
-        if ctx.cut_inner_green_key.is_none() {
-            return None;
-        }
-        let green_key = ctx.green_key;
-        ctx.get_merge_point_at(green_key, ctx.header_pc)
+        let inner_key = ctx.cut_inner_green_key?;
+        // compile.py:269: cross-loop cut uses the inner loop's merge point.
+        // Lookup by inner_key (not ctx.green_key which is the outer loop).
+        ctx.get_merge_point_at(inner_key, ctx.header_pc)
             .filter(|mp| mp.position.ops_len > 0)
             .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
     }
