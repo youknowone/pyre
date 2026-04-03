@@ -263,15 +263,11 @@ pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> Op
 }
 
 pub fn emit_trace_int_constant(ctx: &mut TraceCtx, value: i64) -> OpRef {
-    let opref = ctx.const_int(w_int_new(value) as i64);
-    ctx.root_const_for_gc(opref);
-    opref
+    ctx.const_int(w_int_new(value) as i64)
 }
 
 pub fn emit_trace_float_constant(ctx: &mut TraceCtx, value: f64) -> OpRef {
-    let opref = ctx.const_int(box_float_constant(value) as i64);
-    ctx.root_const_for_gc(opref);
-    opref
+    ctx.const_int(box_float_constant(value) as i64)
 }
 
 pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
@@ -447,11 +443,7 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_bigint_constant(&mut self, value: &PyBigInt) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(box_bigint_constant(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_int(box_bigint_constant(value) as i64)))
     }
 
     fn trace_float_constant(&mut self, value: f64) -> Result<OpRef, PyError> {
@@ -459,19 +451,11 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_bool_constant(&mut self, value: bool) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(w_bool_from(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_int(w_bool_from(value) as i64)))
     }
 
     fn trace_str_constant(&mut self, value: &str) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(box_str_constant(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_int(box_str_constant(value) as i64)))
     }
 
     fn trace_code_constant(
@@ -479,18 +463,12 @@ pub trait TraceHelperAccess {
         code: &pyre_interpreter::CodeObject,
     ) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(pyre_interpreter::box_code_constant(code) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
+            Ok(ctx.const_int(pyre_interpreter::box_code_constant(code) as i64))
         })
     }
 
     fn trace_none_constant(&mut self) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(w_none() as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_int(w_none() as i64)))
     }
 }
 
