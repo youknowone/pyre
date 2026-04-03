@@ -69,7 +69,6 @@ fn main() {
                     call_effects: build_call_effect_overrides(),
                     ..Default::default()
                 },
-                classify: build_classification_config(),
             },
         },
     );
@@ -86,12 +85,12 @@ fn main() {
 
     // Report
     eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} graph-classified), {} functions, {} blocks, {} flat ops, generated {} bytes",
+        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened), {} functions, {} blocks, {} flat ops, generated {} bytes",
         pipeline.opcode_dispatch.len(),
         pipeline
             .opcode_dispatch
             .iter()
-            .filter(|arm| arm.classified_pattern.is_some())
+            .filter(|arm| arm.flattened.is_some())
             .count(),
         pipeline.functions.len(),
         pipeline.total_blocks,
@@ -127,110 +126,6 @@ fn build_call_effect_overrides() -> Vec<majit_codewriter::CallEffectOverride> {
             majit_codewriter::CallEffectOverride::new(target, effect)
         })
         .collect()
-}
-
-fn build_classification_config() -> majit_codewriter::ClassificationConfig {
-    majit_codewriter::ClassificationConfig {
-        field_roles: virtualizable_spec::PYFRAME_FIELD_ROLES
-            .iter()
-            .map(|spec| {
-                let role = match spec.role {
-                    virtualizable_spec::FieldPatternRole::LocalArray => {
-                        majit_codewriter::FieldPatternRole::LocalArray
-                    }
-                    virtualizable_spec::FieldPatternRole::InstructionPosition => {
-                        majit_codewriter::FieldPatternRole::InstructionPosition
-                    }
-                    virtualizable_spec::FieldPatternRole::ConstantPool => {
-                        majit_codewriter::FieldPatternRole::ConstantPool
-                    }
-                };
-                majit_codewriter::FieldRoleDescriptor::new(
-                    spec.name,
-                    Some(spec.owner_root.to_string()),
-                    role,
-                )
-            })
-            .collect(),
-        call_roles: call_spec::PYFRAME_CALL_EFFECTS
-            .iter()
-            .filter_map(|spec| {
-                let role = spec.role?;
-                let target = match spec.target {
-                    call_spec::CallTargetSpec::Method {
-                        name,
-                        receiver_root,
-                    } => {
-                        majit_codewriter::CallTarget::method(name, Some(receiver_root.to_string()))
-                    }
-                    call_spec::CallTargetSpec::FunctionPath(segments) => {
-                        majit_codewriter::CallTarget::function_path(segments.iter().copied())
-                    }
-                };
-                let role = match role {
-                    call_spec::CallPatternRole::IntArithmetic => {
-                        majit_codewriter::CallPatternRole::IntArithmetic
-                    }
-                    call_spec::CallPatternRole::FloatArithmetic => {
-                        majit_codewriter::CallPatternRole::FloatArithmetic
-                    }
-                    call_spec::CallPatternRole::LocalRead => {
-                        majit_codewriter::CallPatternRole::LocalRead
-                    }
-                    call_spec::CallPatternRole::LocalWrite => {
-                        majit_codewriter::CallPatternRole::LocalWrite
-                    }
-                    call_spec::CallPatternRole::FunctionCall => {
-                        majit_codewriter::CallPatternRole::FunctionCall
-                    }
-                    call_spec::CallPatternRole::TruthCheck => {
-                        majit_codewriter::CallPatternRole::TruthCheck
-                    }
-                    call_spec::CallPatternRole::StackManip => {
-                        majit_codewriter::CallPatternRole::StackManip
-                    }
-                    call_spec::CallPatternRole::ConstLoad => {
-                        majit_codewriter::CallPatternRole::ConstLoad
-                    }
-                    call_spec::CallPatternRole::NamespaceLoadLocal => {
-                        majit_codewriter::CallPatternRole::NamespaceLoadLocal
-                    }
-                    call_spec::CallPatternRole::NamespaceLoadGlobal => {
-                        majit_codewriter::CallPatternRole::NamespaceLoadGlobal
-                    }
-                    call_spec::CallPatternRole::NamespaceStoreLocal => {
-                        majit_codewriter::CallPatternRole::NamespaceStoreLocal
-                    }
-                    call_spec::CallPatternRole::NamespaceStoreGlobal => {
-                        majit_codewriter::CallPatternRole::NamespaceStoreGlobal
-                    }
-                    call_spec::CallPatternRole::RangeIterNext => {
-                        majit_codewriter::CallPatternRole::RangeIterNext
-                    }
-                    call_spec::CallPatternRole::IterCleanup => {
-                        majit_codewriter::CallPatternRole::IterCleanup
-                    }
-                    call_spec::CallPatternRole::Return => majit_codewriter::CallPatternRole::Return,
-                    call_spec::CallPatternRole::BuildList => {
-                        majit_codewriter::CallPatternRole::BuildList
-                    }
-                    call_spec::CallPatternRole::BuildTuple => {
-                        majit_codewriter::CallPatternRole::BuildTuple
-                    }
-                    call_spec::CallPatternRole::UnpackSequence => {
-                        majit_codewriter::CallPatternRole::UnpackSequence
-                    }
-                    call_spec::CallPatternRole::SequenceSetitem => {
-                        majit_codewriter::CallPatternRole::SequenceSetitem
-                    }
-                    call_spec::CallPatternRole::CollectionAppend => {
-                        majit_codewriter::CallPatternRole::CollectionAppend
-                    }
-                };
-                Some(majit_codewriter::CallRoleDescriptor::new(target, role))
-            })
-            .collect(),
-    }
 }
 
 /// Recursively collect all .rs files from a directory.
