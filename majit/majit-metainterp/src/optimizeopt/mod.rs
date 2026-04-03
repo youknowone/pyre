@@ -1965,8 +1965,12 @@ impl OptContext {
             return;
         };
 
-        let (rd_numb, rd_consts, rd_virtuals, _, liveboxes, liveboxes_map) =
-            memo.finish(numb_state, &env, &[], None);
+        // resume.py:428-445, 520-558: pending_setfields are passed to finish()
+        // which handles register_box, visitor_walk_recursive, and tagging.
+        let mut pending_slice = op.rd_pendingfields.take().unwrap_or_default();
+
+        let (rd_numb, rd_consts, rd_virtuals, liveboxes) =
+            memo.finish(numb_state, &env, &mut pending_slice, None);
 
         // fail_arg_types — majit-specific (RPython Box.type is intrinsic).
         // Full type resolution cascade: constants, value_types, ops, snapshots.
@@ -2018,7 +2022,10 @@ impl OptContext {
                         return o.result_type();
                     }
                 }
-                majit_ir::Type::Int
+                panic!(
+                    "fail_arg_types: unknown type for OpRef({}) resolved=OpRef({})",
+                    opref.0, resolved.0
+                )
             })
             .collect();
 
@@ -2028,44 +2035,13 @@ impl OptContext {
             op.rd_virtuals = Some(rd_virtuals);
         }
 
-        // resume.py:520-558 _add_pending_fields: tag pendingfield target/value
-        if let Some(ref mut pf_entries) = op.rd_pendingfields {
-            for pf in pf_entries.iter_mut() {
-                pf.target_tagged = self.gettagged_for_pending(pf.target, &liveboxes_map, &mut memo);
-                pf.value_tagged = self.gettagged_for_pending(pf.value, &liveboxes_map, &mut memo);
-            }
+        // Restore pending fields (now tagged by finish())
+        if !pending_slice.is_empty() {
+            op.rd_pendingfields = Some(pending_slice);
         }
 
         op.rd_numb = Some(rd_numb);
         op.rd_consts = Some(rd_consts);
-    }
-
-    /// resume.py:560-568 _gettagged — tag an OpRef for pendingfield encoding.
-    ///
-    /// Mirrors RPython's _gettagged: liveboxes lookup → Const → UNINITIALIZED.
-    /// Uses memo.getconst() for large ints and non-zero refs (TAGCONST pool).
-    fn gettagged_for_pending(
-        &self,
-        opref: OpRef,
-        liveboxes: &crate::resume::LiveboxMap,
-        memo: &mut crate::resume::ResumeDataLoopMemo,
-    ) -> i16 {
-        use majit_ir::resumedata;
-        let resolved = self.get_box_replacement(opref);
-        // resume.py:561-562: box is None → UNINITIALIZED
-        if resolved.is_none() {
-            return resumedata::UNINITIALIZED_TAG;
-        }
-        // resume.py:563-564: isinstance(box, Const) → memo.getconst(box)
-        if let Some((raw, tp)) = self.getconst(resolved) {
-            return memo.getconst(raw, tp);
-        }
-        // resume.py:566-568: liveboxes[box]
-        if let Some(tagged) = liveboxes.get(resolved.0) {
-            return tagged;
-        }
-        // Unresolvable — RPython would raise KeyError here.
-        resumedata::UNASSIGNED
     }
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.
