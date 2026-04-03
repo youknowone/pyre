@@ -3480,7 +3480,12 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 });
                 Box::into_raw(obj) as i64
             }
-            _ => 0,
+            // resume.py:1437 allocate_with_vtable must return a valid object.
+            // Panic on unknown type_id so the issue is visible immediately.
+            _ => panic!(
+                "allocate_with_vtable: unsupported gc type_id {}",
+                descr_index
+            ),
         }
     }
 
