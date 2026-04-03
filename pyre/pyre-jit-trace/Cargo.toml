@@ -10,6 +10,7 @@ description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 majit-ir = { workspace = true }
+majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }

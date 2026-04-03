@@ -713,7 +713,7 @@ use crate::descr::{
 };
 use crate::frame_layout::{
     PYFRAME_CODE_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_NAMESPACE_OFFSET,
-    PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, build_pyframe_virtualizable_info,
+    PYFRAME_NEXT_INSTR_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
 
@@ -2544,7 +2544,7 @@ impl MIFrame {
             return;
         };
         ctx.gen_store_back_in_vable(vable_ref);
-        let info = build_pyframe_virtualizable_info();
+        let info = crate::virtualizable_gen::build_virtualizable_info();
         let obj_ptr = self.sym().concrete_vable_ptr;
         unsafe {
             info.tracing_before_residual_call(obj_ptr);
@@ -2558,7 +2558,7 @@ impl MIFrame {
     }
 
     fn sync_standard_virtualizable_after_residual_call(&mut self, ctx: &mut TraceCtx) -> bool {
-        let info = build_pyframe_virtualizable_info();
+        let info = crate::virtualizable_gen::build_virtualizable_info();
         let obj_ptr = self.sym().concrete_vable_ptr;
         let vable_forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
         // pyjitpl.py:3400 parity: check if any virtualref was forced
@@ -8168,7 +8168,7 @@ impl JitState for PyreJitState {
         _virtualizable: &str,
         _info: &VirtualizableInfo,
     ) -> Option<*mut u8> {
-        self.frame_ptr()
+        crate::virtualizable_gen::virt_heap_ptr(self, _virtualizable)
     }
 
     fn virtualizable_array_lengths(
@@ -8177,8 +8177,7 @@ impl JitState for PyreJitState {
         _virtualizable: &str,
         _info: &VirtualizableInfo,
     ) -> Option<Vec<usize>> {
-        // virtualizable.py:86/139 parity: full array length.
-        self.locals_cells_stack_array().map(|arr| vec![arr.len()])
+        crate::virtualizable_gen::virt_array_lengths(self, _virtualizable, _info)
     }
 
     fn sync_virtualizable_before_jit(
@@ -8222,34 +8221,14 @@ impl JitState for PyreJitState {
     }
 
     fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
-        let info = build_pyframe_virtualizable_info();
-        let Some(vable_ref) = ctx.standard_virtualizable_box() else {
-            return;
-        };
-        ctx.gen_store_back_in_vable(vable_ref);
-        let Some(obj_ptr) = self.frame_ptr() else {
-            return;
-        };
-        unsafe {
-            info.tracing_before_residual_call(obj_ptr);
-        }
-        let force_token = ctx.force_token();
-        ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
+        crate::virtualizable_gen::virt_sync_before_residual(self, ctx)
     }
 
     fn sync_virtualizable_after_residual_call(
         &self,
         _ctx: &mut TraceCtx,
     ) -> ResidualVirtualizableSync {
-        let info = build_pyframe_virtualizable_info();
-        let Some(obj_ptr) = self.frame_ptr() else {
-            return ResidualVirtualizableSync::default();
-        };
-        let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
-        ResidualVirtualizableSync {
-            updated_fields: Vec::new(),
-            forced,
-        }
+        crate::virtualizable_gen::virt_sync_after_residual(self, _ctx)
     }
 
     fn import_virtualizable_boxes(
@@ -8785,7 +8764,7 @@ mod tests {
         let mut state = empty_state();
         state.frame = frame_ptr;
         state.valuestackdepth = 2;
-        let info = build_pyframe_virtualizable_info();
+        let info = crate::virtualizable_gen::build_virtualizable_info();
 
         // virtualizable.py:86 parity: full array length, not valuestackdepth.
         assert_eq!(

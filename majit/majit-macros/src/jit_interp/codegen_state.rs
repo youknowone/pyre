@@ -4,7 +4,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Expr;
 
-use super::{JitInterpConfig, StateFieldKind, VableArrayLayoutDecl};
+use super::codegen_virtualizable;
+use super::{JitInterpConfig, StateFieldKind};
 
 /// Extract the member field name from a field access expression.
 /// e.g., `state.storage` → `storage`, `state.selected` → `selected`.
@@ -45,165 +46,13 @@ fn generate_storage_pool_jit_state(config: &JitInterpConfig) -> TokenStream {
     } else {
         quote! {}
     };
-    let vable_info_fn = config.virtualizable_decl.as_ref().map(|decl| {
-        let token_offset = &decl.token_offset;
-        let field_adds: Vec<TokenStream> = decl
-            .fields
-            .iter()
-            .map(|f| {
-                let name = f.name.to_string();
-                let offset = &f.offset;
-                let tp = if f.field_type == "ref" {
-                    quote! { majit_ir::Type::Ref }
-                } else if f.field_type == "float" {
-                    quote! { majit_ir::Type::Float }
-                } else {
-                    quote! { majit_ir::Type::Int }
-                };
-                quote! {
-                    __info.add_field(#name, #tp, #offset);
-                }
-            })
-            .collect();
-        let array_adds: Vec<TokenStream> = decl
-            .arrays
-            .iter()
-            .map(|a| {
-                let name = a.name.to_string();
-                let tp = if a.item_type == "ref" {
-                    quote! { majit_ir::Type::Ref }
-                } else if a.item_type == "float" {
-                    quote! { majit_ir::Type::Float }
-                } else {
-                    quote! { majit_ir::Type::Int }
-                };
-                match &a.layout {
-                    VableArrayLayoutDecl::Direct { field_offset } => quote! {
-                        __info.add_array_field(#name, #tp, #field_offset);
-                    },
-                    VableArrayLayoutDecl::Embedded {
-                        field_offset,
-                        ptr_offset,
-                        length_offset,
-                        items_offset,
-                    } => quote! {
-                        __info.add_embedded_array_field_with_layout(
-                            #name,
-                            #tp,
-                            #field_offset,
-                            #ptr_offset,
-                            #length_offset,
-                            #items_offset,
-                        );
-                    },
-                }
-            })
-            .collect();
-        quote! {
-            #[allow(non_snake_case)]
-            fn __build_virtualizable_info() -> Option<majit_metainterp::virtualizable::VirtualizableInfo> {
-                let mut __info = majit_metainterp::virtualizable::VirtualizableInfo::new(#token_offset);
-                #(#field_adds)*
-                #(#array_adds)*
-                Some(__info)
-            }
-        }
-    });
+    let vable_info_fn = config
+        .virtualizable_decl
+        .as_ref()
+        .map(|decl| codegen_virtualizable::generate_vable_info_fn(decl));
     let vable_state_hooks = config.virtualizable_decl.as_ref().map(|decl| {
-        let virtualizable_name = decl.var_name.to_string();
-        quote! {
-            fn virtualizable_heap_ptr(
-                &self,
-                _meta: &Self::Meta,
-                virtualizable: &str,
-                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> Option<*mut u8> {
-                if virtualizable == #virtualizable_name {
-                    Some((&self.#pool_field as *const _ as *mut u8).cast::<u8>())
-                } else {
-                    None
-                }
-            }
-
-            fn virtualizable_array_lengths(
-                &self,
-                _meta: &Self::Meta,
-                virtualizable: &str,
-                info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> Option<Vec<usize>> {
-                if virtualizable != #virtualizable_name {
-                    return None;
-                }
-                if info.can_read_all_array_lengths_from_heap() {
-                    let obj_ptr = (&self.#pool_field as *const _).cast::<u8>();
-                    Some(unsafe { info.read_array_lengths_from_heap(obj_ptr) })
-                } else {
-                    None
-                }
-            }
-
-            fn import_virtualizable_boxes(
-                &mut self,
-                _meta: &Self::Meta,
-                _virtualizable: &str,
-                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-                _static_boxes: &[i64],
-                _array_boxes: &[Vec<i64>],
-            ) -> bool {
-                true
-            }
-
-            fn export_virtualizable_boxes(
-                &self,
-                meta: &Self::Meta,
-                virtualizable: &str,
-                info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
-                if virtualizable != #virtualizable_name {
-                    return None;
-                }
-                let obj_ptr = (&self.#pool_field as *const _).cast::<u8>();
-                let lengths = if info.can_read_all_array_lengths_from_heap() {
-                    unsafe { info.read_array_lengths_from_heap(obj_ptr) }
-                } else {
-                    self.virtualizable_array_lengths(meta, virtualizable, info)?
-                };
-                Some(unsafe { info.read_all_boxes(obj_ptr, &lengths) })
-            }
-
-            fn sync_virtualizable_before_residual_call(
-                &self,
-                ctx: &mut majit_metainterp::trace_ctx::TraceCtx,
-            ) {
-                let Some(info) = Self::__build_virtualizable_info() else {
-                    return;
-                };
-                let Some(vable_ref) = ctx.standard_virtualizable_box() else {
-                    return;
-                };
-                let obj_ptr = (&self.#pool_field as *const _ as *mut u8).cast::<u8>();
-                unsafe {
-                    info.tracing_before_residual_call(obj_ptr);
-                }
-                let force_token = ctx.force_token();
-                ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
-            }
-
-            fn sync_virtualizable_after_residual_call(
-                &self,
-                _ctx: &mut majit_metainterp::trace_ctx::TraceCtx,
-            ) -> majit_metainterp::jit_state::ResidualVirtualizableSync {
-                let Some(info) = Self::__build_virtualizable_info() else {
-                    return majit_metainterp::jit_state::ResidualVirtualizableSync::default();
-                };
-                let obj_ptr = (&self.#pool_field as *const _ as *mut u8).cast::<u8>();
-                let forced = unsafe { info.tracing_after_residual_call(obj_ptr) };
-                majit_metainterp::jit_state::ResidualVirtualizableSync {
-                    updated_fields: Vec::new(),
-                    forced,
-                }
-            }
-        }
+        let heap_ptr_expr = quote! { (&self.#pool_field as *const _ as *mut u8).cast::<u8>() };
+        codegen_virtualizable::generate_vable_state_hooks(decl, &heap_ptr_expr)
     });
     let compact_encode = storage
         .compact_encode
