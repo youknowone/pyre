@@ -443,6 +443,13 @@ impl TraceCtx {
         self.constants.as_ref().get(&opref.0).copied()
     }
 
+    /// Root an Int-typed constant on the GC shadow stack.
+    /// Keeps the constant's type as Int (optimizer sees Value::Int),
+    /// but prevents GC from freeing the referenced object.
+    pub fn root_const_for_gc(&mut self, opref: OpRef) {
+        self.constants.root_int_as_ref(opref);
+    }
+
     /// Constant-fold a pure field read on a constant object pointer.
     /// If `obj` is a constant and `descr` is immutable, reads the field
     /// at runtime and returns the value as a constant OpRef.
