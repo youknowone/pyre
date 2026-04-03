@@ -143,12 +143,13 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 /// - Call classification → CallElidable/CallResidual/CallMayForce
 pub struct Transformer<'a> {
     /// RPython: `Transformer.callcontrol`.
-    /// When present, `rewrite_op_direct_call` uses `guess_call_kind()`
-    /// to dispatch to handle_regular_call / handle_residual_call /
-    /// handle_builtin_call / handle_recursive_call.
     callcontrol: Option<&'a mut crate::call::CallControl>,
     /// RPython: `Transformer.__init__` config for virtualizable lowering.
     config: &'a GraphTransformConfig,
+    /// Type resolution state from the rtype pass.
+    /// Used by `make_three_lists()` to split args by kind.
+    /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
+    type_state: Option<&'a crate::passes::rtype::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
     vable_array_vars: std::collections::HashMap<ValueId, usize>,
     /// RPython: `Transformer.vable_flags`.
@@ -183,6 +184,7 @@ impl<'a> Transformer<'a> {
         Self {
             callcontrol: None,
             config,
+            type_state: None,
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
@@ -196,6 +198,13 @@ impl<'a> Transformer<'a> {
     /// RPython: `Transformer.__init__(callcontrol=...)`.
     pub fn with_callcontrol(mut self, cc: &'a mut crate::call::CallControl) -> Self {
         self.callcontrol = Some(cc);
+        self
+    }
+
+    /// Set the type resolution state for arg kind splitting.
+    /// RPython: types live on `Variable.concretetype`.
+    pub fn with_type_state(mut self, ts: &'a crate::passes::rtype::TypeResolutionState) -> Self {
+        self.type_state = Some(ts);
         self
     }
 
@@ -306,14 +315,42 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.make_three_lists(vars)` (jtransform.py:437-445).
     /// Split args into three lists by kind (int, ref, float).
-    /// Currently all args are treated as 'ref' (unknown type) since
-    /// full type resolution runs before jtransform in the pipeline.
+    ///
+    /// RPython: `add_in_correct_list(v, lst_i, lst_r, lst_f)` checks
+    /// `getkind(v.concretetype)` and appends to the matching list.
+    /// Void args are skipped.
     fn make_three_lists(&self, args: &[ValueId]) -> (Vec<ValueId>, Vec<ValueId>, Vec<ValueId>) {
-        // With full type info, we would check each arg's concretetype.
-        // For now, place all args in the ref list (safe default — the
-        // assembler will correct based on regalloc kinds).
-        let args_r = args.to_vec();
-        (vec![], args_r, vec![])
+        let mut args_i = Vec::new();
+        let mut args_r = Vec::new();
+        let mut args_f = Vec::new();
+        for &v in args {
+            let kind = self.get_value_kind(v);
+            match kind {
+                'i' => args_i.push(v),
+                'r' => args_r.push(v),
+                'f' => args_f.push(v),
+                'v' => {}            // void — skip (RPython jtransform.py:449)
+                _ => args_r.push(v), // unknown → ref
+            }
+        }
+        (args_i, args_r, args_f)
+    }
+
+    /// RPython: `getkind(v.concretetype)` — get the kind of a value.
+    /// Uses type_state if available, falls back to 'r' for unknown.
+    fn get_value_kind(&self, v: ValueId) -> char {
+        if let Some(ts) = self.type_state {
+            if let Some(ct) = ts.concrete_types.get(&v) {
+                return match ct {
+                    crate::passes::rtype::ConcreteType::Signed => 'i',
+                    crate::passes::rtype::ConcreteType::GcRef => 'r',
+                    crate::passes::rtype::ConcreteType::Float => 'f',
+                    crate::passes::rtype::ConcreteType::Void => 'v',
+                    crate::passes::rtype::ConcreteType::Unknown => 'r',
+                };
+            }
+        }
+        'r' // default: ref (most Python values are GC refs)
     }
 
     // ── rewrite_op_* methods ──────────────────────────────────
@@ -798,13 +835,17 @@ impl<'a> Transformer<'a> {
 }
 
 /// RPython: `getkind(concretetype)[0]` → 'i', 'r', 'f', or 'v'.
+///
+/// RPython's rtyper resolves all types before jtransform runs, so
+/// getkind() never sees an unknown type. In our pipeline, Unknown
+/// means the annotate/rtype pass couldn't resolve the type. We map
+/// Unknown to 'r' (ref) since most Python-level values are GC refs.
 fn value_type_to_kind(ty: &ValueType) -> char {
     match ty {
         ValueType::Int | ValueType::State => 'i',
-        ValueType::Ref => 'r',
+        ValueType::Ref | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
-        ValueType::Unknown => 'i', // default to int for unknown
     }
 }
 

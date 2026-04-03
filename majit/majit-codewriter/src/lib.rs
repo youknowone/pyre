@@ -220,16 +220,16 @@ fn build_canonical_opcode_dispatch(
             // opcode arm. The arm's body_graph IS the handler — jtransform
             // rewrites its Call ops to inline_call_*/residual_call_* etc.
             let flattened = arm.body_graph.as_ref().map(|handler_graph| {
+                // RPython pipeline: annotate → rtype → jtransform → flatten.
+                // We compute types BEFORE jtransform so make_three_lists
+                // can split args by kind (RPython: getkind(v.concretetype)).
+                let annotations = passes::annotate_graph(handler_graph);
+                let type_state = passes::resolve_types(handler_graph, &annotations);
                 let mut transformer = passes::Transformer::new(&pipeline_config.transform)
-                    .with_callcontrol(&mut *call_control);
+                    .with_callcontrol(&mut *call_control)
+                    .with_type_state(&type_state);
                 let rewritten = transformer.transform(handler_graph);
-                passes::flatten_with_types(
-                    &rewritten.graph,
-                    &passes::resolve_types(
-                        &rewritten.graph,
-                        &passes::annotate_graph(&rewritten.graph),
-                    ),
-                )
+                passes::flatten_with_types(&rewritten.graph, &type_state)
             });
 
             passes::PipelineOpcodeArm {
