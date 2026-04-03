@@ -66,20 +66,19 @@ pub fn trace_bytecode(
         .pop()
         .and_then(|f| f.owned_concrete_frame);
 
-    // RPython pyjitpl.py:3160: greenkey = original_boxes[:num_green_args].
-    // reached_loop_header (pyjitpl.py:2997) matches the INNER loop's
-    // merge point, so compile_loop stores under the inner loop header's
-    // green key.  Pyre: retarget green_key to the inner key so compiled
-    // code is found when the interpreter's back-edge reaches that PC.
+    // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
+    // original_boxes comes from the merge point where the loop closes
+    // (pyjitpl.py:2995), which may differ from start_pc when
+    // cut_trace_from retargets to an inner loop.
     match &action {
         TraceAction::CloseLoopWithArgs {
             loop_header_pc: Some(target_pc),
             ..
         } if *target_pc != start_pc => {
-            let inner_key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
-            ctx.set_green_key(inner_key);
+            let target_key = crate::driver::make_green_key(code as *const CodeObject, *target_pc);
+            ctx.set_green_key(target_key);
             ctx.header_pc = *target_pc;
-            ctx.cut_inner_green_key = Some(inner_key);
+            ctx.cut_inner_green_key = Some(target_key);
         }
         TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let key = crate::driver::make_green_key(code as *const CodeObject, start_pc);
