@@ -3468,12 +3468,39 @@ fn sync_jit_state_to_frame(
 pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
+    fn allocate_struct(&self, descr_index: u32) -> i64 {
+        // resume.py:1441 allocate_struct — same as allocate_with_vtable
+        // for pyre (no RPython struct/GC distinction).
+        self.allocate_with_vtable(descr_index)
+    }
+
     fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
         // resume.py:1437-1439 allocate_with_vtable
-        // pyre objects are GC-managed; allocation requires type_id → gc.alloc.
-        // Delegate to GC allocator when available.
-        let _ = descr_index;
-        0 // TODO: gc.alloc_with_type_id(descr_index)
+        // Allocate a fresh GC object by type_id. Fields are zeroed; the
+        // caller fills them via setfield_typed. Must return a NEW object
+        // (not from small-int pool) because setfield_typed mutates in-place.
+        use crate::jit::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+        match descr_index {
+            W_INT_GC_TYPE_ID => {
+                let obj = Box::new(pyre_object::intobject::W_IntObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: &pyre_object::pyobject::INT_TYPE as *const _,
+                    },
+                    intval: 0,
+                });
+                Box::into_raw(obj) as i64
+            }
+            W_FLOAT_GC_TYPE_ID => {
+                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: &pyre_object::pyobject::FLOAT_TYPE as *const _,
+                    },
+                    floatval: 0.0,
+                });
+                Box::into_raw(obj) as i64
+            }
+            _ => 0,
+        }
     }
 
     fn setfield_typed(
