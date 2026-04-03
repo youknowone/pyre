@@ -326,14 +326,17 @@ impl CallControl {
         if !self.candidate_graphs.contains(&path) {
             return None;
         }
-        self.function_graphs.get(&path)
-    }
-
-    /// Get the callee graph WITHOUT candidate check.
-    /// Used during BFS discovery (where we're building the candidate set).
-    fn graphs_from_unchecked(&self, target: &CallTarget) -> Option<&MajitGraph> {
-        let path = self.target_to_path(target)?;
-        self.function_graphs.get(&path)
+        // RPython call.py:94-101: returns the actual target graph.
+        // For FunctionPath: direct lookup in function_graphs.
+        // For Method: resolve_method returns the specific impl graph,
+        // NOT whatever was first registered under the synthetic path.
+        match target {
+            CallTarget::Method {
+                name,
+                receiver_root,
+            } => self.resolve_method(name, receiver_root.as_deref()),
+            _ => self.function_graphs.get(&path),
+        }
     }
 
     /// Convert a CallTarget to a CallPath for lookup.
