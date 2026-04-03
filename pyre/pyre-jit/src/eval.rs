@@ -1066,11 +1066,10 @@ fn jit_merge_point_hook(
     // Trace completed or aborted — clear tracing depth.
     if !driver.is_tracing() {
         driver.meta_interp_mut().tracing_call_depth = None;
-        // RPython compile.py:204-207 (record_loop_or_bridge) parity:
-        // register quasi-immutable watchers after compilation.
-        register_quasi_immutable_deps(green_key);
-        // compile.py:269: cross-loop cut now stores under inner key
-        // directly. No alias registration needed.
+        // compile.py:269: cross-loop cut stores under inner key.
+        // Use the actual compiled key for post-compilation steps.
+        let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
+        register_quasi_immutable_deps(compiled_key);
         // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
@@ -1413,9 +1412,11 @@ fn bound_reached(
         driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
         // force_start_tracing may return RunCompiled (retargeted trace
         // already compiled for this cell). In that case, enter compiled.
-        if !driver.is_tracing() && driver.has_compiled_loop(green_key) {
+        // compile.py:269: actual key may be inner key after cross-loop cut.
+        let actual_key = driver.last_compiled_key().unwrap_or(green_key);
+        if !driver.is_tracing() && driver.has_compiled_loop(actual_key) {
             Some(driver.run_compiled_detailed_with_bridge_keyed(
-                green_key,
+                actual_key,
                 loop_header_pc,
                 &mut jit_state,
                 env,
@@ -1444,14 +1445,14 @@ fn bound_reached(
                 },
             );
             driver.meta_interp_mut().tracing_call_depth = None;
-            if !had_compiled && driver.has_compiled_loop(green_key) {
-                register_quasi_immutable_deps(green_key);
-                // counter.py:246 install_new_cell: mark celltable hint
+            let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
+            if !had_compiled && driver.has_compiled_loop(compiled_key) {
+                register_quasi_immutable_deps(compiled_key);
                 driver
                     .meta_interp_mut()
                     .warm_state_mut()
                     .counter
-                    .set_compiled_hint(green_key, true);
+                    .set_compiled_hint(compiled_key, true);
             }
             // pyjitpl.py:3048-3061 raise_continue_running_normally:
             // after compilation, restart so execute_assembler runs.
