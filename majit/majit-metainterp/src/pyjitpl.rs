@@ -471,6 +471,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) exported_state: Option<crate::optimizeopt::unroll::ExportedState>,
     /// pyjitpl.py:2373: number of cancelled compilation attempts.
     pub(crate) cancel_count: u32,
+    /// Actual green_key the last compile_loop stored under. May differ
+    /// from the tracing green_key when cross-loop cut retargets to the
+    /// inner loop's key (compile.py:269).
+    pub(crate) last_compiled_key: Option<u64>,
     /// pyjitpl.py:3182: trace position saved before compile_trace records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
@@ -825,6 +829,7 @@ impl<M: Clone> MetaInterp<M> {
             retracing_from: None,
             exported_state: None,
             cancel_count: 0,
+            last_compiled_key: None,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
@@ -1874,7 +1879,12 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.header_pc,
                 );
             }
-            trace.cut_trace_from(start, original_boxes, original_box_types)
+            trace.cut_trace_from_with_consts(
+                start,
+                original_boxes,
+                original_box_types,
+                &ctx.initial_inputarg_consts,
+            )
         } else {
             trace
         };
@@ -2375,6 +2385,7 @@ impl<M: Clone> MetaInterp<M> {
                 // trace). The new compiled code may have different inputarg
                 // layout, but is_compatible uses meta to extract live_values
                 // so the meta must stay consistent with the entry point.
+                self.last_compiled_key = Some(green_key);
                 return CompileOutcome::Compiled {
                     green_key,
                     from_retry,
@@ -3709,6 +3720,12 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn get_compiled_meta_mut(&mut self, green_key: u64) -> Option<&mut M> {
         self.compiled_loops.get_mut(&green_key).map(|e| &mut e.meta)
+    }
+
+    /// Actual key the last compile_loop stored under. Returns inner key
+    /// for cross-loop cuts, otherwise the tracing key.
+    pub fn last_compiled_key(&self) -> Option<u64> {
+        self.last_compiled_key
     }
 
     /// Get num_inputs of the compiled loop.

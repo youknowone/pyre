@@ -2238,6 +2238,11 @@ impl<S: JitState> JitDriver<S> {
         self.meta.has_compiled_loop(green_key)
     }
 
+    /// Actual key the last compile_loop stored under.
+    pub fn last_compiled_key(&self) -> Option<u64> {
+        self.meta.last_compiled_key()
+    }
+
     /// Check if any guard in the compiled trace has Float-typed fail_args.
     pub fn compiled_trace_has_float_guards(&self, green_key: u64) -> bool {
         self.meta.compiled_trace_has_float_guards(green_key)
