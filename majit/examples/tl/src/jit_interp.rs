@@ -6,11 +6,30 @@
 ///
 /// Greens: [pc]
 /// Reds:   [stack (via storage pool)]
-/// Hint to the JIT that this value should be treated as a compile-time constant.
-/// During tracing, the tracer records a GUARD_VALUE. Non-tracing mode: identity.
-#[inline(always)]
-fn hint_promote<T: Copy>(val: T) -> T {
-    val
+
+/// Stack rotation — residual call in JIT traces (tl.py:43).
+///
+/// `stack_ptr` / `stack_len` describe the live portion of the stack.
+/// The JIT does not trace into this function; it emits a residual CALL.
+#[majit_macros::dont_look_inside]
+extern "C" fn storage_roll(stack_ptr: usize, stack_len: usize, r: i64) {
+    let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stack_len) };
+    let len = stack.len();
+    if r < -1 {
+        let i = (len as i64 + r) as usize;
+        let elem = stack[len - 1];
+        for j in (i..len - 1).rev() {
+            stack[j + 1] = stack[j];
+        }
+        stack[i] = elem;
+    } else if r > 1 {
+        let i = len - r as usize;
+        let elem = stack[i];
+        for j in i..len - 1 {
+            stack[j] = stack[j + 1];
+        }
+        stack[len - 1] = elem;
+    }
 }
 
 // ── Storage pool types ──
@@ -69,25 +88,8 @@ impl TlStorage {
         let b = self.pop();
         self.push(b / a);
     }
-    /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
-    /// The JIT does not trace into it; in tracing mode, break exits trace.
     pub fn roll(&mut self, r: i64) {
-        let len = self.stack.len();
-        if r < -1 {
-            let i = (len as i64 + r) as usize;
-            let elem = self.stack[len - 1];
-            for j in (i..len - 1).rev() {
-                self.stack[j + 1] = self.stack[j];
-            }
-            self.stack[i] = elem;
-        } else if r > 1 {
-            let i = len - r as usize;
-            let elem = self.stack[i];
-            for j in i..len - 1 {
-                self.stack[j] = self.stack[j + 1];
-            }
-            self.stack[len - 1] = elem;
-        }
+        storage_roll(self.data_mut_ptr(), self.len(), r);
     }
     pub fn len(&self) -> usize {
         self.stack.len()
@@ -103,6 +105,9 @@ impl TlStorage {
     }
     pub fn data_ptr(&self) -> usize {
         self.stack.as_ptr() as usize
+    }
+    pub fn data_mut_ptr(&mut self) -> usize {
+        self.stack.as_mut_ptr() as usize
     }
     pub fn get_op(&self, _pc: usize) -> u8 {
         0 // unused — opcode is read from env/program directly
@@ -187,6 +192,7 @@ const PUSHARG: u8 = 22;
 #[majit_macros::jit_interp(
     state = TlState,
     env = Bytecode,
+    auto_calls = true,
     storage = {
         pool: state.pool,
         pool_type: TlPool,
@@ -213,9 +219,8 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
     while pc < program.len() {
         jit_merge_point!();
-        // promote(stack.stackpos) — tl.py:88
-        // Makes stackpos a compile-time constant via GUARD_VALUE.
-        stacksize = hint_promote(stacksize);
+        // TODO: promote(stack.stackpos) — tl.py:88
+        // RPython emits GUARD_VALUE here; macro-level promote support needed.
         let opcode = program[pc];
         pc += 1;
 
@@ -235,11 +240,10 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 state.pool.get_mut(state.selected).swap();
             }
             ROLL => {
-                // Stack.roll() is @dont_look_inside in RPython — the JIT does
-                // not trace into it. We delegate to TlStorage::roll().
                 let r = program[pc] as i8 as i64;
                 pc += 1;
-                state.pool.get_mut(state.selected).roll(r);
+                let stk = state.pool.get_mut(state.selected);
+                storage_roll(stk.data_mut_ptr(), stk.len(), r);
             }
             PICK => {
                 let i = program[pc] as usize;
