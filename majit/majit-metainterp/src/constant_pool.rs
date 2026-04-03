@@ -102,6 +102,18 @@ impl ConstantPool {
         opref
     }
 
+    /// Root an Int-typed constant on the shadow stack for GC safety.
+    /// The constant stays Int-typed (optimizer sees Value::Int), but
+    /// the referenced object won't be freed by GC.
+    pub fn root_int_as_ref(&mut self, opref: OpRef) {
+        if let Some(&value) = self.constants.get(&opref.0) {
+            if value != 0 {
+                let ss_idx = shadow_stack::push(GcRef(value as usize));
+                self.rooted_refs.push((opref.0, ss_idx));
+            }
+        }
+    }
+
     /// Get the type of a constant, if recorded.
     pub fn constant_type(&self, opref: OpRef) -> Option<Type> {
         self.constant_types.get(&opref.0).copied()
