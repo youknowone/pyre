@@ -2336,6 +2336,13 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     inherited_guard_failures = old_entry.guard_failures;
+                    // RPython parity: ResumeGuardDescr lives on the guard
+                    // and never gets discarded. Preserve old trace metadata
+                    // so guards from previous compilations can still find
+                    // their exit_layouts.
+                    for (tid, ct) in old_entry.traces {
+                        traces.entry(tid).or_insert(ct);
+                    }
                 }
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
@@ -2930,16 +2937,15 @@ impl<M: Clone> MetaInterp<M> {
                 );
 
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
+                    inherited_guard_failures = old_entry.guard_failures;
+                    for (tid, ct) in old_entry.traces {
+                        traces.entry(tid).or_insert(ct);
+                    }
                 }
-                // RPython parity: if a compiled loop already exists for
-                // this green_key with a WORKING merge_pc, don't replace it
-                // with a retrace that has a different merge_pc (from
-                // cut_trace_from). This prevents incompatible-state aborts
-                // in nested-loop benchmarks like fannkuch.
-                // skip-overwrite guard (see jitdriver.rs caller)
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
                 }
@@ -2956,7 +2962,7 @@ impl<M: Clone> MetaInterp<M> {
                         },
                         retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
-                        guard_failures: HashMap::new(),
+                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },
@@ -3354,9 +3360,14 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.retraced_count)
                         .unwrap_or(0);
+                    let mut inherited_guard_failures = HashMap::new();
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
+                        inherited_guard_failures = old_entry.guard_failures;
+                        for (tid, ct) in old_entry.traces {
+                            traces.entry(tid).or_insert(ct);
+                        }
                     }
                     self.compiled_loops.insert(
                         green_key,
@@ -3367,7 +3378,7 @@ impl<M: Clone> MetaInterp<M> {
                             front_target_tokens: ft,
                             retraced_count: rc,
                             root_trace_id: trace_id,
-                            guard_failures: HashMap::new(),
+                            guard_failures: inherited_guard_failures,
                             traces,
                             previous_tokens,
                         },
@@ -3642,9 +3653,14 @@ impl<M: Clone> MetaInterp<M> {
                 // This is the LABEL that bridges can close back to.
                 let target_token = crate::optimizeopt::unroll::TargetToken::new_preamble(token_num);
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
+                    inherited_guard_failures = old_entry.guard_failures;
+                    for (tid, ct) in old_entry.traces {
+                        traces.entry(tid).or_insert(ct);
+                    }
                 }
                 self.compiled_loops.insert(
                     green_key,
@@ -3655,7 +3671,7 @@ impl<M: Clone> MetaInterp<M> {
                         front_target_tokens: vec![target_token],
                         retraced_count: 0,
                         root_trace_id: trace_id,
-                        guard_failures: HashMap::new(),
+                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },
