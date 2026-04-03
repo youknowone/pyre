@@ -1569,17 +1569,8 @@ impl OptContext {
         // from tracing, no ResumeAtPositionDescr from unroll).
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
-        //
-        // RPython: ResumeAtPositionDescr guards (from inline_short_preamble /
-        // generate_guards) always have patchguardop for snapshot lookup.
-        // Pyre: traces without promote lack GUARD_FUTURE_CONDITION, so
-        // patchguardop may be None. Fall back to guard sharing.
-        let is_resume_at_pos_without_snapshot =
-            op.descr.as_ref().is_some_and(|d| d.is_resume_at_position())
-                && op.rd_resume_position < 0
-                && self.patchguardop.is_none();
         let can_share = self.last_guard_idx.is_some()
-            && (op.descr.is_none() || is_resume_at_pos_without_snapshot)
+            && op.descr.is_none()
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -1675,31 +1666,14 @@ impl OptContext {
             return;
         }
 
-        // resume.py:397: assert resume_position >= 0.
-        // RPython: every guard has a snapshot from capture_resumedata.
-        // Pyre: optimizer-created guards (VirtualState, inline_short_preamble)
-        // may have rd_resume_position=-1. Use patchguardop's position as
-        // fallback — RPython does this implicitly via patchguardop chain.
-        // resume.py:396-397: resume_position = self.guard_op.rd_resume_position
-        // assert resume_position >= 0
-        // RPython: every guard has a valid snapshot from capture_resumedata.
-        // pyre: optimizer-created guards may have rd_resume_position=-1.
-        // Fall back to patchguardop (unroll.py:336), then to the highest
-        // snapshot index (last capture_resumedata from tracing).
-        let mut resume_pos = op.rd_resume_position;
-        if resume_pos < 0 || !self.snapshot_boxes.contains_key(&resume_pos) {
-            if let Some(ref patch) = self.patchguardop {
-                if patch.rd_resume_position >= 0
-                    && self.snapshot_boxes.contains_key(&patch.rd_resume_position)
-                {
-                    resume_pos = patch.rd_resume_position;
-                    op.rd_resume_position = resume_pos;
-                }
-            }
-        }
-        // No "max snapshot key" fallback: using a snapshot from a different
-        // guard would assign the wrong liveboxes to this guard (resume.py:397
-        // invariant: rd_resume_position must be this guard's own snapshot).
+        // resume.py:396-397:
+        //   resume_position = self.guard_op.rd_resume_position
+        //   assert resume_position >= 0
+        // RPython: every guard has a valid rd_resume_position set by either
+        // capture_resumedata (tracer guards) or patchguardop copy
+        // (unroll.py:336/409). No fallback — the position is always set
+        // before store_final_boxes_in_guard runs.
+        let resume_pos = op.rd_resume_position;
         let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
         if !has_snapshot {
             if std::env::var_os("MAJIT_LOG").is_some() {

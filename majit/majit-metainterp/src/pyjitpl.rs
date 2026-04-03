@@ -64,13 +64,7 @@ pub enum BackEdgeAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileOutcome {
     /// Compilation succeeded — compiled loop is installed and ready to run.
-    /// `cut_header_pc` is Some when the trace was retargeted to a different
-    /// loop header via cross-loop cut. The caller should update meta.merge_pc.
-    Compiled {
-        cut_header_pc: Option<usize>,
-        green_key: u64,
-        from_retry: bool,
-    },
+    Compiled { green_key: u64, from_retry: bool },
     /// Compilation was cancelled (e.g. InvalidLoop, virtual state mismatch).
     /// The caller may retry or continue tracing.
     Cancelled,
@@ -1750,7 +1744,6 @@ impl<M: Clone> MetaInterp<M> {
                         self.cancel_count = 0;
                         self.warm_state.reset_function_counts();
                         return CompileOutcome::Compiled {
-                            cut_header_pc: None,
                             green_key: 0,
                             from_retry: false,
                         };
@@ -1866,11 +1859,6 @@ impl<M: Clone> MetaInterp<M> {
         // compiled independently, its entry has correct code+meta. Cutting
         // and replacing would install cross-loop-cut code with mismatched
         // inputarg layout. Instead, keep the original (uncut) trace and
-        let cut_header_pc = if cross_loop_cut.is_some() {
-            Some(ctx.header_pc)
-        } else {
-            None
-        };
         // compile.py:269: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header,
         // cut_trace_from removes ops before the merge point and
@@ -2389,7 +2377,6 @@ impl<M: Clone> MetaInterp<M> {
                 // layout, but is_compatible uses meta to extract live_values
                 // so the meta must stay consistent with the entry point.
                 return CompileOutcome::Compiled {
-                    cut_header_pc,
                     green_key,
                     from_retry,
                 };
@@ -2576,7 +2563,6 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 if success {
                     CompileOutcome::Compiled {
-                        cut_header_pc: None,
                         green_key: 0,
                         from_retry: false,
                     }
@@ -2606,7 +2592,6 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 if success {
                     CompileOutcome::Compiled {
-                        cut_header_pc: None,
                         green_key: 0,
                         from_retry: false,
                     }
