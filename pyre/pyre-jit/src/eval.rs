@@ -3110,12 +3110,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
     for vl in &recovery.virtual_layouts {
         match vl {
             majit_backend::ExitVirtualLayout::Object {
-                fields,
-                fielddescrs,
-                descr_size,
-                ..
-            }
-            | majit_backend::ExitVirtualLayout::Struct {
+                descr,
                 fields,
                 fielddescrs,
                 descr_size,
@@ -3125,9 +3120,27 @@ fn rebuild_state_after_failure_from_recovery_layout(
                     .iter()
                     .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
                     .collect();
-                let ob_type = field_vals.first().copied().unwrap_or(0) as usize;
-                let payload_src = fields.get(1).map(|(_, src)| src);
-                let val_raw = field_vals.get(1).copied().unwrap_or(0);
+                let vtable = descr
+                    .as_ref()
+                    .and_then(|d| d.as_size_descr())
+                    .map(|sd| sd.vtable())
+                    .unwrap_or(0);
+                let ob_type_idx = fielddescrs.iter().position(|fd| fd.offset == 0);
+                let ob_type = if vtable != 0 {
+                    vtable
+                } else {
+                    ob_type_idx
+                        .and_then(|idx| field_vals.get(idx).copied())
+                        .unwrap_or(0) as usize
+                };
+                let payload_idx = fielddescrs
+                    .iter()
+                    .position(|fd| fd.offset != 0)
+                    .or_else(|| (!field_vals.is_empty()).then_some(0));
+                let payload_src = payload_idx.and_then(|idx| fields.get(idx).map(|(_, src)| src));
+                let val_raw = payload_idx
+                    .and_then(|idx| field_vals.get(idx).copied())
+                    .unwrap_or(0);
                 // resume.py:617-621 VirtualInfo.allocate + setfields
                 let obj = if ob_type == w_float_type {
                     pyre_object::floatobject::w_float_new(f64::from_bits(
@@ -3158,23 +3171,110 @@ fn rebuild_state_after_failure_from_recovery_layout(
                     // resume.py:597-602 setfields using fielddescrs
                     for (i, &val) in field_vals.iter().enumerate() {
                         if let Some(fd) = fielddescrs.get(i) {
-                            if fd.offset > 0 || ob_type == 0 {
-                                let addr = unsafe { ptr.add(fd.offset) };
-                                unsafe {
-                                    match fd.field_type {
-                                        majit_ir::Type::Ref => {
-                                            std::ptr::write(addr as *mut i64, val)
-                                        }
-                                        majit_ir::Type::Float => {
-                                            std::ptr::write(addr as *mut u64, val as u64)
-                                        }
-                                        _ => match fd.field_size {
-                                            1 => std::ptr::write(addr, val as u8),
-                                            2 => std::ptr::write(addr as *mut u16, val as u16),
-                                            4 => std::ptr::write(addr as *mut u32, val as u32),
-                                            _ => std::ptr::write(addr as *mut i64, val),
-                                        },
+                            if fd.offset == 0 && ob_type != 0 {
+                                continue;
+                            }
+                            let addr = unsafe { ptr.add(fd.offset) };
+                            unsafe {
+                                match fd.field_type {
+                                    majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
+                                    majit_ir::Type::Float => {
+                                        std::ptr::write(addr as *mut u64, val as u64)
                                     }
+                                    _ => match fd.field_size {
+                                        1 => std::ptr::write(addr, val as u8),
+                                        2 => std::ptr::write(addr as *mut u16, val as u16),
+                                        4 => std::ptr::write(addr as *mut u32, val as u32),
+                                        _ => std::ptr::write(addr as *mut i64, val),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                    ptr as usize
+                } else {
+                    return false;
+                };
+                materialized.push(obj);
+            }
+            majit_backend::ExitVirtualLayout::Struct {
+                typedescr,
+                fields,
+                fielddescrs,
+                descr_size,
+                ..
+            } => {
+                let field_vals: Vec<i64> = fields
+                    .iter()
+                    .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
+                    .collect();
+                let vtable = typedescr
+                    .as_ref()
+                    .and_then(|d| d.as_size_descr())
+                    .map(|sd| sd.vtable())
+                    .unwrap_or(0);
+                let ob_type_idx = fielddescrs.iter().position(|fd| fd.offset == 0);
+                let ob_type = if vtable != 0 {
+                    vtable
+                } else {
+                    ob_type_idx
+                        .and_then(|idx| field_vals.get(idx).copied())
+                        .unwrap_or(0) as usize
+                };
+                let payload_idx = fielddescrs
+                    .iter()
+                    .position(|fd| fd.offset != 0)
+                    .or_else(|| (!field_vals.is_empty()).then_some(0));
+                let payload_src = payload_idx.and_then(|idx| fields.get(idx).map(|(_, src)| src));
+                let val_raw = payload_idx
+                    .and_then(|idx| field_vals.get(idx).copied())
+                    .unwrap_or(0);
+                // resume.py:617-621 VirtualInfo.allocate + setfields
+                let obj = if ob_type == w_float_type {
+                    pyre_object::floatobject::w_float_new(f64::from_bits(
+                        decode_recovery_float_payload_bits(
+                            val_raw,
+                            payload_src,
+                            typed,
+                            raw_values,
+                            exit_layout,
+                        ) as u64,
+                    )) as usize
+                } else if ob_type == w_int_type {
+                    pyre_object::intobject::w_int_new(decode_recovery_payload_from_source(
+                        val_raw,
+                        payload_src,
+                        typed,
+                        raw_values,
+                        exit_layout,
+                    )) as usize
+                } else if ob_type != 0 || *descr_size > 0 {
+                    // General struct: allocate + setfields using fielddescrs
+                    let size = if *descr_size > 0 { *descr_size } else { 16 };
+                    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
+                    if ob_type != 0 {
+                        unsafe { *(ptr as *mut i64) = ob_type as i64 };
+                    }
+                    // resume.py:597-602 setfields using fielddescrs
+                    for (i, &val) in field_vals.iter().enumerate() {
+                        if let Some(fd) = fielddescrs.get(i) {
+                            if fd.offset == 0 && ob_type != 0 {
+                                continue;
+                            }
+                            let addr = unsafe { ptr.add(fd.offset) };
+                            unsafe {
+                                match fd.field_type {
+                                    majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
+                                    majit_ir::Type::Float => {
+                                        std::ptr::write(addr as *mut u64, val as u64)
+                                    }
+                                    _ => match fd.field_size {
+                                        1 => std::ptr::write(addr, val as u8),
+                                        2 => std::ptr::write(addr as *mut u16, val as u16),
+                                        4 => std::ptr::write(addr as *mut u32, val as u32),
+                                        _ => std::ptr::write(addr as *mut i64, val),
+                                    },
                                 }
                             }
                         }
