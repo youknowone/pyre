@@ -1812,8 +1812,11 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         ctx.apply_replacements();
-        let green_key = ctx.green_key;
+        let outer_green_key = ctx.green_key;
         let cut_inner_green_key = ctx.cut_inner_green_key;
+        // compile.py:269-270: cross-loop cut → store under inner loop's
+        // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
+        let green_key = cut_inner_green_key.unwrap_or(outer_green_key);
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position.ops_len > 0)
@@ -1868,6 +1871,10 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        // compile.py:269: cut trace at cross-loop merge point.
+        // When the trace was retargeted to a different loop header,
+        // cut_trace_from removes ops before the merge point and
+        // replaces inputargs with original_boxes at the cut position.
         let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
             cross_loop_cut
         {
@@ -1880,12 +1887,7 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.header_pc,
                 );
             }
-            trace.cut_trace_from_with_consts(
-                start,
-                original_boxes,
-                original_box_types,
-                &ctx.initial_inputarg_consts,
-            )
+            trace.cut_trace_from(start, original_boxes, original_box_types)
         } else {
             trace
         };
@@ -3087,10 +3089,12 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constant_types,
             );
         // compile.py:92-96: SimpleCompileData.optimize → optimize_loop.
-        // LivenessInfo has precise per-local liveness (liveness.py parity).
-        // Blocked: fib_recursive SEGFAULT in blackhole_from_resumedata —
-        // decode_ref(TAGINT) boxes via w_int_new but the boxed object
-        // may be reclaimed before BH returns (GC/lifetime issue).
+        // Blocked: fib_recursive SEGFAULT — inputarg types from recorder
+        // are Ref for Python objects, but backend unboxes to Int. Snapshot
+        // numbering produces fail_arg_types=[Ref] for an Int-typed dead
+        // frame slot → decode_ref treats raw int as pointer → SIGSEGV.
+        // Needs inputarg-type correction after fold_box_into_create_frame
+        // before activation.
         let _ = (
             &snapshot_map,
             &snapshot_frame_size_map,
@@ -3717,6 +3721,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `run_compiled`.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
+    }
+
+    pub fn get_compiled_meta_mut(&mut self, green_key: u64) -> Option<&mut M> {
+        self.compiled_loops.get_mut(&green_key).map(|e| &mut e.meta)
     }
 
     /// Get num_inputs of the compiled loop.

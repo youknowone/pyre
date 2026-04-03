@@ -112,6 +112,11 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
 
+// GREEN_KEY_ALIASES removed: compile.py:269 parity — cross-loop cut
+// traces are now stored directly under the inner loop's green_key
+// (cut_inner_green_key) in compile_loop, matching RPython's
+// jitcell_token = cross_loop.jitcell_token. No alias dispatch needed.
+
 /// Return a raw pointer to the thread-local VirtualizableInfo.
 /// Used by the blackhole to implement BC_GETFIELD_VABLE_* bytecodes.
 pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable::VirtualizableInfo
@@ -1064,6 +1069,8 @@ fn jit_merge_point_hook(
         // RPython compile.py:204-207 (record_loop_or_bridge) parity:
         // register quasi-immutable watchers after compilation.
         register_quasi_immutable_deps(green_key);
+        // compile.py:269: cross-loop cut now stores under inner key
+        // directly. No alias registration needed.
         // RPython pyjitpl.py:3048-3061 raise_continue_running_normally:
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
@@ -1096,21 +1103,16 @@ fn maybe_compile_and_run(
     if driver.is_tracing() {
         return None;
     }
-    // warmstate.py:482-511: compiled procedure_token exists.
-    // RPython enters the assembler unconditionally — target_tokens
-    // dispatch (compile.py:288) selects the right entry point.
-    // Pyre doesn't have target_tokens yet. For compatible entries,
-    // enter the assembler normally. For incompatible: fall through
-    // to counter path so the inner loop can get its own trace.
+    // warmstate.py:482-511: RPython enters assembler unconditionally
+    // when procedure_token exists (line 511: EnterJitAssembler).
+    // compile.py:269: cross-loop cut traces are stored under the inner
+    // loop's green_key directly, so no alias resolution is needed.
     if driver.has_compiled_loop(green_key) {
-        let compatible = driver
-            .get_compiled_meta(green_key)
-            .map_or(false, |meta| meta.merge_pc == loop_header_pc);
-        if compatible {
-            return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+        if let Some(meta) = driver.get_compiled_meta(green_key) {
+            if meta.merge_pc == loop_header_pc {
+                return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+            }
         }
-        // Incompatible merge_pc: let counter tick so inner loop
-        // can eventually get its own independent trace.
     }
     // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
     if driver
