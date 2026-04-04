@@ -3282,6 +3282,42 @@ impl ResumeDataLoopMemo {
             }
         }
 
+        // resume.py:440-442 parity: drain worklist for nested virtuals
+        // discovered from pending_setfields. RPython's visitor_walk_recursive
+        // recursively processes all levels; our worklist pattern resumes here.
+        while worklist_idx < virtual_worklist.len() {
+            let opref_id = virtual_worklist[worklist_idx];
+            worklist_idx += 1;
+            if virtual_fields.contains_key(&opref_id) {
+                continue;
+            }
+            if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
+                for &field_opref in &vf.field_oprefs {
+                    self.register_box_in_new_liveboxes(
+                        field_opref,
+                        env,
+                        &numb_state.liveboxes,
+                        &mut new_liveboxes,
+                        &mut new_liveboxes_order,
+                    );
+                    let resolved = env.get_box_replacement(field_opref);
+                    if !resolved.is_none()
+                        && !virtual_fields.contains_key(&resolved.0)
+                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                    {
+                        if numb_state.liveboxes.get(resolved.0).is_none()
+                            && new_liveboxes.get(resolved.0).is_none()
+                        {
+                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.0);
+                        }
+                        virtual_worklist.push(resolved.0);
+                    }
+                }
+                virtual_fields.insert(opref_id, vf);
+            }
+        }
+
         // resume.py:454-509: _number_virtuals
         let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.cached_boxes.len()];
         let mut count = 0;
