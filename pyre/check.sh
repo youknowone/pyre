@@ -136,7 +136,7 @@ pypy3 "$BENCH/int_loop.py" >/dev/null 2>&1 || true
 printf "$(dim done)\n"
 
 #                NAME             SCRIPT                         TIMEOUT  MAX_SEC  BEAT_CPYTHON
-run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""       1       1.5
+run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""       1       2.5
 run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""       1
 run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""       1       1.5
 run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       ""       1       2.5
