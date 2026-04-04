@@ -1561,11 +1561,13 @@ fn collect_readwrite_effects(
                             }
                         } else {
                             // RPython: plain array — item_size from element type.
-                            let item_size = match ir_type {
-                                majit_ir::value::Type::Float => 8,
-                                majit_ir::value::Type::Int => 8,
-                                majit_ir::value::Type::Ref => 8,
-                                _ => 8,
+                            // symbolic.get_array_token(ARRAY, tsc) → (basesize, itemsize, ofs)
+                            // For GcArray(Char) → itemsize=1, GcArray(Signed) → itemsize=8, etc.
+                            let item_size = if let Some(ref elem) = resolved_id {
+                                field_type_from_rust_type(elem).1
+                            } else {
+                                // Fallback: word size for unknown element type.
+                                8
                             };
                             let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
                                 idx, 0, item_size, 0, ir_type, flag,
@@ -1628,18 +1630,24 @@ fn build_interior_fielddescrs(
     };
     // RPython: heaptracker.py:83-91 — iterate STRUCT._names,
     // skip Void fields and typeptr.
+    //
+    // RPython: heaptracker.py:89-90 —
+    //   isinstance(FIELD, lltype.Struct) → raise UnsupportedFieldExc
+    // If ANY field is a nested struct, the entire all_interiorfielddescrs
+    // call fails and arraydescr.all_interiorfielddescrs remains None.
+    // This is NOT a per-field skip — the exception propagates from
+    // get_array_descr (descr.py:373) and prevents setting the field.
+    for (_, field_type_str) in fields.iter() {
+        if cc.is_known_struct(field_type_str) {
+            return (Vec::new(), 0);
+        }
+    }
     let mut offset: usize = 0;
     let mut result = Vec::new();
     for (i, (field_name, field_type_str)) in fields.iter().enumerate() {
         // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
         let (field_type, field_size) = field_type_from_rust_type(field_type_str);
         if field_type == majit_ir::value::Type::Void {
-            continue;
-        }
-        // RPython: heaptracker.py:89-90 —
-        //   isinstance(FIELD, lltype.Struct) → raise UnsupportedFieldExc
-        // Nested struct fields are not supported in array-of-structs.
-        if cc.is_known_struct(field_type_str) {
             continue;
         }
         // RPython: get_field_descr(gccache, REALARRAY.OF, name)

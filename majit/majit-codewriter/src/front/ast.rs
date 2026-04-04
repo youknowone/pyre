@@ -74,9 +74,34 @@ pub fn build_semantic_program_with_options(
     let mut known_struct_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
 
+    // Pass 1: collect all struct definitions first.
+    // RPython equivalent: the annotator/rtyper resolves all types before
+    // the codewriter runs, so field types are globally available.
+    for item in &parsed.file.items {
+        if let Item::Struct(s) = item {
+            let name = s.ident.to_string();
+            known_struct_names.insert(name.clone());
+            let fields: Vec<(String, String)> = s
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    let field_name = f.ident.as_ref()?.to_string();
+                    let field_type = full_type_string(&f.ty)?;
+                    Some((field_name, field_type))
+                })
+                .collect();
+            struct_fields.fields.insert(name, fields);
+        }
+    }
+
+    // Pass 2: build function graphs with struct_fields available.
+    // This allows array_type_id_from_expr to resolve field access
+    // (e.g. self.array[i]) at parse time.
     for item in &parsed.file.items {
         match item {
-            Item::Fn(func) => functions.push(build_function_graph(func, options, None)),
+            Item::Fn(func) => {
+                functions.push(build_function_graph(func, options, None, &struct_fields))
+            }
             Item::Impl(impl_block) => {
                 let self_ty_root = type_root_ident(&impl_block.self_ty);
                 for item in &impl_block.items {
@@ -91,27 +116,10 @@ pub fn build_semantic_program_with_options(
                             &fake_fn,
                             options,
                             self_ty_root.clone(),
+                            &struct_fields,
                         ));
                     }
                 }
-            }
-            // RPython: collect struct types + field info.
-            // heaptracker.all_interiorfielddescrs iterates STRUCT._names
-            // to build interior field descriptors.
-            Item::Struct(s) => {
-                let name = s.ident.to_string();
-                known_struct_names.insert(name.clone());
-                // Collect field names and types (RPython: STRUCT._names + getattr(STRUCT, name))
-                let fields: Vec<(String, String)> = s
-                    .fields
-                    .iter()
-                    .filter_map(|f| {
-                        let field_name = f.ident.as_ref()?.to_string();
-                        let field_type = full_type_string(&f.ty)?;
-                        Some((field_name, field_type))
-                    })
-                    .collect();
-                struct_fields.fields.insert(name, fields);
             }
             _ => {}
         }
@@ -146,7 +154,8 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 /// Used to build semantic graphs from opcode match arm bodies.
 pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
     let mut block = graph.startblock;
-    let mut ctx = GraphBuildContext::default();
+    let empty_registry = StructFieldRegistry::default();
+    let mut ctx = GraphBuildContext::new(&empty_registry);
     let result = lower_expr(
         graph,
         &mut block,
@@ -162,34 +171,55 @@ pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
 }
 
 pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
-    build_function_graph(func, &AstGraphOptions::default(), None)
+    let empty_registry = StructFieldRegistry::default();
+    build_function_graph(func, &AstGraphOptions::default(), None, &empty_registry)
 }
 
 pub fn build_function_graph_with_self_ty_pub(
     func: &ItemFn,
     self_ty_root: Option<String>,
 ) -> SemanticFunction {
-    build_function_graph(func, &AstGraphOptions::default(), self_ty_root)
+    let empty_registry = StructFieldRegistry::default();
+    build_function_graph(
+        func,
+        &AstGraphOptions::default(),
+        self_ty_root,
+        &empty_registry,
+    )
 }
 
-#[derive(Debug, Clone, Default)]
-struct GraphBuildContext {
+#[derive(Debug, Clone)]
+struct GraphBuildContext<'a> {
     local_type_roots: HashMap<String, String>,
     /// RPython: ARRAY element type identity — maps variable name to the
     /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
     /// element type that determines the ARRAY identity for `cpu.arraydescrof()`.
     local_element_types: HashMap<String, String>,
+    /// RPython: program-level struct field types, available for resolving
+    /// field access array identity (e.g. `self.array[i]` → owner.field_type).
+    struct_fields: &'a StructFieldRegistry,
+}
+
+impl<'a> GraphBuildContext<'a> {
+    fn new(struct_fields: &'a StructFieldRegistry) -> Self {
+        Self {
+            local_type_roots: HashMap::new(),
+            local_element_types: HashMap::new(),
+            struct_fields,
+        }
+    }
 }
 
 fn build_function_graph(
     func: &ItemFn,
     options: &AstGraphOptions,
     self_ty_root: Option<String>,
+    struct_fields: &StructFieldRegistry,
 ) -> SemanticFunction {
     let mut graph = FunctionGraph::new(func.sig.ident.to_string());
     let mut entry = graph.startblock;
-    let mut ctx = GraphBuildContext::default();
+    let mut ctx = GraphBuildContext::new(struct_fields);
 
     // Register function parameters as Input ops (RPython: Block.inputargs)
     for param in &func.sig.inputs {
@@ -254,7 +284,8 @@ fn build_function_graph(
 /// Used by the graph-based classifier in lib.rs to analyze resolved method bodies.
 pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stmt) {
     let mut block = block;
-    let mut ctx = GraphBuildContext::default();
+    let empty_registry = StructFieldRegistry::default();
+    let mut ctx = GraphBuildContext::new(&empty_registry);
     lower_stmt(
         graph,
         &mut block,
@@ -1069,6 +1100,18 @@ fn full_type_string(ty: &syn::Type) -> Option<String> {
 /// For `arr[idx]`, returns the ELEMENT TYPE of `arr` from context.
 /// This is the Rust equivalent of RPython's `op.args[0].concretetype.TO`
 /// which gives `GcArray(T)` — the `T` is what distinguishes array types.
+/// Extract element type from a type string like `"Vec<Point>"` → `"Point"`.
+/// RPython equivalent: `ARRAY.OF` from `GcArray(T)` → `T`.
+fn extract_element_type_from_str(type_str: &str) -> Option<String> {
+    let start = type_str.find('<')?;
+    let end = type_str.rfind('>')?;
+    if start < end {
+        Some(type_str[start + 1..end].trim().to_string())
+    } else {
+        None
+    }
+}
+
 fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
     match expr {
         syn::Expr::Path(path) => path
@@ -1077,8 +1120,14 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
             .and_then(|ident| ctx.local_element_types.get(&ident.to_string()).cloned()),
         syn::Expr::Reference(r) => array_type_id_from_expr(&r.expr, ctx),
         syn::Expr::Paren(p) => array_type_id_from_expr(&p.expr, ctx),
-        // For field access (self.array) or other complex exprs,
-        // type is not statically known — return None (conservative).
+        // RPython: op.args[0].concretetype — for field access like `self.array`,
+        // resolve the field's type from struct_fields to get element type.
+        syn::Expr::Field(field) => {
+            let owner_type = receiver_type_root(&field.base, ctx)?;
+            let field_name = member_name(&field.member);
+            let field_type_str = ctx.struct_fields.field_type(&owner_type, &field_name)?;
+            extract_element_type_from_str(field_type_str)
+        }
         _ => None,
     }
 }
