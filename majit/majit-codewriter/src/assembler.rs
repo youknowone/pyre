@@ -189,14 +189,17 @@ impl Assembler {
                 } else {
                     let pos = self.all_liveness.len();
                     self.all_liveness_positions.insert(liveness_key, pos);
-                    // RPython: chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))
+                    // RPython assembler.py:241: 3 count bytes
                     self.all_liveness.push(live_i.len() as u8);
                     self.all_liveness.push(live_r.len() as u8);
                     self.all_liveness.push(live_f.len() as u8);
-                    // Then register indices for each kind
-                    self.all_liveness.extend_from_slice(&live_i);
-                    self.all_liveness.extend_from_slice(&live_r);
-                    self.all_liveness.extend_from_slice(&live_f);
+                    // RPython assembler.py:243-247: encode_liveness per kind
+                    // liveness.py:147-166: bitset encoding — each byte is an
+                    // 8-bit bitmap of register indices (bit N = reg N is live).
+                    for live in [&live_i, &live_r, &live_f] {
+                        let encoded = encode_liveness(live);
+                        self.all_liveness.extend_from_slice(&encoded);
+                    }
                     pos
                 };
                 // RPython liveness.py:127-131: encode_offset — 2-byte LE
@@ -306,7 +309,12 @@ impl Assembler {
                     argcodes.push(kc);
                     state.code.push(reg);
                 }
-                let opname = format!("inline_call_{}", self.kinds_suffix(args_i, args_r, args_f));
+                // RPython jtransform.py:423,434: inline_call_{kinds}_{reskind}
+                let opname = format!(
+                    "inline_call_{}_{}",
+                    self.kinds_suffix(args_i, args_r, args_f),
+                    result_kind
+                );
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -562,6 +570,34 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
     }
+}
+
+/// RPython liveness.py:147-166: encode_liveness.
+///
+/// Encodes a sorted set of register indices as a bitset. Each byte
+/// represents 8 consecutive register indices: bit N = register (offset+N)
+/// is live. The output is a compact bitmap.
+fn encode_liveness(live: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut offset: u16 = 0;
+    let mut byte: u8 = 0;
+    let mut i = 0;
+    while i < live.len() {
+        let x = live[i] as u16;
+        let rel = x - offset;
+        if rel >= 8 {
+            result.push(byte);
+            byte = 0;
+            offset += 8;
+            continue;
+        }
+        byte |= 1 << rel;
+        i += 1;
+    }
+    if byte != 0 {
+        result.push(byte);
+    }
+    result
 }
 
 /// Convert OpKind to an opname string for the assembler's instruction table.
