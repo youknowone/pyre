@@ -165,7 +165,7 @@ impl CodeWriter {
 
         // RPython: self.assembler.finished(self.callcontrol.callinfocollection)
         // (codewriter.py:85)
-        self.assembler.finished();
+        self.assembler.finished(&callcontrol.callinfocollection);
 
         all_jitcodes
     }
