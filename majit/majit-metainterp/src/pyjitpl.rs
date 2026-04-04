@@ -2000,7 +2000,7 @@ impl<M: Clone> MetaInterp<M> {
                 // Phase 2 panicked — unroll_opt dropped. Phase 1 results
                 // survive in phase1_out (written before Phase 2 started).
                 if payload
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
                     if crate::majit_log_enabled() {
@@ -2199,9 +2199,7 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(e) => {
-                let is_invalid_loop = e
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
-                    .is_some();
+                let is_invalid_loop = e.downcast_ref::<crate::optimize::InvalidLoop>().is_some();
                 if crate::majit_log_enabled() {
                     let kind = if is_invalid_loop {
                         "InvalidLoop"
@@ -2774,7 +2772,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(result) => result,
             Err(payload) => {
                 if payload
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
                     if crate::majit_log_enabled() {
@@ -3128,7 +3126,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(ops) => ops,
             Err(payload) => {
                 if payload
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
                     if crate::majit_log_enabled() {
@@ -3515,7 +3513,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 if crate::majit_log_enabled() {
                     if payload
-                        .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                        .downcast_ref::<crate::optimize::InvalidLoop>()
                         .is_some()
                     {
                         eprintln!(

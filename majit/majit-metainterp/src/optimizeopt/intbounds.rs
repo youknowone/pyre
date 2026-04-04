@@ -123,7 +123,7 @@ impl OptIntBounds {
         let existing = self.getintbound(replaced, ctx);
         if !existing.is_unbounded() {
             if !existing.contains(value) {
-                std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                std::panic::panic_any(crate::optimize::InvalidLoop(
                     "constant int is outside the range allowed for that box",
                 ));
             }

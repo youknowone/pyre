@@ -37,13 +37,6 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         None
     }
 
-    /// guard.py:89: Create a CompileLoopVersionDescr with attributes
-    /// copied from this descr (copy_all_attributes_from), then
-    /// rd_vector_info = None. Returns None if not supported.
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        None
-    }
-
     // ── Downcasting helpers ──
 
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {

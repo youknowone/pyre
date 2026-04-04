@@ -28,6 +28,7 @@ pub mod jitcode;
 mod jitdriver;
 pub mod jitexc;
 pub mod jitframe;
+pub mod optimize;
 pub mod optimizeopt;
 pub mod parity;
 mod pyjitpl;
@@ -37,6 +38,7 @@ mod symbolic_stack;
 mod trace_ctx;
 pub mod virtualizable;
 pub mod virtualref;
+pub mod walkvirtual;
 
 pub use call_descr::{make_call_assembler_descr, make_call_descr};
 pub use constant_pool::ConstantPool;
