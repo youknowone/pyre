@@ -119,6 +119,15 @@ impl CodeWriter {
     /// Processes all pending graphs from CallControl's unfinished_graphs queue.
     /// New graphs may be discovered during jtransform (via `get_jitcode()`),
     /// so the loop continues until no more pending graphs remain.
+    ///
+    /// RPython identity contract: `get_jitcode()` creates the JitCode object
+    /// and assigns it to `jitcodes[graph]`. `enum_pending_graphs()` yields
+    /// `(graph, jitcode)` — the same object. `jitcode.index` is set to
+    /// `len(all_jitcodes)` at processing time (codewriter.py:68,80).
+    ///
+    /// In majit, `get_jitcode()` assigns a stable index upfront. We use
+    /// that same index here, preserving the contract that InlineCall's
+    /// `jitcode_index` matches the final `JitCode.index`.
     pub fn make_jitcodes(
         &mut self,
         callcontrol: &mut CallControl,
@@ -133,18 +142,20 @@ impl CodeWriter {
         //            self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
         // (codewriter.py:79-84)
         //
-        // enum_pending_graphs() is a while-loop that pops from unfinished_graphs.
-        // During transform, new graphs may be discovered and added. We emulate
-        // this with a loop that drains the queue until empty.
+        // RPython's enum_pending_graphs() is a while-loop that pops from
+        // unfinished_graphs. During transform, new graphs may be discovered
+        // and added via get_jitcode(). We drain the queue in batches.
         loop {
             let pending = callcontrol.enum_pending_graphs();
             if pending.is_empty() {
                 break;
             }
-            for path in pending {
+            for (path, index) in pending {
                 let graph = callcontrol.function_graphs().get(&path).cloned();
                 if let Some(graph) = graph {
-                    let index = all_jitcodes.len();
+                    // RPython: self.transform_graph_to_jitcode(graph, jitcode, verbose, index)
+                    // The index comes from CallControl.get_jitcode() — the same
+                    // index embedded in InlineCall ops by jtransform.
                     let (_ssarepr, jitcode) =
                         self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
                     all_jitcodes.push(jitcode);

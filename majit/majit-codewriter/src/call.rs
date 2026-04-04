@@ -351,8 +351,20 @@ impl CallControl {
     }
 
     /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
-    pub fn enum_pending_graphs(&mut self) -> Vec<CallPath> {
-        std::mem::take(&mut self.unfinished_graphs)
+    ///
+    /// RPython yields `(graph, jitcode)` pairs. In majit, we return
+    /// `(CallPath, usize)` where the usize is the jitcode index assigned
+    /// by `get_jitcode()`. This preserves the identity contract: the
+    /// index embedded in InlineCall ops matches the JitCode.index.
+    pub fn enum_pending_graphs(&mut self) -> Vec<(CallPath, usize)> {
+        let paths = std::mem::take(&mut self.unfinished_graphs);
+        paths
+            .into_iter()
+            .map(|path| {
+                let index = self.jitcodes[&path];
+                (path, index)
+            })
+            .collect()
     }
 
     /// Classify a call target.
