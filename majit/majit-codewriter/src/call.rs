@@ -78,6 +78,9 @@ pub struct JitDriverStaticData {
     pub reds: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
+    /// RPython: `jd.mainjitcode` (call.py:147) — JitCode index for the portal.
+    /// Set by `grab_initial_jitcodes()`.
+    pub mainjitcode: Option<usize>,
 }
 
 /// Call control — decides inline vs residual for each call target.
@@ -213,6 +216,7 @@ impl CallControl {
             greens,
             reds,
             portal_graph: portal_graph.clone(),
+            mainjitcode: None,
         });
         self.portal_targets.insert(portal_graph);
     }
@@ -342,34 +346,48 @@ impl CallControl {
 
     /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
     ///
-    /// For each jitdriver, create a JitCode entry for its portal graph.
-    /// RPython also sets `jd.mainjitcode` and back-reference.
+    /// ```python
+    /// def grab_initial_jitcodes(self):
+    ///     for jd in self.jitdrivers_sd:
+    ///         jd.mainjitcode = self.get_jitcode(jd.portal_graph)
+    ///         jd.mainjitcode.jitdriver_sd = jd
+    /// ```
+    ///
+    /// Creates JitCode entries for portal graphs and sets back-references.
     pub fn grab_initial_jitcodes(&mut self) {
-        let portals: Vec<CallPath> = self
+        // Collect portal paths first to avoid borrow conflict.
+        let portals: Vec<(usize, CallPath)> = self
             .jitdrivers_sd
             .iter()
-            .map(|jd| jd.portal_graph.clone())
+            .enumerate()
+            .map(|(i, jd)| (i, jd.portal_graph.clone()))
             .collect();
-        for portal in portals {
-            self.get_jitcode(&portal);
+        for (jd_index, portal) in portals {
+            // RPython: jd.mainjitcode = self.get_jitcode(jd.portal_graph)
+            let jitcode_index = self.get_jitcode(&portal);
+            // RPython: jd.mainjitcode.jitdriver_sd = jd
+            // (In majit, we store the jitcode index on the jitdriver.)
+            self.jitdrivers_sd[jd_index].mainjitcode = Some(jitcode_index);
         }
     }
 
     /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
     ///
-    /// RPython yields `(graph, jitcode)` pairs. In majit, we return
-    /// `(CallPath, usize)` where the usize is the jitcode index assigned
-    /// by `get_jitcode()`. This preserves the identity contract: the
-    /// index embedded in InlineCall ops matches the JitCode.index.
-    pub fn enum_pending_graphs(&mut self) -> Vec<(CallPath, usize)> {
-        let paths = std::mem::take(&mut self.unfinished_graphs);
-        paths
-            .into_iter()
-            .map(|path| {
-                let index = self.jitcodes[&path];
-                (path, index)
-            })
-            .collect()
+    /// ```python
+    /// def enum_pending_graphs(self):
+    ///     while self.unfinished_graphs:
+    ///         graph = self.unfinished_graphs.pop()  # LIFO
+    ///         yield graph, self.jitcodes[graph]
+    /// ```
+    ///
+    /// RPython uses a generator that pops one graph at a time (LIFO).
+    /// During processing, new graphs may be added to `unfinished_graphs`
+    /// via `get_jitcode()`, and the generator picks them up on the next
+    /// iteration. We emulate this with `pop_one_graph()`.
+    pub fn pop_one_graph(&mut self) -> Option<(CallPath, usize)> {
+        let path = self.unfinished_graphs.pop()?; // LIFO, matching RPython
+        let index = self.jitcodes[&path];
+        Some((path, index))
     }
 
     /// Classify a call target.

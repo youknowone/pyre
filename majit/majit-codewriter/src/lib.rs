@@ -227,6 +227,11 @@ fn build_canonical_opcode_dispatch(
         }
     }
 
+    // RPython: grab_initial_jitcodes() BEFORE any jtransform processing.
+    // This seeds portal graphs into the pending queue first, so they get
+    // the lowest JitCode indices (codewriter.py:76, call.py:145-148).
+    call_control.grab_initial_jitcodes();
+
     // Phase 1: Process opcode arms through annotate → rtype → jtransform → flatten.
     // This produces SSARepr for each arm (PipelineOpcodeArm.flattened).
     // During jtransform, CallControl.get_jitcode() may discover callee graphs
@@ -262,11 +267,11 @@ fn build_canonical_opcode_dispatch(
         })
         .collect();
 
-    // Phase 2: RPython CodeWriter.make_jitcodes() (codewriter.py:74-89).
-    // Process all pending graphs discovered during Phase 1's jtransform.
-    // Each graph → one JitCode with index from CallControl.get_jitcode().
+    // Phase 2: RPython CodeWriter.make_jitcodes() enum_pending_graphs loop
+    // (codewriter.py:79-85). Process pending graphs: portal (seeded above)
+    // + callees discovered during Phase 1's jtransform.
     let mut codewriter = codewriter::CodeWriter::new();
-    let jitcodes = codewriter.make_jitcodes(call_control, &pipeline_config.transform);
+    let jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
 
     (dispatch, jitcodes)
 }
