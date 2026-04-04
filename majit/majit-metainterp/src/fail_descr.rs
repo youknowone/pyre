@@ -49,6 +49,28 @@ impl majit_ir::Descr for MetaFailDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(MetaFailDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            vector_info: UnsafeCell::new(self.vector_info().clone()),
+        }))
+    }
+    /// MetaFailDescr has no resume_data; the CompileLoopVersionDescr
+    /// gets empty ResumeData. Resume state is carried on Op fields.
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            vector_info: UnsafeCell::new(Vec::new()),
+        }))
+    }
 }
 
 impl FailDescr for MetaFailDescr {
@@ -230,6 +252,25 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     }
     fn is_resume_at_position(&self) -> bool {
         true
+    }
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(ResumeAtPositionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+        }))
+    }
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            vector_info: UnsafeCell::new(Vec::new()),
+        }))
     }
 }
 
