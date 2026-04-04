@@ -17,22 +17,30 @@ use crate::regalloc::RegAllocResult;
 ///
 /// RPython: `jitcode.py::JitCode` — contains bytecode, constants, and
 /// register counts for the meta-interpreter to execute.
+/// RPython: `jitcode.py::JitCode.setup()` (jitcode.py:22-34).
 #[derive(Debug, Clone)]
 pub struct JitCode {
     /// RPython: JitCode.name
     pub name: String,
-    /// RPython: JitCode.code — bytecode string
+    /// RPython: JitCode.code — bytecode bytes
     pub code: Vec<u8>,
-    /// RPython: JitCode.constants_i — integer constant pool
+    /// RPython: JitCode.constants_i
     pub constants_i: Vec<i64>,
-    /// RPython: JitCode.constants_r — reference constant pool
+    /// RPython: JitCode.constants_r
     pub constants_r: Vec<u64>,
-    /// RPython: JitCode.constants_f — float constant pool
+    /// RPython: JitCode.constants_f
     pub constants_f: Vec<f64>,
     /// RPython: num_regs_i, num_regs_r, num_regs_f
     pub num_regs_i: usize,
     pub num_regs_r: usize,
     pub num_regs_f: usize,
+    /// RPython: jitcode.py:30 — set of bytecode offsets where instructions start.
+    /// Used for debugging and verification.
+    pub startpoints: std::collections::HashSet<usize>,
+    /// RPython: jitcode.py:31 — set of bytecode offsets that are label targets.
+    pub alllabels: std::collections::HashSet<usize>,
+    /// RPython: jitcode.py:32 — map from bytecode offset to result type char.
+    pub resulttypes: HashMap<usize, char>,
     /// Total flat ops (for statistics)
     pub num_ops: usize,
 }
@@ -123,6 +131,10 @@ impl Assembler {
             }
         }
 
+        // RPython assembler.py:271-281: jitcode.setup(code, ...)
+        // Collect alllabels from label_positions values.
+        let alllabels: std::collections::HashSet<usize> =
+            state.label_positions.values().copied().collect();
         let jitcode = JitCode {
             name: ssarepr.name.clone(),
             code: state.code,
@@ -132,6 +144,9 @@ impl Assembler {
             num_regs_i,
             num_regs_r,
             num_regs_f,
+            startpoints: state.startpoints,
+            alllabels,
+            resulttypes: HashMap::new(), // TODO: track during write_insn
             num_ops: ssarepr.ops.len(),
         };
 
@@ -289,19 +304,26 @@ impl Assembler {
                 result_kind,
                 ..
             } => {
+                // RPython: [jitcode] + sublists (only needed kinds)
                 // jitcode index as descr-like 2-byte value
                 state.code.push((*jitcode_index & 0xFF) as u8);
                 state.code.push((*jitcode_index >> 8) as u8);
                 argcodes.push('d');
-                // ListOfKind 'int'
-                self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
-                argcodes.push('I');
-                // ListOfKind 'ref'
-                self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
-                argcodes.push('R');
-                // ListOfKind 'float'
-                self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
-                argcodes.push('F');
+                // RPython jtransform.py:422-431: rewrite_call
+                // Only emit the kind sublists that are in 'kinds'.
+                let kinds = self.kinds_suffix(args_i, args_r, args_f);
+                if kinds.contains('i') {
+                    self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                    argcodes.push('I');
+                }
+                if kinds.contains('r') {
+                    self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                    argcodes.push('R');
+                }
+                if kinds.contains('f') {
+                    self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
+                    argcodes.push('F');
+                }
                 // Result
                 if let Some(result) = op.result {
                     argcodes.push('>');
@@ -309,13 +331,8 @@ impl Assembler {
                     argcodes.push(kc);
                     state.code.push(reg);
                 }
-                // RPython jtransform.py:423,434: inline_call_{kinds}_{reskind}
-                let opname = format!(
-                    "inline_call_{}_{}",
-                    self.kinds_suffix(args_i, args_r, args_f),
-                    result_kind
-                );
-                let key = format!("{opname}/{argcodes}");
+                // RPython jtransform.py:434: inline_call_{kinds}_{reskind}
+                let key = format!("inline_call_{kinds}_{result_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
@@ -602,27 +619,51 @@ fn encode_liveness(live: &[u8]) -> Vec<u8> {
 
 /// Convert OpKind to an opname string for the assembler's instruction table.
 /// RPython: the opname comes from SpaceOperation.opname.
+/// Convert OpKind to a typed opname matching RPython's jtransform output.
+///
+/// RPython jtransform produces fully-qualified names like `getfield_vable_i`,
+/// `setfield_gc_r`, `int_add`. The kind suffix comes from the result type
+/// or value type of the operation.
 fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     use crate::model::OpKind;
     match kind {
-        OpKind::Input { .. } => "input".into(),
+        OpKind::Input { ty, .. } => format!("input_{}", value_type_to_kind(ty)),
         OpKind::ConstInt(_) => "const_int".into(),
-        OpKind::FieldRead { .. } => "getfield_gc".into(),
-        OpKind::FieldWrite { .. } => "setfield_gc".into(),
-        OpKind::ArrayRead { .. } => "getarrayitem_gc".into(),
-        OpKind::ArrayWrite { .. } => "setarrayitem_gc".into(),
-        OpKind::Call { .. } => "direct_call".into(),
+        // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f
+        OpKind::FieldRead { ty, .. } => format!("getfield_gc_{}", value_type_to_kind(ty)),
+        OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
+        // RPython: getarrayitem_gc_i etc.
+        OpKind::ArrayRead { item_ty, .. } => {
+            format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))
+        }
+        OpKind::ArrayWrite { item_ty, .. } => {
+            format!("setarrayitem_gc_{}", value_type_to_kind(item_ty))
+        }
+        OpKind::Call { result_ty, .. } => {
+            format!("direct_call_{}", value_type_to_kind(result_ty))
+        }
         OpKind::GuardTrue { .. } => "guard_true".into(),
         OpKind::GuardFalse { .. } => "guard_false".into(),
         OpKind::GuardValue { kind_char, .. } => format!("{kind_char}_guard_value"),
-        OpKind::VableFieldRead { .. } => "getfield_vable".into(),
-        OpKind::VableFieldWrite { .. } => "setfield_vable".into(),
-        OpKind::VableArrayRead { .. } => "getarrayitem_vable".into(),
-        OpKind::VableArrayWrite { .. } => "setarrayitem_vable".into(),
+        // RPython: getfield_vable_i, getfield_vable_r, getfield_vable_f
+        OpKind::VableFieldRead { ty, .. } => {
+            format!("getfield_vable_{}", value_type_to_kind(ty))
+        }
+        OpKind::VableFieldWrite { ty, .. } => {
+            format!("setfield_vable_{}", value_type_to_kind(ty))
+        }
+        // RPython: getarrayitem_vable_i etc.
+        OpKind::VableArrayRead { item_ty, .. } => {
+            format!("getarrayitem_vable_{}", value_type_to_kind(item_ty))
+        }
+        OpKind::VableArrayWrite { item_ty, .. } => {
+            format!("setarrayitem_vable_{}", value_type_to_kind(item_ty))
+        }
         OpKind::BinOp { op, .. } => format!("int_{op}"),
         OpKind::UnaryOp { op, .. } => format!("int_{op}"),
         OpKind::VableForce => "hint_force_virtualizable".into(),
         OpKind::Live => "live".into(),
+        // Call variants are handled by encode_op directly, not here.
         OpKind::CallElidable { .. } => "call_elidable".into(),
         OpKind::CallResidual { .. } => "residual_call".into(),
         OpKind::CallMayForce { .. } => "call_may_force".into(),

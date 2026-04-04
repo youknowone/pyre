@@ -21,6 +21,7 @@ use crate::passes::flatten::{FlatOp, Label, SSARepr};
 /// Modifies the flattened ops in place: each `FlatOp::Live` marker
 /// gets its `live_values` set populated with all values alive at that
 /// point in the instruction sequence.
+/// RPython liveness.py:19-23.
 pub fn compute_liveness(flattened: &mut SSARepr) {
     let mut label2alive: HashMap<Label, HashSet<ValueId>> = HashMap::new();
 
@@ -30,6 +31,48 @@ pub fn compute_liveness(flattened: &mut SSARepr) {
             break;
         }
     }
+    // RPython liveness.py:23: remove_repeated_live(ssarepr)
+    remove_repeated_live(&mut flattened.ops);
+}
+
+/// RPython liveness.py:82-116: remove_repeated_live.
+///
+/// Merges consecutive `-live-` markers into a single one (union of
+/// all live values). Labels between them are preserved.
+fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
+    let mut result: Vec<FlatOp> = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        if !matches!(&ops[i], FlatOp::Live { .. }) {
+            result.push(ops[i].clone());
+            i += 1;
+            continue;
+        }
+        // Collect consecutive Live + Label runs
+        let mut labels = Vec::new();
+        let mut merged_live: HashSet<ValueId> = HashSet::new();
+        while i < ops.len() {
+            match &ops[i] {
+                FlatOp::Live { live_values } => {
+                    merged_live.extend(live_values.iter());
+                    i += 1;
+                }
+                FlatOp::Label(_) => {
+                    labels.push(ops[i].clone());
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        // Emit labels first, then the merged -live-
+        result.extend(labels);
+        let mut merged: Vec<ValueId> = merged_live.into_iter().collect();
+        merged.sort_by_key(|v| v.0);
+        result.push(FlatOp::Live {
+            live_values: merged,
+        });
+    }
+    *ops = result;
 }
 
 /// One backward pass of liveness analysis.
