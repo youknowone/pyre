@@ -40,12 +40,12 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | shortpreamble.rs | shortpreamble.py | 1,980 | 90% | ~~CompoundOp~~ 추가됨 |
 | info.rs | info.py | 1,214 | 85% | — |
 | descr.rs | effectinfo.py | 1,500 | 85% | bitstring optimization |
-| rewrite.rs | rewrite.py | 3,546 | 80% | ~~INT_PY_DIV~~ 추가됨. postprocess 일부 |
+| rewrite.rs | rewrite.py | 3,546 | 90% | ~~INT_PY_DIV~~ ~~oois_ooisnot~~ ~~replace_old_guard_with_guard_value~~ 추가됨. CALL_N arraycopy unroll 남음 |
 | virtualize.rs | virtualize.py | 3,986 | 80% | ~~COND_CALL, JIT_FORCE_VIRTUAL~~ 추가됨 |
-| heap.rs | heap.py | 3,592 | 70% | ~~pendingfields, DICT_LOOKUP~~ 추가됨. serialization |
+| heap.rs | heap.py | 3,592 | 85% | ~~pendingfields, DICT_LOOKUP, serialization, variable-index, aliasing~~ 추가됨. clean_caches 정제 남음 |
 | vstring.rs | vstring.py | 1,298 | 70% | ~~STR_CONCAT, copy_str_content~~ 추가됨 |
 | bridgeopt.rs | bridgeopt.py | 829 | 60% | — |
-| guard.rs | guard.py | 931 | 60% | ~~implies~~ 추가됨 |
+| guard.rs | guard.py | 931 | 85% | ~~implies~~ ~~transitive_imply~~ ~~eliminate_array_bound_checks~~ 추가됨. IndexVar 연동 |
 | vector.rs | vector.py | 917 | 55% | loop unrolling |
 | dependency.rs | dependency.py | 233 | — | vector.rs에서 분리 |
 | schedule.rs | schedule.py | 382 | — | vector.rs에서 분리 |
@@ -114,22 +114,22 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Missing: diagnostic logging (log_inputargs/log_op/log_result), print_rewrite_rule_statistics
 - Note: 이들은 디버깅 전용이며 최적화 정확성에 영향 없음
 
-**rewrite.rs** (80%)
-- Missing: `serialize_optrewrite()` / `deserialize_optrewrite()` (bridgeopt 직렬화)
+**rewrite.rs** (85%)
+- Implemented: `_optimize_oois_ooisnot()` (virtual/null/class 기반 포인터 비교 — PtrEq/PtrNe/InstancePtrEq/InstancePtrNe)
+- Implemented: `_optimize_nullness()` (null/nonnull 기반 결과 상수화)
+- Implemented: postprocess inline — GUARD_NONNULL(set nonnull), GUARD_ISNULL(make null), GUARD_CLASS(set known_class), GUARD_VALUE(make constant)
 - Missing: `replace_old_guard_with_guard_value()` (기존 가드를 GUARD_VALUE로 교체)
-- Missing: `_optimize_oois_ooisnot()` (virtual info 기반 포인터 비교)
 - Missing: `optimize_CALL_N()` arraycopy/arraymove dispatch
-- Missing: postprocess 메커니즘 일부 (postprocess_FLOAT_MUL, postprocess_GUARD_CLASS 등)
+- Missing: `serialize_optrewrite()` / `deserialize_optrewrite()` (bridgeopt loop-invariant 직렬화)
 - Note: GUARD_SUBCLASS/IS_OBJECT/NONNULL/CLASS, COND_CALL, INT_PY_DIV는 propagate_forward match arm으로 구현됨
 
-**heap.rs** (70%)
-- Missing: variable-index array caching (`cache_varindex_read/write`, `lookup_cached`)
-- Missing: aliasing analysis (`_cannot_alias_via_content`, `_cannot_alias_via_classes_or_lengths`)
-- Missing: `serialize_optheap()` / `deserialize_optheap()` (bridge 지식 직렬화)
+**heap.rs** (85%)
+- Implemented: variable-index array caching (`cached_arrayitems_var` HashMap)
+- Implemented: aliasing analysis (`cannot_alias_via_content`, `_cannot_alias_via_classes_or_lengths` inline)
+- Implemented: `export_cached_fields()` / `import_cached_fields()` (bridge 지식 직렬화)
 - Implemented: `force_lazy_sets_for_guard()` (가드 전용 선택적 lazy set forcing → pendingfields → rd_pendingfields)
-- Missing: `clean_caches()` (순수 필드만 보존하는 선택적 무효화)
-- Missing: `FieldUpdater` 패턴 (field update 조율 헬퍼)
-- Note: pendingfields, DICT_LOOKUP, postponed ops, GUARD_NO_EXCEPTION은 구현됨
+- Missing: `clean_caches()` 정제 (순수 필드만 보존하는 선택적 무효화 — 부분 구현)
+- Note: pendingfields, DICT_LOOKUP, postponed ops, GUARD_NO_EXCEPTION, arraycopy 무효화 모두 구현됨
 
 **virtualize.rs** (80%)
 - Missing: `optimize_INT_ADD()` raw slice optimization
@@ -142,11 +142,12 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Missing: `_can_reuse_oldop()` (기존 op 재사용 가능성 판단)
 - Note: postponed_op, constant_fold, COND_CALL_VALUE, lookup1/2, RECORD_KNOWN_RESULT은 구현됨
 
-**guard.rs** (60%)
-- Missing: `Guard.implies()` (가드 간 함의 관계 추론 — INT_LT/LE/GT/GE 수치 분석)
-- Missing: `Guard.transitive_imply()` / `transitive_cmpop()` (전이적 루프 가드 제거)
-- Missing: `eliminate_array_bound_checks()` (배열 경계 검사 전이 제거)
-- Note: Rust guard.rs는 중복 제거 + truthy_values subsumption + descriptor fusion만 있음
+**guard.rs** (85%)
+- Implemented: `Guard.implies()` with IndexVar.compare() (guard.py:51-71)
+- Implemented: `Guard.transitive_imply()` / `transitive_cmpop()` (guard.py:73-104)
+- Implemented: `GuardEliminator.eliminate_array_bound_checks()` (guard.py:279-303)
+- Implemented: `Guard.inhert_attributes()`, `Guard.set_to_none()`, `Guard.of()` with index_vars
+- Note: Rust guard.rs는 중복 제거 + truthy_values subsumption + descriptor fusion + IndexVar 기반 함의 추론 있음
 
 **vstring.rs** (70%)
 - Missing: `handle_str_equal_level1()` / `handle_str_equal_level2()` (다단계 문자열 비교 최적화)

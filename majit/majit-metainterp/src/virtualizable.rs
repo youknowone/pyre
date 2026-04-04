@@ -724,6 +724,21 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         // virtualizable.py:103-113 write_boxes parity.
+        // Pre-compute expected total and validate up front (RPython contract).
+        // RPython asserts `len(boxes) == i + 1` (the +1 is the trailing
+        // virtualizable ref). majit boxes omit that trailing ref, so we
+        // assert exact count == static_fields + array_items.
+        let mut expected = self.static_fields.len();
+        for ai in 0..self.array_fields.len() {
+            expected += self.get_array_length(obj_ptr as *const u8, ai);
+        }
+        assert!(
+            boxes.len() == expected,
+            "write_boxes_to_heap: boxes.len()={} != expected {}",
+            boxes.len(),
+            expected,
+        );
+
         let mut i = 0;
 
         // virtualizable.py:104-107: static fields.
@@ -732,11 +747,7 @@ impl VirtualizableInfo {
             i += 1;
         }
 
-        // virtualizable.py:108-112:
-        //   lst = getattr(virtualizable, fieldname)
-        //   for j in range(len(lst)):
-        //       lst[j] = unwrap(ARRAYITEMTYPE, boxes[i])
-        //       i = i + 1
+        // virtualizable.py:108-112: array items.
         for ai in 0..self.array_fields.len() {
             let len = self.get_array_length(obj_ptr as *const u8, ai);
             for ei in 0..len {
@@ -744,16 +755,6 @@ impl VirtualizableInfo {
                 i += 1;
             }
         }
-
-        // virtualizable.py:113: assert len(boxes) == i + 1
-        // RPython boxes end with the virtualizable ref itself (+1).
-        // Our boxes omit that trailing ref, so exact count == i.
-        assert!(
-            boxes.len() == i,
-            "write_boxes_to_heap: boxes.len()={} != consumed {}",
-            boxes.len(),
-            i,
-        );
     }
 
     /// RPython equivalent: `vinfo.write_from_resume_data_partial(...)`.
