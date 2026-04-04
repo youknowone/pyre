@@ -3174,7 +3174,8 @@ impl ResumeDataLoopMemo {
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern).
-        let mut virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo> = HashMap::new();
+        let mut virtual_fields: std::collections::BTreeMap<u32, majit_ir::VirtualFieldsInfo> =
+            std::collections::BTreeMap::new();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<u32> = Vec::new();
@@ -3362,6 +3363,7 @@ impl ResumeDataLoopMemo {
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
 
+            // BTreeMap provides deterministic iteration by key order.
             for (&opref_id, vf) in &virtual_fields {
                 // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
                 // Check both numb_state.liveboxes (env virtuals) and
