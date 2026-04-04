@@ -51,9 +51,11 @@ impl majit_ir::Descr for OptResumeAtPositionDescr {
         true
     }
     // RPython: ResumeAtPositionDescr does NOT override clone().
-    // Inherited clone() returns plain ResumeGuardDescr, losing the marker.
-    // OptResumeAtPositionDescr is a lightweight tag with no resume storage,
-    // so clone_descr returns None (not clonable as resume source).
+    // Inherited ResumeGuardDescr.clone() returns plain ResumeGuardDescr,
+    // so the is_resume_at_position marker is lost after clone.
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(crate::fail_descr::make_plain_resume_guard_descr(Vec::new()))
+    }
     // clone_as_loop_version_descr: NOT implemented (no resume storage).
 }
 
