@@ -163,8 +163,17 @@ impl CodeWriter {
             };
             // RPython: jitcode.index = len(all_jitcodes) (codewriter.py:68,80)
             let index = all_jitcodes.len();
-            let (_ssarepr, jitcode) =
+            let (_ssarepr, mut jitcode) =
                 self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
+
+            // RPython call.py:148: jd.mainjitcode.jitdriver_sd = jd
+            // Set the back-reference from portal JitCode to its jitdriver.
+            for jd in callcontrol.jitdrivers_sd() {
+                if jd.portal_graph == path {
+                    jitcode.jitdriver_sd = Some(jd.index);
+                }
+            }
+
             all_jitcodes.push(jitcode);
         }
 

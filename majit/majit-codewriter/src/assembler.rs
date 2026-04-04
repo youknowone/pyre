@@ -44,6 +44,9 @@ pub struct JitCode {
     /// RPython: jitcode.py:24 — sequential index assigned by CodeWriter.
     /// Used by InlineCall to reference callee JitCode.
     pub index: usize,
+    /// RPython: jitcode.py:18 — `self.jitdriver_sd = None`.
+    /// None for non-portals. Set by `grab_initial_jitcodes()` for portal JitCodes.
+    pub jitdriver_sd: Option<usize>,
     /// Total flat ops (for statistics)
     pub num_ops: usize,
 }
@@ -166,7 +169,8 @@ impl Assembler {
             startpoints: state.startpoints,
             alllabels: state.alllabels,
             resulttypes: state.resulttypes,
-            index: 0, // set by CodeWriter after assembly
+            index: 0,           // set by CodeWriter after assembly
+            jitdriver_sd: None, // RPython jitcode.py:18 — None for non-portals
             num_ops: ssarepr.insns.len(),
         };
 

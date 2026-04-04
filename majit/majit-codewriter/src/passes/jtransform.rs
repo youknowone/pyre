@@ -621,6 +621,18 @@ impl<'a> Transformer<'a> {
                 detail: format!("builtin {target} → {}", effect.as_str()),
             });
             self.calls_classified += 1;
+
+            // RPython jtransform.py:2001,2028:
+            //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
+            // Register builtin function in callinfocollection for assembler.finished().
+            if let Some(cc) = self.callcontrol.as_mut() {
+                let oopspec_name = format!("{target}");
+                let calldescr_key = format!("{}", descriptor.target);
+                let func_path = format!("{target}");
+                cc.callinfocollection
+                    .add(&oopspec_name, calldescr_key, func_path);
+            }
+
             match effect {
                 CallEffectKind::Elidable => {
                     return self.handle_elidable_call(op, descriptor, args, result_ty, graph_name);
