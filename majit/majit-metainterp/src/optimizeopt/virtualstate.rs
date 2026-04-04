@@ -834,12 +834,13 @@ impl VirtualState {
         match info {
             VirtualStateInfo::Constant(_) => Ok(()),
             VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
-                // RPython virtualstate.py:185: if not info.is_virtual() → VirtualStatesCantMatch
+                // RPython virtualstate.py:185: if not info.is_virtual() →
+                // raise VirtualStatesCantMatch. Always, regardless of force_boxes.
                 let resolved = ctx.get_box_replacement(opref);
                 let is_virtual = ctx
                     .get_ptr_info(resolved)
                     .map_or(false, |pi| pi.is_virtual());
-                if !is_virtual && !force_boxes {
+                if !is_virtual {
                     return Err(());
                 }
                 let field_refs: Vec<_> = fields
