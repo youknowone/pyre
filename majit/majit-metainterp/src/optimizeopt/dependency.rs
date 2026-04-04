@@ -731,6 +731,27 @@ impl IndexVar {
         self.coefficient_mul == 1 && self.coefficient_div == 1 && self.constant == 0
     }
 
+    /// dependency.py:1095-1121: compare(other)
+    ///
+    /// Returns `(valid, ordering)` where `ordering` is the signed constant
+    /// difference between self and other when the linear coefficients match.
+    /// Returns `(false, 0)` if the two IndexVars are not comparable.
+    pub fn compare(&self, other: &IndexVar) -> (bool, i64) {
+        if !self.same_mulfactor(other) {
+            return (false, 0);
+        }
+        let c = self.constant - other.constant;
+        if self.var == other.var {
+            return (true, c);
+        }
+        (false, 0)
+    }
+
+    /// dependency.py:1123-1130: getvariable()
+    pub fn getvariable(&self) -> OpRef {
+        self.var
+    }
+
     /// dependency.py:1035-1040
     pub fn clone_var(&self) -> Self {
         IndexVar {

@@ -1164,6 +1164,91 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
+    /// rewrite.py:515-554: _optimize_oois_ooisnot(op, expect_isnot, instance)
+    ///
+    /// Pointer equality optimization using virtual/null/class information.
+    fn optimize_oois_ooisnot(
+        &self,
+        op: &Op,
+        expect_isnot: bool,
+        instance: bool,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let info0 = ctx.get_ptr_info(arg0);
+        let info1 = ctx.get_ptr_info(arg1);
+
+        let is_virtual0 = info0.as_ref().is_some_and(|i| i.is_virtual());
+        let is_virtual1 = info1.as_ref().is_some_and(|i| i.is_virtual());
+
+        // rewrite.py:520-527: virtual objects
+        if is_virtual0 {
+            let intres = if is_virtual1 {
+                // Both virtual: same object only if same info instance.
+                // In Rust, check arg identity (same OpRef after forwarding).
+                (arg0 == arg1) ^ expect_isnot
+            } else {
+                expect_isnot
+            };
+            ctx.make_constant(op.pos, Value::Int(intres as i64));
+            return OptimizationResult::Remove;
+        }
+        if is_virtual1 {
+            ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+            return OptimizationResult::Remove;
+        }
+
+        // rewrite.py:528-531: null checks
+        if info1.as_ref().is_some_and(|i| i.is_null()) {
+            return self.optimize_nullness(op, arg0, expect_isnot, ctx);
+        }
+        if info0.as_ref().is_some_and(|i| i.is_null()) {
+            return self.optimize_nullness(op, arg1, expect_isnot, ctx);
+        }
+
+        // rewrite.py:532-533: same object
+        if arg0 == arg1 {
+            ctx.make_constant(op.pos, Value::Int(!expect_isnot as i64));
+            return OptimizationResult::Remove;
+        }
+
+        // rewrite.py:535-553: instance comparison — different classes → not same
+        if instance {
+            let cls0 = info0.and_then(|i| i.get_known_class()).cloned();
+            let cls1 = info1.and_then(|i| i.get_known_class()).cloned();
+            if let (Some(c0), Some(c1)) = (cls0, cls1) {
+                if c0 != c1 {
+                    ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+
+        OptimizationResult::PassOn
+    }
+
+    /// rewrite.py:496-503: _optimize_nullness(op, box, expect_nonnull)
+    fn optimize_nullness(
+        &self,
+        op: &Op,
+        arg: OpRef,
+        expect_nonnull: bool,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        if let Some(info) = ctx.get_ptr_info(arg) {
+            if info.is_nonnull() {
+                ctx.make_constant(op.pos, Value::Int(expect_nonnull as i64));
+                return OptimizationResult::Remove;
+            }
+            if info.is_null() {
+                ctx.make_constant(op.pos, Value::Int(!expect_nonnull as i64));
+                return OptimizationResult::Remove;
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
     /// Constant fold INT_FORCE_GE_ZERO.
     fn optimize_int_force_ge_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
@@ -2011,70 +2096,12 @@ impl Optimization for OptRewrite {
 
             // ── Pointer equality (rewrite.py: _optimize_oois_ooisnot) ──
             OpCode::PtrEq | OpCode::InstancePtrEq => {
-                if op.arg(0) == op.arg(1) {
-                    ctx.make_constant(op.pos, Value::Int(1));
-                    return OptimizationResult::Remove;
-                }
-                if let (Some(a), Some(b)) = (
-                    ctx.get_constant_int(op.arg(0)),
-                    ctx.get_constant_int(op.arg(1)),
-                ) {
-                    ctx.make_constant(op.pos, Value::Int(if a == b { 1 } else { 0 }));
-                    return OptimizationResult::Remove;
-                }
-                // rewrite.py: if one arg is NULL and the other is known non-null,
-                // the result is always 0 (not equal).
-                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
-                    if ctx.get_constant(op.arg(1)).is_some() {
-                        if let Some(v) = ctx.get_constant_int(op.arg(1)) {
-                            if v != 0 {
-                                ctx.make_constant(op.pos, Value::Int(0));
-                                return OptimizationResult::Remove;
-                            }
-                        }
-                    }
-                }
-                if let Some(0) = ctx.get_constant_int(op.arg(1)) {
-                    if let Some(v) = ctx.get_constant_int(op.arg(0)) {
-                        if v != 0 {
-                            ctx.make_constant(op.pos, Value::Int(0));
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
+                let instance = matches!(op.opcode, OpCode::InstancePtrEq);
+                return self.optimize_oois_ooisnot(op, false, instance, ctx);
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
-                if op.arg(0) == op.arg(1) {
-                    ctx.make_constant(op.pos, Value::Int(0));
-                    return OptimizationResult::Remove;
-                }
-                if let (Some(a), Some(b)) = (
-                    ctx.get_constant_int(op.arg(0)),
-                    ctx.get_constant_int(op.arg(1)),
-                ) {
-                    ctx.make_constant(op.pos, Value::Int(if a != b { 1 } else { 0 }));
-                    return OptimizationResult::Remove;
-                }
-                // rewrite.py: if one arg is NULL and the other is known non-null,
-                // the result is always 1 (not equal).
-                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
-                    if let Some(v) = ctx.get_constant_int(op.arg(1)) {
-                        if v != 0 {
-                            ctx.make_constant(op.pos, Value::Int(1));
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-                if let Some(0) = ctx.get_constant_int(op.arg(1)) {
-                    if let Some(v) = ctx.get_constant_int(op.arg(0)) {
-                        if v != 0 {
-                            ctx.make_constant(op.pos, Value::Int(1));
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                }
-                OptimizationResult::PassOn
+                let instance = matches!(op.opcode, OpCode::InstancePtrNe);
+                return self.optimize_oois_ooisnot(op, true, instance, ctx);
             }
 
             // ── Cast round-trip elimination ──
