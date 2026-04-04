@@ -62,6 +62,20 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     }
 }
 
+/// Create a W_IntObject bypassing the small-int cache.
+///
+/// Used for int subclass instances that need unique object identity
+/// (so per-object attributes in ATTR_TABLE don't collide).
+pub fn w_int_new_unique(value: i64) -> PyObjectRef {
+    let obj = Box::new(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+        },
+        intval: value,
+    });
+    Box::into_raw(obj) as PyObjectRef
+}
+
 /// Return the address of INT_TYPE for JIT type-id validation.
 #[inline]
 pub fn w_int_type_id() -> usize {
