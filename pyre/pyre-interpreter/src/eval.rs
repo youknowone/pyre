@@ -830,7 +830,7 @@ impl OpcodeStepExecutor for PyFrame {
     // Stack: [module] → peek module, push getattr(module, name)
     fn import_from(&mut self, name: &str) -> Result<(), Self::Error> {
         let module = self.peek();
-        let attr = crate::importing::import_from(module, name, self.execution_context)?;
+        let attr = crate::importing::import_from(module, name)?;
         self.push(attr);
         Ok(())
     }

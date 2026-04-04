@@ -42,10 +42,8 @@ pub fn init(ns: &mut PyNamespace) {
             w_int_new(0),
         ]),
     );
-    // sys.modules — live dict synced with the import cache.
-    let modules_dict = w_dict_new();
-    crate::importing::set_sys_modules_dict(modules_dict);
-    namespace_store(ns, "modules", modules_dict);
+    // sys.modules — empty dict placeholder
+    namespace_store(ns, "modules", w_dict_new());
     // sys.path — empty list placeholder
     namespace_store(ns, "path", w_list_new(vec![]));
     // sys.stdout/stderr/stdin — stubs

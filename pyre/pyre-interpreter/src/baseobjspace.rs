@@ -1425,19 +1425,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_dict(obj) {
             match w_dict_lookup(obj, index) {
                 Some(val) => Ok(val),
-                None => {
-                    let key_repr = if is_str(index) {
-                        format!("'{}'", w_str_get_value(index))
-                    } else if is_int(index) {
-                        format!("{}", w_int_get_value(index))
-                    } else {
-                        "key".to_string()
-                    };
-                    Err(PyError::new(
-                        PyErrorKind::KeyError,
-                        format!("KeyError: {key_repr}"),
-                    ))
-                }
+                None => Err(PyError::new(PyErrorKind::KeyError, "key not found")),
             }
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
@@ -2160,48 +2148,26 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     }
 
     // All other objects: use side table
-    let found = ATTR_TABLE.with(|table| {
+    ATTR_TABLE.with(|table| {
         let table = table.borrow();
         let key = obj as usize;
-        table.get(&key).and_then(|dict| dict.get(name).copied())
-    });
-    if let Some(value) = found {
-        return Ok(value);
-    }
-
-    // If the object has an overridden __class__ (int subclass), do MRO
-    // lookup on that class for method resolution.
-    let overridden_class = ATTR_TABLE.with(|table| {
-        let table = table.borrow();
-        table
-            .get(&(obj as usize))
-            .and_then(|dict| dict.get("__class__").copied())
-    });
-    if let Some(w_class) = overridden_class {
-        if unsafe { is_type(w_class) } {
-            if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
-                if unsafe { crate::is_builtin_code(method) } {
-                    return Ok(pyre_object::w_method_new(method, obj, w_class));
-                }
-                if let Some(result) = unsafe { get(method, obj, w_class) } {
-                    return Ok(result);
-                }
-                return Ok(method);
+        if let Some(dict) = table.get(&key) {
+            if let Some(&value) = dict.get(name) {
+                return Ok(value);
             }
         }
-    }
-
-    unsafe {
-        let tp_name = if obj.is_null() {
-            "NULL"
-        } else {
-            (*(*obj).ob_type).tp_name
-        };
-        Err(PyError::new(
-            PyErrorKind::AttributeError,
-            format!("'{tp_name}' object has no attribute '{name}'"),
-        ))
-    }
+        unsafe {
+            let tp_name = if obj.is_null() {
+                "NULL"
+            } else {
+                (*(*obj).ob_type).tp_name
+            };
+            Err(PyError::new(
+                PyErrorKind::AttributeError,
+                format!("'{tp_name}' object has no attribute '{name}'"),
+            ))
+        }
+    })
 }
 
 // Builtin type method implementations moved to type_methods.rs
@@ -3315,44 +3281,19 @@ fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 /// Delete item: `del obj[index]`
-///
-/// PyPy: descroperation.py delitem → dispatches to type-specific __delitem__.
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
-        if is_list(obj) {
-            if is_int(index) {
-                let i = w_int_get_value(index);
-                let len = w_list_len(obj) as i64;
-                let idx = if i < 0 { len + i } else { i };
-                if idx >= 0 && idx < len {
-                    w_list_pop(obj, idx);
-                    return Ok(());
-                }
-                return Err(PyError::type_error("list index out of range"));
-            }
-            if is_slice(index) {
-                let len = w_list_len(obj) as i64;
-                let start = w_slice_get_start(index);
-                let stop = w_slice_get_stop(index);
-                let s = if is_none(start) {
-                    0
-                } else {
-                    let v = w_int_get_value(start);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                } as usize;
-                let e = if is_none(stop) {
-                    len
-                } else {
-                    let v = w_int_get_value(stop);
-                    if v < 0 { (len + v).max(0) } else { v.min(len) }
-                } as usize;
-                w_list_delslice(obj, s, e);
+        if is_list(obj) && is_int(index) {
+            let i = w_int_get_value(index);
+            let len = w_list_len(obj) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx >= 0 && idx < len {
+                // For Phase 1: set to PY_NULL (proper removal needs list mutation API)
+                w_list_setitem(obj, idx, PY_NULL);
                 return Ok(());
             }
-        }
-        if is_dict(obj) {
-            return dict_delitem(obj, index);
+            return Err(PyError::type_error("list index out of range"));
         }
     }
     // Instance __delitem__ — PyPy: descroperation.py delitem
@@ -3367,32 +3308,6 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
         }
     }
     Err(PyError::type_error("object does not support item deletion"))
-}
-
-/// Delete item from dict by key.
-fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
-    use pyre_object::*;
-    unsafe {
-        let dict = &mut *(obj as *mut dictobject::W_DictObject);
-        let entries = &mut *dict.entries;
-        for i in 0..entries.len() {
-            let eq = if std::ptr::eq(entries[i].0, key) {
-                true
-            } else if is_int(entries[i].0) && is_int(key) {
-                w_int_get_value(entries[i].0) == w_int_get_value(key)
-            } else if is_str(entries[i].0) && is_str(key) {
-                w_str_get_value(entries[i].0) == w_str_get_value(key)
-            } else {
-                false
-            };
-            if eq {
-                entries.remove(i);
-                dict.len -= 1;
-                return Ok(());
-            }
-        }
-    }
-    Err(PyError::type_error("KeyError"))
 }
 
 // py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).

@@ -826,29 +826,7 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
         }
     }
-    // globals() proxy: sync dict entries to the backing PyNamespace.
-    dict_sync_namespace_proxy(dict);
     Ok(w_none())
-}
-
-/// If dict has a namespace_proxy (i.e. it was returned by `globals()`),
-/// sync all str-keyed entries back to the PyNamespace.
-fn dict_sync_namespace_proxy(dict: PyObjectRef) {
-    unsafe {
-        let ns_ptr = pyre_object::w_dict_get_namespace_proxy(dict);
-        if ns_ptr.is_null() {
-            return;
-        }
-        let ns = &mut *(ns_ptr as *mut crate::PyNamespace);
-        let dict_obj = &*(dict as *const pyre_object::dictobject::W_DictObject);
-        let entries = &*dict_obj.entries;
-        for &(k, v) in entries {
-            if pyre_object::is_str(k) {
-                let name = pyre_object::w_str_get_value(k);
-                crate::namespace_store(ns, name, v);
-            }
-        }
-    }
 }
 
 /// PyPy: dictobject.py descr_pop

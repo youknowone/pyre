@@ -10,7 +10,7 @@
 use crate::pyobject::*;
 use crate::{
     FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
-    intobject::w_int_get_value, intobject::w_int_new, intobject::w_int_small_cached,
+    intobject::w_int_get_value, intobject::w_int_new,
 };
 
 #[repr(u8)]
@@ -34,22 +34,10 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// Check if all items are regular (cached) ints that can use IntegerListStrategy.
-/// Unique ints (created by w_int_new_unique for int subclass instances) are excluded
-/// because they may carry per-object attributes that require pointer identity.
 fn all_ints(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| {
-        if item.is_null() || !unsafe { is_int(item) } {
-            return false;
-        }
-        let v = unsafe { w_int_get_value(item) };
-        // If value is in small-int cache range, check pointer identity
-        if w_int_small_cached(v) {
-            std::ptr::eq(item, w_int_new(v))
-        } else {
-            true
-        }
-    })
+    items
+        .iter()
+        .all(|&item| !item.is_null() && unsafe { is_int(item) })
 }
 
 fn all_floats(items: &[PyObjectRef]) -> bool {
@@ -236,21 +224,7 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     match list.strategy {
         ListStrategy::Object => list.items.push(value),
         ListStrategy::Integer => {
-            if !value.is_null()
-                && is_int(value)
-                && crate::w_int_small_cached(w_int_get_value(value))
-            {
-                // Only use int strategy for cached (non-unique) ints.
-                // Unique ints (from w_int_new_unique) may carry per-object
-                // attributes and must preserve pointer identity.
-                let v = w_int_get_value(value);
-                if std::ptr::eq(value, crate::w_int_new(v)) {
-                    list.int_items.push(v);
-                } else {
-                    switch_to_object_strategy(list);
-                    list.items.push(value);
-                }
-            } else if !value.is_null() && is_int(value) {
+            if !value.is_null() && is_int(value) {
                 list.int_items.push(w_int_get_value(value));
             } else {
                 switch_to_object_strategy(list);
@@ -378,19 +352,6 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     let mut items = items_to_vec(list);
     items.reverse();
-    rebuild_object_items(list, items);
-}
-
-/// Delete a range of items by index range (drain). PyPy: listobject.py list_delslice.
-pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
-    let list = &mut *(obj as *mut W_ListObject);
-    let mut items = items_to_vec(list);
-    let len = items.len();
-    let s = start.min(len);
-    let e = end.min(len);
-    if s < e {
-        items.drain(s..e);
-    }
     rebuild_object_items(list, items);
 }
 
