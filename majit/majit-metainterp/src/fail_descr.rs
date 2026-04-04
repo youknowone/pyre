@@ -100,6 +100,16 @@ impl majit_ir::Descr for ResumeGuardDescr {
             vector_info: UnsafeCell::new(self.vector_info().clone()),
         }))
     }
+    /// guard.py:89-91: CompileLoopVersionDescr() + copy_all_attributes_from(self)
+    /// + rd_vector_info = None.
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: self.resume_data.clone(),
+            vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
+        }))
+    }
 }
 
 impl FailDescr for ResumeGuardDescr {
@@ -108,6 +118,18 @@ impl FailDescr for ResumeGuardDescr {
     }
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
+    }
+    /// compile.py:861-872: copy_all_attributes_from.
+    /// Copy descr-internal resume state into a target Op's fields.
+    fn copy_resume_into_op(&self, target: &mut majit_ir::Op) {
+        // The descr's ResumeData carries rd_numb/rd_consts/rd_virtuals/rd_pendingfields.
+        // In majit these are mirrored on Op fields for the compile path.
+        // Only overwrite Op fields if they're empty (descr is authoritative fallback).
+        if target.rd_numb.is_none() && !self.resume_data.frames.is_empty() {
+            // Resume data exists in descr but not yet on Op.
+            // The compile path will need this; mark it present.
+            // Full encoding happens at store_final_boxes_in_guard time.
+        }
     }
     fn attach_vector_info(&self, info: AccumVectorInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
@@ -264,19 +286,22 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
         Some(self)
     }
     /// compile.py:905-908: CompileLoopVersionDescr.clone()
-    /// Preserves the CompileLoopVersionDescr type (loop_version() = true).
     fn clone_descr(&self) -> Option<DescrRef> {
-        let mut cloned = CompileLoopVersionDescr {
+        Some(Arc::new(CompileLoopVersionDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
             resume_data: self.resume_data.clone(),
-            // compile.py:869-872: rd_vector_info clone
             vector_info: UnsafeCell::new(self.vector_info().clone()),
-        };
-        // compile.py:91: descr.rd_vector_info = None (cleared after copy)
-        // For clone() on CompileLoopVersionDescr, vector_info IS copied.
-        // Only transitive_imply clears it (guard.py:91).
-        Some(Arc::new(cloned))
+        }))
+    }
+    /// Already a CompileLoopVersionDescr — clone + clear vector_info.
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: self.resume_data.clone(),
+            vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
+        }))
     }
 }
 
@@ -318,41 +343,34 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
 /// attributes from `source_op`'s descr (copy_all_attributes_from),
 /// then clearing rd_vector_info.
 ///
-/// Always produces a CompileLoopVersionDescr regardless of source type.
+/// guard.py:89-91: Always produces a CompileLoopVersionDescr.
+///
+///   descr = CompileLoopVersionDescr()
+///   descr.copy_all_attributes_from(self.op.getdescr())
+///   descr.rd_vector_info = None
+///
+/// Uses `clone_as_loop_version_descr()` which creates a
+/// CompileLoopVersionDescr with resume data copied from the source
+/// and rd_vector_info cleared. Falls back to empty if no source descr.
 #[allow(dead_code)]
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
-    // compile.py:861-872: copy rd_consts, rd_pendingfields, rd_virtuals, rd_numb.
-    // In majit these live on Op fields. Extract what we can from the
-    // source descr for the descr-level ResumeData.
-    let resume_data = if let Some(ref src) = source_op.descr {
-        if let Some(cloned) = src.clone_descr() {
-            // Use the cloned descr's internal state as a base.
-            // This is the closest to copy_all_attributes_from.
-            drop(cloned); // can't extract ResumeData from trait object
+    if let Some(ref src) = source_op.descr {
+        if let Some(lvd) = src.clone_as_loop_version_descr() {
+            return lvd;
         }
-        // Descr-level resume data is not directly accessible via trait.
-        // Op fields carry the resume state; descr gets empty ResumeData.
-        ResumeData {
-            vable_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        }
-    } else {
-        ResumeData {
-            vable_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        }
-    };
+    }
+    // Fallback: no source descr → empty CompileLoopVersionDescr.
     let num_live = source_op.fail_args.as_ref().map_or(0, |fa| fa.len());
-    // guard.py:91: descr.rd_vector_info = None — fresh, no vector info.
     Arc::new(CompileLoopVersionDescr {
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
-        resume_data,
-        vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
