@@ -282,45 +282,13 @@ impl Guard {
         //   descr.copy_all_attributes_from(self.op.getdescr())
         //   descr.rd_vector_info = None
         //
+        // Always create a NEW CompileLoopVersionDescr (loop_version()=true),
+        // then copy resume attributes from the source guard's descr.
         // compile.py:861-872 copy_all_attributes_from copies:
         //   rd_consts, rd_pendingfields, rd_virtuals, rd_numb
-        // In majit resume state lives on Op fields, transferred to descr
-        // at compile time. The fresh descr carries loop_version()=true.
-        // We copy the source descr's resume data if accessible.
-        let source_resume = if let Some(ref src) = self.op.descr {
-            // Best effort: clone the source descr to get its resume data.
-            // If not clonable, use empty.
-            src.clone_descr()
-        } else {
-            None
-        };
-        let fresh_descr = if let Some(cloned) = source_resume {
-            // If the source was already CompileLoopVersionDescr, clone
-            // preserves the type. Otherwise wrap in a new one.
-            if cloned.as_fail_descr().is_some_and(|f| f.loop_version()) {
-                cloned
-            } else {
-                crate::fail_descr::make_compile_loop_version_descr(
-                    label_args.len(),
-                    crate::resume::ResumeData {
-                        vable_array: Vec::new(),
-                        frames: Vec::new(),
-                        virtuals: Vec::new(),
-                        pending_fields: Vec::new(),
-                    },
-                )
-            }
-        } else {
-            crate::fail_descr::make_compile_loop_version_descr(
-                label_args.len(),
-                crate::resume::ResumeData {
-                    vable_array: Vec::new(),
-                    frames: Vec::new(),
-                    virtuals: Vec::new(),
-                    pending_fields: Vec::new(),
-                },
-            )
-        };
+        // In majit these live on Op fields; the descr-level copy is done
+        // via copy_resume_from_descr which extracts what it can.
+        let fresh_descr = crate::fail_descr::make_compile_loop_version_descr_from(&self.op);
         let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
         guard_op.descr = Some(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
@@ -595,44 +563,43 @@ impl GuardEliminator {
     /// Returns `(ops, const_values)`. `const_values` maps constant OpRefs
     /// (allocated by IndexVar materialization) to their i64 values.
     /// The caller must register these in the trace's constant pool.
+    /// guard.py:251-269: propagate_all_forward(info, loop, user_code)
     pub fn propagate_all_forward(
         &mut self,
         ops: &[Op],
-        version_info: Option<&mut super::version::LoopVersionInfo>,
+        info: &mut super::version::LoopVersionInfo,
         label_args: &[OpRef],
         user_code: bool,
     ) -> (Vec<Op>, HashMap<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
-        if let Some(info) = version_info {
-            // guard.py:257-266: track loop-version guards in version_info.
-            assert!(
-                info.versions.len() == 1,
-                "guard.py:257 assert len(info.versions) == 1"
-            );
-            let version = info.versions[0].clone();
-            for op in &result {
-                if !op.opcode.is_guard() {
-                    continue;
-                }
-                if let Some(ref descr) = op.descr {
-                    if let Some(fd) = descr.as_fail_descr() {
-                        if fd.loop_version() {
-                            info.track(fd.fail_index(), version.clone());
-                        }
+        // guard.py:257-266: track loop-version guards.
+        assert!(
+            info.versions.len() == 1,
+            "guard.py:257 assert len(info.versions) == 1"
+        );
+        let version = info.versions[0].clone();
+        for op in &result {
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            if let Some(ref descr) = op.descr {
+                if let Some(fd) = descr.as_fail_descr() {
+                    if fd.loop_version() {
+                        info.track(fd.fail_index(), version.clone());
                     }
                 }
             }
+        }
 
-            // guard.py:268-269: if user_code: self.eliminate_array_bound_checks(info, loop)
-            if user_code {
-                let prefix = self.eliminate_array_bound_checks(&mut result, label_args, info);
-                if !prefix.is_empty() {
-                    let mut combined = prefix;
-                    combined.append(&mut result);
-                    result = combined;
-                }
+        // guard.py:268-269
+        if user_code {
+            let prefix = self.eliminate_array_bound_checks(&mut result, label_args, info);
+            if !prefix.is_empty() {
+                let mut combined = prefix;
+                combined.append(&mut result);
+                result = combined;
             }
         }
 

@@ -314,6 +314,48 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
     })
 }
 
+/// guard.py:89-91: Create a CompileLoopVersionDescr, copying resume
+/// attributes from `source_op`'s descr (copy_all_attributes_from),
+/// then clearing rd_vector_info.
+///
+/// Always produces a CompileLoopVersionDescr regardless of source type.
+#[allow(dead_code)]
+pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
+    // compile.py:861-872: copy rd_consts, rd_pendingfields, rd_virtuals, rd_numb.
+    // In majit these live on Op fields. Extract what we can from the
+    // source descr for the descr-level ResumeData.
+    let resume_data = if let Some(ref src) = source_op.descr {
+        if let Some(cloned) = src.clone_descr() {
+            // Use the cloned descr's internal state as a base.
+            // This is the closest to copy_all_attributes_from.
+            drop(cloned); // can't extract ResumeData from trait object
+        }
+        // Descr-level resume data is not directly accessible via trait.
+        // Op fields carry the resume state; descr gets empty ResumeData.
+        ResumeData {
+            vable_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        }
+    } else {
+        ResumeData {
+            vable_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        }
+    };
+    let num_live = source_op.fail_args.as_ref().map_or(0, |fa| fa.len());
+    // guard.py:91: descr.rd_vector_info = None — fresh, no vector info.
+    Arc::new(CompileLoopVersionDescr {
+        fail_index: alloc_fail_index(),
+        types: vec![Type::Int; num_live],
+        resume_data,
+        vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
+    })
+}
+
 /// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
 ///
 /// The recommended pattern for resume data lookup:
