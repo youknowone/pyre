@@ -2330,6 +2330,7 @@ impl<M: Clone> MetaInterp<M> {
                 // counters so bridge threshold accumulates across compilations.
                 let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     inherited_guard_failures = old_entry.guard_failures;
@@ -2945,6 +2946,9 @@ impl<M: Clone> MetaInterp<M> {
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    // Migrate bridges from old fail_descrs to new ones
+                    // so they survive the retrace.
+                    self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     inherited_guard_failures = old_entry.guard_failures;
@@ -6065,36 +6069,34 @@ impl<M: Clone> MetaInterp<M> {
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
 
-        // compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
-        // set up per-value counting on first failure. Subsequent ticks will
-        // use value-based hash (compile.py:780-781).
+        // compile.py:826-830: store_hash — ALL guards get a counter hash.
+        // compile.py:813-824: make_a_counter_per_value — GUARD_VALUE gets
+        // per-value counting on first failure.
         {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-            if let Some(guard_op_idx) = compiled
-                .traces
-                .get(&norm_tid)
-                .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
-            {
-                if let Some(guard_op) = compiled
+            let info = compiled
+                .guard_failures
+                .entry((norm_tid, fail_index))
+                .or_insert_with(|| GuardFailureInfo {
+                    guard_hash: Self::stable_guard_hash(green_key, norm_tid, fail_index),
+                    compiling: false,
+                    per_value: None,
+                    copied_from: None,
+                });
+            // compile.py:813-824: GUARD_VALUE per-value setup
+            if info.per_value.is_none() {
+                if let Some(guard_op_idx) = compiled
                     .traces
                     .get(&norm_tid)
-                    .and_then(|t| t.ops.get(guard_op_idx))
+                    .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
                 {
-                    if guard_op.opcode == OpCode::GuardValue {
-                        let info = compiled
-                            .guard_failures
-                            .entry((norm_tid, fail_index))
-                            .or_insert_with(|| GuardFailureInfo {
-                                guard_hash: Self::stable_guard_hash(
-                                    green_key, norm_tid, fail_index,
-                                ),
-                                compiling: false,
-                                per_value: None,
-                                copied_from: None,
-                            });
-                        if info.per_value.is_none() {
-                            // compile.py:816-824: store fail_arg index + type
+                    if let Some(guard_op) = compiled
+                        .traces
+                        .get(&norm_tid)
+                        .and_then(|t| t.ops.get(guard_op_idx))
+                    {
+                        if guard_op.opcode == OpCode::GuardValue {
                             if let Some(ref fa) = guard_op.fail_args {
                                 let arg0 = guard_op.arg(0);
                                 let idx = fa.iter().position(|&r| r == arg0);
@@ -6112,28 +6114,8 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // compile.py:783-784: tick with per-value hash for GUARD_VALUE.
-        // This is the canonical tick point for this path. For GUARD_VALUE,
-        // compile.py:780-781 computes hash from guard_addr + intval.
-        {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-            if let Some(info) = compiled.guard_failures.get(&(norm_tid, fail_index)) {
-                if let Some((idx, _tp)) = info.per_value {
-                    let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
-                    let per_value_hash = info
-                        .guard_hash
-                        .wrapping_mul(777767777)
-                        .wrapping_add((intval as u64).wrapping_mul(1442968193));
-                    self.warm_state.tick_guard_failure(per_value_hash);
-                }
-            }
-        }
-
-        // compile.py:701-709, 753-784: handle_fail / must_compile.
-        // For GUARD_VALUE, use per-value hash (compile.py:780-781):
-        //   hash = guard_addr * 777767777 + intval * 1442968193
-        // For other guards, use the normal guard_hash via would_fire.
+        // compile.py:738-784: must_compile — tick counter and check threshold.
+        // For GUARD_VALUE: per-value hash. For all others: per-guard hash.
         let action = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             let norm_tid = Self::normalize_trace_id(compiled, trace_id);
@@ -6144,23 +6126,17 @@ impl<M: Clone> MetaInterp<M> {
                     if info.compiling || Self::stack_almost_full() {
                         return false;
                     }
-                    if let Some((idx, _tp)) = info.per_value {
+                    let hash = if let Some((idx, _tp)) = info.per_value {
                         // compile.py:780-781: per-value hash for GUARD_VALUE
                         let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
-                        let per_value_hash = info
-                            .guard_hash
+                        info.guard_hash
                             .wrapping_mul(777767777)
-                            .wrapping_add((intval as u64).wrapping_mul(1442968193));
-                        self.warm_state.counter.would_fire_with_increment(
-                            per_value_hash,
-                            self.warm_state.increment_trace_eagerness(),
-                        )
+                            .wrapping_add((intval as u64).wrapping_mul(1442968193))
                     } else {
-                        self.warm_state.counter.would_fire_with_increment(
-                            info.guard_hash,
-                            self.warm_state.increment_trace_eagerness(),
-                        )
-                    }
+                        // compile.py:753: generic guards use stored hash
+                        info.guard_hash
+                    };
+                    self.warm_state.tick_guard_failure(hash)
                 });
             if must_compile {
                 GuardRecoveryAction::CompileBridge
@@ -8655,6 +8631,9 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -8737,6 +8716,7 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -8860,6 +8840,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -8932,6 +8913,7 @@ mod tests {
             &bridge_fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -9036,6 +9018,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         ));
 
         let bridge_trace_id = meta.compiled_loops[&green_key]
@@ -9123,6 +9106,7 @@ mod tests {
             &fail_descr,
             &bridge_ops,
             &bridge_inputargs,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

@@ -3977,8 +3977,15 @@ impl MIFrame {
             };
 
             let guard_op = self.with_ctx(|this, ctx| {
+                // pyjitpl.py:2575-2578: after_residual_call=true for
+                // GuardException — all boxes in top frame are live.
+                let after_residual_call = true;
+                let resume_pc = this.fallthrough_pc;
+                let saved_orgpc = this.orgpc;
+                this.orgpc = resume_pc;
+
                 this.flush_to_frame_for_guard(ctx);
-                let active_boxes = this.get_list_of_active_boxes(ctx, false, false);
+                let active_boxes = this.get_list_of_active_boxes(ctx, false, after_residual_call);
                 let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
                 let fail_args = {
                     let s = this.sym();
@@ -3986,13 +3993,34 @@ impl MIFrame {
                     fa.extend_from_slice(&active_boxes);
                     fa
                 };
+
+                // capture_resumedata parity: snapshot before guard.
+                let snapshot_boxes =
+                    Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &fail_arg_types, ctx);
+                let vable_boxes = Self::build_virtualizable_boxes(this.sym(), ctx);
+                let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
+                let snapshot = majit_trace::recorder::Snapshot {
+                    frames: vec![majit_trace::recorder::SnapshotFrame {
+                        jitcode_index,
+                        pc: resume_pc as u32,
+                        boxes: snapshot_boxes,
+                    }],
+                    vable_boxes,
+                    vref_boxes: Self::build_virtualref_boxes(this.sym(), ctx),
+                };
+                let snapshot_id = ctx.capture_resumedata(snapshot);
+
                 let exc_type_const = ctx.const_int(exc_type_ptr);
-                ctx.record_guard_typed_with_fail_args(
+                let op = ctx.record_guard_typed_with_fail_args(
                     majit_ir::OpCode::GuardException,
                     &[exc_type_const],
                     fail_arg_types,
                     &fail_args,
-                )
+                );
+                ctx.set_last_guard_resume_position(snapshot_id);
+
+                this.orgpc = saved_orgpc;
+                op
             });
 
             // pyjitpl.py:3386-3389: last_exc_box = guard op result.
@@ -4696,10 +4724,14 @@ impl ControlFlowOpcodeHandler for MIFrame {
             ctx.reset_heap_cache();
             // pyjitpl.py:2978-2983: get_procedure_token(greenboxes)
             // RPython uses the CURRENT greenboxes (back_edge_key), not root_key.
+            // pyjitpl.py:2979: if not self.partial_trace — skip compile_trace
+            // when a retrace is pending (compile_retrace handles it via
+            // compile_loop at the final merge point).
             {
                 let (driver, _) = crate::driver::driver_pair();
+                let has_partial = driver.meta_interp().has_partial_trace();
                 let bridge_origin = driver.bridge_origin();
-                if driver.meta_interp().has_compiled_targets(back_edge_key) {
+                if !has_partial && driver.meta_interp().has_compiled_targets(back_edge_key) {
                     let jump_args = MIFrame::close_loop_args(this, ctx);
                     let outcome = driver
                         .meta_interp_mut()
