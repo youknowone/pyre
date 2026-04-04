@@ -1508,18 +1508,31 @@ fn collect_readwrite_effects(
                         let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
                             idx, 0, 8, 0, ir_type, flag,
                         );
-                        // RPython: heaptracker.all_interiorfielddescrs(gccache, ARRAY).
-                        // For array-of-structs, collect interior field descriptors
-                        // from the struct definition.
+                        // RPython: descr.py:372-375 — for array-of-structs:
+                        //   descrs = heaptracker.all_interiorfielddescrs(
+                        //       gccache, ARRAY, get_field_descr=get_interiorfield_descr)
+                        //   arraydescr.all_interiorfielddescrs = descrs
                         if is_struct {
                             if let Some(struct_name) = elem_name {
-                                let fielddescrs = build_interior_fielddescrs(cc, struct_name, idx);
+                                // RPython: InteriorFieldDescr needs the parent arraydescr.
+                                // Create Arc first, then build interior field descrs.
+                                let ad_arc = std::sync::Arc::new(ad);
+                                let fielddescrs =
+                                    build_interior_fielddescrs(cc, struct_name, ad_arc.clone());
                                 if !fielddescrs.is_empty() {
-                                    ad.set_all_fielddescrs(fielddescrs);
+                                    // Clone the inner to set fielddescrs, then re-wrap.
+                                    let mut ad_mut = (*ad_arc).clone();
+                                    ad_mut.set_all_fielddescrs(fielddescrs);
+                                    array_write_descrs.push(std::sync::Arc::new(ad_mut));
+                                } else {
+                                    array_write_descrs.push(ad_arc);
                                 }
+                            } else {
+                                array_write_descrs.push(std::sync::Arc::new(ad));
                             }
+                        } else {
+                            array_write_descrs.push(std::sync::Arc::new(ad));
                         }
-                        array_write_descrs.push(std::sync::Arc::new(ad));
                     }
                 }
                 // Recursive: follow calls.
@@ -1554,35 +1567,97 @@ fn collect_readwrite_effects(
 
 /// RPython: `heaptracker.all_interiorfielddescrs(gccache, ARRAY)`.
 ///
-/// For an array-of-structs (element type is a known struct), iterate the
-/// struct's fields and create an InteriorFieldDescr for each one.
-/// This mirrors `heaptracker.py:74-92` which iterates `STRUCT._names`.
+/// For an array-of-structs (element type is a known struct), iterate
+/// `STRUCT._names` and create `InteriorFieldDescr(arraydescr, fielddescr)`
+/// for each field. This mirrors heaptracker.py:74-92 with
+/// `get_field_descr=get_interiorfield_descr` (descr.py:373-375).
+///
+/// Each interior field descriptor wraps:
+/// - The parent `ArrayDescr` (shared Arc)
+/// - A `FieldDescr` with actual offset/size/type from the struct definition
 fn build_interior_fielddescrs(
     cc: &CallControl,
     struct_name: &str,
-    array_descr_idx: u32,
+    array_descr: std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
 ) -> Vec<majit_ir::descr::DescrRef> {
     let fields = match cc.struct_fields.fields.get(struct_name) {
         Some(f) => f,
         None => return Vec::new(),
     };
-    fields
-        .iter()
-        .enumerate()
-        .map(|(i, (_field_name, _field_type))| {
-            // RPython: InteriorFieldDescr(arraydescr, fielddescr)
-            // Create a simple field descriptor with a unique index.
-            let field_idx = (array_descr_idx * 64 + i as u32) % u32::MAX;
-            let fd = majit_ir::descr::SimpleFieldDescr::new(
-                field_idx,
-                0,                          // offset — determined at backend time
-                8,                          // field_size — default word size
-                majit_ir::value::Type::Int, // field_type — refined at backend
-                false,                      // is_immutable
-            );
-            std::sync::Arc::new(fd) as majit_ir::descr::DescrRef
-        })
-        .collect()
+    // RPython: heaptracker.py:83-91 — iterate STRUCT._names,
+    // skip Void fields and typeptr.
+    let mut offset: usize = 0;
+    let mut result = Vec::new();
+    for (i, (field_name, field_type_str)) in fields.iter().enumerate() {
+        // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
+        let (field_type, field_size) = field_type_from_rust_type(field_type_str);
+        if field_type == majit_ir::value::Type::Void {
+            continue;
+        }
+        // RPython: get_field_descr(gccache, REALARRAY.OF, name)
+        // → FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
+        let align = field_size;
+        if align > 0 {
+            offset = (offset + align - 1) & !(align - 1);
+        }
+        // RPython: index_in_parent = heaptracker.get_fielddescr_index_in(STRUCT, name)
+        let index_in_parent = i as u32;
+        let is_immutable = false;
+        let fd = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+            index_in_parent,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            format!("{}.{}", struct_name, field_name),
+        ));
+        // RPython: descr.py:436 — InteriorFieldDescr(arraydescr, fielddescr)
+        let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new(
+            index_in_parent,
+            array_descr.clone(),
+            fd,
+        );
+        result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+        offset += field_size;
+    }
+    result
+}
+
+/// RPython: `get_type_flag(TYPE)` (descr.py:241-254).
+///
+/// Maps a Rust type string to (IR type, size in bytes).
+/// Ptr(gc) → (Ref, 8), Float → (Float, 8), signed int → (Int, N).
+fn field_type_from_rust_type(type_str: &str) -> (majit_ir::value::Type, usize) {
+    match type_str {
+        // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
+        s if s.starts_with('&')
+            || s.starts_with("Box<")
+            || s.starts_with("Arc<")
+            || s.starts_with("Rc<")
+            || s.starts_with("Vec<")
+            || s.starts_with("Option<")
+            || s == "String" =>
+        {
+            (majit_ir::value::Type::Ref, 8)
+        }
+        // RPython: TYPE is lltype.Float → FLAG_FLOAT
+        "f64" => (majit_ir::value::Type::Float, 8),
+        "f32" => (majit_ir::value::Type::Float, 4),
+        // RPython: isinstance(TYPE, lltype.Number) and signed → FLAG_SIGNED
+        "i64" | "isize" => (majit_ir::value::Type::Int, 8),
+        "i32" => (majit_ir::value::Type::Int, 4),
+        "i16" => (majit_ir::value::Type::Int, 2),
+        "i8" => (majit_ir::value::Type::Int, 1),
+        "u64" | "usize" => (majit_ir::value::Type::Int, 8),
+        "u32" => (majit_ir::value::Type::Int, 4),
+        "u16" => (majit_ir::value::Type::Int, 2),
+        "u8" => (majit_ir::value::Type::Int, 1),
+        "bool" => (majit_ir::value::Type::Int, 1),
+        // RPython: Void fields are skipped
+        "()" => (majit_ir::value::Type::Void, 0),
+        // Unknown type — treat as word-sized reference (conservative)
+        _ => (majit_ir::value::Type::Ref, 8),
+    }
 }
 
 /// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py:14-17).
