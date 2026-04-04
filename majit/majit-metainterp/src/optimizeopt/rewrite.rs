@@ -1879,20 +1879,19 @@ impl OptRewrite {
                 return false;
             }
             // rewrite.py:628-629: all_fdescrs = arraydescr.get_all_fielddescrs()
-            // Collect field descriptor indices from the source VirtualArrayStruct.
+            // RPython: get field descriptors from the array descriptor metadata,
+            // NOT from the virtual's current contents (which may be sparse).
             let all_fdescr_indices: Vec<u32> = ctx
                 .get_ptr_info(source_box)
                 .and_then(|info| match info {
+                    // Use VirtualArrayStructInfo.fielddescrs (from the descriptor
+                    // metadata) to enumerate ALL fields, including those not yet
+                    // materialized in the virtual.
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
-                        if v.element_fields.is_empty() {
+                        if v.fielddescrs.is_empty() {
                             None
                         } else {
-                            Some(
-                                v.element_fields[0]
-                                    .iter()
-                                    .map(|&(fdidx, _)| fdidx)
-                                    .collect(),
-                            )
+                            Some(v.fielddescrs.iter().map(|d| d.index()).collect())
                         }
                     }
                     _ => None,
