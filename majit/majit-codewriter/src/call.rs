@@ -196,6 +196,11 @@ pub struct CallControl {
     /// when the base of an array access comes from a FieldRead.
     /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
     struct_fields: crate::front::StructFieldRegistry,
+
+    /// RPython: `op.result.concretetype` — function return type strings.
+    /// Maps CallPath → full return type string (e.g. "Vec<Point>").
+    /// Used by `resolve_array_identity` for Call result array identity.
+    pub return_types: HashMap<CallPath, String>,
 }
 
 /// Sequential descriptor index assignment — majit equivalent of
@@ -271,6 +276,7 @@ impl CallControl {
             loopinvariant_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
+            return_types: HashMap::new(),
         }
     }
 
@@ -1381,11 +1387,15 @@ fn resolve_array_identity(
                     return array_type_id.clone();
                 }
             }
-            // Call result: RPython resolves this via result.concretetype
-            // from the rtyper. In majit, we would need function return type
-            // annotations to resolve the ARRAY identity of a call result.
-            // Currently unresolved — falls through to None (conservative).
-            OpKind::Call { .. } => {}
+            // Call result: RPython resolves via result.concretetype.
+            // In majit, look up the callee's return type from CallControl.
+            OpKind::Call { target, .. } => {
+                if let Some(callee_path) = cc.target_to_path(target) {
+                    if let Some(ret_type) = cc.return_types.get(&callee_path) {
+                        return extract_element_type_from_str(ret_type);
+                    }
+                }
+            }
             // Input: RPython resolves via the parameter's concretetype.
             // In majit, the input's array_type_id was set by the parser
             // and propagated through the op_array_type_id path above.
@@ -1510,34 +1520,38 @@ fn collect_readwrite_effects(
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                         };
-                        // RPython: get_type_flag(ARRAY.OF) determines the flag.
-                        // isinstance(TYPE, lltype.Struct) → FLAG_STRUCT.
+                        // RPython: descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF)
                         let elem_name = resolved_id.as_deref();
                         let is_struct = elem_name.is_some_and(|n| cc.is_known_struct(n));
-                        let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, is_struct);
-                        // RPython: get_array_descr(gccache, ARRAY) (descr.py:348-378)
-                        //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
-                        //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
+                        let (flag, item_size) = if is_struct {
+                            // RPython: isinstance(TYPE, lltype.Struct) → FLAG_STRUCT
+                            (
+                                majit_ir::descr::ArrayFlag::Struct,
+                                elem_name
+                                    .map(|n| compute_struct_size(cc, n))
+                                    .filter(|s| *s > 0)
+                                    .unwrap_or(8),
+                            )
+                        } else if let Some(ref elem) = resolved_id {
+                            // RPython: get_type_flag(ARRAY.OF) from element type.
+                            let (f, _, s) = get_type_flag(elem);
+                            (f, s)
+                        } else {
+                            // Fallback: derive from item_ty (less precise).
+                            (
+                                majit_ir::descr::ArrayFlag::from_item_type(ir_type, false),
+                                8,
+                            )
+                        };
                         // RPython: get_array_descr(gccache, ARRAY) — descr.py:348-378.
                         //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
                         //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
-                        // Compute item_size first, then build once.
-                        let item_size = if is_struct {
-                            // Struct array: item_size = struct size.
-                            elem_name
-                                .map(|n| compute_struct_size(cc, n))
-                                .filter(|s| *s > 0)
-                                .unwrap_or(8)
-                        } else {
-                            // Plain array: item_size from element type.
-                            // GcArray(Char) → 1, GcArray(Signed) → 8, etc.
-                            resolved_id
-                                .as_deref()
-                                .map(|e| get_type_flag(e).1)
-                                .unwrap_or(8)
-                        };
+                        // basesize: Rust arrays have no GC header — data starts at offset 0
+                        // from the data pointer. RPython's basesize accounts for GC header +
+                        // length field. In pyre, the backend provides the actual basesize.
+                        let base_size = 0;
                         let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                            idx, 0, item_size, 0, ir_type, flag,
+                            idx, base_size, item_size, 0, ir_type, flag,
                         );
                         // RPython: descr.py:372-375 — for array-of-structs:
                         //   descrs = heaptracker.all_interiorfielddescrs(
@@ -1633,7 +1647,7 @@ fn all_interiorfielddescrs(
     let mut result = Vec::new();
     for (i, (field_name, field_type_str)) in fields.iter().enumerate() {
         // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
-        let (field_type, field_size) = get_type_flag(field_type_str);
+        let (_flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -1667,7 +1681,7 @@ fn all_interiorfielddescrs(
     // item_size = total struct size, aligned to max field alignment.
     let max_align = fields
         .iter()
-        .map(|(_, ty)| get_type_flag(ty).1)
+        .map(|(_, ty)| get_type_flag(ty).2)
         .filter(|s| *s > 0)
         .max()
         .unwrap_or(8);
@@ -1696,7 +1710,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
     }
     let mut offset: usize = 0;
     for (_, field_type_str) in fields.iter() {
-        let (field_type, field_size) = get_type_flag(field_type_str);
+        let (_, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
@@ -1705,7 +1719,7 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| get_type_flag(ty).1)
+        .map(|(_, ty)| get_type_flag(ty).2)
         .filter(|s| *s > 0)
         .max()
         .unwrap_or(8);
@@ -1718,9 +1732,13 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
 
 /// RPython: `get_type_flag(TYPE)` (descr.py:241-254).
 ///
-/// Maps a Rust type string to (IR type, size in bytes).
-/// Ptr(gc) → (Ref, 8), Float → (Float, 8), signed int → (Int, N).
-fn get_type_flag(type_str: &str) -> (majit_ir::value::Type, usize) {
+/// Returns (ArrayFlag, IR type, size in bytes).
+/// The ArrayFlag encodes both category AND signedness, matching RPython:
+/// - Ptr(gc) → FLAG_POINTER; Ptr(non-gc) → FLAG_UNSIGNED
+/// - Struct → FLAG_STRUCT; Float → FLAG_FLOAT
+/// - Bool/unsigned → FLAG_UNSIGNED; signed int → FLAG_SIGNED
+fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    use majit_ir::descr::ArrayFlag;
     match type_str {
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
@@ -1731,25 +1749,26 @@ fn get_type_flag(type_str: &str) -> (majit_ir::value::Type, usize) {
             || s.starts_with("Option<")
             || s == "String" =>
         {
-            (majit_ir::value::Type::Ref, 8)
+            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8)
         }
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
-        "f64" => (majit_ir::value::Type::Float, 8),
-        "f32" => (majit_ir::value::Type::Float, 4),
-        // RPython: isinstance(TYPE, lltype.Number) and signed → FLAG_SIGNED
-        "i64" | "isize" => (majit_ir::value::Type::Int, 8),
-        "i32" => (majit_ir::value::Type::Int, 4),
-        "i16" => (majit_ir::value::Type::Int, 2),
-        "i8" => (majit_ir::value::Type::Int, 1),
-        "u64" | "usize" => (majit_ir::value::Type::Int, 8),
-        "u32" => (majit_ir::value::Type::Int, 4),
-        "u16" => (majit_ir::value::Type::Int, 2),
-        "u8" => (majit_ir::value::Type::Int, 1),
-        "bool" => (majit_ir::value::Type::Int, 1),
+        "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
+        "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
+        // RPython: rffi.cast(TYPE, -1) == -1 → FLAG_SIGNED
+        "i64" | "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
+        "i16" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 2),
+        "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
+        // RPython: Bool → FLAG_UNSIGNED; unsigned number → FLAG_UNSIGNED
+        "u64" | "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
+        "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
+        "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         // RPython: Void fields are skipped
-        "()" => (majit_ir::value::Type::Void, 0),
-        // Unknown type — treat as word-sized reference (conservative)
-        _ => (majit_ir::value::Type::Ref, 8),
+        "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
+        // Unknown type — treat as GC pointer (conservative)
+        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8),
     }
 }
 

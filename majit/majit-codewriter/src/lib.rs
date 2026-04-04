@@ -143,6 +143,14 @@ fn analyze_pipeline_from_parsed(
     for (path, graph) in &canonical_function_graphs {
         call_control.register_function_graph(path.clone(), graph.clone());
     }
+    // RPython: op.result.concretetype — register return types for Call result
+    // array identity resolution.
+    for func in &program.functions {
+        if let Some(ref ret_type) = func.return_type {
+            let path = crate::parse::CallPath::from_segments([func.name.as_str()]);
+            call_control.return_types.insert(path, ret_type.clone());
+        }
+    }
     for impl_info in &canonical_trait_impls {
         let impl_type = impl_info
             .self_ty_root
