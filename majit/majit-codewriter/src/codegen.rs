@@ -412,7 +412,7 @@ mod tests {
             vable_rewrites: 0,
             calls_classified: 0,
             transform_notes: Vec::new(),
-            flattened: crate::passes::FlattenedFunction {
+            flattened: crate::passes::SSARepr {
                 name: "add".into(),
                 ops: Vec::new(),
                 num_values: 0,

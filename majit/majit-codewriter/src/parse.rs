@@ -15,7 +15,7 @@ pub struct ExtractedOpcodeArm {
     /// Semantic graph of the match arm body.
     /// This is the handler's own graph — the primary input for
     /// jtransform/flatten. handler_calls are metadata only.
-    pub body_graph: Option<crate::graph::MajitGraph>,
+    pub body_graph: Option<crate::model::FunctionGraph>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,7 +87,7 @@ pub struct InherentMethodInfo {
     pub for_type: String,
     pub self_ty_root: Option<String>,
     pub name: String,
-    pub graph: crate::graph::MajitGraph,
+    pub graph: crate::model::FunctionGraph,
 }
 
 /// Parsed representation of an interpreter source file.
@@ -315,7 +315,7 @@ pub fn extract_opcode_dispatch_receiver_traits(
 /// Collect canonical function names and graphs for the active pipeline path.
 pub fn collect_function_graphs(
     parsed: &ParsedInterpreter,
-    graphs: &mut std::collections::HashMap<CallPath, crate::graph::MajitGraph>,
+    graphs: &mut std::collections::HashMap<CallPath, crate::model::FunctionGraph>,
 ) {
     for item in &parsed.file.items {
         if let Item::Fn(func) = item {
@@ -377,7 +377,7 @@ impl<'ast> Visit<'ast> for MatchArmCollector {
             // Build semantic graph from the arm body expression.
             let body_graph = {
                 let name = selector.canonical_key();
-                let mut graph = crate::graph::MajitGraph::new(name);
+                let mut graph = crate::model::FunctionGraph::new(name);
                 crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body);
                 Some(graph)
             };

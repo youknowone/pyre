@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::graph::ValueId;
-use crate::passes::flatten::{FlatOp, FlattenedFunction, RegKind};
+use crate::model::ValueId;
+use crate::passes::flatten::{FlatOp, RegKind, SSARepr};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -362,7 +362,7 @@ pub struct RegAllocResult {
 /// 1. Build interference graph from instruction liveness
 /// 2. Coalesce Move src/dst pairs
 /// 3. Find minimal graph coloring
-pub fn perform_register_allocation(flattened: &FlattenedFunction, kind: RegKind) -> RegAllocResult {
+pub fn perform_register_allocation(flattened: &SSARepr, kind: RegKind) -> RegAllocResult {
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(&flattened.ops, kind, &flattened.value_kinds);
     allocator.coalesce_variables(&flattened.ops, &flattened.value_kinds, kind);
@@ -394,9 +394,7 @@ pub fn perform_register_allocation(flattened: &FlattenedFunction, kind: RegKind)
 /// for kind in KINDS:
 ///     regallocs[kind] = perform_register_allocation(graph, kind)
 /// ```
-pub fn perform_all_register_allocations(
-    flattened: &FlattenedFunction,
-) -> HashMap<RegKind, RegAllocResult> {
+pub fn perform_all_register_allocations(flattened: &SSARepr) -> HashMap<RegKind, RegAllocResult> {
     let mut result = HashMap::new();
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         result.insert(kind, perform_register_allocation(flattened, kind));
@@ -407,29 +405,29 @@ pub fn perform_all_register_allocations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Op, OpKind, ValueType};
+    use crate::model::{OpKind, SpaceOperation, ValueType};
 
     #[test]
     fn allocate_separates_by_kind() {
         // Three values defined in ops so make_dependencies sees them
-        let flat = FlattenedFunction {
+        let flat = SSARepr {
             name: "test".into(),
             ops: vec![
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(1)),
                     kind: OpKind::Input {
                         name: "b".into(),
                         ty: ValueType::Ref,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(2)),
                     kind: OpKind::Input {
                         name: "c".into(),
@@ -460,10 +458,10 @@ mod tests {
     fn coalesce_reduces_registers() {
         // v0 = Input
         // v1 = Move(v0) — should coalesce with v0
-        let mut flat = FlattenedFunction {
+        let mut flat = SSARepr {
             name: "test".into(),
             ops: vec![
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),
                     kind: OpKind::Input {
                         name: "a".into(),
@@ -502,17 +500,17 @@ mod tests {
     fn interfering_values_get_different_registers() {
         // v0 = Input
         // v1 = BinOp(v0, v0) — v1 is defined while v0 is alive → they interfere
-        let flat = FlattenedFunction {
+        let flat = SSARepr {
             name: "test".into(),
             ops: vec![
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(1)),
                     kind: OpKind::BinOp {
                         op: "add".into(),

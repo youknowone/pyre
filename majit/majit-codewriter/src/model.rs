@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BasicBlockId(pub usize);
+pub struct BlockId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub usize);
@@ -284,7 +284,7 @@ pub enum OpKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Op {
+pub struct SpaceOperation {
     pub result: Option<ValueId>,
     pub kind: OpKind,
 }
@@ -298,15 +298,15 @@ pub struct Op {
 pub enum Terminator {
     /// Unconditional jump. `args` → target.inputargs.
     Goto {
-        target: BasicBlockId,
+        target: BlockId,
         args: Vec<ValueId>,
     },
     /// Conditional branch. Each arm carries its own args.
     Branch {
         cond: ValueId,
-        if_true: BasicBlockId,
+        if_true: BlockId,
         true_args: Vec<ValueId>,
-        if_false: BasicBlockId,
+        if_false: BlockId,
         false_args: Vec<ValueId>,
     },
     Return(Option<ValueId>),
@@ -323,21 +323,21 @@ pub enum Terminator {
 /// - `ops`: sequential operations within this block
 /// - `terminator`: how control leaves this block
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BasicBlock {
-    pub id: BasicBlockId,
+pub struct Block {
+    pub id: BlockId,
     /// Phi-node inputs: values provided by incoming Links.
     /// RPython: `Block.inputargs` — each predecessor Link carries
     /// values that map 1:1 to these inputargs.
     pub inputargs: Vec<ValueId>,
-    pub ops: Vec<Op>,
+    pub ops: Vec<SpaceOperation>,
     pub terminator: Terminator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MajitGraph {
+pub struct FunctionGraph {
     pub name: String,
-    pub entry: BasicBlockId,
-    pub blocks: Vec<BasicBlock>,
+    pub entry: BlockId,
+    pub blocks: Vec<Block>,
     #[serde(default)]
     pub notes: Vec<String>,
     next_value: usize,
@@ -346,13 +346,13 @@ pub struct MajitGraph {
     pub value_names: std::collections::HashMap<ValueId, String>,
 }
 
-impl MajitGraph {
+impl FunctionGraph {
     pub fn new(name: impl Into<String>) -> Self {
-        let entry = BasicBlockId(0);
+        let entry = BlockId(0);
         Self {
             name: name.into(),
             entry,
-            blocks: vec![BasicBlock {
+            blocks: vec![Block {
                 id: entry,
                 inputargs: Vec::new(),
                 ops: Vec::new(),
@@ -364,9 +364,9 @@ impl MajitGraph {
         }
     }
 
-    pub fn create_block(&mut self) -> BasicBlockId {
-        let id = BasicBlockId(self.blocks.len());
-        self.blocks.push(BasicBlock {
+    pub fn create_block(&mut self) -> BlockId {
+        let id = BlockId(self.blocks.len());
+        self.blocks.push(Block {
             id,
             inputargs: Vec::new(),
             ops: Vec::new(),
@@ -376,10 +376,10 @@ impl MajitGraph {
     }
 
     /// Create a block with explicit inputargs (Phi nodes).
-    pub fn create_block_with_args(&mut self, num_args: usize) -> (BasicBlockId, Vec<ValueId>) {
-        let id = BasicBlockId(self.blocks.len());
+    pub fn create_block_with_args(&mut self, num_args: usize) -> (BlockId, Vec<ValueId>) {
+        let id = BlockId(self.blocks.len());
         let args: Vec<ValueId> = (0..num_args).map(|_| self.alloc_value()).collect();
-        self.blocks.push(BasicBlock {
+        self.blocks.push(Block {
             id,
             inputargs: args.clone(),
             ops: Vec::new(),
@@ -396,20 +396,20 @@ impl MajitGraph {
 
     pub fn push_op(
         &mut self,
-        block: BasicBlockId,
+        block: BlockId,
         kind: OpKind,
         has_result: bool,
     ) -> Option<ValueId> {
         let result = has_result.then(|| self.alloc_value());
-        self.blocks[block.0].ops.push(Op { result, kind });
+        self.blocks[block.0].ops.push(SpaceOperation { result, kind });
         result
     }
 
-    pub fn set_terminator(&mut self, block: BasicBlockId, terminator: Terminator) {
+    pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
         self.blocks[block.0].terminator = terminator;
     }
 
-    pub fn block(&self, block: BasicBlockId) -> &BasicBlock {
+    pub fn block(&self, block: BlockId) -> &Block {
         &self.blocks[block.0]
     }
 
@@ -423,26 +423,26 @@ impl MajitGraph {
         self.value_names.get(&id).map(|s| s.as_str())
     }
 
-    pub fn block_mut(&mut self, block: BasicBlockId) -> &mut BasicBlock {
+    pub fn block_mut(&mut self, block: BlockId) -> &mut Block {
         &mut self.blocks[block.0]
     }
 
     // ── RPython FunctionGraph iteration methods ──────────────────
 
     /// Iterate all blocks. RPython: `graph.iterblocks()`.
-    pub fn iter_blocks(&self) -> impl Iterator<Item = &BasicBlock> {
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
         self.blocks.iter()
     }
 
     /// Iterate all (block, op) pairs. RPython: `graph.iterblockops()`.
-    pub fn iter_block_ops(&self) -> impl Iterator<Item = (&BasicBlock, &Op)> {
+    pub fn iter_block_ops(&self) -> impl Iterator<Item = (&Block, &SpaceOperation)> {
         self.blocks
             .iter()
             .flat_map(|b| b.ops.iter().map(move |op| (b, op)))
     }
 
     /// Get successor block IDs for a block.
-    pub fn successors(&self, block: BasicBlockId) -> Vec<BasicBlockId> {
+    pub fn successors(&self, block: BlockId) -> Vec<BlockId> {
         match &self.block(block).terminator {
             Terminator::Goto { target, .. } => vec![*target],
             Terminator::Branch {
@@ -453,7 +453,7 @@ impl MajitGraph {
     }
 
     /// Get predecessor block IDs for a block.
-    pub fn predecessors(&self, target: BasicBlockId) -> Vec<BasicBlockId> {
+    pub fn predecessors(&self, target: BlockId) -> Vec<BlockId> {
         self.blocks
             .iter()
             .filter(|b| self.successors(b.id).contains(&target))
@@ -467,7 +467,7 @@ impl MajitGraph {
     }
 
     /// Check if a block is a loop header (has a back-edge predecessor).
-    pub fn is_loop_header(&self, block: BasicBlockId) -> bool {
+    pub fn is_loop_header(&self, block: BlockId) -> bool {
         self.predecessors(block)
             .iter()
             .any(|&pred| pred.0 >= block.0)
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn graph_allocates_values_and_blocks() {
-        let mut graph = MajitGraph::new("demo");
+        let mut graph = FunctionGraph::new("demo");
         let entry = graph.entry;
         let cond = graph
             .push_op(

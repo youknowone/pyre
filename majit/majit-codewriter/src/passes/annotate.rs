@@ -6,7 +6,9 @@
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
+use crate::model::{
+    BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId, ValueType,
+};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.
@@ -35,7 +37,7 @@ impl AnnotationState {
 ///
 /// RPython equivalent: `RPythonAnnotator.complete()` — processes all
 /// blocks until no annotation changes.
-pub fn annotate(graph: &MajitGraph) -> AnnotationState {
+pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     let mut state = AnnotationState::new();
 
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
@@ -169,7 +171,7 @@ fn kind_char_to_value_type(kind: char) -> ValueType {
 }
 
 fn infer_call_result_type(
-    target: &crate::graph::CallTarget,
+    target: &crate::model::CallTarget,
     _args: &[ValueId],
     _state: &AnnotationState,
 ) -> ValueType {
@@ -201,11 +203,11 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{CallTarget, MajitGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
 
     #[test]
     fn annotates_const_int() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
@@ -216,7 +218,7 @@ mod tests {
 
     #[test]
     fn annotates_field_read_type() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let base = graph.alloc_value();
         let v = graph
@@ -224,7 +226,7 @@ mod tests {
                 entry,
                 OpKind::FieldRead {
                     base,
-                    field: crate::graph::FieldDescriptor::new("x", None),
+                    field: crate::model::FieldDescriptor::new("x", None),
                     ty: ValueType::Int,
                 },
                 true,
@@ -238,7 +240,7 @@ mod tests {
 
     #[test]
     fn annotates_call_with_int_args() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
@@ -263,7 +265,7 @@ mod tests {
 
     #[test]
     fn annotates_path_like_int_helper_call() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
@@ -287,7 +289,7 @@ mod tests {
     #[test]
     fn propagates_across_blocks_via_phi() {
         // Test cross-block annotation propagation through Link args → inputargs
-        let mut graph = MajitGraph::new("phi_test");
+        let mut graph = FunctionGraph::new("phi_test");
         let entry = graph.entry;
 
         // Entry: produce an Int value

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::call::{CallControl, CallKind};
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId};
+use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId};
 
 /// Inline all `Regular` calls in the graph, consulting `CallControl`
 /// for the inline/residual decision.
@@ -20,7 +20,11 @@ use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId};
 /// RPython equivalent: flow space auto-inlining + `backendopt/inline.py`.
 ///
 /// Returns the number of call sites inlined.
-pub fn inline_graph(graph: &mut MajitGraph, call_control: &CallControl, max_depth: usize) -> usize {
+pub fn inline_graph(
+    graph: &mut FunctionGraph,
+    call_control: &CallControl,
+    max_depth: usize,
+) -> usize {
     let mut total_inlined = 0;
     for _depth in 0..max_depth {
         let sites = find_inline_sites(graph, call_control);
@@ -39,13 +43,13 @@ pub fn inline_graph(graph: &mut MajitGraph, call_control: &CallControl, max_dept
 
 /// A call site eligible for inlining.
 struct InlineSite {
-    block_id: BasicBlockId,
+    block_id: BlockId,
     op_index: usize,
-    callee: MajitGraph,
+    callee: FunctionGraph,
 }
 
 /// Find all Call ops in the graph where `CallControl` says `Regular`.
-fn find_inline_sites(graph: &MajitGraph, call_control: &CallControl) -> Vec<InlineSite> {
+fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<InlineSite> {
     let mut sites = Vec::new();
     for block in &graph.blocks {
         for (op_idx, op) in block.ops.iter().enumerate() {
@@ -78,7 +82,7 @@ fn find_inline_sites(graph: &MajitGraph, call_control: &CallControl) -> Vec<Inli
 /// 3. Connect: before → callee entry (passing call args)
 /// 4. Connect: callee Return → merge block (passing return value)
 /// 5. Merge block continues with the "after" ops
-fn inline_call_site(graph: &mut MajitGraph, site: InlineSite) {
+fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let InlineSite {
         block_id,
         op_index,
@@ -94,7 +98,7 @@ fn inline_call_site(graph: &mut MajitGraph, site: InlineSite) {
     };
 
     // Separate ops into before-call and after-call
-    let after_ops: Vec<Op> = block.ops[op_index + 1..].to_vec();
+    let after_ops: Vec<SpaceOperation> = block.ops[op_index + 1..].to_vec();
     let after_terminator = block.terminator.clone();
 
     // Truncate the original block to before-call ops only
@@ -149,7 +153,7 @@ fn inline_call_site(graph: &mut MajitGraph, site: InlineSite) {
         graph.blocks[new_block_id.0].inputargs = new_inputargs;
 
         // Remap ops
-        let new_ops: Vec<Op> = callee_block
+        let new_ops: Vec<SpaceOperation> = callee_block
             .ops
             .iter()
             .map(|op| remap_op(op, &value_map))
@@ -224,7 +228,10 @@ fn inline_call_site(graph: &mut MajitGraph, site: InlineSite) {
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.
-fn remap_callee_values(graph: &mut MajitGraph, callee: &MajitGraph) -> HashMap<ValueId, ValueId> {
+fn remap_callee_values(
+    graph: &mut FunctionGraph,
+    callee: &FunctionGraph,
+) -> HashMap<ValueId, ValueId> {
     let mut map = HashMap::new();
     // Collect all ValueIds used in the callee
     for block in &callee.blocks {
@@ -246,11 +253,11 @@ fn remap_callee_values(graph: &mut MajitGraph, callee: &MajitGraph) -> HashMap<V
     map
 }
 
-/// Allocate fresh BasicBlockIds for all blocks in the callee graph.
+/// Allocate fresh BlockIds for all blocks in the callee graph.
 fn remap_callee_blocks(
-    graph: &mut MajitGraph,
-    callee: &MajitGraph,
-) -> HashMap<BasicBlockId, BasicBlockId> {
+    graph: &mut FunctionGraph,
+    callee: &FunctionGraph,
+) -> HashMap<BlockId, BlockId> {
     let mut map = HashMap::new();
     for block in &callee.blocks {
         let new_id = graph.create_block();
@@ -260,11 +267,11 @@ fn remap_callee_blocks(
 }
 
 /// Remap a single Op's values.
-fn remap_op(op: &Op, value_map: &HashMap<ValueId, ValueId>) -> Op {
+fn remap_op(op: &SpaceOperation, value_map: &HashMap<ValueId, ValueId>) -> SpaceOperation {
     let remap = |v: &ValueId| *value_map.get(v).unwrap_or(v);
     let result = op.result.map(|v| remap(&v));
     let kind = remap_op_kind(&op.kind, &remap);
-    Op { result, kind }
+    SpaceOperation { result, kind }
 }
 
 fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind {
@@ -447,10 +454,10 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
 fn remap_terminator(
     term: &Terminator,
     value_map: &HashMap<ValueId, ValueId>,
-    block_map: &HashMap<BasicBlockId, BasicBlockId>,
+    block_map: &HashMap<BlockId, BlockId>,
 ) -> Terminator {
     let rv = |v: &ValueId| *value_map.get(v).unwrap_or(v);
-    let rb = |b: &BasicBlockId| *block_map.get(b).unwrap_or(b);
+    let rb = |b: &BlockId| *block_map.get(b).unwrap_or(b);
     match term {
         Terminator::Goto { target, args } => Terminator::Goto {
             target: rb(target),
@@ -560,12 +567,12 @@ fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
 
 /// Replace all occurrences of `old` with `new` in ops within the specified blocks.
 fn remap_value_in_graph(
-    graph: &mut MajitGraph,
-    block_map: &HashMap<BasicBlockId, BasicBlockId>,
+    graph: &mut FunctionGraph,
+    block_map: &HashMap<BlockId, BlockId>,
     old: ValueId,
     new: ValueId,
 ) {
-    let target_blocks: Vec<BasicBlockId> = block_map.values().copied().collect();
+    let target_blocks: Vec<BlockId> = block_map.values().copied().collect();
     for &bid in &target_blocks {
         let block = &mut graph.blocks[bid.0];
         block.ops = remap_value_in_ops(&block.ops, old, new);
@@ -574,10 +581,10 @@ fn remap_value_in_graph(
 }
 
 /// Replace all occurrences of `old` with `new` in a list of ops.
-fn remap_value_in_ops(ops: &[Op], old: ValueId, new: ValueId) -> Vec<Op> {
+fn remap_value_in_ops(ops: &[SpaceOperation], old: ValueId, new: ValueId) -> Vec<SpaceOperation> {
     let remap = |v: &ValueId| if *v == old { new } else { *v };
     ops.iter()
-        .map(|op| Op {
+        .map(|op| SpaceOperation {
             result: op.result,
             kind: remap_op_kind(&op.kind, &remap),
         })
@@ -617,12 +624,12 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
 mod tests {
     use super::*;
     use crate::call::CallControl;
-    use crate::graph::{CallTarget, FieldDescriptor, MajitGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallTarget, FieldDescriptor, FunctionGraph, OpKind, Terminator, ValueType};
     use crate::parse::CallPath;
 
-    fn make_simple_callee() -> MajitGraph {
+    fn make_simple_callee() -> FunctionGraph {
         // Callee: fn callee(base) -> value { ArrayRead(base, const(0)) }
-        let mut g = MajitGraph::new("callee");
+        let mut g = FunctionGraph::new("callee");
         let entry = g.entry;
         let base = g.push_op(
             entry,
@@ -649,7 +656,7 @@ mod tests {
     #[test]
     fn inline_single_call() {
         // Caller: fn caller() { v = Call("callee", [base]); Return v }
-        let mut caller = MajitGraph::new("caller");
+        let mut caller = FunctionGraph::new("caller");
         let entry = caller.entry;
         let base = caller.push_op(
             entry,
@@ -701,7 +708,7 @@ mod tests {
 
     #[test]
     fn inline_preserves_residual_calls() {
-        let mut caller = MajitGraph::new("caller");
+        let mut caller = FunctionGraph::new("caller");
         let entry = caller.entry;
         let result = caller.push_op(
             entry,
@@ -733,7 +740,7 @@ mod tests {
         let inner = make_simple_callee();
 
         // outer: fn outer(base) -> Call("callee", [base])
-        let mut outer = MajitGraph::new("outer");
+        let mut outer = FunctionGraph::new("outer");
         let entry = outer.entry;
         let base = outer.push_op(
             entry,
@@ -755,7 +762,7 @@ mod tests {
         outer.set_terminator(entry, Terminator::Return(result));
 
         // caller: fn caller(x) -> Call("outer", [x])
-        let mut caller = MajitGraph::new("caller");
+        let mut caller = FunctionGraph::new("caller");
         let centry = caller.entry;
         let x = caller.push_op(
             centry,

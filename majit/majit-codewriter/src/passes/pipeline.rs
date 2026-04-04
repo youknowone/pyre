@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::OpcodeDispatchSelector;
 use crate::front::SemanticFunction;
-use crate::graph::MajitGraph;
+use crate::model::FunctionGraph;
 use crate::passes::annotate::{AnnotationState, annotate};
-use crate::passes::flatten::{self, FlattenedFunction};
+use crate::passes::flatten::{self, SSARepr};
 use crate::passes::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
 use crate::passes::rtype::{TypeResolutionState, resolve_types};
 
@@ -38,7 +38,7 @@ pub struct PipelineResult {
     pub calls_classified: usize,
     pub transform_notes: Vec<super::jtransform::GraphTransformNote>,
     /// RPython: the SSARepr produced by flatten_graph().
-    pub flattened: FlattenedFunction,
+    pub flattened: SSARepr,
 }
 
 /// Canonical opcode dispatch metadata.
@@ -51,7 +51,7 @@ pub struct PipelineOpcodeArm {
     pub selector: OpcodeDispatchSelector,
     /// Inlined + jtransform'd + flattened output.
     /// None if the opcode handler was too trivial or unsupported.
-    pub flattened: Option<FlattenedFunction>,
+    pub flattened: Option<SSARepr>,
 }
 
 /// Result of running the pipeline on a full program.
