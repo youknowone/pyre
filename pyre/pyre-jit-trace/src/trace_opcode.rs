@@ -3916,8 +3916,18 @@ impl MIFrame {
         pc: usize,
     ) -> TraceAction {
         if !self.sym().last_exc_value.is_null() {
-            // pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
             let exc_obj = self.sym().last_exc_value;
+
+            // RPython parity: deterministic raise (opimpl_raise set
+            // class_of_last_exc_is_const=true) needs no GUARD_EXCEPTION.
+            if self.sym().class_of_last_exc_is_const {
+                let exc_box = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
+                self.sym_mut().last_exc_box = exc_box;
+                return self.finishframe_exception(code, pc);
+            }
+
+            // pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
+            // Residual call raised — need guard to check exception type.
             let exc_type_ptr = unsafe {
                 (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
                     .ob_header
@@ -3943,16 +3953,8 @@ impl MIFrame {
                 )
             });
 
-            // pyjitpl.py:3386-3389: last_exc_box = ConstPtr if class known,
-            // else guard op result.
-            {
-                let exc_box = if self.sym().class_of_last_exc_is_const {
-                    self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64))
-                } else {
-                    guard_op
-                };
-                self.sym_mut().last_exc_box = exc_box;
-            }
+            // pyjitpl.py:3386-3389: last_exc_box = guard op result.
+            self.sym_mut().last_exc_box = guard_op;
 
             // pyjitpl.py:3390
             self.sym_mut().class_of_last_exc_is_const = true;
@@ -5244,16 +5246,11 @@ impl OpcodeStepExecutor for MIFrame {
                     .ob_type
             };
             self.with_ctx(|this, ctx| {
+                // pyjitpl.py:1690-1693: GUARD_CLASS only if class unknown.
+                // RPython parity: no residual call — the metainterp sets
+                // class_of_last_exc_is_const and handle_possible_exception
+                // skips GUARD_EXCEPTION for deterministic raises.
                 this.guard_object_class(ctx, exc_val.opref, exc_class_ptr);
-                // Emit residual call to set pending exception in compiled code.
-                // GUARD_EXCEPTION checks jit_exc_type_matches(); without this
-                // call, no exception would be pending and the guard always fails.
-                let exc_type_const = ctx.const_int(exc_class_ptr as i64);
-                #[cfg(not(target_arch = "wasm32"))]
-                let exc_raise_ptr = majit_backend_cranelift::jit_exc_raise as *const ();
-                #[cfg(target_arch = "wasm32")]
-                let exc_raise_ptr: *const () = std::ptr::null();
-                ctx.call_void(exc_raise_ptr, &[exc_val.opref, exc_type_const]);
             });
         }
         // RPython pyjitpl.py:2745 execute_ll_raised: store concrete
