@@ -281,7 +281,7 @@ pub struct OptContext {
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
-#[allow(dead_code)]
+#[inline(always)]
 pub(crate) fn is_typeptr_field(field_idx: u32, field_descrs: &[(u32, majit_ir::DescrRef)]) -> bool {
     field_descrs
         .iter()
