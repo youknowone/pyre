@@ -5430,6 +5430,27 @@ impl<M: Clone> MetaInterp<M> {
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
 
+        // Merge source trace's constant_types into the bridge optimizer
+        // BEFORE optimization runs. The bridge trace's constant pool may
+        // reference OpRefs from the source trace (e.g. ob_type constants
+        // for virtual objects). Without this, fail_arg_type inference
+        // panics on unknown OpRef types during bridge optimization.
+        {
+            let source_trace_id = {
+                let tid = fail_descr.trace_id();
+                if tid == 0 {
+                    compiled.root_trace_id
+                } else {
+                    tid
+                }
+            };
+            if let Some(source_trace) = compiled.traces.get(&source_trace_id) {
+                for (&idx, &tp) in &source_trace.constant_types {
+                    optimizer.constant_types.entry(idx).or_insert(tp);
+                }
+            }
+        }
+
         // RPython bridgeopt.py:133-146 deserialize_optimizer_knowledge:
         // known_classes are restored from the per-guard bitfield that was
         // serialized at guard compile time (bridgeopt.py:69-88). Only
