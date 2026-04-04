@@ -23,6 +23,10 @@ pub struct SemanticFunction {
     /// Used for array identity resolution on Call result values.
     #[serde(default)]
     pub return_type: Option<String>,
+    /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
+    /// Used to construct the full CallPath for return_type registration.
+    #[serde(default)]
+    pub self_ty_root: Option<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -286,6 +290,7 @@ fn build_function_graph(
         name: func.sig.ident.to_string(),
         graph,
         return_type,
+        self_ty_root,
     }
 }
 
