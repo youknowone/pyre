@@ -161,17 +161,6 @@ pub trait FailDescr: Descr {
         &[]
     }
 
-    /// compile.py:861-872: copy_all_attributes_from — copy resume attributes
-    /// from this descr into a target Op's fields.
-    ///
-    /// This is the majit equivalent of `descr.copy_all_attributes_from(other)`.
-    /// Since descr-level resume data (rd_numb, rd_consts, rd_virtuals,
-    /// rd_pendingfields) is stored on Op fields in majit, this method
-    /// copies those fields from the descr's internal state into `target`.
-    fn copy_resume_into_op(&self, _target: &mut super::Op) {
-        // Default: no-op. Concrete descr types override to copy their data.
-    }
-
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
     fn attach_vector_info(&self, _info: AccumVectorInfo) {}
