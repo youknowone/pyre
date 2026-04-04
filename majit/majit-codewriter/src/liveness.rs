@@ -90,15 +90,7 @@ fn compute_liveness_pass(
                     alive.extend(alive_at_target.iter());
                 }
             }
-            FlatOp::JumpIfTrue { cond, target } => {
-                let cond = *cond;
-                let target = *target;
-                alive.insert(cond);
-                if let Some(alive_at_target) = label2alive.get(&target) {
-                    alive.extend(alive_at_target.iter());
-                }
-            }
-            FlatOp::JumpIfFalse { cond, target } => {
+            FlatOp::GotoIfNot { cond, target } => {
                 let cond = *cond;
                 let target = *target;
                 alive.insert(cond);

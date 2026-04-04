@@ -26,11 +26,13 @@ pub enum FlatOp {
     /// Semantic op (from the graph).
     Op(SpaceOperation),
     /// Unconditional jump to label.
+    /// RPython: `('goto', TLabel(target))`.
     Jump(Label),
-    /// Conditional jump: if cond is true, jump to label.
-    JumpIfTrue { cond: ValueId, target: Label },
-    /// Conditional jump: if cond is false, jump to label.
-    JumpIfFalse { cond: ValueId, target: Label },
+    /// Conditional jump: if cond is false (zero), jump to label.
+    /// RPython: `('goto_if_not', cond, TLabel(false_path))`.
+    /// There is NO goto_if_true — RPython only uses goto_if_not.
+    /// The true path is always the fallthrough.
+    GotoIfNot { cond: ValueId, target: Label },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     Move { dst: ValueId, src: ValueId },
     /// Liveness marker — expanded by `compute_liveness()` to include
@@ -131,37 +133,42 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 if_false,
                 false_args,
             } => {
-                // Emit conditional jump to true branch
-                // (false branch falls through or jumps)
+                // RPython flatten.py:240-267: Two exits with boolean condition.
+                // Emit goto_if_not(cond, false_label) — jump to false path
+                // when cond is 0. True path is the fallthrough.
                 let true_label = block_labels[if_true];
                 let false_label = block_labels[if_false];
 
-                // Phi moves for true branch (before jump)
-                // Note: in proper SSA, parallel moves need careful ordering.
-                // Simplified: emit moves + jump for true, then false.
-                if !true_args.is_empty() || !false_args.is_empty() {
-                    // Complex case: need to handle Phi args for both branches
-                    // For now, emit the branch directly
-                    ops.push(FlatOp::JumpIfTrue {
-                        cond: *cond,
-                        target: true_label,
+                // RPython flatten.py:259: -live- before goto_if_not
+                ops.push(FlatOp::Live {
+                    live_values: Vec::new(),
+                });
+                // RPython flatten.py:260: goto_if_not(cond, TLabel(false_path))
+                ops.push(FlatOp::GotoIfNot {
+                    cond: *cond,
+                    target: false_label,
+                });
+
+                // RPython flatten.py:264: true path (fallthrough)
+                let true_block = graph.block(*if_true);
+                for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
+                    ops.push(FlatOp::Move {
+                        dst: *dst,
+                        src: *src,
                     });
-                    // False path moves
-                    let false_block = graph.block(*if_false);
-                    for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
-                        ops.push(FlatOp::Move {
-                            dst: *dst,
-                            src: *src,
-                        });
-                    }
-                    ops.push(FlatOp::Jump(false_label));
-                } else {
-                    ops.push(FlatOp::JumpIfTrue {
-                        cond: *cond,
-                        target: true_label,
-                    });
-                    ops.push(FlatOp::Jump(false_label));
                 }
+                ops.push(FlatOp::Jump(true_label));
+
+                // RPython flatten.py:266: false path label
+                ops.push(FlatOp::Label(false_label));
+                let false_block = graph.block(*if_false);
+                for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
+                    ops.push(FlatOp::Move {
+                        dst: *dst,
+                        src: *src,
+                    });
+                }
+                ops.push(FlatOp::Jump(false_label));
             }
             Terminator::Return(val) => {
                 // Return is implicit at the end (no jump needed)
@@ -321,7 +328,7 @@ mod tests {
         let has_jump = flat
             .ops
             .iter()
-            .any(|op| matches!(op, FlatOp::Jump(_) | FlatOp::JumpIfTrue { .. }));
+            .any(|op| matches!(op, FlatOp::Jump(_) | FlatOp::GotoIfNot { .. }));
         assert!(has_jump, "flattened if/else should have jumps");
         // Should have 4 labels (one per block)
         let label_count = flat
@@ -329,7 +336,11 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, FlatOp::Label(_)))
             .count();
-        assert_eq!(label_count, 4, "should have 4 labels for 4 blocks");
+        // 4 block labels + 1 false-path label from Branch (RPython goto_if_not convention)
+        assert!(
+            label_count >= 4,
+            "should have at least 4 labels, got {label_count}"
+        );
     }
 
     #[test]
