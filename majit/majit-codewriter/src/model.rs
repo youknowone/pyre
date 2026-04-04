@@ -394,14 +394,11 @@ impl FunctionGraph {
         id
     }
 
-    pub fn push_op(
-        &mut self,
-        block: BlockId,
-        kind: OpKind,
-        has_result: bool,
-    ) -> Option<ValueId> {
+    pub fn push_op(&mut self, block: BlockId, kind: OpKind, has_result: bool) -> Option<ValueId> {
         let result = has_result.then(|| self.alloc_value());
-        self.blocks[block.0].ops.push(SpaceOperation { result, kind });
+        self.blocks[block.0]
+            .ops
+            .push(SpaceOperation { result, kind });
         result
     }
 
