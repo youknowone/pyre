@@ -722,37 +722,27 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        // virtualizable.py:103-113 write_boxes parity.
-        // Pre-compute expected total and validate up front (RPython contract).
-        // RPython asserts `len(boxes) == i + 1` (the +1 is the trailing
-        // virtualizable ref). majit boxes omit that trailing ref, so we
-        // assert exact count == static_fields + array_items.
-        let mut expected = self.static_fields.len();
-        for ai in 0..self.array_fields.len() {
-            expected += self.get_array_length(obj_ptr as *const u8, ai);
-        }
-        assert!(
-            boxes.len() == expected,
-            "write_boxes_to_heap: boxes.len()={} != expected {}",
-            boxes.len(),
-            expected,
-        );
-
-        let mut i = 0;
-
-        // virtualizable.py:104-107: static fields.
-        for fi in 0..self.static_fields.len() {
-            self.write_field(obj_ptr, fi, boxes[i]);
-            i += 1;
+    pub unsafe fn write_boxes_to_heap(
+        &self,
+        obj_ptr: *mut u8,
+        boxes: &[i64],
+        array_lengths: &[usize],
+    ) {
+        // Static fields
+        for i in 0..self.static_fields.len() {
+            if i < boxes.len() {
+                self.write_field(obj_ptr, i, boxes[i]);
+            }
         }
 
-        // virtualizable.py:108-112: array items.
-        for ai in 0..self.array_fields.len() {
-            let len = self.get_array_length(obj_ptr as *const u8, ai);
+        // Array elements
+        let mut idx = self.static_fields.len();
+        for (ai, &len) in array_lengths.iter().enumerate() {
             for ei in 0..len {
-                self.write_array_item(obj_ptr, ai, ei, boxes[i]);
-                i += 1;
+                if idx < boxes.len() {
+                    self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
+                }
+                idx += 1;
             }
         }
     }
@@ -780,8 +770,13 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        self.write_boxes_to_heap(obj_ptr, boxes);
+    pub unsafe fn force_from_boxes(
+        &self,
+        obj_ptr: *mut u8,
+        boxes: &[i64],
+        array_lengths: &[usize],
+    ) {
+        self.write_boxes_to_heap(obj_ptr, boxes, array_lengths);
         self.reset_vable_token(obj_ptr);
     }
 }
@@ -1723,7 +1718,7 @@ mod tests {
         let lengths = vec![2];
 
         unsafe {
-            info.force_from_boxes(obj, &boxes);
+            info.force_from_boxes(obj, &boxes, &lengths);
 
             assert_eq!(frame.x, 42);
             assert_eq!(arr.items[0], 100);
