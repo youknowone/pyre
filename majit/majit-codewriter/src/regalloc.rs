@@ -1,29 +1,28 @@
-//! Register allocation for flattened JitCode.
+//! Register allocation on the control flow graph.
 //!
 //! RPython equivalent: `rpython/jit/codewriter/regalloc.py` +
 //! `rpython/tool/algo/regalloc.py` + `rpython/tool/algo/color.py`.
 //!
-//! Builds an interference graph from the flattened instruction sequence,
-//! coalesces variables connected by Move ops, then finds a minimal
-//! graph coloring to assign register indices.
+//! Operates on `FunctionGraph` (Block structure), NOT on flattened ops.
+//! RPython runs regalloc BEFORE flatten: codewriter.py:45-47.
+//!
+//! 1. Build interference graph per-block (die_at analysis)
+//! 2. Coalesce variables connected by Goto link args
+//! 3. Greedy graph coloring via lexicographic BFS
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
-use crate::model::ValueId;
-use crate::passes::flatten::{FlatOp, RegKind, SSARepr};
+use crate::model::{Block, FunctionGraph, OpKind, Terminator, ValueId};
+use crate::passes::flatten::RegKind;
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
 /// Interference graph for register allocation.
 ///
 /// RPython: `color.py::DependencyGraph`.
-/// Two nodes are neighbours if they are simultaneously alive and thus
-/// cannot share a register.
 #[derive(Debug, Clone)]
 struct DependencyGraph {
-    /// RPython: `DependencyGraph._all_nodes`
     all_nodes: Vec<ValueId>,
-    /// RPython: `DependencyGraph.neighbours`
     neighbours: HashMap<ValueId, HashSet<ValueId>>,
 }
 
@@ -35,7 +34,6 @@ impl DependencyGraph {
         }
     }
 
-    /// RPython: `DependencyGraph.add_node(v)`
     fn add_node(&mut self, v: ValueId) {
         if !self.neighbours.contains_key(&v) {
             self.all_nodes.push(v);
@@ -43,7 +41,6 @@ impl DependencyGraph {
         }
     }
 
-    /// RPython: `DependencyGraph.add_edge(v1, v2)`
     fn add_edge(&mut self, v1: ValueId, v2: ValueId) {
         if v1 == v2 {
             return;
@@ -52,8 +49,6 @@ impl DependencyGraph {
         self.neighbours.entry(v2).or_default().insert(v1);
     }
 
-    /// RPython: `DependencyGraph.coalesce(vold, vnew)`
-    /// Remove vold from the graph, attach all its edges to vnew.
     fn coalesce(&mut self, vold: ValueId, vnew: ValueId) {
         if let Some(old_neighbours) = self.neighbours.remove(&vold) {
             for n in old_neighbours {
@@ -68,7 +63,6 @@ impl DependencyGraph {
         }
     }
 
-    /// RPython: `DependencyGraph.getnodes()`
     fn getnodes(&self) -> Vec<ValueId> {
         self.all_nodes
             .iter()
@@ -78,7 +72,6 @@ impl DependencyGraph {
     }
 
     /// RPython: `DependencyGraph.lexicographic_order()`
-    /// Lexicographic breadth-first ordering for chordal graph coloring.
     fn lexicographic_order(&self) -> Vec<ValueId> {
         let nodes = self.getnodes();
         if nodes.is_empty() {
@@ -86,22 +79,13 @@ impl DependencyGraph {
         }
         let mut sigma: Vec<Vec<ValueId>> = vec![nodes.into_iter().rev().collect()];
         let mut result = Vec::new();
-
         while !sigma.is_empty() && !sigma[0].is_empty() {
             let v = sigma[0].pop().unwrap();
             result.push(v);
             let neighb = self.neighbours.get(&v).cloned().unwrap_or_default();
             let mut new_sigma = Vec::new();
             for s in sigma {
-                let mut s1 = Vec::new();
-                let mut s2 = Vec::new();
-                for x in s {
-                    if neighb.contains(&x) {
-                        s1.push(x);
-                    } else {
-                        s2.push(x);
-                    }
-                }
+                let (s1, s2): (Vec<_>, Vec<_>) = s.into_iter().partition(|x| neighb.contains(x));
                 if !s1.is_empty() {
                     new_sigma.push(s1);
                 }
@@ -115,23 +99,20 @@ impl DependencyGraph {
     }
 
     /// RPython: `DependencyGraph.find_node_coloring()`
-    /// Greedy coloring using lexicographic BFS order.
+    /// Uses `HashSet<usize>` — no color limit (fixes u64 overflow).
     fn find_node_coloring(&self) -> HashMap<ValueId, usize> {
         let mut result = HashMap::new();
         for v in self.lexicographic_order() {
-            let mut forbidden: u64 = 0;
+            let mut forbidden: HashSet<usize> = HashSet::new();
             if let Some(neighbours) = self.neighbours.get(&v) {
                 for &n in neighbours {
                     if let Some(&color) = result.get(&n) {
-                        if color < 64 {
-                            forbidden |= 1u64 << color;
-                        }
+                        forbidden.insert(color);
                     }
                 }
             }
-            // Find lowest 0 bit
             let mut num = 0;
-            while forbidden & (1u64 << num) != 0 {
+            while forbidden.contains(&num) {
                 num += 1;
             }
             result.insert(v, num);
@@ -142,9 +123,6 @@ impl DependencyGraph {
 
 // ── UnionFind (RPython tool/algo/unionfind.py) ────────────────────
 
-/// Union-Find data structure for variable coalescing.
-///
-/// RPython: `unionfind.py::UnionFind`.
 #[derive(Debug, Clone)]
 struct UnionFind {
     parent: HashMap<ValueId, ValueId>,
@@ -159,19 +137,16 @@ impl UnionFind {
         }
     }
 
-    /// RPython: `UnionFind.find_rep(obj)`
     fn find_rep(&mut self, v: ValueId) -> ValueId {
         if !self.parent.contains_key(&v) {
             self.parent.insert(v, v);
             self.weight.insert(v, 1);
             return v;
         }
-        // Path compression
         let mut root = v;
         while self.parent[&root] != root {
             root = self.parent[&root];
         }
-        // Compress path
         let mut current = v;
         while current != root {
             let next = self.parent[&current];
@@ -181,7 +156,6 @@ impl UnionFind {
         root
     }
 
-    /// RPython: `UnionFind.union(obj1, obj2)` → returns representative
     fn union(&mut self, v1: ValueId, v2: ValueId) -> ValueId {
         let rep1 = self.find_rep(v1);
         let rep2 = self.find_rep(v2);
@@ -200,14 +174,11 @@ impl UnionFind {
 
 // ── RegAllocator (RPython tool/algo/regalloc.py) ──────────────────
 
-/// Register allocator for a single kind (int/ref/float).
+/// Register allocator on FunctionGraph (Block structure).
 ///
 /// RPython: `regalloc.py::RegAllocator`.
-///
-/// 1. `make_dependencies()` — build interference graph from liveness
-/// 2. `coalesce_variables()` — merge Move src/dst when non-interfering
-/// 3. `find_node_coloring()` — greedy graph coloring
-#[derive(Debug, Clone)]
+/// Runs BEFORE flatten, on Block/SpaceOperation structure.
+#[derive(Debug)]
 struct RegAllocator {
     depgraph: DependencyGraph,
     unionfind: UnionFind,
@@ -223,104 +194,145 @@ impl RegAllocator {
         }
     }
 
-    /// RPython: `RegAllocator.make_dependencies()`
-    ///
-    /// Build the interference graph: two values interfere if one is
-    /// defined while the other is alive.
-    fn make_dependencies(
+    /// RPython: `RegAllocator.make_dependencies()` — regalloc.py:26-77.
+    /// Per-block die_at analysis.
+    fn make_dependencies(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
+        for block in &graph.blocks {
+            self.process_block(block, graph, consider);
+        }
+    }
+
+    /// Process one block: compute die_at, build interference edges.
+    fn process_block(
         &mut self,
-        ops: &[FlatOp],
-        target_kind: RegKind,
-        value_kinds: &HashMap<ValueId, RegKind>,
+        block: &Block,
+        graph: &FunctionGraph,
+        consider: &dyn Fn(ValueId) -> bool,
     ) {
-        let consider = |v: &ValueId| -> bool { value_kinds.get(v).copied() == Some(target_kind) };
+        // die_at: last usage index of each variable in this block.
+        let mut die_at: HashMap<ValueId, usize> = HashMap::new();
+        for &v in &block.inputargs {
+            die_at.insert(v, 0);
+        }
+        for (i, op) in block.ops.iter().enumerate() {
+            for v in crate::inline::op_value_refs(&op.kind) {
+                die_at.insert(v, i);
+            }
+            if let Some(result) = op.result {
+                die_at.insert(result, i + 1);
+            }
+        }
+        // Variables used in exit links stay alive until block end.
+        match &block.terminator {
+            Terminator::Goto { args, .. } => {
+                for &v in args {
+                    die_at.remove(&v);
+                }
+            }
+            Terminator::Branch {
+                cond,
+                true_args,
+                false_args,
+                ..
+            } => {
+                die_at.remove(cond);
+                for &v in true_args {
+                    die_at.remove(&v);
+                }
+                for &v in false_args {
+                    die_at.remove(&v);
+                }
+            }
+            _ => {}
+        }
+        let mut die_list: Vec<(usize, ValueId)> = die_at.into_iter().map(|(v, t)| (t, v)).collect();
+        die_list.sort();
+        die_list.push((usize::MAX, ValueId(0)));
 
-        // Compute liveness intervals and build interference edges.
-        // Walk forward: track alive set, add edges when a new value is defined.
-        let mut alive: HashSet<ValueId> = HashSet::new();
+        // inputargs all interfere with each other
+        let livevars: Vec<ValueId> = block
+            .inputargs
+            .iter()
+            .filter(|v| consider(**v))
+            .copied()
+            .collect();
+        for (i, &v) in livevars.iter().enumerate() {
+            self.depgraph.add_node(v);
+            for j in 0..i {
+                self.depgraph.add_edge(livevars[j], v);
+            }
+        }
+        let mut alive: HashSet<ValueId> = livevars.into_iter().collect();
 
-        for op in ops {
-            match op {
-                FlatOp::Op(inner) => {
-                    // Operands are used — add to alive
-                    for v in crate::inline::op_value_refs(&inner.kind) {
-                        if consider(&v) {
-                            self.depgraph.add_node(v);
-                            alive.insert(v);
+        // Scan ops, kill at die_at, add interference edges
+        let mut die_index = 0;
+        for (i, op) in block.ops.iter().enumerate() {
+            while die_list[die_index].0 == i {
+                alive.remove(&die_list[die_index].1);
+                die_index += 1;
+            }
+            if let Some(result) = op.result {
+                if consider(result) {
+                    self.depgraph.add_node(result);
+                    for &v in &alive {
+                        if consider(v) {
+                            self.depgraph.add_edge(v, result);
                         }
                     }
-                    // Result is defined — interferes with all alive, then add to alive
-                    if let Some(result) = inner.result {
-                        if consider(&result) {
-                            self.depgraph.add_node(result);
-                            for &v in &alive {
-                                self.depgraph.add_edge(v, result);
-                            }
-                            alive.insert(result);
-                        }
-                    }
+                    alive.insert(result);
                 }
-                FlatOp::Move { dst, src } => {
-                    if consider(src) {
-                        self.depgraph.add_node(*src);
-                        alive.insert(*src);
-                    }
-                    if consider(dst) {
-                        self.depgraph.add_node(*dst);
-                        alive.insert(*dst);
-                    }
-                }
-                FlatOp::JumpIfTrue { cond, .. } | FlatOp::JumpIfFalse { cond, .. } => {
-                    if consider(cond) {
-                        alive.insert(*cond);
-                    }
-                }
-                FlatOp::Label(_) => {
-                    // Block boundary — reset alive set (simplified).
-                    // Full implementation would track across blocks via labels.
-                    alive.clear();
-                }
-                FlatOp::Jump(_) | FlatOp::Live { .. } | FlatOp::Unreachable => {}
             }
         }
     }
 
-    /// RPython: `RegAllocator.coalesce_variables()`
-    ///
-    /// For each Move(dst, src), try to coalesce src and dst if they
-    /// don't interfere. This reduces unnecessary copies.
-    fn coalesce_variables(
-        &mut self,
-        ops: &[FlatOp],
-        value_kinds: &HashMap<ValueId, RegKind>,
-        target_kind: RegKind,
-    ) {
-        let consider = |v: &ValueId| -> bool { value_kinds.get(v).copied() == Some(target_kind) };
-
-        for op in ops {
-            if let FlatOp::Move { dst, src } = op {
-                if consider(src) && consider(dst) {
-                    self.try_coalesce(*src, *dst);
+    /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py:79-96.
+    /// Coalesce link.args[i] with target.inputargs[i].
+    fn coalesce_variables(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
+        for block in &graph.blocks {
+            match &block.terminator {
+                Terminator::Goto { target, args } => {
+                    let target_block = graph.block(*target);
+                    for (&v, &w) in args.iter().zip(target_block.inputargs.iter()) {
+                        self.try_coalesce(v, w, consider);
+                    }
                 }
+                Terminator::Branch {
+                    if_true,
+                    true_args,
+                    if_false,
+                    false_args,
+                    ..
+                } => {
+                    let tb = graph.block(*if_true);
+                    for (&v, &w) in true_args.iter().zip(tb.inputargs.iter()) {
+                        self.try_coalesce(v, w, consider);
+                    }
+                    let fb = graph.block(*if_false);
+                    for (&v, &w) in false_args.iter().zip(fb.inputargs.iter()) {
+                        self.try_coalesce(v, w, consider);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    /// RPython: `RegAllocator._try_coalesce(v, w)`
-    fn try_coalesce(&mut self, v: ValueId, w: ValueId) {
+    fn try_coalesce(&mut self, v: ValueId, w: ValueId, consider: &dyn Fn(ValueId) -> bool) {
+        if !consider(v) || !consider(w) {
+            return;
+        }
         let v0 = self.unionfind.find_rep(v);
         let w0 = self.unionfind.find_rep(w);
         if v0 == w0 {
             return;
         }
-        // Check if they interfere
         if self
             .depgraph
             .neighbours
             .get(&w0)
             .map_or(false, |ns| ns.contains(&v0))
         {
-            return; // can't coalesce — they interfere
+            return;
         }
         let rep = self.unionfind.union(v0, w0);
         if rep == v0 {
@@ -330,12 +342,10 @@ impl RegAllocator {
         }
     }
 
-    /// RPython: `RegAllocator.find_node_coloring()`
     fn find_node_coloring(&mut self) {
         self.coloring = self.depgraph.find_node_coloring();
     }
 
-    /// RPython: `RegAllocator.getcolor(v)`
     fn getcolor(&mut self, v: ValueId) -> Option<usize> {
         let rep = self.unionfind.find_rep(v);
         self.coloring.get(&rep).copied()
@@ -345,32 +355,30 @@ impl RegAllocator {
 // ── Public API ────────────────────────────────────────────────────
 
 /// Result of register allocation for one kind.
-///
-/// RPython: the `RegAllocator` object with `_coloring` dict.
 #[derive(Debug, Clone)]
 pub struct RegAllocResult {
-    /// RPython: `RegAlloc._coloring` — maps ValueId → register index.
     pub coloring: HashMap<ValueId, usize>,
-    /// Number of registers used for this kind.
     pub num_regs: usize,
 }
 
-/// Perform register allocation for a single kind on a flattened function.
+/// Perform register allocation for a single kind on a graph.
 ///
 /// RPython: `regalloc.py::perform_register_allocation(graph, kind)`.
-///
-/// 1. Build interference graph from instruction liveness
-/// 2. Coalesce Move src/dst pairs
-/// 3. Find minimal graph coloring
-pub fn perform_register_allocation(flattened: &SSARepr, kind: RegKind) -> RegAllocResult {
+/// Runs on FunctionGraph (Block structure), BEFORE flatten.
+pub fn perform_register_allocation(
+    graph: &FunctionGraph,
+    kind: RegKind,
+    value_kinds: &HashMap<ValueId, RegKind>,
+) -> RegAllocResult {
+    let consider = |v: ValueId| -> bool { value_kinds.get(&v).copied() == Some(kind) };
     let mut allocator = RegAllocator::new();
-    allocator.make_dependencies(&flattened.ops, kind, &flattened.value_kinds);
-    allocator.coalesce_variables(&flattened.ops, &flattened.value_kinds, kind);
+    allocator.make_dependencies(graph, &consider);
+    allocator.coalesce_variables(graph, &consider);
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::new();
     let mut max_reg = 0usize;
-    for (&vid, &vkind) in &flattened.value_kinds {
+    for (&vid, &vkind) in value_kinds {
         if vkind == kind {
             if let Some(color) = allocator.getcolor(vid) {
                 coloring.insert(vid, color);
@@ -380,7 +388,6 @@ pub fn perform_register_allocation(flattened: &SSARepr, kind: RegKind) -> RegAll
             }
         }
     }
-
     RegAllocResult {
         coloring,
         num_regs: max_reg,
@@ -388,16 +395,13 @@ pub fn perform_register_allocation(flattened: &SSARepr, kind: RegKind) -> RegAll
 }
 
 /// Perform register allocation for all three kinds.
-///
-/// RPython codewriter.py:45-47:
-/// ```python
-/// for kind in KINDS:
-///     regallocs[kind] = perform_register_allocation(graph, kind)
-/// ```
-pub fn perform_all_register_allocations(flattened: &SSARepr) -> HashMap<RegKind, RegAllocResult> {
+pub fn perform_all_register_allocations(
+    graph: &FunctionGraph,
+    value_kinds: &HashMap<ValueId, RegKind>,
+) -> HashMap<RegKind, RegAllocResult> {
     let mut result = HashMap::new();
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        result.insert(kind, perform_register_allocation(flattened, kind));
+        result.insert(kind, perform_register_allocation(graph, kind, value_kinds));
     }
     result
 }
@@ -405,151 +409,149 @@ pub fn perform_all_register_allocations(flattened: &SSARepr) -> HashMap<RegKind,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{OpKind, SpaceOperation, ValueType};
+    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
 
     #[test]
-    fn allocate_separates_by_kind() {
-        // Three values defined in ops so make_dependencies sees them
-        let flat = SSARepr {
-            name: "test".into(),
-            ops: vec![
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(0)),
-                    kind: OpKind::Input {
-                        name: "a".into(),
-                        ty: ValueType::Int,
-                    },
-                }),
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(1)),
-                    kind: OpKind::Input {
-                        name: "b".into(),
-                        ty: ValueType::Ref,
-                    },
-                }),
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(2)),
-                    kind: OpKind::Input {
-                        name: "c".into(),
-                        ty: ValueType::Int,
-                    },
-                }),
-            ],
-            num_values: 3,
-            num_blocks: 1,
-            value_kinds: {
-                let mut m = HashMap::new();
-                m.insert(ValueId(0), RegKind::Int);
-                m.insert(ValueId(1), RegKind::Ref);
-                m.insert(ValueId(2), RegKind::Int);
-                m
-            },
-        };
-
-        let allocs = perform_all_register_allocations(&flat);
-        // Int kind has 2 values, Ref has 1, Float has 0.
-        // But v0 and v2 don't interfere (no overlap), so they may coalesce to 1 reg.
-        assert!(allocs[&RegKind::Int].num_regs >= 1);
-        assert_eq!(allocs[&RegKind::Ref].num_regs, 1);
-        assert_eq!(allocs[&RegKind::Float].num_regs, 0);
-    }
-
-    #[test]
-    fn coalesce_reduces_registers() {
-        // v0 = Input
-        // v1 = Move(v0) — should coalesce with v0
-        let mut flat = SSARepr {
-            name: "test".into(),
-            ops: vec![
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(0)),
-                    kind: OpKind::Input {
-                        name: "a".into(),
-                        ty: ValueType::Int,
-                    },
-                }),
-                FlatOp::Move {
-                    dst: ValueId(1),
-                    src: ValueId(0),
+    fn non_overlapping_lifetimes_share_register() {
+        // v0 = Input; v1 = BinOp(v0, v0); Return v1
+        // v0 dies when v1 is defined → no interference → can share register.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.entry;
+        let v0 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
                 },
-            ],
-            num_values: 2,
-            num_blocks: 1,
-            value_kinds: {
-                let mut m = HashMap::new();
-                m.insert(ValueId(0), RegKind::Int);
-                m.insert(ValueId(1), RegKind::Int);
-                m
-            },
-        };
+                true,
+            )
+            .unwrap();
+        let v1 = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: v0,
+                    rhs: v0,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(entry, Terminator::Return(Some(v1)));
 
-        let result = perform_register_allocation(&flat, RegKind::Int);
-        // v0 and v1 should coalesce to the same register
-        assert_eq!(
-            result.coloring.get(&ValueId(0)),
-            result.coloring.get(&ValueId(1)),
-            "coalesced values should share a register"
-        );
-        assert_eq!(
-            result.num_regs, 1,
-            "should need only 1 register after coalescing"
-        );
+        let mut vk = HashMap::new();
+        vk.insert(v0, RegKind::Int);
+        vk.insert(v1, RegKind::Int);
+        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
+        // v0 and v1 don't overlap → can share
+        assert_eq!(result.num_regs, 1);
     }
 
     #[test]
-    fn interfering_values_get_different_registers() {
-        // v0 = Input
-        // v1 = BinOp(v0, v0) — v1 is defined while v0 is alive → they interfere
-        let flat = SSARepr {
-            name: "test".into(),
-            ops: vec![
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(0)),
-                    kind: OpKind::Input {
-                        name: "a".into(),
-                        ty: ValueType::Int,
-                    },
-                }),
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(1)),
-                    kind: OpKind::BinOp {
-                        op: "add".into(),
-                        lhs: ValueId(0),
-                        rhs: ValueId(0),
-                        result_ty: ValueType::Int,
-                    },
-                }),
-            ],
-            num_values: 2,
-            num_blocks: 1,
-            value_kinds: {
-                let mut m = HashMap::new();
-                m.insert(ValueId(0), RegKind::Int);
-                m.insert(ValueId(1), RegKind::Int);
-                m
-            },
-        };
+    fn overlapping_lifetimes_need_different_registers() {
+        // v0 = Input; v1 = Input; v2 = BinOp(v0, v1); Return v2
+        // v0 and v1 are both alive when v2 is defined → v0 and v1 interfere
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.entry;
+        let v0 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v1 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "b".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v2 = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: v0,
+                    rhs: v1,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(entry, Terminator::Return(Some(v2)));
 
-        let result = perform_register_allocation(&flat, RegKind::Int);
+        let mut vk = HashMap::new();
+        vk.insert(v0, RegKind::Int);
+        vk.insert(v1, RegKind::Int);
+        vk.insert(v2, RegKind::Int);
+        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
         assert_ne!(
-            result.coloring.get(&ValueId(0)),
-            result.coloring.get(&ValueId(1)),
-            "interfering values should get different registers"
+            result.coloring.get(&v0),
+            result.coloring.get(&v1),
+            "v0 and v1 are simultaneously alive → different registers"
         );
-        assert_eq!(result.num_regs, 2);
+        // v2 can share with v0 or v1 (they die before v2's definition)
+        assert!(result.num_regs >= 2);
     }
 
     #[test]
-    fn dependency_graph_coloring() {
+    fn goto_link_coalescing() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.entry;
+        let v0 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (block1, block1_args) = graph.create_block_with_args(1);
+        let v1 = block1_args[0];
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target: block1,
+                args: vec![v0],
+            },
+        );
+        graph.set_terminator(block1, Terminator::Return(Some(v1)));
+
+        let mut vk = HashMap::new();
+        vk.insert(v0, RegKind::Int);
+        vk.insert(v1, RegKind::Int);
+        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
+        assert_eq!(result.coloring.get(&v0), result.coloring.get(&v1));
+        assert_eq!(result.num_regs, 1);
+    }
+
+    #[test]
+    fn coloring_unbounded() {
         let mut dg = DependencyGraph::new();
-        dg.add_node(ValueId(0));
-        dg.add_node(ValueId(1));
-        dg.add_node(ValueId(2));
-        dg.add_edge(ValueId(0), ValueId(1));
-        // 0-1 interfere, 2 is independent
+        for i in 0..100 {
+            dg.add_node(ValueId(i));
+        }
+        for i in 0..99 {
+            dg.add_edge(ValueId(i), ValueId(i + 1));
+        }
         let coloring = dg.find_node_coloring();
-        assert_ne!(coloring[&ValueId(0)], coloring[&ValueId(1)]);
-        // 2 can share a color with either 0 or 1
-        assert!(coloring[&ValueId(2)] <= 1);
+        assert_eq!(coloring.len(), 100);
+        let max_color = coloring.values().max().copied().unwrap_or(0);
+        assert!(
+            max_color <= 1,
+            "chain needs at most 2 colors, got {}",
+            max_color + 1
+        );
     }
 }

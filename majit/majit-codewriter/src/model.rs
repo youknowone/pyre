@@ -9,7 +9,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
