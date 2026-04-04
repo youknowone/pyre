@@ -1235,6 +1235,8 @@ fn effectinfo_from_writeanalyze(
     let mut write_fields: u64 = 0;
     let mut read_arrays: u64 = 0;
     let mut write_arrays: u64 = 0;
+    // effectinfo.py:201-206: collect actual array write DescrRefs.
+    let mut array_write_descrs: Vec<majit_ir::descr::DescrRef> = Vec::new();
 
     if let Some(path) = cc.target_to_path(target) {
         let mut seen = HashSet::new();
@@ -1248,6 +1250,7 @@ fn effectinfo_from_writeanalyze(
             &mut write_fields,
             &mut read_arrays,
             &mut write_arrays,
+            &mut array_write_descrs,
         );
     }
 
@@ -1270,6 +1273,14 @@ fn effectinfo_from_writeanalyze(
         write_descrs_arrays = 0;
     }
 
+    // effectinfo.py:201-206: single_write_descr_array
+    // RPython: if len(_write_descrs_arrays) == 1: single = _write_descrs_arrays[0]
+    let single_write_descr_array = if array_write_descrs.len() == 1 {
+        Some(array_write_descrs.into_iter().next().unwrap())
+    } else {
+        None
+    };
+
     EffectInfo {
         extra_effect: extraeffect,
         oopspec_index: oopspecindex,
@@ -1278,7 +1289,7 @@ fn effectinfo_from_writeanalyze(
         readonly_descrs_arrays,
         write_descrs_arrays,
         can_invalidate,
-        single_write_descr_array: None, // populated by callers with actual DescrRef
+        single_write_descr_array,
     }
 }
 
@@ -1300,6 +1311,9 @@ fn collect_readwrite_effects(
     write_fields: &mut u64,
     read_arrays: &mut u64,
     write_arrays: &mut u64,
+    // effectinfo.py:201-206: collect actual array write DescrRefs
+    // for single_write_descr_array population.
+    array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
 ) {
     if !seen.insert(path.clone()) {
         return;
@@ -1340,6 +1354,21 @@ fn collect_readwrite_effects(
                 OpKind::ArrayWrite { item_ty, .. } => {
                     let idx = descr_indices.array_index(value_type_discriminant(item_ty));
                     *write_arrays |= 1u64 << idx;
+                    // effectinfo.py:201-206: collect array DescrRef for
+                    // single_write_descr_array. Create SimpleArrayDescr
+                    // from item type (RPython: cpu.arraydescrof(ARRAY)).
+                    let ir_type = match item_ty {
+                        crate::model::ValueType::Int | crate::model::ValueType::State => {
+                            majit_ir::value::Type::Int
+                        }
+                        crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
+                            majit_ir::value::Type::Ref
+                        }
+                        crate::model::ValueType::Float => majit_ir::value::Type::Float,
+                        crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                    };
+                    let ad = majit_ir::descr::SimpleArrayDescr::new(idx, 0, 8, 0, ir_type);
+                    array_write_descrs.push(std::sync::Arc::new(ad));
                 }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {
@@ -1354,6 +1383,7 @@ fn collect_readwrite_effects(
                             write_fields,
                             read_arrays,
                             write_arrays,
+                            array_write_descrs,
                         );
                     } else {
                         // Unresolvable call → top_set.
