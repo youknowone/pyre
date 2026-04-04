@@ -628,27 +628,33 @@ impl<'a> Transformer<'a> {
             if let Some(cc) = self.callcontrol.as_mut() {
                 let oopspec_index = descriptor.effect_info.oopspec_index;
                 if oopspec_index != OopSpecIndex::None {
-                    // RPython jtransform.py:2000-2001:
+                    // RPython jtransform.py:1990-2002:
+                    //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, ...)
                     //   func = ptr2int(op.args[0].value)
                     //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
                     //
+                    // RPython calldescr = cpu.calldescrof(FUNC, args, RESULT, effectinfo).
+                    // In majit, we build a SimpleCallDescr with the descriptor's EffectInfo
+                    // via make_call_descr(). Arg/result types are not yet resolved
+                    // (RPython gets them from op.args[i].concretetype).
+                    let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
+                        Vec::new(), // arg_types (not yet resolved)
+                        majit_ir::value::Type::Void,
+                        descriptor.effect_info.clone(),
+                    );
+
+                    // RPython: func = ptr2int(op.args[0].value)
                     // In static analysis we don't have real function pointers.
-                    // Use a hash of the target path as a stable surrogate for
-                    // func_as_int, and the effect_info's calldescr placeholder.
-                    // This ensures each builtin gets a distinct address in
-                    // list_of_addr2name instead of all collapsing to 0x0.
+                    // Use a hash of the target path as a stable surrogate.
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     target.hash(&mut hasher);
                     let func_as_int = hasher.finish();
 
-                    let calldescr: majit_ir::descr::DescrRef =
-                        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0));
                     cc.callinfocollection
                         .add(oopspec_index, calldescr, func_as_int);
                     // RPython: see_raw_object(func.ptr) derives name from
-                    // func.ptr._obj._name. We store the target name explicitly
-                    // since we have no pointer linkage.
+                    // func.ptr._obj._name. We store the target name explicitly.
                     cc.callinfocollection
                         .register_func_name(func_as_int, format!("{target}"));
                 }
