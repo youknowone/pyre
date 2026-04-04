@@ -681,12 +681,10 @@ impl GuardEliminator {
                         version = Some(version_info.snapshot(&flat_ops, label_args));
                     }
                     // guard.py:295: info.remove(other.op.getdescr())
-                    // Only loop_version guards are tracked in leads_to.
-                    // RPython invariant: the removed guard was previously tracked.
+                    // RPython: unconditional call. version.py:38-42 asserts
+                    // descr is in leads_to — if not, it's a programming error.
                     if let Some(fd) = other.op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                        if fd.loop_version() {
-                            version_info.remove(fd.fail_index());
-                        }
+                        version_info.remove(fd.fail_index());
                     }
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);

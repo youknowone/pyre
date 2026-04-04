@@ -56,21 +56,9 @@ impl majit_ir::Descr for MetaFailDescr {
             vector_info: UnsafeCell::new(self.vector_info().clone()),
         }))
     }
-    /// MetaFailDescr has no resume_data; the CompileLoopVersionDescr
-    /// gets empty ResumeData. Resume state is carried on Op fields.
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(CompileLoopVersionDescr {
-            fail_index: alloc_fail_index(),
-            types: self.types.clone(),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
-            vector_info: UnsafeCell::new(Vec::new()),
-        }))
-    }
+    // clone_as_loop_version_descr: NOT implemented.
+    // MetaFailDescr has no resume storage. RPython's
+    // copy_all_attributes_from requires ResumeGuardDescr as source.
 }
 
 impl FailDescr for MetaFailDescr {
@@ -253,14 +241,13 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     fn is_resume_at_position(&self) -> bool {
         true
     }
+    // RPython: ResumeAtPositionDescr does NOT override clone().
+    // The inherited ResumeGuardDescr.clone() returns a plain ResumeGuardDescr,
+    // losing the ResumeAtPositionDescr marker. In majit, we return a
+    // ResumeGuardDescr with empty resume_data (ResumeAtPositionDescr has
+    // no resume storage of its own).
     fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeAtPositionDescr {
-            fail_index: alloc_fail_index(),
-            types: self.types.clone(),
-        }))
-    }
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(CompileLoopVersionDescr {
+        Some(Arc::new(ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
             resume_data: ResumeData {
@@ -272,6 +259,8 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
             vector_info: UnsafeCell::new(Vec::new()),
         }))
     }
+    // clone_as_loop_version_descr: NOT implemented.
+    // ResumeAtPositionDescr has no resume storage.
 }
 
 impl FailDescr for ResumeAtPositionDescr {
