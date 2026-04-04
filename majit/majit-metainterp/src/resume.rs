@@ -3706,13 +3706,7 @@ impl<'a> ResumeDataReader<'a> {
 // deserialization.
 // ═══════════════════════════════════════════════════════════════
 
-/// Result of rebuilding interpreter state from resume data.
-#[derive(Debug)]
-pub struct RebuiltFrame {
-    pub jitcode_index: i32,
-    pub pc: i32,
-    pub values: Vec<RebuiltValue>,
-}
+/// Use `majit_ir::resumedata::RebuiltFrame` — local duplicate removed.
 
 /// resume.py:576-728 VirtualInfo parity.
 /// Describes a virtual object's fields for materialization.
@@ -3755,122 +3749,13 @@ pub struct OptimizerKnowledgeForResume {
 // VirtualFieldInfo removed: replaced by majit_ir::VirtualFieldsInfo.
 // finish() now discovers virtual fields via env.get_virtual_fields().
 
-/// A single value decoded from tagged resume numbering.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RebuiltValue {
-    /// TAGINT: inline integer constant.
-    Int(i32),
-    /// TAGCONST: value from constant pool (value, type).
-    Const(i64, majit_ir::Type),
-    /// TAGBOX: live value from fail_args[index].
-    Box(usize),
-    /// TAGVIRTUAL: virtual object (index into rd_virtuals).
-    Virtual(usize),
-    /// Unassigned slot.
-    Unassigned,
-}
-
-/// Decode a single tagged value from resume numbering.
-/// resume.py:1552-1588 decode_int/decode_ref/decode_float parity.
-fn decode_tagged(
-    tagged: i16,
-    num_failargs: i32,
-    rd_consts: &[(i64, majit_ir::Type)],
-) -> RebuiltValue {
-    let (val, tagbits) = untag(tagged);
-    match tagbits {
-        TAGINT => RebuiltValue::Int(val),
-        TAGCONST => {
-            if tagged == NULLREF {
-                RebuiltValue::Const(0, majit_ir::Type::Ref)
-            } else if tagged == UNINITIALIZED_TAG {
-                RebuiltValue::Unassigned
-            } else {
-                let idx = (val - TAG_CONST_OFFSET) as usize;
-                let (c, tp) = rd_consts
-                    .get(idx)
-                    .copied()
-                    .unwrap_or((0, majit_ir::Type::Int));
-                RebuiltValue::Const(c, tp)
-            }
-        }
-        TAGBOX => {
-            let index = if val < 0 {
-                (val + num_failargs) as usize
-            } else {
-                val as usize
-            };
-            RebuiltValue::Box(index)
-        }
-        TAGVIRTUAL => RebuiltValue::Virtual(val as usize),
-        _ => RebuiltValue::Unassigned,
-    }
-}
-
-/// resume.py:1042-1057 rebuild_from_resumedata parity.
-///
-/// Decode a numbering (produced by `ResumeDataLoopMemo::number()`)
-/// back into frame state. `rd_consts` is the shared constant pool.
-///
-/// NOTE: RPython's rebuild_from_resumedata is an OO builder that
-/// creates MetaInterp frames and writes to blackhole registers
-/// in-place (via ResumeDataBoxReader). This is a pure functional
-/// decoder that returns RebuiltFrame structs. The caller materializes
-/// concrete interpreter state from the decoded values.
-///
-/// TAGVIRTUAL values are returned as `RebuiltValue::Virtual(index)`.
-/// Materialization is handled by materialize_from_recovery_layout
-/// in pyre-jit/eval.rs using the guard's rd_virtuals/ExitRecoveryLayout.
-pub fn rebuild_from_numbering(
-    rd_numb: &[u8],
-    rd_consts: &[(i64, majit_ir::Type)],
-) -> (i32, Vec<RebuiltFrame>) {
-    let mut reader = crate::resumecode::Reader::new(rd_numb);
-
-    let total_size = reader.next_item();
-    let num_failargs = reader.next_item();
-
-    // Virtualizable array (skip).
-    let vable_len = reader.next_item();
-    if vable_len > 0 {
-        reader.jump(vable_len as usize);
-    }
-
-    // Virtualref array (skip).
-    let vref_len = reader.next_item();
-    if vref_len > 0 {
-        reader.jump((vref_len * 2) as usize);
-    }
-
-    // Frames.
-    // resume.py:1049-1055: read frames until done.
-    // RPython does NOT encode slot_count — it uses jitcode.position_info
-    // to know how many registers each frame has. For single-frame (all we
-    // support), after reading jitcode_index and pc, consume ALL remaining
-    // tagged values.
-    let mut frames = Vec::new();
-    if reader.has_more() {
-        let jitcode_index = reader.next_item();
-        let pc = reader.next_item();
-        let mut values = Vec::new();
-        while reader.has_more() {
-            let tagged = reader.next_item() as i16;
-            values.push(decode_tagged(tagged, num_failargs, rd_consts));
-        }
-        frames.push(RebuiltFrame {
-            jitcode_index,
-            pc,
-            values,
-        });
-    }
-
-    let _ = total_size;
-    (num_failargs, frames)
-}
+/// Use `majit_ir::resumedata::RebuiltValue` — local duplicate removed.
+/// Use `majit_ir::resumedata::rebuild_from_numbering` — local stale copy removed.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     #[test]
     fn test_simple_resume_data() {
