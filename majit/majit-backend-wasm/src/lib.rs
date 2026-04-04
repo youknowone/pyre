@@ -131,6 +131,7 @@ impl majit_backend::Backend for WasmBackend {
         _inputargs: &[InputArg],
         _ops: &[Op],
         _original_token: &JitCellToken,
+        _previous_tokens: &[JitCellToken],
     ) -> Result<AsmInfo, BackendError> {
         Err(BackendError::Unsupported(
             "wasm backend: bridge compile not yet implemented".into(),

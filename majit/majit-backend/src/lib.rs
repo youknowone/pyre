@@ -718,12 +718,19 @@ pub trait Backend: Send {
     }
 
     /// Compile a bridge (side exit path) and attach it to the loop.
+    ///
+    /// `previous_tokens` contains old tokens from retraces. Because
+    /// Cranelift can't patch existing machine code (unlike RPython's x86
+    /// backend), the running machine code may reference fail_descrs from
+    /// an older token. The bridge must be attached to ALL matching
+    /// fail_descrs across current + previous tokens.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
         original_token: &JitCellToken,
+        previous_tokens: &[JitCellToken],
     ) -> Result<AsmInfo, BackendError>;
 
     /// Compile all registered loop versions as bridges.
@@ -747,7 +754,7 @@ pub trait Backend: Send {
                 version_index: *guard_idx,
                 fail_arg_types: inputargs.iter().map(|ia| ia.tp).collect(),
             };
-            let asm = self.compile_bridge(&descr, inputargs, ops, token)?;
+            let asm = self.compile_bridge(&descr, inputargs, ops, token, &[])?;
             results.push(asm);
         }
         Ok(results)

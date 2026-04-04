@@ -187,7 +187,8 @@ impl JitCounter {
         };
 
         // counter.py:194: counter = float(p_entry.times[n]) + increment
-        let counter: f64 = entry.times[n] as f64 + increment;
+        let old_time = entry.times[n] as f64;
+        let counter: f64 = old_time + increment;
         if counter < 1.0 {
             // counter.py:196: p_entry.times[n] = r_singlefloat(counter)
             entry.times[n] = counter as f32;
