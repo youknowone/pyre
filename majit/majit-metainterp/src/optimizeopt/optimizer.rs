@@ -927,7 +927,7 @@ impl Optimizer {
 
         // bridgeopt.py:133-146: known classes -> PtrInfo::KnownClass
         for &(opref, class_ptr) in &knowledge.known_classes {
-            Self::make_constant_class(ctx, opref, class_ptr.0 as i64);
+            Self::make_constant_class(ctx, opref, class_ptr.0 as i64, true);
         }
 
         // bridgeopt.py:173-185: loopinvariant results -> OptRewrite
@@ -1292,11 +1292,18 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py:137-156: make_constant_class(op, class_const)
-    /// If existing info is InstancePtrInfo, update its known_class field.
-    /// Otherwise create KnownClass (majit's PtrInfo::KnownClass maps to
-    /// RPython's InstancePtrInfo(None, class_const) for non-Instance info).
-    pub fn make_constant_class(ctx: &mut OptContext, opref: OpRef, class_value: i64) {
+    /// optimizer.py:137-152: make_constant_class(op, class_const, update_last_guard)
+    ///
+    /// Sets known class on PtrInfo, preserving last_guard_pos from any
+    /// existing info. When `update_last_guard` is false (RECORD_EXACT_CLASS),
+    /// the guard position is NOT updated — preserving guard strengthening
+    /// opportunities for subsequent GUARD_CLASS ops.
+    pub fn make_constant_class(
+        ctx: &mut OptContext,
+        opref: OpRef,
+        class_value: i64,
+        update_last_guard: bool,
+    ) {
         let class_ptr = GcRef(class_value as usize);
         let resolved = ctx.get_box_replacement(opref);
         // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo)
@@ -1307,9 +1314,22 @@ impl Optimizer {
                 iinfo.known_class = Some(class_ptr);
             }
         } else {
-            // optimizer.py:142-147: InstancePtrInfo(None, class_const)
-            // In majit, KnownClass is the canonical variant for class-only info.
-            ctx.set_ptr_info(resolved, PtrInfo::known_class(class_ptr, true));
+            // optimizer.py:142-148: preserve last_guard_pos from old info
+            let old_guard_pos = ctx
+                .get_ptr_info(resolved)
+                .and_then(|i| i.get_last_guard_pos())
+                .map(|p| p as i32)
+                .unwrap_or(-1);
+            let mut new_info = PtrInfo::known_class(class_ptr, true);
+            // Restore last_guard_pos from old info.
+            if let PtrInfo::KnownClass { last_guard_pos, .. } = &mut new_info {
+                *last_guard_pos = old_guard_pos;
+            }
+            ctx.set_ptr_info(resolved, new_info);
+        }
+        // optimizer.py:150-151: if update_last_guard: mark_last_guard
+        if update_last_guard {
+            ctx.mark_last_guard(resolved);
         }
     }
 

@@ -62,16 +62,23 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
 
 /// Emit a constant integer into the optimization context.
 pub(crate) fn emit_constant_int(ctx: &mut OptContext, value: i64) -> OpRef {
-    let mut op = Op::new(OpCode::SameAsI, &[OpRef::NONE]);
-    op.pos = OpRef::NONE;
-    let opref = ctx.emit(op);
-    ctx.make_constant(opref, Value::Int(value));
-    opref
+    ctx.make_constant_int(value)
+}
+
+/// RPython intdiv.py: emit an op through the pass chain.
+///
+/// In RPython, intdiv returns a list of ops and the caller sends each
+/// through `send_extra_operation()`. In majit, we use `emit_extra()`
+/// to route through downstream passes, matching the upstream semantics.
+fn emit_op(ctx: &mut OptContext, pass_idx: usize, op: Op) -> OpRef {
+    ctx.emit_extra(pass_idx, op)
 }
 
 /// Generate division operations: `n // m` using multiply-and-shift.
 ///
-/// Emits ops into `ctx` and returns the OpRef of the final result.
+/// `pass_idx`: caller's pass index, so synthesized ops route through
+/// downstream passes via `emit_extra` (matching RPython's
+/// `send_extra_operation`).
 ///
 /// Algorithm:
 /// ```text
@@ -91,6 +98,7 @@ pub fn division_operations(
     n_ref: OpRef,
     m: i64,
     known_nonneg: bool,
+    pass_idx: usize,
     ctx: &mut OptContext,
 ) -> OpRef {
     let (k, i) = magic_numbers(m);
@@ -101,40 +109,66 @@ pub fn division_operations(
     if !known_nonneg {
         // t = n >> 63
         let shift63_ref = emit_constant_int(ctx, 63);
-        let t_ref = ctx.emit(Op::new(OpCode::IntRshift, &[n_ref, shift63_ref]));
+        let t_ref = emit_op(
+            ctx,
+            pass_idx,
+            Op::new(OpCode::IntRshift, &[n_ref, shift63_ref]),
+        );
 
         // nt = n ^ t
-        let nt_ref = ctx.emit(Op::new(OpCode::IntXor, &[n_ref, t_ref]));
+        let nt_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[n_ref, t_ref]));
 
         // mul = UINT_MUL_HIGH(nt, k)
-        let mul_ref = ctx.emit(Op::new(OpCode::UintMulHigh, &[nt_ref, k_ref]));
+        let mul_ref = emit_op(
+            ctx,
+            pass_idx,
+            Op::new(OpCode::UintMulHigh, &[nt_ref, k_ref]),
+        );
 
         // sh = UINT_RSHIFT(mul, i)
-        let sh_ref = ctx.emit(Op::new(OpCode::UintRshift, &[mul_ref, i_ref]));
+        let sh_ref = emit_op(
+            ctx,
+            pass_idx,
+            Op::new(OpCode::UintRshift, &[mul_ref, i_ref]),
+        );
 
         // result = sh ^ t
-        ctx.emit(Op::new(OpCode::IntXor, &[sh_ref, t_ref]))
+        emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[sh_ref, t_ref]))
     } else {
         // mul = UINT_MUL_HIGH(n, k)
-        let mul_ref = ctx.emit(Op::new(OpCode::UintMulHigh, &[n_ref, k_ref]));
+        let mul_ref = emit_op(ctx, pass_idx, Op::new(OpCode::UintMulHigh, &[n_ref, k_ref]));
 
         // result = UINT_RSHIFT(mul, i)
-        ctx.emit(Op::new(OpCode::UintRshift, &[mul_ref, i_ref]))
+        emit_op(
+            ctx,
+            pass_idx,
+            Op::new(OpCode::UintRshift, &[mul_ref, i_ref]),
+        )
     }
 }
 
 /// Generate modulo operations: `n % m` using division + multiply + subtract.
 ///
 /// Computes: `n - (n // m) * m`.
-pub fn modulo_operations(n_ref: OpRef, m: i64, known_nonneg: bool, ctx: &mut OptContext) -> OpRef {
-    let div_ref = division_operations(n_ref, m, known_nonneg, ctx);
+pub fn modulo_operations(
+    n_ref: OpRef,
+    m: i64,
+    known_nonneg: bool,
+    pass_idx: usize,
+    ctx: &mut OptContext,
+) -> OpRef {
+    let div_ref = division_operations(n_ref, m, known_nonneg, pass_idx, ctx);
 
     // product = div_result * m
     let m_ref = emit_constant_int(ctx, m);
-    let product_ref = ctx.emit(Op::new(OpCode::IntMul, &[div_ref, m_ref]));
+    let product_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntMul, &[div_ref, m_ref]));
 
     // remainder = n - product
-    ctx.emit(Op::new(OpCode::IntSub, &[n_ref, product_ref]))
+    emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntSub, &[n_ref, product_ref]),
+    )
 }
 
 #[cfg(test)]
@@ -230,7 +264,7 @@ mod tests {
         let n_op = Op::new(OpCode::SameAsI, &[]);
         let n_ref = ctx.emit(n_op);
 
-        let result_ref = division_operations(n_ref, 7, false, &mut ctx);
+        let result_ref = division_operations(n_ref, 7, false, 0, &mut ctx);
 
         // Should emit: const(k), const(i), const(63), IntRshift, IntXor,
         //              UintMulHigh, UintRshift, IntXor
@@ -262,7 +296,7 @@ mod tests {
         let n_op = Op::new(OpCode::SameAsI, &[]);
         let n_ref = ctx.emit(n_op);
 
-        let result_ref = division_operations(n_ref, 7, true, &mut ctx);
+        let result_ref = division_operations(n_ref, 7, true, 0, &mut ctx);
 
         // known_nonneg: const(k), const(i), UintMulHigh, UintRshift = 4 ops
         assert_eq!(ctx.new_operations.len(), 5); // 1 (n) + 4
@@ -279,7 +313,7 @@ mod tests {
         let n_op = Op::new(OpCode::SameAsI, &[]);
         let n_ref = ctx.emit(n_op);
 
-        let result_ref = modulo_operations(n_ref, 7, false, &mut ctx);
+        let result_ref = modulo_operations(n_ref, 7, false, 0, &mut ctx);
 
         // Division (8 ops) + const(m) + IntMul + IntSub = 11 ops after n
         assert_eq!(ctx.new_operations.len(), 12); // 1 (n) + 11
@@ -301,7 +335,7 @@ mod tests {
         let n_op = Op::new(OpCode::SameAsI, &[]);
         let n_ref = ctx.emit(n_op);
 
-        let result_ref = modulo_operations(n_ref, 7, true, &mut ctx);
+        let result_ref = modulo_operations(n_ref, 7, true, 0, &mut ctx);
 
         // Division nonneg (4 ops) + const(m) + IntMul + IntSub = 7 ops after n
         assert_eq!(ctx.new_operations.len(), 8); // 1 (n) + 7
@@ -322,7 +356,7 @@ mod tests {
             let mut ctx = OptContext::new(16);
             let n_op = Op::new(OpCode::SameAsI, &[]);
             let n_ref = ctx.emit(n_op);
-            division_operations(n_ref, m, false, &mut ctx);
+            division_operations(n_ref, m, false, 0, &mut ctx);
 
             // First constant emitted should be k
             let k_val = ctx.get_constant_int(OpRef(1)).unwrap();
