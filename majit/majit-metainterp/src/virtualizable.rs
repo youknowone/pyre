@@ -718,33 +718,38 @@ impl VirtualizableInfo {
 
     /// Write all boxes back to the heap object (force direction).
     ///
-    /// RPython equivalent: `vinfo.write_from_resume_data_partial(virtualizable, ...)`
+    /// virtualizable.py:101-113 write_boxes(virtualizable, boxes).
+    ///
+    /// Writes static fields then every array item (using the heap array's
+    /// actual length, NOT a caller-provided length). Asserts that exactly
+    /// `len(boxes) == i + 1` items were consumed (the +1 is the vable_box
+    /// that the caller appends but write_boxes does not write).
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(
-        &self,
-        obj_ptr: *mut u8,
-        boxes: &[i64],
-        array_lengths: &[usize],
-    ) {
+    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        let mut i = 0;
         // Static fields
-        for i in 0..self.static_fields.len() {
-            if i < boxes.len() {
-                self.write_field(obj_ptr, i, boxes[i]);
-            }
+        for fi in 0..self.static_fields.len() {
+            self.write_field(obj_ptr, fi, boxes[i]);
+            i += 1;
         }
-
-        // Array elements
-        let mut idx = self.static_fields.len();
-        for (ai, &len) in array_lengths.iter().enumerate() {
+        // Array elements — read actual length from heap (RPython: len(lst))
+        for ai in 0..self.array_fields.len() {
+            let len = self.get_array_length(obj_ptr, ai);
             for ei in 0..len {
-                if idx < boxes.len() {
-                    self.write_array_item(obj_ptr, ai, ei, boxes[idx]);
-                }
-                idx += 1;
+                self.write_array_item(obj_ptr, ai, ei, boxes[i]);
+                i += 1;
             }
         }
+        // virtualizable.py:113: assert len(boxes) == i + 1
+        assert_eq!(
+            boxes.len(),
+            i + 1,
+            "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
+            i + 1,
+            boxes.len()
+        );
     }
 
     /// RPython equivalent: `vinfo.write_from_resume_data_partial(...)`.
@@ -770,13 +775,8 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn force_from_boxes(
-        &self,
-        obj_ptr: *mut u8,
-        boxes: &[i64],
-        array_lengths: &[usize],
-    ) {
-        self.write_boxes_to_heap(obj_ptr, boxes, array_lengths);
+    pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+        self.write_boxes_to_heap(obj_ptr, boxes);
         self.reset_vable_token(obj_ptr);
     }
 }
@@ -1714,11 +1714,11 @@ mod tests {
         info.add_array_field_with_layout("arr", Type::Int, 16, 0, 8);
 
         let obj = &mut frame as *mut Frame as *mut u8;
-        let boxes = vec![42, 100, 200]; // x=42, arr=[100, 200]
-        let lengths = vec![2];
+        // RPython: boxes = [x, arr[0], arr[1], vable_box]
+        let boxes = vec![42, 100, 200, obj as i64];
 
         unsafe {
-            info.force_from_boxes(obj, &boxes, &lengths);
+            info.force_from_boxes(obj, &boxes);
 
             assert_eq!(frame.x, 42);
             assert_eq!(arr.items[0], 100);
