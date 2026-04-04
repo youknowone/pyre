@@ -863,9 +863,12 @@ impl EffectInfo {
 // ── Concrete descriptor implementations (descr.py) ──
 
 /// Simple concrete FieldDescr for use by pyre-jit and tests.
+/// RPython: `FieldDescr(name, offset, size, flag, index_in_parent, is_pure)`.
 #[derive(Debug, Clone)]
 pub struct SimpleFieldDescr {
     index: u32,
+    /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
+    name: String,
     offset: usize,
     field_size: usize,
     field_type: Type,
@@ -884,11 +887,34 @@ impl SimpleFieldDescr {
     ) -> Self {
         SimpleFieldDescr {
             index,
+            name: String::new(),
             offset,
             field_size,
             field_type,
             is_immutable,
             is_signed: true,
+            virtualizable: false,
+        }
+    }
+
+    /// RPython: FieldDescr(name, offset, size, flag, index_in_parent, is_pure).
+    /// `name` format: `"STRUCT.fieldname"` (descr.py:227).
+    pub fn new_with_name(
+        index: u32,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        name: String,
+    ) -> Self {
+        SimpleFieldDescr {
+            index,
+            name,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_signed: field_type == Type::Int,
             virtualizable: false,
         }
     }
