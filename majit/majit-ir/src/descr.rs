@@ -290,6 +290,47 @@ pub trait FieldDescr: Descr {
     }
 }
 
+/// RPython: descr.py FLAG_* constants for array element type classification.
+///
+/// ```python
+/// FLAG_POINTER  = 'P'  # GC pointer (Ptr to gc obj)
+/// FLAG_FLOAT    = 'F'  # Float or longlong
+/// FLAG_UNSIGNED = 'U'  # Unsigned integer
+/// FLAG_SIGNED   = 'S'  # Signed integer
+/// FLAG_STRUCT   = 'X'  # Inline struct (array-of-structs)
+/// FLAG_VOID     = 'V'  # Void
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArrayFlag {
+    /// RPython: FLAG_POINTER = 'P'
+    Pointer,
+    /// RPython: FLAG_FLOAT = 'F'
+    Float,
+    /// RPython: FLAG_UNSIGNED = 'U'
+    Unsigned,
+    /// RPython: FLAG_SIGNED = 'S'
+    Signed,
+    /// RPython: FLAG_STRUCT = 'X'
+    Struct,
+    /// RPython: FLAG_VOID = 'V'
+    Void,
+}
+
+impl ArrayFlag {
+    /// RPython: get_type_flag(TYPE) (descr.py:241-254).
+    pub fn from_item_type(item_type: Type, is_struct: bool) -> Self {
+        if is_struct {
+            return ArrayFlag::Struct;
+        }
+        match item_type {
+            Type::Ref => ArrayFlag::Pointer,
+            Type::Float => ArrayFlag::Float,
+            Type::Int => ArrayFlag::Signed,
+            Type::Void => ArrayFlag::Void,
+        }
+    }
+}
+
 /// Descriptor for an array type.
 ///
 /// Mirrors rpython/jit/backend/llsupport/descr.py ArrayDescr.
@@ -336,9 +377,15 @@ pub trait ArrayDescr: Descr {
     }
 
     /// Whether items are structs (array-of-structs pattern).
-    /// descr.py: is_array_of_structs()
+    /// descr.py: is_array_of_structs() → self.flag == FLAG_STRUCT
     fn is_array_of_structs(&self) -> bool {
         false
+    }
+
+    /// RPython: descr.py ArrayDescr.get_all_fielddescrs().
+    /// For array-of-structs, returns interior field descriptors.
+    fn get_all_fielddescrs(&self) -> Option<&[DescrRef]> {
+        None
     }
 
     /// descr.py: repr_of_descr()
@@ -957,7 +1004,11 @@ pub struct SimpleArrayDescr {
     item_size: usize,
     type_id: u32,
     item_type: Type,
-    is_signed: bool,
+    /// RPython: descr.py ArrayDescr.flag — element type classification.
+    flag: ArrayFlag,
+    /// RPython: descr.py ArrayDescr.all_interiorfielddescrs.
+    /// For array-of-structs, contains interior field descriptors.
+    all_fielddescrs: Option<Vec<DescrRef>>,
 }
 
 impl SimpleArrayDescr {
@@ -968,14 +1019,41 @@ impl SimpleArrayDescr {
         type_id: u32,
         item_type: Type,
     ) -> Self {
+        let flag = ArrayFlag::from_item_type(item_type, false);
         SimpleArrayDescr {
             index,
             base_size,
             item_size,
             type_id,
             item_type,
-            is_signed: true,
+            flag,
+            all_fielddescrs: None,
         }
+    }
+
+    /// RPython: ArrayDescr with explicit flag (for struct arrays).
+    pub fn with_flag(
+        index: u32,
+        base_size: usize,
+        item_size: usize,
+        type_id: u32,
+        item_type: Type,
+        flag: ArrayFlag,
+    ) -> Self {
+        SimpleArrayDescr {
+            index,
+            base_size,
+            item_size,
+            type_id,
+            item_type,
+            flag,
+            all_fielddescrs: None,
+        }
+    }
+
+    /// RPython: arraydescr.all_interiorfielddescrs = descrs
+    pub fn set_all_fielddescrs(&mut self, descrs: Vec<DescrRef>) {
+        self.all_fielddescrs = Some(descrs);
     }
 }
 
@@ -1002,7 +1080,30 @@ impl ArrayDescr for SimpleArrayDescr {
         self.item_type
     }
     fn is_item_signed(&self) -> bool {
-        self.is_signed
+        self.flag == ArrayFlag::Signed
+    }
+    /// RPython: descr.py ArrayDescr.is_array_of_pointers()
+    fn is_array_of_pointers(&self) -> bool {
+        self.flag == ArrayFlag::Pointer
+    }
+    /// RPython: descr.py ArrayDescr.is_array_of_floats()
+    fn is_array_of_floats(&self) -> bool {
+        self.flag == ArrayFlag::Float
+    }
+    /// RPython: descr.py ArrayDescr.is_array_of_structs()
+    fn is_array_of_structs(&self) -> bool {
+        self.flag == ArrayFlag::Struct
+    }
+    /// RPython: descr.py ArrayDescr.is_array_of_primitives()
+    fn is_array_of_primitives(&self) -> bool {
+        matches!(
+            self.flag,
+            ArrayFlag::Float | ArrayFlag::Signed | ArrayFlag::Unsigned
+        )
+    }
+    /// RPython: descr.py ArrayDescr.get_all_fielddescrs()
+    fn get_all_fielddescrs(&self) -> Option<&[DescrRef]> {
+        self.all_fielddescrs.as_deref()
     }
 }
 

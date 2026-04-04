@@ -1299,6 +1299,39 @@ fn effectinfo_from_writeanalyze(
     }
 }
 
+/// RPython: `op.args[0].concretetype` — resolve ARRAY identity from the
+/// producer of a ValueId.  When the op's `array_type_id` is None, we trace
+/// back to the op that produced the `base` ValueId to determine the array's
+/// structural identity.
+///
+/// - FieldRead `{ field: { owner_root, name } }` → `"owner::name"` (like
+///   RPython's `getfield(self, 'arr')` producing `Ptr(GcArray(T))`)
+/// - Input with `array_type_id` from parser → use that directly
+fn resolve_array_identity(
+    base: &crate::model::ValueId,
+    op_array_type_id: &Option<String>,
+    value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+) -> Option<String> {
+    // 1. If the op already has an array_type_id (from parser), use it.
+    if op_array_type_id.is_some() {
+        return op_array_type_id.clone();
+    }
+    // 2. Trace back: look up the producer of `base`.
+    if let Some(producer) = value_producers.get(base) {
+        match producer {
+            // self.arr[i] → base comes from FieldRead { field: "arr", owner_root: "MyStruct" }
+            // The array identity is "MyStruct::arr", analogous to RPython's
+            // getfield(self, 'arr').concretetype.TO being GcArray(T).
+            OpKind::FieldRead { field, .. } => {
+                let owner = field.owner_root.as_deref().unwrap_or("_");
+                return Some(format!("{}::{}", owner, field.name));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Transitive read/write effect collection.
 ///
 /// RPython: ReadWriteAnalyzer.analyze() — traverses callee graphs.
@@ -1336,6 +1369,16 @@ fn collect_readwrite_effects(
         }
     };
 
+    // RPython: the rtyped graph gives op.args[0].concretetype directly.
+    // In majit, we build a producer map to resolve ValueId → producing OpKind,
+    // so we can determine the array identity from the base operand's provenance.
+    let value_producers: HashMap<crate::model::ValueId, &crate::model::OpKind> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| op.result.map(|vid| (vid, &op.kind)))
+        .collect();
+
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
@@ -1352,26 +1395,30 @@ fn collect_readwrite_effects(
                 }
                 // RPython: ("readarray", T)
                 OpKind::ArrayRead {
+                    base,
                     item_ty,
                     array_type_id,
                     ..
                 } => {
-                    // RPython: cpu.arraydescrof(ARRAY).get_ei_index()
+                    // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
+                    let resolved_id = resolve_array_identity(base, array_type_id, &value_producers);
                     let idx =
-                        descr_indices.array_index(value_type_discriminant(item_ty), array_type_id);
+                        descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *read_arrays |= 1u64 << idx;
                 }
                 // RPython: ("array", T)
                 OpKind::ArrayWrite {
+                    base,
                     item_ty,
                     array_type_id,
                     ..
                 } => {
+                    let resolved_id = resolve_array_identity(base, array_type_id, &value_producers);
                     let idx =
-                        descr_indices.array_index(value_type_discriminant(item_ty), array_type_id);
+                        descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *write_arrays |= 1u64 << idx;
                     // effectinfo.py:298,307: cpu.arraydescrof(ARRAY) → DescrRef.
-                    // Keyed on (item_ty, array_type_id) for ARRAY identity.
+                    // Keyed on (item_ty, resolved_id) for ARRAY identity.
                     // Dedup by descriptor index (frozenset semantics).
                     if !array_write_descrs.iter().any(|d| d.index() == idx) {
                         let ir_type = match item_ty {
@@ -1384,7 +1431,11 @@ fn collect_readwrite_effects(
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                         };
-                        let ad = majit_ir::descr::SimpleArrayDescr::new(idx, 0, 8, 0, ir_type);
+                        // RPython: get_type_flag(ARRAY.OF) determines the flag.
+                        let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, false);
+                        let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                            idx, 0, 8, 0, ir_type, flag,
+                        );
                         array_write_descrs.push(std::sync::Arc::new(ad));
                     }
                 }
