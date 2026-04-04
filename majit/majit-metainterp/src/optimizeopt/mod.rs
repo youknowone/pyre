@@ -281,8 +281,22 @@ pub struct OptContext {
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
+/// Only offset 0 fields of structs WITH a vtable are typeptr.
+/// Structs without vtable may have legitimate offset-0 fields.
 #[inline(always)]
-pub(crate) fn is_typeptr_field(field_idx: u32, field_descrs: &[(u32, majit_ir::DescrRef)]) -> bool {
+pub(crate) fn is_typeptr_field(
+    field_idx: u32,
+    field_descrs: &[(u32, majit_ir::DescrRef)],
+    descr: &majit_ir::DescrRef,
+) -> bool {
+    // Only structs with a vtable have a typeptr field
+    let has_vtable = descr
+        .as_size_descr()
+        .map(|sd| sd.vtable() != 0)
+        .unwrap_or(false);
+    if !has_vtable {
+        return false;
+    }
     field_descrs
         .iter()
         .find(|(di, _)| *di == field_idx)
@@ -414,7 +428,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
                     .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
@@ -424,7 +438,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
                     .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
@@ -474,7 +488,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
                     .fields
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
@@ -508,7 +522,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
                     .fields
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
