@@ -1471,6 +1471,7 @@ pub fn rd_virtual_to_virtual_info(
     match rd {
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
+            type_id,
             descr_index,
             fielddescrs,
             fieldnums,
@@ -1484,7 +1485,7 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
-                type_id: 0,
+                type_id: *type_id,
                 descr_index: *descr_index,
                 fields,
                 fielddescrs: fielddescrs.clone(),

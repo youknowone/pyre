@@ -118,6 +118,7 @@ impl PartialEq for RdVirtualInfo {
         match (self, other) {
             (
                 Self::VirtualInfo {
+                    type_id: a0,
                     descr_index: a1,
                     known_class: a2,
                     fielddescrs: a3,
@@ -126,6 +127,7 @@ impl PartialEq for RdVirtualInfo {
                     ..
                 },
                 Self::VirtualInfo {
+                    type_id: b0,
                     descr_index: b1,
                     known_class: b2,
                     fielddescrs: b3,
@@ -133,7 +135,7 @@ impl PartialEq for RdVirtualInfo {
                     descr_size: b5,
                     ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             (
                 Self::VStructInfo {
                     type_id: a1,
