@@ -19,6 +19,10 @@ pub struct AstGraphOptions;
 pub struct SemanticFunction {
     pub name: String,
     pub graph: FunctionGraph,
+    /// RPython: `op.result.concretetype` — full return type string.
+    /// Used for array identity resolution on Call result values.
+    #[serde(default)]
+    pub return_type: Option<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -272,9 +276,16 @@ fn build_function_graph(
         graph.set_terminator(entry, Terminator::Return(None));
     }
 
+    // RPython: op.result.concretetype — extract return type for array identity.
+    let return_type = match &func.sig.output {
+        syn::ReturnType::Type(_, ty) => full_type_string(ty),
+        syn::ReturnType::Default => None,
+    };
+
     SemanticFunction {
         name: func.sig.ident.to_string(),
         graph,
+        return_type,
     }
 }
 
