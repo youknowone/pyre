@@ -59,26 +59,44 @@ pub struct Assembler {
     insns: HashMap<String, u8>,
     /// RPython: Assembler.descrs — list of descriptors
     descrs: Vec<String>,
+    /// RPython: Assembler.indirectcalltargets — set of JitCode indices.
+    /// RPython: set of JitCode objects. In majit: set of jitcode indices.
+    pub indirectcalltargets: std::collections::HashSet<usize>,
+    /// RPython: Assembler.list_of_addr2name — (addr, name) pairs for debugging.
+    /// In majit: (target_path, name) string pairs since we don't have raw addresses.
+    pub list_of_addr2name: Vec<(String, String)>,
     /// RPython: Assembler._count_jitcodes
     count_jitcodes: usize,
+    /// RPython: Assembler._seen_raw_objects — dedup set for see_raw_object.
+    seen_raw_objects: std::collections::HashSet<String>,
     /// RPython: Assembler.all_liveness — shared liveness table.
     /// Encoded as bytes: [count_i, count_r, count_f, reg_indices...].
     /// Deduplicated across all JitCodes via all_liveness_positions.
     all_liveness: Vec<u8>,
+    /// RPython: Assembler.all_liveness_length (assembler.py:30).
+    pub all_liveness_length: usize,
     /// RPython: Assembler.all_liveness_positions — dedup cache.
     /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
     all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
+    /// RPython: Assembler.num_liveness_ops (assembler.py:32).
+    pub num_liveness_ops: usize,
 }
 
 impl Assembler {
     /// RPython: `Assembler.__init__()`.
+    /// RPython: `Assembler.__init__()` (assembler.py:21-32).
     pub fn new() -> Self {
         Self {
             insns: HashMap::new(),
             descrs: Vec::new(),
+            indirectcalltargets: std::collections::HashSet::new(),
+            list_of_addr2name: Vec::new(),
             count_jitcodes: 0,
+            seen_raw_objects: std::collections::HashSet::new(),
             all_liveness: Vec::new(),
+            all_liveness_length: 0,
             all_liveness_positions: HashMap::new(),
+            num_liveness_ops: 0,
         }
     }
 
@@ -179,6 +197,7 @@ impl Assembler {
             // Separates live registers by kind (int/ref/float) and encodes
             // as offset into shared liveness table.
             FlatOp::Live { live_values } => {
+                self.num_liveness_ops += 1;
                 let key = state.code.len();
                 state.startpoints.insert(key);
                 // Separate live values by kind
@@ -218,6 +237,7 @@ impl Assembler {
                         let encoded = encode_liveness(live);
                         self.all_liveness.extend_from_slice(&encoded);
                     }
+                    self.all_liveness_length = self.all_liveness.len();
                     pos
                 };
                 // RPython liveness.py:127-131: encode_offset — 2-byte LE
@@ -710,10 +730,71 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     }
 }
 
+/// RPython: `effectinfo.py::CallInfoCollection`.
+///
+/// Stores `{oopspecindex: (calldescr_key, func_path)}` for builtin functions.
+/// Populated by jtransform when processing `oopspec` calls.
+#[derive(Debug, Clone, Default)]
+pub struct CallInfoCollection {
+    /// RPython: `_callinfo_for_oopspec` — {oopspecindex: (calldescr, func_as_int)}.
+    /// In majit: maps oopspec name → (descriptor key, function path).
+    callinfo_for_oopspec: HashMap<String, (String, String)>,
+}
+
+impl CallInfoCollection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// RPython: `CallInfoCollection.add(oopspecindex, calldescr, func_as_int)`.
+    pub fn add(&mut self, oopspecindex: &str, calldescr_key: String, func_path: String) {
+        self.callinfo_for_oopspec
+            .insert(oopspecindex.to_string(), (calldescr_key, func_path));
+    }
+
+    /// RPython: `CallInfoCollection.has_oopspec(oopspecindex)`.
+    pub fn has_oopspec(&self, oopspecindex: &str) -> bool {
+        self.callinfo_for_oopspec.contains_key(oopspecindex)
+    }
+
+    /// RPython: `CallInfoCollection.all_function_addresses_as_int()`.
+    /// Returns all function paths (majit equivalent of function addresses).
+    pub fn all_function_paths(&self) -> Vec<&str> {
+        self.callinfo_for_oopspec
+            .values()
+            .map(|(_, path)| path.as_str())
+            .collect()
+    }
+
+    /// RPython: `CallInfoCollection.callinfo_for_oopspec(oopspecindex)`.
+    pub fn callinfo_for_oopspec(&self, oopspecindex: &str) -> Option<(&str, &str)> {
+        self.callinfo_for_oopspec
+            .get(oopspecindex)
+            .map(|(d, f)| (d.as_str(), f.as_str()))
+    }
+}
+
 impl Assembler {
-    /// RPython: `Assembler.finished()` — finalize all JitCodes.
-    pub fn finished(&self) {
-        // Future: finalize shared liveness data, descriptor table, etc.
+    /// RPython: `Assembler.see_raw_object(value)` (assembler.py:283-298).
+    ///
+    /// Registers a function/vtable name for debugging.
+    /// RPython stores `(addr, name)` pairs; majit stores `(path, name)`.
+    pub fn see_raw_object(&mut self, path: &str, name: &str) {
+        if self.seen_raw_objects.insert(path.to_string()) {
+            self.list_of_addr2name
+                .push((path.to_string(), name.to_string()));
+        }
+    }
+
+    /// RPython: `Assembler.finished(callinfocollection)` (assembler.py:300-305).
+    ///
+    /// Registers extra functions from the CallInfoCollection for debugging.
+    pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
+        // RPython: for func in callinfocollection.all_function_addresses_as_int():
+        //            func = int2adr(func); self.see_raw_object(func.ptr)
+        for func_path in callinfocollection.all_function_paths() {
+            self.see_raw_object(func_path, func_path);
+        }
     }
 
     /// Number of JitCodes assembled so far.
