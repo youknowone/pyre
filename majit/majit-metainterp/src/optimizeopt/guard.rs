@@ -204,16 +204,30 @@ impl Guard {
         old_arg: OpRef,
         new_ops: &mut Vec<Op>,
         renamer: &mut HashMap<OpRef, OpRef>,
+        next_const_pos: &mut u32,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
         }
-        let result = var.emit_operations(new_ops);
-        // guard.py:131: opt.renamer.start_renaming(old_arg, box)
-        if !result.is_constant() {
-            renamer.insert(old_arg, result);
+        // RPython: ConstInt(value) creates inline constant boxes.
+        // In majit we pre-allocate constant OpRefs, then pass them
+        // to get_operations via the closure.
+        let ncp = next_const_pos;
+        let ops = var.get_operations(|_value| {
+            let cref = OpRef(*ncp);
+            *ncp += 1;
+            cref
+        });
+        let mut last = var.var;
+        for op in ops {
+            last = op.pos;
+            new_ops.push(op);
         }
-        result
+        // guard.py:131: opt.renamer.start_renaming(old_arg, box)
+        if !last.is_constant() {
+            renamer.insert(old_arg, last);
+        }
+        last
     }
 
     /// guard.py:73-97: transitive_imply(other, opt, loop)
@@ -227,6 +241,7 @@ impl Guard {
         label_args: &[OpRef],
         new_ops: &mut Vec<Op>,
         renamer: &mut HashMap<OpRef, OpRef>,
+        next_const_pos: &mut u32,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -240,17 +255,27 @@ impl Guard {
         // guard.py:83
         let opnum = Self::transitive_cmpop(self.cmp_op.opcode);
         // guard.py:84-85: emit_varops
-        let box_rhs = Self::emit_varops(&self.rhs, self.cmp_op.arg(1), new_ops, renamer);
-        let other_rhs = Self::emit_varops(&other.rhs, other.cmp_op.arg(1), new_ops, renamer);
+        let box_rhs = Self::emit_varops(
+            &self.rhs,
+            self.cmp_op.arg(1),
+            new_ops,
+            renamer,
+            next_const_pos,
+        );
+        let other_rhs = Self::emit_varops(
+            &other.rhs,
+            other.cmp_op.arg(1),
+            new_ops,
+            renamer,
+            next_const_pos,
+        );
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(opnum, &[box_rhs, other_rhs]);
         new_ops.push(compare.clone());
         // guard.py:89-91: descr = CompileLoopVersionDescr()
         //   descr.copy_all_attributes_from(self.op.getdescr())
         //   descr.rd_vector_info = None
-        // Fresh descr — RPython creates a new CompileLoopVersionDescr
-        // with copied attributes but distinct identity.
-        let fresh_descr = crate::fail_descr::make_resume_guard_descr(
+        let fresh_descr = crate::fail_descr::make_compile_loop_version_descr(
             label_args.len(),
             crate::resume::ResumeData {
                 vable_array: Vec::new(),
@@ -303,10 +328,27 @@ impl Guard {
     ///
     /// Re-emit the guard: materialize lhs/rhs via emit_varops,
     /// create fresh cmp + guard, emit them.
-    pub fn emit_operations(&mut self, new_ops: &mut Vec<Op>, renamer: &mut HashMap<OpRef, OpRef>) {
+    pub fn emit_operations(
+        &mut self,
+        new_ops: &mut Vec<Op>,
+        renamer: &mut HashMap<OpRef, OpRef>,
+        next_const_pos: &mut u32,
+    ) {
         // guard.py:136-137: lhs/rhs via emit_varops
-        let lhs = Self::emit_varops(&self.lhs, self.cmp_op.arg(0), new_ops, renamer);
-        let rhs = Self::emit_varops(&self.rhs, self.cmp_op.arg(1), new_ops, renamer);
+        let lhs = Self::emit_varops(
+            &self.lhs,
+            self.cmp_op.arg(0),
+            new_ops,
+            renamer,
+            next_const_pos,
+        );
+        let rhs = Self::emit_varops(
+            &self.rhs,
+            self.cmp_op.arg(1),
+            new_ops,
+            renamer,
+            next_const_pos,
+        );
         // guard.py:138-140: cmp_op = ResOperation(opnum, [lhs, rhs])
         let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
         new_ops.push(cmp_op.clone());
@@ -358,6 +400,11 @@ pub struct GuardEliminator {
     guards: HashMap<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
     renamer: HashMap<OpRef, OpRef>,
+    /// Counter for constant OpRef allocation (>= CONST_BASE).
+    next_const_pos: u32,
+    /// Materialized constant values: OpRef → i64.
+    /// RPython uses ConstInt boxes inline; majit stores const values here.
+    pub const_values: HashMap<OpRef, i64>,
 }
 
 impl GuardEliminator {
@@ -370,6 +417,7 @@ impl GuardEliminator {
             strongest_guards: HashMap::new(),
             guards: HashMap::new(),
             renamer: HashMap::new(),
+            next_const_pos: OpRef::CONST_BASE + 50000,
         }
     }
 
@@ -449,7 +497,11 @@ impl GuardEliminator {
                         }
                         Some(guard) => {
                             // guard.py:234: guard.emit_operations(self)
-                            guard.emit_operations(&mut self._newoperations, &mut self.renamer);
+                            guard.emit_operations(
+                                &mut self._newoperations,
+                                &mut self.renamer,
+                                &mut self.next_const_pos,
+                            );
                             continue;
                         }
                     }
@@ -465,7 +517,13 @@ impl GuardEliminator {
             if op.opcode.result_type() != majit_ir::Type::Void {
                 if let Some(index_var) = index_vars.get(&op.pos) {
                     if !index_var.is_identity() {
-                        let result = index_var.emit_operations(&mut self._newoperations);
+                        let ncp = &mut self.next_const_pos;
+                        let result =
+                            index_var.emit_operations(&mut self._newoperations, |_value| {
+                                let cref = OpRef(*ncp);
+                                *ncp += 1;
+                                cref
+                            });
                         self.renamer.insert(op.pos, result);
                         continue;
                     }
@@ -481,9 +539,56 @@ impl GuardEliminator {
     }
 
     /// guard.py:251-269: propagate_all_forward(info, loop, user_code)
-    pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
+    ///
+    /// `version_info`: optional LoopVersionInfo for loop-version tracking.
+    /// `label_args`: label arglist for transitive guard fail_args.
+    /// `user_code`: if true, run eliminate_array_bound_checks.
+    pub fn propagate_all_forward(
+        &mut self,
+        ops: &[Op],
+        version_info: Option<&mut super::version::LoopVersionInfo>,
+        label_args: &[OpRef],
+        user_code: bool,
+    ) -> Vec<Op> {
         self.collect_guard_information(ops);
-        self.eliminate_guards(ops)
+        let mut result = self.eliminate_guards(ops);
+
+        // guard.py:257-266: track loop-version guards in version_info.
+        if let Some(info) = version_info {
+            assert!(
+                info.versions.len() == 1,
+                "guard.py:257 assert len(info.versions) == 1"
+            );
+            let version = info.versions[0].clone();
+            for op in &result {
+                if !op.opcode.is_guard() {
+                    continue;
+                }
+                if let Some(ref descr) = op.descr {
+                    // guard.py:263-266: if descr and descr.loop_version()
+                    if let Some(fd) = descr.as_fail_descr() {
+                        if fd.loop_version() {
+                            let fi = fd.fail_index();
+                            info.track(fi, version.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if user_code {
+            // guard.py:269: self.eliminate_array_bound_checks(info, loop)
+            // Returns prefix ops; RPython does loop.prefix = prefix + loop.prefix.
+            let prefix = self.eliminate_array_bound_checks(&mut result, label_args);
+            if !prefix.is_empty() {
+                // Prepend prefix to result.
+                let mut combined = prefix;
+                combined.append(&mut result);
+                result = combined;
+            }
+        }
+
+        result
     }
 
     /// renamer.py:20-22: rename(op) — apply renamer map to op args.
@@ -535,6 +640,7 @@ impl GuardEliminator {
                         label_args,
                         &mut self._newoperations,
                         &mut self.renamer,
+                        &mut self.next_const_pos,
                     )
                     .is_some()
                 {

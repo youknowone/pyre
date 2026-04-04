@@ -231,6 +231,65 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     })
 }
 
+/// compile.py:895-908: CompileLoopVersionDescr(ResumeGuardDescr)
+///
+/// A guard descriptor for loop-version guards. These guards must never
+/// fail at runtime — they exist only to mark where a specialized loop
+/// version should be compiled and stitched.
+#[derive(Debug)]
+pub struct CompileLoopVersionDescr {
+    fail_index: u32,
+    types: Vec<Type>,
+    resume_data: ResumeData,
+    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
+}
+
+unsafe impl Send for CompileLoopVersionDescr {}
+unsafe impl Sync for CompileLoopVersionDescr {}
+
+impl majit_ir::Descr for CompileLoopVersionDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for CompileLoopVersionDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.types
+    }
+    /// compile.py:899-900
+    fn exits_early(&self) -> bool {
+        true
+    }
+    /// compile.py:902-903
+    fn loop_version(&self) -> bool {
+        true
+    }
+    fn attach_vector_info(&self, info: AccumVectorInfo) {
+        unsafe { &mut *self.vector_info.get() }.push(info);
+    }
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        unsafe { &mut *self.vector_info.get() }.clone()
+    }
+}
+
+/// Create a CompileLoopVersionDescr with resume data copied from source.
+#[allow(dead_code)]
+pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData) -> DescrRef {
+    Arc::new(CompileLoopVersionDescr {
+        fail_index: alloc_fail_index(),
+        types: vec![Type::Int; num_live],
+        resume_data,
+        vector_info: UnsafeCell::new(Vec::new()),
+    })
+}
+
 /// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
 ///
 /// The recommended pattern for resume data lookup:

@@ -113,6 +113,18 @@ pub trait FailDescr: Descr {
         false
     }
 
+    /// history.py:137-139: exits_early()
+    /// Is this guard a guard_early_exit or moved before one?
+    fn exits_early(&self) -> bool {
+        false
+    }
+
+    /// history.py:141-143: loop_version()
+    /// Should a loop version be compiled out of this guard?
+    fn loop_version(&self) -> bool {
+        false
+    }
+
     /// Identifier of the compiled trace that owns this exit.
     ///
     /// Backends that lower loops and bridges as separate compiled traces use
