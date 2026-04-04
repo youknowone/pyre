@@ -141,13 +141,12 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         OpKind::ConstInt(_) => ConcreteType::Signed,
         OpKind::FieldRead { ty, .. } => valuetype_to_concrete(ty),
         OpKind::ArrayRead { item_ty, .. } => valuetype_to_concrete(item_ty),
-        OpKind::Call { result_ty, .. }
-        | OpKind::CallElidable { result_ty, .. }
-        | OpKind::CallResidual { result_ty, .. }
-        | OpKind::CallMayForce { result_ty, .. } => valuetype_to_concrete(result_ty),
-        OpKind::InlineCall { result_kind, .. } | OpKind::RecursiveCall { result_kind, .. } => {
-            kind_char_to_concrete(*result_kind)
-        }
+        OpKind::Call { result_ty, .. } => valuetype_to_concrete(result_ty),
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_concrete(*result_kind),
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             let c = valuetype_to_concrete(result_ty);
             if c != ConcreteType::Unknown {

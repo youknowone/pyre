@@ -623,14 +623,7 @@ impl<'a> Transformer<'a> {
             self.calls_classified += 1;
             match effect {
                 CallEffectKind::Elidable => {
-                    return RewriteResult::Replace(vec![SpaceOperation {
-                        result: op.result,
-                        kind: OpKind::CallElidable {
-                            descriptor,
-                            args: args.to_vec(),
-                            result_ty: result_ty.clone(),
-                        },
-                    }]);
+                    return self.handle_elidable_call(op, descriptor, args, result_ty, graph_name);
                 }
                 _ => {
                     return self.handle_residual_call(op, descriptor, args, result_ty, graph_name);
@@ -801,8 +794,9 @@ impl<'a> Transformer<'a> {
         self.get_value_kind(v)
     }
 
-    /// RPython: `Transformer.handle_residual_call(op)`.
+    /// RPython: `Transformer.handle_residual_call(op)` (jtransform.py:456-471).
     /// Call that the JIT should NOT look inside — emit residual_call_*.
+    /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
     fn handle_residual_call(
         &mut self,
         op: &SpaceOperation,
@@ -816,6 +810,9 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → residual", descriptor.target),
         });
         self.calls_classified += 1;
+        // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
+        let (args_i, args_r, args_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
         let can_raise = descriptor.effect_info.check_can_raise(false);
@@ -823,8 +820,10 @@ impl<'a> Transformer<'a> {
             result: op.result,
             kind: OpKind::CallResidual {
                 descriptor,
-                args: args.to_vec(),
-                result_ty: result_ty.clone(),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
             },
         }];
         if can_raise {
@@ -837,6 +836,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: elidable call — pure function, result depends only on args.
+    /// RPython jtransform.py:546-562.
     fn handle_elidable_call(
         &mut self,
         op: &SpaceOperation,
@@ -850,17 +850,22 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → elidable", descriptor.target),
         });
         self.calls_classified += 1;
+        let (args_i, args_r, args_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
         RewriteResult::Replace(vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallElidable {
                 descriptor,
-                args: args.to_vec(),
-                result_ty: result_ty.clone(),
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
             },
         }])
     }
 
     /// RPython: may-force call — can trigger GC or force virtualizables.
+    /// RPython jtransform.py:609-625.
     fn handle_may_force_call(
         &mut self,
         op: &SpaceOperation,
@@ -874,14 +879,18 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → may_force", descriptor.target),
         });
         self.calls_classified += 1;
+        let (args_i, args_r, args_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: op.result,
                 kind: OpKind::CallMayForce {
                     descriptor,
-                    args: args.to_vec(),
-                    result_ty: result_ty.clone(),
+                    args_i,
+                    args_r,
+                    args_f,
+                    result_kind,
                 },
             },
             SpaceOperation {
@@ -933,6 +942,17 @@ fn resolve_alias(
 
 fn remap_value(value: ValueId, aliases: &std::collections::HashMap<ValueId, ValueId>) -> ValueId {
     resolve_alias(value, aliases)
+}
+
+fn remap_list(
+    values: &[ValueId],
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> Vec<ValueId> {
+    values
+        .iter()
+        .copied()
+        .map(|v| remap_value(v, aliases))
+        .collect()
 }
 
 fn remap_op(
@@ -1053,42 +1073,42 @@ fn remap_op(
         },
         OpKind::CallElidable {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallElidable {
             descriptor: descriptor.clone(),
-            args: args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_ty: result_ty.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+            result_kind: *result_kind,
         },
         OpKind::CallResidual {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallResidual {
             descriptor: descriptor.clone(),
-            args: args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_ty: result_ty.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+            result_kind: *result_kind,
         },
         OpKind::CallMayForce {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallMayForce {
             descriptor: descriptor.clone(),
-            args: args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_ty: result_ty.clone(),
+            args_i: remap_list(args_i, aliases),
+            args_r: remap_list(args_r, aliases),
+            args_f: remap_list(args_f, aliases),
+            result_kind: *result_kind,
         },
         OpKind::InlineCall {
             jitcode_index,

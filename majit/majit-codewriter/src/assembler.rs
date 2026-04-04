@@ -114,6 +114,8 @@ impl Assembler {
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
             startpoints: std::collections::HashSet::new(),
+            alllabels: std::collections::HashSet::new(),
+            resulttypes: HashMap::new(),
         };
 
         // RPython assembler.py:42-44: for insn in ssarepr.insns: write_insn(insn)
@@ -132,9 +134,6 @@ impl Assembler {
         }
 
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
-        // Collect alllabels from label_positions values.
-        let alllabels: std::collections::HashSet<usize> =
-            state.label_positions.values().copied().collect();
         let jitcode = JitCode {
             name: ssarepr.name.clone(),
             code: state.code,
@@ -145,8 +144,8 @@ impl Assembler {
             num_regs_r,
             num_regs_f,
             startpoints: state.startpoints,
-            alllabels,
-            resulttypes: HashMap::new(), // TODO: track during write_insn
+            alllabels: state.alllabels,
+            resulttypes: state.resulttypes,
             num_ops: ssarepr.insns.len(),
         };
 
@@ -233,7 +232,10 @@ impl Assembler {
             // RPython flatten.py: 'goto' + TLabel
             FlatOp::Jump(label) => {
                 let opnum = self.get_opnum("goto/L");
+                state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
+                // RPython assembler.py:175-179: TLabel → record position + 2 placeholder bytes
+                state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*label, state.code.len()));
                 state.code.push(0);
                 state.code.push(0);
@@ -244,8 +246,11 @@ impl Assembler {
             FlatOp::GotoIfNot { cond, target } => {
                 let (reg, _) = self.lookup_reg_with_kind(*cond, regallocs);
                 let opnum = self.get_opnum("goto_if_not/iL");
+                state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
+                // RPython assembler.py:175-179: TLabel operand position
+                state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
                 state.code.push(0);
                 state.code.push(0);
@@ -378,51 +383,64 @@ impl Assembler {
             }
 
             // RPython: residual_call/call_may_force/call_elidable
-            // → [funcptr/descr, I[...], R[...], F[...]]
-            // Currently these use flat args (not kind-separated), so we
-            // encode the descriptor as a 2-byte index and args as registers.
+            // → [funcptr, calldescr, I[...], R[...], F[...]]
+            // RPython jtransform.py:414-435: rewrite_call splits args
+            // by kind via make_three_lists.
             OpKind::CallResidual {
                 descriptor,
-                args,
-                result_ty,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
             }
             | OpKind::CallMayForce {
                 descriptor,
-                args,
-                result_ty,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
             }
             | OpKind::CallElidable {
                 descriptor,
-                args,
-                result_ty,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
             } => {
                 let base = match &op.kind {
                     OpKind::CallMayForce { .. } => "call_may_force",
                     OpKind::CallElidable { .. } => "call_elidable",
                     _ => "residual_call",
                 };
-                // Descriptor as 2-byte index (RPython assembler.py:197-207)
+                // RPython assembler.py:197-207: descriptor as 2-byte index
                 let descr_idx = self.descrs.len();
                 self.descrs.push(format!("{}", descriptor.target));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // Args as registers (flat — kind separation is in the
-                // opname suffix, not the encoding)
-                for &v in args {
-                    let (reg, kc) = self.lookup_reg_with_kind(v, regallocs);
-                    state.code.push(reg);
-                    argcodes.push(kc);
+                // RPython jtransform.py:422-431: kind-separated sublists
+                let kinds = self.kinds_suffix(args_i, args_r, args_f);
+                if kinds.contains('i') {
+                    self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                    argcodes.push('I');
+                }
+                if kinds.contains('r') {
+                    self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                    argcodes.push('R');
+                }
+                if kinds.contains('f') {
+                    self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
+                    argcodes.push('F');
                 }
                 // Result
-                let result_kind = value_type_to_kind(result_ty);
                 if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
                 }
-                let key = format!("{base}_{result_kind}/{argcodes}");
+                // RPython jtransform.py:434: {base}_{kinds}_{reskind}
+                let key = format!("{base}_{kinds}_{result_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
@@ -464,6 +482,15 @@ impl Assembler {
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
+            }
+        }
+
+        // RPython assembler.py:217-219: record result type position.
+        // If argcodes contains '>', the last char is the result kind,
+        // and we record the current code length as the result position.
+        if argcodes.contains('>') {
+            if let Some(reskind) = argcodes.chars().last() {
+                state.resulttypes.insert(state.code.len(), reskind);
             }
         }
     }
@@ -576,6 +603,12 @@ struct AssemblyState {
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
     startpoints: std::collections::HashSet<usize>,
+    /// RPython assembler.py:176: positions in bytecode where TLabel operands
+    /// are written. Used by JitCode.follow_jump() for verification.
+    alllabels: std::collections::HashSet<usize>,
+    /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
+    /// to result kind character. Recorded when encoding result registers.
+    resulttypes: HashMap<usize, char>,
 }
 
 /// RPython: getkind(v.concretetype)[0] → 'i', 'r', 'f', 'v'.
