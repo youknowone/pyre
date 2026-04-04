@@ -237,24 +237,13 @@ impl DescrIndexRegistry {
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
     ///
-    /// Keys on `(item_ty_discriminant, array_type_id)`.  For non-Ref types
-    /// (Int, Float, Void), `array_type_id` is ignored because all arrays
-    /// of the same primitive element type share one descriptor — exactly
-    /// like RPython's `GcArray(Signed)` being one lltype regardless of
-    /// which field holds it.  Only Ref types need `array_type_id` to
-    /// distinguish different pointer/struct element types.
+    /// Keys on `(item_ty_discriminant, array_type_id)` unconditionally.
+    /// RPython always distinguishes by ARRAY lltype identity:
+    /// `GcArray(Char)`, `GcArray(Signed)`, `GcArray(Bool)` are all
+    /// different descriptors even though they are all "integer" arrays
+    /// (effectinfo.py:307-311).
     pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
-        // RPython: GcArray(Signed) == GcArray(Signed) for all int arrays.
-        // Only Ref (discriminant for Ref/Unknown) needs sub-discrimination.
-        let effective_id = if item_ty_discriminant
-            == value_type_discriminant(&crate::model::ValueType::Ref)
-            || item_ty_discriminant == value_type_discriminant(&crate::model::ValueType::Unknown)
-        {
-            array_type_id.clone()
-        } else {
-            None
-        };
-        let key = (item_ty_discriminant, effective_id);
+        let key = (item_ty_discriminant, array_type_id.clone());
         *self.array_indices.entry(key).or_insert_with(|| {
             let idx = self.next_array_index % 64;
             self.next_array_index += 1;
@@ -1354,10 +1343,17 @@ fn effectinfo_from_writeanalyze(
 /// same descriptor because they have the same element type.
 ///
 /// Resolution order:
-/// 1. If the op has `array_type_id` from parser (direct variable access), use it
-/// 2. If the base comes from FieldRead, look up the field's type in struct_fields
-///    to determine the element type (RPython: op.args[0].concretetype.TO)
-/// 3. Otherwise return None (conservative: falls back to item_ty-only keying)
+/// RPython: `op.args[0].concretetype` — resolve the ARRAY identity
+/// for an array access base expression.
+///
+/// Resolution order:
+/// 1. Parser-set `array_type_id` (direct variable access)
+/// 2. Producer chain trace-back:
+///    - FieldRead: look up field type in struct_fields
+///    - ArrayRead: propagate the array's own array_type_id (nested array)
+///    - Call: look up return type from function graphs
+///    - Input: propagate the input's array_type_id if set
+/// 3. None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
@@ -1370,17 +1366,31 @@ fn resolve_array_identity(
     }
     // 2. Trace back to producer — RPython: op.args[0].concretetype.
     if let Some(producer) = value_producers.get(base) {
-        if let OpKind::FieldRead { field, .. } = producer {
-            // Look up the field's type in the struct registry.
-            // self.points → owner="MyStruct", name="points"
-            // struct_fields["MyStruct"]["points"] = "Vec<Point>"
-            // → element type = "Point"
-            if let Some(owner) = &field.owner_root {
-                if let Some(field_type_str) = cc.field_type(owner, &field.name) {
-                    // Extract element type from container: "Vec<Point>" → "Point"
-                    return extract_element_type_from_str(field_type_str);
+        match producer {
+            // FieldRead: self.array → look up field type in struct registry.
+            OpKind::FieldRead { field, .. } => {
+                if let Some(owner) = &field.owner_root {
+                    if let Some(field_type_str) = cc.field_type(owner, &field.name) {
+                        return extract_element_type_from_str(field_type_str);
+                    }
                 }
             }
+            // ArrayRead with known array_type_id: propagate.
+            OpKind::ArrayRead { array_type_id, .. } => {
+                if array_type_id.is_some() {
+                    return array_type_id.clone();
+                }
+            }
+            // Call result: RPython resolves this via result.concretetype
+            // from the rtyper. In majit, we would need function return type
+            // annotations to resolve the ARRAY identity of a call result.
+            // Currently unresolved — falls through to None (conservative).
+            OpKind::Call { .. } => {}
+            // Input: RPython resolves via the parameter's concretetype.
+            // In majit, the input's array_type_id was set by the parser
+            // and propagated through the op_array_type_id path above.
+            OpKind::Input { .. } => {}
+            _ => {}
         }
     }
     None
@@ -1505,32 +1515,61 @@ fn collect_readwrite_effects(
                         let elem_name = resolved_id.as_deref();
                         let is_struct = elem_name.is_some_and(|n| cc.is_known_struct(n));
                         let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, is_struct);
-                        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                            idx, 0, 8, 0, ir_type, flag,
-                        );
-                        // RPython: descr.py:372-375 — for array-of-structs:
-                        //   descrs = heaptracker.all_interiorfielddescrs(
-                        //       gccache, ARRAY, get_field_descr=get_interiorfield_descr)
-                        //   arraydescr.all_interiorfielddescrs = descrs
+                        // RPython: get_array_descr(gccache, ARRAY) (descr.py:348-378)
+                        //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
+                        //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
                         if is_struct {
                             if let Some(struct_name) = elem_name {
-                                // RPython: InteriorFieldDescr needs the parent arraydescr.
-                                // Create Arc first, then build interior field descrs.
-                                let ad_arc = std::sync::Arc::new(ad);
-                                let fielddescrs =
-                                    build_interior_fielddescrs(cc, struct_name, ad_arc.clone());
+                                // Build a temporary arraydescr to pass to interior field builder.
+                                let tmp_ad = std::sync::Arc::new(
+                                    majit_ir::descr::SimpleArrayDescr::with_flag(
+                                        idx, 0, 8, 0, ir_type, flag,
+                                    ),
+                                );
+                                let (fielddescrs, item_size) =
+                                    build_interior_fielddescrs(cc, struct_name, tmp_ad);
+                                // Rebuild with correct item_size from struct layout.
+                                let actual_item_size = if item_size > 0 { item_size } else { 8 };
+                                let ad_final = std::sync::Arc::new(
+                                    majit_ir::descr::SimpleArrayDescr::with_flag(
+                                        idx,
+                                        0,
+                                        actual_item_size,
+                                        0,
+                                        ir_type,
+                                        flag,
+                                    ),
+                                );
                                 if !fielddescrs.is_empty() {
-                                    // Clone the inner to set fielddescrs, then re-wrap.
-                                    let mut ad_mut = (*ad_arc).clone();
-                                    ad_mut.set_all_fielddescrs(fielddescrs);
+                                    // Re-build interior descrs with the final arraydescr.
+                                    let (final_fielddescrs, _) = build_interior_fielddescrs(
+                                        cc,
+                                        struct_name,
+                                        ad_final.clone(),
+                                    );
+                                    let mut ad_mut = (*ad_final).clone();
+                                    ad_mut.set_all_fielddescrs(final_fielddescrs);
                                     array_write_descrs.push(std::sync::Arc::new(ad_mut));
                                 } else {
-                                    array_write_descrs.push(ad_arc);
+                                    array_write_descrs.push(ad_final);
                                 }
                             } else {
+                                let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                                    idx, 0, 8, 0, ir_type, flag,
+                                );
                                 array_write_descrs.push(std::sync::Arc::new(ad));
                             }
                         } else {
+                            // RPython: plain array — item_size from element type.
+                            let item_size = match ir_type {
+                                majit_ir::value::Type::Float => 8,
+                                majit_ir::value::Type::Int => 8,
+                                majit_ir::value::Type::Ref => 8,
+                                _ => 8,
+                            };
+                            let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                                idx, 0, item_size, 0, ir_type, flag,
+                            );
                             array_write_descrs.push(std::sync::Arc::new(ad));
                         }
                     }
@@ -1575,14 +1614,17 @@ fn collect_readwrite_effects(
 /// Each interior field descriptor wraps:
 /// - The parent `ArrayDescr` (shared Arc)
 /// - A `FieldDescr` with actual offset/size/type from the struct definition
+///
+/// Returns `(fielddescrs, item_size)` where `item_size` is the total
+/// struct size (RPython: `symbolic.get_array_token(ARRAY, tsc)[1]`).
 fn build_interior_fielddescrs(
     cc: &CallControl,
     struct_name: &str,
     array_descr: std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
-) -> Vec<majit_ir::descr::DescrRef> {
+) -> (Vec<majit_ir::descr::DescrRef>, usize) {
     let fields = match cc.struct_fields.fields.get(struct_name) {
         Some(f) => f,
-        None => return Vec::new(),
+        None => return (Vec::new(), 0),
     };
     // RPython: heaptracker.py:83-91 — iterate STRUCT._names,
     // skip Void fields and typeptr.
@@ -1592,6 +1634,12 @@ fn build_interior_fielddescrs(
         // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
         let (field_type, field_size) = field_type_from_rust_type(field_type_str);
         if field_type == majit_ir::value::Type::Void {
+            continue;
+        }
+        // RPython: heaptracker.py:89-90 —
+        //   isinstance(FIELD, lltype.Struct) → raise UnsupportedFieldExc
+        // Nested struct fields are not supported in array-of-structs.
+        if cc.is_known_struct(field_type_str) {
             continue;
         }
         // RPython: get_field_descr(gccache, REALARRAY.OF, name)
@@ -1620,7 +1668,20 @@ fn build_interior_fielddescrs(
         result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
         offset += field_size;
     }
-    result
+    // RPython: symbolic.get_array_token(ARRAY, tsc) → (basesize, itemsize, ofs_length)
+    // item_size = total struct size, aligned to max field alignment.
+    let max_align = fields
+        .iter()
+        .map(|(_, ty)| field_type_from_rust_type(ty).1)
+        .filter(|s| *s > 0)
+        .max()
+        .unwrap_or(8);
+    let item_size = if offset > 0 {
+        (offset + max_align - 1) & !(max_align - 1)
+    } else {
+        0
+    };
+    (result, item_size)
 }
 
 /// RPython: `get_type_flag(TYPE)` (descr.py:241-254).
