@@ -8,11 +8,50 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_ir::descr::EffectInfo;
+use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
+use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CallTarget, FunctionGraph, OpKind};
+use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator};
 use crate::parse::CallPath;
+
+// ── Graph-based analyzers (RPython effectinfo.py + canraise.py) ────
+//
+// RPython uses BoolGraphAnalyzer subclasses that traverse call graphs
+// transitively. Each analyzer checks for specific operations:
+//   - RaiseAnalyzer: Abort terminators (canraise.py)
+//   - VirtualizableAnalyzer: jit_force_virtualizable/jit_force_virtual ops
+//   - QuasiImmutAnalyzer: jit_force_quasi_immutable ops
+//   - RandomEffectsAnalyzer: unanalyzable external calls
+
+/// RPython: canraise.py — result of raise analysis.
+///
+/// `_canraise()` returns True, False, or "mem" (only MemoryError).
+/// call.py:337-355.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanRaise {
+    /// Function cannot raise any exception.
+    No,
+    /// Function can only raise MemoryError.
+    MemoryErrorOnly,
+    /// Function can raise arbitrary exceptions.
+    Yes,
+}
+
+/// RPython: DependencyTracker equivalent — caches transitive analysis results.
+///
+/// Each analyzer in RPython has its own `seen` set (via `analyze_direct_call`).
+/// We cache the final result per CallPath so repeated queries are O(1).
+#[derive(Default)]
+pub struct AnalysisCache {
+    can_raise: HashMap<CallPath, CanRaise>,
+    forces_virtualizable: HashMap<CallPath, bool>,
+    random_effects: HashMap<CallPath, bool>,
+    can_invalidate: HashMap<CallPath, bool>,
+    /// RPython: `cpu.fielddescrof(T, fieldname)` / `cpu.arraydescrof(ARRAY)`.
+    /// Assigns sequential, collision-free ei_index values for bitstrings.
+    pub descr_indices: DescrIndexRegistry,
+}
 
 /// Call descriptor — associates a call target with its effect info.
 ///
@@ -138,6 +177,63 @@ pub struct CallControl {
 
     /// Next JitCode index to assign.
     next_jitcode_index: usize,
+
+    /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
+    /// Targets known to be elidable (pure, no side effects).
+    elidable_targets: HashSet<CallPath>,
+
+    /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
+    /// Targets known to be loop-invariant (call once per loop).
+    loopinvariant_targets: HashSet<CallPath>,
+}
+
+/// Sequential descriptor index assignment — majit equivalent of
+/// `cpu.fielddescrof(T, fieldname).get_ei_index()` /
+/// `cpu.arraydescrof(ARRAY).get_ei_index()`.
+///
+/// RPython: each descriptor gets a globally unique index via
+/// `compute_bitstrings()`. The bitstring module creates variable-length
+/// bitfields. In majit we use fixed-width u64, so indices wrap at 64.
+///
+/// Guarantees: same (owner_root, field_name) always gets the same index.
+/// Limitation: after 64 unique field descriptors, indices wrap and may
+/// alias unrelated descriptors. This matches RPython's bitstring semantics
+/// where aliased bits cause conservative over-approximation (safe but
+/// imprecise). Array descriptors are keyed by item type only — different
+/// arrays with the same item type share an index, matching RPython's
+/// `cpu.arraydescrof(ARRAY)` which distinguishes by ARRAY identity.
+#[derive(Default)]
+pub struct DescrIndexRegistry {
+    /// (owner_root, field_name) → bit index (0..63)
+    field_indices: HashMap<(Option<String>, String), u32>,
+    /// item_type discriminant → bit index (0..63)
+    array_indices: HashMap<u8, u32>,
+    next_field_index: u32,
+    next_array_index: u32,
+}
+
+impl DescrIndexRegistry {
+    /// RPython: `cpu.fielddescrof(T, fieldname).get_ei_index()`
+    pub fn field_index(&mut self, owner_root: &Option<String>, field_name: &str) -> u32 {
+        let key = (owner_root.clone(), field_name.to_string());
+        *self.field_indices.entry(key).or_insert_with(|| {
+            let idx = self.next_field_index % 64;
+            self.next_field_index += 1;
+            idx
+        })
+    }
+
+    /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
+    pub fn array_index(&mut self, item_ty_discriminant: u8) -> u32 {
+        *self
+            .array_indices
+            .entry(item_ty_discriminant)
+            .or_insert_with(|| {
+                let idx = self.next_array_index % 64;
+                self.next_array_index += 1;
+                idx
+            })
+    }
 }
 
 impl CallControl {
@@ -155,6 +251,8 @@ impl CallControl {
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::descr::CallInfoCollection::new(),
             next_jitcode_index: 0,
+            elidable_targets: HashSet::new(),
+            loopinvariant_targets: HashSet::new(),
         }
     }
 
@@ -572,11 +670,808 @@ impl CallControl {
     pub fn jitdrivers_sd(&self) -> &[JitDriverStaticData] {
         &self.jitdrivers_sd
     }
+
+    // ── Elidable / loop-invariant registration ──────────────────────
+
+    /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
+    /// Mark a target as elidable (pure function).
+    pub fn mark_elidable(&mut self, path: CallPath) {
+        self.elidable_targets.insert(path);
+    }
+
+    /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
+    /// Mark a target as loop-invariant.
+    pub fn mark_loopinvariant(&mut self, path: CallPath) {
+        self.loopinvariant_targets.insert(path);
+    }
+
+    /// RPython: call.py:239 — check if target has `_elidable_function_`.
+    pub fn is_elidable(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target)
+            .is_some_and(|p| self.elidable_targets.contains(&p))
+    }
+
+    /// RPython: call.py:240 — check if target has `_jit_loop_invariant_`.
+    pub fn is_loopinvariant(&self, target: &CallTarget) -> bool {
+        self.target_to_path(target)
+            .is_some_and(|p| self.loopinvariant_targets.contains(&p))
+    }
+
+    // ── Graph-based analyzers (call.py:282-303) ─────────────────────
+
+    /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
+    ///
+    /// canraise.py:8-24: RaiseAnalyzer(BoolGraphAnalyzer)
+    /// - `analyze_simple_operation`: checks `LL_OPERATIONS[op.opname].canraise`
+    /// - `analyze_external_call`: `getattr(fnobj, 'canraise', True)`
+    /// - `analyze_exceptblock_in_graph`: checks except blocks
+    ///
+    /// In majit we check per-operation canraise metadata via `op_can_raise()`,
+    /// Abort terminators, and transitive Call analysis.
+    fn analyze_can_raise(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+        self.analyze_can_raise_impl(path, seen, false)
+    }
+
+    /// Shared implementation for both raise analyzers.
+    ///
+    /// RPython has two separate RaiseAnalyzer instances (call.py:34-36):
+    /// - `raise_analyzer`: normal mode
+    /// - `raise_analyzer_ignore_memoryerror`: `do_ignore_memory_error()` mode
+    ///
+    /// `ignore_memoryerror` controls whether ops that can only raise
+    /// MemoryError are treated as non-raising (canraise.py:11-17).
+    fn analyze_can_raise_impl(
+        &self,
+        path: &CallPath,
+        seen: &mut HashSet<CallPath>,
+        ignore_memoryerror: bool,
+    ) -> bool {
+        if !seen.insert(path.clone()) {
+            return false; // cycle → bottom_result
+        }
+        let graph = match self.function_graphs.get(path) {
+            Some(g) => g,
+            // RPython: analyze_external_call → getattr(fnobj, 'canraise', True)
+            None => return true,
+        };
+        for block in &graph.blocks {
+            // RPython: Abort terminator = except block path.
+            // canraise.py:27-41: analyze_exceptblock_in_graph.
+            if let Terminator::Abort { reason } = &block.terminator {
+                if ignore_memoryerror && is_memoryerror_only(reason) {
+                    // RPython: do_ignore_memory_error skips MemoryError-only
+                    continue;
+                }
+                return true;
+            }
+            // RPython: analyze_simple_operation(op) per operation.
+            // canraise.py:14-17: LL_OPERATIONS[op.opname].canraise
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        let callee_path = match self.target_to_path(target) {
+                            Some(p) => p,
+                            None => return true, // unresolvable → conservative
+                        };
+                        if self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror) {
+                            return true;
+                        }
+                    }
+                    other => {
+                        if op_can_raise(other, ignore_memoryerror) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py:401-404).
+    ///
+    /// analyze_simple_operation: op.opname in ('jit_force_virtualizable',
+    ///                                         'jit_force_virtual')
+    fn analyze_forces_virtualizable(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+        if !seen.insert(path.clone()) {
+            return false;
+        }
+        let graph = match self.function_graphs.get(path) {
+            Some(g) => g,
+            // RPython: external call → analyze_external_call → bottom_result (False).
+            // VirtualizableAnalyzer does not override analyze_external_call.
+            None => return false,
+        };
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    // RPython: jit_force_virtualizable / jit_force_virtual
+                    OpKind::VableForce => return true,
+                    OpKind::Call { target, .. } => {
+                        let callee_path = match self.target_to_path(target) {
+                            Some(p) => p,
+                            None => continue, // external call → False
+                        };
+                        if self.analyze_forces_virtualizable(&callee_path, seen) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// RPython: RandomEffectsAnalyzer.analyze() (effectinfo.py:410-418).
+    ///
+    /// ```python
+    /// class RandomEffectsAnalyzer(BoolGraphAnalyzer):
+    ///     def analyze_external_call(self, funcobj, seen=None):
+    ///         if funcobj.random_effects_on_gcobjs:
+    ///             return True
+    ///         return super().analyze_external_call(funcobj, seen)
+    ///     def analyze_simple_operation(self, op, graphinfo):
+    ///         return False
+    /// ```
+    ///
+    /// Key: `analyze_simple_operation` always returns False. External calls
+    /// only return True if `random_effects_on_gcobjs` is set. The default
+    /// `analyze_external_call` returns `bottom_result()` = False
+    /// (graphanalyze.py:60-69). "No graph" ≠ random effects in RPython.
+    ///
+    /// In majit: functions without graphs are treated as external calls
+    /// → returns False (matching RPython's default external call behavior).
+    fn analyze_random_effects(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+        if !seen.insert(path.clone()) {
+            return false; // cycle → bottom_result
+        }
+        let graph = match self.function_graphs.get(path) {
+            Some(g) => g,
+            // RPython: external call → analyze_external_call() → bottom_result
+            // (False) unless funcobj.random_effects_on_gcobjs. In majit, we
+            // don't have that flag, so external functions default to False.
+            None => return false,
+        };
+        // RPython: analyze_simple_operation always returns False.
+        // Only recursive calls into graphs can propagate random effects.
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::Call { target, .. } = &op.kind {
+                    let callee_path = match self.target_to_path(target) {
+                        Some(p) => p,
+                        // Unresolvable target = external call → False
+                        None => continue,
+                    };
+                    if self.analyze_random_effects(&callee_path, seen) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// RPython: QuasiImmutAnalyzer.analyze() (effectinfo.py).
+    ///
+    /// analyze_simple_operation: op.opname == 'jit_force_quasi_immutable'.
+    ///
+    /// In majit: we don't have quasi-immutable ops in the model yet,
+    /// so this always returns false. The transitive call check is still
+    /// performed for future-proofing.
+    fn analyze_can_invalidate(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+        if !seen.insert(path.clone()) {
+            return false;
+        }
+        let graph = match self.function_graphs.get(path) {
+            Some(g) => g,
+            None => return false, // no graph → cannot invalidate (not conservative here)
+        };
+        for block in &graph.blocks {
+            for op in &block.operations {
+                // RPython: jit_force_quasi_immutable → true
+                // majit: no such op yet, but check calls transitively
+                if let OpKind::Call { target, .. } = &op.kind {
+                    let callee_path = match self.target_to_path(target) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    if self.analyze_can_invalidate(&callee_path, seen) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // ── Cached analyzer wrappers ────────────────────────────────────
+
+    /// Cached version of _canraise for a CallTarget.
+    ///
+    /// RPython call.py:337-355 — _canraise uses two analyzers:
+    /// 1. raise_analyzer.can_raise(op)
+    /// 2. raise_analyzer_ignore_memoryerror.can_raise(op)
+    ///
+    /// If (1) is True and (2) is False → "mem" (MemoryErrorOnly).
+    /// If (1) is True and (2) is True → True.
+    /// If (1) is False → False.
+    fn cached_can_raise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return CanRaise::Yes,
+        };
+        if let Some(&result) = cache.can_raise.get(&path) {
+            return result;
+        }
+        // RPython call.py:342: self.raise_analyzer.can_raise(op)
+        let mut seen = HashSet::new();
+        let can_raise = self.analyze_can_raise_impl(&path, &mut seen, false);
+        let result = if !can_raise {
+            // RPython call.py:348: return False
+            CanRaise::No
+        } else {
+            // RPython call.py:343: self.raise_analyzer_ignore_memoryerror.can_raise(op)
+            let mut seen2 = HashSet::new();
+            let can_raise_non_memoryerror = self.analyze_can_raise_impl(&path, &mut seen2, true);
+            if can_raise_non_memoryerror {
+                // RPython call.py:344: return True
+                CanRaise::Yes
+            } else {
+                // RPython: return "mem"
+                CanRaise::MemoryErrorOnly
+            }
+        };
+        cache.can_raise.insert(path, result);
+        result
+    }
+
+    /// Cached version of analyze_forces_virtualizable for a CallTarget.
+    /// RPython: VirtualizableAnalyzer external calls → bottom_result (False).
+    fn cached_forces_virtualizable(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return false, // external → False (RPython bottom_result)
+        };
+        if let Some(&result) = cache.forces_virtualizable.get(&path) {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let result = self.analyze_forces_virtualizable(&path, &mut seen);
+        cache.forces_virtualizable.insert(path, result);
+        result
+    }
+
+    /// Cached version of analyze_random_effects for a CallTarget.
+    /// RPython: RandomEffectsAnalyzer defaults to False for external calls.
+    fn cached_random_effects(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return false, // external call → False (RPython default)
+        };
+        if let Some(&result) = cache.random_effects.get(&path) {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let result = self.analyze_random_effects(&path, &mut seen);
+        cache.random_effects.insert(path, result);
+        result
+    }
+
+    /// Cached version of analyze_can_invalidate for a CallTarget.
+    fn cached_can_invalidate(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return false,
+        };
+        if let Some(&result) = cache.can_invalidate.get(&path) {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let result = self.analyze_can_invalidate(&path, &mut seen);
+        cache.can_invalidate.insert(path, result);
+        result
+    }
+
+    // ── _canraise + getcalldescr (call.py:210-355) ──────────────────
+
+    /// RPython: CallControl._canraise(op) (call.py:337-355).
+    ///
+    /// ```python
+    /// def _canraise(self, op):
+    ///     if op.opname == 'pseudo_call_cannot_raise':
+    ///         return False
+    ///     try:
+    ///         if self.raise_analyzer.can_raise(op):
+    ///             if self.raise_analyzer_ignore_memoryerror.can_raise(op):
+    ///                 return True
+    ///             else:
+    ///                 return "mem"
+    ///         else:
+    ///             return False
+    ///     except DelayedPointer:
+    ///         return True
+    /// ```
+    pub fn canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
+        self.cached_can_raise(target, cache)
+    }
+
+    /// RPython: CallControl.getcalldescr(op, oopspecindex, extraeffect, ...)
+    /// (call.py:210-335).
+    ///
+    /// Determines the effect classification for a call target by running
+    /// graph-based analyzers, then builds and returns a CallDescriptor
+    /// with the computed EffectInfo.
+    ///
+    /// ```python
+    /// def getcalldescr(self, op, oopspecindex=OS_NONE,
+    ///                  extraeffect=None, extradescr=None, calling_graph=None):
+    ///     ...
+    ///     random_effects = self.randomeffects_analyzer.analyze(op)
+    ///     if random_effects:
+    ///         extraeffect = EF_RANDOM_EFFECTS
+    ///     can_invalidate = random_effects or self.quasiimmut_analyzer.analyze(op)
+    ///     if extraeffect is None:
+    ///         if self.virtualizable_analyzer.analyze(op):
+    ///             extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE
+    ///         elif loopinvariant:
+    ///             extraeffect = EF_LOOPINVARIANT
+    ///         elif elidable:
+    ///             cr = self._canraise(op)
+    ///             ...
+    ///         elif self._canraise(op):
+    ///             extraeffect = EF_CAN_RAISE
+    ///         else:
+    ///             extraeffect = EF_CANNOT_RAISE
+    ///     ...
+    ///     effectinfo = effectinfo_from_writeanalyze(...)
+    ///     return self.cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
+    /// ```
+    pub fn getcalldescr(
+        &self,
+        target: &CallTarget,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        oopspecindex: OopSpecIndex,
+        extraeffect: Option<ExtraEffect>,
+        cache: &mut AnalysisCache,
+    ) -> CallDescriptor {
+        // RPython call.py:239-240: extract flags
+        let elidable = self.is_elidable(target);
+        let loopinvariant = self.is_loopinvariant(target);
+
+        // RPython call.py:223-234: check the number and type of arguments.
+        //   FUNC = op.args[0].concretetype.TO
+        //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not Void]:
+        //       raise Exception(...)
+        //   if RESULT != FUNC.RESULT:
+        //       raise Exception(...)
+        //
+        // In majit, we validate by looking up the callee's FunctionGraph inputs.
+        // RPython raises on mismatch; we warn (callee signatures are approximate
+        // in static analysis, so hard errors would be too strict).
+        if !arg_types.is_empty() {
+            if let Some(path) = self.target_to_path(target) {
+                if let Some(graph) = self.function_graphs.get(&path) {
+                    let expected_arity = graph.block(graph.startblock).inputargs.len();
+                    if arg_types.len() != expected_arity {
+                        eprintln!(
+                            "[getcalldescr] WARNING: {target} expects {expected_arity} args \
+                             but got {} (NON_VOID_ARGS mismatch)",
+                            arg_types.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        // RPython call.py:282: random_effects = self.randomeffects_analyzer.analyze(op)
+        let random_effects = self.cached_random_effects(target, cache);
+        let mut extraeffect = extraeffect;
+        if random_effects {
+            extraeffect = Some(ExtraEffect::RandomEffects);
+        }
+
+        // RPython call.py:285: can_invalidate = random_effects or quasiimmut_analyzer
+        let can_invalidate = random_effects || self.cached_can_invalidate(target, cache);
+
+        // RPython call.py:286-303: determine extraeffect
+        if extraeffect.is_none() {
+            extraeffect = Some(if self.cached_forces_virtualizable(target, cache) {
+                // call.py:288
+                ExtraEffect::ForcesVirtualOrVirtualizable
+            } else if loopinvariant {
+                // call.py:290
+                ExtraEffect::LoopInvariant
+            } else if elidable {
+                // call.py:292-298
+                match self.canraise(target, cache) {
+                    CanRaise::No => ExtraEffect::ElidableCannotRaise,
+                    CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
+                    CanRaise::Yes => ExtraEffect::ElidableCanRaise,
+                }
+            } else if matches!(
+                self.canraise(target, cache),
+                CanRaise::Yes | CanRaise::MemoryErrorOnly
+            ) {
+                // call.py:299-300
+                ExtraEffect::CanRaise
+            } else {
+                // call.py:302
+                ExtraEffect::CannotRaise
+            });
+        }
+
+        let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
+
+        // RPython call.py:249-251: loopinvariant functions must have no args
+        if loopinvariant && !arg_types.is_empty() {
+            panic!(
+                "getcalldescr: arguments not supported for loop-invariant \
+                 function {target}"
+            );
+        }
+
+        // RPython call.py:305-318: check that the result is really as expected
+        if loopinvariant && extraeffect != ExtraEffect::LoopInvariant {
+            panic!(
+                "getcalldescr: {target} is marked loop-invariant but got \
+                 extraeffect={extraeffect:?}"
+            );
+        }
+        if elidable {
+            if !matches!(
+                extraeffect,
+                ExtraEffect::ElidableCannotRaise
+                    | ExtraEffect::ElidableOrMemoryError
+                    | ExtraEffect::ElidableCanRaise
+            ) {
+                panic!(
+                    "getcalldescr: {target} is marked elidable but got \
+                     extraeffect={extraeffect:?}"
+                );
+            }
+            // RPython call.py:315-318: elidable function must have a result
+            if result_type == Type::Void {
+                panic!("getcalldescr: {target} is elidable but has no result");
+            }
+        }
+
+        // RPython call.py:320-324: effectinfo_from_writeanalyze(...)
+        let effectinfo = effectinfo_from_writeanalyze(
+            target,
+            extraeffect,
+            oopspecindex,
+            can_invalidate,
+            &self.function_graphs,
+            self,
+            &mut cache.descr_indices,
+        );
+
+        // RPython call.py:326-332: assert post-conditions
+        if elidable || loopinvariant {
+            assert!(
+                effectinfo.extra_effect < ExtraEffect::ForcesVirtualOrVirtualizable,
+                "getcalldescr: elidable/loopinvariant {target} has \
+                 effect {:?} >= ForcesVirtualOrVirtualizable",
+                effectinfo.extra_effect
+            );
+        }
+
+        // RPython call.py:334-335: cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
+        CallDescriptor {
+            target: target.clone(),
+            effect_info: effectinfo,
+        }
+    }
+
+    /// RPython: calldescr_canraise(calldescr) (call.py:357-359).
+    pub fn calldescr_canraise(&self, calldescr: &CallDescriptor) -> bool {
+        calldescr.effect_info.check_can_raise(false)
+    }
 }
 
 impl Default for CallControl {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── effectinfo_from_writeanalyze (effectinfo.py:276-378) ──────────
+//
+// RPython: effectinfo_from_writeanalyze(effects, cpu, extraeffect, ...)
+// Builds EffectInfo from the write-analysis result set.
+//
+// In RPython, the ReadWriteAnalyzer produces a set of tuples like:
+//   ("struct", T, fieldname), ("readstruct", T, fieldname),
+//   ("array", T), ("readarray", T), etc.
+// These are converted to field/array descriptor bitsets.
+//
+// In majit, we scan the callee graph's ops directly for
+// FieldRead/FieldWrite/ArrayRead/ArrayWrite and collect their
+// descriptor indices into EffectInfo's bitset fields.
+
+/// RPython: effectinfo_from_writeanalyze() (effectinfo.py:276-378).
+///
+/// Scans the callee's graph for field/array read/write operations
+/// and populates the corresponding bitset fields in EffectInfo.
+fn effectinfo_from_writeanalyze(
+    target: &CallTarget,
+    extraeffect: ExtraEffect,
+    oopspecindex: OopSpecIndex,
+    can_invalidate: bool,
+    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    cc: &CallControl,
+    descr_indices: &mut DescrIndexRegistry,
+) -> EffectInfo {
+    // RPython effectinfo.py:279-281:
+    // if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
+    //     readonly/write = None (=> check_* always returns True)
+    if extraeffect == ExtraEffect::RandomEffects {
+        return EffectInfo {
+            extra_effect: ExtraEffect::RandomEffects,
+            oopspec_index: oopspecindex,
+            readonly_descrs_fields: !0, // all bits set = top_set
+            write_descrs_fields: !0,
+            readonly_descrs_arrays: !0,
+            write_descrs_arrays: !0,
+            can_invalidate,
+        };
+    }
+
+    // For elidable/loopinvariant: ignore writes (effectinfo.py:181-186).
+    // RPython: if elidable or loopinvariant: write_descrs = frozenset()
+    let ignore_writes = matches!(
+        extraeffect,
+        ExtraEffect::ElidableCannotRaise
+            | ExtraEffect::ElidableOrMemoryError
+            | ExtraEffect::ElidableCanRaise
+            | ExtraEffect::LoopInvariant
+    );
+
+    // Collect raw read/write bitsets from graph traversal.
+    let mut read_fields: u64 = 0;
+    let mut write_fields: u64 = 0;
+    let mut read_arrays: u64 = 0;
+    let mut write_arrays: u64 = 0;
+
+    if let Some(path) = cc.target_to_path(target) {
+        let mut seen = HashSet::new();
+        collect_readwrite_effects(
+            &path,
+            function_graphs,
+            cc,
+            descr_indices,
+            &mut seen,
+            &mut read_fields,
+            &mut write_fields,
+            &mut read_arrays,
+            &mut write_arrays,
+        );
+    }
+
+    // RPython effectinfo.py:345-360: readonly = reads that have NO
+    // corresponding write. If a field is both read and written, it
+    // goes into write_descrs only, NOT readonly_descrs.
+    //
+    // effectinfo.py:346: tupw = ("struct",) + tup[1:]
+    //                    if tupw not in effects:
+    //                        add_struct(readonly_descrs_fields, tup)
+    let readonly_descrs_fields = read_fields & !write_fields;
+    let readonly_descrs_arrays = read_arrays & !write_arrays;
+    let mut write_descrs_fields = write_fields;
+    let mut write_descrs_arrays = write_arrays;
+
+    // RPython effectinfo.py:181-186: for elidable/loopinvariant,
+    // ignore writes (write_descrs = frozenset()).
+    if ignore_writes {
+        write_descrs_fields = 0;
+        write_descrs_arrays = 0;
+    }
+
+    EffectInfo {
+        extra_effect: extraeffect,
+        oopspec_index: oopspecindex,
+        readonly_descrs_fields,
+        write_descrs_fields,
+        readonly_descrs_arrays,
+        write_descrs_arrays,
+        can_invalidate,
+    }
+}
+
+/// Transitive read/write effect collection.
+///
+/// RPython: ReadWriteAnalyzer.analyze() — traverses callee graphs.
+/// Produces a set of tuples: ("struct"/"readstruct"/"array"/"readarray", ...).
+///
+/// We collect raw reads and writes separately into bitsets. The caller
+/// (`effectinfo_from_writeanalyze`) then applies the RPython rule:
+/// "readonly = reads & ~writes" (effectinfo.py:345-360).
+fn collect_readwrite_effects(
+    path: &CallPath,
+    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    cc: &CallControl,
+    descr_indices: &mut DescrIndexRegistry,
+    seen: &mut HashSet<CallPath>,
+    read_fields: &mut u64,
+    write_fields: &mut u64,
+    read_arrays: &mut u64,
+    write_arrays: &mut u64,
+) {
+    if !seen.insert(path.clone()) {
+        return;
+    }
+    let graph = match function_graphs.get(path) {
+        Some(g) => g,
+        None => {
+            // No graph available → top_set (all bits set).
+            *read_fields = !0;
+            *write_fields = !0;
+            *read_arrays = !0;
+            *write_arrays = !0;
+            return;
+        }
+    };
+
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                // RPython: ("readstruct", T, fieldname)
+                OpKind::FieldRead { field, .. } => {
+                    // RPython: cpu.fielddescrof(T, fieldname).get_ei_index()
+                    let idx = descr_indices.field_index(&field.owner_root, &field.name);
+                    *read_fields |= 1u64 << idx;
+                }
+                // RPython: ("struct", T, fieldname)
+                OpKind::FieldWrite { field, .. } => {
+                    let idx = descr_indices.field_index(&field.owner_root, &field.name);
+                    *write_fields |= 1u64 << idx;
+                }
+                // RPython: ("readarray", T)
+                OpKind::ArrayRead { item_ty, .. } => {
+                    // RPython: cpu.arraydescrof(ARRAY).get_ei_index()
+                    let idx = descr_indices.array_index(value_type_discriminant(item_ty));
+                    *read_arrays |= 1u64 << idx;
+                }
+                // RPython: ("array", T)
+                OpKind::ArrayWrite { item_ty, .. } => {
+                    let idx = descr_indices.array_index(value_type_discriminant(item_ty));
+                    *write_arrays |= 1u64 << idx;
+                }
+                // Recursive: follow calls.
+                OpKind::Call { target, .. } => {
+                    if let Some(callee_path) = cc.target_to_path(target) {
+                        collect_readwrite_effects(
+                            &callee_path,
+                            function_graphs,
+                            cc,
+                            descr_indices,
+                            seen,
+                            read_fields,
+                            write_fields,
+                            read_arrays,
+                            write_arrays,
+                        );
+                    } else {
+                        // Unresolvable call → top_set.
+                        *read_fields = !0;
+                        *write_fields = !0;
+                        *read_arrays = !0;
+                        *write_arrays = !0;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py:14-17).
+///
+/// ```python
+/// canraise = LL_OPERATIONS[op.opname].canraise
+/// return bool(canraise) and canraise != (self.ignore_exact_class,)
+/// ```
+///
+/// Returns true if the operation itself (not counting transitive calls)
+/// can raise an exception. When `ignore_memoryerror` is true, operations
+/// that can only raise MemoryError are treated as non-raising.
+fn op_can_raise(op: &OpKind, ignore_memoryerror: bool) -> bool {
+    // RPython canraise.py:14-17:
+    //   canraise = LL_OPERATIONS[op.opname].canraise
+    //   return bool(canraise) and canraise != (self.ignore_exact_class,)
+    //
+    // canraise.py:18: unknown op → log.WARNING + return True
+    //
+    // Each op has a canraise tuple. When ignore_exact_class == MemoryError,
+    // ops that can ONLY raise MemoryError are treated as non-raising.
+    match op {
+        // ── Known non-raising ops (canraise = ()) ─────────────────
+        // RPython LL: getfield_gc, setfield_gc → cannot raise
+        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => false,
+        // RPython LL: getarrayitem_gc, setarrayitem_gc → cannot raise
+        OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => false,
+        // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
+        // (non-ovf, non-div arithmetic)
+        OpKind::BinOp { op, .. }
+            if !op.contains("div")
+                && !op.contains("mod")
+                && !op.contains("rem")
+                && !op.contains("ovf") =>
+        {
+            false
+        }
+        // RPython LL: int_neg, bool_not → cannot raise
+        OpKind::UnaryOp { op, .. } if !op.contains("ovf") => false,
+        // RPython LL: same_as, cast_*, hint → cannot raise
+        OpKind::Input { .. } | OpKind::ConstInt(_) => false,
+        // JIT-specific ops that cannot raise
+        OpKind::GuardTrue { .. }
+        | OpKind::GuardFalse { .. }
+        | OpKind::GuardValue { .. }
+        | OpKind::Live => false,
+        // Virtualizable field/array access (from boxes, no heap) → cannot raise
+        OpKind::VableFieldRead { .. }
+        | OpKind::VableFieldWrite { .. }
+        | OpKind::VableArrayRead { .. }
+        | OpKind::VableArrayWrite { .. } => false,
+        // Post-jtransform call ops: raise is determined by their descriptor,
+        // not by op_can_raise. These are not "simple operations" in RPython
+        // terms — they're handled by analyze() → analyze_direct_call.
+        OpKind::CallResidual { .. }
+        | OpKind::CallElidable { .. }
+        | OpKind::CallMayForce { .. }
+        | OpKind::InlineCall { .. }
+        | OpKind::RecursiveCall { .. } => false,
+
+        // ── Known raising ops ─────────────────────────────────────
+        // RPython LL: jit_force_virtualizable → canraise
+        OpKind::VableForce => true,
+        // RPython LL: int_floordiv, int_mod → canraise = (ZeroDivisionError,)
+        OpKind::BinOp { .. } => true, // div/mod/rem/ovf (others matched above)
+        // RPython LL: int_neg_ovf → canraise = (OverflowError,)
+        OpKind::UnaryOp { .. } => true, // ovf (others matched above)
+
+        // ── Calls handled by analyze() dispatch, not here ─────────
+        // RPython: Call ops dispatch to analyze_direct_call/analyze_external_call.
+        // op_can_raise is only for "simple operations" (non-call).
+        // But if we see a Call here (shouldn't happen in normal flow),
+        // be conservative.
+        OpKind::Call { .. } => true,
+
+        // ── Unknown ops: canraise.py:18 → True (conservative) ─────
+        // RPython: log.WARNING("Unknown operation: %s" % op.opname)
+        //          return True
+        OpKind::Unknown { .. } => true,
+    }
+}
+
+/// Check if an Abort reason indicates MemoryError-only.
+///
+/// RPython: `do_ignore_memory_error()` sets `ignore_exact_class = MemoryError`.
+/// Then `canraise != (self.ignore_exact_class,)` filters it out.
+///
+/// In majit, Abort carries a reason string. We check for MemoryError
+/// indicators. This matches:
+/// - "MemoryError" — explicit MemoryError raise
+/// - "alloc" / "allocation" — memory allocation failures
+fn is_memoryerror_only(reason: &str) -> bool {
+    let r = reason.to_lowercase();
+    r.contains("memoryerror") || r.contains("out of memory")
+}
+
+/// Map ValueType to a small integer for array descriptor indexing.
+fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
+    use crate::model::ValueType;
+    match ty {
+        ValueType::Int => 0,
+        ValueType::Ref => 1,
+        ValueType::Float => 2,
+        ValueType::Void => 3,
+        ValueType::State => 4,
+        ValueType::Unknown => 5,
     }
 }
 
@@ -607,8 +1502,6 @@ pub fn is_generic_receiver(receiver: &str) -> bool {
 // These tables map known function targets to their effect info,
 // used by `jtransform::classify_call()` as a fallback when the
 // call is not in the explicit `call_effects` config.
-
-use majit_ir::descr::{ExtraEffect, OopSpecIndex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallTargetPattern {
@@ -800,5 +1693,470 @@ mod tests {
         assert!(!is_generic_receiver("PyFrame"));
         assert!(!is_generic_receiver("Code"));
         assert!(!is_generic_receiver("Vec"));
+    }
+
+    // ── getcalldescr tests ───────────────────────────���──────────────
+
+    use crate::model::{Block, SpaceOperation, Terminator, ValueId, ValueType};
+
+    /// Helper: create a FunctionGraph with just a return.
+    fn simple_graph(name: &str) -> FunctionGraph {
+        let mut g = FunctionGraph::new(name);
+        g.set_terminator(g.startblock, Terminator::Return(None));
+        g
+    }
+
+    /// Helper: create a FunctionGraph with an Abort terminator.
+    fn raising_graph(name: &str) -> FunctionGraph {
+        let mut g = FunctionGraph::new(name);
+        g.set_terminator(
+            g.startblock,
+            Terminator::Abort {
+                reason: "error".into(),
+            },
+        );
+        g
+    }
+
+    #[test]
+    fn test_getcalldescr_cannot_raise() {
+        // A simple function with no Abort → CannotRaise.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pure_add"]);
+        cc.register_function_graph(path.clone(), simple_graph("pure_add"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["pure_add"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::CannotRaise
+        );
+        assert!(!descriptor.effect_info.can_invalidate);
+    }
+
+    #[test]
+    fn test_getcalldescr_can_raise() {
+        // A function with Abort terminator → CanRaise.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["failing_func"]);
+        cc.register_function_graph(path.clone(), raising_graph("failing_func"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["failing_func"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+    }
+
+    #[test]
+    fn test_getcalldescr_elidable() {
+        // An elidable function that cannot raise → ElidableCannotRaise.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pure_lookup"]);
+        cc.register_function_graph(path.clone(), simple_graph("pure_lookup"));
+        cc.mark_elidable(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["pure_lookup"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::ElidableCannotRaise
+        );
+    }
+
+    #[test]
+    fn test_getcalldescr_elidable_can_raise() {
+        // An elidable function that CAN raise → ElidableCanRaise.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["elidable_raiser"]);
+        cc.register_function_graph(path.clone(), raising_graph("elidable_raiser"));
+        cc.mark_elidable(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["elidable_raiser"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::ElidableCanRaise
+        );
+    }
+
+    #[test]
+    fn test_getcalldescr_loopinvariant() {
+        // A loop-invariant function → LoopInvariant.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["get_config"]);
+        cc.register_function_graph(path.clone(), simple_graph("get_config"));
+        cc.mark_loopinvariant(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["get_config"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::LoopInvariant
+        );
+    }
+
+    #[test]
+    fn test_getcalldescr_forces_virtualizable() {
+        // A function with VableForce → ForcesVirtualOrVirtualizable.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("forcer");
+        graph.push_op(graph.startblock, OpKind::VableForce, false);
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        let path = CallPath::from_segments(["forcer"]);
+        cc.register_function_graph(path, graph);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["forcer"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+    }
+
+    #[test]
+    fn test_getcalldescr_extraeffect_override() {
+        // When extraeffect is provided, it overrides the analyzers.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["func"]);
+        cc.register_function_graph(path, simple_graph("func"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["func"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            Some(ExtraEffect::ElidableCannotRaise),
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::ElidableCannotRaise
+        );
+    }
+
+    #[test]
+    fn test_getcalldescr_transitive_can_raise() {
+        // A function that calls another function that raises → CanRaise.
+        let mut cc = CallControl::new();
+
+        // callee: raises
+        let callee_path = CallPath::from_segments(["callee"]);
+        cc.register_function_graph(callee_path, raising_graph("callee"));
+
+        // caller: calls callee (no Abort itself)
+        let mut caller = FunctionGraph::new("caller");
+        caller.push_op(
+            caller.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["callee"]),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        caller.set_terminator(caller.startblock, Terminator::Return(None));
+        let caller_path = CallPath::from_segments(["caller"]);
+        cc.register_function_graph(caller_path, caller);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["caller"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+    }
+
+    #[test]
+    fn test_getcalldescr_unknown_target_can_raise() {
+        // Unknown target (no graph) treated as external call.
+        // RPython: RandomEffectsAnalyzer returns False for external calls
+        // (only True if random_effects_on_gcobjs). RaiseAnalyzer returns
+        // True (top_result) for unknown graphs → CanRaise.
+        let cc = CallControl::new();
+        let target = CallTarget::function_path(["unknown_extern"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(descriptor.effect_info.extra_effect, ExtraEffect::CanRaise);
+        // RandomEffects is false, QuasiImmut is false → can_invalidate is false.
+        assert!(!descriptor.effect_info.can_invalidate);
+    }
+
+    #[test]
+    fn test_getcalldescr_readwrite_effects() {
+        // A function with FieldRead/FieldWrite → bitsets populated.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("accessor");
+        let base = graph.alloc_value();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldRead {
+                base,
+                field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
+                value: base, // dummy
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        let path = CallPath::from_segments(["accessor"]);
+        cc.register_function_graph(path, graph);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["accessor"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        // Should have non-zero bitsets for field reads and writes.
+        assert_ne!(descriptor.effect_info.readonly_descrs_fields, 0);
+        assert_ne!(descriptor.effect_info.write_descrs_fields, 0);
+    }
+
+    #[test]
+    fn test_getcalldescr_elidable_ignores_writes() {
+        // Elidable function: write_descrs should be 0 even if graph has writes.
+        // RPython effectinfo.py:181-186: ignore writes for elidable.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("pure_writer");
+        let base = graph.alloc_value();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("cache", Some("Obj".into())),
+                value: base,
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        let path = CallPath::from_segments(["pure_writer"]);
+        cc.register_function_graph(path.clone(), graph);
+        cc.mark_elidable(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["pure_writer"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(
+            descriptor.effect_info.extra_effect,
+            ExtraEffect::ElidableCannotRaise
+        );
+        // Writes should be zeroed out for elidable functions.
+        assert_eq!(descriptor.effect_info.write_descrs_fields, 0);
+    }
+
+    #[test]
+    fn test_canraise_cached() {
+        // Verify caching: second call should reuse result.
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["raiser"]);
+        cc.register_function_graph(path, raising_graph("raiser"));
+
+        let target = CallTarget::function_path(["raiser"]);
+        let mut cache = AnalysisCache::default();
+
+        let r1 = cc.canraise(&target, &mut cache);
+        assert_eq!(r1, CanRaise::Yes);
+        assert!(
+            cache
+                .can_raise
+                .contains_key(&CallPath::from_segments(["raiser"]))
+        );
+
+        let r2 = cc.canraise(&target, &mut cache);
+        assert_eq!(r2, CanRaise::Yes);
+    }
+
+    #[test]
+    fn test_readonly_excludes_written_fields() {
+        // RPython effectinfo.py:345-348: readstruct only goes to readonly
+        // if there's no corresponding write ("struct") for that field.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("rw_same_field");
+        let base = graph.alloc_value();
+        let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
+        // Both read AND write the same field "x"
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldRead {
+                base,
+                field: field.clone(),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base,
+                field: field.clone(),
+                value: base,
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        let path = CallPath::from_segments(["rw_same_field"]);
+        cc.register_function_graph(path, graph);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["rw_same_field"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &target,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+        // Write is set, but readonly should NOT have the same bit set.
+        // RPython: readonly = reads & ~writes
+        assert_ne!(descriptor.effect_info.write_descrs_fields, 0);
+        let overlap = descriptor.effect_info.readonly_descrs_fields
+            & descriptor.effect_info.write_descrs_fields;
+        assert_eq!(
+            overlap, 0,
+            "readonly and write should not overlap for same field"
+        );
+    }
+
+    #[test]
+    fn test_op_can_raise_division() {
+        // Division ops can raise (ZeroDivisionError).
+        // RPython: LL_OPERATIONS[int_floordiv].canraise = (ZeroDivisionError,)
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("divider");
+        let a = graph.alloc_value();
+        let b = graph.alloc_value();
+        graph.push_op(
+            graph.startblock,
+            OpKind::BinOp {
+                op: "int_floordiv".to_string(),
+                lhs: a,
+                rhs: b,
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        let path = CallPath::from_segments(["divider"]);
+        cc.register_function_graph(path, graph);
+
+        let target = CallTarget::function_path(["divider"]);
+        let mut cache = AnalysisCache::default();
+        let result = cc.canraise(&target, &mut cache);
+        assert_eq!(result, CanRaise::Yes);
+    }
+
+    #[test]
+    fn test_canraise_memoryerror_only() {
+        // Abort with "MemoryError" reason → MemoryErrorOnly.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("allocator");
+        graph.set_terminator(
+            graph.startblock,
+            Terminator::Abort {
+                reason: "MemoryError: allocation failed".into(),
+            },
+        );
+        let path = CallPath::from_segments(["allocator"]);
+        cc.register_function_graph(path, graph);
+
+        let target = CallTarget::function_path(["allocator"]);
+        let mut cache = AnalysisCache::default();
+        let result = cc.canraise(&target, &mut cache);
+        assert_eq!(result, CanRaise::MemoryErrorOnly);
     }
 }

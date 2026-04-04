@@ -159,6 +159,9 @@ pub struct Transformer<'a> {
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
+    /// RPython: DependencyTracker — caches transitive analysis results.
+    /// Shared across all getcalldescr() calls within this transform pass.
+    analysis_cache: crate::call::AnalysisCache,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -191,6 +194,7 @@ impl<'a> Transformer<'a> {
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
+            analysis_cache: crate::call::AnalysisCache::default(),
         }
     }
 
@@ -549,26 +553,32 @@ impl<'a> Transformer<'a> {
                     self.handle_regular_call(op, target, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Residual => {
-                    // Residual: classify effect from call_effects/describe_call
-                    if let Some((descriptor, effect)) =
-                        classify_call(target, &self.config.call_effects)
-                    {
-                        match effect {
-                            CallEffectKind::Elidable => self
-                                .handle_elidable_call(op, descriptor, args, result_ty, graph_name),
-                            CallEffectKind::MayForce => self
-                                .handle_may_force_call(op, descriptor, args, result_ty, graph_name),
-                            CallEffectKind::Residual => self
-                                .handle_residual_call(op, descriptor, args, result_ty, graph_name),
-                        }
-                    } else {
-                        // No effect info — plain residual
-                        let descriptor = CallDescriptor::known(
-                            target.clone(),
-                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
-                        );
-                        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
-                    }
+                    // RPython jtransform.py:456-471:
+                    //   calldescr = self.callcontrol.getcalldescr(op, ...)
+                    //   op1 = self.rewrite_call(op, 'residual_call', ...)
+                    //
+                    // RPython ALWAYS produces residual_call_* for residual
+                    // calls — the effect is only in the calldescr, NOT in
+                    // the opcode name. No dispatch_by_effect.
+                    let descriptor =
+                        if let Some((d, _)) = classify_call(target, &self.config.call_effects) {
+                            d
+                        } else {
+                            // RPython call.py:220-222: NON_VOID_ARGS + RESULT
+                            let non_void_args = resolve_non_void_arg_types(args, self.type_state);
+                            let result_ir_type = value_type_to_ir_type(result_ty);
+                            let cc_ref: &crate::call::CallControl =
+                                self.callcontrol.as_deref().unwrap();
+                            cc_ref.getcalldescr(
+                                target,
+                                non_void_args,
+                                result_ir_type,
+                                OopSpecIndex::None,
+                                None,
+                                &mut self.analysis_cache,
+                            )
+                        };
+                    self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Builtin => {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name)
@@ -579,19 +589,10 @@ impl<'a> Transformer<'a> {
             };
         }
 
-        // Fallback when no CallControl: effect-only classification (legacy path)
-        if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
-            match effect {
-                CallEffectKind::Elidable => {
-                    self.handle_elidable_call(op, descriptor, args, result_ty, graph_name)
-                }
-                CallEffectKind::Residual => {
-                    self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
-                }
-                CallEffectKind::MayForce => {
-                    self.handle_may_force_call(op, descriptor, args, result_ty, graph_name)
-                }
-            }
+        // Fallback when no CallControl: effect-only classification (legacy path).
+        // RPython: always residual_call_*, effect only in calldescr.
+        if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
+            self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
         } else {
             RewriteResult::Keep
         }
@@ -614,63 +615,84 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // Look up effect info for this builtin target.
-        if let Some((descriptor, effect)) = classify_call(target, &self.config.call_effects) {
-            self.notes.push(GraphTransformNote {
-                function: graph_name.to_string(),
-                detail: format!("builtin {target} → {}", effect.as_str()),
-            });
-            self.calls_classified += 1;
+        // RPython jtransform.py:484-520: _handle_oopspec_call pattern.
+        //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
+        //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
 
-            // RPython jtransform.py:2001,2028:
-            //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
-            // Register builtin function in callinfocollection for assembler.finished().
+        // Look up oopspec/effect info: config overrides first, then static table.
+        let (oopspec_index, extra_effect_override) =
+            if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
+                (
+                    descriptor.effect_info.oopspec_index,
+                    Some(descriptor.effect_info.extra_effect),
+                )
+            } else if let Some(descriptor) = crate::call::describe_call(target) {
+                (
+                    descriptor.effect_info.oopspec_index,
+                    Some(descriptor.effect_info.extra_effect),
+                )
+            } else {
+                // Unknown builtin — keep as unclassified Call.
+                return RewriteResult::Keep;
+            };
+
+        // RPython jtransform.py:1990-2002:
+        //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
+        //
+        // RPython reuses the same calldescr for both the op and callinfocollection.
+        // We compute arg types once and clone for the collection.
+        let non_void_args = resolve_non_void_arg_types(args, self.type_state);
+        let result_ir_type = value_type_to_ir_type(result_ty);
+        let non_void_args_for_collection = non_void_args.clone();
+        let descriptor = {
+            let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+            cc_ref.getcalldescr(
+                target,
+                non_void_args,
+                result_ir_type,
+                oopspec_index,
+                extra_effect_override,
+                &mut self.analysis_cache,
+            )
+        };
+
+        let effect_str = format!("{:?}", descriptor.effect_info.extra_effect);
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("builtin {target} → {effect_str}"),
+        });
+        self.calls_classified += 1;
+
+        // RPython jtransform.py:2000-2002:
+        //   func = ptr2int(op.args[0].value)
+        //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
+        //
+        // RPython reuses the SAME calldescr returned by getcalldescr() —
+        // it carries the real NON_VOID_ARGS and RESULT types from call.py:334.
+        if oopspec_index != OopSpecIndex::None {
             if let Some(cc) = self.callcontrol.as_mut() {
-                let oopspec_index = descriptor.effect_info.oopspec_index;
-                if oopspec_index != OopSpecIndex::None {
-                    // RPython jtransform.py:1990-2002:
-                    //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, ...)
-                    //   func = ptr2int(op.args[0].value)
-                    //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
-                    //
-                    // RPython calldescr = cpu.calldescrof(FUNC, args, RESULT, effectinfo).
-                    // In majit, we build a SimpleCallDescr with the descriptor's EffectInfo
-                    // via make_call_descr(). Arg/result types are not yet resolved
-                    // (RPython gets them from op.args[i].concretetype).
-                    let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
-                        Vec::new(), // arg_types (not yet resolved)
-                        majit_ir::value::Type::Void,
-                        descriptor.effect_info.clone(),
-                    );
+                let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
+                    non_void_args_for_collection,
+                    result_ir_type,
+                    descriptor.effect_info.clone(),
+                );
 
-                    // RPython: func = ptr2int(op.args[0].value)
-                    // In static analysis we don't have real function pointers.
-                    // Use a hash of the target path as a stable surrogate.
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    target.hash(&mut hasher);
-                    let func_as_int = hasher.finish();
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                target.hash(&mut hasher);
+                let func_as_int = hasher.finish();
 
-                    cc.callinfocollection
-                        .add(oopspec_index, calldescr, func_as_int);
-                    // RPython: see_raw_object(func.ptr) derives name from
-                    // func.ptr._obj._name. We store the target name explicitly.
-                    cc.callinfocollection
-                        .register_func_name(func_as_int, format!("{target}"));
-                }
-            }
-
-            match effect {
-                CallEffectKind::Elidable => {
-                    return self.handle_elidable_call(op, descriptor, args, result_ty, graph_name);
-                }
-                _ => {
-                    return self.handle_residual_call(op, descriptor, args, result_ty, graph_name);
-                }
+                cc.callinfocollection
+                    .add(oopspec_index, calldescr, func_as_int);
+                cc.callinfocollection
+                    .register_func_name(func_as_int, format!("{target}"));
             }
         }
-        // Unknown builtin — keep as unclassified Call.
-        RewriteResult::Keep
+
+        // RPython jtransform.py:2003-2007: _handle_oopspec_call always
+        // produces residual_call_*, appends -live- if calldescr_canraise.
+        // Effect is only in the calldescr, never in the opcode name.
+        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
@@ -946,12 +968,62 @@ impl<'a> Transformer<'a> {
 /// getkind() never sees an unknown type. In our pipeline, Unknown
 /// means the annotate/rtype pass couldn't resolve the type. We map
 /// Unknown to 'r' (ref) since most Python-level values are GC refs.
+/// RPython: `NON_VOID_ARGS = [x.concretetype for x in op.args[1:]
+///                             if x.concretetype is not Void]`
+/// (call.py:220-221).
+///
+/// Resolve the IR types of call arguments, skipping Void.
+fn resolve_non_void_arg_types(
+    args: &[ValueId],
+    type_state: Option<&crate::passes::rtype::TypeResolutionState>,
+) -> Vec<majit_ir::value::Type> {
+    args.iter()
+        .filter_map(|&v| {
+            let kind = if let Some(ts) = type_state {
+                if let Some(ct) = ts.concrete_types.get(&v) {
+                    match ct {
+                        crate::passes::rtype::ConcreteType::Signed => 'i',
+                        crate::passes::rtype::ConcreteType::GcRef => 'r',
+                        crate::passes::rtype::ConcreteType::Float => 'f',
+                        crate::passes::rtype::ConcreteType::Void => 'v',
+                        crate::passes::rtype::ConcreteType::Unknown => 'r',
+                    }
+                } else {
+                    'r'
+                }
+            } else {
+                'r'
+            };
+            match kind {
+                'v' => None, // RPython: skip Void args
+                'i' => Some(majit_ir::value::Type::Int),
+                'r' => Some(majit_ir::value::Type::Ref),
+                'f' => Some(majit_ir::value::Type::Float),
+                _ => Some(majit_ir::value::Type::Ref),
+            }
+        })
+        .collect()
+}
+
 fn value_type_to_kind(ty: &ValueType) -> char {
     match ty {
         ValueType::Int | ValueType::State => 'i',
         ValueType::Ref | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
+    }
+}
+
+/// Convert codewriter ValueType to IR Type.
+///
+/// RPython: `x.concretetype` → lltype mapping.
+/// Used by getcalldescr to build NON_VOID_ARGS and RESULT types.
+fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
+    match ty {
+        ValueType::Int | ValueType::State => majit_ir::value::Type::Int,
+        ValueType::Ref | ValueType::Unknown => majit_ir::value::Type::Ref,
+        ValueType::Float => majit_ir::value::Type::Float,
+        ValueType::Void => majit_ir::value::Type::Void,
     }
 }
 
@@ -1456,6 +1528,8 @@ mod tests {
 
     #[test]
     fn rewrite_graph_uses_explicit_call_effect_overrides() {
+        // RPython: residual calls always produce residual_call_*, regardless
+        // of effect. The effect is only in the calldescr (descriptor).
         let mut graph = FunctionGraph::new("test");
         graph.push_op(
             graph.startblock,
@@ -1478,10 +1552,19 @@ mod tests {
                 ..Default::default()
             },
         );
+        // RPython: always residual_call_*, effect in descriptor only.
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,
-            OpKind::CallMayForce { .. }
+            OpKind::CallResidual { .. }
         ));
+        // Verify the effect is correctly carried in the descriptor.
+        if let OpKind::CallResidual { descriptor, .. } =
+            &result.graph.block(graph.startblock).operations[0].kind
+        {
+            assert!(descriptor.effect_info.forces_virtual_or_virtualizable());
+        } else {
+            panic!("expected CallResidual");
+        }
     }
 
     #[test]
