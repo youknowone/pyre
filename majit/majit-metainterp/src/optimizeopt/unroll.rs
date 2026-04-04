@@ -682,7 +682,7 @@ impl UnrollOptimizer {
                     Ok(result) => result,
                     Err(payload) => {
                         if payload
-                            .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                            .downcast_ref::<crate::optimize::InvalidLoop>()
                             .is_some()
                         {
                             // unroll.py:154-158: except InvalidLoop →
@@ -731,7 +731,7 @@ impl UnrollOptimizer {
                         Ok(result) => result,
                         Err(payload) => {
                             if payload
-                                .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                                .downcast_ref::<crate::optimize::InvalidLoop>()
                                 .is_some()
                             {
                                 false // unroll.py:167-168: except InvalidLoop: pass
@@ -759,7 +759,7 @@ impl UnrollOptimizer {
                         Ok(result) => result,
                         Err(payload) => {
                             if payload
-                                .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                                .downcast_ref::<crate::optimize::InvalidLoop>()
                                 .is_some()
                             {
                                 false // unroll.py:224-225: except InvalidLoop: pass
@@ -2183,7 +2183,7 @@ impl OptUnroll {
                                     arg, new_op.opcode
                                 );
                             }
-                            std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                            std::panic::panic_any(crate::optimize::InvalidLoop(
                                 "inline_short_preamble: unmapped arg in short preamble",
                             ));
                         }

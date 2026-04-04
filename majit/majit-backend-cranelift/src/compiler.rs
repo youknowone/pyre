@@ -2520,19 +2520,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             release_force_token(handle);
-            // RPython rebuild_state_after_failure parity: materialize virtual
-            // objects from recovery_layout before bridge dispatch.
-            let mut mat_outputs = outputs.clone();
-            rebuild_state_after_failure(
-                &mut mat_outputs,
-                &fail_descr.fail_arg_types,
-                fail_descr.recovery_layout_ref().as_ref(),
-                bridge.num_inputs,
-            );
             if bridge.loop_reentry {
+                // loop_reentry: use raw fail_args (same as run_compiled_code
+                // bridge dispatch). rebuild_state_after_failure transforms
+                // outputs for blackhole resume which may change Vec length.
+                let raw_outputs = outputs[..bridge.num_inputs].to_vec();
                 let bridge_frame = CraneliftBackend::execute_bridge(
                     bridge,
-                    &mat_outputs,
+                    &raw_outputs,
                     &fail_descr.fail_arg_types,
                 );
                 let _ = bridge_guard;
@@ -2550,6 +2545,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 }
                 return bridge_frame;
             }
+            // Non-loop-reentry: materialize virtuals then dispatch.
+            let mut mat_outputs = outputs.clone();
+            rebuild_state_after_failure(
+                &mut mat_outputs,
+                &fail_descr.fail_arg_types,
+                fail_descr.recovery_layout_ref().as_ref(),
+                bridge.num_inputs,
+            );
             return CraneliftBackend::execute_bridge(
                 bridge,
                 &mat_outputs,
@@ -4728,32 +4731,37 @@ fn run_compiled_code(
                     .map(|i| unsafe { *result_jf.add(header_words + i) })
                     .collect();
                 eprintln!(
-                    "[exec] bridge dispatch: guard fail_idx={} → bridge trace={} inputs={:?}",
+                    "[exec] bridge dispatch: guard fail_idx={} → bridge trace={} loop_reentry={} inputs={:?}",
                     descr.fail_index(),
                     bridge.trace_id,
+                    bridge.loop_reentry,
                     bi,
                 );
             }
-            // llgraph/runner.py:1190: values = [v for v in values if v is not None]
-            let bridge_inputs: Vec<i64> = (0..bridge.num_inputs)
-                .map(|i| unsafe { *result_jf.add(header_words + i) })
-                .collect();
-
-            // llgraph/runner.py:1191: raise Jump(target, values)
-            // run_compiled_code handles nested bridges internally via
-            // its own bridge dispatch check (recursive).
-            let (b_fi, b_out, _b_handle, _b_ff, b_descr) = run_compiled_code(
-                bridge.code_ptr,
-                &bridge.fail_descrs,
-                bridge.gc_runtime_id,
-                bridge.num_ref_roots,
-                bridge.max_output_slots,
-                &bridge_inputs,
-                bridge.needs_force_frame,
-            );
-
-            drop(_jitted_guard);
-            return (b_fi, b_out, handle, force_frame, b_descr);
+            // loop_reentry bridges: do NOT dispatch recursively from
+            // run_compiled_code. Return the guard failure to the caller
+            // (execute_with_inputs), which handles loop re-entry.
+            // Recursive dispatch would cause infinite bridge chains when
+            // the bridge's body guard fails on every 7th iteration.
+            if bridge.loop_reentry {
+                // Fall through — return guard failure to caller.
+            } else {
+                // llgraph/runner.py:1190-1191: non-loop-reentry bridge.
+                let bridge_inputs: Vec<i64> = (0..bridge.num_inputs)
+                    .map(|i| unsafe { *result_jf.add(header_words + i) })
+                    .collect();
+                let (b_fi, b_out, _b_handle, _b_ff, b_descr) = run_compiled_code(
+                    bridge.code_ptr,
+                    &bridge.fail_descrs,
+                    bridge.gc_runtime_id,
+                    bridge.num_ref_roots,
+                    bridge.max_output_slots,
+                    &bridge_inputs,
+                    bridge.needs_force_frame,
+                );
+                drop(_jitted_guard);
+                return (b_fi, b_out, handle, force_frame, b_descr);
+            }
         }
     }
 
@@ -5125,8 +5133,77 @@ impl CraneliftBackend {
             // jf_descr when available (same as RPython's get_latest_descr()).
             // Fall back to index lookup only for sentinel values (0,
             // CALL_ASSEMBLER_DEADFRAME_SENTINEL) where direct_descr is None.
-            let fail_descr = if let Some(descr) = direct_descr {
-                descr
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                let has_br = direct_descr
+                    .as_ref()
+                    .map_or(false, |d| d.bridge_ref().is_some());
+                eprintln!(
+                    "[exec-wi] direct_descr={} fi={} compiled.tid={} has_bridge={}",
+                    direct_descr
+                        .as_ref()
+                        .map_or("None".to_string(), |d| format!(
+                            "Some(fi={},tid={})",
+                            d.fail_index, d.trace_id
+                        )),
+                    fail_index,
+                    compiled.trace_id,
+                    has_br,
+                );
+            }
+            let fail_descr = if let Some(ref descr) = direct_descr {
+                // If the result came from a bridge (trace_id differs from
+                // compiled loop), check for loop_reentry or return as-is.
+                if descr.trace_id != 0 && descr.trace_id != compiled.trace_id {
+                    if descr.is_finish
+                        && descr
+                            .is_loop_reentry
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        // Bridge external JUMP → parent loop: re-enter.
+                        let frame = DeadFrame {
+                            data: Box::new(FrameData::new_preview(
+                                outputs,
+                                descr.clone(),
+                                compiled.gc_runtime_id,
+                            )),
+                        };
+                        current_inputs =
+                            raw_values_from_deadframe_typed(&frame, &descr.fail_arg_types)
+                                .unwrap_or_else(|err| {
+                                    panic!("bridge loop-reentry deadframe decode failed: {err}")
+                                });
+                        release_force_token(handle);
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[exec-wi] loop_reentry: current_inputs={:?}",
+                                &current_inputs[..current_inputs.len().min(5)],
+                            );
+                        }
+                        continue;
+                    }
+                    // Bridge guard failure: return to caller for blackhole
+                    // resume or further bridge compilation.
+                    let saved_data = if let Some(ref ff) = force_frame {
+                        take_force_frame_saved_data(ff)
+                    } else {
+                        None
+                    };
+                    let (exception_class, exception) = take_pending_jit_exception_state();
+                    if !output_transfers_current_force_token(descr, &outputs, handle) {
+                        release_force_token(handle);
+                    }
+                    return DeadFrame {
+                        data: Box::new(FrameData::new_with_savedata_and_exception(
+                            outputs,
+                            descr.clone(),
+                            compiled.gc_runtime_id,
+                            saved_data,
+                            exception_class,
+                            (!exception.is_null()).then_some(exception),
+                        )),
+                    };
+                }
+                descr.clone()
             } else if (fail_index as usize) < compiled.fail_descrs.len() {
                 compiled.fail_descrs[fail_index as usize].clone()
             } else {
@@ -5174,24 +5251,21 @@ impl CraneliftBackend {
             ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
             // If a bridge is attached to this guard, execute it.
+            // loop_reentry bridges are NOT dispatched by run_compiled_code
+            // (they skip recursive dispatch). Execute them here instead.
             let bridge_guard = fail_descr.bridge_ref();
             if let Some(ref bridge) = *bridge_guard {
                 release_force_token(handle);
-                // Materialize virtuals in-place (avoid clone).
-                rebuild_state_after_failure(
-                    &mut outputs,
-                    &fail_descr.fail_arg_types,
-                    fail_descr.recovery_layout_ref().as_ref(),
-                    bridge.num_inputs,
-                );
                 if bridge.loop_reentry {
+                    // Use raw fail_args without rebuild (same as
+                    // run_compiled_code's bridge dispatch).
+                    let raw_outputs = outputs[..bridge.num_inputs].to_vec();
                     let bridge_frame =
-                        Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+                        Self::execute_bridge(bridge, &raw_outputs, &fail_descr.fail_arg_types);
                     let _ = bridge_guard;
                     let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                         .expect("bridge deadframe must have descriptor");
                     if bridge_descr.is_finish() {
-                        // RPython llmodel.py: cpu.get_{int,ref,float}_value by type
                         current_inputs = raw_values_from_deadframe_typed(
                             &bridge_frame,
                             bridge_descr.fail_arg_types(),
@@ -5199,10 +5273,24 @@ impl CraneliftBackend {
                         .unwrap_or_else(|err| {
                             panic!("bridge loop-reentry deadframe decode failed: {err}")
                         });
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[exec-wi] loop_reentry via bridge: current_inputs={:?}",
+                                &current_inputs[..current_inputs.len().min(5)],
+                            );
+                        }
                         continue;
                     }
+                    // Bridge guard failure or non-reentry Finish: return to caller.
                     return bridge_frame;
                 }
+                // Non-loop-reentry: materialize virtuals then dispatch.
+                rebuild_state_after_failure(
+                    &mut outputs,
+                    &fail_descr.fail_arg_types,
+                    fail_descr.recovery_layout_ref().as_ref(),
+                    bridge.num_inputs,
+                );
                 return Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             }
             let _ = bridge_guard;
@@ -9822,6 +9910,30 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         if let Some(ref sd) = source_descr {
             let bridge_num_inputs = compiled.num_inputs;
+            // Determine loop_reentry before creating BridgeData.
+            let has_label: HashSet<u32> = ops
+                .iter()
+                .filter(|o| o.opcode == OpCode::Label)
+                .filter_map(|o| o.descr.as_ref().map(|d| d.index()))
+                .collect();
+            let is_loop_reentry = ops.last().map_or(false, |op| {
+                op.opcode == OpCode::Jump
+                    && op
+                        .descr
+                        .as_ref()
+                        .map_or(false, |d| !has_label.contains(&d.index()))
+            });
+            // Mark the bridge's Finish descriptors as loop_reentry so
+            // execute_with_inputs can detect them and re-enter the loop.
+            if is_loop_reentry {
+                for descr in &compiled.fail_descrs {
+                    if descr.is_finish {
+                        descr
+                            .is_loop_reentry
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
             sd.attach_bridge(BridgeData {
                 trace_id: compiled.trace_id,
                 input_types: compiled.input_types.clone(),
