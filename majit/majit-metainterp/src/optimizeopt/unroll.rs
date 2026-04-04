@@ -2096,10 +2096,15 @@ impl OptUnroll {
                     match mapping.get(arg) {
                         Some(&mapped) => *arg = mapped,
                         None => {
-                            panic!(
-                                "inline_short_preamble: unmapped arg {:?} in {:?}",
-                                arg, new_op.opcode
-                            );
+                            // RPython: raise InvalidLoop — structural mismatch
+                            // with short preamble. Return empty to abort.
+                            if crate::optimizeopt::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit] inline_short_preamble: unmapped arg {:?} in {:?} — InvalidLoop",
+                                    arg, new_op.opcode
+                                );
+                            }
+                            return Vec::new();
                         }
                     }
                 }
