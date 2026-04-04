@@ -50,6 +50,13 @@ pub struct Assembler {
     descrs: Vec<String>,
     /// RPython: Assembler._count_jitcodes
     count_jitcodes: usize,
+    /// RPython: Assembler.all_liveness — shared liveness table.
+    /// Encoded as bytes: [count_i, count_r, count_f, reg_indices...].
+    /// Deduplicated across all JitCodes via all_liveness_positions.
+    all_liveness: Vec<u8>,
+    /// RPython: Assembler.all_liveness_positions — dedup cache.
+    /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
+    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
 }
 
 impl Assembler {
@@ -59,6 +66,8 @@ impl Assembler {
             insns: HashMap::new(),
             descrs: Vec::new(),
             count_jitcodes: 0,
+            all_liveness: Vec::new(),
+            all_liveness_positions: HashMap::new(),
         }
     }
 
@@ -69,11 +78,22 @@ impl Assembler {
     /// constant pools, and register counts.
     ///
     /// RPython assembler.py:34-54.
+    /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
+    ///
+    /// RPython codewriter.py:53-56:
+    ///   ssarepr = flatten_graph(graph, regallocs)
+    ///   compute_liveness(ssarepr)          ← step 3b
+    ///   self.assembler.assemble(ssarepr)   ← step 4
     pub fn assemble(
         &mut self,
-        ssarepr: &SSARepr,
+        ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> JitCode {
+        // RPython codewriter.py:56: compute_liveness(ssarepr)
+        // Must run BEFORE assembly so -live- markers carry the full
+        // set of alive registers.
+        crate::liveness::compute_liveness(ssarepr);
+
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
         let num_regs_r = regallocs.get(&RegKind::Ref).map_or(0, |r| r.num_regs);
         let num_regs_f = regallocs.get(&RegKind::Float).map_or(0, |r| r.num_regs);
@@ -157,20 +177,31 @@ impl Assembler {
                 }
                 let opnum = self.get_opnum("live/");
                 state.code.push(opnum);
-                // RPython: _encode_liveness — 3 bytes (count_i, count_r, count_f)
-                // then register indices for each kind.
-                state.code.push(live_i.len().min(255) as u8);
-                state.code.push(live_r.len().min(255) as u8);
-                state.code.push(live_f.len().min(255) as u8);
-                for &reg in &live_i {
-                    state.code.push(reg);
-                }
-                for &reg in &live_r {
-                    state.code.push(reg);
-                }
-                for &reg in &live_f {
-                    state.code.push(reg);
-                }
+                // RPython assembler.py:234-248: _encode_liveness
+                // Deduplicate liveness data in shared table. Bytecode
+                // gets a 2-byte offset into all_liveness.
+                live_i.sort();
+                live_r.sort();
+                live_f.sort();
+                let liveness_key = (live_i.clone(), live_r.clone(), live_f.clone());
+                let offset = if let Some(&pos) = self.all_liveness_positions.get(&liveness_key) {
+                    pos
+                } else {
+                    let pos = self.all_liveness.len();
+                    self.all_liveness_positions.insert(liveness_key, pos);
+                    // RPython: chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))
+                    self.all_liveness.push(live_i.len() as u8);
+                    self.all_liveness.push(live_r.len() as u8);
+                    self.all_liveness.push(live_f.len() as u8);
+                    // Then register indices for each kind
+                    self.all_liveness.extend_from_slice(&live_i);
+                    self.all_liveness.extend_from_slice(&live_r);
+                    self.all_liveness.extend_from_slice(&live_f);
+                    pos
+                };
+                // RPython liveness.py:127-131: encode_offset — 2-byte LE
+                state.code.push((offset & 0xFF) as u8);
+                state.code.push((offset >> 8) as u8);
             }
 
             // RPython assembler.py:141-142: '---' → skip
@@ -590,7 +621,7 @@ mod tests {
 
     #[test]
     fn assemble_basic() {
-        let flat = SSARepr {
+        let mut flat = SSARepr {
             name: "test".into(),
             ops: vec![],
             num_values: 0,
@@ -622,7 +653,7 @@ mod tests {
             },
         );
         let mut asm = Assembler::new();
-        let jitcode = asm.assemble(&flat, &regallocs);
+        let jitcode = asm.assemble(&mut flat, &regallocs);
 
         assert_eq!(jitcode.name, "test");
         assert_eq!(jitcode.num_regs_i, 0);
@@ -677,7 +708,7 @@ mod tests {
         value_kinds.insert(v2, RegKind::Ref);
 
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
-        let flat = SSARepr {
+        let mut flat = SSARepr {
             name: "add".into(),
             ops: vec![],
             num_values: 3,
@@ -685,7 +716,7 @@ mod tests {
             value_kinds,
         };
         let mut asm = Assembler::new();
-        let jitcode = asm.assemble(&flat, &regallocs);
+        let jitcode = asm.assemble(&mut flat, &regallocs);
 
         // v0 dies when v1 is defined → they share a register → 1 int reg
         assert_eq!(jitcode.num_regs_i, 1);

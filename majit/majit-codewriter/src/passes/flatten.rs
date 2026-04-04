@@ -134,8 +134,16 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 false_args,
             } => {
                 // RPython flatten.py:240-267: Two exits with boolean condition.
-                // Emit goto_if_not(cond, false_label) — jump to false path
-                // when cond is 0. True path is the fallthrough.
+                //
+                // Layout:
+                //   -live-
+                //   goto_if_not(cond, TLabel(false_path))
+                //   [true path: phi moves + goto true_block]
+                //   Label(false_path)
+                //   [false path: phi moves + goto false_block]
+                //
+                // The true/false block bodies are emitted separately in
+                // block order. Here we only emit the branch + phi moves.
                 let true_label = block_labels[if_true];
                 let false_label = block_labels[if_false];
 
@@ -143,13 +151,21 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 ops.push(FlatOp::Live {
                     live_values: Vec::new(),
                 });
-                // RPython flatten.py:260: goto_if_not(cond, TLabel(false_path))
+                // Allocate a fresh label for the false-path landing pad.
+                // This avoids re-using the block's own label and creating
+                // a self-jump. RPython uses TLabel(linkfalse) which is
+                // distinct from Label(linkfalse.target).
+                let false_landing = Label(next_label);
+                next_label += 1;
+
+                // RPython flatten.py:260: goto_if_not(cond, TLabel(false))
                 ops.push(FlatOp::GotoIfNot {
                     cond: *cond,
-                    target: false_label,
+                    target: false_landing,
                 });
 
                 // RPython flatten.py:264: true path (fallthrough)
+                // insert_renamings(linktrue) + make_bytecode_block(linktrue.target)
                 let true_block = graph.block(*if_true);
                 for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
                     ops.push(FlatOp::Move {
@@ -159,8 +175,9 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 }
                 ops.push(FlatOp::Jump(true_label));
 
-                // RPython flatten.py:266: false path label
-                ops.push(FlatOp::Label(false_label));
+                // RPython flatten.py:266-267: false path
+                // Label(linkfalse) then insert_renamings + make_bytecode_block
+                ops.push(FlatOp::Label(false_landing));
                 let false_block = graph.block(*if_false);
                 for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
                     ops.push(FlatOp::Move {
