@@ -1223,6 +1223,19 @@ impl OptRewrite {
                     return OptimizationResult::Remove;
                 }
             }
+        } else {
+            // rewrite.py:550-553: non-instance array pointer comparison.
+            // If both are ArrayPtrInfo with known-different length bounds,
+            // they cannot be the same object.
+            if let (Some(lb0), Some(lb1)) = (
+                info0.and_then(|i| i.getlenbound()),
+                info1.and_then(|i| i.getlenbound()),
+            ) {
+                if lb0.known_ne(lb1) {
+                    ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
+                    return OptimizationResult::Remove;
+                }
+            }
         }
 
         OptimizationResult::PassOn
@@ -1426,12 +1439,12 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Optimize GUARD_VALUE: if the guarded value equals the expected constant -> remove.
-    /// rewrite.py: optimize_GUARD_VALUE + _maybe_replace_guard_value
+    /// rewrite.py:284-347: optimize_GUARD_VALUE + replace_old_guard_with_guard_value
     ///
     /// If both args are constants and equal, the guard is redundant → remove.
-    /// If the guarded value is a boolean comparison result, replace with
-    /// GUARD_TRUE (if expecting 1) or GUARD_FALSE (if expecting 0).
+    /// If arg0 is Ref-typed with a prior guard_nonnull/guard_class, replace
+    /// that old guard with guard_value (rewrite.py:307-347).
+    /// If the expected value is boolean, replace with GUARD_TRUE/FALSE.
     fn optimize_guard_value(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
@@ -1444,6 +1457,69 @@ impl OptRewrite {
         {
             if actual == expected {
                 return OptimizationResult::Remove;
+            }
+        }
+
+        // rewrite.py:284-301: optimize_GUARD_VALUE for Ref args.
+        // If there's a prior guard_nonnull or guard_class, replace it with
+        // guard_value (rewrite.py:307-347: replace_old_guard_with_guard_value).
+        let obj = ctx.get_box_replacement(arg0);
+        if let Some(info) = ctx.get_ptr_info(obj) {
+            if info.is_virtual() {
+                raise_invalid_loop("promote of a virtual");
+            }
+            // rewrite.py:307-347: replace_old_guard_with_guard_value
+            if let Some(old_guard) = ctx.get_last_guard(obj).cloned() {
+                if let Some(ev) = ctx.get_constant_int(arg1) {
+                    if ev == 0 {
+                        raise_invalid_loop(
+                            "GUARD_VALUE(..., NULL) follows a guard that it is not NULL",
+                        );
+                    }
+                    // rewrite.py:324-332: check class consistency
+                    if let Some(prev_cls) = ctx
+                        .get_ptr_info(obj)
+                        .and_then(|i| i.get_known_class())
+                        .cloned()
+                    {
+                        if let Some(known_cls) = ctx.get_known_class(arg1) {
+                            if prev_cls != known_cls {
+                                raise_invalid_loop(
+                                    "GUARD_VALUE class contradicts prior GUARD_CLASS",
+                                );
+                            }
+                        }
+                    }
+                    // rewrite.py:333-334: can_replace_guards check.
+                    if !ctx.can_replace_guards {
+                        return OptimizationResult::PassOn;
+                    }
+                    // rewrite.py:335-347: replace old guard with GUARD_VALUE
+                    if let Some(old_idx) =
+                        ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos())
+                    {
+                        // rewrite.py:335-338: copy_and_change with fresh descr.
+                        let mut replacement =
+                            Op::new(OpCode::GuardValue, &[old_guard.arg(0), arg1]);
+                        replacement.pos = old_guard.pos;
+                        replacement.fail_args = old_guard.fail_args.clone();
+                        replacement.fail_arg_types = old_guard.fail_arg_types.clone();
+                        replacement.rd_resume_position = old_guard.rd_resume_position;
+                        replacement.rd_numb = old_guard.rd_numb.clone();
+                        replacement.rd_consts = old_guard.rd_consts.clone();
+                        replacement.rd_virtuals = old_guard.rd_virtuals.clone();
+                        // descr is intentionally NOT copied — fresh descr
+                        // (rewrite.py:335: descr = compile.ResumeGuardDescr())
+                        // rewrite.py:343: self.optimizer.replace_guard(op, info)
+                        ctx.new_operations[old_idx] = replacement;
+                        // rewrite.py:345-346: info.reset_last_guard_pos()
+                        if let Some(info_mut) = ctx.get_ptr_info_mut(obj) {
+                            info_mut.reset_last_guard_pos();
+                        }
+                        ctx.make_constant(arg0, majit_ir::Value::Int(ev));
+                        return OptimizationResult::Remove;
+                    }
+                }
             }
         }
 

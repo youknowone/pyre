@@ -681,6 +681,9 @@ pub fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 pub struct IndexVar {
     /// The base SSA variable.
     pub var: OpRef,
+    /// If `var` is a ConstInt OpRef, the resolved integer value.
+    /// dependency.py:1117-1118: isinstance(svar, ConstInt) comparison.
+    pub var_const: Option<i64>,
     /// Multiplicative coefficient (numerator).
     pub coefficient_mul: i64,
     /// Divisive coefficient (denominator).
@@ -693,6 +696,18 @@ impl IndexVar {
     pub fn new(var: OpRef) -> Self {
         IndexVar {
             var,
+            var_const: None,
+            coefficient_mul: 1,
+            coefficient_div: 1,
+            constant: 0,
+        }
+    }
+
+    /// Create an IndexVar for a constant variable.
+    pub fn new_const(var: OpRef, value: i64) -> Self {
+        IndexVar {
+            var,
+            var_const: Some(value),
             coefficient_mul: 1,
             coefficient_div: 1,
             constant: 0,
@@ -741,6 +756,11 @@ impl IndexVar {
             return (false, 0);
         }
         let c = self.constant - other.constant;
+        // dependency.py:1117-1118: both ConstInt → always comparable.
+        // RPython returns (True, svar.getint() - ovar.getint()) without c.
+        if let (Some(sv), Some(ov)) = (self.var_const, other.var_const) {
+            return (true, sv - ov);
+        }
         if self.var == other.var {
             return (true, c);
         }
@@ -756,6 +776,7 @@ impl IndexVar {
     pub fn clone_var(&self) -> Self {
         IndexVar {
             var: self.var,
+            var_const: self.var_const,
             coefficient_mul: self.coefficient_mul,
             coefficient_div: self.coefficient_div,
             constant: self.constant,
@@ -1009,10 +1030,14 @@ impl<'a> IntegralForwardModification<'a> {
     }
 
     fn get_or_create(&mut self, arg: OpRef) -> IndexVar {
-        self.index_vars
-            .get(&arg)
-            .cloned()
-            .unwrap_or_else(|| IndexVar::new(arg))
+        self.index_vars.get(&arg).cloned().unwrap_or_else(|| {
+            if Self::is_const(arg) {
+                let val = self.const_val(arg).unwrap_or(0);
+                IndexVar::new_const(arg, val)
+            } else {
+                IndexVar::new(arg)
+            }
+        })
     }
 
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.

@@ -217,6 +217,9 @@ pub struct OptContext {
     /// RPython import_state: maps original inputarg index → fresh virtual head OpRef.
     /// Used by ensure_linked_list_head to return the imported virtual.
     pub imported_virtual_heads: Vec<(usize, OpRef)>,
+    /// optimizer.py: `can_replace_guards` — disable guard replacement during
+    /// bridge compilation. Defaults to true for preamble.
+    pub can_replace_guards: bool,
     /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
     /// Used by unroll to attach resume data to extra guards from short preamble.
     pub patchguardop: Option<Op>,
@@ -642,6 +645,7 @@ impl OptContext {
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),
             imported_label_args: None,
+            can_replace_guards: true,
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
@@ -695,6 +699,7 @@ impl OptContext {
             imported_virtual_heads: Vec::new(),
             imported_virtuals: Vec::new(),
             imported_label_args: None,
+            can_replace_guards: true,
             patchguardop: None,
             pre_force_virtual_state: None,
             pre_force_jump_args: None,
