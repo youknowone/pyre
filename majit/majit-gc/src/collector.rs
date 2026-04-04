@@ -3426,23 +3426,23 @@ mod tests {
     }
 
     #[test]
-    fn test_minor_root_walk_copies_nursery_object() {
-        // RPython parity: is_nursery_object_start uses range check
-        // (incminimark.py:1208), not a set. All roots point to exact
-        // object starts — interior pointers are never GC roots.
+    fn test_minor_root_walk_skips_interior_nursery_pointers() {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
 
         let obj = gc.alloc_with_type(tid, 16);
         let mut exact_root = obj;
+        let mut interior_root = GcRef(obj.0 + 8);
         unsafe {
             gc.roots.add(&mut exact_root);
+            gc.roots.add(&mut interior_root);
         }
 
         gc.do_collect_nursery();
 
         assert!(!exact_root.is_null());
         assert!(gc.oldgen.contains(exact_root.0));
+        assert_eq!(interior_root.0, obj.0 + 8);
 
         gc.roots.clear();
     }
