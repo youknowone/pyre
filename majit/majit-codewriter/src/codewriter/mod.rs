@@ -116,18 +116,7 @@ impl CodeWriter {
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
     ///
-    /// Processes all pending graphs from CallControl's unfinished_graphs queue.
-    /// New graphs may be discovered during jtransform (via `get_jitcode()`),
-    /// so the loop continues until no more pending graphs remain.
-    ///
-    /// RPython identity contract: `get_jitcode()` creates the JitCode object
-    /// and assigns it to `jitcodes[graph]`. `enum_pending_graphs()` yields
-    /// `(graph, jitcode)` — the same object. `jitcode.index` is set to
-    /// `len(all_jitcodes)` at processing time (codewriter.py:68,80).
-    ///
-    /// In majit, `get_jitcode()` assigns a stable index upfront. We use
-    /// that same index here, preserving the contract that InlineCall's
-    /// `jitcode_index` matches the final `JitCode.index`.
+    /// Full pipeline: grab_initial_jitcodes → enum_pending_graphs loop → finished.
     pub fn make_jitcodes(
         &mut self,
         callcontrol: &mut CallControl,
@@ -135,31 +124,40 @@ impl CodeWriter {
     ) -> Vec<JitCode> {
         // RPython: self.callcontrol.grab_initial_jitcodes() (codewriter.py:76)
         callcontrol.grab_initial_jitcodes();
+        self.make_jitcodes_pending(callcontrol, config)
+    }
 
+    /// Process pending graphs only (enum_pending_graphs loop + finished).
+    ///
+    /// Split from `make_jitcodes()` so that callers who need to seed
+    /// portal graphs before arm processing can call `grab_initial_jitcodes()`
+    /// themselves, then call this after arm jtransform completes.
+    ///
+    /// RPython codewriter.py:79-85: the enum_pending_graphs loop + finished.
+    pub fn make_jitcodes_pending(
+        &mut self,
+        callcontrol: &mut CallControl,
+        config: &GraphTransformConfig,
+    ) -> Vec<JitCode> {
         let mut all_jitcodes: Vec<JitCode> = Vec::new();
 
         // RPython: for graph, jitcode in self.callcontrol.enum_pending_graphs():
         //            self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
         // (codewriter.py:79-84)
         //
-        // RPython's enum_pending_graphs() is a while-loop that pops from
-        // unfinished_graphs. During transform, new graphs may be discovered
-        // and added via get_jitcode(). We drain the queue in batches.
+        // RPython's enum_pending_graphs() pops from unfinished_graphs (LIFO).
+        // During transform, new graphs may be discovered and added via
+        // get_jitcode(). We pop one at a time to match RPython's yield semantics.
         loop {
-            let pending = callcontrol.enum_pending_graphs();
-            if pending.is_empty() {
+            let popped = callcontrol.pop_one_graph();
+            let Some((path, index)) = popped else {
                 break;
-            }
-            for (path, index) in pending {
-                let graph = callcontrol.function_graphs().get(&path).cloned();
-                if let Some(graph) = graph {
-                    // RPython: self.transform_graph_to_jitcode(graph, jitcode, verbose, index)
-                    // The index comes from CallControl.get_jitcode() — the same
-                    // index embedded in InlineCall ops by jtransform.
-                    let (_ssarepr, jitcode) =
-                        self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
-                    all_jitcodes.push(jitcode);
-                }
+            };
+            let graph = callcontrol.function_graphs().get(&path).cloned();
+            if let Some(graph) = graph {
+                let (_ssarepr, jitcode) =
+                    self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
+                all_jitcodes.push(jitcode);
             }
         }
 
