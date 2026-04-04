@@ -646,6 +646,11 @@ impl<'a> Transformer<'a> {
                         std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0));
                     cc.callinfocollection
                         .add(oopspec_index, calldescr, func_as_int);
+                    // RPython: see_raw_object(func.ptr) derives name from
+                    // func.ptr._obj._name. We store the target name explicitly
+                    // since we have no pointer linkage.
+                    cc.callinfocollection
+                        .register_func_name(func_as_int, format!("{target}"));
                 }
             }
 

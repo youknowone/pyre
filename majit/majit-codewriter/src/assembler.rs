@@ -751,13 +751,24 @@ impl Assembler {
 
     /// RPython: `Assembler.finished(callinfocollection)` (assembler.py:300-305).
     ///
-    /// Registers extra functions from the CallInfoCollection for debugging.
+    /// ```python
+    /// def finished(self, callinfocollection):
+    ///     for func in callinfocollection.all_function_addresses_as_int():
+    ///         func = int2adr(func)
+    ///         self.see_raw_object(func.ptr)
+    /// ```
+    ///
+    /// RPython's `see_raw_object` extracts `func.ptr._obj._name` to build
+    /// `list_of_addr2name`. In majit, names are registered at `add()` time
+    /// via `register_func_name()`.
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
-        // RPython: for func in callinfocollection.all_function_addresses_as_int():
-        //            func = int2adr(func); self.see_raw_object(func.ptr)
         for func_addr in callinfocollection.all_function_addresses() {
-            let name = format!("func@{func_addr:#x}");
-            self.see_raw_object(&name, &name);
+            // RPython: see_raw_object(func.ptr)
+            // → name = value._obj._name (for FuncType)
+            // → self.list_of_addr2name.append((addr, name))
+            let name = callinfocollection.func_name(func_addr).unwrap_or("?");
+            let addr_key = format!("{func_addr:#x}");
+            self.see_raw_object(&addr_key, name);
         }
     }
 

@@ -1148,8 +1148,12 @@ impl FailDescr for SimpleFailDescr {
 /// of special-cased operations (arraycopy, string ops, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct CallInfoCollection {
-    /// Maps OopSpecIndex → (descriptor_ref, function_address).
+    /// RPython: `_callinfo_for_oopspec` — {oopspecindex: (calldescr, func_as_int)}.
     entries: std::collections::HashMap<OopSpecIndex, (DescrRef, u64)>,
+    /// majit extension: func_as_int → function name.
+    /// RPython derives names from `func.ptr._obj._name` at `see_raw_object` time.
+    /// Since majit has no function pointers, we store the name at `add()` time.
+    func_names: std::collections::HashMap<u64, String>,
 }
 
 impl CallInfoCollection {
@@ -1160,6 +1164,13 @@ impl CallInfoCollection {
     /// effectinfo.py: add(oopspecindex, calldescr, func_as_int)
     pub fn add(&mut self, oopspec: OopSpecIndex, calldescr: DescrRef, func_addr: u64) {
         self.entries.insert(oopspec, (calldescr, func_addr));
+    }
+
+    /// Register the name for a function address.
+    /// RPython: the name is `func.ptr._obj._name`, extracted by `see_raw_object`.
+    /// In majit, we must store it explicitly since we have no pointer linkage.
+    pub fn register_func_name(&mut self, func_addr: u64, name: String) {
+        self.func_names.insert(func_addr, name);
     }
 
     /// effectinfo.py: has_oopspec(oopspecindex)
@@ -1175,6 +1186,12 @@ impl CallInfoCollection {
     /// effectinfo.py: all_function_addresses_as_int()
     pub fn all_function_addresses(&self) -> Vec<u64> {
         self.entries.values().map(|(_, addr)| *addr).collect()
+    }
+
+    /// Look up function name by address.
+    /// RPython: `see_raw_object(func.ptr)` derives name from `func.ptr._obj._name`.
+    pub fn func_name(&self, addr: u64) -> Option<&str> {
+        self.func_names.get(&addr).map(String::as_str)
     }
 }
 
