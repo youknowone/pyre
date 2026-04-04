@@ -111,6 +111,10 @@ pub fn build_function_graph_with_self_ty_pub(
 #[derive(Debug, Clone, Default)]
 struct GraphBuildContext {
     local_type_roots: HashMap<String, String>,
+    /// RPython: ARRAY identity — full type string for array identity
+    /// discrimination. Maps variable name → canonical type string
+    /// (e.g. "arr" → "Vec<Point>"). Used by `cpu.arraydescrof(ARRAY)`.
+    local_full_types: HashMap<String, String>,
 }
 
 fn build_function_graph(
@@ -145,6 +149,9 @@ fn build_function_graph(
                 let name = canonical_pat_name(&pat_type.pat);
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
                     ctx.local_type_roots.insert(name.clone(), type_root);
+                }
+                if let Some(full_type) = full_type_string(&pat_type.ty) {
+                    ctx.local_full_types.insert(name.clone(), full_type);
                 }
                 if let Some(vid) = graph.push_op(
                     entry,
@@ -267,12 +274,14 @@ fn lower_expr(
                 .unwrap_or_else(|| graph.alloc_value());
             let index = lower_expr(graph, block, &idx.index, options, ctx)
                 .unwrap_or_else(|| graph.alloc_value());
+            let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             graph.push_op(
                 *block,
                 OpKind::ArrayRead {
                     base,
                     index,
                     item_ty: ValueType::Unknown,
+                    array_type_id,
                 },
                 true,
             )
@@ -307,6 +316,7 @@ fn lower_expr(
                         .unwrap_or_else(|| graph.alloc_value());
                     let index = lower_expr(graph, block, &idx.index, options, ctx)
                         .unwrap_or_else(|| graph.alloc_value());
+                    let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                     graph.push_op(
                         *block,
                         OpKind::ArrayWrite {
@@ -314,6 +324,7 @@ fn lower_expr(
                             index,
                             value,
                             item_ty: ValueType::Unknown,
+                            array_type_id,
                         },
                         false,
                     );
@@ -892,6 +903,72 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
         syn::Type::Reference(reference) => type_root_ident(&reference.elem),
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
+        _ => None,
+    }
+}
+
+/// RPython: ARRAY lltype identity string.
+///
+/// Produces a canonical string from a `syn::Type` that includes generic
+/// arguments, e.g. `Vec<Point>`, `HashMap<String,i64>`.  This is the
+/// Rust equivalent of RPython's `lltype.GcArray(T)` identity — two types
+/// produce the same string iff they represent the same array layout.
+fn full_type_string(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| {
+                    let name = seg.ident.to_string();
+                    match &seg.arguments {
+                        syn::PathArguments::None => name,
+                        syn::PathArguments::AngleBracketed(args) => {
+                            let inner: Vec<String> = args
+                                .args
+                                .iter()
+                                .filter_map(|arg| match arg {
+                                    syn::GenericArgument::Type(t) => full_type_string(t),
+                                    _ => None,
+                                })
+                                .collect();
+                            if inner.is_empty() {
+                                name
+                            } else {
+                                format!("{}<{}>", name, inner.join(","))
+                            }
+                        }
+                        syn::PathArguments::Parenthesized(_) => name,
+                    }
+                })
+                .collect();
+            Some(segments.join("::"))
+        }
+        syn::Type::Reference(r) => full_type_string(&r.elem),
+        syn::Type::Paren(p) => full_type_string(&p.elem),
+        syn::Type::Group(g) => full_type_string(&g.elem),
+        syn::Type::Slice(s) => full_type_string(&s.elem).map(|t| format!("[{}]", t)),
+        syn::Type::Array(a) => full_type_string(&a.elem).map(|t| format!("[{}]", t)),
+        _ => None,
+    }
+}
+
+/// RPython: resolve ARRAY identity from an expression.
+///
+/// For `arr[idx]`, returns the full type of `arr` from context.
+/// Analogous to how RPython's rtyper resolves `op.args[0].concretetype`
+/// to get the ARRAY lltype.
+fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .and_then(|ident| ctx.local_full_types.get(&ident.to_string()).cloned()),
+        syn::Expr::Reference(r) => array_type_id_from_expr(&r.expr, ctx),
+        syn::Expr::Paren(p) => array_type_id_from_expr(&p.expr, ctx),
+        // For field access (self.array) or other complex exprs,
+        // type is not statically known — return None (conservative).
         _ => None,
     }
 }

@@ -301,21 +301,25 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             base,
             index,
             item_ty,
+            array_type_id,
         } => OpKind::ArrayRead {
             base: remap(base),
             index: remap(index),
             item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::ArrayWrite {
             base,
             index,
             value,
             item_ty,
+            array_type_id,
         } => OpKind::ArrayWrite {
             base: remap(base),
             index: remap(index),
             value: remap(value),
             item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::Call {
             target,
@@ -673,6 +677,7 @@ mod tests {
                 base: base.unwrap(),
                 index: idx.unwrap(),
                 item_ty: ValueType::Ref,
+                array_type_id: None,
             },
             true,
         );
