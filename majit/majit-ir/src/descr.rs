@@ -318,6 +318,12 @@ pub enum ArrayFlag {
 
 impl ArrayFlag {
     /// RPython: get_type_flag(TYPE) (descr.py:241-254).
+    ///
+    /// When only the IR type is known (no concrete Rust type string),
+    /// `Type::Int` maps to `Unsigned` — RPython's default for unknown
+    /// integer types (descr.py:254: `return FLAG_UNSIGNED`).
+    /// Use `get_type_flag()` in call.rs for precise signed/unsigned
+    /// classification from concrete type names.
     pub fn from_item_type(item_type: Type, is_struct: bool) -> Self {
         if is_struct {
             return ArrayFlag::Struct;
@@ -325,7 +331,10 @@ impl ArrayFlag {
         match item_type {
             Type::Ref => ArrayFlag::Pointer,
             Type::Float => ArrayFlag::Float,
-            Type::Int => ArrayFlag::Signed,
+            // RPython: default for unresolved integer type is FLAG_UNSIGNED
+            // (descr.py:254). Callers with concrete type info should use
+            // get_type_flag() for FLAG_SIGNED/FLAG_UNSIGNED distinction.
+            Type::Int => ArrayFlag::Unsigned,
             Type::Void => ArrayFlag::Void,
         }
     }
