@@ -2237,6 +2237,16 @@ impl Optimizer {
             let ni = self.final_num_inputs();
             OptContext::with_num_inputs(32, ni)
         });
+
+        // RPython parity: export virtual state BEFORE flush() and
+        // force_box_for_end_of_preamble(). In RPython, get_virtual_state
+        // is called inside _jump_to_existing_trace on the original Box
+        // objects whose PtrInfo reflects the pre-flush optimizer state.
+        // flush() may force pending virtuals, changing their PtrInfo to
+        // non-virtual. Capture the virtual state before any forcing.
+        let pre_force_vs =
+            crate::optimizeopt::virtualstate::export_state(&jump_args, &ctx, &ctx.forwarded);
+
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_box_for_end_of_preamble for each jump arg
@@ -2244,11 +2254,17 @@ impl Optimizer {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
 
-        // Resolve JUMP args after forcing
-        let jump_args: Vec<_> = jump_args
-            .iter()
-            .map(|&a| ctx.get_box_replacement(a))
-            .collect();
+        // RPython parity: jump_op.getarglist() returns the ORIGINAL Boxes.
+        // force_box_for_end_of_preamble recurses into virtual fields but
+        // does NOT force the top-level virtuals. So get_virtual_state on
+        // the original args still sees Virtual PtrInfo.
+        // In pyre, pass the PRE-resolved OpRefs to jump_to_existing_trace
+        // so that get_virtual_state (export_state) sees the original PtrInfo.
+        // The resolution to forced boxes happens inside _jump_to_existing_trace
+        // via get_box_replacement, which is correct for make_inputargs_and_virtuals.
+        //
+        // DO NOT resolve jump_args here — pass originals so virtual_state
+        // is computed from the pre-force state.
 
         // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
         // RPython iterates ALL target_tokens; preamble (virtual_state=None)
@@ -2262,6 +2278,7 @@ impl Optimizer {
             &mut ctx,
             false,
             &pre_opt_jump_args,
+            Some(pre_force_vs.clone()),
         ) {
             Ok(vs) => vs,
             // unroll.py:209-210: except InvalidLoop → jump_to_preamble
@@ -2295,6 +2312,7 @@ impl Optimizer {
             &mut ctx,
             true,
             &pre_opt_jump_args,
+            Some(pre_force_vs),
         ) {
             Ok(vs) => vs,
             // unroll.py:224-225: except InvalidLoop: pass
@@ -2328,9 +2346,10 @@ impl Optimizer {
         ctx: &mut OptContext,
         force_boxes: bool,
         pre_opt_jump_args: &[OpRef],
+        pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Result<Option<crate::optimizeopt::virtualstate::VirtualState>, ()> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            opt_unroll.jump_to_existing_trace(
+            opt_unroll.jump_to_existing_trace_with_vs(
                 jump_args,
                 None,
                 front_target_tokens,
@@ -2338,6 +2357,7 @@ impl Optimizer {
                 ctx,
                 force_boxes,
                 Some(pre_opt_jump_args),
+                pre_vs,
             )
         })) {
             Ok(vs) => Ok(vs),

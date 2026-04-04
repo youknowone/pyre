@@ -1763,6 +1763,32 @@ impl OptUnroll {
         force_boxes: bool,
         runtime_boxes: Option<&[OpRef]>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
+        self.jump_to_existing_trace_with_vs(
+            jump_args,
+            current_label_args,
+            target_tokens,
+            optimizer,
+            ctx,
+            force_boxes,
+            runtime_boxes,
+            None,
+        )
+    }
+
+    /// Like jump_to_existing_trace, but with an optional pre-computed
+    /// virtual_state. Used by optimize_bridge where force_box_for_end_of_preamble
+    /// may change forwarding chains after the virtual state was exported.
+    pub fn jump_to_existing_trace_with_vs(
+        &self,
+        jump_args: &[OpRef],
+        current_label_args: Option<&[OpRef]>,
+        target_tokens: &mut [TargetToken],
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+        ctx: &mut OptContext,
+        force_boxes: bool,
+        runtime_boxes: Option<&[OpRef]>,
+        pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
+    ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
         optimizer.disable_guard_replacement();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.jump_to_existing_trace_impl(
@@ -1773,6 +1799,7 @@ impl OptUnroll {
                 ctx,
                 force_boxes,
                 runtime_boxes,
+                pre_vs,
             )
         }));
         optimizer.enable_guard_replacement();
@@ -1791,9 +1818,11 @@ impl OptUnroll {
         ctx: &mut OptContext,
         force_boxes: bool,
         runtime_boxes: Option<&[OpRef]>,
+        pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        let mut virtual_state =
-            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.forwarded);
+        let mut virtual_state = pre_vs.unwrap_or_else(|| {
+            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.forwarded)
+        });
         let mut args: Vec<OpRef> = jump_args
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
@@ -1837,7 +1866,9 @@ impl OptUnroll {
                 force_boxes,
             ) {
                 Ok(guards) => guards,
-                Err(()) => continue,
+                Err(()) => {
+                    continue;
+                }
             };
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args, ctx) {
