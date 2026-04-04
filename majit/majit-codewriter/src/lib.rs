@@ -138,6 +138,8 @@ fn analyze_pipeline_from_parsed(
     let mut call_control = call::CallControl::new();
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
+    // RPython: struct field types for op.args[0].concretetype resolution.
+    call_control.set_struct_fields(program.struct_fields.clone());
     for (path, graph) in &canonical_function_graphs {
         call_control.register_function_graph(path.clone(), graph.clone());
     }

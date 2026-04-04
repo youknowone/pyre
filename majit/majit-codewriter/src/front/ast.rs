@@ -21,13 +21,39 @@ pub struct SemanticFunction {
     pub graph: FunctionGraph,
 }
 
+/// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
+/// Maps struct_name → vec of (field_name, field_element_type).
+/// `field_element_type` is the array element type when the field is an
+/// array container (e.g. `Vec<Point>` → `"Point"`), or the full type
+/// string for non-array fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StructFieldRegistry {
+    /// struct_name → [(field_name, full_field_type_string)]
+    pub fields: HashMap<String, Vec<(String, String)>>,
+}
+
+impl StructFieldRegistry {
+    /// RPython: look up a field's type.  For array-typed fields like
+    /// `Vec<Point>`, this returns the full type string `"Vec<Point>"`.
+    /// Callers use `array_element_type_from_str` to extract `"Point"`.
+    pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
+        self.fields.get(owner).and_then(|fields| {
+            fields
+                .iter()
+                .find(|(name, _)| name == field_name)
+                .map(|(_, ty)| ty.as_str())
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
-    /// If the element type of an array is in this set, the array is
-    /// array-of-structs (inline struct elements, not pointers).
     pub known_struct_names: std::collections::HashSet<String>,
+    /// RPython: struct field types for resolving `op.args[0].concretetype`
+    /// on FieldRead-produced array bases.
+    pub struct_fields: StructFieldRegistry,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
@@ -46,6 +72,7 @@ pub fn build_semantic_program_with_options(
 ) -> SemanticProgram {
     let mut functions = Vec::new();
     let mut known_struct_names = std::collections::HashSet::new();
+    let mut struct_fields = StructFieldRegistry::default();
 
     for item in &parsed.file.items {
         match item {
@@ -68,11 +95,23 @@ pub fn build_semantic_program_with_options(
                     }
                 }
             }
-            // RPython: collect struct type names for get_type_flag(ARRAY.OF).
-            // If an array's element type is a known struct, the array gets
-            // FLAG_STRUCT instead of FLAG_POINTER.
+            // RPython: collect struct types + field info.
+            // heaptracker.all_interiorfielddescrs iterates STRUCT._names
+            // to build interior field descriptors.
             Item::Struct(s) => {
-                known_struct_names.insert(s.ident.to_string());
+                let name = s.ident.to_string();
+                known_struct_names.insert(name.clone());
+                // Collect field names and types (RPython: STRUCT._names + getattr(STRUCT, name))
+                let fields: Vec<(String, String)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        let field_name = f.ident.as_ref()?.to_string();
+                        let field_type = full_type_string(&f.ty)?;
+                        Some((field_name, field_type))
+                    })
+                    .collect();
+                struct_fields.fields.insert(name, fields);
             }
             _ => {}
         }
@@ -81,6 +120,7 @@ pub fn build_semantic_program_with_options(
     SemanticProgram {
         functions,
         known_struct_names,
+        struct_fields,
     }
 }
 
@@ -93,6 +133,10 @@ pub fn build_semantic_program_from_parsed_files_with_options(
         let sub = build_semantic_program_with_options(parsed, options);
         program.functions.extend(sub.functions);
         program.known_struct_names.extend(sub.known_struct_names);
+        program
+            .struct_fields
+            .fields
+            .extend(sub.struct_fields.fields);
     }
     program
 }
@@ -102,8 +146,14 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 /// Used to build semantic graphs from opcode match arm bodies.
 pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
     let mut block = graph.startblock;
-    let ctx = GraphBuildContext::default();
-    let result = lower_expr(graph, &mut block, expr, &AstGraphOptions::default(), &ctx);
+    let mut ctx = GraphBuildContext::default();
+    let result = lower_expr(
+        graph,
+        &mut block,
+        expr,
+        &AstGraphOptions::default(),
+        &mut ctx,
+    );
     if let Some(val) = result {
         graph.set_terminator(block, crate::model::Terminator::Return(Some(val)));
     } else {
@@ -184,7 +234,7 @@ fn build_function_graph(
 
     // Lower function body
     for stmt in &func.block.stmts {
-        lower_stmt(&mut graph, &mut entry, stmt, options, &ctx);
+        lower_stmt(&mut graph, &mut entry, stmt, options, &mut ctx);
     }
 
     // Default terminator if none was set
@@ -204,12 +254,13 @@ fn build_function_graph(
 /// Used by the graph-based classifier in lib.rs to analyze resolved method bodies.
 pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stmt) {
     let mut block = block;
+    let mut ctx = GraphBuildContext::default();
     lower_stmt(
         graph,
         &mut block,
         stmt,
         &AstGraphOptions::default(),
-        &GraphBuildContext::default(),
+        &mut ctx,
     );
 }
 
@@ -218,19 +269,33 @@ fn lower_stmt(
     block: &mut BlockId,
     stmt: &syn::Stmt,
     options: &AstGraphOptions,
-    ctx: &GraphBuildContext,
+    ctx: &mut GraphBuildContext,
 ) {
     match stmt {
         syn::Stmt::Expr(expr, _) => {
             lower_expr(graph, block, expr, options, ctx);
         }
         syn::Stmt::Local(local) => {
+            // RPython: rtyper assigns concretetype to let-bound variables.
+            // Extract array element type from type annotations on let bindings.
+            if let syn::Pat::Type(pat_type) = &local.pat {
+                let name = canonical_pat_name(&pat_type.pat);
+                if let Some(type_root) = type_root_ident(&pat_type.ty) {
+                    ctx.local_type_roots.insert(name.clone(), type_root);
+                }
+                if let Some(elem_type) = array_element_type(&pat_type.ty) {
+                    ctx.local_element_types.insert(name.clone(), elem_type);
+                }
+            }
             if let Some(init) = &local.init {
                 let result = lower_expr(graph, block, &init.expr, options, ctx);
                 // Record variable name (RPython Variable._name)
                 if let Some(vid) = result {
                     if let syn::Pat::Ident(pat_ident) = &local.pat {
                         graph.name_value(vid, pat_ident.ident.to_string());
+                    } else if let syn::Pat::Type(pat_type) = &local.pat {
+                        let name = canonical_pat_name(&pat_type.pat);
+                        graph.name_value(vid, name);
                     }
                 }
             }
@@ -261,7 +326,7 @@ fn lower_expr(
     block: &mut BlockId,
     expr: &syn::Expr,
     options: &AstGraphOptions,
-    ctx: &GraphBuildContext,
+    ctx: &mut GraphBuildContext,
 ) -> Option<ValueId> {
     match expr {
         // ── receiver.field ──

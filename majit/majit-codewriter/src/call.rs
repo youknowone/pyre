@@ -190,6 +190,12 @@ pub struct CallControl {
     /// If an array's element type is in this set, the array descriptor gets
     /// `ArrayFlag::Struct` (like RPython's `isinstance(TYPE, lltype.Struct)`).
     known_struct_names: HashSet<String>,
+
+    /// RPython: struct field type info — maps struct_name → [(field_name, type_string)].
+    /// Used by `resolve_array_identity` to determine the ARRAY element type
+    /// when the base of an array access comes from a FieldRead.
+    /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
+    struct_fields: crate::front::StructFieldRegistry,
 }
 
 /// Sequential descriptor index assignment — majit equivalent of
@@ -275,6 +281,7 @@ impl CallControl {
             elidable_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
+            struct_fields: crate::front::StructFieldRegistry::default(),
         }
     }
 
@@ -283,9 +290,20 @@ impl CallControl {
         self.known_struct_names = names;
     }
 
+    /// RPython: register struct field types for op.args[0].concretetype resolution.
+    pub fn set_struct_fields(&mut self, registry: crate::front::StructFieldRegistry) {
+        self.struct_fields = registry;
+    }
+
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
         self.known_struct_names.contains(name)
+    }
+
+    /// RPython: resolve a struct field's type string.
+    /// For `owner::field_name`, returns the full type of the field.
+    pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
+        self.struct_fields.field_type(owner, field_name)
     }
 
     /// Register a free function graph.
@@ -1335,20 +1353,50 @@ fn effectinfo_from_writeanalyze(
 /// Two fields `a: GcArray(Signed)` and `b: GcArray(Signed)` share the
 /// same descriptor because they have the same element type.
 ///
-/// When `array_type_id` is already set (from parser's element type
-/// extraction), use it directly. Otherwise return None, which falls
-/// back to item_ty-only keying in DescrIndexRegistry.
+/// Resolution order:
+/// 1. If the op has `array_type_id` from parser (direct variable access), use it
+/// 2. If the base comes from FieldRead, look up the field's type in struct_fields
+///    to determine the element type (RPython: op.args[0].concretetype.TO)
+/// 3. Otherwise return None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
-    _base: &crate::model::ValueId,
+    base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
-    _value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+    value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+    cc: &CallControl,
 ) -> Option<String> {
-    // Use the element-type-based identity from parser if available.
-    // For FieldRead-produced bases (self.arr[i]), we don't know the
-    // field's array element type here; fall back to item_ty only.
-    // This is conservative (merges same-item_ty arrays) but correct:
-    // RPython merges GcArray(Signed) regardless of source field.
-    op_array_type_id.clone()
+    // 1. Parser-set element type (from FnArg or typed let binding).
+    if op_array_type_id.is_some() {
+        return op_array_type_id.clone();
+    }
+    // 2. Trace back to producer — RPython: op.args[0].concretetype.
+    if let Some(producer) = value_producers.get(base) {
+        if let OpKind::FieldRead { field, .. } = producer {
+            // Look up the field's type in the struct registry.
+            // self.points → owner="MyStruct", name="points"
+            // struct_fields["MyStruct"]["points"] = "Vec<Point>"
+            // → element type = "Point"
+            if let Some(owner) = &field.owner_root {
+                if let Some(field_type_str) = cc.field_type(owner, &field.name) {
+                    // Extract element type from container: "Vec<Point>" → "Point"
+                    return extract_element_type_from_str(field_type_str);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract element type from a type string like `"Vec<Point>"` → `"Point"`.
+/// RPython equivalent: `ARRAY.OF` from `GcArray(T)` → `T`.
+fn extract_element_type_from_str(type_str: &str) -> Option<String> {
+    // Find first '<' and matching '>'
+    let start = type_str.find('<')?;
+    let end = type_str.rfind('>')?;
+    if start < end {
+        Some(type_str[start + 1..end].trim().to_string())
+    } else {
+        None
+    }
 }
 
 /// Transitive read/write effect collection.
@@ -1420,7 +1468,8 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
-                    let resolved_id = resolve_array_identity(base, array_type_id, &value_producers);
+                    let resolved_id =
+                        resolve_array_identity(base, array_type_id, &value_producers, cc);
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *read_arrays |= 1u64 << idx;
@@ -1432,7 +1481,8 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let resolved_id = resolve_array_identity(base, array_type_id, &value_producers);
+                    let resolved_id =
+                        resolve_array_identity(base, array_type_id, &value_producers, cc);
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *write_arrays |= 1u64 << idx;
@@ -1452,13 +1502,23 @@ fn collect_readwrite_effects(
                         };
                         // RPython: get_type_flag(ARRAY.OF) determines the flag.
                         // isinstance(TYPE, lltype.Struct) → FLAG_STRUCT.
-                        let is_struct = resolved_id
-                            .as_deref()
-                            .is_some_and(|name| cc.is_known_struct(name));
+                        let elem_name = resolved_id.as_deref();
+                        let is_struct = elem_name.is_some_and(|n| cc.is_known_struct(n));
                         let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, is_struct);
-                        let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
                             idx, 0, 8, 0, ir_type, flag,
                         );
+                        // RPython: heaptracker.all_interiorfielddescrs(gccache, ARRAY).
+                        // For array-of-structs, collect interior field descriptors
+                        // from the struct definition.
+                        if is_struct {
+                            if let Some(struct_name) = elem_name {
+                                let fielddescrs = build_interior_fielddescrs(cc, struct_name, idx);
+                                if !fielddescrs.is_empty() {
+                                    ad.set_all_fielddescrs(fielddescrs);
+                                }
+                            }
+                        }
                         array_write_descrs.push(std::sync::Arc::new(ad));
                     }
                 }
@@ -1490,6 +1550,39 @@ fn collect_readwrite_effects(
             }
         }
     }
+}
+
+/// RPython: `heaptracker.all_interiorfielddescrs(gccache, ARRAY)`.
+///
+/// For an array-of-structs (element type is a known struct), iterate the
+/// struct's fields and create an InteriorFieldDescr for each one.
+/// This mirrors `heaptracker.py:74-92` which iterates `STRUCT._names`.
+fn build_interior_fielddescrs(
+    cc: &CallControl,
+    struct_name: &str,
+    array_descr_idx: u32,
+) -> Vec<majit_ir::descr::DescrRef> {
+    let fields = match cc.struct_fields.fields.get(struct_name) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, (_field_name, _field_type))| {
+            // RPython: InteriorFieldDescr(arraydescr, fielddescr)
+            // Create a simple field descriptor with a unique index.
+            let field_idx = (array_descr_idx * 64 + i as u32) % u32::MAX;
+            let fd = majit_ir::descr::SimpleFieldDescr::new(
+                field_idx,
+                0,                          // offset — determined at backend time
+                8,                          // field_size — default word size
+                majit_ir::value::Type::Int, // field_type — refined at backend
+                false,                      // is_immutable
+            );
+            std::sync::Arc::new(fd) as majit_ir::descr::DescrRef
+        })
+        .collect()
 }
 
 /// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py:14-17).
