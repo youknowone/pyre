@@ -136,6 +136,32 @@ fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
     }
 }
 
+/// Build value kind map from type resolution state.
+///
+/// RPython: `getkind(v.concretetype)` — in RPython, types live directly
+/// on variables. In majit, we extract them from TypeResolutionState.
+///
+/// Used by both `perform_all_register_allocations()` (before flatten)
+/// and `flatten_with_types()` (populates SSARepr.value_kinds).
+pub fn build_value_kinds(
+    types: &TypeResolutionState,
+) -> HashMap<ValueId, crate::passes::flatten::RegKind> {
+    use crate::passes::flatten::RegKind;
+    types
+        .concrete_types
+        .iter()
+        .filter_map(|(&vid, ct)| {
+            let kind = match ct {
+                ConcreteType::Signed => RegKind::Int,
+                ConcreteType::GcRef => RegKind::Ref,
+                ConcreteType::Float => RegKind::Float,
+                _ => return None,
+            };
+            Some((vid, kind))
+        })
+        .collect()
+}
+
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) => ConcreteType::Signed,
