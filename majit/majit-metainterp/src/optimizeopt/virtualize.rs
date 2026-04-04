@@ -365,37 +365,37 @@ impl OptVirtualize {
         vinfo: VirtualInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // RPython info.py:137-156: _is_virtual = False.
-        // info.py:225: self._fields[i] = None before emit_extra(setfieldop).
-        // Clear field values so heap cache doesn't suppress SetfieldGc.
+        // info.py:147-156: self._is_virtual = False, newop.set_forwarded(self).
+        // Same PtrInfo (now non-virtual) stays on newop with fields intact.
         let preserved = PtrInfo::Instance(crate::optimizeopt::info::InstancePtrInfo {
             descr: Some(vinfo.descr.clone()),
             known_class: vinfo.known_class,
-            fields: Vec::new(),
+            fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
-        // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
-        // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
 
-        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
 
-        // Set forwarding only when the refs differ (avoids self-loop)
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // Emit SETFIELD_GC for each tracked field
+        // info.py:216-226 _force_elements: for each field, read value,
+        // force_box, clear self._fields[i] = None, THEN emit_extra.
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
+            // info.py:225: self._fields[i] = None — clear BEFORE emit_extra
+            if let Some(info) = ctx.get_ptr_info_mut(alloc_ref) {
+                info.clear_field(field_idx);
+            }
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
                 get_field_descr(&vinfo.field_descrs, field_idx)
@@ -447,39 +447,36 @@ impl OptVirtualize {
         vinfo: VirtualStructInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // RPython info.py:147-156: _is_virtual = False, _fields retained.
-        // newop.set_forwarded(self) — the same PtrInfo (now non-virtual)
-        // stays accessible via get_ptr_info(alloc_ref).
-        // RPython info.py:147-156: _is_virtual = False, _fields retained
-        // BUT info.py:225: self._fields[i] = None before emit_extra(setfieldop).
-        // Preserve descr+field_descrs for type resolution, but clear field VALUES
-        // so the heap cache doesn't suppress the SetfieldGc emissions.
+        // info.py:147-156: self._is_virtual = False, newop.set_forwarded(self).
+        // Same PtrInfo (now non-virtual) stays on newop with fields intact.
         let preserved = PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
             descr: vinfo.descr.clone(),
-            fields: Vec::new(),
+            fields: vinfo.fields.clone(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
-        // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
-        // Emit NEW
         let mut alloc_op = Op::new(OpCode::New, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
 
-        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // RPython info.py:226: optforce.emit_extra(setfieldop)
+        // info.py:216-226 _force_elements: for each field, read value,
+        // force_box, clear self._fields[i] = None, THEN emit_extra.
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
+            // info.py:225: self._fields[i] = None — clear BEFORE emit_extra
+            if let Some(info) = ctx.get_ptr_info_mut(alloc_ref) {
+                info.clear_field(*field_idx);
+            }
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
