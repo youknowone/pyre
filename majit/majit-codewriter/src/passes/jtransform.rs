@@ -795,13 +795,10 @@ impl<'a> Transformer<'a> {
         ops
     }
 
-    /// Get the kind character ('i', 'r', 'f', 'v') for a value.
-    /// Uses type_state if available, falls back to 'i'.
-    fn value_kind(&self, _v: ValueId) -> char {
-        // Without full type resolution at this stage, assume 'i' for
-        // non-void values. A complete implementation would consult
-        // type_state or the annotation pass.
-        'i'
+    /// RPython: `getkind(v.concretetype)` — get the kind of a value.
+    /// Delegates to `get_value_kind()` which consults type_state.
+    fn value_kind(&self, v: ValueId) -> char {
+        self.get_value_kind(v)
     }
 
     /// RPython: `Transformer.handle_residual_call(op)`.

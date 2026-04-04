@@ -128,7 +128,29 @@ mod tests {
             value_kinds: HashMap::new(),
         };
 
-        let regallocs = regalloc::perform_all_register_allocations(&flat);
+        // Empty regalloc results
+        let mut regallocs = HashMap::new();
+        regallocs.insert(
+            RegKind::Int,
+            regalloc::RegAllocResult {
+                coloring: HashMap::new(),
+                num_regs: 0,
+            },
+        );
+        regallocs.insert(
+            RegKind::Ref,
+            regalloc::RegAllocResult {
+                coloring: HashMap::new(),
+                num_regs: 0,
+            },
+        );
+        regallocs.insert(
+            RegKind::Float,
+            regalloc::RegAllocResult {
+                coloring: HashMap::new(),
+                num_regs: 0,
+            },
+        );
         let mut asm = Assembler::new();
         let jitcode = asm.assemble(&flat, &regallocs);
 
@@ -141,51 +163,62 @@ mod tests {
 
     #[test]
     fn assemble_with_registers() {
-        use crate::model::{OpKind, SpaceOperation, ValueType};
+        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+        // Build graph for regalloc (regalloc operates on graph, not SSARepr)
+        let mut graph = FunctionGraph::new("add");
+        let entry = graph.entry;
+        let v0 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v1 = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: v0,
+                    rhs: v0,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v2 = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "r".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(entry, Terminator::Return(Some(v1)));
+
+        let mut value_kinds = HashMap::new();
+        value_kinds.insert(v0, RegKind::Int);
+        value_kinds.insert(v1, RegKind::Int);
+        value_kinds.insert(v2, RegKind::Ref);
+
+        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let flat = SSARepr {
             name: "add".into(),
-            ops: vec![
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(0)),
-                    kind: OpKind::Input {
-                        name: "a".into(),
-                        ty: ValueType::Int,
-                    },
-                }),
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(1)),
-                    kind: OpKind::BinOp {
-                        op: "add".into(),
-                        lhs: ValueId(0),
-                        rhs: ValueId(0),
-                        result_ty: ValueType::Int,
-                    },
-                }),
-                FlatOp::Op(SpaceOperation {
-                    result: Some(ValueId(2)),
-                    kind: OpKind::Input {
-                        name: "r".into(),
-                        ty: ValueType::Ref,
-                    },
-                }),
-            ],
+            ops: vec![],
             num_values: 3,
             num_blocks: 1,
-            value_kinds: {
-                let mut m = HashMap::new();
-                m.insert(ValueId(0), RegKind::Int);
-                m.insert(ValueId(1), RegKind::Int);
-                m.insert(ValueId(2), RegKind::Ref);
-                m
-            },
+            value_kinds,
         };
-
-        let regallocs = regalloc::perform_all_register_allocations(&flat);
         let mut asm = Assembler::new();
         let jitcode = asm.assemble(&flat, &regallocs);
 
-        // v0 and v1 interfere (v1 uses v0), so they need different regs
-        assert_eq!(jitcode.num_regs_i, 2);
+        // v0 dies when v1 is defined → they share a register → 1 int reg
+        assert_eq!(jitcode.num_regs_i, 1);
         assert_eq!(jitcode.num_regs_r, 1);
         assert_eq!(jitcode.num_regs_f, 0);
     }
