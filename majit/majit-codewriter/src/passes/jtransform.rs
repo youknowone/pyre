@@ -626,11 +626,16 @@ impl<'a> Transformer<'a> {
             //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
             // Register builtin function in callinfocollection for assembler.finished().
             if let Some(cc) = self.callcontrol.as_mut() {
-                let oopspec_name = format!("{target}");
-                let calldescr_key = format!("{}", descriptor.target);
-                let func_path = format!("{target}");
-                cc.callinfocollection
-                    .add(&oopspec_name, calldescr_key, func_path);
+                let oopspec_index = descriptor.effect_info.oopspec_index;
+                if oopspec_index != OopSpecIndex::None {
+                    // RPython: callinfocollection.add(oopspecindex, calldescr, func_as_int)
+                    // In static analysis we don't have real calldescr/funcaddr;
+                    // use a placeholder descr and 0 address.
+                    let placeholder_descr: majit_ir::descr::DescrRef =
+                        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0));
+                    cc.callinfocollection
+                        .add(oopspec_index, placeholder_descr, 0);
+                }
             }
 
             match effect {

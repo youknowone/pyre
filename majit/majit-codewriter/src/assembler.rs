@@ -733,49 +733,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     }
 }
 
-/// RPython: `effectinfo.py::CallInfoCollection`.
-///
-/// Stores `{oopspecindex: (calldescr_key, func_path)}` for builtin functions.
-/// Populated by jtransform when processing `oopspec` calls.
-#[derive(Debug, Clone, Default)]
-pub struct CallInfoCollection {
-    /// RPython: `_callinfo_for_oopspec` — {oopspecindex: (calldescr, func_as_int)}.
-    /// In majit: maps oopspec name → (descriptor key, function path).
-    callinfo_for_oopspec: HashMap<String, (String, String)>,
-}
-
-impl CallInfoCollection {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// RPython: `CallInfoCollection.add(oopspecindex, calldescr, func_as_int)`.
-    pub fn add(&mut self, oopspecindex: &str, calldescr_key: String, func_path: String) {
-        self.callinfo_for_oopspec
-            .insert(oopspecindex.to_string(), (calldescr_key, func_path));
-    }
-
-    /// RPython: `CallInfoCollection.has_oopspec(oopspecindex)`.
-    pub fn has_oopspec(&self, oopspecindex: &str) -> bool {
-        self.callinfo_for_oopspec.contains_key(oopspecindex)
-    }
-
-    /// RPython: `CallInfoCollection.all_function_addresses_as_int()`.
-    /// Returns all function paths (majit equivalent of function addresses).
-    pub fn all_function_paths(&self) -> Vec<&str> {
-        self.callinfo_for_oopspec
-            .values()
-            .map(|(_, path)| path.as_str())
-            .collect()
-    }
-
-    /// RPython: `CallInfoCollection.callinfo_for_oopspec(oopspecindex)`.
-    pub fn callinfo_for_oopspec(&self, oopspecindex: &str) -> Option<(&str, &str)> {
-        self.callinfo_for_oopspec
-            .get(oopspecindex)
-            .map(|(d, f)| (d.as_str(), f.as_str()))
-    }
-}
+// Re-export CallInfoCollection from majit-ir (effectinfo.py::CallInfoCollection).
+// majit-ir already has the RPython-parity version with OopSpecIndex keys.
+pub use majit_ir::descr::CallInfoCollection;
 
 impl Assembler {
     /// RPython: `Assembler.see_raw_object(value)` (assembler.py:283-298).
@@ -795,8 +755,9 @@ impl Assembler {
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
         // RPython: for func in callinfocollection.all_function_addresses_as_int():
         //            func = int2adr(func); self.see_raw_object(func.ptr)
-        for func_path in callinfocollection.all_function_paths() {
-            self.see_raw_object(func_path, func_path);
+        for func_addr in callinfocollection.all_function_addresses() {
+            let name = format!("func@{func_addr:#x}");
+            self.see_raw_object(&name, &name);
         }
     }
 
