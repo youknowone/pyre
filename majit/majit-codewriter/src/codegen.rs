@@ -31,7 +31,7 @@ pub fn generate_from_graph(result: &crate::passes::ProgramPipelineResult) -> Str
             "    (\"{}\", {}, {}),\n",
             func.name,
             func.original_blocks,
-            func.flattened.ops.len()
+            func.flattened.insns.len()
         ));
     }
     out.push_str("];\n\n");
@@ -84,7 +84,7 @@ fn generate_graph_function_summary(
             "    (\"{}\", {}, {}),\n",
             func.name,
             func.original_blocks,
-            func.flattened.ops.len()
+            func.flattened.insns.len()
         ));
     }
     out.push_str("];\n\n");
@@ -98,7 +98,7 @@ fn generate_canonical_dispatch_table(
     out.push_str("pub const CANONICAL_TRACE_PATTERNS: &[(&str, &str)] = &[\n");
     for arm in &result.opcode_dispatch {
         let status = match &arm.flattened {
-            Some(f) => format!("Flattened({}ops)", f.ops.len()),
+            Some(f) => format!("Flattened({}ops)", f.insns.len()),
             None => "Unflattened".to_string(),
         };
         out.push_str(&format!(
@@ -414,7 +414,7 @@ mod tests {
             transform_notes: Vec::new(),
             flattened: crate::passes::SSARepr {
                 name: "add".into(),
-                ops: Vec::new(),
+                insns: Vec::new(),
                 num_values: 0,
                 num_blocks: 0,
                 value_kinds: std::collections::HashMap::new(),

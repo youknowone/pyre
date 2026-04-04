@@ -214,7 +214,7 @@ impl RegAllocator {
         for &v in &block.inputargs {
             die_at.insert(v, 0);
         }
-        for (i, op) in block.ops.iter().enumerate() {
+        for (i, op) in block.operations.iter().enumerate() {
             for v in crate::inline::op_value_refs(&op.kind) {
                 die_at.insert(v, i);
             }
@@ -266,7 +266,7 @@ impl RegAllocator {
 
         // Scan ops, kill at die_at, add interference edges
         let mut die_index = 0;
-        for (i, op) in block.ops.iter().enumerate() {
+        for (i, op) in block.operations.iter().enumerate() {
             while die_list[die_index].0 == i {
                 alive.remove(&die_list[die_index].1);
                 die_index += 1;
@@ -416,7 +416,7 @@ mod tests {
         // v0 = Input; v1 = BinOp(v0, v0); Return v1
         // v0 dies when v1 is defined → no interference → can share register.
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v0 = graph
             .push_op(
                 entry,
@@ -454,7 +454,7 @@ mod tests {
         // v0 = Input; v1 = Input; v2 = BinOp(v0, v1); Return v2
         // v0 and v1 are both alive when v2 is defined → v0 and v1 interfere
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v0 = graph
             .push_op(
                 entry,
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn goto_link_coalescing() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v0 = graph
             .push_op(
                 entry,

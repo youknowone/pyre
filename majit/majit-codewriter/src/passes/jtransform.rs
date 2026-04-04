@@ -226,9 +226,9 @@ impl<'a> Transformer<'a> {
 
     /// RPython: Transformer.optimize_block()
     fn optimize_block(&mut self, block: &mut crate::model::Block, graph_name: &str) {
-        let mut new_ops = Vec::with_capacity(block.ops.len());
+        let mut new_ops = Vec::with_capacity(block.operations.len());
 
-        for original_op in &block.ops {
+        for original_op in &block.operations {
             let op = remap_op(original_op, &self.aliases);
             match self.rewrite_operation(&op, graph_name) {
                 RewriteResult::Replace(ops) => {
@@ -246,7 +246,7 @@ impl<'a> Transformer<'a> {
             }
         }
 
-        block.ops = new_ops;
+        block.operations = new_ops;
         block.terminator = remap_terminator(&block.terminator, &self.aliases);
 
         if let Terminator::Abort { reason } = &block.terminator {
@@ -1307,7 +1307,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::FieldRead {
                 base,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
@@ -1315,7 +1315,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let config = GraphTransformConfig {
             vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -1328,7 +1328,7 @@ mod tests {
         let result = rewrite_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
         // Should be rewritten to VableFieldRead
-        let rewritten_op = &result.graph.block(graph.entry).ops[0];
+        let rewritten_op = &result.graph.block(graph.startblock).operations[0];
         assert!(
             matches!(
                 &rewritten_op.kind,
@@ -1344,7 +1344,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::FieldRead {
                 base,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
@@ -1352,7 +1352,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let config = GraphTransformConfig {
             vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -1365,7 +1365,7 @@ mod tests {
         let result = rewrite_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 0);
         assert!(matches!(
-            result.graph.block(graph.entry).ops[0].kind,
+            result.graph.block(graph.startblock).operations[0].kind,
             OpKind::FieldRead { .. }
         ));
     }
@@ -1374,7 +1374,7 @@ mod tests {
     fn rewrite_graph_classifies_calls() {
         let mut graph = FunctionGraph::new("test");
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("call_callable", Some("PyFrame".into())),
                 args: vec![],
@@ -1382,7 +1382,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let result = rewrite_graph(
             &graph,
@@ -1390,7 +1390,7 @@ mod tests {
         );
         assert_eq!(result.calls_classified, 1);
         assert!(matches!(
-            result.graph.block(graph.entry).ops[0].kind,
+            result.graph.block(graph.startblock).operations[0].kind,
             OpKind::CallResidual { .. }
         ));
     }
@@ -1399,7 +1399,7 @@ mod tests {
     fn rewrite_graph_uses_explicit_call_effect_overrides() {
         let mut graph = FunctionGraph::new("test");
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["custom_reader"]),
                 args: vec![],
@@ -1407,7 +1407,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let result = rewrite_graph(
             &graph,
@@ -1420,7 +1420,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            result.graph.block(graph.entry).ops[0].kind,
+            result.graph.block(graph.startblock).operations[0].kind,
             OpKind::CallMayForce { .. }
         ));
     }
@@ -1429,14 +1429,14 @@ mod tests {
     fn rewrite_graph_reports_unknowns() {
         let mut graph = FunctionGraph::new("demo");
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::Unknown {
                 kind: crate::model::UnknownKind::UnsupportedExpr,
             },
             false,
         );
         graph.set_terminator(
-            graph.entry,
+            graph.startblock,
             Terminator::Abort {
                 reason: "not implemented".into(),
             },
@@ -1450,9 +1450,9 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let hinted = graph.alloc_value();
-        graph.block_mut(graph.entry).inputargs.push(frame);
+        graph.block_mut(graph.startblock).inputargs.push(frame);
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_access_directly"]),
                 args: vec![frame],
@@ -1460,9 +1460,14 @@ mod tests {
             },
             false,
         );
-        graph.block_mut(graph.entry).ops.last_mut().unwrap().result = Some(hinted);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(hinted);
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::FieldRead {
                 base: hinted,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
@@ -1470,7 +1475,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let result = rewrite_graph(
             &graph,
@@ -1484,8 +1489,8 @@ mod tests {
             },
         );
 
-        assert_eq!(result.graph.block(graph.entry).ops.len(), 1);
-        match &result.graph.block(graph.entry).ops[0].kind {
+        assert_eq!(result.graph.block(graph.startblock).operations.len(), 1);
+        match &result.graph.block(graph.startblock).operations[0].kind {
             OpKind::VableFieldRead { field_index, .. } => assert_eq!(*field_index, 0),
             other => panic!("expected VableFieldRead after hint suppression, got {other:?}"),
         }
@@ -1496,9 +1501,9 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let forced = graph.alloc_value();
-        graph.block_mut(graph.entry).inputargs.push(frame);
+        graph.block_mut(graph.startblock).inputargs.push(frame);
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
                 args: vec![frame],
@@ -1506,9 +1511,14 @@ mod tests {
             },
             false,
         );
-        graph.block_mut(graph.entry).ops.last_mut().unwrap().result = Some(forced);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(forced);
         graph.push_op(
-            graph.entry,
+            graph.startblock,
             OpKind::FieldRead {
                 base: forced,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
@@ -1516,7 +1526,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.entry, Terminator::Return(None));
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
 
         let result = rewrite_graph(
             &graph,
@@ -1530,7 +1540,7 @@ mod tests {
             },
         );
 
-        let ops = &result.graph.block(graph.entry).ops;
+        let ops = &result.graph.block(graph.startblock).operations;
         assert!(matches!(ops[0].kind, OpKind::VableForce));
         assert!(matches!(
             ops[1].kind,

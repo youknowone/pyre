@@ -87,7 +87,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 /// Lower a standalone expression into an existing graph.
 /// Used to build semantic graphs from opcode match arm bodies.
 pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
-    let mut block = graph.entry;
+    let mut block = graph.startblock;
     let ctx = GraphBuildContext::default();
     let result = lower_expr(graph, &mut block, expr, &AstGraphOptions::default(), &ctx);
     if let Some(val) = result {
@@ -119,7 +119,7 @@ fn build_function_graph(
     self_ty_root: Option<String>,
 ) -> SemanticFunction {
     let mut graph = FunctionGraph::new(func.sig.ident.to_string());
-    let mut entry = graph.entry;
+    let mut entry = graph.startblock;
     let mut ctx = GraphBuildContext::default();
 
     // Register function parameters as Input ops (RPython: Block.inputargs)
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(program.functions.len(), 1);
         let graph = &program.functions[0].graph;
         // Should have Input ops for params + ops for body
-        assert!(graph.block(graph.entry).ops.len() >= 2);
+        assert!(graph.block(graph.startblock).operations.len() >= 2);
     }
 
     #[test]
@@ -929,7 +929,7 @@ mod tests {
         );
         let program = build_semantic_program(&parsed);
         let graph = &program.functions[0].graph;
-        let ops = &graph.block(graph.entry).ops;
+        let ops = &graph.block(graph.startblock).operations;
         // Should contain a FieldRead op
         assert!(
             ops.iter().any(|op| matches!(
@@ -952,7 +952,7 @@ mod tests {
         );
         let program = build_semantic_program(&parsed);
         let graph = &program.functions[0].graph;
-        let ops = &graph.block(graph.entry).ops;
+        let ops = &graph.block(graph.startblock).operations;
         assert!(
             ops.iter().any(|op| matches!(
                 &op.kind,
@@ -982,7 +982,7 @@ mod tests {
             .iter()
             .find(|func| func.name == "run")
             .expect("run graph");
-        let ops = &run.graph.block(run.graph.entry).ops;
+        let ops = &run.graph.block(run.graph.startblock).operations;
         assert!(
             ops.iter().any(|op| matches!(
                 &op.kind,
@@ -1005,7 +1005,7 @@ mod tests {
         );
         let program = build_semantic_program(&parsed);
         let graph = &program.functions[0].graph;
-        let ops = &graph.block(graph.entry).ops;
+        let ops = &graph.block(graph.startblock).operations;
         assert!(
             ops.iter().any(|op| matches!(
                 &op.kind,
@@ -1054,11 +1054,11 @@ mod tests {
         // Entry block should have a Branch terminator
         assert!(
             matches!(
-                &graph.block(graph.entry).terminator,
+                &graph.block(graph.startblock).terminator,
                 Terminator::Branch { .. }
             ),
             "entry should end with Branch, got {:?}",
-            graph.block(graph.entry).terminator
+            graph.block(graph.startblock).terminator
         );
     }
 
@@ -1094,8 +1094,8 @@ mod tests {
         let program = build_semantic_program(&parsed);
         let graph = &program.functions[0].graph;
         let op = graph
-            .block(graph.entry)
-            .ops
+            .block(graph.startblock)
+            .operations
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::BinOp { op, .. } => Some(op.clone()),
@@ -1117,8 +1117,8 @@ mod tests {
         let program = build_semantic_program(&parsed);
         let graph = &program.functions[0].graph;
         let op = graph
-            .block(graph.entry)
-            .ops
+            .block(graph.startblock)
+            .operations
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::UnaryOp { op, .. } => Some(op.clone()),

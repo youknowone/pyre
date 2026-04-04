@@ -52,7 +52,7 @@ struct InlineSite {
 fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<InlineSite> {
     let mut sites = Vec::new();
     for block in &graph.blocks {
-        for (op_idx, op) in block.ops.iter().enumerate() {
+        for (op_idx, op) in block.operations.iter().enumerate() {
             let target = match &op.kind {
                 OpKind::Call { target, .. } => target,
                 _ => continue,
@@ -91,18 +91,18 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
 
     // Extract the call op details
     let block = &graph.blocks[block_id.0];
-    let call_op = &block.ops[op_index];
+    let call_op = &block.operations[op_index];
     let (call_args, call_result) = match &call_op.kind {
         OpKind::Call { args, .. } => (args.clone(), call_op.result),
         _ => unreachable!("InlineSite should point to a Call op"),
     };
 
     // Separate ops into before-call and after-call
-    let after_ops: Vec<SpaceOperation> = block.ops[op_index + 1..].to_vec();
+    let after_ops: Vec<SpaceOperation> = block.operations[op_index + 1..].to_vec();
     let after_terminator = block.terminator.clone();
 
     // Truncate the original block to before-call ops only
-    graph.blocks[block_id.0].ops.truncate(op_index);
+    graph.blocks[block_id.0].operations.truncate(op_index);
 
     // --- Remap callee values and blocks ---
     let value_map = remap_callee_values(graph, &callee);
@@ -123,12 +123,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             let remapped_after_ops = remap_value_in_ops(&after_ops, original_result, args[0]);
             let remapped_after_term =
                 remap_value_in_terminator(&after_terminator, original_result, args[0]);
-            graph.blocks[id.0].ops = remapped_after_ops;
+            graph.blocks[id.0].operations = remapped_after_ops;
             graph.blocks[id.0].terminator = remapped_after_term;
             (id, args)
         } else {
             let id = graph.create_block();
-            graph.blocks[id.0].ops = after_ops;
+            graph.blocks[id.0].operations = after_ops;
             graph.blocks[id.0].terminator = after_terminator;
             (id, vec![])
         };
@@ -139,7 +139,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     };
 
     // --- Copy callee blocks into the graph ---
-    let callee_entry = *block_map.get(&callee.entry).unwrap();
+    let callee_entry = *block_map.get(&callee.startblock).unwrap();
 
     for callee_block in &callee.blocks {
         let new_block_id = block_map[&callee_block.id];
@@ -154,11 +154,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
 
         // Remap ops
         let new_ops: Vec<SpaceOperation> = callee_block
-            .ops
+            .operations
             .iter()
             .map(|op| remap_op(op, &value_map))
             .collect();
-        graph.blocks[new_block_id.0].ops = new_ops;
+        graph.blocks[new_block_id.0].operations = new_ops;
 
         // Remap terminator, replacing Return with Goto to merge block
         let new_terminator = match &callee_block.terminator {
@@ -199,9 +199,9 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // --- Connect caller's before-block to callee entry ---
     // Map call arguments to callee's Input ops.
     // Callee's Input ops correspond to its entry block's first N ops.
-    let callee_entry_block = &callee.blocks[callee.entry.0];
+    let callee_entry_block = &callee.blocks[callee.startblock.0];
     let input_values: Vec<ValueId> = callee_entry_block
-        .ops
+        .operations
         .iter()
         .filter(|op| matches!(&op.kind, OpKind::Input { .. }))
         .filter_map(|op| op.result)
@@ -238,7 +238,7 @@ fn remap_callee_values(
         for &v in &block.inputargs {
             map.entry(v).or_insert_with(|| graph.alloc_value());
         }
-        for op in &block.ops {
+        for op in &block.operations {
             if let Some(result) = op.result {
                 map.entry(result).or_insert_with(|| graph.alloc_value());
             }
@@ -575,7 +575,7 @@ fn remap_value_in_graph(
     let target_blocks: Vec<BlockId> = block_map.values().copied().collect();
     for &bid in &target_blocks {
         let block = &mut graph.blocks[bid.0];
-        block.ops = remap_value_in_ops(&block.ops, old, new);
+        block.operations = remap_value_in_ops(&block.operations, old, new);
         block.terminator = remap_value_in_terminator(&block.terminator, old, new);
     }
 }
@@ -630,7 +630,7 @@ mod tests {
     fn make_simple_callee() -> FunctionGraph {
         // Callee: fn callee(base) -> value { ArrayRead(base, const(0)) }
         let mut g = FunctionGraph::new("callee");
-        let entry = g.entry;
+        let entry = g.startblock;
         let base = g.push_op(
             entry,
             OpKind::Input {
@@ -657,7 +657,7 @@ mod tests {
     fn inline_single_call() {
         // Caller: fn caller() { v = Call("callee", [base]); Return v }
         let mut caller = FunctionGraph::new("caller");
-        let entry = caller.entry;
+        let entry = caller.startblock;
         let base = caller.push_op(
             entry,
             OpKind::Input {
@@ -690,7 +690,7 @@ mod tests {
         let has_array_read = caller
             .blocks
             .iter()
-            .flat_map(|b| &b.ops)
+            .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::ArrayRead { .. }));
         assert!(
             has_array_read,
@@ -701,7 +701,7 @@ mod tests {
         let has_call = caller
             .blocks
             .iter()
-            .flat_map(|b| &b.ops)
+            .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::Call { .. }));
         assert!(!has_call, "Call op should be replaced by inlined body");
     }
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn inline_preserves_residual_calls() {
         let mut caller = FunctionGraph::new("caller");
-        let entry = caller.entry;
+        let entry = caller.startblock;
         let result = caller.push_op(
             entry,
             OpKind::Call {
@@ -729,7 +729,7 @@ mod tests {
         let has_call = caller
             .blocks
             .iter()
-            .flat_map(|b| &b.ops)
+            .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::Call { .. }));
         assert!(has_call, "residual Call should be preserved");
     }
@@ -741,7 +741,7 @@ mod tests {
 
         // outer: fn outer(base) -> Call("callee", [base])
         let mut outer = FunctionGraph::new("outer");
-        let entry = outer.entry;
+        let entry = outer.startblock;
         let base = outer.push_op(
             entry,
             OpKind::Input {
@@ -763,7 +763,7 @@ mod tests {
 
         // caller: fn caller(x) -> Call("outer", [x])
         let mut caller = FunctionGraph::new("caller");
-        let centry = caller.entry;
+        let centry = caller.startblock;
         let x = caller.push_op(
             centry,
             OpKind::Input {
@@ -795,7 +795,7 @@ mod tests {
         let has_array_read = caller
             .blocks
             .iter()
-            .flat_map(|b| &b.ops)
+            .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::ArrayRead { .. }));
         assert!(
             has_array_read,
