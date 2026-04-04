@@ -405,39 +405,7 @@ macro_rules! descr_new_wrapper {
     };
 }
 
-/// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
-///
-/// If cls is the builtin int type, returns a plain W_IntObject.
-/// If cls is a subclass of int, returns a W_InstanceObject with the
-/// int value stored internally (for int subclasses like IntFlag).
-fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = if args.is_empty() {
-        std::ptr::null_mut() as PyObjectRef
-    } else {
-        args[0]
-    };
-    let value = crate::builtins::builtin_int(&args[1..])?;
-    // If cls is int itself (or null), return a plain int.
-    // Compare against both the static &INT_TYPE and the W_TypeObject for int.
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
-    }
-    let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
-    if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t)) {
-        return Ok(value);
-    }
-    // cls is a subclass of int — create a W_IntObject with cls's type.
-    // Register the type as an int subclass so is_int() recognizes it.
-    // cls is a subclass of int. Create a unique W_IntObject (bypassing
-    // the small-int cache so each instance has its own identity for
-    // ATTR_TABLE). Tag with __class__ = cls so type()/isinstance()
-    // see the subclass while preserving W_IntObject layout for arithmetic.
-    let int_val = unsafe { pyre_object::w_int_get_value(value) };
-    let obj = pyre_object::w_int_new_unique(int_val);
-    let _ = crate::baseobjspace::setattr(obj, "__class__", cls);
-    Ok(obj)
-}
-
+descr_new_wrapper!(int_descr_new, crate::builtins::builtin_int);
 descr_new_wrapper!(float_descr_new, crate::builtins::builtin_float);
 descr_new_wrapper!(str_descr_new, crate::builtins::builtin_str);
 
@@ -1271,37 +1239,6 @@ fn init_classmethod_type(ns: &mut PyNamespace) {
 
 fn init_int_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", builtin_code_new("__new__", int_descr_new));
-    namespace_store(
-        ns,
-        "bit_length",
-        builtin_code_new("bit_length", |args| {
-            let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                unsafe { pyre_object::w_int_get_value(args[0]) }
-            } else {
-                0
-            };
-            let bits = if val == 0 {
-                0
-            } else {
-                64 - val.unsigned_abs().leading_zeros()
-            };
-            Ok(pyre_object::w_int_new(bits as i64))
-        }),
-    );
-    namespace_store(
-        ns,
-        "bit_count",
-        builtin_code_new("bit_count", |args| {
-            let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                unsafe { pyre_object::w_int_get_value(args[0]) }
-            } else {
-                0
-            };
-            Ok(pyre_object::w_int_new(
-                val.unsigned_abs().count_ones() as i64
-            ))
-        }),
-    );
 }
 fn init_float_type(ns: &mut PyNamespace) {
     namespace_store(ns, "__new__", builtin_code_new("__new__", float_descr_new));

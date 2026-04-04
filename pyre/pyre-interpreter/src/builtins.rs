@@ -849,10 +849,6 @@ pub(crate) fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
         }
     }
-    // __int__ protocol
-    if let Ok(int_fn) = crate::baseobjspace::getattr(obj, "__int__") {
-        return Ok(crate::call_function(int_fn, &[obj]));
-    }
     Ok(w_int_new(0))
 }
 
@@ -1348,10 +1344,7 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "globals() requires an active frame",
             ));
         }
-        // Create a dict backed by the live namespace. Mutations (update,
-        // __setitem__) are synced back to the namespace so that patterns
-        // like `globals().update({...})` work correctly.
-        let dict = pyre_object::w_dict_new_with_namespace(namespace as *mut u8);
+        let dict = pyre_object::w_dict_new();
         for (k, &v) in unsafe { &*namespace }.entries() {
             unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
         }
@@ -1473,18 +1466,9 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `chr(i)` — PyPy: operation.py chr
 fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 1, "chr() takes exactly one argument");
-    let val = unsafe { w_int_get_value(args[0]) };
-    if val < 0 || val > 0x10ffff {
-        return Err(crate::PyError::type_error(&format!(
-            "chr() arg not in range(0x110000): {val}"
-        )));
-    }
-    match char::from_u32(val as u32) {
-        Some(c) => Ok(w_str_new(&c.to_string())),
-        None => Err(crate::PyError::type_error(&format!(
-            "chr() arg not in range(0x110000): {val}"
-        ))),
-    }
+    let code = unsafe { w_int_get_value(args[0]) } as u32;
+    let c = char::from_u32(code).expect("chr() arg not in range");
+    Ok(w_str_new(&c.to_string()))
 }
 
 /// `map()` — PyPy: functional.py W_Map (returns iterator)
