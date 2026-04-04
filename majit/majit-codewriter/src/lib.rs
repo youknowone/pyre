@@ -144,9 +144,16 @@ fn analyze_pipeline_from_parsed(
         call_control.register_function_graph(path.clone(), graph.clone());
     }
     // RPython: op.result.concretetype — register return types for Call result
-    // array identity resolution.
+    // array identity resolution. Both bare functions and impl methods.
     for func in &program.functions {
         if let Some(ref ret_type) = func.return_type {
+            if let Some(ref owner) = func.self_ty_root {
+                // impl method: path = ["owner", "method_name"]
+                let path =
+                    crate::parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
+                call_control.return_types.insert(path, ret_type.clone());
+            }
+            // Also register bare function path for free functions.
             let path = crate::parse::CallPath::from_segments([func.name.as_str()]);
             call_control.return_types.insert(path, ret_type.clone());
         }

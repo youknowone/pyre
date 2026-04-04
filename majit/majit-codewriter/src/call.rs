@@ -203,11 +203,10 @@ pub struct CallControl {
     pub return_types: HashMap<CallPath, String>,
 
     /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.
-    /// This is the offset from the array object pointer to the first element.
-    /// In RPython's GcArray layout: [GC header] [length] [items...], so
-    /// basesize = sizeof(header) + sizeof(length) = `carray.items.offset`.
-    /// Set by the runtime/backend when initializing the JIT. Default 0 (Rust
-    /// data-pointer model where ptr points directly at first element).
+    /// Offset from the array object pointer to the first element.
+    /// RPython GcArray layout: `[length (WORD)] [items...]`, so
+    /// `basesize = carray.items.offset = sizeof(Signed) = WORD`.
+    /// Default: WORD (8 on 64-bit) matching RPython's standard GcArray.
     pub array_header_size: usize,
 }
 
@@ -285,7 +284,9 @@ impl CallControl {
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
             return_types: HashMap::new(),
-            array_header_size: 0,
+            // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
+            // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
+            array_header_size: std::mem::size_of::<usize>(),
         }
     }
 
