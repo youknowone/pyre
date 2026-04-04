@@ -1518,60 +1518,47 @@ fn collect_readwrite_effects(
                         // RPython: get_array_descr(gccache, ARRAY) (descr.py:348-378)
                         //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
                         //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
+                        // RPython: get_array_descr(gccache, ARRAY) — descr.py:348-378.
+                        //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
+                        //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
+                        // Compute item_size first, then build once.
+                        let item_size = if is_struct {
+                            // Struct array: item_size = struct size.
+                            elem_name
+                                .map(|n| compute_struct_size(cc, n))
+                                .filter(|s| *s > 0)
+                                .unwrap_or(8)
+                        } else {
+                            // Plain array: item_size from element type.
+                            // GcArray(Char) → 1, GcArray(Signed) → 8, etc.
+                            resolved_id
+                                .as_deref()
+                                .map(|e| get_type_flag(e).1)
+                                .unwrap_or(8)
+                        };
+                        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                            idx, 0, item_size, 0, ir_type, flag,
+                        );
+                        // RPython: descr.py:372-375 — for array-of-structs:
+                        //   descrs = heaptracker.all_interiorfielddescrs(
+                        //       gccache, ARRAY, get_field_descr=get_interiorfield_descr)
+                        //   arraydescr.all_interiorfielddescrs = descrs
                         if is_struct {
                             if let Some(struct_name) = elem_name {
-                                // Build a temporary arraydescr to pass to interior field builder.
-                                let tmp_ad = std::sync::Arc::new(
-                                    majit_ir::descr::SimpleArrayDescr::with_flag(
-                                        idx, 0, 8, 0, ir_type, flag,
-                                    ),
-                                );
-                                let (fielddescrs, item_size) =
-                                    build_interior_fielddescrs(cc, struct_name, tmp_ad);
-                                // Rebuild with correct item_size from struct layout.
-                                let actual_item_size = if item_size > 0 { item_size } else { 8 };
-                                let ad_final = std::sync::Arc::new(
-                                    majit_ir::descr::SimpleArrayDescr::with_flag(
-                                        idx,
-                                        0,
-                                        actual_item_size,
-                                        0,
-                                        ir_type,
-                                        flag,
-                                    ),
-                                );
-                                if !fielddescrs.is_empty() {
-                                    // Re-build interior descrs with the final arraydescr.
-                                    let (final_fielddescrs, _) = build_interior_fielddescrs(
-                                        cc,
-                                        struct_name,
-                                        ad_final.clone(),
-                                    );
-                                    let mut ad_mut = (*ad_final).clone();
-                                    ad_mut.set_all_fielddescrs(final_fielddescrs);
+                                let ad_arc = std::sync::Arc::new(ad);
+                                let (descrs, _) =
+                                    all_interiorfielddescrs(cc, struct_name, ad_arc.clone());
+                                if !descrs.is_empty() {
+                                    let mut ad_mut = (*ad_arc).clone();
+                                    ad_mut.set_all_interiorfielddescrs(descrs);
                                     array_write_descrs.push(std::sync::Arc::new(ad_mut));
                                 } else {
-                                    array_write_descrs.push(ad_final);
+                                    array_write_descrs.push(ad_arc);
                                 }
                             } else {
-                                let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                                    idx, 0, 8, 0, ir_type, flag,
-                                );
                                 array_write_descrs.push(std::sync::Arc::new(ad));
                             }
                         } else {
-                            // RPython: plain array — item_size from element type.
-                            // symbolic.get_array_token(ARRAY, tsc) → (basesize, itemsize, ofs)
-                            // For GcArray(Char) → itemsize=1, GcArray(Signed) → itemsize=8, etc.
-                            let item_size = if let Some(ref elem) = resolved_id {
-                                field_type_from_rust_type(elem).1
-                            } else {
-                                // Fallback: word size for unknown element type.
-                                8
-                            };
-                            let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                                idx, 0, item_size, 0, ir_type, flag,
-                            );
                             array_write_descrs.push(std::sync::Arc::new(ad));
                         }
                     }
@@ -1619,7 +1606,7 @@ fn collect_readwrite_effects(
 ///
 /// Returns `(fielddescrs, item_size)` where `item_size` is the total
 /// struct size (RPython: `symbolic.get_array_token(ARRAY, tsc)[1]`).
-fn build_interior_fielddescrs(
+fn all_interiorfielddescrs(
     cc: &CallControl,
     struct_name: &str,
     array_descr: std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
@@ -1646,7 +1633,7 @@ fn build_interior_fielddescrs(
     let mut result = Vec::new();
     for (i, (field_name, field_type_str)) in fields.iter().enumerate() {
         // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
-        let (field_type, field_size) = field_type_from_rust_type(field_type_str);
+        let (field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -1680,7 +1667,7 @@ fn build_interior_fielddescrs(
     // item_size = total struct size, aligned to max field alignment.
     let max_align = fields
         .iter()
-        .map(|(_, ty)| field_type_from_rust_type(ty).1)
+        .map(|(_, ty)| get_type_flag(ty).1)
         .filter(|s| *s > 0)
         .max()
         .unwrap_or(8);
@@ -1692,11 +1679,48 @@ fn build_interior_fielddescrs(
     (result, item_size)
 }
 
+/// RPython: `symbolic.get_array_token(ARRAY, tsc)[1]`.
+///
+/// Compute the total size of a struct (the item_size for an array-of-structs).
+/// This uses the same layout calculation as `all_interiorfielddescrs`.
+fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
+    let fields = match cc.struct_fields.fields.get(struct_name) {
+        Some(f) => f,
+        None => return 0,
+    };
+    // Check for nested structs — RPython: UnsupportedFieldExc.
+    for (_, field_type_str) in fields.iter() {
+        if cc.is_known_struct(field_type_str) {
+            return 0;
+        }
+    }
+    let mut offset: usize = 0;
+    for (_, field_type_str) in fields.iter() {
+        let (field_type, field_size) = get_type_flag(field_type_str);
+        if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        offset = (offset + field_size - 1) & !(field_size - 1);
+        offset += field_size;
+    }
+    let max_align = fields
+        .iter()
+        .map(|(_, ty)| get_type_flag(ty).1)
+        .filter(|s| *s > 0)
+        .max()
+        .unwrap_or(8);
+    if offset > 0 {
+        (offset + max_align - 1) & !(max_align - 1)
+    } else {
+        0
+    }
+}
+
 /// RPython: `get_type_flag(TYPE)` (descr.py:241-254).
 ///
 /// Maps a Rust type string to (IR type, size in bytes).
 /// Ptr(gc) → (Ref, 8), Float → (Float, 8), signed int → (Int, N).
-fn field_type_from_rust_type(type_str: &str) -> (majit_ir::value::Type, usize) {
+fn get_type_flag(type_str: &str) -> (majit_ir::value::Type, usize) {
     match type_str {
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
