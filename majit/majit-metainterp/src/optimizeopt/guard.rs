@@ -681,12 +681,9 @@ impl GuardEliminator {
                         version = Some(version_info.snapshot(&flat_ops, label_args));
                     }
                     // guard.py:295: info.remove(other.op.getdescr())
+                    // version.py:38-42: remove asserts descr is in leads_to.
                     if let Some(fd) = other.op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                        let fi = fd.fail_index();
-                        // Only remove if tracked; non-loop-version guards aren't in leads_to.
-                        if version_info.leads_to.contains_key(&fi) {
-                            version_info.remove(fi);
-                        }
+                        version_info.remove(fd.fail_index());
                     }
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
