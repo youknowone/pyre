@@ -1348,6 +1348,10 @@ impl ShortPreambleBuilder {
         &self.state.used_boxes
     }
 
+    pub fn short_preamble_jump(&self) -> &[Op] {
+        &self.state.short_preamble_jump
+    }
+
     pub fn extra_same_as(&self) -> &[Op] {
         &self.state.extra_same_as
     }

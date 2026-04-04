@@ -1097,7 +1097,8 @@ impl OptHeap {
                 .or_else(|| {
                     ctx.get_const_info_mut(obj)
                         .and_then(|info| info.take_preamble_field(field_idx))
-                });
+                })
+                .or_else(|| ctx.preamble_field_fallback.remove(&(obj, field_idx)));
             if let Some(pop) = pop {
                 let cached = pop.resolved;
                 // RPython heap.py:185-186: always force PreambleOp.

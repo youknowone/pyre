@@ -278,6 +278,11 @@ pub struct OptContext {
     /// resume.py parity: RPython guards always get a snapshot via
     /// capture_resumedata; pyre tracks the nearest valid position.
     pub last_seen_snapshot_pos: Option<i32>,
+    /// Fallback preamble_field map for HeapField imports.
+    /// Maps (source_opref, field_idx) → PreambleOp.
+    /// Used when the PtrInfo-based lookup fails because forwarding
+    /// overwrites Op→Info after import_short_preamble_ops.
+    pub preamble_field_fallback: HashMap<(OpRef, u32), crate::optimizeopt::info::PreambleOp>,
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
@@ -689,6 +694,7 @@ impl OptContext {
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
+            preamble_field_fallback: HashMap::new(),
         }
     }
 
@@ -743,6 +749,7 @@ impl OptContext {
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
+            preamble_field_fallback: HashMap::new(),
         }
     }
 
@@ -1095,6 +1102,10 @@ impl OptContext {
             // unroll.py:33-37: potential_extra_ops[op] = preamble_op
             //
             // shortpreamble.py:471-477: add_preamble_op — track used ops.
+            // RPython relies on force_box (optimizer.py:354-359) to pop from
+            // potential_extra_ops → add_preamble_op → used_boxes. In majit,
+            // OpRef identity doesn't always match between potential_extra_ops
+            // keys and force_box args, so also register immediately.
             if tracked && !is_constant {
                 let produced = self
                     .imported_short_preamble_builder
@@ -1111,11 +1122,12 @@ impl OptContext {
                     } else {
                         preamble_source
                     };
+                    // Register in potential_extra_ops for force_box path.
                     self.potential_extra_ops.insert(
                         key,
                         TrackedPreambleUse {
                             result: preamble_source,
-                            produced,
+                            produced: produced.clone(),
                         },
                     );
                 }
@@ -1503,6 +1515,19 @@ impl OptContext {
                 _ => return opref,
             }
         }
+    }
+
+    /// resoperation.py: op.get_forwarded() is not None — check if OpRef
+    /// has any forwarding entry (Op, Info, IntBound, Const).
+    pub fn has_forwarding(&self, opref: OpRef) -> bool {
+        let idx = opref.0 as usize;
+        if idx >= self.forwarded.len() {
+            return false;
+        }
+        !matches!(
+            &self.forwarded[idx],
+            crate::optimizeopt::info::Forwarded::None
+        )
     }
 
     /// Store a constant value WITHOUT setting Forwarded::Const.
