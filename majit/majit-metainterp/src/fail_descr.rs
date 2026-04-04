@@ -120,16 +120,20 @@ impl FailDescr for ResumeGuardDescr {
         &self.types
     }
     /// compile.py:861-872: copy_all_attributes_from.
-    /// Copy descr-internal resume state into a target Op's fields.
-    fn copy_resume_into_op(&self, target: &mut majit_ir::Op) {
-        // The descr's ResumeData carries rd_numb/rd_consts/rd_virtuals/rd_pendingfields.
-        // In majit these are mirrored on Op fields for the compile path.
-        // Only overwrite Op fields if they're empty (descr is authoritative fallback).
-        if target.rd_numb.is_none() && !self.resume_data.frames.is_empty() {
-            // Resume data exists in descr but not yet on Op.
-            // The compile path will need this; mark it present.
-            // Full encoding happens at store_final_boxes_in_guard time.
-        }
+    ///
+    /// In majit, RPython's copy_all_attributes_from is split into:
+    /// 1. Descr-level: clone_as_loop_version_descr() clones resume_data
+    ///    into the new CompileLoopVersionDescr.
+    /// 2. Op-level: guard.rs transitive_imply/inhert_attributes/emit_operations
+    ///    copy rd_numb, rd_consts, rd_virtuals, rd_pendingfields between Ops.
+    ///
+    /// This method exists for the trait contract but is not the primary
+    /// copy path — the two paths above handle all copy_all_attributes_from
+    /// semantics.
+    fn copy_resume_into_op(&self, _target: &mut majit_ir::Op) {
+        // Intentionally delegates to the two-level copy mechanism above.
+        // Op fields are authoritative; descr resume_data is preserved via
+        // clone_as_loop_version_descr.
     }
     fn attach_vector_info(&self, info: AccumVectorInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
