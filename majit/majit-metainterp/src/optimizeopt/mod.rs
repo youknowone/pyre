@@ -50,20 +50,11 @@ impl majit_ir::Descr for OptResumeAtPositionDescr {
     fn is_resume_at_position(&self) -> bool {
         true
     }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(std::sync::Arc::new(OptResumeAtPositionDescr))
-    }
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        Some(crate::fail_descr::make_compile_loop_version_descr(
-            0,
-            crate::resume::ResumeData {
-                vable_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
-        ))
-    }
+    // RPython: ResumeAtPositionDescr does NOT override clone().
+    // Inherited clone() returns plain ResumeGuardDescr, losing the marker.
+    // OptResumeAtPositionDescr is a lightweight tag with no resume storage,
+    // so clone_descr returns None (not clonable as resume source).
+    // clone_as_loop_version_descr: NOT implemented (no resume storage).
 }
 
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
