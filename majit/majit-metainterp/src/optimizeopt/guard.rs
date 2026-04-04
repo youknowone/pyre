@@ -205,17 +205,19 @@ impl Guard {
         new_ops: &mut Vec<Op>,
         renamer: &mut HashMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
+        const_values: &mut HashMap<OpRef, i64>,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
         }
         // RPython: ConstInt(value) creates inline constant boxes.
-        // In majit we pre-allocate constant OpRefs, then pass them
-        // to get_operations via the closure.
+        // In majit we allocate constant OpRefs and record the value.
         let ncp = next_const_pos;
-        let ops = var.get_operations(|_value| {
+        let cv = const_values;
+        let ops = var.get_operations(|value| {
             let cref = OpRef(*ncp);
             *ncp += 1;
+            cv.insert(cref, value);
             cref
         });
         let mut last = var.var;
@@ -242,6 +244,7 @@ impl Guard {
         new_ops: &mut Vec<Op>,
         renamer: &mut HashMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
+        const_values: &mut HashMap<OpRef, i64>,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -261,6 +264,7 @@ impl Guard {
             new_ops,
             renamer,
             next_const_pos,
+            const_values,
         );
         let other_rhs = Self::emit_varops(
             &other.rhs,
@@ -268,6 +272,7 @@ impl Guard {
             new_ops,
             renamer,
             next_const_pos,
+            const_values,
         );
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(opnum, &[box_rhs, other_rhs]);
@@ -333,6 +338,7 @@ impl Guard {
         new_ops: &mut Vec<Op>,
         renamer: &mut HashMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
+        const_values: &mut HashMap<OpRef, i64>,
     ) {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
@@ -341,6 +347,7 @@ impl Guard {
             new_ops,
             renamer,
             next_const_pos,
+            const_values,
         );
         let rhs = Self::emit_varops(
             &self.rhs,
@@ -348,6 +355,7 @@ impl Guard {
             new_ops,
             renamer,
             next_const_pos,
+            const_values,
         );
         // guard.py:138-140: cmp_op = ResOperation(opnum, [lhs, rhs])
         let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
@@ -418,6 +426,7 @@ impl GuardEliminator {
             guards: HashMap::new(),
             renamer: HashMap::new(),
             next_const_pos: OpRef::CONST_BASE + 50000,
+            const_values: HashMap::new(),
         }
     }
 
@@ -501,6 +510,7 @@ impl GuardEliminator {
                                 &mut self._newoperations,
                                 &mut self.renamer,
                                 &mut self.next_const_pos,
+                                &mut self.const_values,
                             );
                             continue;
                         }
@@ -518,12 +528,13 @@ impl GuardEliminator {
                 if let Some(index_var) = index_vars.get(&op.pos) {
                     if !index_var.is_identity() {
                         let ncp = &mut self.next_const_pos;
-                        let result =
-                            index_var.emit_operations(&mut self._newoperations, |_value| {
-                                let cref = OpRef(*ncp);
-                                *ncp += 1;
-                                cref
-                            });
+                        let cv = &mut self.const_values;
+                        let result = index_var.emit_operations(&mut self._newoperations, |value| {
+                            let cref = OpRef(*ncp);
+                            *ncp += 1;
+                            cv.insert(cref, value);
+                            cref
+                        });
                         self.renamer.insert(op.pos, result);
                         continue;
                     }
@@ -641,6 +652,7 @@ impl GuardEliminator {
                         &mut self._newoperations,
                         &mut self.renamer,
                         &mut self.next_const_pos,
+                        &mut self.const_values,
                     )
                     .is_some()
                 {
