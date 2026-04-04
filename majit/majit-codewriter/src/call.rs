@@ -201,6 +201,14 @@ pub struct CallControl {
     /// Maps CallPath → full return type string (e.g. "Vec<Point>").
     /// Used by `resolve_array_identity` for Call result array identity.
     pub return_types: HashMap<CallPath, String>,
+
+    /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.
+    /// This is the offset from the array object pointer to the first element.
+    /// In RPython's GcArray layout: [GC header] [length] [items...], so
+    /// basesize = sizeof(header) + sizeof(length) = `carray.items.offset`.
+    /// Set by the runtime/backend when initializing the JIT. Default 0 (Rust
+    /// data-pointer model where ptr points directly at first element).
+    pub array_header_size: usize,
 }
 
 /// Sequential descriptor index assignment — majit equivalent of
@@ -277,6 +285,7 @@ impl CallControl {
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
             return_types: HashMap::new(),
+            array_header_size: 0,
         }
     }
 
@@ -1364,6 +1373,7 @@ fn resolve_array_identity(
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
     value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+    phi_sources: &HashMap<crate::model::ValueId, crate::model::ValueId>,
     cc: &CallControl,
 ) -> Option<String> {
     // 1. Parser-set element type (from FnArg or typed let binding).
@@ -1388,7 +1398,6 @@ fn resolve_array_identity(
                 }
             }
             // Call result: RPython resolves via result.concretetype.
-            // In majit, look up the callee's return type from CallControl.
             OpKind::Call { target, .. } => {
                 if let Some(callee_path) = cc.target_to_path(target) {
                     if let Some(ret_type) = cc.return_types.get(&callee_path) {
@@ -1396,11 +1405,41 @@ fn resolve_array_identity(
                     }
                 }
             }
-            // Input: RPython resolves via the parameter's concretetype.
-            // In majit, the input's array_type_id was set by the parser
-            // and propagated through the op_array_type_id path above.
             OpKind::Input { .. } => {}
             _ => {}
+        }
+    }
+    // 3. Phi/link: RPython concretetype propagates through block boundaries.
+    // Follow inputarg → source value chain (limited depth to avoid cycles).
+    let mut vid = *base;
+    for _ in 0..4 {
+        if let Some(&src) = phi_sources.get(&vid) {
+            // Check if the source has a producer with array identity.
+            if let Some(producer) = value_producers.get(&src) {
+                match producer {
+                    OpKind::FieldRead { field, .. } => {
+                        if let Some(owner) = &field.owner_root {
+                            if let Some(fts) = cc.field_type(owner, &field.name) {
+                                return extract_element_type_from_str(fts);
+                            }
+                        }
+                    }
+                    OpKind::ArrayRead { array_type_id, .. } if array_type_id.is_some() => {
+                        return array_type_id.clone();
+                    }
+                    OpKind::Call { target, .. } => {
+                        if let Some(cp) = cc.target_to_path(target) {
+                            if let Some(rt) = cc.return_types.get(&cp) {
+                                return extract_element_type_from_str(rt);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            vid = src;
+        } else {
+            break;
         }
     }
     None
@@ -1466,6 +1505,41 @@ fn collect_readwrite_effects(
         .filter_map(|op| op.result.map(|vid| (vid, &op.kind)))
         .collect();
 
+    // RPython: phi/link args carry concretetype through block boundaries.
+    // Build inputarg → source value mapping from Goto/Cond terminators so
+    // resolve_array_identity can trace through control-flow merges.
+    let mut phi_sources: HashMap<crate::model::ValueId, crate::model::ValueId> = HashMap::new();
+    for block in &graph.blocks {
+        match &block.terminator {
+            crate::model::Terminator::Goto { target, args } => {
+                if let Some(target_block) = graph.blocks.get(target.0) {
+                    for (ia, src) in target_block.inputargs.iter().zip(args.iter()) {
+                        phi_sources.insert(*ia, *src);
+                    }
+                }
+            }
+            crate::model::Terminator::Branch {
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+                ..
+            } => {
+                if let Some(tb) = graph.blocks.get(if_true.0) {
+                    for (ia, src) in tb.inputargs.iter().zip(true_args.iter()) {
+                        phi_sources.insert(*ia, *src);
+                    }
+                }
+                if let Some(fb) = graph.blocks.get(if_false.0) {
+                    for (ia, src) in fb.inputargs.iter().zip(false_args.iter()) {
+                        phi_sources.insert(*ia, *src);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
@@ -1488,8 +1562,13 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
-                    let resolved_id =
-                        resolve_array_identity(base, array_type_id, &value_producers, cc);
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    );
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *read_arrays |= 1u64 << idx;
@@ -1501,8 +1580,13 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let resolved_id =
-                        resolve_array_identity(base, array_type_id, &value_producers, cc);
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    );
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *write_arrays |= 1u64 << idx;
@@ -1546,10 +1630,8 @@ fn collect_readwrite_effects(
                         // RPython: get_array_descr(gccache, ARRAY) — descr.py:348-378.
                         //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
                         //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
-                        // basesize: Rust arrays have no GC header — data starts at offset 0
-                        // from the data pointer. RPython's basesize accounts for GC header +
-                        // length field. In pyre, the backend provides the actual basesize.
-                        let base_size = 0;
+                        // basesize from runtime: symbolic.get_array_token(ARRAY)[0].
+                        let base_size = cc.array_header_size;
                         let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
                             idx, base_size, item_size, 0, ir_type, flag,
                         );
