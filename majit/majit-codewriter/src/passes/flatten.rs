@@ -234,15 +234,7 @@ pub fn flatten_with_types(
     types: &super::rtype::TypeResolutionState,
 ) -> SSARepr {
     let mut result = flatten(graph);
-    for (&vid, concrete) in &types.concrete_types {
-        let kind = match concrete {
-            super::rtype::ConcreteType::Signed => RegKind::Int,
-            super::rtype::ConcreteType::GcRef => RegKind::Ref,
-            super::rtype::ConcreteType::Float => RegKind::Float,
-            _ => continue,
-        };
-        result.value_kinds.insert(vid, kind);
-    }
+    result.value_kinds = super::rtype::build_value_kinds(types);
     result
 }
 

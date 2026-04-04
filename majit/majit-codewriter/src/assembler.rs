@@ -41,6 +41,9 @@ pub struct JitCode {
     pub alllabels: std::collections::HashSet<usize>,
     /// RPython: jitcode.py:32 — map from bytecode offset to result type char.
     pub resulttypes: HashMap<usize, char>,
+    /// RPython: jitcode.py:24 — sequential index assigned by CodeWriter.
+    /// Used by InlineCall to reference callee JitCode.
+    pub index: usize,
     /// Total flat ops (for statistics)
     pub num_ops: usize,
 }
@@ -146,6 +149,7 @@ impl Assembler {
             startpoints: state.startpoints,
             alllabels: state.alllabels,
             resulttypes: state.resulttypes,
+            index: 0, // set by CodeWriter after assembly
             num_ops: ssarepr.insns.len(),
         };
 

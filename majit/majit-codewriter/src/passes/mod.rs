@@ -20,4 +20,4 @@ pub use pipeline::{
     PipelineConfig, PipelineOpcodeArm, PipelineResult, ProgramPipelineResult, analyze_function,
     analyze_program,
 };
-pub use rtype::{ConcreteType, TypeResolutionState, resolve_types};
+pub use rtype::{ConcreteType, TypeResolutionState, build_value_kinds, resolve_types};

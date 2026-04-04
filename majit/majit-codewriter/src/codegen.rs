@@ -400,6 +400,7 @@ mod tests {
                 ])),
                 flattened: None,
             }],
+            jitcodes: Vec::new(),
             total_blocks: 0,
             total_ops: 0,
             total_vable_rewrites: 0,

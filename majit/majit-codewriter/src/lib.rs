@@ -181,7 +181,7 @@ fn analyze_pipeline_from_parsed(
     }
     call_control.find_all_graphs();
 
-    pipeline.opcode_dispatch = build_canonical_opcode_dispatch(
+    let (opcode_dispatch, jitcodes) = build_canonical_opcode_dispatch(
         parsed_files,
         &canonical_trait_impls,
         &canonical_inherent_methods,
@@ -189,10 +189,19 @@ fn analyze_pipeline_from_parsed(
         &config.pipeline,
         &mut call_control,
     );
+    pipeline.opcode_dispatch = opcode_dispatch;
+    pipeline.jitcodes = jitcodes;
 
     pipeline
 }
 
+/// RPython: `CodeWriter.make_jitcodes()` equivalent for opcode dispatch.
+///
+/// Each opcode arm's handler graph goes through the full codewriter pipeline:
+///   annotate → rtype → jtransform → regalloc → flatten → liveness → assemble
+///
+/// After all arms are processed, any callee graphs discovered during jtransform
+/// (via `CallControl.get_jitcode()`) are also processed into JitCodes.
 fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
     trait_impls: &[TraitImplInfo],
@@ -200,7 +209,7 @@ fn build_canonical_opcode_dispatch(
     function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
     pipeline_config: &passes::PipelineConfig,
     call_control: &mut call::CallControl,
-) -> Vec<passes::PipelineOpcodeArm> {
+) -> (Vec<passes::PipelineOpcodeArm>, Vec<assembler::JitCode>) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
 
@@ -213,10 +222,14 @@ fn build_canonical_opcode_dispatch(
         }
     }
 
-    opcode_arms
+    // RPython: codewriter = CodeWriter(cpu, jitdrivers_sd)  (codewriter.py:20-23)
+    let mut codewriter = codewriter::CodeWriter::new();
+    let mut arm_jitcodes: Vec<assembler::JitCode> = Vec::new();
+
+    let dispatch: Vec<passes::PipelineOpcodeArm> = opcode_arms
         .into_iter()
         .map(|arm| {
-            let resolved_calls = resolve_handler_calls(
+            let _resolved_calls = resolve_handler_calls(
                 &arm.handler_calls,
                 trait_impls,
                 inherent_methods,
@@ -224,23 +237,22 @@ fn build_canonical_opcode_dispatch(
                 &receiver_traits,
             );
 
-            // RPython codewriter path: jtransform → flatten on the handler's
-            // OWN graph (the match arm body), not a resolved callee.
+            // RPython: CodeWriter.transform_graph_to_jitcode(graph, jitcode, verbose, index)
+            // (codewriter.py:33-72)
             //
-            // RPython processes the portal graph as a whole. We process per-
-            // opcode arm. The arm's body_graph IS the handler — jtransform
-            // rewrites its Call ops to inline_call_*/residual_call_* etc.
+            // Each arm's body_graph goes through the full pipeline.
+            // The SSARepr is kept for backward compatibility (PipelineOpcodeArm.flattened),
+            // and the JitCode is the new assembled output.
             let flattened = arm.body_graph.as_ref().map(|handler_graph| {
-                // RPython pipeline: annotate → rtype → jtransform → flatten.
-                // We compute types BEFORE jtransform so make_three_lists
-                // can split args by kind (RPython: getkind(v.concretetype)).
-                let annotations = passes::annotate_graph(handler_graph);
-                let type_state = passes::resolve_types(handler_graph, &annotations);
-                let mut transformer = passes::Transformer::new(&pipeline_config.transform)
-                    .with_callcontrol(&mut *call_control)
-                    .with_type_state(&type_state);
-                let rewritten = transformer.transform(handler_graph);
-                passes::flatten_with_types(&rewritten.graph, &type_state)
+                let index = arm_jitcodes.len();
+                let (ssarepr, jitcode) = codewriter.transform_graph_to_jitcode(
+                    handler_graph,
+                    call_control,
+                    &pipeline_config.transform,
+                    index,
+                );
+                arm_jitcodes.push(jitcode);
+                ssarepr
             });
 
             passes::PipelineOpcodeArm {
@@ -248,7 +260,19 @@ fn build_canonical_opcode_dispatch(
                 flattened,
             }
         })
-        .collect()
+        .collect();
+
+    // RPython: process callee graphs discovered during jtransform
+    // (codewriter.py:79-84 — the enum_pending_graphs loop)
+    let callee_jitcodes = codewriter.make_jitcodes(call_control, &pipeline_config.transform);
+
+    // RPython: self.assembler.finished(callinfocollection) (codewriter.py:85)
+    // Already called inside make_jitcodes.
+
+    // Combine arm JitCodes + callee JitCodes
+    arm_jitcodes.extend(callee_jitcodes);
+
+    (dispatch, arm_jitcodes)
 }
 
 /// Classify a resolved call by jtransform-rewriting its graph.
@@ -627,6 +651,29 @@ mod tests {
                 .filter_map(|arm| arm.flattened.as_ref())
                 .all(|f| f.insns.len() > 0),
             "all flattened arms should have non-empty op sequences"
+        );
+
+        // RPython: CodeWriter.make_jitcodes() produces JitCode for each graph.
+        // Verify the full pipeline (regalloc + liveness + assemble) runs.
+        eprintln!("\nJitCodes: {}", result.jitcodes.len());
+        for (i, jitcode) in result.jitcodes.iter().enumerate() {
+            eprintln!(
+                "  [{}] {} → {} bytes, regs i={} r={} f={}",
+                i,
+                jitcode.name,
+                jitcode.code.len(),
+                jitcode.num_regs_i,
+                jitcode.num_regs_r,
+                jitcode.num_regs_f,
+            );
+        }
+        assert!(
+            !result.jitcodes.is_empty(),
+            "CodeWriter should produce JitCodes from opcode arms"
+        );
+        assert!(
+            result.jitcodes.iter().all(|jc| !jc.code.is_empty()),
+            "all JitCodes should have non-empty bytecode"
         );
     }
 
