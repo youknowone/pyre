@@ -5459,11 +5459,9 @@ impl VirtualInfo {
     ) -> i64 {
         match self {
             VirtualInfo::VirtualObj {
-                descr_index,
-                fields,
-                ..
+                type_id, fields, ..
             } => {
-                let obj = allocator.allocate_with_vtable(*descr_index);
+                let obj = allocator.allocate_with_vtable(*type_id);
                 decoder.virtuals_cache_ptr[index] = obj;
                 for (field_descr, source) in fields {
                     let value = decoder.decode_field_source(source);
