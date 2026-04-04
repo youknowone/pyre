@@ -567,6 +567,11 @@ impl CallControl {
     pub fn function_graphs(&self) -> &HashMap<CallPath, FunctionGraph> {
         &self.function_graphs
     }
+
+    /// Access jitdriver static data.
+    pub fn jitdrivers_sd(&self) -> &[JitDriverStaticData] {
+        &self.jitdrivers_sd
+    }
 }
 
 impl Default for CallControl {

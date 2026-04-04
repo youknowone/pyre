@@ -227,15 +227,25 @@ fn build_canonical_opcode_dispatch(
         }
     }
 
-    // RPython: grab_initial_jitcodes() BEFORE any jtransform processing.
-    // This seeds portal graphs into the pending queue first, so they get
-    // the lowest JitCode indices (codewriter.py:76, call.py:145-148).
-    call_control.grab_initial_jitcodes();
+    // RPython codewriter.py:74-89: make_jitcodes() processes graphs in order:
+    //   1. grab_initial_jitcodes() seeds portal → portal is first in queue
+    //   2. enum_pending_graphs loop: portal processed FIRST, discovers callees
+    //   3. callees processed in LIFO order
+    //
+    // In majit, we must process portal + its callees BEFORE arm jtransform
+    // so that the processing order (and thus jitcode.index) matches RPython.
+    // Arm jtransform may call get_jitcode() but will mostly hit the cache
+    // (idempotent) since portal processing already discovered the callees.
+    let mut codewriter = codewriter::CodeWriter::new();
 
-    // Phase 1: Process opcode arms through annotate → rtype → jtransform → flatten.
-    // This produces SSARepr for each arm (PipelineOpcodeArm.flattened).
-    // During jtransform, CallControl.get_jitcode() may discover callee graphs
-    // and add them to the pending queue.
+    // Phase 1: RPython make_jitcodes() — portal first, then callees.
+    call_control.grab_initial_jitcodes();
+    let mut jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
+
+    // Phase 2: majit-specific arm processing (SSARepr for PipelineOpcodeArm).
+    // Arm body_graphs go through annotate → rtype → jtransform → flatten.
+    // get_jitcode() calls during jtransform are idempotent for already-known
+    // callees; new callees are added to the pending queue.
     let dispatch: Vec<passes::PipelineOpcodeArm> = opcode_arms
         .into_iter()
         .map(|arm| {
@@ -247,9 +257,6 @@ fn build_canonical_opcode_dispatch(
                 &receiver_traits,
             );
 
-            // RPython pipeline: annotate → rtype → jtransform → flatten.
-            // We compute types BEFORE jtransform so make_three_lists
-            // can split args by kind (RPython: getkind(v.concretetype)).
             let flattened = arm.body_graph.as_ref().map(|handler_graph| {
                 let annotations = passes::annotate_graph(handler_graph);
                 let type_state = passes::resolve_types(handler_graph, &annotations);
@@ -267,11 +274,9 @@ fn build_canonical_opcode_dispatch(
         })
         .collect();
 
-    // Phase 2: RPython CodeWriter.make_jitcodes() enum_pending_graphs loop
-    // (codewriter.py:79-85). Process pending graphs: portal (seeded above)
-    // + callees discovered during Phase 1's jtransform.
-    let mut codewriter = codewriter::CodeWriter::new();
-    let jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
+    // Phase 3: Process any NEW callees discovered during Phase 2's arm jtransform.
+    let extra_jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
+    jitcodes.extend(extra_jitcodes);
 
     (dispatch, jitcodes)
 }
