@@ -2431,7 +2431,9 @@ impl Optimization for OptRewrite {
                         }
                     }
                 }
-                // postprocess_GUARD_CLASS: record known class
+                // rewrite.py:430-436 postprocess_GUARD_CLASS:
+                // Record known class with guard position so downstream passes
+                // can distinguish "set by THIS guard" from "set by a PRIOR guard".
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
                         let should_record = ctx
@@ -2441,10 +2443,13 @@ impl Optimization for OptRewrite {
                         if should_record {
                             ctx.set_ptr_info(
                                 obj,
-                                crate::optimizeopt::info::PtrInfo::known_class(
-                                    majit_ir::GcRef(class_val as usize),
-                                    true,
-                                ),
+                                crate::optimizeopt::info::PtrInfo::KnownClass {
+                                    class_ptr: majit_ir::GcRef(class_val as usize),
+                                    is_nonnull: true,
+                                    // Tag with THIS guard's position so the virtualize
+                                    // pass can skip removal for the SAME guard.
+                                    last_guard_pos: op.pos.0 as i32,
+                                },
                             );
                         }
                     }

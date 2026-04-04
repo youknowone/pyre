@@ -657,34 +657,54 @@ impl UnrollOptimizer {
             });
             jump_ctx.clear_newoperations();
 
-            // unroll.py:207: first attempt without forcing boxes
-            // runtime_boxes: in loop optimization, the JUMP args ARE the
-            // runtime boxes (they represent live values at the back-edge).
+            // unroll.py:151-158: jump_to_existing_trace(force_boxes=False)
+            // RPython: except InvalidLoop → jump_to_preamble immediately,
+            // NO retry. The big comment at unroll.py:305-316 explains why
+            // continuing after partial inlining is unsafe.
             let runtime_boxes = body_jump_args.clone();
+            let mut invalid_loop = false;
             let mut jumped = if skip_jump_to_existing {
                 false
             } else {
-                opt_unroll
-                    .jump_to_existing_trace(
-                        &body_jump_args,
-                        Some(&current_label_args),
-                        &mut self.target_tokens,
-                        &mut opt_p2,
-                        &mut jump_ctx,
-                        false,
-                        Some(&runtime_boxes),
-                    )
-                    .is_none() // None = jumped successfully
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    opt_unroll
+                        .jump_to_existing_trace(
+                            &body_jump_args,
+                            Some(&current_label_args),
+                            &mut self.target_tokens,
+                            &mut opt_p2,
+                            &mut jump_ctx,
+                            false,
+                            Some(&runtime_boxes),
+                        )
+                        .is_none()
+                })) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if payload
+                            .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                            .is_some()
+                        {
+                            // unroll.py:154-158: except InvalidLoop →
+                            // jump_to_preamble, skip retry
+                            invalid_loop = true;
+                            false
+                        } else {
+                            std::panic::resume_unwind(payload);
+                        }
+                    }
+                }
             };
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
-                    "[jit] jump_to_existing_trace(force_boxes=false) result: jumped={}",
-                    jumped
+                    "[jit] jump_to_existing_trace(force_boxes=false) result: jumped={}, invalid_loop={}",
+                    jumped, invalid_loop
                 );
             }
 
-            if !jumped && !skip_jump_to_existing {
-                // unroll.py:214-230: retrace_limit check
+            // unroll.py:154-158: on InvalidLoop, skip retry entirely
+            if !jumped && !skip_jump_to_existing && !invalid_loop {
+                // unroll.py:161-174: virtual state not matched, retry
                 if self.retraced_count < self.retrace_limit {
                     self.retraced_count += 1;
                     if std::env::var_os("MAJIT_LOG").is_some() {
@@ -693,37 +713,61 @@ impl UnrollOptimizer {
                             self.retraced_count, self.retrace_limit
                         );
                     }
-                    // RPython: when force_boxes=false fails, retry with
-                    // force_boxes=true to materialize virtual args before
-                    // the JUMP. This matches RPython's self-loop compilation
-                    // where the JUMP goes through the optimizer's JUMP handler
-                    // which forces all virtuals.
+                    // unroll.py:164-168: force_boxes=True, except InvalidLoop: pass
                     jump_ctx.clear_newoperations();
-                    jumped = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            Some(&runtime_boxes),
-                        )
-                        .is_none();
+                    jumped = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        opt_unroll
+                            .jump_to_existing_trace(
+                                &body_jump_args,
+                                Some(&current_label_args),
+                                &mut self.target_tokens,
+                                &mut opt_p2,
+                                &mut jump_ctx,
+                                true,
+                                Some(&runtime_boxes),
+                            )
+                            .is_none()
+                    })) {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            if payload
+                                .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                                .is_some()
+                            {
+                                false // unroll.py:167-168: except InvalidLoop: pass
+                            } else {
+                                std::panic::resume_unwind(payload);
+                            }
+                        }
+                    };
                 } else {
                     // unroll.py:220-226: limit reached, try force_boxes=true
                     jump_ctx.clear_newoperations();
-                    jumped = opt_unroll
-                        .jump_to_existing_trace(
-                            &body_jump_args,
-                            Some(&current_label_args),
-                            &mut self.target_tokens,
-                            &mut opt_p2,
-                            &mut jump_ctx,
-                            true,
-                            Some(&runtime_boxes),
-                        )
-                        .is_none();
+                    jumped = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        opt_unroll
+                            .jump_to_existing_trace(
+                                &body_jump_args,
+                                Some(&current_label_args),
+                                &mut self.target_tokens,
+                                &mut opt_p2,
+                                &mut jump_ctx,
+                                true,
+                                Some(&runtime_boxes),
+                            )
+                            .is_none()
+                    })) {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            if payload
+                                .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                                .is_some()
+                            {
+                                false // unroll.py:224-225: except InvalidLoop: pass
+                            } else {
+                                std::panic::resume_unwind(payload);
+                            }
+                        }
+                    };
                     if !jumped {
                         // unroll.py:228: "Retrace count reached, jumping to preamble"
                         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -2096,15 +2140,21 @@ impl OptUnroll {
                     match mapping.get(arg) {
                         Some(&mapped) => *arg = mapped,
                         None => {
-                            // RPython: raise InvalidLoop — structural mismatch
-                            // with short preamble. Return empty to abort.
+                            // RPython: _map_args raises KeyError for unmapped
+                            // args. This is equivalent to InvalidLoop — the
+                            // short preamble is structurally incompatible.
+                            // Panic propagates through jump_to_existing_trace
+                            // to the caller, which catches it and falls back
+                            // to jump_to_preamble (unroll.py:154-158, 209-211).
                             if crate::optimizeopt::majit_log_enabled() {
                                 eprintln!(
                                     "[jit] inline_short_preamble: unmapped arg {:?} in {:?} — InvalidLoop",
                                     arg, new_op.opcode
                                 );
                             }
-                            return Vec::new();
+                            std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                                "inline_short_preamble: unmapped arg in short preamble",
+                            ));
                         }
                     }
                 }

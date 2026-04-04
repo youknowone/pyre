@@ -1480,15 +1480,7 @@ impl MIFrame {
         let raw_index = if self.value_type(key) == Type::Int {
             key
         } else {
-            let fail_args = self.current_fail_args(ctx);
-            crate::generated::trace_unbox_int(
-                ctx,
-                key,
-                &INT_TYPE as *const _ as i64,
-                ob_type_descr(),
-                int_intval_descr(),
-                &fail_args,
-            )
+            crate::state::trace_unbox_int_with_resume(self, ctx, key, &INT_TYPE as *const _ as i64)
         };
         let zero = ctx.const_int(0);
         if concrete_key >= 0 {
@@ -1969,31 +1961,16 @@ impl MIFrame {
             OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
         );
         self.with_ctx(|this, ctx| {
-            let fail_args = this.current_fail_args(ctx);
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             let lhs_raw = if this.value_type(a) == Type::Int {
                 a
             } else {
-                crate::generated::trace_unbox_int(
-                    ctx,
-                    a,
-                    int_type_addr,
-                    crate::descr::ob_type_descr(),
-                    crate::descr::int_intval_descr(),
-                    &fail_args,
-                )
+                crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
             };
             let rhs_raw = if this.value_type(b) == Type::Int {
                 b
             } else {
-                crate::generated::trace_unbox_int(
-                    ctx,
-                    b,
-                    int_type_addr,
-                    crate::descr::ob_type_descr(),
-                    crate::descr::int_intval_descr(),
-                    &fail_args,
-                )
+                crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
             };
             let raw_result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
             if has_overflow {
@@ -2067,18 +2044,10 @@ impl MIFrame {
             // RPython: space.float_w(w_int) → float(w_int.intval)
             let unbox_int_to_float =
                 |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                    let fail_args = this.current_fail_args(ctx);
                     let raw_int = if this.value_type(obj) == Type::Int {
                         obj
                     } else {
-                        crate::generated::trace_unbox_int(
-                            ctx,
-                            obj,
-                            int_type_addr,
-                            crate::descr::ob_type_descr(),
-                            crate::descr::int_intval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_int_with_resume(this, ctx, obj, int_type_addr)
                     };
                     ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
                 };
@@ -2143,35 +2112,20 @@ impl MIFrame {
                     ComparisonOperator::NotEqual => OpCode::IntNe,
                 };
                 return self.with_ctx(|this, ctx| {
-                    let fail_args = this.current_fail_args(ctx);
                     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                     let lhs_raw = if this.value_type(a) == Type::Int {
                         a
                     } else if let Some(raw) = try_trace_const_boxed_int(ctx, a, lhs_obj) {
                         raw
                     } else {
-                        crate::generated::trace_unbox_int(
-                            ctx,
-                            a,
-                            int_type_addr,
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_int_with_resume(this, ctx, a, int_type_addr)
                     };
                     let rhs_raw = if this.value_type(b) == Type::Int {
                         b
                     } else if let Some(raw) = try_trace_const_boxed_int(ctx, b, rhs_obj) {
                         raw
                     } else {
-                        crate::generated::trace_unbox_int(
-                            ctx,
-                            b,
-                            int_type_addr,
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_int_with_resume(this, ctx, b, int_type_addr)
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
                     this.remember_value_type(truth, Type::Int);
@@ -2197,31 +2151,16 @@ impl MIFrame {
                     ComparisonOperator::NotEqual => OpCode::FloatNe,
                 };
                 return self.with_ctx(|this, ctx| {
-                    let fail_args = this.current_fail_args(ctx);
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
                     let lhs_raw = if this.value_type(a) == Type::Float {
                         a
                     } else {
-                        crate::generated::trace_unbox_float(
-                            ctx,
-                            a,
-                            float_type_addr,
-                            ob_type_descr(),
-                            float_floatval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_float_with_resume(this, ctx, a, float_type_addr)
                     };
                     let rhs_raw = if this.value_type(b) == Type::Float {
                         b
                     } else {
-                        crate::generated::trace_unbox_float(
-                            ctx,
-                            b,
-                            float_type_addr,
-                            ob_type_descr(),
-                            float_floatval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_float_with_resume(this, ctx, b, float_type_addr)
                     };
                     let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
                     this.remember_value_type(truth, Type::Int);
@@ -2308,18 +2247,10 @@ impl MIFrame {
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-                            let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::generated::trace_unbox_int(
-                                    ctx,
-                                    value,
-                                    &INT_TYPE as *const _ as i64,
-                                    ob_type_descr(),
-                                    int_intval_descr(),
-                                    &fail_args,
-                                )
+                                crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
                             };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2337,18 +2268,10 @@ impl MIFrame {
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_int_items_ptr_descr());
-                            let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::generated::trace_unbox_int(
-                                    ctx,
-                                    value,
-                                    &INT_TYPE as *const _ as i64,
-                                    ob_type_descr(),
-                                    int_intval_descr(),
-                                    &fail_args,
-                                )
+                                crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
                             };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2372,18 +2295,10 @@ impl MIFrame {
                             let index = this.trace_dynamic_list_index(ctx, key, len, index as i64);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-                            let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::generated::trace_unbox_float(
-                                    ctx,
-                                    value,
-                                    &FLOAT_TYPE as *const _ as i64,
-                                    ob_type_descr(),
-                                    float_floatval_descr(),
-                                    &fail_args,
-                                )
+                                crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
                             };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2401,18 +2316,10 @@ impl MIFrame {
                             let index = this.trace_dynamic_list_index(ctx, key, len, index);
                             let items_ptr =
                                 trace_gc_object_int_field(ctx, obj, list_float_items_ptr_descr());
-                            let fail_args = this.current_fail_args(ctx);
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::generated::trace_unbox_float(
-                                    ctx,
-                                    value,
-                                    &FLOAT_TYPE as *const _ as i64,
-                                    ob_type_descr(),
-                                    float_floatval_descr(),
-                                    &fail_args,
-                                )
+                                crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
                             };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2488,18 +2395,10 @@ impl MIFrame {
                     let items_ptr =
                         trace_gc_object_int_field(ctx, list, list_int_items_ptr_descr());
                     let index = ctx.const_int(concrete_len as i64);
-                    let fail_args = this.current_fail_args(ctx);
                     let raw = if this.value_type(value) == Type::Int {
                         value
                     } else {
-                        crate::generated::trace_unbox_int(
-                            ctx,
-                            value,
-                            &INT_TYPE as *const _ as i64,
-                            ob_type_descr(),
-                            int_intval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
                     };
                     trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
@@ -2532,18 +2431,10 @@ impl MIFrame {
                     let items_ptr =
                         trace_gc_object_int_field(ctx, list, list_float_items_ptr_descr());
                     let index = ctx.const_int(concrete_len as i64);
-                    let fail_args = this.current_fail_args(ctx);
                     let raw = if this.value_type(value) == Type::Float {
                         value
                     } else {
-                        crate::generated::trace_unbox_float(
-                            ctx,
-                            value,
-                            &FLOAT_TYPE as *const _ as i64,
-                            ob_type_descr(),
-                            float_floatval_descr(),
-                            &fail_args,
-                        )
+                        crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
                     };
                     trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
@@ -3788,20 +3679,12 @@ impl MIFrame {
         unsafe {
             if is_int(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let fail_args = this.current_fail_args(ctx);
                     let int_type_addr = &INT_TYPE as *const _ as i64;
                     let int_value =
                         if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
                             raw
                         } else {
-                            crate::generated::trace_unbox_int(
-                                ctx,
-                                value,
-                                int_type_addr,
-                                ob_type_descr(),
-                                int_intval_descr(),
-                                &fail_args,
-                            )
+                            crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
                         };
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[int_value, zero]))
@@ -3809,20 +3692,12 @@ impl MIFrame {
             }
             if is_bool(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let fail_args = this.current_fail_args(ctx);
                     let bool_type_addr = &BOOL_TYPE as *const _ as i64;
                     let bool_value =
                         if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
                             raw
                         } else {
-                            crate::generated::trace_unbox_int(
-                                ctx,
-                                value,
-                                bool_type_addr,
-                                ob_type_descr(),
-                                bool_boolval_descr(),
-                                &fail_args,
-                            )
+                            crate::state::trace_unbox_int_with_resume_descr(this, ctx, value, bool_type_addr, crate::descr::bool_boolval_descr())
                         };
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[bool_value, zero]))
@@ -3836,16 +3711,8 @@ impl MIFrame {
             }
             if is_float(concrete_value) {
                 return self.with_ctx(|this, ctx| {
-                    let fail_args = this.current_fail_args(ctx);
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let float_value = crate::generated::trace_unbox_float(
-                        ctx,
-                        value,
-                        float_type_addr,
-                        ob_type_descr(),
-                        float_floatval_descr(),
-                        &fail_args,
-                    );
+                    let float_value = crate::state::trace_unbox_float_with_resume(this, ctx, value, float_type_addr);
                     let zero = ctx.const_int(0);
                     let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
                     Ok(ctx.record_op(OpCode::FloatNe, &[float_value, zero_float]))
@@ -3917,16 +3784,8 @@ impl MIFrame {
             let payload = if this.value_type(value) == Type::Int {
                 value
             } else {
-                let fail_args = this.current_fail_args(ctx);
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                crate::generated::trace_unbox_int(
-                    ctx,
-                    value,
-                    int_type_addr,
-                    ob_type_descr(),
-                    int_intval_descr(),
-                    &fail_args,
-                )
+                crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
             };
             if matches!(opcode, OpCode::IntNeg) {
                 let min_val = ctx.const_int(i64::MIN);
