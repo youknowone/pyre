@@ -1606,10 +1606,12 @@ const FLOAT_CMP_TARGETS: &[CallTargetPattern] = &[
 ];
 
 // effectinfo.py: EF_ELIDABLE_CAN_RAISE — may raise (e.g. ZeroDivisionError)
-const INT_DIV_TARGETS: &[CallTargetPattern] = &[
-    CallTargetPattern::FunctionPath(&["int_floordiv"]),
-    CallTargetPattern::FunctionPath(&["int_mod"]),
-];
+// int_floordiv and int_mod have distinct oopspec indices (IntPyDiv vs IntPyMod)
+// because intbounds.rs optimizes them differently.
+const INT_FLOORDIV_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["int_floordiv"])];
+
+const INT_MOD_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(&["int_mod"])];
 
 const FLOAT_DIV_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["float_floordiv"]),
@@ -1688,9 +1690,14 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     },
     // ── Elidable but may raise (ZeroDivisionError, OverflowError) ──
     CallDescriptorEntry {
-        targets: INT_DIV_TARGETS,
+        targets: INT_FLOORDIV_TARGETS,
         extra_effect: ExtraEffect::ElidableCanRaise,
         oopspec_index: OopSpecIndex::IntPyDiv,
+    },
+    CallDescriptorEntry {
+        targets: INT_MOD_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::IntPyMod,
     },
     CallDescriptorEntry {
         targets: FLOAT_DIV_TARGETS,
@@ -1740,17 +1747,20 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
         extra_effect: ExtraEffect::ElidableCanRaise,
         oopspec_index: OopSpecIndex::None,
     },
-    // ── Constructors (elidable, cannot raise) ──
+    // ── Allocating constructors (cannot raise, but NOT elidable) ──
+    // w_int_new/w_float_new allocate fresh objects — CSE would merge
+    // distinct allocations, breaking Python identity (is).
     CallDescriptorEntry {
         targets: INT_NEW_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
+        extra_effect: ExtraEffect::CannotRaise,
         oopspec_index: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: FLOAT_NEW_TARGETS,
-        extra_effect: ExtraEffect::ElidableCannotRaise,
+        extra_effect: ExtraEffect::CannotRaise,
         oopspec_index: OopSpecIndex::None,
     },
+    // w_bool_from returns singletons (True/False) — safe to CSE.
     CallDescriptorEntry {
         targets: BOOL_FROM_TARGETS,
         extra_effect: ExtraEffect::ElidableCannotRaise,
