@@ -416,7 +416,7 @@ pub(crate) fn build_guard_metadata(
                                         fielddescrs.iter().map(|fd| fd.index).collect();
                                     majit_backend::ExitVirtualLayout::Object {
                                         descr: descr.clone(),
-                                        type_id: known_class.map_or(0, |kc| kc as u32),
+                                        type_id: *type_id,
                                         descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
