@@ -782,6 +782,58 @@ impl IndexVar {
             constant: self.constant,
         }
     }
+
+    /// dependency.py:1065-1083: get_operations()
+    ///
+    /// Materialize the linear combination as IR operations:
+    ///   var * coefficient_mul / coefficient_div + constant
+    pub fn get_operations(&self) -> Vec<majit_ir::Op> {
+        use majit_ir::{Op, OpCode};
+        let mut var = self.var;
+        let mut tolist = Vec::new();
+        if self.coefficient_mul != 1 {
+            let c = OpRef(OpRef::CONST_BASE + tolist.len() as u32 + 10000);
+            // Caller must set constant value for c to coefficient_mul.
+            let op = Op::new(OpCode::IntMul, &[var, c]);
+            var = op.pos;
+            tolist.push(op);
+        }
+        // coefficient_div != 1: assert 0 in RPython (commented out INT_PY_DIV)
+        assert!(
+            self.coefficient_div == 1,
+            "IndexVar.get_operations: coefficient_div != 1 not supported"
+        );
+        if self.constant > 0 {
+            let c = OpRef(OpRef::CONST_BASE + tolist.len() as u32 + 10001);
+            let op = Op::new(OpCode::IntAdd, &[var, c]);
+            var = op.pos;
+            tolist.push(op);
+        }
+        if self.constant < 0 {
+            let c = OpRef(OpRef::CONST_BASE + tolist.len() as u32 + 10002);
+            let op = Op::new(OpCode::IntSub, &[var, c]);
+            let _ = var;
+            tolist.push(op);
+        }
+        tolist
+    }
+
+    /// dependency.py:1085-1093: emit_operations(opt, result_box)
+    ///
+    /// Emit the linear operations into the output list.
+    /// Returns the result OpRef (last emitted op, or var if identity).
+    pub fn emit_operations(&self, new_ops: &mut Vec<majit_ir::Op>) -> OpRef {
+        if self.is_identity() {
+            return self.var;
+        }
+        let ops = self.get_operations();
+        let mut last = self.var;
+        for op in ops {
+            last = op.pos;
+            new_ops.push(op);
+        }
+        last
+    }
 }
 
 // ── dependency.py:1140-1220: MemoryRef ────────────────────────

@@ -198,11 +198,36 @@ impl Guard {
         self.rhs.getvariable()
     }
 
+    /// guard.py:126-132: emit_varops(opt, var, old_arg)
+    fn emit_varops(
+        var: &IndexVar,
+        old_arg: OpRef,
+        new_ops: &mut Vec<Op>,
+        renamer: &mut HashMap<OpRef, OpRef>,
+    ) -> OpRef {
+        if var.is_identity() {
+            return var.var;
+        }
+        let result = var.emit_operations(new_ops);
+        // guard.py:131: opt.renamer.start_renaming(old_arg, box)
+        if !result.is_constant() {
+            renamer.insert(old_arg, result);
+        }
+        result
+    }
+
     /// guard.py:73-97: transitive_imply(other, opt, loop)
     ///
     /// Emit a transitive guard that eliminates a loop guard.
-    /// `label_args` is `loop.label.getarglist_copy()` for fail_args.
-    pub fn transitive_imply(&self, other: &Guard, label_args: &[OpRef]) -> Option<(Op, Op)> {
+    /// `label_args` = `loop.label.getarglist_copy()`.
+    /// Emits compare + guard into `new_ops`. Returns the guard op.
+    pub fn transitive_imply(
+        &self,
+        other: &Guard,
+        label_args: &[OpRef],
+        new_ops: &mut Vec<Op>,
+        renamer: &mut HashMap<OpRef, OpRef>,
+    ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
         }
@@ -214,21 +239,38 @@ impl Guard {
         }
         // guard.py:83
         let opnum = Self::transitive_cmpop(self.cmp_op.opcode);
-        // guard.py:84-86: compare = ResOperation(opnum, [box_rhs, other_rhs])
-        let cmp_op = Op::new(opnum, &[self.cmp_op.arg(1), other.cmp_op.arg(1)]);
-        // guard.py:89-94: descr = CompileLoopVersionDescr()
+        // guard.py:84-85: emit_varops
+        let box_rhs = Self::emit_varops(&self.rhs, self.cmp_op.arg(1), new_ops, renamer);
+        let other_rhs = Self::emit_varops(&other.rhs, other.cmp_op.arg(1), new_ops, renamer);
+        // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
+        let compare = Op::new(opnum, &[box_rhs, other_rhs]);
+        new_ops.push(compare.clone());
+        // guard.py:89-91: descr = CompileLoopVersionDescr()
         //   descr.copy_all_attributes_from(self.op.getdescr())
         //   descr.rd_vector_info = None
-        let mut guard_op = Op::new(self.op.opcode, &[cmp_op.pos]);
-        // Copy resume data from self.op (the stronger guard).
-        guard_op.descr = self.op.descr.clone();
+        // Fresh descr — RPython creates a new CompileLoopVersionDescr
+        // with copied attributes but distinct identity.
+        let fresh_descr = crate::fail_descr::make_resume_guard_descr(
+            label_args.len(),
+            crate::resume::ResumeData {
+                vable_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+        );
+        let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
+        guard_op.descr = Some(fresh_descr);
+        // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.fail_args = Some(label_args.into());
         guard_op.fail_arg_types = self.op.fail_arg_types.clone();
         guard_op.rd_resume_position = self.op.rd_resume_position;
         guard_op.rd_numb = self.op.rd_numb.clone();
         guard_op.rd_consts = self.op.rd_consts.clone();
         guard_op.rd_virtuals = self.op.rd_virtuals.clone();
-        Some((cmp_op, guard_op))
+        // guard.py:95: opt.emit_operation(guard)
+        new_ops.push(guard_op.clone());
+        Some(guard_op)
     }
 
     /// guard.py:99-104: transitive_cmpop(opnum)
@@ -259,12 +301,17 @@ impl Guard {
 
     /// guard.py:134-147: emit_operations(opt)
     ///
-    /// Re-emit the guard with fresh comparison and guard ops.
-    pub fn emit_operations(&mut self, new_ops: &mut Vec<Op>) {
-        // guard.py:136-140: emit cmp_op
-        new_ops.push(self.cmp_op.clone());
-        // guard.py:142-144: emit guard with descr + fail_args from self.op
-        let mut guard = Op::new(self.op.opcode, &[self.cmp_op.pos]);
+    /// Re-emit the guard: materialize lhs/rhs via emit_varops,
+    /// create fresh cmp + guard, emit them.
+    pub fn emit_operations(&mut self, new_ops: &mut Vec<Op>, renamer: &mut HashMap<OpRef, OpRef>) {
+        // guard.py:136-137: lhs/rhs via emit_varops
+        let lhs = Self::emit_varops(&self.lhs, self.cmp_op.arg(0), new_ops, renamer);
+        let rhs = Self::emit_varops(&self.rhs, self.cmp_op.arg(1), new_ops, renamer);
+        // guard.py:138-140: cmp_op = ResOperation(opnum, [lhs, rhs])
+        let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
+        new_ops.push(cmp_op.clone());
+        // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
+        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos]);
         guard.descr = self.op.descr.clone();
         guard.fail_args = self.op.fail_args.clone();
         guard.fail_arg_types = self.op.fail_arg_types.clone();
@@ -276,6 +323,7 @@ impl Guard {
         // guard.py:145-147
         self.setindex(new_ops.len() - 1);
         self.setoperation(guard);
+        self.setcmp(cmp_op);
     }
 
     /// guard.py:149-156: set_to_none(info, loop)
@@ -308,6 +356,8 @@ pub struct GuardEliminator {
     pub strongest_guards: HashMap<OpRef, Vec<Guard>>,
     /// guard.py:172
     guards: HashMap<usize, Option<Guard>>,
+    /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
+    renamer: HashMap<OpRef, OpRef>,
 }
 
 impl GuardEliminator {
@@ -319,6 +369,7 @@ impl GuardEliminator {
             strength_reduced: 0,
             strongest_guards: HashMap::new(),
             guards: HashMap::new(),
+            renamer: HashMap::new(),
         }
     }
 
@@ -379,10 +430,17 @@ impl GuardEliminator {
 
     /// guard.py:221-249: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
+        // guard.py:222: self.renamer = Renamer()
+        self.renamer = HashMap::new();
         self._newoperations = Vec::with_capacity(ops.len());
+
+        // Take guards out of self to satisfy borrow checker.
+        let mut guards = std::mem::take(&mut self.guards);
+        let index_vars = self.index_vars.clone();
+
         for (i, op) in ops.iter().enumerate() {
             if op.opcode.is_guard() {
-                if let Some(replacement) = self.guards.get_mut(&i) {
+                if let Some(replacement) = guards.get_mut(&i) {
                     self.strength_reduced += 1;
                     match replacement {
                         None => {
@@ -391,30 +449,34 @@ impl GuardEliminator {
                         }
                         Some(guard) => {
                             // guard.py:234: guard.emit_operations(self)
-                            guard.emit_operations(&mut self._newoperations);
+                            guard.emit_operations(&mut self._newoperations, &mut self.renamer);
                             continue;
                         }
                     }
                 } else {
                     // guard.py:237: self.emit_operation(op)
-                    self._newoperations.push(op.clone());
+                    let mut renamed = op.clone();
+                    self.rename_op(&mut renamed);
+                    self._newoperations.push(renamed);
                     continue;
                 }
             }
-            // guard.py:239-245: non-void index_var → emit_operations
+            // guard.py:239-245: non-void index_var → emit_operations + rename
             if op.opcode.result_type() != majit_ir::Type::Void {
-                if let Some(index_var) = self.index_vars.get(&op.pos) {
+                if let Some(index_var) = index_vars.get(&op.pos) {
                     if !index_var.is_identity() {
-                        // TODO: index_var.emit_operations(opt, op)
-                        // For now, emit the original op.
-                        self._newoperations.push(op.clone());
+                        let result = index_var.emit_operations(&mut self._newoperations);
+                        self.renamer.insert(op.pos, result);
                         continue;
                     }
                 }
             }
             // guard.py:246: self.emit_operation(op)
-            self._newoperations.push(op.clone());
+            let mut renamed = op.clone();
+            self.rename_op(&mut renamed);
+            self._newoperations.push(renamed);
         }
+        self.guards = guards;
         self._newoperations.clone()
     }
 
@@ -424,43 +486,68 @@ impl GuardEliminator {
         self.eliminate_guards(ops)
     }
 
-    /// guard.py:272-277: emit_operation / operation_position
-    pub fn emit_operation(&mut self, op: Op) {
+    /// renamer.py:20-22: rename(op) — apply renamer map to op args.
+    fn rename_op(&self, op: &mut Op) {
+        for arg in op.args.iter_mut() {
+            if let Some(&replacement) = self.renamer.get(arg) {
+                *arg = replacement;
+            }
+        }
+    }
+
+    /// guard.py:272-274: emit_operation(op)
+    pub fn emit_operation(&mut self, mut op: Op) {
+        self.rename_op(&mut op);
         self._newoperations.push(op);
     }
 
+    /// guard.py:276-277: operation_position()
     pub fn operation_position(&self) -> usize {
         self._newoperations.len()
     }
 
     /// guard.py:279-303: eliminate_array_bound_checks(info, loop)
     ///
-    /// `label_args` is `loop.label.getarglist_copy()` for transitive guard fail_args.
+    /// `label_args` = `loop.label.getarglist_copy()`.
+    /// Mutates `ops` in place (nullifies removed guards then compacts).
+    /// Returns prefix ops to prepend to the loop.
     pub fn eliminate_array_bound_checks(
         &mut self,
         ops: &mut Vec<Op>,
         label_args: &[OpRef],
     ) -> Vec<Op> {
-        let mut prefix = Vec::new();
-        // guard.py:283-302
-        for guards in self.strongest_guards.values() {
+        // guard.py:282
+        self._newoperations = Vec::new();
+
+        // guard.py:283-299
+        let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
+        let guards_snapshot: HashMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
+        for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
             }
             let one = &guards[0];
             for other in &guards[1..] {
-                if let Some((cmp_op, guard_op)) = one.transitive_imply(other, label_args) {
+                // guard.py:291
+                if one
+                    .transitive_imply(
+                        other,
+                        label_args,
+                        &mut self._newoperations,
+                        &mut self.renamer,
+                    )
+                    .is_some()
+                {
                     // guard.py:296: other.set_to_none(info, loop)
-                    let mut opt_ops: Vec<Option<Op>> = ops.iter().cloned().map(Some).collect();
                     other.set_to_none(&mut opt_ops);
-                    *ops = opt_ops.into_iter().flatten().collect();
-                    // guard.py:302: loop.prefix
-                    prefix.push(cmp_op);
-                    prefix.push(guard_op);
                 }
             }
         }
-        prefix
+        // guard.py:303: loop.operations = [op for op in loop.operations if op]
+        *ops = opt_ops.into_iter().flatten().collect();
+
+        // guard.py:302: loop.prefix = self._newoperations + loop.prefix
+        std::mem::take(&mut self._newoperations)
     }
 }
 
