@@ -1266,15 +1266,18 @@ fn effectinfo_from_writeanalyze(
     let mut write_descrs_fields = write_fields;
     let mut write_descrs_arrays = write_arrays;
 
-    // RPython effectinfo.py:181-186: for elidable/loopinvariant,
-    // ignore writes (write_descrs = frozenset()).
+    // RPython effectinfo.py:169-181: for elidable/loopinvariant,
+    // ignore writes (_write_descrs_* = frozenset()).
+    // This must clear BOTH the bitset AND the descr set, so that
+    // single_write_descr_array becomes None (effectinfo.py:201-206).
     if ignore_writes {
         write_descrs_fields = 0;
         write_descrs_arrays = 0;
+        array_write_descrs.clear();
     }
 
     // effectinfo.py:201-206: single_write_descr_array
-    // RPython: if len(_write_descrs_arrays) == 1: single = _write_descrs_arrays[0]
+    // RPython: if len(_write_descrs_arrays) == 1: [single] = _write_descrs_arrays
     let single_write_descr_array = if array_write_descrs.len() == 1 {
         Some(array_write_descrs.into_iter().next().unwrap())
     } else {
@@ -1354,21 +1357,26 @@ fn collect_readwrite_effects(
                 OpKind::ArrayWrite { item_ty, .. } => {
                     let idx = descr_indices.array_index(value_type_discriminant(item_ty));
                     *write_arrays |= 1u64 << idx;
-                    // effectinfo.py:201-206: collect array DescrRef for
-                    // single_write_descr_array. Create SimpleArrayDescr
-                    // from item type (RPython: cpu.arraydescrof(ARRAY)).
-                    let ir_type = match item_ty {
-                        crate::model::ValueType::Int | crate::model::ValueType::State => {
-                            majit_ir::value::Type::Int
-                        }
-                        crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
-                            majit_ir::value::Type::Ref
-                        }
-                        crate::model::ValueType::Float => majit_ir::value::Type::Float,
-                        crate::model::ValueType::Void => majit_ir::value::Type::Void,
-                    };
-                    let ad = majit_ir::descr::SimpleArrayDescr::new(idx, 0, 8, 0, ir_type);
-                    array_write_descrs.push(std::sync::Arc::new(ad));
+                    // effectinfo.py:298,307: cpu.arraydescrof(ARRAY) → DescrRef.
+                    // RPython keys on ARRAY identity (lltype.GcArray(T));
+                    // majit keys on item_ty (ValueType discriminant), which is
+                    // equivalent for plain arrays (GcArray(Signed) etc.) but
+                    // merges different struct-arrays with the same item_ty.
+                    // Dedup by descriptor index (frozenset semantics).
+                    if !array_write_descrs.iter().any(|d| d.index() == idx) {
+                        let ir_type = match item_ty {
+                            crate::model::ValueType::Int | crate::model::ValueType::State => {
+                                majit_ir::value::Type::Int
+                            }
+                            crate::model::ValueType::Ref | crate::model::ValueType::Unknown => {
+                                majit_ir::value::Type::Ref
+                            }
+                            crate::model::ValueType::Float => majit_ir::value::Type::Float,
+                            crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                        };
+                        let ad = majit_ir::descr::SimpleArrayDescr::new(idx, 0, 8, 0, ir_type);
+                        array_write_descrs.push(std::sync::Arc::new(ad));
+                    }
                 }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {
