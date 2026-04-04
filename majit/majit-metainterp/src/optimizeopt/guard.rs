@@ -277,27 +277,61 @@ impl Guard {
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(opnum, &[box_rhs, other_rhs]);
         new_ops.push(compare.clone());
-        // guard.py:89-91: descr = CompileLoopVersionDescr()
+        // guard.py:89-91:
+        //   descr = CompileLoopVersionDescr()
         //   descr.copy_all_attributes_from(self.op.getdescr())
         //   descr.rd_vector_info = None
-        let fresh_descr = crate::fail_descr::make_compile_loop_version_descr(
-            label_args.len(),
-            crate::resume::ResumeData {
-                vable_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
-        );
+        //
+        // compile.py:861-872 copy_all_attributes_from copies:
+        //   rd_consts, rd_pendingfields, rd_virtuals, rd_numb
+        // In majit resume state lives on Op fields, transferred to descr
+        // at compile time. The fresh descr carries loop_version()=true.
+        // We copy the source descr's resume data if accessible.
+        let source_resume = if let Some(ref src) = self.op.descr {
+            // Best effort: clone the source descr to get its resume data.
+            // If not clonable, use empty.
+            src.clone_descr()
+        } else {
+            None
+        };
+        let fresh_descr = if let Some(cloned) = source_resume {
+            // If the source was already CompileLoopVersionDescr, clone
+            // preserves the type. Otherwise wrap in a new one.
+            if cloned.as_fail_descr().is_some_and(|f| f.loop_version()) {
+                cloned
+            } else {
+                crate::fail_descr::make_compile_loop_version_descr(
+                    label_args.len(),
+                    crate::resume::ResumeData {
+                        vable_array: Vec::new(),
+                        frames: Vec::new(),
+                        virtuals: Vec::new(),
+                        pending_fields: Vec::new(),
+                    },
+                )
+            }
+        } else {
+            crate::fail_descr::make_compile_loop_version_descr(
+                label_args.len(),
+                crate::resume::ResumeData {
+                    vable_array: Vec::new(),
+                    frames: Vec::new(),
+                    virtuals: Vec::new(),
+                    pending_fields: Vec::new(),
+                },
+            )
+        };
         let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
         guard_op.descr = Some(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.fail_args = Some(label_args.into());
+        // copy_all_attributes_from parity: Op-level resume fields.
         guard_op.fail_arg_types = self.op.fail_arg_types.clone();
         guard_op.rd_resume_position = self.op.rd_resume_position;
         guard_op.rd_numb = self.op.rd_numb.clone();
         guard_op.rd_consts = self.op.rd_consts.clone();
         guard_op.rd_virtuals = self.op.rd_virtuals.clone();
+        guard_op.rd_pendingfields = self.op.rd_pendingfields.clone();
         // guard.py:95: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
@@ -319,11 +353,13 @@ impl Guard {
         // guard.py:118
         self.index = other.index;
         // guard.py:120-121: descr.copy_all_attributes_from(other.op.getdescr())
+        // compile.py:861-872: copies rd_consts, rd_pendingfields, rd_virtuals, rd_numb
         self.op.descr = other.op.descr.clone();
         self.op.rd_resume_position = other.op.rd_resume_position;
         self.op.rd_numb = other.op.rd_numb.clone();
         self.op.rd_consts = other.op.rd_consts.clone();
         self.op.rd_virtuals = other.op.rd_virtuals.clone();
+        self.op.rd_pendingfields = other.op.rd_pendingfields.clone();
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
         self.op.fail_args = other.op.fail_args.clone();
         self.op.fail_arg_types = other.op.fail_arg_types.clone();
@@ -369,6 +405,7 @@ impl Guard {
         guard.rd_numb = self.op.rd_numb.clone();
         guard.rd_consts = self.op.rd_consts.clone();
         guard.rd_virtuals = self.op.rd_virtuals.clone();
+        guard.rd_pendingfields = self.op.rd_pendingfields.clone();
         new_ops.push(guard.clone());
         // guard.py:145-147
         self.setindex(new_ops.len() - 1);
@@ -554,18 +591,22 @@ impl GuardEliminator {
     /// `version_info`: optional LoopVersionInfo for loop-version tracking.
     /// `label_args`: label arglist for transitive guard fail_args.
     /// `user_code`: if true, run eliminate_array_bound_checks.
+    ///
+    /// Returns `(ops, const_values)`. `const_values` maps constant OpRefs
+    /// (allocated by IndexVar materialization) to their i64 values.
+    /// The caller must register these in the trace's constant pool.
     pub fn propagate_all_forward(
         &mut self,
         ops: &[Op],
         version_info: Option<&mut super::version::LoopVersionInfo>,
         label_args: &[OpRef],
         user_code: bool,
-    ) -> Vec<Op> {
+    ) -> (Vec<Op>, HashMap<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
-        // guard.py:257-266: track loop-version guards in version_info.
         if let Some(info) = version_info {
+            // guard.py:257-266: track loop-version guards in version_info.
             assert!(
                 info.versions.len() == 1,
                 "guard.py:257 assert len(info.versions) == 1"
@@ -576,30 +617,26 @@ impl GuardEliminator {
                     continue;
                 }
                 if let Some(ref descr) = op.descr {
-                    // guard.py:263-266: if descr and descr.loop_version()
                     if let Some(fd) = descr.as_fail_descr() {
                         if fd.loop_version() {
-                            let fi = fd.fail_index();
-                            info.track(fi, version.clone());
+                            info.track(fd.fail_index(), version.clone());
                         }
                     }
                 }
             }
-        }
 
-        if user_code {
-            // guard.py:269: self.eliminate_array_bound_checks(info, loop)
-            // Returns prefix ops; RPython does loop.prefix = prefix + loop.prefix.
-            let prefix = self.eliminate_array_bound_checks(&mut result, label_args);
-            if !prefix.is_empty() {
-                // Prepend prefix to result.
-                let mut combined = prefix;
-                combined.append(&mut result);
-                result = combined;
+            // guard.py:268-269: if user_code: self.eliminate_array_bound_checks(info, loop)
+            if user_code {
+                let prefix = self.eliminate_array_bound_checks(&mut result, label_args, info);
+                if !prefix.is_empty() {
+                    let mut combined = prefix;
+                    combined.append(&mut result);
+                    result = combined;
+                }
             }
         }
 
-        result
+        (result, std::mem::take(&mut self.const_values))
     }
 
     /// renamer.py:20-22: rename(op) — apply renamer map to op args.
@@ -621,9 +658,21 @@ impl GuardEliminator {
     pub fn operation_position(&self) -> usize {
         self._newoperations.len()
     }
+}
 
+/// Helper: track a guard in version_info without borrow conflicts.
+fn info_track_guard(
+    info: &mut super::version::LoopVersionInfo,
+    fail_index: u32,
+    version: super::version::LoopVersion,
+) {
+    info.track(fail_index, version);
+}
+
+impl GuardEliminator {
     /// guard.py:279-303: eliminate_array_bound_checks(info, loop)
     ///
+    /// `version_info`: LoopVersionInfo for tracking.
     /// `label_args` = `loop.label.getarglist_copy()`.
     /// Mutates `ops` in place (nullifies removed guards then compacts).
     /// Returns prefix ops to prepend to the loop.
@@ -631,7 +680,12 @@ impl GuardEliminator {
         &mut self,
         ops: &mut Vec<Op>,
         label_args: &[OpRef],
+        version_info: &mut super::version::LoopVersionInfo,
     ) -> Vec<Op> {
+        // guard.py:280
+        version_info.mark();
+        // guard.py:281
+        let mut version: Option<super::version::LoopVersion> = None;
         // guard.py:282
         self._newoperations = Vec::new();
 
@@ -645,22 +699,43 @@ impl GuardEliminator {
             let one = &guards[0];
             for other in &guards[1..] {
                 // guard.py:291
-                if one
-                    .transitive_imply(
-                        other,
-                        label_args,
-                        &mut self._newoperations,
-                        &mut self.renamer,
-                        &mut self.next_const_pos,
-                        &mut self.const_values,
-                    )
-                    .is_some()
-                {
+                let transitive_guard = one.transitive_imply(
+                    other,
+                    label_args,
+                    &mut self._newoperations,
+                    &mut self.renamer,
+                    &mut self.next_const_pos,
+                    &mut self.const_values,
+                );
+                if let Some(tg) = transitive_guard {
+                    // guard.py:293-294: version = info.snapshot(loop)
+                    if version.is_none() {
+                        let flat_ops: Vec<Op> = opt_ops.iter().filter_map(|o| o.clone()).collect();
+                        version = Some(version_info.snapshot(&flat_ops, label_args));
+                    }
+                    // guard.py:295: info.remove(other.op.getdescr())
+                    if let Some(fd) = other.op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                        let fi = fd.fail_index();
+                        // Only remove if tracked; non-loop-version guards aren't in leads_to.
+                        if version_info.leads_to.contains_key(&fi) {
+                            version_info.remove(fi);
+                        }
+                    }
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
+                    // guard.py:297-299: info.track(transitive_guard, descr, version)
+                    if let Some(fd) = tg.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                        info_track_guard(
+                            version_info,
+                            fd.fail_index(),
+                            version.as_ref().unwrap().clone(),
+                        );
+                    }
                 }
             }
         }
+        // guard.py:300
+        version_info.clear();
         // guard.py:303: loop.operations = [op for op in loop.operations if op]
         *ops = opt_ops.into_iter().flatten().collect();
 

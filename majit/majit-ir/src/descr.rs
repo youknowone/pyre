@@ -29,6 +29,14 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         format!("{:?}", self)
     }
 
+    /// compile.py: clone() — create a subtype-preserving copy with a fresh
+    /// fail_index. Returns None if this descriptor type doesn't support cloning.
+    /// RPython: `olddescr.clone()` preserves the concrete type
+    /// (ResumeGuardDescr, CompileLoopVersionDescr, etc.).
+    fn clone_descr(&self) -> Option<DescrRef> {
+        None
+    }
+
     // ── Downcasting helpers ──
 
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {

@@ -142,38 +142,45 @@ impl LoopVersion {
     ///
     /// Clone guard descriptors in the version's ops so each version
     /// has its own descr identity. Re-track cloned loop-version guards.
+    /// version.py:100-114: setup_once(info)
+    ///
+    /// Clone guard descriptors in the version's ops so each version
+    /// has its own descr identity. Uses `olddescr.clone()` which
+    /// preserves the concrete type (CompileLoopVersionDescr stays
+    /// CompileLoopVersionDescr, ResumeGuardDescr stays ResumeGuardDescr).
     pub fn setup_once(&mut self, info: &mut LoopVersionInfo) {
         for op in &mut self.ops {
             if !op.opcode.is_guard() {
                 continue;
             }
+            // version.py:104-105
             let old_descr = match &op.descr {
                 Some(d) => d.clone(),
                 None => continue,
             };
-            let Some(old_fd) = old_descr.as_fail_descr() else {
+            // version.py:107: descr = olddescr.clone()
+            // Subtype-preserving clone: CompileLoopVersionDescr.clone()
+            // returns CompileLoopVersionDescr, preserving loop_version()==true.
+            let Some(new_descr) = old_descr.clone_descr() else {
                 continue;
             };
-            let old_fail_index = old_fd.fail_index();
-            // version.py:105: descr = olddescr.clone()
-            let new_descr = fail_descr::make_resume_guard_descr(
-                op.fail_args.as_ref().map_or(0, |fa| fa.len()),
-                crate::resume::ResumeData {
-                    vable_array: Vec::new(),
-                    frames: Vec::new(),
-                    virtuals: Vec::new(),
-                    pending_fields: Vec::new(),
-                },
-            );
+            // version.py:108: op.setdescr(descr)
             op.descr = Some(new_descr.clone());
-            // version.py:107-112: if descr.loop_version(), re-track
-            // We check if the old descr was tracked in leads_to.
-            if let Some(to_version) = info.leads_to.get(&old_fail_index).cloned() {
-                let new_fail_index = new_descr
-                    .as_fail_descr()
-                    .expect("fresh descr must be FailDescr")
-                    .fail_index();
-                info.track(new_fail_index, to_version);
+            // version.py:109-114: if descr.loop_version()
+            let Some(new_fd) = new_descr.as_fail_descr() else {
+                continue;
+            };
+            if new_fd.loop_version() {
+                let Some(old_fd) = old_descr.as_fail_descr() else {
+                    continue;
+                };
+                let old_fi = old_fd.fail_index();
+                let toversion = info.leads_to.get(&old_fi).cloned();
+                if let Some(tv) = toversion {
+                    info.track(new_fd.fail_index(), tv);
+                } else {
+                    panic!("version.py:114 olddescr must be found in leads_to");
+                }
             }
         }
     }
