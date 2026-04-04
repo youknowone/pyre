@@ -131,24 +131,18 @@ impl CodeWriter {
     ///
     /// RPython codewriter.py:79-84: the enum_pending_graphs loop.
     ///
-    /// Appends to `all_jitcodes` (caller-owned) so that multiple calls
-    /// accumulate into a single collection — this avoids the index-reset
-    /// problem that would occur with a local Vec.
+    /// Places each JitCode at `all_jitcodes[jitcode.index]` directly,
+    /// guaranteeing the RPython invariant `all_jitcodes[i].index == i`
+    /// without post-hoc sorting.
     ///
-    /// ## Index contract
-    ///
-    /// RPython uses JitCode *object references* in InlineCall ops, so
-    /// `jitcode.index = len(all_jitcodes)` is just metadata (codewriter.py:80).
-    ///
-    /// majit uses `InlineCall.jitcode_index` (an integer) as the dispatch
-    /// key. This integer comes from `CallControl.get_jitcode()` at jtransform
-    /// time. To keep InlineCall.jitcode_index == JitCode.index, we use the
-    /// same allocation index from `get_jitcode()` — NOT `all_jitcodes.len()`.
+    /// RPython achieves this naturally because `jitcode.index = len(all_jitcodes)`
+    /// at append time (codewriter.py:80). majit uses `get_jitcode()` allocation
+    /// indices instead, so we place by index rather than append.
     pub fn drain_pending_graphs(
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-        all_jitcodes: &mut Vec<JitCode>,
+        all_jitcodes: &mut Vec<Option<JitCode>>,
     ) {
         // RPython: for graph, jitcode in self.callcontrol.enum_pending_graphs():
         //            self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
@@ -163,9 +157,6 @@ impl CodeWriter {
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
                 continue;
             };
-            // majit: jitcode.index = alloc_index (from get_jitcode).
-            // This matches InlineCall.jitcode_index which was set at
-            // jtransform time using the same get_jitcode() call.
             let (_ssarepr, mut jitcode) =
                 self.transform_graph_to_jitcode(&graph, callcontrol, config, alloc_index);
 
@@ -176,7 +167,12 @@ impl CodeWriter {
                 }
             }
 
-            all_jitcodes.push(jitcode);
+            // Place at the correct index position.
+            // RPython: all_jitcodes[jitcode.index] == jitcode
+            if alloc_index >= all_jitcodes.len() {
+                all_jitcodes.resize_with(alloc_index + 1, || None);
+            }
+            all_jitcodes[alloc_index] = Some(jitcode);
         }
     }
 
@@ -188,11 +184,11 @@ impl CodeWriter {
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
     ) -> Vec<JitCode> {
-        let mut all_jitcodes: Vec<JitCode> = Vec::new();
+        let mut all_jitcodes: Vec<Option<JitCode>> = Vec::new();
         self.drain_pending_graphs(callcontrol, config, &mut all_jitcodes);
-        // RPython: self.assembler.finished(self.callcontrol.callinfocollection)
         self.assembler.finished(&callcontrol.callinfocollection);
-        all_jitcodes
+        // Unwrap: every slot must be filled.
+        all_jitcodes.into_iter().flatten().collect()
     }
 }
 

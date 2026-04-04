@@ -230,11 +230,10 @@ fn build_canonical_opcode_dispatch(
     // RPython codewriter.py:74-89: make_jitcodes().
     //
     // A single all_jitcodes collection accumulates across all phases.
-    // JitCode.index = allocation index from get_jitcode(), NOT
-    // all_jitcodes.len(). This guarantees InlineCall.jitcode_index
-    // (set at jtransform time) == JitCode.index (set at assembly time).
+    // Indexed by alloc_index from get_jitcode(), guaranteeing
+    // all_jitcodes[i].index == i (RPython codewriter.py:80 invariant).
     let mut codewriter = codewriter::CodeWriter::new();
-    let mut jitcodes: Vec<assembler::JitCode> = Vec::new();
+    let mut jitcodes: Vec<Option<assembler::JitCode>> = Vec::new();
 
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     call_control.grab_initial_jitcodes();
@@ -278,6 +277,9 @@ fn build_canonical_opcode_dispatch(
     codewriter
         .assembler
         .finished(&call_control.callinfocollection);
+
+    // Unwrap: all_jitcodes[i].index == i by construction.
+    let jitcodes = jitcodes.into_iter().flatten().collect();
 
     (dispatch, jitcodes)
 }
