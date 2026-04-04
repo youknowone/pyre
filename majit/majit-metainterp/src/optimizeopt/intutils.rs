@@ -13,7 +13,7 @@
 /// - tvalue: the known bits (where tmask is 0)
 /// - tmask: 1 where the bit is unknown, 0 where it's known
 /// - the combination tvalue=1, tmask=1 at the same bit position is forbidden
-pub use crate::optimizeopt::optimize::InvalidLoop;
+pub use crate::optimize::InvalidLoop;
 
 // ── Free helper functions ──
 

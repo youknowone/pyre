@@ -90,7 +90,7 @@ fn real_main() {
         // Only print if it's NOT an InvalidLoop (which is caught by catch_unwind)
         let payload = info.payload();
         if payload
-            .downcast_ref::<majit_metainterp::optimizeopt::optimize::InvalidLoop>()
+            .downcast_ref::<majit_metainterp::optimize::InvalidLoop>()
             .is_none()
         {
             default_hook(info);

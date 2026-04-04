@@ -2323,7 +2323,7 @@ impl Optimizer {
             Ok(vs) => Ok(vs),
             Err(payload) => {
                 if payload
-                    .downcast_ref::<crate::optimizeopt::optimize::InvalidLoop>()
+                    .downcast_ref::<crate::optimize::InvalidLoop>()
                     .is_some()
                 {
                     Err(())

@@ -50,15 +50,14 @@ impl majit_ir::Descr for MetaFailDescr {
         Some(self)
     }
     fn clone_descr(&self) -> Option<DescrRef> {
+        // RPython: clone() preserves the concrete subtype.
+        // MetaFailDescr.clone() → MetaFailDescr (same type, new fail_index).
         Some(Arc::new(MetaFailDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
             vector_info: UnsafeCell::new(self.vector_info().clone()),
         }))
     }
-    // clone_as_loop_version_descr: NOT implemented.
-    // MetaFailDescr has no resume storage. RPython's
-    // copy_all_attributes_from requires ResumeGuardDescr as source.
 }
 
 impl FailDescr for MetaFailDescr {
@@ -108,16 +107,6 @@ impl majit_ir::Descr for ResumeGuardDescr {
             types: self.types.clone(),
             resume_data: self.resume_data.clone(),
             vector_info: UnsafeCell::new(self.vector_info().clone()),
-        }))
-    }
-    /// guard.py:89-91: CompileLoopVersionDescr() + copy_all_attributes_from(self)
-    /// + rd_vector_info = None.
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(CompileLoopVersionDescr {
-            fail_index: alloc_fail_index(),
-            types: self.types.clone(),
-            resume_data: self.resume_data.clone(),
-            vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
         }))
     }
 }
@@ -220,20 +209,30 @@ pub fn make_resume_guard_descr_with_index(
     })
 }
 
-/// compile.py: ResumeAtPositionDescr — type tag for guards created during
-/// loop unrolling / short preamble inlining. Carries no extra data.
+/// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
+/// with no additional fields or method overrides. Type tag only.
 ///
-/// When compile_trace encounters a bridge starting from this descriptor,
-/// it sets inline_short_preamble = false.
+/// In RPython, ResumeAtPositionDescr inherits all of ResumeGuardDescr's
+/// fields (rd_numb, rd_consts, rd_virtuals, rd_pendingfields) and its
+/// clone() method (which calls copy_all_attributes_from). The only
+/// difference is the type tag used by compile_trace to decide
+/// inline_short_preamble.
+///
+/// We model this as a newtype wrapping ResumeGuardDescr so that
+/// clone_descr() produces a plain ResumeGuardDescr with resume data
+/// preserved — matching RPython's inherited clone() behavior exactly.
 #[derive(Debug)]
 pub struct ResumeAtPositionDescr {
-    fail_index: u32,
-    types: Vec<Type>,
+    inner: ResumeGuardDescr,
 }
+
+// Safety: same as ResumeGuardDescr (single-threaded JIT).
+unsafe impl Send for ResumeAtPositionDescr {}
+unsafe impl Sync for ResumeAtPositionDescr {}
 
 impl majit_ir::Descr for ResumeAtPositionDescr {
     fn index(&self) -> u32 {
-        self.fail_index
+        self.inner.fail_index
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -241,32 +240,60 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     fn is_resume_at_position(&self) -> bool {
         true
     }
-    // RPython: ResumeAtPositionDescr does NOT override clone().
-    // The inherited ResumeGuardDescr.clone() returns a plain ResumeGuardDescr,
-    // losing the ResumeAtPositionDescr marker. In majit, we return a
-    // ResumeGuardDescr with empty resume_data (ResumeAtPositionDescr has
-    // no resume storage of its own).
+    // compile.py:878-881: inherited ResumeGuardDescr.clone() →
+    // plain ResumeGuardDescr with copy_all_attributes_from(self).
+    // Marker lost, resume data preserved.
     fn clone_descr(&self) -> Option<DescrRef> {
-        Some(make_plain_resume_guard_descr(self.types.clone()))
+        self.inner.clone_descr()
     }
-    // clone_as_loop_version_descr: NOT implemented.
-    // ResumeAtPositionDescr has no resume storage.
 }
 
 impl FailDescr for ResumeAtPositionDescr {
     fn fail_index(&self) -> u32 {
-        self.fail_index
+        self.inner.fail_index
     }
     fn fail_arg_types(&self) -> &[Type] {
-        &self.types
+        &self.inner.types
+    }
+    fn attach_vector_info(&self, info: AccumVectorInfo) {
+        unsafe { &mut *self.inner.vector_info.get() }.push(info);
+    }
+    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+        unsafe { &mut *self.inner.vector_info.get() }.clone()
     }
 }
 
-/// Create a ResumeAtPositionDescr with auto-assigned fail_index.
+/// Create a ResumeAtPositionDescr with auto-assigned fail_index and
+/// empty resume data.
 pub fn make_resume_at_position_descr() -> DescrRef {
     Arc::new(ResumeAtPositionDescr {
-        fail_index: alloc_fail_index(),
-        types: Vec::new(),
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: Vec::new(),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            vector_info: UnsafeCell::new(Vec::new()),
+        },
+    })
+}
+
+/// Create a ResumeAtPositionDescr with resume data.
+#[allow(dead_code)]
+pub fn make_resume_at_position_descr_with_data(
+    types: Vec<Type>,
+    resume_data: ResumeData,
+) -> DescrRef {
+    Arc::new(ResumeAtPositionDescr {
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types,
+            resume_data,
+            vector_info: UnsafeCell::new(Vec::new()),
+        },
     })
 }
 
@@ -322,15 +349,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             vector_info: UnsafeCell::new(self.vector_info().clone()),
         }))
     }
-    /// Already a CompileLoopVersionDescr — clone + clear vector_info.
-    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(CompileLoopVersionDescr {
-            fail_index: alloc_fail_index(),
-            types: self.types.clone(),
-            resume_data: self.resume_data.clone(),
-            vector_info: UnsafeCell::new(Vec::new()), // rd_vector_info = None
-        }))
-    }
 }
 
 impl FailDescr for CompileLoopVersionDescr {
@@ -372,18 +390,37 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
 ///   descr.copy_all_attributes_from(self.op.getdescr())
 ///   descr.rd_vector_info = None
 ///
-/// Creates a CompileLoopVersionDescr with resume data copied from the
-/// source Op's descr. The source descr MUST exist and support
-/// clone_as_loop_version_descr — this is an invariant from RPython
-/// where the source guard always has a ResumeGuardDescr.
+/// Creates a fresh CompileLoopVersionDescr. In RPython, resume attributes
+/// (rd_numb etc.) are copied from the source descr via copy_all_attributes_from.
+/// In majit, resume state lives on Op fields (rd_numb, rd_consts etc.),
+/// so the caller copies those separately (guard.rs:297-302).
+/// The descr only carries fail_arg types and an empty vector_info.
+///
+/// Panics if source_op has no descr or the descr is not a FailDescr —
+/// matching RPython's invariant that the source guard always has a
+/// ResumeGuardDescr (compile.py:861 assert).
 #[allow(dead_code)]
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
-    let src = source_op
+    let src_descr = source_op
         .descr
         .as_ref()
-        .expect("guard.py:90 self.op.getdescr() must exist");
-    src.clone_as_loop_version_descr()
-        .expect("guard.py:90 descr must support clone_as_loop_version_descr")
+        .expect("guard.py:90: self.op.getdescr() must exist");
+    let src_fd = src_descr
+        .as_fail_descr()
+        .expect("guard.py:90: descr must be a FailDescr");
+    let types = src_fd.fail_arg_types().to_vec();
+    Arc::new(CompileLoopVersionDescr {
+        fail_index: alloc_fail_index(),
+        types,
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        // guard.py:91: descr.rd_vector_info = None
+        vector_info: UnsafeCell::new(Vec::new()),
+    })
 }
 
 /// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.

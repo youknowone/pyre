@@ -14,7 +14,7 @@ pub mod info;
 pub mod intbounds;
 pub mod intdiv;
 pub mod intutils;
-pub mod optimize;
+// optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
 pub mod renamer;
@@ -28,7 +28,7 @@ pub mod version;
 pub mod virtualize;
 pub mod virtualstate;
 pub mod vstring;
-pub mod walkvirtual;
+// walkvirtual moved to crate::walkvirtual (RPython: metainterp/walkvirtual.py)
 
 use std::collections::{HashMap, HashSet};
 
@@ -50,13 +50,10 @@ impl majit_ir::Descr for OptResumeAtPositionDescr {
     fn is_resume_at_position(&self) -> bool {
         true
     }
-    // RPython: ResumeAtPositionDescr does NOT override clone().
-    // Inherited ResumeGuardDescr.clone() returns plain ResumeGuardDescr,
-    // so the is_resume_at_position marker is lost after clone.
+    // RPython: inherited clone() → plain ResumeGuardDescr (marker lost).
     fn clone_descr(&self) -> Option<DescrRef> {
         Some(crate::fail_descr::make_plain_resume_guard_descr(Vec::new()))
     }
-    // clone_as_loop_version_descr: NOT implemented (no resume storage).
 }
 
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
@@ -1579,7 +1576,7 @@ impl OptContext {
             if ridx < self.forwarded.len() {
                 if let Forwarded::IntBound(bound) = &mut self.forwarded[ridx] {
                     if !bound.contains(intval as i64) {
-                        std::panic::panic_any(crate::optimizeopt::optimize::InvalidLoop(
+                        std::panic::panic_any(crate::optimize::InvalidLoop(
                             "constant int is outside the range allowed for that box",
                         ));
                     }
