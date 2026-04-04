@@ -3,6 +3,6 @@
 pub mod ast;
 
 pub use ast::{
-    AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
-    build_semantic_program_from_parsed_files,
+    AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry,
+    build_semantic_program, build_semantic_program_from_parsed_files,
 };
