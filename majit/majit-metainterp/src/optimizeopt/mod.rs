@@ -486,6 +486,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
                 Some(majit_ir::RdVirtualInfo::VirtualInfo {
                     descr: Some(vi.descr.clone()),
+                    type_id: vi.descr.as_size_descr().map(|sd| sd.type_id()).unwrap_or(0),
                     descr_index: vi.descr.index(),
                     known_class: vi
                         .known_class

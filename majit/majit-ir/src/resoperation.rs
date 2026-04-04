@@ -47,6 +47,8 @@ pub enum RdVirtualInfo {
     VirtualInfo {
         /// resume.py:615 self.descr — live SizeDescr reference.
         descr: Option<crate::DescrRef>,
+        /// descr.tid — GC type identifier for allocation dispatch.
+        type_id: u32,
         descr_index: u32,
         known_class: Option<i64>,
         fielddescrs: Vec<FieldDescrInfo>,
