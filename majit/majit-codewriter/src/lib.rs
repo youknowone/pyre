@@ -955,7 +955,7 @@ mod tests {
             }
 
             struct PyFrame;
-            impl SpaceOperationcodeStepExecutor for PyFrame {}
+            impl OpcodeStepExecutor for PyFrame {}
 
             fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
                 match instruction {
@@ -1004,7 +1004,7 @@ mod tests {
             }
 
             struct PyFrame;
-            impl SpaceOperationcodeStepExecutor for PyFrame {
+            impl OpcodeStepExecutor for PyFrame {
                 fn load_fast_checked(&mut self, idx: usize) {
                     let _ = idx;
                 }
