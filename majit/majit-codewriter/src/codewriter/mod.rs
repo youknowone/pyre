@@ -148,17 +148,24 @@ impl CodeWriter {
         // RPython's enum_pending_graphs() pops from unfinished_graphs (LIFO).
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
+        //
+        // Index: RPython uses `len(all_jitcodes)` = processing order (codewriter.py:80).
+        // NOT the get_jitcode() allocation order.
         loop {
-            let popped = callcontrol.pop_one_graph();
-            let Some((path, index)) = popped else {
+            let Some((path, _alloc_index)) = callcontrol.pop_one_graph() else {
                 break;
             };
-            let graph = callcontrol.function_graphs().get(&path).cloned();
-            if let Some(graph) = graph {
-                let (_ssarepr, jitcode) =
-                    self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
-                all_jitcodes.push(jitcode);
-            }
+            // RPython: graph is always available via funcptr._obj.graph.
+            // In majit, some paths from get_jitcode() may not have a graph
+            // (e.g. unresolved external functions). Skip them.
+            let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
+                continue;
+            };
+            // RPython: jitcode.index = len(all_jitcodes) (codewriter.py:68,80)
+            let index = all_jitcodes.len();
+            let (_ssarepr, jitcode) =
+                self.transform_graph_to_jitcode(&graph, callcontrol, config, index);
+            all_jitcodes.push(jitcode);
         }
 
         // RPython: self.assembler.finished(self.callcontrol.callinfocollection)
