@@ -185,6 +185,11 @@ pub struct CallControl {
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
     /// Targets known to be loop-invariant (call once per loop).
     loopinvariant_targets: HashSet<CallPath>,
+
+    /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
+    /// If an array's element type is in this set, the array descriptor gets
+    /// `ArrayFlag::Struct` (like RPython's `isinstance(TYPE, lltype.Struct)`).
+    known_struct_names: HashSet<String>,
 }
 
 /// Sequential descriptor index assignment — majit equivalent of
@@ -226,11 +231,24 @@ impl DescrIndexRegistry {
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
     ///
-    /// Keys on `(item_ty_discriminant, array_type_id)` so that arrays with
-    /// different ARRAY identity get distinct bit indices, even if item_ty
-    /// is the same (e.g. `Vec<Point>` vs `Vec<Line>` both have item_ty=Ref).
+    /// Keys on `(item_ty_discriminant, array_type_id)`.  For non-Ref types
+    /// (Int, Float, Void), `array_type_id` is ignored because all arrays
+    /// of the same primitive element type share one descriptor — exactly
+    /// like RPython's `GcArray(Signed)` being one lltype regardless of
+    /// which field holds it.  Only Ref types need `array_type_id` to
+    /// distinguish different pointer/struct element types.
     pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
-        let key = (item_ty_discriminant, array_type_id.clone());
+        // RPython: GcArray(Signed) == GcArray(Signed) for all int arrays.
+        // Only Ref (discriminant for Ref/Unknown) needs sub-discrimination.
+        let effective_id = if item_ty_discriminant
+            == value_type_discriminant(&crate::model::ValueType::Ref)
+            || item_ty_discriminant == value_type_discriminant(&crate::model::ValueType::Unknown)
+        {
+            array_type_id.clone()
+        } else {
+            None
+        };
+        let key = (item_ty_discriminant, effective_id);
         *self.array_indices.entry(key).or_insert_with(|| {
             let idx = self.next_array_index % 64;
             self.next_array_index += 1;
@@ -256,7 +274,18 @@ impl CallControl {
             next_jitcode_index: 0,
             elidable_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
+            known_struct_names: HashSet::new(),
         }
+    }
+
+    /// RPython: register struct type names for get_type_flag(ARRAY.OF).
+    pub fn set_known_struct_names(&mut self, names: HashSet<String>) {
+        self.known_struct_names = names;
+    }
+
+    /// RPython: isinstance(TYPE, lltype.Struct) check.
+    pub fn is_known_struct(&self, name: &str) -> bool {
+        self.known_struct_names.contains(name)
     }
 
     /// Register a free function graph.
@@ -1299,37 +1328,27 @@ fn effectinfo_from_writeanalyze(
     }
 }
 
-/// RPython: `op.args[0].concretetype` — resolve ARRAY identity from the
-/// producer of a ValueId.  When the op's `array_type_id` is None, we trace
-/// back to the op that produced the `base` ValueId to determine the array's
-/// structural identity.
+/// RPython: `op.args[0].concretetype` — resolve ARRAY identity.
 ///
-/// - FieldRead `{ field: { owner_root, name } }` → `"owner::name"` (like
-///   RPython's `getfield(self, 'arr')` producing `Ptr(GcArray(T))`)
-/// - Input with `array_type_id` from parser → use that directly
+/// In RPython, array identity is the ARRAY lltype (e.g. `GcArray(Signed)`),
+/// determined by the ELEMENT TYPE, not by which field holds the array.
+/// Two fields `a: GcArray(Signed)` and `b: GcArray(Signed)` share the
+/// same descriptor because they have the same element type.
+///
+/// When `array_type_id` is already set (from parser's element type
+/// extraction), use it directly. Otherwise return None, which falls
+/// back to item_ty-only keying in DescrIndexRegistry.
 fn resolve_array_identity(
-    base: &crate::model::ValueId,
+    _base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
-    value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+    _value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
 ) -> Option<String> {
-    // 1. If the op already has an array_type_id (from parser), use it.
-    if op_array_type_id.is_some() {
-        return op_array_type_id.clone();
-    }
-    // 2. Trace back: look up the producer of `base`.
-    if let Some(producer) = value_producers.get(base) {
-        match producer {
-            // self.arr[i] → base comes from FieldRead { field: "arr", owner_root: "MyStruct" }
-            // The array identity is "MyStruct::arr", analogous to RPython's
-            // getfield(self, 'arr').concretetype.TO being GcArray(T).
-            OpKind::FieldRead { field, .. } => {
-                let owner = field.owner_root.as_deref().unwrap_or("_");
-                return Some(format!("{}::{}", owner, field.name));
-            }
-            _ => {}
-        }
-    }
-    None
+    // Use the element-type-based identity from parser if available.
+    // For FieldRead-produced bases (self.arr[i]), we don't know the
+    // field's array element type here; fall back to item_ty only.
+    // This is conservative (merges same-item_ty arrays) but correct:
+    // RPython merges GcArray(Signed) regardless of source field.
+    op_array_type_id.clone()
 }
 
 /// Transitive read/write effect collection.
@@ -1432,7 +1451,11 @@ fn collect_readwrite_effects(
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                         };
                         // RPython: get_type_flag(ARRAY.OF) determines the flag.
-                        let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, false);
+                        // isinstance(TYPE, lltype.Struct) → FLAG_STRUCT.
+                        let is_struct = resolved_id
+                            .as_deref()
+                            .is_some_and(|name| cc.is_known_struct(name));
+                        let flag = majit_ir::descr::ArrayFlag::from_item_type(ir_type, is_struct);
                         let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
                             idx, 0, 8, 0, ir_type, flag,
                         );

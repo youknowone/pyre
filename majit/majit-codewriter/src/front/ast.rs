@@ -24,6 +24,10 @@ pub struct SemanticFunction {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
+    /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
+    /// If the element type of an array is in this set, the array is
+    /// array-of-structs (inline struct elements, not pointers).
+    pub known_struct_names: std::collections::HashSet<String>,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
@@ -41,6 +45,7 @@ pub fn build_semantic_program_with_options(
     options: &AstGraphOptions,
 ) -> SemanticProgram {
     let mut functions = Vec::new();
+    let mut known_struct_names = std::collections::HashSet::new();
 
     for item in &parsed.file.items {
         match item {
@@ -63,11 +68,20 @@ pub fn build_semantic_program_with_options(
                     }
                 }
             }
+            // RPython: collect struct type names for get_type_flag(ARRAY.OF).
+            // If an array's element type is a known struct, the array gets
+            // FLAG_STRUCT instead of FLAG_POINTER.
+            Item::Struct(s) => {
+                known_struct_names.insert(s.ident.to_string());
+            }
             _ => {}
         }
     }
 
-    SemanticProgram { functions }
+    SemanticProgram {
+        functions,
+        known_struct_names,
+    }
 }
 
 pub fn build_semantic_program_from_parsed_files_with_options(
@@ -76,9 +90,9 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 ) -> SemanticProgram {
     let mut program = SemanticProgram::default();
     for parsed in parsed_files {
-        program
-            .functions
-            .extend(build_semantic_program_with_options(parsed, options).functions);
+        let sub = build_semantic_program_with_options(parsed, options);
+        program.functions.extend(sub.functions);
+        program.known_struct_names.extend(sub.known_struct_names);
     }
     program
 }
@@ -111,10 +125,11 @@ pub fn build_function_graph_with_self_ty_pub(
 #[derive(Debug, Clone, Default)]
 struct GraphBuildContext {
     local_type_roots: HashMap<String, String>,
-    /// RPython: ARRAY identity — full type string for array identity
-    /// discrimination. Maps variable name → canonical type string
-    /// (e.g. "arr" → "Vec<Point>"). Used by `cpu.arraydescrof(ARRAY)`.
-    local_full_types: HashMap<String, String>,
+    /// RPython: ARRAY element type identity — maps variable name to the
+    /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
+    /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
+    /// element type that determines the ARRAY identity for `cpu.arraydescrof()`.
+    local_element_types: HashMap<String, String>,
 }
 
 fn build_function_graph(
@@ -150,8 +165,8 @@ fn build_function_graph(
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
                     ctx.local_type_roots.insert(name.clone(), type_root);
                 }
-                if let Some(full_type) = full_type_string(&pat_type.ty) {
-                    ctx.local_full_types.insert(name.clone(), full_type);
+                if let Some(elem_type) = array_element_type(&pat_type.ty) {
+                    ctx.local_element_types.insert(name.clone(), elem_type);
                 }
                 if let Some(vid) = graph.push_op(
                     entry,
@@ -907,12 +922,42 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
     }
 }
 
-/// RPython: ARRAY lltype identity string.
+/// RPython: `GcArray(T)` — extract the element type `T` from an
+/// array-like container type.
 ///
-/// Produces a canonical string from a `syn::Type` that includes generic
-/// arguments, e.g. `Vec<Point>`, `HashMap<String,i64>`.  This is the
-/// Rust equivalent of RPython's `lltype.GcArray(T)` identity — two types
-/// produce the same string iff they represent the same array layout.
+/// For `Vec<Point>`, returns `"Point"`.  For `[i64]`, returns `"i64"`.
+/// This is the Rust equivalent of RPython's ARRAY.OF, which is the
+/// element type that determines the ARRAY identity.  Two arrays with
+/// the same element type share one `cpu.arraydescrof()` descriptor.
+fn array_element_type(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => {
+            // Vec<T>, Box<[T]>, etc. — extract first generic type arg
+            let last_seg = path.path.segments.last()?;
+            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
+                for arg in &args.args {
+                    if let syn::GenericArgument::Type(inner_ty) = arg {
+                        return full_type_string(inner_ty);
+                    }
+                }
+            }
+            None
+        }
+        syn::Type::Reference(r) => array_element_type(&r.elem),
+        syn::Type::Paren(p) => array_element_type(&p.elem),
+        syn::Type::Group(g) => array_element_type(&g.elem),
+        // [T] slice → element type is T
+        syn::Type::Slice(s) => full_type_string(&s.elem),
+        // [T; N] array → element type is T
+        syn::Type::Array(a) => full_type_string(&a.elem),
+        _ => None,
+    }
+}
+
+/// Canonical type string for a syn::Type.
+///
+/// Produces a string that includes generic arguments,
+/// e.g. `Vec<Point>` → `"Vec<Point>"`, `Point` → `"Point"`.
 fn full_type_string(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(path) => {
@@ -956,15 +1001,15 @@ fn full_type_string(ty: &syn::Type) -> Option<String> {
 
 /// RPython: resolve ARRAY identity from an expression.
 ///
-/// For `arr[idx]`, returns the full type of `arr` from context.
-/// Analogous to how RPython's rtyper resolves `op.args[0].concretetype`
-/// to get the ARRAY lltype.
+/// For `arr[idx]`, returns the ELEMENT TYPE of `arr` from context.
+/// This is the Rust equivalent of RPython's `op.args[0].concretetype.TO`
+/// which gives `GcArray(T)` — the `T` is what distinguishes array types.
 fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
     match expr {
         syn::Expr::Path(path) => path
             .path
             .get_ident()
-            .and_then(|ident| ctx.local_full_types.get(&ident.to_string()).cloned()),
+            .and_then(|ident| ctx.local_element_types.get(&ident.to_string()).cloned()),
         syn::Expr::Reference(r) => array_type_id_from_expr(&r.expr, ctx),
         syn::Expr::Paren(p) => array_type_id_from_expr(&p.expr, ctx),
         // For field access (self.array) or other complex exprs,
