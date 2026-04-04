@@ -136,6 +136,8 @@ fn analyze_pipeline_from_parsed(
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
     let mut call_control = call::CallControl::new();
+    // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
+    call_control.set_known_struct_names(program.known_struct_names.clone());
     for (path, graph) in &canonical_function_graphs {
         call_control.register_function_graph(path.clone(), graph.clone());
     }
