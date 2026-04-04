@@ -803,6 +803,44 @@ impl OptVirtualize {
                 ctx.replace_op(op.pos, val_ref);
                 return OptimizationResult::Remove;
             }
+            // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
+            // virtual fields but can be resolved from the SizeDescr vtable.
+            // RPython doesn't need this because GUARD_CLASS reads the class
+            // directly from the object, not via a separate GetfieldGcPure.
+            if field_val.is_none()
+                && matches!(
+                    op.opcode,
+                    majit_ir::OpCode::GetfieldGcPureI | majit_ir::OpCode::GetfieldGcI
+                )
+            {
+                let is_typeptr = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_field_descr())
+                    .map(|fd| fd.offset() == 0)
+                    .unwrap_or(false);
+                if is_typeptr {
+                    let vtable = match &info {
+                        PtrInfo::Virtual(vinfo) => vinfo
+                            .descr
+                            .as_size_descr()
+                            .map(|sd| sd.vtable())
+                            .filter(|&v| v != 0),
+                        PtrInfo::VirtualStruct(vinfo) => vinfo
+                            .descr
+                            .as_size_descr()
+                            .map(|sd| sd.vtable())
+                            .filter(|&v| v != 0),
+                        _ => None,
+                    };
+                    if let Some(vtable) = vtable {
+                        let const_pos = ctx.alloc_op_position();
+                        ctx.make_constant(const_pos, Value::Int(vtable as i64));
+                        ctx.replace_op(op.pos, const_pos);
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
             // Virtualizable: first read of an untracked field.
             // Let the op emit, but cache result for future reads
             // and register array pointers for array tracking.
@@ -1080,19 +1118,15 @@ impl OptVirtualize {
 
         if let Some(info) = ctx.get_ptr_info(obj_ref) {
             match info {
-                // Virtual objects have a known allocation type — guard is redundant
+                // Virtual objects have a known allocation type — guard is redundant.
+                // RPython info.py: only virtual objects can eliminate GUARD_CLASS
+                // in the virtualize pass. KnownClass is handled by OptRewrite
+                // (rewrite.py:397-428), NOT by the virtualize pass.
                 PtrInfo::Virtual(_)
                 | PtrInfo::VirtualStruct(_)
                 | PtrInfo::VirtualArrayStruct(_)
                 | PtrInfo::VirtualRawBuffer(_) => {
                     return OptimizationResult::Remove;
-                }
-                PtrInfo::KnownClass { class_ptr, .. } => {
-                    if expected_class
-                        .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
-                    {
-                        return OptimizationResult::Remove;
-                    }
                 }
                 _ => {}
             }
@@ -1101,10 +1135,35 @@ impl OptVirtualize {
         // Constant-fold: if the guarded value is a compile-time constant,
         // check the class at optimization time. If it matches, remove the guard.
         // PyPy guard.py: guards on constants are always removable.
+        // This handles Phase 2 where virtual typeptr fields resolve to constants.
         if op.num_args() >= 2 {
             if let Some(value) = ctx.get_constant_int(obj_ref) {
                 if let Some(expected) = ctx.get_constant_int(op.arg(1)) {
                     if value == expected {
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
+        }
+
+        // KnownClass check — RPython rewrite.py:401-404 equivalent.
+        // Only remove if KnownClass was set by a PRIOR guard (not the
+        // current one). In RPython, postprocess runs after emit, so
+        // downstream passes never see KnownClass from the same guard.
+        // In majit, OptRewrite's postprocess tags KnownClass with the
+        // guard's position; skip if it matches this guard.
+        if let Some(info) = ctx.get_ptr_info(obj_ref) {
+            if let PtrInfo::KnownClass {
+                class_ptr,
+                last_guard_pos,
+                ..
+            } = info
+            {
+                let is_same_guard = *last_guard_pos >= 0 && *last_guard_pos == op.pos.0 as i32;
+                if !is_same_guard {
+                    if expected_class
+                        .is_none_or(|expected| *class_ptr == expected || class_ptr.is_null())
+                    {
                         return OptimizationResult::Remove;
                     }
                 }

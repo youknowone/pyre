@@ -794,6 +794,48 @@ pub(crate) fn trace_gc_object_type_field(ctx: &mut TraceCtx, obj: OpRef, descr: 
     trace_gc_object_int_field(ctx, obj, descr)
 }
 
+/// Unbox int with proper GuardClass resume data via MIFrame::record_guard.
+pub(crate) fn trace_unbox_int_with_resume(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    int_type_addr: i64,
+) -> OpRef {
+    trace_unbox_int_with_resume_descr(frame, ctx, obj, int_type_addr, crate::descr::int_intval_descr())
+}
+
+pub(crate) fn trace_unbox_int_with_resume_descr(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+) -> OpRef {
+    if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
+        let ob_type = trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
+        let type_const = ctx.const_int(type_addr);
+        frame.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+        ctx.heap_cache_mut().class_now_known(obj, majit_ir::GcRef(type_addr as usize));
+    }
+    crate::generated::trace_unbox_int(ctx, obj, type_addr, crate::descr::ob_type_descr(), intval_descr, &[])
+}
+
+/// Unbox float with proper GuardClass resume data via MIFrame::record_guard.
+pub(crate) fn trace_unbox_float_with_resume(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    float_type_addr: i64,
+) -> OpRef {
+    if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
+        let ob_type = trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
+        let type_const = ctx.const_int(float_type_addr);
+        frame.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+        ctx.heap_cache_mut().class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
+    }
+    crate::generated::trace_unbox_float(ctx, obj, float_type_addr, crate::descr::ob_type_descr(), crate::descr::float_floatval_descr(), &[])
+}
+
 pub(crate) unsafe fn objspace_compare_ints(
     lhs_obj: PyObjectRef,
     rhs_obj: PyObjectRef,

@@ -1098,6 +1098,12 @@ fn maybe_compile_and_run(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    // PYRE_NO_JIT: disable JIT entirely, run interpreter only.
+    // Checked once and cached for the process lifetime.
+    static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+        return None;
+    }
     // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
     if driver.is_tracing() {
         return None;
