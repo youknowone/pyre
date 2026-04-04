@@ -114,7 +114,7 @@ pub fn analyze_program(
     for func in &program.functions {
         let result = analyze_function(func, config);
         total_blocks += result.original_blocks;
-        total_ops += result.flattened.ops.len();
+        total_ops += result.flattened.insns.len();
         total_vable_rewrites += result.vable_rewrites;
         functions.push(result);
     }
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(result.functions.len(), 1);
         assert_eq!(result.functions[0].name, "add");
         assert!(result.functions[0].annotations_count > 0);
-        assert!(result.functions[0].flattened.ops.len() > 0);
+        assert!(result.functions[0].flattened.insns.len() > 0);
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
             func.original_blocks
         );
         // Flattened should have jumps
-        let has_jump = func.flattened.ops.iter().any(|op| {
+        let has_jump = func.flattened.insns.iter().any(|op| {
             matches!(
                 op,
                 crate::passes::flatten::FlatOp::Jump(_)

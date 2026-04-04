@@ -278,7 +278,7 @@ impl CallControl {
             // For each call, check guess_call_kind (with BFS-aware
             // is_candidate that treats "has graph" as candidate).
             for block in &graph.blocks {
-                for op in &block.ops {
+                for op in &block.operations {
                     let target = match &op.kind {
                         OpKind::Call { target, .. } => target,
                         _ => continue,

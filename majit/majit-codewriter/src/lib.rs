@@ -531,7 +531,7 @@ mod tests {
             eprintln!(
                 "  [{i}] {} → {:?}",
                 arm.selector.canonical_key(),
-                arm.flattened.as_ref().map(|f| f.ops.len())
+                arm.flattened.as_ref().map(|f| f.insns.len())
             );
         }
     }
@@ -582,7 +582,7 @@ mod tests {
                 eprintln!(
                     "  {} → {} flat ops",
                     arm.selector.canonical_key(),
-                    flat.ops.len()
+                    flat.insns.len()
                 );
             }
         }
@@ -602,7 +602,7 @@ mod tests {
                 eprintln!(
                     "  {} → {} flat ops",
                     arm.selector.canonical_key(),
-                    flat.ops.len()
+                    flat.insns.len()
                 );
             }
         }
@@ -625,7 +625,7 @@ mod tests {
                 .opcode_dispatch
                 .iter()
                 .filter_map(|arm| arm.flattened.as_ref())
-                .all(|f| f.ops.len() > 0),
+                .all(|f| f.insns.len() > 0),
             "all flattened arms should have non-empty op sequences"
         );
     }
@@ -724,10 +724,13 @@ mod tests {
         );
         eprintln!(
             "load_fast graph ops: {:?}",
-            load_fast_graph.block(load_fast_graph.entry).ops
+            load_fast_graph.block(load_fast_graph.startblock).operations
         );
-        eprintln!("load_fast flattened: {} ops", flattened.ops.len());
-        assert!(flattened.ops.len() > 0, "load_fast should produce flat ops");
+        eprintln!("load_fast flattened: {} ops", flattened.insns.len());
+        assert!(
+            flattened.insns.len() > 0,
+            "load_fast should produce flat ops"
+        );
     }
 
     #[test]
@@ -842,7 +845,7 @@ mod tests {
             "LoadFast should be flattened"
         );
         assert!(
-            load_fast.flattened.as_ref().unwrap().ops.len() > 0,
+            load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "LoadFast flattened should have ops"
         );
     }
@@ -908,7 +911,7 @@ mod tests {
             "canonical LoadFast should be flattened"
         );
         assert!(
-            canonical_load_fast.flattened.as_ref().unwrap().ops.len() > 0,
+            canonical_load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "canonical LoadFast flattened should have ops"
         );
     }
@@ -1226,7 +1229,7 @@ mod tests {
             graph.blocks.len()
         );
         for block in &graph.blocks {
-            for op in &block.ops {
+            for op in &block.operations {
                 eprintln!("    {:?}", op.kind);
             }
         }
@@ -1237,7 +1240,7 @@ mod tests {
         eprintln!("  inlined count: {inlined}");
 
         // Check if any low-level ops emerged from inlining FunctionPath calls
-        let all_ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.ops).collect();
+        let all_ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
         let has_low_level = all_ops.iter().any(|op| {
             matches!(
                 &op.kind,

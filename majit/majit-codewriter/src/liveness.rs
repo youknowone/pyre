@@ -27,12 +27,12 @@ pub fn compute_liveness(flattened: &mut SSARepr) {
 
     // Iterate to fixpoint (RPython: while _compute_liveness_must_continue)
     loop {
-        if !compute_liveness_pass(&mut flattened.ops, &mut label2alive) {
+        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive) {
             break;
         }
     }
     // RPython liveness.py:23: remove_repeated_live(ssarepr)
-    remove_repeated_live(&mut flattened.ops);
+    remove_repeated_live(&mut flattened.insns);
 }
 
 /// RPython liveness.py:82-116: remove_repeated_live.
@@ -167,7 +167,7 @@ mod tests {
         // Return v2
         let mut flat = SSARepr {
             name: "test".into(),
-            ops: vec![
+            insns: vec![
                 FlatOp::Label(Label(0)),
                 FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),

@@ -64,7 +64,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                 }
             }
         }
-        for op in &block.ops {
+        for op in &block.operations {
             if let Some(result) = op.result {
                 if state.get(result) == &ConcreteType::Unknown {
                     let inferred = infer_concrete_from_op(&op.kind);
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn resolves_int_types() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
 
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn resolves_ref_field() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let base = graph.alloc_value();
         let v = graph
             .push_op(
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn resolves_phi_through_link_args() {
         let mut graph = FunctionGraph::new("phi");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let val = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let (target, phi_args) = graph.create_block_with_args(1);
         let phi = phi_args[0];

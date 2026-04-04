@@ -51,7 +51,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
 
         for block in &graph.blocks {
             // Propagate annotations through ops in this block
-            for op in &block.ops {
+            for op in &block.operations {
                 if let Some(result) = op.result {
                     let inferred = infer_op_type(&op.kind, &state);
                     let current = state.get(result).clone();
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn annotates_const_int() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
 
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn annotates_field_read_type() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let base = graph.alloc_value();
         let v = graph
             .push_op(
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn annotates_call_with_int_args() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
         let result = graph
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn annotates_path_like_int_helper_call() {
         let mut graph = FunctionGraph::new("test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
         let result = graph
@@ -290,7 +290,7 @@ mod tests {
     fn propagates_across_blocks_via_phi() {
         // Test cross-block annotation propagation through Link args → inputargs
         let mut graph = FunctionGraph::new("phi_test");
-        let entry = graph.entry;
+        let entry = graph.startblock;
 
         // Entry: produce an Int value
         let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();

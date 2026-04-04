@@ -64,7 +64,7 @@ pub enum RegKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SSARepr {
     pub name: String,
-    pub ops: Vec<FlatOp>,
+    pub insns: Vec<FlatOp>,
     /// Total number of values used (for register allocation).
     pub num_values: usize,
     /// Number of basic blocks in the source graph.
@@ -102,7 +102,7 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
         ops.push(FlatOp::Label(label));
 
         // Ops
-        for op in &block.ops {
+        for op in &block.operations {
             if matches!(&op.kind, crate::model::OpKind::Live) {
                 // RPython: -live- op becomes FlatOp::Live marker
                 ops.push(FlatOp::Live {
@@ -219,7 +219,7 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
 
     SSARepr {
         name: graph.name.clone(),
-        ops,
+        insns: ops,
         num_values: max_value,
         num_blocks: graph.blocks.len(),
         value_kinds: std::collections::HashMap::new(),
@@ -252,8 +252,8 @@ fn block_order(graph: &FunctionGraph) -> Vec<BlockId> {
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
 
-    queue.push_back(graph.entry);
-    visited.insert(graph.entry);
+    queue.push_back(graph.startblock);
+    visited.insert(graph.startblock);
 
     while let Some(bid) = queue.pop_front() {
         order.push(bid);
@@ -294,21 +294,21 @@ mod tests {
     #[test]
     fn flatten_single_block() {
         let mut graph = FunctionGraph::new("simple");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
 
         let flat = flatten(&graph);
         assert_eq!(flat.name, "simple");
         // Label + ConstInt op = 2 flat ops
-        assert!(flat.ops.len() >= 2);
-        assert!(matches!(flat.ops[0], FlatOp::Label(Label(0))));
+        assert!(flat.insns.len() >= 2);
+        assert!(matches!(flat.insns[0], FlatOp::Label(Label(0))));
     }
 
     #[test]
     fn flatten_if_else_produces_jumps() {
         let mut graph = FunctionGraph::new("branch");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let then_block = graph.create_block();
         let else_block = graph.create_block();
@@ -343,13 +343,13 @@ mod tests {
         let flat = flatten(&graph);
         // Should have labels + jumps
         let has_jump = flat
-            .ops
+            .insns
             .iter()
             .any(|op| matches!(op, FlatOp::Jump(_) | FlatOp::GotoIfNot { .. }));
         assert!(has_jump, "flattened if/else should have jumps");
         // Should have 4 labels (one per block)
         let label_count = flat
-            .ops
+            .insns
             .iter()
             .filter(|op| matches!(op, FlatOp::Label(_)))
             .count();
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn flatten_while_loop_has_back_edge() {
         let mut graph = FunctionGraph::new("loop");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let header = graph.create_block();
         let body = graph.create_block();
         let exit = graph.create_block();
@@ -398,7 +398,7 @@ mod tests {
         let flat = flatten(&graph);
         // Body should jump back to header label
         let jumps: Vec<_> = flat
-            .ops
+            .insns
             .iter()
             .filter(|op| matches!(op, FlatOp::Jump(_)))
             .collect();
@@ -413,7 +413,7 @@ mod tests {
         // When a Goto carries Link args to a target with inputargs,
         // flatten should emit Move ops for Phi resolution.
         let mut graph = FunctionGraph::new("phi");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
 
         let (target, phi_args) = graph.create_block_with_args(1);
@@ -430,7 +430,7 @@ mod tests {
 
         let flat = flatten(&graph);
         let moves: Vec<_> = flat
-            .ops
+            .insns
             .iter()
             .filter(|op| matches!(op, FlatOp::Move { .. }))
             .collect();

@@ -117,7 +117,7 @@ impl Assembler {
         };
 
         // RPython assembler.py:42-44: for insn in ssarepr.insns: write_insn(insn)
-        for op in &ssarepr.ops {
+        for op in &ssarepr.insns {
             self.write_insn(op, regallocs, &mut state);
         }
 
@@ -147,7 +147,7 @@ impl Assembler {
             startpoints: state.startpoints,
             alllabels,
             resulttypes: HashMap::new(), // TODO: track during write_insn
-            num_ops: ssarepr.ops.len(),
+            num_ops: ssarepr.insns.len(),
         };
 
         self.count_jitcodes += 1;
@@ -700,7 +700,7 @@ mod tests {
     fn assemble_basic() {
         let mut flat = SSARepr {
             name: "test".into(),
-            ops: vec![],
+            insns: vec![],
             num_values: 0,
             num_blocks: 1,
             value_kinds: HashMap::new(),
@@ -744,7 +744,7 @@ mod tests {
         use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
         // Build graph for regalloc (regalloc operates on graph, not SSARepr)
         let mut graph = FunctionGraph::new("add");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let v0 = graph
             .push_op(
                 entry,
@@ -787,7 +787,7 @@ mod tests {
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let mut flat = SSARepr {
             name: "add".into(),
-            ops: vec![],
+            insns: vec![],
             num_values: 3,
             num_blocks: 1,
             value_kinds,

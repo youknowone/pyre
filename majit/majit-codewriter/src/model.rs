@@ -329,14 +329,14 @@ pub struct Block {
     /// RPython: `Block.inputargs` — each predecessor Link carries
     /// values that map 1:1 to these inputargs.
     pub inputargs: Vec<ValueId>,
-    pub ops: Vec<SpaceOperation>,
+    pub operations: Vec<SpaceOperation>,
     pub terminator: Terminator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionGraph {
     pub name: String,
-    pub entry: BlockId,
+    pub startblock: BlockId,
     pub blocks: Vec<Block>,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -351,11 +351,11 @@ impl FunctionGraph {
         let entry = BlockId(0);
         Self {
             name: name.into(),
-            entry,
+            startblock: entry,
             blocks: vec![Block {
                 id: entry,
                 inputargs: Vec::new(),
-                ops: Vec::new(),
+                operations: Vec::new(),
                 terminator: Terminator::Unreachable,
             }],
             notes: Vec::new(),
@@ -369,7 +369,7 @@ impl FunctionGraph {
         self.blocks.push(Block {
             id,
             inputargs: Vec::new(),
-            ops: Vec::new(),
+            operations: Vec::new(),
             terminator: Terminator::Unreachable,
         });
         id
@@ -382,7 +382,7 @@ impl FunctionGraph {
         self.blocks.push(Block {
             id,
             inputargs: args.clone(),
-            ops: Vec::new(),
+            operations: Vec::new(),
             terminator: Terminator::Unreachable,
         });
         (id, args)
@@ -397,7 +397,7 @@ impl FunctionGraph {
     pub fn push_op(&mut self, block: BlockId, kind: OpKind, has_result: bool) -> Option<ValueId> {
         let result = has_result.then(|| self.alloc_value());
         self.blocks[block.0]
-            .ops
+            .operations
             .push(SpaceOperation { result, kind });
         result
     }
@@ -435,7 +435,7 @@ impl FunctionGraph {
     pub fn iter_block_ops(&self) -> impl Iterator<Item = (&Block, &SpaceOperation)> {
         self.blocks
             .iter()
-            .flat_map(|b| b.ops.iter().map(move |op| (b, op)))
+            .flat_map(|b| b.operations.iter().map(move |op| (b, op)))
     }
 
     /// Get successor block IDs for a block.
@@ -460,7 +460,7 @@ impl FunctionGraph {
 
     /// Count total operations across all blocks.
     pub fn num_ops(&self) -> usize {
-        self.blocks.iter().map(|b| b.ops.len()).sum()
+        self.blocks.iter().map(|b| b.operations.len()).sum()
     }
 
     /// Check if a block is a loop header (has a back-edge predecessor).
@@ -485,7 +485,7 @@ impl FunctionGraph {
             } else {
                 out.push_str(&format!("  Block {}({}):\n", block.id.0, args.join(", ")));
             }
-            for op in &block.ops {
+            for op in &block.operations {
                 let result = op
                     .result
                     .map(|v| format!("{} = ", self.fmt_value(v)))
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn graph_allocates_values_and_blocks() {
         let mut graph = FunctionGraph::new("demo");
-        let entry = graph.entry;
+        let entry = graph.startblock;
         let cond = graph
             .push_op(
                 entry,
@@ -536,6 +536,6 @@ mod tests {
             },
         );
         assert_eq!(graph.blocks.len(), 2);
-        assert_eq!(graph.block(entry).ops.len(), 1);
+        assert_eq!(graph.block(entry).operations.len(), 1);
     }
 }
