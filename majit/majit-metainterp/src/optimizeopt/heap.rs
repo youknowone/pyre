@@ -342,6 +342,8 @@ pub struct OptHeap {
     postponed_op: Option<Op>,
     /// Descriptor indices known to be immutable. RPython: descr.is_always_pure().
     immutable_field_descrs: Vec<bool>,
+    /// Array descriptor indices known to be immutable. RPython: descr.is_always_pure().
+    immutable_array_descrs: Vec<bool>,
 
     // ── Aliasing analysis state — RPython: PtrInfo flags ──
     seen_allocation: Vec<bool>,
@@ -384,6 +386,7 @@ impl OptHeap {
             seen_guard_not_invalidated: false,
             postponed_op: None,
             immutable_field_descrs: Vec::new(),
+            immutable_array_descrs: Vec::new(),
             seen_allocation: Vec::new(),
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
@@ -727,10 +730,16 @@ impl OptHeap {
             }
         }
         // heap.py:386-389: invalidate non-pure array caches
-        for cai in self.cached_arrayitems.values_mut() {
-            cai.invalidate();
+        for (&(descr_idx, _index), cai) in self.cached_arrayitems.iter_mut() {
+            if !vb_get(&self.immutable_array_descrs, descr_idx) {
+                cai.invalidate();
+            }
         }
-        self.cached_arrayitems_var.clear();
+        // heap.py:386-389: variable-index cache also respects is_always_pure.
+        // RPython: descr.is_always_pure() skips the entire submap, which
+        // includes both const_indexes and variable-index entries.
+        self.cached_arrayitems_var
+            .retain(|&(_, descr_idx, _), _| vb_get(&self.immutable_array_descrs, descr_idx));
         // heap.py:390: self.cached_dict_reads.clear()
         // (no dict_reads cache in majit)
     }
@@ -1315,6 +1324,13 @@ impl OptHeap {
                 }
             }
             self.cache_arrayitem(array, descr_idx, const_index, op.pos, op.descr.as_ref());
+            // Track immutable array descriptors so clean_caches() preserves them.
+            // RPython: descr.is_always_pure() — same pattern as immutable_field_descrs.
+            if let Some(descr) = &op.descr {
+                if descr.is_always_pure() {
+                    vb_set(&mut self.immutable_array_descrs, descr_idx);
+                }
+            }
             // heap.py line 701: make_nonnull(op.getarg(0))
             let array_ref = ctx.get_box_replacement(op.arg(0));
             vb_set(&mut self.known_nonnull, array_ref.0);
@@ -1944,6 +1960,7 @@ impl Optimization for OptHeap {
         self.seen_guard_not_invalidated = false;
         self.postponed_op = None;
         self.immutable_field_descrs.clear();
+        self.immutable_array_descrs.clear();
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
