@@ -389,30 +389,42 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         OpKind::Live => OpKind::Live,
         OpKind::CallElidable {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallElidable {
             descriptor: descriptor.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
         },
         OpKind::CallResidual {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallResidual {
             descriptor: descriptor.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
         },
         OpKind::CallMayForce {
             descriptor,
-            args,
-            result_ty,
+            args_i,
+            args_r,
+            args_f,
+            result_kind,
         } => OpKind::CallMayForce {
             descriptor: descriptor.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
+            args_i: args_i.iter().map(remap).collect(),
+            args_r: args_r.iter().map(remap).collect(),
+            args_f: args_f.iter().map(remap).collect(),
+            result_kind: *result_kind,
         },
         OpKind::InlineCall {
             jitcode_index,
@@ -511,10 +523,25 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         } => vec![*elem_index, *value],
         OpKind::BinOp { lhs, rhs, .. } => vec![*lhs, *rhs],
         OpKind::UnaryOp { operand, .. } => vec![*operand],
-        OpKind::CallElidable { args, .. }
-        | OpKind::CallResidual { args, .. }
-        | OpKind::CallMayForce { args, .. } => args.clone(),
-        OpKind::InlineCall {
+        OpKind::CallElidable {
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallResidual {
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallMayForce {
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::InlineCall {
             args_i,
             args_r,
             args_f,

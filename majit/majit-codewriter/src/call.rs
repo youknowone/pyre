@@ -335,7 +335,22 @@ impl CallControl {
         index
     }
 
-    /// RPython: `CallControl.enum_pending_graphs()`.
+    /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
+    ///
+    /// For each jitdriver, create a JitCode entry for its portal graph.
+    /// RPython also sets `jd.mainjitcode` and back-reference.
+    pub fn grab_initial_jitcodes(&mut self) {
+        let portals: Vec<CallPath> = self
+            .jitdrivers_sd
+            .iter()
+            .map(|jd| jd.portal_graph.clone())
+            .collect();
+        for portal in portals {
+            self.get_jitcode(&portal);
+        }
+    }
+
+    /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
     pub fn enum_pending_graphs(&mut self) -> Vec<CallPath> {
         std::mem::take(&mut self.unfinished_graphs)
     }
