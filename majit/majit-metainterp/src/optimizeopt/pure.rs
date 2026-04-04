@@ -408,8 +408,7 @@ impl OptPure {
                 continue;
             }
             // pure.py:62: box0.same_box(get_box_replacement(op.getarg(0)))
-            // same_box: identity for non-constants, same_constant for constants.
-            if entry
+            let args_match = entry
                 .args
                 .iter()
                 .zip(op.args.iter())
@@ -419,13 +418,12 @@ impl OptPure {
                     if s == q {
                         return true;
                     }
-                    // same_constant: both must be constants with equal values
                     matches!(
                         (ctx.get_constant(s), ctx.get_constant(q)),
                         (Some(a), Some(b)) if a == b
                     )
-                })
-            {
+                });
+            if args_match {
                 // pure.py:50-55: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
                     return Some(result);
@@ -647,6 +645,8 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
+                // pure.py:50-55: force_preamble_op replaces the OVF op
+                // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
                     ctx.replace_op(postponed.pos, cached_ref);
                     self.last_emitted_was_removed = true;

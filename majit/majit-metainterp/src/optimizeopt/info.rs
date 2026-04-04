@@ -934,7 +934,24 @@ impl PtrInfo {
                 v.preamble_fields.retain(|(k, _)| *k != field_idx);
                 v.preamble_fields.push((field_idx, pop));
             }
-            _ => {}
+            _ => {
+                // RPython: AbstractStructPtrInfo always supports _fields.
+                // In majit, KnownClass/NonNull/Ref lack preamble_fields.
+                // Upgrade to Instance, preserving known_class.
+                let known_class = if let PtrInfo::KnownClass { class_ptr, .. } = self {
+                    Some(*class_ptr)
+                } else {
+                    None
+                };
+                *self = PtrInfo::Instance(InstancePtrInfo {
+                    descr: None,
+                    known_class,
+                    fields: Vec::new(),
+                    field_descrs: Vec::new(),
+                    preamble_fields: vec![(field_idx, pop)],
+                    last_guard_pos: -1,
+                });
+            }
         }
     }
 
