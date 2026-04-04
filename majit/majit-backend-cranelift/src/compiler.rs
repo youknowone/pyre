@@ -9438,6 +9438,7 @@ fn collect_guards(
                     let layout = match entry {
                         majit_ir::RdVirtualInfo::VirtualInfo {
                             descr,
+                            type_id,
                             descr_index,
                             known_class,
                             fielddescrs,
@@ -9447,7 +9448,7 @@ fn collect_guards(
                             let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
                             ExitVirtualLayout::Object {
                                 descr: descr.clone(),
-                                type_id: known_class.map_or(0, |kc| kc as u32),
+                                type_id: *type_id,
                                 descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,

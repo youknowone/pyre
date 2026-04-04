@@ -405,6 +405,7 @@ pub(crate) fn build_guard_metadata(
                             match entry {
                                 majit_ir::RdVirtualInfo::VirtualInfo {
                                     descr,
+                                    type_id,
                                     descr_index,
                                     known_class,
                                     fielddescrs,
