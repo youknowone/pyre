@@ -227,25 +227,22 @@ fn build_canonical_opcode_dispatch(
         }
     }
 
-    // RPython codewriter.py:74-89: make_jitcodes() processes graphs in order:
-    //   1. grab_initial_jitcodes() seeds portal → portal is first in queue
-    //   2. enum_pending_graphs loop: portal processed FIRST, discovers callees
-    //   3. callees processed in LIFO order
+    // RPython codewriter.py:74-89: make_jitcodes().
     //
-    // In majit, we must process portal + its callees BEFORE arm jtransform
-    // so that the processing order (and thus jitcode.index) matches RPython.
-    // Arm jtransform may call get_jitcode() but will mostly hit the cache
-    // (idempotent) since portal processing already discovered the callees.
+    // A single all_jitcodes collection accumulates across all phases.
+    // JitCode.index = allocation index from get_jitcode(), NOT
+    // all_jitcodes.len(). This guarantees InlineCall.jitcode_index
+    // (set at jtransform time) == JitCode.index (set at assembly time).
     let mut codewriter = codewriter::CodeWriter::new();
+    let mut jitcodes: Vec<assembler::JitCode> = Vec::new();
 
-    // Phase 1: RPython make_jitcodes() — portal first, then callees.
+    // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     call_control.grab_initial_jitcodes();
-    let mut jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
+    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
 
     // Phase 2: majit-specific arm processing (SSARepr for PipelineOpcodeArm).
-    // Arm body_graphs go through annotate → rtype → jtransform → flatten.
-    // get_jitcode() calls during jtransform are idempotent for already-known
-    // callees; new callees are added to the pending queue.
+    // get_jitcode() calls are idempotent for already-known callees;
+    // new callees are added to the pending queue.
     let dispatch: Vec<passes::PipelineOpcodeArm> = opcode_arms
         .into_iter()
         .map(|arm| {
@@ -274,9 +271,13 @@ fn build_canonical_opcode_dispatch(
         })
         .collect();
 
-    // Phase 3: Process any NEW callees discovered during Phase 2's arm jtransform.
-    let extra_jitcodes = codewriter.make_jitcodes_pending(call_control, &pipeline_config.transform);
-    jitcodes.extend(extra_jitcodes);
+    // Phase 3: Drain any NEW callees from Phase 2, into the SAME jitcodes vec.
+    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
+
+    // RPython: self.assembler.finished(callinfocollection) (codewriter.py:85)
+    codewriter
+        .assembler
+        .finished(&call_control.callinfocollection);
 
     (dispatch, jitcodes)
 }
