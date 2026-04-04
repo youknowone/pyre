@@ -50,6 +50,20 @@ impl majit_ir::Descr for OptResumeAtPositionDescr {
     fn is_resume_at_position(&self) -> bool {
         true
     }
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(std::sync::Arc::new(OptResumeAtPositionDescr))
+    }
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        Some(crate::fail_descr::make_compile_loop_version_descr(
+            0,
+            crate::resume::ResumeData {
+                vable_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+        ))
+    }
 }
 
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
