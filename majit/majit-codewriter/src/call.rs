@@ -1556,28 +1556,203 @@ impl CallDescriptorEntry {
     }
 }
 
+// ── Builtin call descriptor table ──
+//
+// RPython effectinfo.py + call.py parity: pre-classified call targets.
+// The codewriter matches function names to determine effect category
+// and oopspec index without graph-level analysis.
+
 const INT_ARITH_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["w_int_add"]),
     CallTargetPattern::FunctionPath(&["w_int_sub"]),
     CallTargetPattern::FunctionPath(&["w_int_mul"]),
+    CallTargetPattern::FunctionPath(&["int_add"]),
+    CallTargetPattern::FunctionPath(&["int_sub"]),
+    CallTargetPattern::FunctionPath(&["int_mul"]),
+    CallTargetPattern::FunctionPath(&["int_bitand"]),
+    CallTargetPattern::FunctionPath(&["int_bitor"]),
+    CallTargetPattern::FunctionPath(&["int_bitxor"]),
+    // Qualified paths (annotator uses these for type inference).
     CallTargetPattern::FunctionPath(&["crate", "math", "w_int_add"]),
     CallTargetPattern::FunctionPath(&["crate", "math", "w_int_sub"]),
     CallTargetPattern::FunctionPath(&["crate", "math", "w_int_mul"]),
 ];
 
+const INT_CMP_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["int_lt"]),
+    CallTargetPattern::FunctionPath(&["int_le"]),
+    CallTargetPattern::FunctionPath(&["int_gt"]),
+    CallTargetPattern::FunctionPath(&["int_ge"]),
+    CallTargetPattern::FunctionPath(&["int_eq"]),
+    CallTargetPattern::FunctionPath(&["int_ne"]),
+];
+
 const FLOAT_ARITH_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["w_float_add"]),
     CallTargetPattern::FunctionPath(&["w_float_sub"]),
+    CallTargetPattern::FunctionPath(&["float_add"]),
+    CallTargetPattern::FunctionPath(&["float_sub"]),
+    CallTargetPattern::FunctionPath(&["float_mul"]),
+    CallTargetPattern::FunctionPath(&["float_truediv"]),
 ];
 
+const FLOAT_CMP_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["float_lt"]),
+    CallTargetPattern::FunctionPath(&["float_le"]),
+    CallTargetPattern::FunctionPath(&["float_gt"]),
+    CallTargetPattern::FunctionPath(&["float_ge"]),
+    CallTargetPattern::FunctionPath(&["float_eq"]),
+    CallTargetPattern::FunctionPath(&["float_ne"]),
+];
+
+// effectinfo.py: EF_ELIDABLE_CAN_RAISE — may raise (e.g. ZeroDivisionError)
+const INT_DIV_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["int_floordiv"]),
+    CallTargetPattern::FunctionPath(&["int_mod"]),
+];
+
+const FLOAT_DIV_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["float_floordiv"]),
+    CallTargetPattern::FunctionPath(&["float_mod"]),
+];
+
+const INT_SHIFT_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["int_lshift"]),
+    CallTargetPattern::FunctionPath(&["int_rshift"]),
+];
+
+const INT_POW_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(&["int_pow"])];
+
+// effectinfo.py: OS_STR_CONCAT etc. — string operations with oopspec
+const STR_CONCAT_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["str_concat"]),
+    CallTargetPattern::FunctionPath(&["jit_str_concat"]),
+];
+
+const STR_CMP_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["jit_str_compare"])];
+
+// effectinfo.py: list operations (may raise IndexError)
+const LIST_GETITEM_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["jit_list_getitem"]),
+    CallTargetPattern::FunctionPath(&["w_list_getitem"]),
+];
+
+const LIST_SETITEM_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["jit_list_setitem"])];
+
+const LIST_APPEND_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["jit_list_append"])];
+
+// effectinfo.py: tuple access (elidable, cannot raise for valid index)
+const TUPLE_GETITEM_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["jit_tuple_getitem"]),
+    CallTargetPattern::FunctionPath(&["w_tuple_getitem"]),
+];
+
+// effectinfo.py: constructor-like (cannot raise, elidable)
+const INT_NEW_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["w_int_new"]),
+    CallTargetPattern::FunctionPath(&["jit_w_int_new"]),
+];
+
+const FLOAT_NEW_TARGETS: &[CallTargetPattern] = &[
+    CallTargetPattern::FunctionPath(&["w_float_new"]),
+    CallTargetPattern::FunctionPath(&["jit_w_float_new"]),
+];
+
+const BOOL_FROM_TARGETS: &[CallTargetPattern] =
+    &[CallTargetPattern::FunctionPath(&["w_bool_from"])];
+
 const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
+    // ── Pure arithmetic (elidable, cannot raise) ──
     CallDescriptorEntry {
         targets: INT_ARITH_TARGETS,
         extra_effect: ExtraEffect::ElidableCannotRaise,
         oopspec_index: OopSpecIndex::None,
     },
     CallDescriptorEntry {
+        targets: INT_CMP_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
         targets: FLOAT_ARITH_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: FLOAT_CMP_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    // ── Elidable but may raise (ZeroDivisionError, OverflowError) ──
+    CallDescriptorEntry {
+        targets: INT_DIV_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::IntPyDiv,
+    },
+    CallDescriptorEntry {
+        targets: FLOAT_DIV_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: INT_SHIFT_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: INT_POW_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    // ── String operations with oopspec ──
+    CallDescriptorEntry {
+        targets: STR_CONCAT_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::StrConcat,
+    },
+    CallDescriptorEntry {
+        targets: STR_CMP_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::StrCmp,
+    },
+    // ── List operations (may raise, side effects) ──
+    CallDescriptorEntry {
+        targets: LIST_GETITEM_TARGETS,
+        extra_effect: ExtraEffect::CanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: LIST_SETITEM_TARGETS,
+        extra_effect: ExtraEffect::CanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: LIST_APPEND_TARGETS,
+        extra_effect: ExtraEffect::CanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    // ── Tuple access (elidable for valid indices) ──
+    CallDescriptorEntry {
+        targets: TUPLE_GETITEM_TARGETS,
+        extra_effect: ExtraEffect::ElidableCanRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    // ── Constructors (elidable, cannot raise) ──
+    CallDescriptorEntry {
+        targets: INT_NEW_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: FLOAT_NEW_TARGETS,
+        extra_effect: ExtraEffect::ElidableCannotRaise,
+        oopspec_index: OopSpecIndex::None,
+    },
+    CallDescriptorEntry {
+        targets: BOOL_FROM_TARGETS,
         extra_effect: ExtraEffect::ElidableCannotRaise,
         oopspec_index: OopSpecIndex::None,
     },
