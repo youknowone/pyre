@@ -37,6 +37,13 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// guard.py:89: Create a CompileLoopVersionDescr with attributes
+    /// copied from this descr (copy_all_attributes_from), then
+    /// rd_vector_info = None. Returns None if not supported.
+    fn clone_as_loop_version_descr(&self) -> Option<DescrRef> {
+        None
+    }
+
     // ── Downcasting helpers ──
 
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
@@ -152,6 +159,17 @@ pub trait FailDescr: Descr {
     /// Exit slot indices that carry opaque force-token handles.
     fn force_token_slots(&self) -> &[usize] {
         &[]
+    }
+
+    /// compile.py:861-872: copy_all_attributes_from — copy resume attributes
+    /// from this descr into a target Op's fields.
+    ///
+    /// This is the majit equivalent of `descr.copy_all_attributes_from(other)`.
+    /// Since descr-level resume data (rd_numb, rd_consts, rd_virtuals,
+    /// rd_pendingfields) is stored on Op fields in majit, this method
+    /// copies those fields from the descr's internal state into `target`.
+    fn copy_resume_into_op(&self, _target: &mut super::Op) {
+        // Default: no-op. Concrete descr types override to copy their data.
     }
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
