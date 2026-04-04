@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use crate::graph::ValueId;
-use crate::passes::flatten::{FlatOp, FlattenedFunction, Label, RegKind};
+use crate::model::ValueId;
+use crate::passes::flatten::{FlatOp, Label, RegKind, SSARepr};
 use crate::regalloc::RegAllocResult;
 
 /// Assembled JitCode — the output of the assembler.
@@ -70,7 +70,7 @@ impl Assembler {
     /// that need real bytecode should not use this yet.
     pub fn assemble(
         &mut self,
-        flattened: &FlattenedFunction,
+        flattened: &SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> JitCode {
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn assemble_basic() {
-        let flat = FlattenedFunction {
+        let flat = SSARepr {
             name: "test".into(),
             ops: vec![],
             num_values: 0,
@@ -141,18 +141,18 @@ mod tests {
 
     #[test]
     fn assemble_with_registers() {
-        use crate::graph::{Op, OpKind, ValueType};
-        let flat = FlattenedFunction {
+        use crate::model::{OpKind, SpaceOperation, ValueType};
+        let flat = SSARepr {
             name: "add".into(),
             ops: vec![
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(1)),
                     kind: OpKind::BinOp {
                         op: "add".into(),
@@ -161,7 +161,7 @@ mod tests {
                         result_ty: ValueType::Int,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(2)),
                     kind: OpKind::Input {
                         name: "r".into(),

@@ -1,15 +1,15 @@
 //! AST front-end: build semantic graphs from Rust source.
 //!
 //! RPython equivalent: flowspace/ — converts source to Block/Link/Variable/SpaceOperation.
-//! This module lowers syn AST nodes into MajitGraph ops with proper data flow (ValueId linking).
+//! This module lowers syn AST nodes into FunctionGraph ops with proper data flow (ValueId linking).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
-use crate::graph::{
-    BasicBlockId, CallTarget, MajitGraph, OpKind, Terminator, UnknownKind, ValueId, ValueType,
+use crate::model::{
+    BlockId, CallTarget, FunctionGraph, OpKind, Terminator, UnknownKind, ValueId, ValueType,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -18,7 +18,7 @@ pub struct AstGraphOptions;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticFunction {
     pub name: String,
-    pub graph: MajitGraph,
+    pub graph: FunctionGraph,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,14 +86,14 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 /// Public entry for building a graph from a single function AST node.
 /// Lower a standalone expression into an existing graph.
 /// Used to build semantic graphs from opcode match arm bodies.
-pub fn lower_expr_into_graph(graph: &mut MajitGraph, expr: &syn::Expr) {
+pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
     let mut block = graph.entry;
     let ctx = GraphBuildContext::default();
     let result = lower_expr(graph, &mut block, expr, &AstGraphOptions::default(), &ctx);
     if let Some(val) = result {
-        graph.set_terminator(block, crate::graph::Terminator::Return(Some(val)));
+        graph.set_terminator(block, crate::model::Terminator::Return(Some(val)));
     } else {
-        graph.set_terminator(block, crate::graph::Terminator::Return(None));
+        graph.set_terminator(block, crate::model::Terminator::Return(None));
     }
 }
 
@@ -118,7 +118,7 @@ fn build_function_graph(
     options: &AstGraphOptions,
     self_ty_root: Option<String>,
 ) -> SemanticFunction {
-    let mut graph = MajitGraph::new(func.sig.ident.to_string());
+    let mut graph = FunctionGraph::new(func.sig.ident.to_string());
     let mut entry = graph.entry;
     let mut ctx = GraphBuildContext::default();
 
@@ -180,7 +180,7 @@ fn build_function_graph(
 
 /// Public entry point for lowering a single statement into a graph.
 /// Used by the graph-based classifier in lib.rs to analyze resolved method bodies.
-pub fn lower_stmt_pub(graph: &mut MajitGraph, block: BasicBlockId, stmt: &syn::Stmt) {
+pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stmt) {
     let mut block = block;
     lower_stmt(
         graph,
@@ -192,8 +192,8 @@ pub fn lower_stmt_pub(graph: &mut MajitGraph, block: BasicBlockId, stmt: &syn::S
 }
 
 fn lower_stmt(
-    graph: &mut MajitGraph,
-    block: &mut BasicBlockId,
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
     stmt: &syn::Stmt,
     options: &AstGraphOptions,
     ctx: &GraphBuildContext,
@@ -235,8 +235,8 @@ fn lower_stmt(
 /// with a Branch, new blocks are created for each arm, and `block`
 /// is updated to the merge/continuation block.
 fn lower_expr(
-    graph: &mut MajitGraph,
-    block: &mut BasicBlockId,
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
     expr: &syn::Expr,
     options: &AstGraphOptions,
     ctx: &GraphBuildContext,
@@ -251,7 +251,7 @@ fn lower_expr(
                 *block,
                 OpKind::FieldRead {
                     base,
-                    field: crate::graph::FieldDescriptor::new(
+                    field: crate::model::FieldDescriptor::new(
                         field_name,
                         receiver_type_root(&field.base, ctx),
                     ),
@@ -292,7 +292,7 @@ fn lower_expr(
                         *block,
                         OpKind::FieldWrite {
                             base,
-                            field: crate::graph::FieldDescriptor::new(
+                            field: crate::model::FieldDescriptor::new(
                                 field_name,
                                 receiver_type_root(&field.base, ctx),
                             ),

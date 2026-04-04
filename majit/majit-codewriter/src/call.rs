@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use majit_ir::descr::EffectInfo;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{CallTarget, MajitGraph, OpKind};
+use crate::model::{CallTarget, FunctionGraph, OpKind};
 use crate::parse::CallPath;
 
 /// Call descriptor — associates a call target with its effect info.
@@ -93,13 +93,13 @@ pub struct JitDriverStaticData {
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
 pub struct CallControl {
-    /// Free function graphs: CallPath → MajitGraph.
+    /// Free function graphs: CallPath → FunctionGraph.
     /// RPython: `funcptr._obj.graph` linkage.
-    function_graphs: HashMap<CallPath, MajitGraph>,
+    function_graphs: HashMap<CallPath, FunctionGraph>,
 
-    /// Trait impl method graphs: (method_name, impl_type) → MajitGraph.
+    /// Trait impl method graphs: (method_name, impl_type) → FunctionGraph.
     /// Used for resolving `handler.method_name()` calls.
-    trait_method_graphs: HashMap<(String, String), MajitGraph>,
+    trait_method_graphs: HashMap<(String, String), FunctionGraph>,
 
     /// Trait bindings: method_name → Vec<impl_type>.
     /// Tracks which types implement a given method.
@@ -152,7 +152,7 @@ impl CallControl {
 
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
-    pub fn register_function_graph(&mut self, path: CallPath, graph: MajitGraph) {
+    pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
         self.function_graphs.insert(path, graph);
     }
 
@@ -162,7 +162,12 @@ impl CallControl {
     /// CallPath so that BFS in find_all_graphs can discover it.
     /// RPython: method graphs are reachable through funcptr._obj.graph
     /// linkage — we emulate this by dual registration.
-    pub fn register_trait_method(&mut self, method_name: &str, impl_type: &str, graph: MajitGraph) {
+    pub fn register_trait_method(
+        &mut self,
+        method_name: &str,
+        impl_type: &str,
+        graph: FunctionGraph,
+    ) {
         self.trait_method_graphs.insert(
             (method_name.to_string(), impl_type.to_string()),
             graph.clone(),
@@ -380,7 +385,7 @@ impl CallControl {
     ///
     /// This is the gatekeeper: if graphs_from returns None, the call
     /// becomes residual. If it returns Some, the call is regular.
-    pub fn graphs_from(&self, target: &CallTarget) -> Option<&MajitGraph> {
+    pub fn graphs_from(&self, target: &CallTarget) -> Option<&FunctionGraph> {
         let path = self.target_to_path(target)?;
         // RPython call.py:100: is_candidate(graph)
         if !self.candidate_graphs.contains(&path) {
@@ -432,7 +437,11 @@ impl CallControl {
     /// exactly one impl for the method, return it. If the receiver
     /// is a generic parameter (lowercase or single uppercase letter),
     /// we try all known impls and return the unique one.
-    pub fn resolve_method(&self, name: &str, receiver_root: Option<&str>) -> Option<&MajitGraph> {
+    pub fn resolve_method(
+        &self,
+        name: &str,
+        receiver_root: Option<&str>,
+    ) -> Option<&FunctionGraph> {
         let impls = self.trait_method_impls.get(name)?;
 
         // Filter out default trait method entries (e.g. "<default methods of LocalOpcodeHandler>")
@@ -505,7 +514,7 @@ impl CallControl {
     }
 
     /// Access the function graphs map (for inline pass).
-    pub fn function_graphs(&self) -> &HashMap<CallPath, MajitGraph> {
+    pub fn function_graphs(&self) -> &HashMap<CallPath, FunctionGraph> {
         &self.function_graphs
     }
 }
@@ -653,12 +662,12 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::MajitGraph;
+    use crate::model::FunctionGraph;
 
     #[test]
     fn guess_call_kind_function_path() {
         let mut cc = CallControl::new();
-        let graph = MajitGraph::new("opcode_load_fast");
+        let graph = FunctionGraph::new("opcode_load_fast");
         let path = CallPath::from_segments(["opcode_load_fast"]);
         cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
@@ -693,7 +702,7 @@ mod tests {
     #[test]
     fn resolve_method_unique_impl() {
         let mut cc = CallControl::new();
-        let graph = MajitGraph::new("PyFrame::load_local_value");
+        let graph = FunctionGraph::new("PyFrame::load_local_value");
         cc.register_trait_method("load_local_value", "PyFrame", graph);
 
         // Unique impl — resolves for any receiver
@@ -711,12 +720,12 @@ mod tests {
         cc.register_trait_method(
             "push_value",
             "PyFrame",
-            MajitGraph::new("PyFrame::push_value"),
+            FunctionGraph::new("PyFrame::push_value"),
         );
         cc.register_trait_method(
             "push_value",
             "MIFrame",
-            MajitGraph::new("MIFrame::push_value"),
+            FunctionGraph::new("MIFrame::push_value"),
         );
 
         // Concrete receiver — resolves to specific impl

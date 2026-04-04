@@ -11,7 +11,7 @@ pub mod pipeline;
 pub mod rtype;
 
 pub use annotate::{AnnotationState, annotate as annotate_graph};
-pub use flatten::{FlatOp, FlattenedFunction, Label, RegKind, flatten, flatten_with_types};
+pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformNote,
     GraphTransformResult, Transformer, VirtualizableFieldDescriptor, rewrite_graph,

@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::graph::ValueId;
-use crate::passes::flatten::{FlatOp, FlattenedFunction, Label};
+use crate::model::ValueId;
+use crate::passes::flatten::{FlatOp, Label, SSARepr};
 
 /// Compute liveness for a flattened function.
 ///
@@ -21,7 +21,7 @@ use crate::passes::flatten::{FlatOp, FlattenedFunction, Label};
 /// Modifies the flattened ops in place: each `FlatOp::Live` marker
 /// gets its `live_values` set populated with all values alive at that
 /// point in the instruction sequence.
-pub fn compute_liveness(flattened: &mut FlattenedFunction) {
+pub fn compute_liveness(flattened: &mut SSARepr) {
     let mut label2alive: HashMap<Label, HashSet<ValueId>> = HashMap::new();
 
     // Iterate to fixpoint (RPython: while _compute_liveness_must_continue)
@@ -121,7 +121,7 @@ fn compute_liveness_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Op, OpKind, ValueType};
+    use crate::model::{OpKind, SpaceOperation, ValueType};
     use crate::passes::flatten::FlatOp;
 
     #[test]
@@ -130,22 +130,22 @@ mod tests {
         // v1 = ConstInt(42)
         // v2 = BinOp(v0, v1)
         // Return v2
-        let mut flat = FlattenedFunction {
+        let mut flat = SSARepr {
             name: "test".into(),
             ops: vec![
                 FlatOp::Label(Label(0)),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(0)),
                     kind: OpKind::Input {
                         name: "a".into(),
                         ty: ValueType::Int,
                     },
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(1)),
                     kind: OpKind::ConstInt(42),
                 }),
-                FlatOp::Op(Op {
+                FlatOp::Op(SpaceOperation {
                     result: Some(ValueId(2)),
                     kind: OpKind::BinOp {
                         op: "add".into(),

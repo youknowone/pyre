@@ -15,10 +15,10 @@ pub mod call;
 mod codegen;
 pub mod codewriter;
 pub mod front;
-pub mod graph;
 pub mod hints;
 pub mod inline;
 pub mod liveness;
+pub mod model;
 mod parse;
 pub mod passes;
 pub mod regalloc;
@@ -30,17 +30,19 @@ pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
 };
-pub use graph::{
-    BasicBlock, BasicBlockId, CallTarget, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType,
+pub use model::{
+    Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
+    ValueType,
 };
 pub use parse::{
     CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
 };
 pub use passes::{
-    AnnotationState, CallEffectKind, CallEffectOverride, ConcreteType, FlatOp, FlattenedFunction,
+    AnnotationState, CallEffectKind, CallEffectOverride, ConcreteType, FlatOp,
     GraphTransformConfig, GraphTransformResult, Label, PipelineConfig, PipelineOpcodeArm,
-    PipelineResult, ProgramPipelineResult, TypeResolutionState, VirtualizableFieldDescriptor,
-    analyze_function, analyze_program, annotate_graph, resolve_types, rewrite_graph,
+    PipelineResult, ProgramPipelineResult, SSARepr, TypeResolutionState,
+    VirtualizableFieldDescriptor, analyze_function, analyze_program, annotate_graph, resolve_types,
+    rewrite_graph,
 };
 
 use serde::{Deserialize, Serialize};
@@ -62,7 +64,7 @@ pub struct ResolvedCall {
     pub trait_name: Option<String>,
     /// Canonical semantic graph for this resolved target.
     #[serde(default)]
-    pub graph: Option<graph::MajitGraph>,
+    pub graph: Option<model::FunctionGraph>,
 }
 
 /// Trait implementation info
@@ -80,7 +82,7 @@ pub struct MethodInfo {
     pub name: String,
     /// Canonical semantic graph for this method when available.
     #[serde(default)]
-    pub graph: Option<graph::MajitGraph>,
+    pub graph: Option<model::FunctionGraph>,
 }
 
 /// Canonical single-file analysis entry point.
@@ -195,7 +197,7 @@ fn build_canonical_opcode_dispatch(
     parsed_files: &[parse::ParsedInterpreter],
     trait_impls: &[TraitImplInfo],
     inherent_methods: &[parse::InherentMethodInfo],
-    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
+    function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
     pipeline_config: &passes::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> Vec<passes::PipelineOpcodeArm> {
@@ -255,7 +257,7 @@ fn resolve_handler_calls(
     handler_calls: &[parse::ExtractedHandlerCall],
     trait_impls: &[TraitImplInfo],
     inherent_methods: &[parse::InherentMethodInfo],
-    function_graphs: &std::collections::HashMap<parse::CallPath, graph::MajitGraph>,
+    function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
     receiver_traits: &parse::ReceiverTraitBindings,
 ) -> Vec<ResolvedCall> {
     fn push_unique(resolved_calls: &mut Vec<ResolvedCall>, call: ResolvedCall) {
@@ -953,7 +955,7 @@ mod tests {
             }
 
             struct PyFrame;
-            impl OpcodeStepExecutor for PyFrame {}
+            impl SpaceOperationcodeStepExecutor for PyFrame {}
 
             fn execute_opcode_step<E: OpcodeStepExecutor>(executor: &mut E, instruction: Instruction) {
                 match instruction {
@@ -1002,7 +1004,7 @@ mod tests {
             }
 
             struct PyFrame;
-            impl OpcodeStepExecutor for PyFrame {
+            impl SpaceOperationcodeStepExecutor for PyFrame {
                 fn load_fast_checked(&mut self, idx: usize) {
                     let _ = idx;
                 }

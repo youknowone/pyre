@@ -2,7 +2,7 @@
 //!
 //! RPython equivalent: jtransform.py Transformer.optimize_block()
 //!
-//! Transforms a MajitGraph by rewriting operations:
+//! Transforms a FunctionGraph by rewriting operations:
 //! - FieldRead on virtualizable fields → VableFieldRead marker
 //! - FieldWrite on virtualizable fields → VableFieldWrite marker
 //! - ArrayRead on virtualizable arrays → VableArrayRead marker
@@ -11,9 +11,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
-use crate::graph::{
-    BasicBlockId, CallTarget, FieldDescriptor, MajitGraph, Op, OpKind, Terminator, ValueId,
-    ValueType,
+use crate::model::{
+    BlockId, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator,
+    ValueId, ValueType,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -116,7 +116,7 @@ pub struct GraphTransformNote {
 /// Result of a graph transformation pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphTransformResult {
-    pub graph: MajitGraph,
+    pub graph: FunctionGraph,
     pub notes: Vec<GraphTransformNote>,
     /// Number of ops rewritten by virtualizable lowering.
     pub vable_rewrites: usize,
@@ -128,7 +128,7 @@ pub struct GraphTransformResult {
 ///
 /// Convenience wrapper that creates a `Transformer` and runs it.
 /// RPython equivalent: jtransform.py `transform_graph()`.
-pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> GraphTransformResult {
+pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
     let mut transformer = Transformer::new(config);
     transformer.transform(graph)
 }
@@ -137,7 +137,7 @@ pub fn rewrite_graph(graph: &MajitGraph, config: &GraphTransformConfig) -> Graph
 ///
 /// RPython equivalent: `jtransform.py` class `Transformer`.
 ///
-/// Rewrites operations in a MajitGraph to JIT-specific instructions:
+/// Rewrites operations in a FunctionGraph to JIT-specific instructions:
 /// - Virtualizable field/array access → VableFieldRead/VableArrayRead
 /// - Hint calls → identity/VableForce
 /// - Call classification → CallElidable/CallResidual/CallMayForce
@@ -172,7 +172,7 @@ pub enum VableFlag {
 /// RPython: `rewrite_operation()` returns SpaceOperation, list, None, or Constant.
 enum RewriteResult {
     /// Replace with these ops
-    Replace(Vec<Op>),
+    Replace(Vec<SpaceOperation>),
     /// Remove the op (identity/alias: result remaps to the given value)
     Identity(ValueId),
     /// Keep the op unchanged
@@ -209,7 +209,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: Transformer.transform() — process all blocks in the graph.
-    pub fn transform(&mut self, graph: &MajitGraph) -> GraphTransformResult {
+    pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
 
         for block in &mut rewritten.blocks {
@@ -225,7 +225,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: Transformer.optimize_block()
-    fn optimize_block(&mut self, block: &mut crate::graph::BasicBlock, graph_name: &str) {
+    fn optimize_block(&mut self, block: &mut crate::model::Block, graph_name: &str) {
         let mut new_ops = Vec::with_capacity(block.ops.len());
 
         for original_op in &block.ops {
@@ -258,7 +258,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
-    fn rewrite_operation(&mut self, op: &Op, graph_name: &str) -> RewriteResult {
+    fn rewrite_operation(&mut self, op: &SpaceOperation, graph_name: &str) -> RewriteResult {
         match &op.kind {
             // ── rewrite_op_hint ──
             OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
@@ -360,7 +360,7 @@ impl<'a> Transformer<'a> {
     /// fresh_virtualizable, promote, etc.)
     fn rewrite_op_hint(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         graph_name: &str,
@@ -396,7 +396,7 @@ impl<'a> Transformer<'a> {
                             .insert(result, resolve_alias(arg, &self.aliases));
                     }
                 }
-                RewriteResult::Replace(vec![Op {
+                RewriteResult::Replace(vec![SpaceOperation {
                     result: None,
                     kind: OpKind::VableForce,
                 }])
@@ -407,7 +407,7 @@ impl<'a> Transformer<'a> {
     /// RPython: rewrite_op_getfield
     fn rewrite_op_getfield(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         field: &FieldDescriptor,
         ty: &ValueType,
         graph_name: &str,
@@ -428,7 +428,7 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![Op {
+            return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldRead {
                     field_index: vable_field.index,
@@ -442,7 +442,7 @@ impl<'a> Transformer<'a> {
     /// RPython: rewrite_op_setfield
     fn rewrite_op_setfield(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         field: &FieldDescriptor,
         value: ValueId,
         ty: &ValueType,
@@ -457,7 +457,7 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![Op {
+            return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldWrite {
                     field_index: vable_field.index,
@@ -472,7 +472,7 @@ impl<'a> Transformer<'a> {
     /// RPython: rewrite_op_getarrayitem
     fn rewrite_op_getarrayitem(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         base: ValueId,
         index: ValueId,
         item_ty: &ValueType,
@@ -484,7 +484,7 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![Op {
+            return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayRead {
                     array_index: arr_idx,
@@ -499,7 +499,7 @@ impl<'a> Transformer<'a> {
     /// RPython: rewrite_op_setarrayitem
     fn rewrite_op_setarrayitem(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         base: ValueId,
         index: ValueId,
         value: ValueId,
@@ -512,7 +512,7 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![Op {
+            return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayWrite {
                     array_index: arr_idx,
@@ -535,7 +535,7 @@ impl<'a> Transformer<'a> {
     /// ```
     fn rewrite_op_direct_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -608,7 +608,7 @@ impl<'a> Transformer<'a> {
     /// lowering (list_getitem → getarrayitem_gc, etc.)
     fn handle_builtin_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -623,7 +623,7 @@ impl<'a> Transformer<'a> {
             self.calls_classified += 1;
             match effect {
                 CallEffectKind::Elidable => {
-                    return RewriteResult::Replace(vec![Op {
+                    return RewriteResult::Replace(vec![SpaceOperation {
                         result: op.result,
                         kind: OpKind::CallElidable {
                             descriptor,
@@ -649,7 +649,7 @@ impl<'a> Transformer<'a> {
     /// RPython jtransform.py:473-482.
     fn handle_regular_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -674,7 +674,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         // RPython jtransform.py:480-481: inline_call always followed by -live-
         RewriteResult::Replace(vec![
-            Op {
+            SpaceOperation {
                 result: op.result,
                 kind: OpKind::InlineCall {
                     jitcode_index,
@@ -684,7 +684,7 @@ impl<'a> Transformer<'a> {
                     result_kind,
                 },
             },
-            Op {
+            SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
             },
@@ -697,7 +697,7 @@ impl<'a> Transformer<'a> {
     /// RPython jtransform.py:522-534.
     fn handle_recursive_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -746,7 +746,7 @@ impl<'a> Transformer<'a> {
         let mut ops = self.promote_greens(green_args);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
-        ops.push(Op {
+        ops.push(SpaceOperation {
             result: op.result,
             kind: OpKind::RecursiveCall {
                 jd_index,
@@ -759,7 +759,7 @@ impl<'a> Transformer<'a> {
                 result_kind,
             },
         });
-        ops.push(Op {
+        ops.push(SpaceOperation {
             result: None,
             kind: OpKind::Live,
         });
@@ -772,7 +772,7 @@ impl<'a> Transformer<'a> {
     /// This ensures green values are constant before the recursive call.
     ///
     /// RPython jtransform.py:1646-1656.
-    fn promote_greens(&self, green_args: &[ValueId]) -> Vec<Op> {
+    fn promote_greens(&self, green_args: &[ValueId]) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
         for &v in green_args {
             let kind = self.value_kind(v);
@@ -780,11 +780,11 @@ impl<'a> Transformer<'a> {
                 continue; // skip void
             }
             // RPython: -live- then {kind}_guard_value
-            ops.push(Op {
+            ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
             });
-            ops.push(Op {
+            ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::GuardValue {
                     value: v,
@@ -808,7 +808,7 @@ impl<'a> Transformer<'a> {
     /// Call that the JIT should NOT look inside — emit residual_call_*.
     fn handle_residual_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -822,7 +822,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
         let can_raise = descriptor.effect_info.check_can_raise(false);
-        let mut ops = vec![Op {
+        let mut ops = vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallResidual {
                 descriptor,
@@ -831,7 +831,7 @@ impl<'a> Transformer<'a> {
             },
         }];
         if can_raise {
-            ops.push(Op {
+            ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
             });
@@ -842,7 +842,7 @@ impl<'a> Transformer<'a> {
     /// RPython: elidable call — pure function, result depends only on args.
     fn handle_elidable_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -853,7 +853,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {} → elidable", descriptor.target),
         });
         self.calls_classified += 1;
-        RewriteResult::Replace(vec![Op {
+        RewriteResult::Replace(vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallElidable {
                 descriptor,
@@ -866,7 +866,7 @@ impl<'a> Transformer<'a> {
     /// RPython: may-force call — can trigger GC or force virtualizables.
     fn handle_may_force_call(
         &mut self,
-        op: &Op,
+        op: &SpaceOperation,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -879,7 +879,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
-            Op {
+            SpaceOperation {
                 result: op.result,
                 kind: OpKind::CallMayForce {
                     descriptor,
@@ -887,7 +887,7 @@ impl<'a> Transformer<'a> {
                     result_ty: result_ty.clone(),
                 },
             },
-            Op {
+            SpaceOperation {
                 result: None,
                 kind: OpKind::Live,
             },
@@ -938,7 +938,10 @@ fn remap_value(value: ValueId, aliases: &std::collections::HashMap<ValueId, Valu
     resolve_alias(value, aliases)
 }
 
-fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> Op {
+fn remap_op(
+    op: &SpaceOperation,
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> SpaceOperation {
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
@@ -1159,7 +1162,7 @@ fn remap_op(op: &Op, aliases: &std::collections::HashMap<ValueId, ValueId>) -> O
             result_kind: *result_kind,
         },
     };
-    Op {
+    SpaceOperation {
         result: op.result,
         kind,
     }
@@ -1300,17 +1303,17 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{CallTarget, MajitGraph, OpKind, ValueId, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueId, ValueType};
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         graph.push_op(
             graph.entry,
             OpKind::FieldRead {
                 base,
-                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -1341,13 +1344,13 @@ mod tests {
 
     #[test]
     fn rewrite_graph_requires_matching_field_owner_root() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         graph.push_op(
             graph.entry,
             OpKind::FieldRead {
                 base,
-                field: crate::graph::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
+                field: crate::model::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -1372,7 +1375,7 @@ mod tests {
 
     #[test]
     fn rewrite_graph_classifies_calls() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         graph.push_op(
             graph.entry,
             OpKind::Call {
@@ -1397,7 +1400,7 @@ mod tests {
 
     #[test]
     fn rewrite_graph_uses_explicit_call_effect_overrides() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         graph.push_op(
             graph.entry,
             OpKind::Call {
@@ -1427,11 +1430,11 @@ mod tests {
 
     #[test]
     fn rewrite_graph_reports_unknowns() {
-        let mut graph = MajitGraph::new("demo");
+        let mut graph = FunctionGraph::new("demo");
         graph.push_op(
             graph.entry,
             OpKind::Unknown {
-                kind: crate::graph::UnknownKind::UnsupportedExpr,
+                kind: crate::model::UnknownKind::UnsupportedExpr,
             },
             false,
         );
@@ -1447,7 +1450,7 @@ mod tests {
 
     #[test]
     fn rewrite_graph_consumes_identity_virtualizable_hints() {
-        let mut graph = MajitGraph::new("demo");
+        let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let hinted = graph.alloc_value();
         graph.block_mut(graph.entry).inputargs.push(frame);
@@ -1465,7 +1468,7 @@ mod tests {
             graph.entry,
             OpKind::FieldRead {
                 base: hinted,
-                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,
@@ -1493,7 +1496,7 @@ mod tests {
 
     #[test]
     fn rewrite_graph_rewrites_hint_force_virtualizable() {
-        let mut graph = MajitGraph::new("demo");
+        let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let forced = graph.alloc_value();
         graph.block_mut(graph.entry).inputargs.push(frame);
@@ -1511,7 +1514,7 @@ mod tests {
             graph.entry,
             OpKind::FieldRead {
                 base: forced,
-                field: crate::graph::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
             },
             true,

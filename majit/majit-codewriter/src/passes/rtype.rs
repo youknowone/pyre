@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::graph::{MajitGraph, OpKind, ValueId, ValueType};
+use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 use crate::passes::annotate::AnnotationState;
 
 /// Concrete low-level type (RPython Repr.lowleveltype).
@@ -42,7 +42,7 @@ impl TypeResolutionState {
 ///
 /// RPython equivalent: `RPythonTyper.specialize_block()` — walks
 /// each block and converts annotation → Repr → lowleveltype.
-pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeResolutionState {
+pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> TypeResolutionState {
     let mut state = TypeResolutionState {
         concrete_types: HashMap::new(),
     };
@@ -79,7 +79,7 @@ pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeR
     // Cross-block: propagate through Link args → target inputargs
     for block in &graph.blocks {
         match &block.terminator {
-            crate::graph::Terminator::Goto { target, args } => {
+            crate::model::Terminator::Goto { target, args } => {
                 let target_block = graph.block(*target);
                 for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
                     if state.get(*dst) == &ConcreteType::Unknown {
@@ -90,7 +90,7 @@ pub fn resolve_types(graph: &MajitGraph, annotations: &AnnotationState) -> TypeR
                     }
                 }
             }
-            crate::graph::Terminator::Branch {
+            crate::model::Terminator::Branch {
                 if_true,
                 true_args,
                 if_false,
@@ -163,12 +163,12 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MajitGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
     use crate::passes::annotate;
 
     #[test]
     fn resolves_int_types() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn resolves_ref_field() {
-        let mut graph = MajitGraph::new("test");
+        let mut graph = FunctionGraph::new("test");
         let entry = graph.entry;
         let base = graph.alloc_value();
         let v = graph
@@ -188,7 +188,7 @@ mod tests {
                 entry,
                 OpKind::FieldRead {
                     base,
-                    field: crate::graph::FieldDescriptor::new("obj", None),
+                    field: crate::model::FieldDescriptor::new("obj", None),
                     ty: ValueType::Ref,
                 },
                 true,
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn resolves_phi_through_link_args() {
-        let mut graph = MajitGraph::new("phi");
+        let mut graph = FunctionGraph::new("phi");
         let entry = graph.entry;
         let val = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let (target, phi_args) = graph.create_block_with_args(1);

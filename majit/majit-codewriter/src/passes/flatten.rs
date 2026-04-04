@@ -2,13 +2,15 @@
 //!
 //! RPython equivalent: `jit/codewriter/flatten.py` flatten_graph().
 //!
-//! Converts a multi-block MajitGraph into a linear sequence of
+//! Converts a multi-block FunctionGraph into a linear sequence of
 //! FlatOps with Labels and Jumps. This is the last graph pass
 //! before register allocation and JitCode assembly.
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{BasicBlockId, MajitGraph, Op, OpKind, Terminator, ValueId, ValueType};
+use crate::model::{
+    BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId, ValueType,
+};
 
 /// A label in the flattened instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,7 +24,7 @@ pub enum FlatOp {
     /// Label definition (target for jumps).
     Label(Label),
     /// Semantic op (from the graph).
-    Op(Op),
+    Op(SpaceOperation),
     /// Unconditional jump to label.
     Jump(Label),
     /// Conditional jump: if cond is true, jump to label.
@@ -58,7 +60,7 @@ pub enum RegKind {
 
 /// Result of the flatten pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FlattenedFunction {
+pub struct SSARepr {
     pub name: String,
     pub ops: Vec<FlatOp>,
     /// Total number of values used (for register allocation).
@@ -70,15 +72,15 @@ pub struct FlattenedFunction {
     pub value_kinds: std::collections::HashMap<ValueId, RegKind>,
 }
 
-/// Flatten a MajitGraph into a linear instruction sequence.
+/// Flatten a FunctionGraph into a linear instruction sequence.
 ///
 /// RPython equivalent: `flatten_graph()` from flatten.py.
 ///
 /// Block ordering: entry first, then BFS order. Back-edges (loops)
 /// become jumps to earlier labels.
-pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
+pub fn flatten(graph: &FunctionGraph) -> SSARepr {
     let mut ops = Vec::new();
-    let mut block_labels: std::collections::HashMap<BasicBlockId, Label> =
+    let mut block_labels: std::collections::HashMap<BlockId, Label> =
         std::collections::HashMap::new();
     let mut next_label = 0usize;
 
@@ -99,7 +101,7 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
 
         // Ops
         for op in &block.ops {
-            if matches!(&op.kind, crate::graph::OpKind::Live) {
+            if matches!(&op.kind, crate::model::OpKind::Live) {
                 // RPython: -live- op becomes FlatOp::Live marker
                 ops.push(FlatOp::Live {
                     live_values: Vec::new(),
@@ -191,7 +193,7 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
         }
     }
 
-    FlattenedFunction {
+    SSARepr {
         name: graph.name.clone(),
         ops,
         num_values: max_value,
@@ -204,9 +206,9 @@ pub fn flatten(graph: &MajitGraph) -> FlattenedFunction {
 ///
 /// Like `flatten()` but populates `value_kinds` from the TypeResolutionState.
 pub fn flatten_with_types(
-    graph: &MajitGraph,
+    graph: &FunctionGraph,
     types: &super::rtype::TypeResolutionState,
-) -> FlattenedFunction {
+) -> SSARepr {
     let mut result = flatten(graph);
     for (&vid, concrete) in &types.concrete_types {
         let kind = match concrete {
@@ -221,7 +223,7 @@ pub fn flatten_with_types(
 }
 
 /// Compute block ordering (entry first, then BFS).
-fn block_order(graph: &MajitGraph) -> Vec<BasicBlockId> {
+fn block_order(graph: &FunctionGraph) -> Vec<BlockId> {
     let mut order = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
@@ -250,7 +252,7 @@ fn block_order(graph: &MajitGraph) -> Vec<BasicBlockId> {
 }
 
 /// Get successor block IDs from a terminator.
-fn successors(term: &Terminator) -> Vec<BasicBlockId> {
+fn successors(term: &Terminator) -> Vec<BlockId> {
     match term {
         Terminator::Goto { target, .. } => vec![*target],
         Terminator::Branch {
@@ -263,11 +265,11 @@ fn successors(term: &Terminator) -> Vec<BasicBlockId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MajitGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
 
     #[test]
     fn flatten_single_block() {
-        let mut graph = MajitGraph::new("simple");
+        let mut graph = FunctionGraph::new("simple");
         let entry = graph.entry;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn flatten_if_else_produces_jumps() {
-        let mut graph = MajitGraph::new("branch");
+        let mut graph = FunctionGraph::new("branch");
         let entry = graph.entry;
         let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let then_block = graph.create_block();
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     fn flatten_while_loop_has_back_edge() {
-        let mut graph = MajitGraph::new("loop");
+        let mut graph = FunctionGraph::new("loop");
         let entry = graph.entry;
         let header = graph.create_block();
         let body = graph.create_block();
@@ -382,7 +384,7 @@ mod tests {
     fn flatten_phi_produces_move_ops() {
         // When a Goto carries Link args to a target with inputargs,
         // flatten should emit Move ops for Phi resolution.
-        let mut graph = MajitGraph::new("phi");
+        let mut graph = FunctionGraph::new("phi");
         let entry = graph.entry;
         let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
 
