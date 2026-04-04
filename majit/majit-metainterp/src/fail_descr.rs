@@ -91,6 +91,15 @@ impl majit_ir::Descr for ResumeGuardDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+    /// compile.py:844-846: ResumeGuardDescr.clone()
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: self.resume_data.clone(),
+            vector_info: UnsafeCell::new(self.vector_info().clone()),
+        }))
+    }
 }
 
 impl FailDescr for ResumeGuardDescr {
@@ -253,6 +262,21 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
+    }
+    /// compile.py:905-908: CompileLoopVersionDescr.clone()
+    /// Preserves the CompileLoopVersionDescr type (loop_version() = true).
+    fn clone_descr(&self) -> Option<DescrRef> {
+        let mut cloned = CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: self.types.clone(),
+            resume_data: self.resume_data.clone(),
+            // compile.py:869-872: rd_vector_info clone
+            vector_info: UnsafeCell::new(self.vector_info().clone()),
+        };
+        // compile.py:91: descr.rd_vector_info = None (cleared after copy)
+        // For clone() on CompileLoopVersionDescr, vector_info IS copied.
+        // Only transitive_imply clears it (guard.py:91).
+        Some(Arc::new(cloned))
     }
 }
 

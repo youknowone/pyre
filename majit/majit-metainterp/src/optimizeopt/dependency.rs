@@ -819,10 +819,13 @@ impl IndexVar {
             tolist.push(op);
         }
         if self.constant < 0 {
-            // dependency.py:1080: args = [var, ConstInt(-self.constant)]
+            // dependency.py:1080-1081: var = ResOperation(INT_SUB, [var, ConstInt(-self.constant)])
             let c = next_const(-self.constant);
             let op = Op::new(OpCode::IntSub, &[var, c]);
-            let _ = var;
+            #[allow(unused_assignments)]
+            {
+                var = op.pos;
+            }
             tolist.push(op);
         }
         tolist
