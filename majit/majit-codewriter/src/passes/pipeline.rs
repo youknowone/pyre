@@ -231,7 +231,7 @@ mod tests {
             matches!(
                 op,
                 crate::passes::flatten::FlatOp::Jump(_)
-                    | crate::passes::flatten::FlatOp::JumpIfTrue { .. }
+                    | crate::passes::flatten::FlatOp::GotoIfNot { .. }
             )
         });
         assert!(has_jump, "flattened fib should have conditional jumps");
