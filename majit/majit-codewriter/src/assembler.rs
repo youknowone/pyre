@@ -83,7 +83,6 @@ pub struct Assembler {
 }
 
 impl Assembler {
-    /// RPython: `Assembler.__init__()`.
     /// RPython: `Assembler.__init__()` (assembler.py:21-32).
     pub fn new() -> Self {
         Self {
