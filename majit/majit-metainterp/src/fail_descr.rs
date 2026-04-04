@@ -247,17 +247,7 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     // ResumeGuardDescr with empty resume_data (ResumeAtPositionDescr has
     // no resume storage of its own).
     fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeGuardDescr {
-            fail_index: alloc_fail_index(),
-            types: self.types.clone(),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
-            vector_info: UnsafeCell::new(Vec::new()),
-        }))
+        Some(make_plain_resume_guard_descr(self.types.clone()))
     }
     // clone_as_loop_version_descr: NOT implemented.
     // ResumeAtPositionDescr has no resume storage.
@@ -277,6 +267,26 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     Arc::new(ResumeAtPositionDescr {
         fail_index: alloc_fail_index(),
         types: Vec::new(),
+    })
+}
+
+/// Create a plain ResumeGuardDescr with empty resume_data.
+///
+/// Used by ResumeAtPositionDescr.clone_descr() and
+/// OptResumeAtPositionDescr.clone_descr() — RPython's inherited
+/// ResumeGuardDescr.clone() returns a plain ResumeGuardDescr,
+/// losing the ResumeAtPositionDescr marker.
+pub fn make_plain_resume_guard_descr(types: Vec<Type>) -> DescrRef {
+    Arc::new(ResumeGuardDescr {
+        fail_index: alloc_fail_index(),
+        types,
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        vector_info: UnsafeCell::new(Vec::new()),
     })
 }
 
