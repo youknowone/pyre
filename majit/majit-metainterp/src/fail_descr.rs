@@ -119,22 +119,6 @@ impl FailDescr for ResumeGuardDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
     }
-    /// compile.py:861-872: copy_all_attributes_from.
-    ///
-    /// In majit, RPython's copy_all_attributes_from is split into:
-    /// 1. Descr-level: clone_as_loop_version_descr() clones resume_data
-    ///    into the new CompileLoopVersionDescr.
-    /// 2. Op-level: guard.rs transitive_imply/inhert_attributes/emit_operations
-    ///    copy rd_numb, rd_consts, rd_virtuals, rd_pendingfields between Ops.
-    ///
-    /// This method exists for the trait contract but is not the primary
-    /// copy path — the two paths above handle all copy_all_attributes_from
-    /// semantics.
-    fn copy_resume_into_op(&self, _target: &mut majit_ir::Op) {
-        // Intentionally delegates to the two-level copy mechanism above.
-        // Op fields are authoritative; descr resume_data is preserved via
-        // clone_as_loop_version_descr.
-    }
     fn attach_vector_info(&self, info: AccumVectorInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
     }
@@ -343,39 +327,23 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
     })
 }
 
-/// guard.py:89-91: Create a CompileLoopVersionDescr, copying resume
-/// attributes from `source_op`'s descr (copy_all_attributes_from),
-/// then clearing rd_vector_info.
-///
-/// guard.py:89-91: Always produces a CompileLoopVersionDescr.
-///
+/// guard.py:89-91:
 ///   descr = CompileLoopVersionDescr()
 ///   descr.copy_all_attributes_from(self.op.getdescr())
 ///   descr.rd_vector_info = None
 ///
-/// Uses `clone_as_loop_version_descr()` which creates a
-/// CompileLoopVersionDescr with resume data copied from the source
-/// and rd_vector_info cleared. Falls back to empty if no source descr.
+/// Creates a CompileLoopVersionDescr with resume data copied from the
+/// source Op's descr. The source descr MUST exist and support
+/// clone_as_loop_version_descr — this is an invariant from RPython
+/// where the source guard always has a ResumeGuardDescr.
 #[allow(dead_code)]
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
-    if let Some(ref src) = source_op.descr {
-        if let Some(lvd) = src.clone_as_loop_version_descr() {
-            return lvd;
-        }
-    }
-    // Fallback: no source descr → empty CompileLoopVersionDescr.
-    let num_live = source_op.fail_args.as_ref().map_or(0, |fa| fa.len());
-    Arc::new(CompileLoopVersionDescr {
-        fail_index: alloc_fail_index(),
-        types: vec![Type::Int; num_live],
-        resume_data: ResumeData {
-            vable_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        },
-        vector_info: UnsafeCell::new(Vec::new()),
-    })
+    let src = source_op
+        .descr
+        .as_ref()
+        .expect("guard.py:90 self.op.getdescr() must exist");
+    src.clone_as_loop_version_descr()
+        .expect("guard.py:90 descr must support clone_as_loop_version_descr")
 }
 
 /// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
