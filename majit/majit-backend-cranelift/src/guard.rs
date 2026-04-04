@@ -115,6 +115,10 @@ pub struct CraneliftFailDescr {
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
     pub is_finish: bool,
+    /// Bridge external JUMP → parent loop: the caller should re-enter
+    /// the parent loop with these fail_arg values as new inputs.
+    /// Set after bridge compilation — uses atomic for interior mutability.
+    pub is_loop_reentry: std::sync::atomic::AtomicBool,
     pub force_token_slots: Vec<usize>,
     /// Write-once during compilation, read-only after.
     /// No lock — RPython ResumeGuardDescr has no lock (GIL).
@@ -228,6 +232,7 @@ impl CraneliftFailDescr {
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
+            is_loop_reentry: std::sync::atomic::AtomicBool::new(false),
             force_token_slots,
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
