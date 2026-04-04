@@ -131,12 +131,18 @@ pub enum OpKind {
         base: ValueId,
         index: ValueId,
         item_ty: ValueType,
+        /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
+        /// Distinguishes arrays with the same item_ty but different
+        /// container types (e.g. `Vec<Point>` vs `Vec<Line>`).
+        array_type_id: Option<String>,
     },
     ArrayWrite {
         base: ValueId,
         index: ValueId,
         value: ValueId,
         item_ty: ValueType,
+        /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
+        array_type_id: Option<String>,
     },
     Call {
         target: CallTarget,

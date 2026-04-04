@@ -199,15 +199,16 @@ pub struct CallControl {
 /// Limitation: after 64 unique field descriptors, indices wrap and may
 /// alias unrelated descriptors. This matches RPython's bitstring semantics
 /// where aliased bits cause conservative over-approximation (safe but
-/// imprecise). Array descriptors are keyed by item type only — different
-/// arrays with the same item type share an index, matching RPython's
-/// `cpu.arraydescrof(ARRAY)` which distinguishes by ARRAY identity.
+/// imprecise). Array descriptors are keyed by `(item_ty, array_type_id)`,
+/// matching RPython's `cpu.arraydescrof(ARRAY)` which distinguishes by
+/// ARRAY identity (e.g. `GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`).
 #[derive(Default)]
 pub struct DescrIndexRegistry {
     /// (owner_root, field_name) → bit index (0..63)
     field_indices: HashMap<(Option<String>, String), u32>,
-    /// item_type discriminant → bit index (0..63)
-    array_indices: HashMap<u8, u32>,
+    /// (item_ty_discriminant, array_type_id) → bit index (0..63)
+    /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
+    array_indices: HashMap<(u8, Option<String>), u32>,
     next_field_index: u32,
     next_array_index: u32,
 }
@@ -224,15 +225,17 @@ impl DescrIndexRegistry {
     }
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
-    pub fn array_index(&mut self, item_ty_discriminant: u8) -> u32 {
-        *self
-            .array_indices
-            .entry(item_ty_discriminant)
-            .or_insert_with(|| {
-                let idx = self.next_array_index % 64;
-                self.next_array_index += 1;
-                idx
-            })
+    ///
+    /// Keys on `(item_ty_discriminant, array_type_id)` so that arrays with
+    /// different ARRAY identity get distinct bit indices, even if item_ty
+    /// is the same (e.g. `Vec<Point>` vs `Vec<Line>` both have item_ty=Ref).
+    pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
+        let key = (item_ty_discriminant, array_type_id.clone());
+        *self.array_indices.entry(key).or_insert_with(|| {
+            let idx = self.next_array_index % 64;
+            self.next_array_index += 1;
+            idx
+        })
     }
 }
 
@@ -1348,20 +1351,27 @@ fn collect_readwrite_effects(
                     *write_fields |= 1u64 << idx;
                 }
                 // RPython: ("readarray", T)
-                OpKind::ArrayRead { item_ty, .. } => {
+                OpKind::ArrayRead {
+                    item_ty,
+                    array_type_id,
+                    ..
+                } => {
                     // RPython: cpu.arraydescrof(ARRAY).get_ei_index()
-                    let idx = descr_indices.array_index(value_type_discriminant(item_ty));
+                    let idx =
+                        descr_indices.array_index(value_type_discriminant(item_ty), array_type_id);
                     *read_arrays |= 1u64 << idx;
                 }
                 // RPython: ("array", T)
-                OpKind::ArrayWrite { item_ty, .. } => {
-                    let idx = descr_indices.array_index(value_type_discriminant(item_ty));
+                OpKind::ArrayWrite {
+                    item_ty,
+                    array_type_id,
+                    ..
+                } => {
+                    let idx =
+                        descr_indices.array_index(value_type_discriminant(item_ty), array_type_id);
                     *write_arrays |= 1u64 << idx;
                     // effectinfo.py:298,307: cpu.arraydescrof(ARRAY) → DescrRef.
-                    // RPython keys on ARRAY identity (lltype.GcArray(T));
-                    // majit keys on item_ty (ValueType discriminant), which is
-                    // equivalent for plain arrays (GcArray(Signed) etc.) but
-                    // merges different struct-arrays with the same item_ty.
+                    // Keyed on (item_ty, array_type_id) for ARRAY identity.
                     // Dedup by descriptor index (frozenset semantics).
                     if !array_write_descrs.iter().any(|d| d.index() == idx) {
                         let ir_type = match item_ty {

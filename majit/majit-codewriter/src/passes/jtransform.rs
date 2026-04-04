@@ -283,6 +283,7 @@ impl<'a> Transformer<'a> {
                 base,
                 index,
                 item_ty,
+                ..
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_getarrayitem(op, *base, *index, item_ty, graph_name)
             }
@@ -292,6 +293,7 @@ impl<'a> Transformer<'a> {
                 index,
                 value,
                 item_ty,
+                ..
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_setarrayitem(op, *base, *index, *value, item_ty, graph_name)
             }
@@ -1097,21 +1099,25 @@ fn remap_op(
             base,
             index,
             item_ty,
+            array_type_id,
         } => OpKind::ArrayRead {
             base: remap_value(*base, aliases),
             index: remap_value(*index, aliases),
             item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::ArrayWrite {
             base,
             index,
             value,
             item_ty,
+            array_type_id,
         } => OpKind::ArrayWrite {
             base: remap_value(*base, aliases),
             index: remap_value(*index, aliases),
             value: remap_value(*value, aliases),
             item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::Call {
             target,
