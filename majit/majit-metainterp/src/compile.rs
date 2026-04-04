@@ -626,19 +626,21 @@ pub(crate) fn build_guard_metadata(
                                     _ => ExitValueSourceLayout::Constant(0),
                                 }
                             };
+                            // field_offset is precomputed for array items
+                            // (base_size + item_index * item_size), so do NOT
+                            // pass item_index to the consumer — it would
+                            // double-count the index. Consumer uses plain
+                            // target_ptr + field_offset for both struct and
+                            // array paths.
                             majit_backend::ExitPendingFieldLayout {
                                 descr_index: pf.descr_index,
-                                item_index: if pf.item_index < 0 {
-                                    None
-                                } else {
-                                    Some(pf.item_index as usize)
-                                },
-                                is_array_item: pf.item_index >= 0,
+                                item_index: None,
+                                is_array_item: false,
                                 target: resolve_tagged(pf.target_tagged),
                                 value: resolve_tagged(pf.value_tagged),
                                 field_offset: pf.field_offset,
                                 field_size: pf.field_size,
-                                field_type: majit_ir::Type::Ref,
+                                field_type: pf.field_type,
                             }
                         })
                         .collect()
