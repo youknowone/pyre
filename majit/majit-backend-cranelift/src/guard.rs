@@ -292,6 +292,16 @@ impl CraneliftFailDescr {
             .store(code_ptr, std::sync::atomic::Ordering::Release);
     }
 
+    /// Take the bridge data out of this fail descriptor, leaving None.
+    pub fn take_bridge(&self) -> Option<BridgeData> {
+        let bridge = unsafe { &mut *self.bridge.get() }.take();
+        if bridge.is_some() {
+            self.bridge_code_ptr_cache
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+        bridge
+    }
+
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
         unsafe { *self.recovery_layout.get() = Some(recovery_layout) };
     }

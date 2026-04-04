@@ -9912,6 +9912,33 @@ impl majit_backend::Backend for CraneliftBackend {
         Ok(info)
     }
 
+    fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
+        let old_compiled = old_token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        let new_compiled = new_token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        let (Some(old), Some(new)) = (old_compiled, new_compiled) else {
+            return;
+        };
+        for old_fd in &old.fail_descrs {
+            if !old_fd.has_bridge() {
+                continue;
+            }
+            let target = new.fail_descrs.iter().find(|d| {
+                d.fail_index == old_fd.fail_index && d.fail_arg_types == old_fd.fail_arg_types
+            });
+            if let Some(new_fd) = target {
+                if let Some(bridge) = old_fd.take_bridge() {
+                    new_fd.attach_bridge(bridge);
+                }
+            }
+        }
+    }
+
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
         let compiled = token
             .compiled
