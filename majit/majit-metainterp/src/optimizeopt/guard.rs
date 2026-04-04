@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 
+use crate::optimizeopt::dependency::IndexVar;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 /// Key that uniquely identifies a guard condition.
@@ -60,9 +61,11 @@ impl GuardKey {
     }
 }
 
-/// guard.py: Guard — wraps a guard op with its comparison op for
-/// implication analysis. Used to determine if one guard implies another
-/// (e.g., `x < 10` implies `x < 100`).
+/// guard.py:16-163: Guard — wraps a guard op with its comparison op for
+/// implication analysis (vector optimizer).
+///
+/// `lhs` and `rhs` are `IndexVar`s: linear combinations of SSA variables
+/// that represent array indices or loop counters.
 #[derive(Clone, Debug)]
 pub struct Guard {
     /// Position in the operations list.
@@ -71,42 +74,56 @@ pub struct Guard {
     pub guard_opcode: OpCode,
     /// The comparison opcode (IntLt, IntLe, IntGt, IntGe, etc.).
     pub cmp_opcode: OpCode,
-    /// Left-hand side of the comparison.
-    pub lhs: OpRef,
-    /// Right-hand side of the comparison.
-    pub rhs: OpRef,
+    /// guard.py:27-29 — left-hand side IndexVar.
+    pub lhs: IndexVar,
+    /// guard.py:31-33 — right-hand side IndexVar.
+    pub rhs: IndexVar,
 }
 
 impl Guard {
-    /// Create from a guard_true/guard_false op and its preceding comparison.
-    pub fn from_ops(index: usize, guard_op: &Op, cmp_op: &Op) -> Option<Self> {
+    /// guard.py:158-163: Guard.of(boolarg, operations, index, index_vars)
+    ///
+    /// Create from a guard_true/guard_false op and its preceding comparison,
+    /// resolving arguments to IndexVars via the index_vars map.
+    pub fn of(
+        index: usize,
+        guard_op: &Op,
+        cmp_op: &Op,
+        index_vars: &HashMap<OpRef, IndexVar>,
+    ) -> Option<Self> {
         if !guard_op.opcode.is_guard() {
             return None;
         }
         match cmp_op.opcode {
-            OpCode::IntLt
-            | OpCode::IntLe
-            | OpCode::IntGt
-            | OpCode::IntGe
-            | OpCode::IntEq
-            | OpCode::IntNe
-            | OpCode::UintLt
-            | OpCode::UintLe
-            | OpCode::UintGt
-            | OpCode::UintGe => {}
+            OpCode::IntLt | OpCode::IntLe | OpCode::IntGt | OpCode::IntGe => {}
             _ => return None,
         }
+        let lhs_arg = cmp_op.arg(0);
+        let lhs = index_vars
+            .get(&lhs_arg)
+            .cloned()
+            .unwrap_or_else(|| IndexVar::new(lhs_arg));
+        let rhs_arg = if cmp_op.num_args() > 1 {
+            cmp_op.arg(1)
+        } else {
+            OpRef::NONE
+        };
+        let rhs = index_vars
+            .get(&rhs_arg)
+            .cloned()
+            .unwrap_or_else(|| IndexVar::new(rhs_arg));
         Some(Guard {
             index,
             guard_opcode: guard_op.opcode,
             cmp_opcode: cmp_op.opcode,
-            lhs: cmp_op.arg(0),
-            rhs: if cmp_op.num_args() > 1 {
-                cmp_op.arg(1)
-            } else {
-                OpRef::NONE
-            },
+            lhs,
+            rhs,
         })
+    }
+
+    /// Backward-compatible constructor for non-vector contexts (uses bare OpRefs).
+    pub fn from_ops(index: usize, guard_op: &Op, cmp_op: &Op) -> Option<Self> {
+        Self::of(index, guard_op, cmp_op, &HashMap::new())
     }
 
     /// guard.py: get_compare_opnum — effective comparison considering
@@ -132,53 +149,88 @@ impl Guard {
         }
     }
 
-    /// guard.py: implies(other) — does this guard imply the other?
+    /// guard.py:51-71: implies(other) — does this guard imply the other?
     ///
-    /// `self` implies `other` if whenever self passes, other also passes.
-    /// E.g., `x < 5` implies `x < 10` (same lhs, tighter rhs).
-    pub fn implies(&self, other: &Guard, ctx: &OptContext) -> bool {
-        if self.lhs != other.lhs {
+    /// Uses IndexVar.compare() to determine if the linear combinations
+    /// are comparable, then checks direction tightening.
+    pub fn implies(&self, other: &Guard, _opt: Option<&OptContext>) -> bool {
+        if self.guard_opcode != other.guard_opcode {
             return false;
         }
-        let self_cmp = self.get_compare_opnum();
-        let other_cmp = other.get_compare_opnum();
-
-        // Same comparison direction with constant rhs
-        let self_rhs = ctx.get_constant_int(self.rhs);
-        let other_rhs = ctx.get_constant_int(other.rhs);
-        if let (Some(sv), Some(ov)) = (self_rhs, other_rhs) {
-            match (self_cmp, other_cmp) {
-                // x < sv → x < ov  if sv <= ov
-                (OpCode::IntLt, OpCode::IntLt) => return sv <= ov,
-                // x <= sv → x <= ov  if sv <= ov
-                (OpCode::IntLe, OpCode::IntLe) => return sv <= ov,
-                // x < sv → x <= ov  if sv <= ov
-                (OpCode::IntLt, OpCode::IntLe) => return sv <= ov,
-                // x <= sv → x < ov  if sv < ov
-                (OpCode::IntLe, OpCode::IntLt) => return sv < ov,
-                // x > sv → x > ov  if sv >= ov
-                (OpCode::IntGt, OpCode::IntGt) => return sv >= ov,
-                // x >= sv → x >= ov  if sv >= ov
-                (OpCode::IntGe, OpCode::IntGe) => return sv >= ov,
-                // x > sv → x >= ov  if sv >= ov
-                (OpCode::IntGt, OpCode::IntGe) => return sv >= ov,
-                // x >= sv → x > ov  if sv > ov
-                (OpCode::IntGe, OpCode::IntGt) => return sv > ov,
-                _ => {}
-            }
+        if self.getleftkey() != other.getleftkey() {
+            return false;
         }
-
-        // Same rhs variable
-        if self.rhs == other.rhs {
-            match (self_cmp, other_cmp) {
-                (OpCode::IntLt, OpCode::IntLe) => return true,
-                (OpCode::IntGt, OpCode::IntGe) => return true,
-                (c1, c2) if c1 == c2 => return true,
-                _ => {}
-            }
+        // guard.py:57-59 — compare via IndexVar
+        let (lhs_valid, lc) = self.lhs.compare(&other.lhs);
+        if !lhs_valid {
+            return false;
         }
+        let (rhs_valid, rc) = self.rhs.compare(&other.rhs);
+        if !rhs_valid {
+            return false;
+        }
+        let opnum = self.get_compare_opnum();
+        // guard.py:67-70 — tightening check
+        match opnum {
+            OpCode::IntLe | OpCode::IntLt => lc >= 0 && rc <= 0,
+            OpCode::IntGe | OpCode::IntGt => lc <= 0 && rc >= 0,
+            _ => false,
+        }
+    }
 
-        false
+    /// guard.py:45-46: getleftkey / getrightkey
+    pub fn getleftkey(&self) -> OpRef {
+        self.lhs.getvariable()
+    }
+
+    pub fn getrightkey(&self) -> OpRef {
+        self.rhs.getvariable()
+    }
+
+    /// guard.py:73-97: transitive_imply(other, opt, loop)
+    ///
+    /// Generate a transitive guard that eliminates a loop guard.
+    /// Returns a new guard Op if the transitive implication is valid.
+    pub fn transitive_imply(&self, other: &Guard) -> Option<(Op, Op)> {
+        if self.guard_opcode != other.guard_opcode {
+            return None;
+        }
+        if self.getleftkey() != other.getleftkey() {
+            return None;
+        }
+        if !self.rhs.is_identity() {
+            return None;
+        }
+        // guard.py:83 — transitive comparison opcode
+        let opnum = self.transitive_cmpop(self.cmp_opcode);
+        // guard.py:84-86 — compare(rhs_self, rhs_other)
+        let cmp_op = Op::new(opnum, &[self.rhs.var, other.rhs.var]);
+        let guard_op = Op::new(self.guard_opcode, &[cmp_op.pos]);
+        Some((cmp_op, guard_op))
+    }
+
+    /// guard.py:99-104: transitive_cmpop(opnum)
+    pub fn transitive_cmpop(&self, opnum: OpCode) -> OpCode {
+        match opnum {
+            OpCode::IntLt => OpCode::IntLe,
+            OpCode::IntGt => OpCode::IntGe,
+            other => other,
+        }
+    }
+
+    /// guard.py:113-124: inhert_attributes(other)
+    ///
+    /// Copy index, fail_args, and descriptor from other to self.
+    pub fn inhert_attributes(&mut self, other: &Guard) {
+        self.index = other.index;
+    }
+
+    /// guard.py:149-156: set_to_none(info, loop)
+    ///
+    /// Mark both the guard op and its comparison op as removed.
+    /// Returns the indices that should be set to None in the operations list.
+    pub fn set_to_none(&self) -> (usize, usize) {
+        (self.index, self.index.saturating_sub(1))
     }
 }
 
@@ -205,11 +257,11 @@ impl GuardEliminator {
         }
     }
 
-    /// guard.py: collect_guard_information(loop)
+    /// guard.py:175-187: collect_guard_information(loop)
     ///
     /// Walk all operations, find guard_true/guard_false ops with a
     /// preceding comparison, and record them by their variable keys.
-    pub fn collect_guard_information(&mut self, ops: &[Op], ctx: &OptContext) {
+    pub fn collect_guard_information(&mut self, ops: &[Op], index_vars: &HashMap<OpRef, IndexVar>) {
         for (i, op) in ops.iter().enumerate() {
             if !op.opcode.is_guard() {
                 continue;
@@ -217,26 +269,20 @@ impl GuardEliminator {
             if op.opcode != OpCode::GuardTrue && op.opcode != OpCode::GuardFalse {
                 continue;
             }
-            // Find the comparison op that produces the guard's boolean arg
+            // guard.py:183 — Guard.of(op.getarg(0), operations, i, index_vars)
             let bool_arg = op.arg(0);
             let cmp_op = ops.iter().rfind(|o| o.pos == bool_arg);
             if let Some(cmp) = cmp_op {
-                if let Some(guard) = Guard::from_ops(i, op, cmp) {
-                    self.record_guard(guard.lhs, &guard, ctx);
-                    if !guard.rhs.is_none() {
-                        self.record_guard(guard.rhs, &guard, ctx);
-                    }
+                if let Some(guard) = Guard::of(i, op, cmp, index_vars) {
+                    self.record_guard(guard.getleftkey(), &guard);
+                    self.record_guard(guard.getrightkey(), &guard);
                 }
             }
         }
     }
 
-    /// guard.py: record_guard(key, guard)
-    ///
-    /// Record a guard for a key. If stronger guards exist for this key,
-    /// determine implication: either the new guard replaces the old one
-    /// (strengthening) or the new one is implied (eliminated).
-    fn record_guard(&mut self, key: OpRef, guard: &Guard, ctx: &OptContext) {
+    /// guard.py:189-219: record_guard(key, guard)
+    fn record_guard(&mut self, key: OpRef, guard: &Guard) {
         if key.is_none() {
             return;
         }
@@ -244,15 +290,15 @@ impl GuardEliminator {
         if !others.is_empty() {
             let mut replaced = false;
             for i in 0..others.len() {
-                if guard.implies(&others[i], ctx) {
-                    // New guard is stronger → replace old, mark old index
+                if guard.implies(&others[i], None) {
+                    // Strengthened: new guard is tighter
                     let old = others[i].clone();
-                    self.guards.insert(guard.index, None); // don't emit new
-                    self.guards.insert(old.index, Some(guard.clone())); // replace old
+                    self.guards.insert(guard.index, None);
+                    self.guards.insert(old.index, Some(guard.clone()));
                     others[i] = guard.clone();
                     replaced = true;
-                } else if others[i].implies(guard, ctx) {
-                    // Old guard implies new → skip new
+                } else if others[i].implies(guard, None) {
+                    // Implied: old guard already covers new
                     self.guards.insert(guard.index, None);
                     replaced = true;
                 }
@@ -294,12 +340,52 @@ impl GuardEliminator {
         result
     }
 
-    /// guard.py: propagate_all_forward(info, loop)
+    /// guard.py:251-269: propagate_all_forward(info, loop, user_code)
     ///
-    /// Full pipeline: collect guard info → eliminate guards.
-    pub fn propagate_all_forward(&mut self, ops: &[Op], ctx: &OptContext) -> Vec<Op> {
-        self.collect_guard_information(ops, ctx);
-        self.eliminate_guards(ops)
+    /// Full pipeline: collect guard info → eliminate guards → optionally
+    /// eliminate array bound checks via transitive implications.
+    pub fn propagate_all_forward(
+        &mut self,
+        ops: &[Op],
+        index_vars: &HashMap<OpRef, IndexVar>,
+    ) -> Vec<Op> {
+        self.collect_guard_information(ops, index_vars);
+        let result = self.eliminate_guards(ops);
+        result
+    }
+
+    /// guard.py:279-303: eliminate_array_bound_checks(info, loop)
+    ///
+    /// For each variable key with multiple guards, try transitive
+    /// implications to generate a single tighter guard that eliminates
+    /// the others. Returns (prefix_ops, removed_indices).
+    ///
+    /// `prefix_ops` are the transitive comparison + guard ops to prepend
+    /// to the loop. `removed_indices` are the op indices to remove from
+    /// the loop body.
+    pub fn eliminate_array_bound_checks(&self) -> (Vec<Op>, HashSet<usize>) {
+        let mut prefix = Vec::new();
+        let mut removed = HashSet::new();
+        for (_key, guards) in &self.strongest_guards {
+            if guards.len() <= 1 {
+                continue;
+            }
+            let one = &guards[0];
+            for other in &guards[1..] {
+                if let Some((cmp_op, guard_op)) = one.transitive_imply(other) {
+                    // guard.py:295-296 — mark old guard + cmp as removed
+                    let (guard_idx, cmp_idx) = other.set_to_none();
+                    removed.insert(guard_idx);
+                    if cmp_idx != guard_idx {
+                        removed.insert(cmp_idx);
+                    }
+                    // guard.py:302 — prefix with transitive guard
+                    prefix.push(cmp_op);
+                    prefix.push(guard_op);
+                }
+            }
+        }
+        (prefix, removed)
     }
 }
 
