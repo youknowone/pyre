@@ -497,7 +497,7 @@ impl Descr for DebugMergePointDescr {
 /// Side effect classification for calls.
 ///
 /// Translated from rpython/jit/codewriter/effectinfo.py.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectInfo {
     pub extra_effect: ExtraEffect,
     pub oopspec_index: OopSpecIndex,
@@ -515,7 +515,28 @@ pub struct EffectInfo {
     pub write_descrs_arrays: u64,
     /// effectinfo.py: can_invalidate
     pub can_invalidate: bool,
+    /// effectinfo.py:201-206: single_write_descr_array
+    /// When exactly one array write descriptor exists (ARRAYCOPY/ARRAYMOVE),
+    /// this holds the actual array DescrRef for typed GET/SETARRAYITEM emission.
+    #[serde(skip)]
+    pub single_write_descr_array: Option<DescrRef>,
 }
+
+/// Manual PartialEq: single_write_descr_array is excluded (like RPython's
+/// cache key which also excludes it — effectinfo.py:155-164).
+impl PartialEq for EffectInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.extra_effect == other.extra_effect
+            && self.oopspec_index == other.oopspec_index
+            && self.readonly_descrs_fields == other.readonly_descrs_fields
+            && self.write_descrs_fields == other.write_descrs_fields
+            && self.readonly_descrs_arrays == other.readonly_descrs_arrays
+            && self.write_descrs_arrays == other.write_descrs_arrays
+            && self.can_invalidate == other.can_invalidate
+    }
+}
+
+impl Eq for EffectInfo {}
 
 impl Default for EffectInfo {
     fn default() -> Self {
@@ -525,6 +546,7 @@ impl Default for EffectInfo {
             readonly_descrs_fields: 0,
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
+            single_write_descr_array: None,
             write_descrs_arrays: 0,
             can_invalidate: false,
         }
@@ -711,6 +733,7 @@ impl EffectInfo {
             readonly_descrs_arrays: 0,
             write_descrs_arrays: 0,
             can_invalidate: false,
+            single_write_descr_array: None,
         }
     }
 
@@ -766,6 +789,27 @@ impl EffectInfo {
     /// effectinfo.py: check_is_elidable()
     pub fn check_is_elidable(&self) -> bool {
         self.is_elidable()
+    }
+
+    /// effectinfo.py:201-206: set single_write_descr_array.
+    ///
+    /// Builder: attaches the actual array DescrRef for ARRAYCOPY/ARRAYMOVE
+    /// unrolling. RPython sets this in `EffectInfo.__new__()` when
+    /// `_write_descrs_arrays` has exactly one element.
+    pub fn with_single_write_descr_array(mut self, descr: DescrRef) -> Self {
+        self.single_write_descr_array = Some(descr);
+        self
+    }
+
+    /// effectinfo.py:201-206: auto-set single_write_descr_array.
+    ///
+    /// If `write_descrs_arrays` has exactly one bit set and a matching
+    /// array DescrRef is provided, store it for ARRAYCOPY/ARRAYMOVE.
+    pub fn set_single_write_descr_array(&mut self, descr: DescrRef) {
+        let w = self.write_descrs_arrays;
+        if w != 0 && w.is_power_of_two() {
+            self.single_write_descr_array = Some(descr);
+        }
     }
 }
 
