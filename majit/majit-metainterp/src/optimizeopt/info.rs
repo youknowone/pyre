@@ -1077,6 +1077,79 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:651-656: _compute_index(index, fielddescr)
+    /// Computes flat index into VirtualArrayStruct's element_fields.
+    fn compute_interior_index(
+        &self,
+        element_index: usize,
+        field_descr_index: u32,
+    ) -> Option<(usize, usize)> {
+        match self {
+            PtrInfo::VirtualArrayStruct(v) => {
+                if element_index >= v.element_fields.len() {
+                    return None;
+                }
+                // Find the slot for field_descr_index within this element.
+                let fields = &v.element_fields[element_index];
+                for (slot, &(fdidx, _)) in fields.iter().enumerate() {
+                    if fdidx == field_descr_index {
+                        return Some((element_index, slot));
+                    }
+                }
+                // Field not yet present — return element index for insertion.
+                Some((element_index, fields.len()))
+            }
+            _ => None,
+        }
+    }
+
+    /// info.py:663-668: getinteriorfield_virtual(index, fielddescr)
+    pub fn getinteriorfield_virtual(
+        &self,
+        element_index: usize,
+        field_descr_index: u32,
+    ) -> Option<OpRef> {
+        match self {
+            PtrInfo::VirtualArrayStruct(v) => {
+                if element_index >= v.element_fields.len() {
+                    return None;
+                }
+                v.element_fields[element_index]
+                    .iter()
+                    .find(|&&(fdidx, _)| fdidx == field_descr_index)
+                    .map(|&(_, opref)| opref)
+            }
+            _ => None,
+        }
+    }
+
+    /// info.py:658-661: setinteriorfield_virtual(index, fielddescr, fld)
+    pub fn setinteriorfield_virtual(
+        &mut self,
+        element_index: usize,
+        field_descr_index: u32,
+        value: OpRef,
+    ) {
+        match self {
+            PtrInfo::VirtualArrayStruct(v) => {
+                if element_index >= v.element_fields.len() {
+                    v.element_fields.resize(element_index + 1, Vec::new());
+                }
+                let fields = &mut v.element_fields[element_index];
+                // Update existing or insert new.
+                if let Some(entry) = fields
+                    .iter_mut()
+                    .find(|(fdidx, _)| *fdidx == field_descr_index)
+                {
+                    entry.1 = value;
+                } else {
+                    fields.push((field_descr_index, value));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// info.py: produce_short_preamble_ops(structbox, descr, index, optimizer, shortboxes)
     ///
     /// Add cached field values to the short preamble builder.

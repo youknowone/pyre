@@ -1869,14 +1869,56 @@ impl OptRewrite {
             }
         };
 
-        // rewrite.py:621: arraydescr.is_array_of_structs()
-        // majit PtrInfo does not support interior fields, so array-of-structs
-        // ARRAYCOPY is not unrolled (falls through to emit the call).
+        // rewrite.py:621-635: arraydescr.is_array_of_structs()
         if arraydescr
             .as_array_descr()
             .is_some_and(|ad| ad.is_array_of_structs())
         {
-            return false;
+            // rewrite.py:624-627: only if both virtual, not memmove
+            if !(source_is_virtual && dest_is_virtual && source_box != dest_box) {
+                return false;
+            }
+            // rewrite.py:628-629: all_fdescrs = arraydescr.get_all_fielddescrs()
+            // Collect field descriptor indices from the source VirtualArrayStruct.
+            let all_fdescr_indices: Vec<u32> = ctx
+                .get_ptr_info(source_box)
+                .and_then(|info| match info {
+                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                        if v.element_fields.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                v.element_fields[0]
+                                    .iter()
+                                    .map(|&(fdidx, _)| fdidx)
+                                    .collect(),
+                            )
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if all_fdescr_indices.is_empty() {
+                return false;
+            }
+            // rewrite.py:631-634: copy interior fields element by element
+            for index in 0..length_int {
+                for &fdescr_idx in &all_fdescr_indices {
+                    let val = ctx.get_ptr_info(source_box).and_then(|info| {
+                        info.getinteriorfield_virtual((index + source_start) as usize, fdescr_idx)
+                    });
+                    if let Some(val) = val {
+                        if let Some(info) = ctx.get_ptr_info_mut(dest_box) {
+                            info.setinteriorfield_virtual(
+                                (index + dest_start) as usize,
+                                fdescr_idx,
+                                val,
+                            );
+                        }
+                    }
+                }
+            }
+            return true;
         }
 
         // rewrite.py:636-643: iteration direction
