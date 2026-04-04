@@ -5601,9 +5601,15 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:701-717: bridge failure → blackhole resume.
             // Catch Cranelift panics to prevent crashing the process.
             let token = &compiled.token;
+            let previous_tokens = &compiled.previous_tokens;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backend
-                    .compile_bridge(fail_descr, bridge_inputargs, &optimized_ops, token)
+                self.backend.compile_bridge(
+                    fail_descr,
+                    bridge_inputargs,
+                    &optimized_ops,
+                    token,
+                    previous_tokens,
+                )
             })) {
                 Ok(r) => r,
                 Err(_) => {

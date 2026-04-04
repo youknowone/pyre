@@ -334,6 +334,7 @@ fn test_bridge_end_to_end() {
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,
+            &[],
         )
         .expect("bridge compilation should succeed");
     assert!(bridge_info.code_addr != 0);
@@ -2369,6 +2370,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
             &bridge_trace.inputargs,
             &bridge_trace.ops,
             &token,
+            &[],
         )
         .expect("bridge compilation should succeed");
 

@@ -2250,7 +2250,12 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
+                                crate::state::trace_unbox_int_with_resume(
+                                    this,
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                )
                             };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2271,7 +2276,12 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Int {
                                 value
                             } else {
-                                crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
+                                crate::state::trace_unbox_int_with_resume(
+                                    this,
+                                    ctx,
+                                    value,
+                                    &INT_TYPE as *const _ as i64,
+                                )
                             };
                             trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2298,7 +2308,12 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
+                                crate::state::trace_unbox_float_with_resume(
+                                    this,
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                )
                             };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2319,7 +2334,12 @@ impl MIFrame {
                             let raw = if this.value_type(value) == Type::Float {
                                 value
                             } else {
-                                crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
+                                crate::state::trace_unbox_float_with_resume(
+                                    this,
+                                    ctx,
+                                    value,
+                                    &FLOAT_TYPE as *const _ as i64,
+                                )
                             };
                             trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                             Ok(())
@@ -2398,7 +2418,12 @@ impl MIFrame {
                     let raw = if this.value_type(value) == Type::Int {
                         value
                     } else {
-                        crate::state::trace_unbox_int_with_resume(this, ctx, value, &INT_TYPE as *const _ as i64)
+                        crate::state::trace_unbox_int_with_resume(
+                            this,
+                            ctx,
+                            value,
+                            &INT_TYPE as *const _ as i64,
+                        )
                     };
                     trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
@@ -2434,7 +2459,12 @@ impl MIFrame {
                     let raw = if this.value_type(value) == Type::Float {
                         value
                     } else {
-                        crate::state::trace_unbox_float_with_resume(this, ctx, value, &FLOAT_TYPE as *const _ as i64)
+                        crate::state::trace_unbox_float_with_resume(
+                            this,
+                            ctx,
+                            value,
+                            &FLOAT_TYPE as *const _ as i64,
+                        )
                     };
                     trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
                     let new_len = ctx.const_int((concrete_len + 1) as i64);
@@ -3680,12 +3710,13 @@ impl MIFrame {
             if is_int(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     let int_type_addr = &INT_TYPE as *const _ as i64;
-                    let int_value =
-                        if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
-                            raw
-                        } else {
-                            crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
-                        };
+                    let int_value = if let Some(raw) =
+                        try_trace_const_boxed_int(ctx, value, concrete_value)
+                    {
+                        raw
+                    } else {
+                        crate::state::trace_unbox_int_with_resume(this, ctx, value, int_type_addr)
+                    };
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[int_value, zero]))
                 });
@@ -3697,7 +3728,13 @@ impl MIFrame {
                         if let Some(raw) = try_trace_const_boxed_int(ctx, value, concrete_value) {
                             raw
                         } else {
-                            crate::state::trace_unbox_int_with_resume_descr(this, ctx, value, bool_type_addr, crate::descr::bool_boolval_descr())
+                            crate::state::trace_unbox_int_with_resume_descr(
+                                this,
+                                ctx,
+                                value,
+                                bool_type_addr,
+                                crate::descr::bool_boolval_descr(),
+                            )
                         };
                     let zero = ctx.const_int(0);
                     Ok(ctx.record_op(OpCode::IntNe, &[bool_value, zero]))
@@ -3712,7 +3749,12 @@ impl MIFrame {
             if is_float(concrete_value) {
                 return self.with_ctx(|this, ctx| {
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
-                    let float_value = crate::state::trace_unbox_float_with_resume(this, ctx, value, float_type_addr);
+                    let float_value = crate::state::trace_unbox_float_with_resume(
+                        this,
+                        ctx,
+                        value,
+                        float_type_addr,
+                    );
                     let zero = ctx.const_int(0);
                     let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
                     Ok(ctx.record_op(OpCode::FloatNe, &[float_value, zero_float]))
