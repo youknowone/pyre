@@ -221,7 +221,7 @@ pub trait SizeDescr: Descr {
     }
 
     /// All field descriptors (not just GC pointer ones).
-    /// descr.py: get_all_fielddescrs()
+    /// descr.py: get_all_interiorfielddescrs()
     fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
         self.gc_field_descrs() // default: same as gc_field_descrs
     }
@@ -382,9 +382,9 @@ pub trait ArrayDescr: Descr {
         false
     }
 
-    /// RPython: descr.py ArrayDescr.get_all_fielddescrs().
+    /// RPython: descr.py ArrayDescr.get_all_interiorfielddescrs().
     /// For array-of-structs, returns interior field descriptors.
-    fn get_all_fielddescrs(&self) -> Option<&[DescrRef]> {
+    fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
         None
     }
 
@@ -1034,7 +1034,7 @@ pub struct SimpleArrayDescr {
     flag: ArrayFlag,
     /// RPython: descr.py ArrayDescr.all_interiorfielddescrs.
     /// For array-of-structs, contains interior field descriptors.
-    all_fielddescrs: Option<Vec<DescrRef>>,
+    all_interiorfielddescrs: Option<Vec<DescrRef>>,
 }
 
 impl SimpleArrayDescr {
@@ -1053,7 +1053,7 @@ impl SimpleArrayDescr {
             type_id,
             item_type,
             flag,
-            all_fielddescrs: None,
+            all_interiorfielddescrs: None,
         }
     }
 
@@ -1073,13 +1073,13 @@ impl SimpleArrayDescr {
             type_id,
             item_type,
             flag,
-            all_fielddescrs: None,
+            all_interiorfielddescrs: None,
         }
     }
 
     /// RPython: arraydescr.all_interiorfielddescrs = descrs
-    pub fn set_all_fielddescrs(&mut self, descrs: Vec<DescrRef>) {
-        self.all_fielddescrs = Some(descrs);
+    pub fn set_all_interiorfielddescrs(&mut self, descrs: Vec<DescrRef>) {
+        self.all_interiorfielddescrs = Some(descrs);
     }
 }
 
@@ -1127,9 +1127,9 @@ impl ArrayDescr for SimpleArrayDescr {
             ArrayFlag::Float | ArrayFlag::Signed | ArrayFlag::Unsigned
         )
     }
-    /// RPython: descr.py ArrayDescr.get_all_fielddescrs()
-    fn get_all_fielddescrs(&self) -> Option<&[DescrRef]> {
-        self.all_fielddescrs.as_deref()
+    /// RPython: descr.py ArrayDescr.get_all_interiorfielddescrs()
+    fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
+        self.all_interiorfielddescrs.as_deref()
     }
 }
 
