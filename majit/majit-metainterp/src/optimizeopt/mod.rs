@@ -41,24 +41,13 @@ pub(crate) fn majit_log_enabled() -> bool {
     std::env::var_os("MAJIT_LOG").is_some()
 }
 
-/// compile.py: ResumeAtPositionDescr — type tag for guards created during
-/// loop unrolling / short preamble inlining.
-#[derive(Debug)]
-struct OptResumeAtPositionDescr;
-
-impl majit_ir::Descr for OptResumeAtPositionDescr {
-    fn is_resume_at_position(&self) -> bool {
-        true
-    }
-    // RPython: inherited clone() → plain ResumeGuardDescr (marker lost).
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(crate::fail_descr::make_plain_resume_guard_descr(Vec::new()))
-    }
-}
-
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
+///
+/// Delegates to fail_descr::make_resume_at_position_descr which wraps a
+/// real ResumeGuardDescr — clone_descr() preserves resume data (RPython
+/// ResumeAtPositionDescr is a plain subclass of ResumeGuardDescr).
 pub fn make_resume_at_position_descr() -> DescrRef {
-    std::sync::Arc::new(OptResumeAtPositionDescr)
+    crate::fail_descr::make_resume_at_position_descr()
 }
 
 /// Result of an optimization pass processing an operation.
