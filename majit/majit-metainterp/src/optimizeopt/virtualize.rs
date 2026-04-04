@@ -365,12 +365,13 @@ impl OptVirtualize {
         vinfo: VirtualInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // RPython info.py:137-156: _is_virtual = False, _fields retained.
-        // newop.set_forwarded(self) — the same PtrInfo stays on newop (alloc_ref).
+        // RPython info.py:137-156: _is_virtual = False.
+        // info.py:225: self._fields[i] = None before emit_extra(setfieldop).
+        // Clear field values so heap cache doesn't suppress SetfieldGc.
         let preserved = PtrInfo::Instance(crate::optimizeopt::info::InstancePtrInfo {
             descr: Some(vinfo.descr.clone()),
             known_class: vinfo.known_class,
-            fields: vinfo.fields.clone(),
+            fields: Vec::new(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
@@ -449,9 +450,13 @@ impl OptVirtualize {
         // RPython info.py:147-156: _is_virtual = False, _fields retained.
         // newop.set_forwarded(self) — the same PtrInfo (now non-virtual)
         // stays accessible via get_ptr_info(alloc_ref).
+        // RPython info.py:147-156: _is_virtual = False, _fields retained
+        // BUT info.py:225: self._fields[i] = None before emit_extra(setfieldop).
+        // Preserve descr+field_descrs for type resolution, but clear field VALUES
+        // so the heap cache doesn't suppress the SetfieldGc emissions.
         let preserved = PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
             descr: vinfo.descr.clone(),
-            fields: vinfo.fields.clone(),
+            fields: Vec::new(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
@@ -472,7 +477,6 @@ impl OptVirtualize {
         }
 
         // RPython info.py:226: optforce.emit_extra(setfieldop)
-        // Emit through remaining passes, same as New().
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);

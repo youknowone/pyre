@@ -1201,29 +1201,15 @@ impl OptHeap {
             }
         }
 
-        // heap.py:81-83: possible_aliasing → force_lazy_set
-        // heap.py:67-75: possible_aliasing_two_infos checks:
-        //   1. same_info → MUST_ALIAS (handled by OpRef equality above)
-        //   2. _cannot_alias_via_classes_or_lengths (198-204)
-        //   3. _cannot_alias_via_content (206-226)
-        let needs_force = self.cached_fields.get(&field_idx).map_or(false, |cf| {
-            if !cf.possible_aliasing(obj) {
-                return false;
-            }
-            let lazy_obj = cf.lazy_set.as_ref().unwrap().0;
-            // heap.py:198-204: _cannot_alias_via_classes_or_lengths
-            let class1 = ctx.get_ptr_info(lazy_obj).and_then(|i| i.get_known_class());
-            let class2 = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class());
-            if matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2) {
-                return false;
-            }
-            // heap.py:206-226: _cannot_alias_via_content
-            let lazy_resolved = ctx.get_box_replacement(lazy_obj);
-            if Self::cannot_alias_via_content(lazy_resolved, obj, ctx) {
-                return false;
-            }
-            true // UNKNOWN_ALIAS → needs force
-        });
+        // heap.py:81-83: possible_aliasing → force_lazy_set.
+        // RPython: possible_aliasing checks only whether lazy_set targets
+        // a DIFFERENT object. If yes, force unconditionally — the
+        // _cannot_alias_via_classes optimization applies to cache
+        // invalidation (possible_aliasing_two_infos), not to force_lazy_set.
+        let needs_force = self
+            .cached_fields
+            .get(&field_idx)
+            .map_or(false, |cf| cf.possible_aliasing(obj));
         if needs_force {
             let lazy_data = self
                 .cached_fields
