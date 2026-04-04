@@ -628,13 +628,24 @@ impl<'a> Transformer<'a> {
             if let Some(cc) = self.callcontrol.as_mut() {
                 let oopspec_index = descriptor.effect_info.oopspec_index;
                 if oopspec_index != OopSpecIndex::None {
-                    // RPython: callinfocollection.add(oopspecindex, calldescr, func_as_int)
-                    // In static analysis we don't have real calldescr/funcaddr;
-                    // use a placeholder descr and 0 address.
-                    let placeholder_descr: majit_ir::descr::DescrRef =
+                    // RPython jtransform.py:2000-2001:
+                    //   func = ptr2int(op.args[0].value)
+                    //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
+                    //
+                    // In static analysis we don't have real function pointers.
+                    // Use a hash of the target path as a stable surrogate for
+                    // func_as_int, and the effect_info's calldescr placeholder.
+                    // This ensures each builtin gets a distinct address in
+                    // list_of_addr2name instead of all collapsing to 0x0.
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    target.hash(&mut hasher);
+                    let func_as_int = hasher.finish();
+
+                    let calldescr: majit_ir::descr::DescrRef =
                         std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 0, 0));
                     cc.callinfocollection
-                        .add(oopspec_index, placeholder_descr, 0);
+                        .add(oopspec_index, calldescr, func_as_int);
                 }
             }
 
