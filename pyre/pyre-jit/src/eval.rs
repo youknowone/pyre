@@ -2157,18 +2157,26 @@ fn materialize_virtual_from_rd(
                 return Value::Ref(majit_ir::GcRef::NULL);
             }
         }
-        // resume.py:634-637: VStructInfo.allocate(typedescr) → allocate_struct.
+        // resume.py:634-637: VStructInfo.allocate — allocate_with_vtable when
+        // vtable present. heaptracker.py:66 excludes typeptr from fielddescrs.
         VirtualKind::Struct { typedescr, type_id } => {
             if let Some(td) = typedescr {
                 let sd = td
                     .as_size_descr()
                     .expect("VStruct typedescr must be SizeDescr");
-                allocate_struct(sd)
+                if sd.vtable() != 0 {
+                    allocate_with_vtable(sd)
+                } else {
+                    allocate_struct(sd)
+                }
             } else if descr_size > 0 {
-                // Fallback: EncodedResumeData decoded without live typedescr.
                 let fallback = majit_ir::make_size_descr_full(0, descr_size, type_id);
                 let sd = fallback.as_size_descr().unwrap();
-                allocate_struct(sd)
+                if sd.vtable() != 0 {
+                    allocate_with_vtable(sd)
+                } else {
+                    allocate_struct(sd)
+                }
             } else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!("[jit] materialize_virtual: vidx={vidx} Struct with no typedescr",);

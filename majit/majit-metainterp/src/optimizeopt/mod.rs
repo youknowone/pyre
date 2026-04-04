@@ -280,6 +280,16 @@ pub struct OptContext {
     pub last_seen_snapshot_pos: Option<i32>,
 }
 
+/// heaptracker.py:66: `if name == 'typeptr': continue`
+#[allow(dead_code)]
+pub(crate) fn is_typeptr_field(field_idx: u32, field_descrs: &[(u32, majit_ir::DescrRef)]) -> bool {
+    field_descrs
+        .iter()
+        .find(|(di, _)| *di == field_idx)
+        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()))
+        == Some(0)
+}
+
 /// resume.py:192-226 parity — BoxEnv for optimizer context.
 ///
 /// Wraps an immutable reference to OptContext, implementing the BoxEnv
@@ -404,6 +414,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
                     .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
@@ -413,6 +424,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 field_oprefs: vi
                     .fields
                     .iter()
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
                     .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
@@ -462,6 +474,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
                     .fields
                     .iter()
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
@@ -495,6 +508,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
                     .fields
                     .iter()
+                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs))
                     .map(|(fi, _)| {
                         let fd = vi
                             .field_descrs
