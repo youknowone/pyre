@@ -36,6 +36,15 @@ fn is_power_of_two_float(v: f64) -> bool {
     mantissa_bits == 0 && exponent > 0 && exponent < 0x7FF
 }
 
+/// info.py:16-18: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
+/// optimizer.py:127-135: getnullness()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nullness {
+    Null,
+    Nonnull,
+    Unknown,
+}
+
 /// Rewrite operations into equivalent, cheaper forms.
 ///
 /// Handles:
@@ -500,7 +509,8 @@ impl OptRewrite {
 
             // General constant divisor >= 3: magic number multiplication
             if divisor >= 3 {
-                let result = intdiv::division_operations(arg0, divisor, false, ctx);
+                let result =
+                    intdiv::division_operations(arg0, divisor, false, ctx.current_pass_idx, ctx);
                 ctx.replace_op(op.pos, result);
                 return OptimizationResult::Remove;
             }
@@ -551,7 +561,8 @@ impl OptRewrite {
         // Strength reduction for constant divisor >= 3 (non-power-of-2)
         if let Some(divisor) = ctx.get_constant_int(arg1) {
             if divisor >= 3 && divisor.count_ones() != 1 {
-                let result = intdiv::modulo_operations(arg0, divisor, false, ctx);
+                let result =
+                    intdiv::modulo_operations(arg0, divisor, false, ctx.current_pass_idx, ctx);
                 ctx.replace_op(op.pos, result);
                 return OptimizationResult::Remove;
             }
@@ -1569,6 +1580,368 @@ impl OptRewrite {
     // ── SAME_AS identity ──
 
     /// SAME_AS_I/R/F(x) -> x
+    /// optimizer.py:127-135: getnullness(op)
+    ///
+    /// RPython dispatches on `op.type`:
+    /// - 'r' (Ref): check PtrInfo only. If PtrInfo is None → INFO_UNKNOWN.
+    /// - 'i' (Int): check IntBound.getnullness() only.
+    /// Never mixes the two — a Ref must not be queried via IntBound.
+    fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
+        // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
+        let is_ref = self.is_ref_typed(opref, ctx);
+        if is_ref {
+            // optimizer.py:129-132: ptrinfo = getptrinfo(op)
+            let info = ctx.get_ptr_info(opref);
+            match info {
+                None => return Nullness::Unknown,
+                Some(info) => {
+                    if info.is_null() {
+                        return Nullness::Null;
+                    }
+                    if info.is_nonnull() {
+                        return Nullness::Nonnull;
+                    }
+                    return Nullness::Unknown;
+                }
+            }
+        }
+        // optimizer.py:133-134: elif op.type == 'i':
+        //   return self.getintbound(op).getnullness()
+        let b = ctx.getintbound(opref);
+        // intutils.py:1318-1329: IntBound.getnullness()
+        if b.known_gt_const(0) || b.known_lt_const(0) {
+            return Nullness::Nonnull;
+        }
+        if b.is_constant() && b.get_constant() == 0 {
+            return Nullness::Null;
+        }
+        Nullness::Unknown
+    }
+
+    /// Check if an OpRef is Ref-typed.
+    /// optimizer.py:128: op.type == 'r'
+    fn is_ref_typed(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        // Check constant type.
+        if let Some(val) = ctx.get_constant(opref) {
+            return val.get_type() == majit_ir::Type::Ref;
+        }
+        // Check value_types (populated by emit).
+        if let Some(&tp) = ctx.value_types.get(&opref.0) {
+            return tp == majit_ir::Type::Ref;
+        }
+        // Check producing op result type.
+        if let Some(tp) = ctx.get_op_result_type(opref) {
+            return tp == majit_ir::Type::Ref;
+        }
+        // Check PtrInfo existence as a Ref indicator.
+        ctx.get_ptr_info(opref).is_some()
+    }
+
+    /// rewrite.py:95-101: _optimize_CALL_INT_UDIV
+    /// x / 1 → x
+    fn optimize_call_int_udiv(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
+        if op.num_args() < 3 {
+            return false;
+        }
+        let arg2 = op.arg(2);
+        if let Some(1) = ctx.get_constant_int(arg2) {
+            ctx.replace_op(op.pos, op.arg(1));
+            self.last_op_removed = true;
+            return true;
+        }
+        false
+    }
+
+    /// rewrite.py:768-805: _optimize_CALL_INT_PY_MOD
+    fn optimize_call_int_py_mod(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        if op.num_args() < 3 {
+            return None;
+        }
+        let arg1 = op.arg(1);
+        let arg2 = op.arg(2);
+        let b1 = ctx.getintbound(arg1);
+        let b2 = ctx.getintbound(arg2);
+
+        // rewrite.py:774-777: b1.known_eq_const(0) → 0
+        if b1.known_eq_const(0) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:780-781: if not b2.is_constant(): return False
+        if !b2.is_constant() {
+            return None;
+        }
+        let val = b2.get_constant();
+        // rewrite.py:783-784
+        if val <= 0 {
+            return None;
+        }
+        // rewrite.py:785-788: x % 1 → 0
+        if val == 1 {
+            ctx.make_constant(op.pos, Value::Int(0));
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:789-796: x % power_of_two → x & (power_of_two - 1)
+        // Python's modulo: valid even for negative x.
+        // RPython: replace_op_with + send_extra_operation (routes through passes).
+        if val & (val - 1) == 0 {
+            let mask = ctx.make_constant_int(val - 1);
+            let mut and_op = Op::new(OpCode::IntAnd, &[arg1, mask]);
+            and_op.pos = op.pos;
+            ctx.emit_extra(ctx.current_pass_idx, and_op);
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:797-805: intdiv.modulo_operations fallback
+        let known_nonneg = b1.known_nonnegative();
+        let result_ref = crate::optimizeopt::intdiv::modulo_operations(
+            arg1,
+            val,
+            known_nonneg,
+            ctx.current_pass_idx,
+            ctx,
+        );
+        ctx.replace_op(op.pos, result_ref);
+        self.last_op_removed = true;
+        Some(OptimizationResult::Remove)
+    }
+
+    /// rewrite.py:713-766: _optimize_CALL_INT_PY_DIV
+    fn optimize_call_int_py_div(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> Option<OptimizationResult> {
+        if op.num_args() < 3 {
+            return None;
+        }
+        let arg1 = op.arg(1);
+        let arg2 = op.arg(2);
+        let b1 = ctx.getintbound(arg1);
+        let b2 = ctx.getintbound(arg2);
+
+        // rewrite.py:726-729: b1.known_eq_const(0) → 0
+        if b1.known_eq_const(0) {
+            ctx.make_constant(op.pos, Value::Int(0));
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:730-741: non-constant divisor (shift optimization)
+        if !b2.is_constant() {
+            // rewrite.py:731-740: x // (1 << y) → x >> y
+            // when 0 <= y < LONG_BIT - 1
+            let arg2_resolved = ctx.get_box_replacement(arg2);
+            if let Some(shift_op) = ctx.get_producing_op(arg2_resolved) {
+                if shift_op.opcode == OpCode::IntLshift
+                    && shift_op.num_args() >= 2
+                    && ctx.get_constant_int(shift_op.arg(0)) == Some(1)
+                {
+                    let shiftvar = ctx.get_box_replacement(shift_op.arg(1));
+                    let shiftbound = ctx.getintbound(shiftvar);
+                    if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
+                        let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shiftvar]);
+                        rshift_op.pos = op.pos;
+                        ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+                        self.last_op_removed = true;
+                        return Some(OptimizationResult::Remove);
+                    }
+                }
+            }
+            return None;
+        }
+        let val = b2.get_constant();
+        // rewrite.py:743-749: x // -1 → -x (if x > MININT)
+        if val == -1 {
+            if b1.known_gt_const(i64::MIN) {
+                let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
+                neg_op.pos = op.pos;
+                ctx.emit_extra(ctx.current_pass_idx, neg_op);
+                self.last_op_removed = true;
+                return Some(OptimizationResult::Remove);
+            }
+        }
+        // rewrite.py:750-751
+        if val <= 0 {
+            return None;
+        }
+        // rewrite.py:752-755: x // 1 → x
+        if val == 1 {
+            ctx.replace_op(op.pos, arg1);
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:756-757: x // power_of_two → x >> shift
+        if val & (val - 1) == 0 {
+            let shift = val.trailing_zeros() as i64;
+            let shift_const = ctx.make_constant_int(shift);
+            let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, shift_const]);
+            rshift_op.pos = op.pos;
+            ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+            self.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
+        }
+        // rewrite.py:758-766: intdiv.division_operations fallback
+        let known_nonneg = b1.known_nonnegative();
+        let result_ref = crate::optimizeopt::intdiv::division_operations(
+            arg1,
+            val,
+            known_nonneg,
+            ctx.current_pass_idx,
+            ctx,
+        );
+        ctx.replace_op(op.pos, result_ref);
+        self.last_op_removed = true;
+        Some(OptimizationResult::Remove)
+    }
+
+    /// rewrite.py:599-670: _optimize_call_arrayop
+    ///
+    /// Element-by-element unrolling for small constant-length array
+    /// copy/move operations. Handles both virtual and non-virtual arrays.
+    fn optimize_call_arrayop(
+        &mut self,
+        op: &Op,
+        source_box: OpRef,
+        dest_box: OpRef,
+        source_start_box: OpRef,
+        dest_start_box: OpRef,
+        length_box: OpRef,
+        ctx: &mut OptContext,
+    ) -> bool {
+        // rewrite.py:601-602: length = self.get_constant_box(length_box)
+        let length_int = match ctx.get_constant_int(length_box) {
+            Some(l) => l,
+            None => return false,
+        };
+        // rewrite.py:605-606: 0-length → remove
+        if length_int == 0 {
+            return true;
+        }
+
+        let source_box = ctx.get_box_replacement(source_box);
+        let dest_box = ctx.get_box_replacement(dest_box);
+        let source_is_virtual = ctx.get_ptr_info(source_box).is_some_and(|i| i.is_virtual());
+        let dest_is_virtual = ctx.get_ptr_info(dest_box).is_some_and(|i| i.is_virtual());
+
+        // rewrite.py:610-611: constant start indices required
+        let source_start = match ctx.get_constant_int(source_start_box) {
+            Some(s) => s,
+            None => return false,
+        };
+        let dest_start = match ctx.get_constant_int(dest_start_box) {
+            Some(d) => d,
+            None => return false,
+        };
+
+        // rewrite.py:613-617: both start constant, at least one virtual or length <= 8
+        if !((dest_is_virtual || length_int <= 8) && (source_is_virtual || length_int <= 8)) {
+            return false;
+        }
+
+        // rewrite.py:612,617: extrainfo.single_write_descr_array sanity check
+        let call_descr = match &op.descr {
+            Some(d) => d.clone(),
+            None => return false,
+        };
+        let cd = match call_descr.as_call_descr() {
+            Some(cd) => cd,
+            None => return false,
+        };
+        let ei = cd.effect_info();
+        // rewrite.py:617: extrainfo.single_write_descr_array is not None
+        // effectinfo.py:201-206: set when exactly one write array descriptor.
+        let arraydescr = match &ei.single_write_descr_array {
+            Some(d) => d.clone(),
+            None => {
+                // Fallback: check bitset — must have exactly one array write.
+                let w = ei.write_descrs_arrays;
+                if w == 0 || !w.is_power_of_two() {
+                    return false;
+                }
+                // No actual DescrRef available — cannot emit typed ops.
+                return false;
+            }
+        };
+
+        // rewrite.py:621: arraydescr.is_array_of_structs()
+        // majit PtrInfo does not support interior fields, so array-of-structs
+        // ARRAYCOPY is not unrolled (falls through to emit the call).
+        if arraydescr
+            .as_array_descr()
+            .is_some_and(|ad| ad.is_array_of_structs())
+        {
+            return false;
+        }
+
+        // rewrite.py:636-643: iteration direction
+        let mut index_current: i64 = 0;
+        let mut index_delta: i64 = 1;
+        let mut index_stop: i64 = length_int;
+        if source_box == dest_box && source_start < dest_start {
+            // ARRAYMOVE with overlapping regions: iterate in reverse
+            index_current = index_stop - 1;
+            index_delta = -1;
+            index_stop = -1;
+        }
+
+        // rewrite.py:646-670: element-by-element copy
+        // RPython routes synthesized ops through send_extra_operation()
+        // so they pass through downstream optimization passes.
+        // We use ctx.emit_extra(current_pass_idx, op) for the same effect.
+        let pass_idx = ctx.current_pass_idx;
+        while index_current != index_stop {
+            let index = index_current;
+            index_current += index_delta;
+            debug_assert!(index >= 0);
+
+            // Read source element
+            let val = if source_is_virtual {
+                // rewrite.py:650-651: source_info.getitem(arraydescr, index + source_start)
+                ctx.get_ptr_info(source_box)
+                    .and_then(|info| info.getitem((index + source_start) as usize))
+            } else {
+                // rewrite.py:653: opnum = OpHelpers.getarrayitem_for_descr(arraydescr)
+                // Select I/R/F opcode based on item type.
+                let item_type = arraydescr
+                    .as_array_descr()
+                    .map(|ad| ad.item_type())
+                    .unwrap_or(majit_ir::Type::Int);
+                let opcode = OpCode::getarrayitem_for_type(item_type);
+                let idx_const = ctx.make_constant_int(index + source_start);
+                let mut getop = Op::new(opcode, &[source_box, idx_const]);
+                getop.descr = Some(arraydescr.clone());
+                let pos = ctx.emit_extra(pass_idx, getop);
+                Some(pos)
+            };
+
+            let val = match val {
+                Some(v) => v,
+                None => continue, // rewrite.py:660-661: if val is None: continue
+            };
+
+            // Write to destination
+            if dest_is_virtual {
+                // rewrite.py:662-665: dest_info.setitem(...)
+                if let Some(info) = ctx.get_ptr_info_mut(dest_box) {
+                    info.setitem((index + dest_start) as usize, val);
+                }
+            } else {
+                // rewrite.py:666-670: emit SETARRAYITEM_GC
+                let idx_const = ctx.make_constant_int(index + dest_start);
+                let mut setop = Op::new(OpCode::SetarrayitemGc, &[dest_box, idx_const, val]);
+                setop.descr = Some(arraydescr.clone());
+                ctx.emit_extra(pass_idx, setop);
+            }
+        }
+        true
+    }
+
     fn optimize_same_as(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if op.num_args() == 0 {
             return OptimizationResult::PassOn;
@@ -1944,13 +2317,32 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
-                // GUARD_ISNULL(x): if x is a known null (0), remove.
-                if let Some(0) = ctx.get_constant_int(op.arg(0)) {
-                    return OptimizationResult::Remove;
+                // rewrite.py:186-195: optimize_GUARD_ISNULL
+                let obj = ctx.get_box_replacement(op.arg(0));
+                if let Some(info) = ctx.get_ptr_info(obj) {
+                    if info.is_null() {
+                        return OptimizationResult::Remove;
+                    }
+                    if info.is_nonnull() {
+                        raise_invalid_loop("GUARD_ISNULL proven to always fail");
+                    }
+                }
+                // Constant-fold: null constant (int 0 or ref NULL).
+                if let Some(val) = ctx.get_constant(obj) {
+                    match val {
+                        Value::Int(0) => return OptimizationResult::Remove,
+                        Value::Ref(r) if r.0 == 0 => return OptimizationResult::Remove,
+                        _ => {}
+                    }
                 }
                 // rewrite.py postprocess_GUARD_ISNULL: after guard passes,
                 // arg(0) is known to be NULL.
-                ctx.make_constant(op.arg(0), Value::Int(0));
+                // Use Ref(NULL) for ref-typed, Int(0) for int-typed.
+                if self.is_ref_typed(obj, ctx) {
+                    ctx.make_constant(op.arg(0), Value::Ref(majit_ir::GcRef(0)));
+                } else {
+                    ctx.make_constant(op.arg(0), Value::Int(0));
+                }
                 OptimizationResult::PassOn
             }
             OpCode::GuardClass => {
@@ -2107,8 +2499,17 @@ impl Optimization for OptRewrite {
             OpCode::FloatNeg => self.optimize_float_neg(op, ctx),
             // rewrite.py: optimize_FLOAT_ABS — FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
             OpCode::FloatAbs => {
-                if let Some(v) = ctx.get_constant_float(op.arg(0)) {
-                    ctx.make_constant(op.pos, Value::Float(v.abs()));
+                // rewrite.py:155-161: optimize_FLOAT_ABS
+                // FLOAT_ABS(FLOAT_ABS(x)) → FLOAT_ABS(x)
+                let v = ctx.get_box_replacement(op.arg(0));
+                if let Some(arg_op) = ctx.get_producing_op(v) {
+                    if arg_op.opcode == OpCode::FloatAbs {
+                        ctx.replace_op(op.pos, v);
+                        return OptimizationResult::Remove;
+                    }
+                }
+                if let Some(fv) = ctx.get_constant_float(op.arg(0)) {
+                    ctx.make_constant(op.pos, Value::Float(fv.abs()));
                     return OptimizationResult::Remove;
                 }
                 OptimizationResult::PassOn
@@ -2137,30 +2538,24 @@ impl Optimization for OptRewrite {
                 self.last_op_removed = false;
                 OptimizationResult::PassOn
             }
-            OpCode::CondCallValueI => {
-                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
-                    if v != 0 {
-                        ctx.replace_op(op.pos, op.arg(0));
-                        self.last_op_removed = true;
-                        return OptimizationResult::Remove;
-                    }
-                    let mut call_op = Op::new(OpCode::CallI, &op.args[1..]);
-                    call_op.pos = op.pos;
-                    call_op.descr = op.descr.clone();
-                    self.last_op_removed = false;
-                    return OptimizationResult::Replace(call_op);
+            // rewrite.py:483-494: optimize_COND_CALL_VALUE_I/R
+            OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                let arg0 = ctx.get_box_replacement(op.arg(0));
+                let nullness = self.getnullness(arg0, ctx);
+                // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
+                if nullness == Nullness::Nonnull {
+                    ctx.replace_op(op.pos, op.arg(0));
+                    self.last_op_removed = true;
+                    return OptimizationResult::Remove;
                 }
-                self.last_op_removed = false;
-                OptimizationResult::PassOn
-            }
-            OpCode::CondCallValueR => {
-                if let Some(v) = ctx.get_constant_int(op.arg(0)) {
-                    if v != 0 {
-                        ctx.replace_op(op.pos, op.arg(0));
-                        self.last_op_removed = true;
-                        return OptimizationResult::Remove;
-                    }
-                    let mut call_op = Op::new(OpCode::CallR, &op.args[1..]);
+                // rewrite.py:490-493: INFO_NULL → demote to CALL_PURE
+                if nullness == Nullness::Null {
+                    let call_opcode = if op.opcode == OpCode::CondCallValueI {
+                        OpCode::CallPureI
+                    } else {
+                        OpCode::CallPureR
+                    };
+                    let mut call_op = Op::new(call_opcode, &op.args[1..]);
                     call_op.pos = op.pos;
                     call_op.descr = op.descr.clone();
                     self.last_op_removed = false;
@@ -2181,15 +2576,24 @@ impl Optimization for OptRewrite {
             }
 
             // ── Cast round-trip elimination ──
-            OpCode::CastPtrToInt | OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
+            // rewrite.py:807-813: register pure inverse for CSE, then emit.
+            // CAST_PTR_TO_INT / CAST_INT_TO_PTR change types and must not
+            // be eliminated — only round-trips are removed by pure.rs.
+            OpCode::CastPtrToInt | OpCode::CastIntToPtr => OptimizationResult::PassOn,
+            // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
+            OpCode::CastOpaquePtr => {
                 ctx.replace_op(op.pos, op.arg(0));
                 OptimizationResult::Remove
             }
 
             // ── Float-bytes conversion round-trip elimination ──
+            // rewrite.py:815-821: register inverse pure relationship for CSE.
+            // CONVERT_FLOAT_BYTES_TO_LONGLONG(x) does NOT reduce to x —
+            // it changes the bit representation. But if we later see
+            // CONVERT_LONGLONG_BYTES_TO_FLOAT(result), pure.rs can
+            // recognize the round-trip and recover x.
             OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
-                ctx.replace_op(op.pos, op.arg(0));
-                OptimizationResult::Remove
+                OptimizationResult::PassOn
             }
 
             // ── Guard no exception after removed call ──
@@ -2219,11 +2623,37 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            // ── rewrite.py: CALL_PURE demote (if not handled by pure.rs) ──
-            // CallPure must reach OptPure for constant folding via
-            // RecordKnownResult cache. Demoting here would bypass the
-            // CSE / known_result lookup in pure.py.
+            // rewrite.py:676-698: optimize_CALL_PURE_I
+            // Dispatch based on oopspecindex to specialized handlers.
+            // Constant-fold and CSE are handled by pure.rs; here we
+            // only do oopspec-specific simplifications.
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
+                if let Some(ref descr) = op.descr {
+                    if let Some(cd) = descr.as_call_descr() {
+                        let ei = cd.effect_info();
+                        match ei.oopspec_index {
+                            // rewrite.py:688: OS_INT_UDIV
+                            majit_ir::OopSpecIndex::IntUdiv => {
+                                if self.optimize_call_int_udiv(op, ctx) {
+                                    return OptimizationResult::Remove;
+                                }
+                            }
+                            // rewrite.py:689: OS_INT_PY_DIV
+                            majit_ir::OopSpecIndex::IntPyDiv => {
+                                if let Some(result) = self.optimize_call_int_py_div(op, ctx) {
+                                    return result;
+                                }
+                            }
+                            // rewrite.py:692: OS_INT_PY_MOD
+                            majit_ir::OopSpecIndex::IntPyMod => {
+                                if let Some(result) = self.optimize_call_int_py_mod(op, ctx) {
+                                    return result;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 OptimizationResult::PassOn
             }
 
@@ -2285,26 +2715,86 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Emit(new_op)
             }
 
-            // ── rewrite.py: ASSERT_NOT_NONE → no-op ──
-            OpCode::AssertNotNone => OptimizationResult::Remove,
+            // ── rewrite.py:373-374: optimize_ASSERT_NOT_NONE ──
+            OpCode::AssertNotNone => {
+                // RPython: self.make_nonnull(op.getarg(0))
+                let obj = ctx.get_box_replacement(op.arg(0));
+                if ctx.get_ptr_info(obj).is_none() {
+                    ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
+                }
+                OptimizationResult::Remove
+            }
 
-            // rewrite.py: optimize_CALL_N — dispatch arraycopy/arraymove
+            // rewrite.py:376-386: optimize_RECORD_EXACT_CLASS
+            OpCode::RecordExactClass => {
+                let obj = ctx.get_box_replacement(op.arg(0));
+                if op.num_args() >= 2 {
+                    // ConstClass is Value::Ref in majit (not Value::Int).
+                    // virtualize.rs:1832 also reads it as Value::Ref.
+                    let expected_class: Option<i64> =
+                        ctx.get_constant(op.arg(1)).and_then(|v| match v {
+                            &Value::Ref(r) => Some(r.0 as i64),
+                            &Value::Int(i) => Some(i),
+                            _ => None,
+                        });
+                    if let Some(expected_class) = expected_class {
+                        // rewrite.py:381-383: if realclassbox is not None: assert same
+                        if let Some(known) = ctx.get_ptr_info(obj).and_then(|i| i.get_known_class())
+                        {
+                            debug_assert_eq!(known.0 as i64, expected_class);
+                            return OptimizationResult::Remove;
+                        }
+                        // rewrite.py:385-386: make_constant_class(op.getarg(0),
+                        //   expectedclassbox, update_last_guard=False)
+                        crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                            ctx,
+                            obj,
+                            expected_class,
+                            false, // update_last_guard=False
+                        );
+                    }
+                }
+                OptimizationResult::Remove
+            }
+
+            // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
                 if let Some(ref descr) = op.descr {
                     if let Some(cd) = descr.as_call_descr() {
                         let ei = cd.effect_info();
                         match ei.oopspec_index {
-                            majit_ir::OopSpecIndex::Arraycopy
-                            | majit_ir::OopSpecIndex::Arraymove => {
-                                // rewrite.py: _optimize_CALL_ARRAYCOPY
-                                // Zero-length copy/move → remove
+                            // rewrite.py:580-590: OS_ARRAYCOPY / OS_ARRAYMOVE
+                            majit_ir::OopSpecIndex::Arraycopy => {
                                 if op.num_args() >= 6 {
-                                    let length_arg = op.arg(5);
-                                    if let Some(0) = ctx.get_constant_int(length_arg) {
+                                    if self.optimize_call_arrayop(
+                                        op,
+                                        op.arg(1),
+                                        op.arg(2), // source, dest
+                                        op.arg(3),
+                                        op.arg(4),
+                                        op.arg(5), // src_start, dst_start, length
+                                        ctx,
+                                    ) {
                                         return OptimizationResult::Remove;
                                     }
                                 }
-                                return OptimizationResult::PassOn;
+                            }
+                            majit_ir::OopSpecIndex::Arraymove => {
+                                // rewrite.py:592-597: ARRAYMOVE: source == dest
+                                if op.num_args() >= 5 {
+                                    let array_box = op.arg(1);
+                                    if self.optimize_call_arrayop(
+                                        op,
+                                        array_box,
+                                        array_box, // source == dest
+                                        op.arg(2),
+                                        op.arg(3),
+                                        op.arg(4),
+                                        ctx,
+                                    ) {
+                                        return OptimizationResult::Remove;
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -3608,8 +4098,8 @@ mod tests {
     // ── CAST round-trip tests ──
 
     #[test]
-    fn test_cast_ptr_to_int_eliminated() {
-        // CastPtrToInt(x) -> x
+    fn test_cast_ptr_to_int_passes_through() {
+        // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
         let mut ops = vec![
             Op::new(OpCode::SameAsR, &[]),              // op0: x
             Op::new(OpCode::CastPtrToInt, &[OpRef(0)]), // op1
@@ -3620,13 +4110,12 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
-    fn test_cast_int_to_ptr_eliminated() {
-        // CastIntToPtr(x) -> x
+    fn test_cast_int_to_ptr_passes_through() {
+        // rewrite.py:811-813: CastIntToPtr registers pure inverse, emits.
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),              // op0: x
             Op::new(OpCode::CastIntToPtr, &[OpRef(0)]), // op1
@@ -3637,8 +4126,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
@@ -3658,11 +4146,13 @@ mod tests {
         assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
-    // ── CONVERT_FLOAT_BYTES round-trip tests ──
+    // ── CONVERT_FLOAT_BYTES tests ──
+    // rewrite.py:815-821: these conversions are NOT eliminated —
+    // they actually change bit representation. Only round-trips
+    // (A→B→A) are eliminated via pure.rs CSE.
 
     #[test]
-    fn test_convert_float_bytes_to_longlong_eliminated() {
-        // ConvertFloatBytesToLonglong(x) -> x
+    fn test_convert_float_bytes_to_longlong_passes_through() {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),                             // op0: x
             Op::new(OpCode::ConvertFloatBytesToLonglong, &[OpRef(0)]), // op1
@@ -3673,13 +4163,11 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
+        assert!(matches!(result, OptimizationResult::PassOn));
     }
 
     #[test]
-    fn test_convert_longlong_bytes_to_float_eliminated() {
-        // ConvertLonglongBytesToFloat(x) -> x
+    fn test_convert_longlong_bytes_to_float_passes_through() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),                             // op0: x
             Op::new(OpCode::ConvertLonglongBytesToFloat, &[OpRef(0)]), // op1
@@ -3690,7 +4178,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(matches!(result, OptimizationResult::Remove));
+        assert!(matches!(result, OptimizationResult::PassOn));
         assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 

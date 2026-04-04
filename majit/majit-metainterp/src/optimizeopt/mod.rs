@@ -1229,16 +1229,12 @@ impl OptContext {
 
         // unroll.py:75-77: known_class → make_constant_class(op, class, False)
         if let Some(cls) = preamble_info.get_known_class() {
-            // optimizer.py:137-156: updates existing InstancePtrInfo._known_class
-            let resolved = self.get_box_replacement(op);
-            let is_instance = matches!(self.get_ptr_info(resolved), Some(PtrInfo::Instance(_)));
-            if is_instance {
-                if let Some(PtrInfo::Instance(iinfo)) = self.get_ptr_info_mut(resolved) {
-                    iinfo.known_class = Some(*cls);
-                }
-            } else {
-                self.set_ptr_info(op, PtrInfo::known_class(*cls, true));
-            }
+            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                self,
+                op,
+                cls.0 as i64,
+                false, // update_last_guard=False (unroll.py:77)
+            );
         }
 
         // unroll.py:79-84: ArrayPtrInfo → set_forwarded(ArrayPtrInfo(descr, lenbound))
