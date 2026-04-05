@@ -304,20 +304,10 @@ struct RegisteredLoopTarget {
     num_ref_roots: usize,
     max_output_slots: usize,
     inputarg_types: Vec<Type>,
-    needs_force_frame: bool,
 }
 
 unsafe impl Send for RegisteredLoopTarget {}
 unsafe impl Sync for RegisteredLoopTarget {}
-
-/// RPython virtualref.py force token state — single-threaded, no lock needed.
-/// RPython has no lock here (GIL-protected). pyre is single-threaded.
-struct ActiveForceFrame {}
-
-// Safety: single-threaded access only. Write-once or scoped mutation
-// during force/bridge compilation, never concurrent.
-unsafe impl Send for ActiveForceFrame {}
-unsafe impl Sync for ActiveForceFrame {}
 
 struct OverlayFrameData {
     inner: DeadFrame,
@@ -442,14 +432,6 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     }
 }
 
-static NEXT_FORCE_TOKEN_HANDLE: AtomicU64 = AtomicU64::new(1);
-thread_local! {
-    /// Force frame registry — single-threaded, no lock.
-    /// RPython virtualref.py has no lock (GIL-protected).
-    static FORCE_FRAMES: RefCell<HashMap<u64, Arc<ActiveForceFrame>>> =
-        RefCell::new(HashMap::new());
-}
-
 /// Global exception state for JIT-compiled code.
 /// pyre is no-GIL single-threaded, so global statics are safe and allow
 /// GUARD_NO_EXCEPTION to emit a direct memory load instead of a TLS call.
@@ -462,7 +444,6 @@ pub fn jit_exc_value_addr() -> usize {
 }
 
 thread_local! {
-    static CURRENT_FORCE_FRAME_HANDLE: Cell<u64> = const { Cell::new(0) };
     /// Thread-local reference storage for JIT-compiled code.
     ///
     /// Mirrors RPython's `rpy_threadlocalref` — an array of integer-sized slots
@@ -843,13 +824,6 @@ pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
             }
         }
     });
-}
-
-fn register_force_frame() -> (u64, Arc<ActiveForceFrame>) {
-    let handle = NEXT_FORCE_TOKEN_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let frame = Arc::new(ActiveForceFrame {});
-    FORCE_FRAMES.with(|ff| ff.borrow_mut().insert(handle, frame.clone()));
-    (handle, frame)
 }
 
 /// RPython rebuild_state_after_failure parity: materialize virtual objects
@@ -1324,22 +1298,6 @@ fn resolve_virtual_field_value_with_materialized(
         }
         _ => None,
     }
-}
-
-pub(crate) fn release_force_token(handle: u64) {
-    if handle == 0 {
-        return;
-    }
-    FORCE_FRAMES.with(|ff| ff.borrow_mut().remove(&handle));
-}
-
-fn with_active_force_frame<R>(handle: u64, f: impl FnOnce() -> R) -> R {
-    CURRENT_FORCE_FRAME_HANDLE.with(|cell| {
-        let previous = cell.replace(handle);
-        let result = f();
-        cell.set(previous);
-        result
-    })
 }
 
 static CALL_ASSEMBLER_TARGETS: OnceLock<Mutex<HashMap<u64, RegisteredLoopTarget>>> =
@@ -1864,7 +1822,6 @@ fn register_call_assembler_target(
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
         inputarg_types: token.inputarg_types.clone(),
-        needs_force_frame: compiled.needs_force_frame,
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
@@ -1918,7 +1875,6 @@ pub fn register_pending_call_assembler_target(
         num_ref_roots: 0,
         max_output_slots: 1,
         inputarg_types,
-        needs_force_frame: false,
     };
     call_assembler_registry()
         .lock()
@@ -2038,15 +1994,11 @@ fn take_call_assembler_deadframe_from_outputs(outputs: &[i64]) -> DeadFrame {
         .unwrap_or_else(|| panic!("unknown call_assembler deadframe handle {handle}"))
 }
 
-fn maybe_take_call_assembler_deadframe(
-    fail_index: u32,
-    outputs: &[i64],
-    handle: u64,
-) -> Option<DeadFrame> {
+fn maybe_take_call_assembler_deadframe(fail_index: u32, outputs: &[i64]) -> Option<DeadFrame> {
     if fail_index != CALL_ASSEMBLER_DEADFRAME_SENTINEL {
         return None;
     }
-    release_force_token(handle);
+
     Some(take_call_assembler_deadframe_from_outputs(outputs))
 }
 
@@ -2247,15 +2199,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             target.num_ref_roots,
             target.max_output_slots,
             &current_inputs,
-            target.needs_force_frame,
         );
         let fail_index = exec.fail_index;
-        let handle = exec.force_handle;
-        let force_frame = exec.force_frame.clone();
         let direct_descr = exec.direct_descr.clone();
         let outputs = exec.extract_outputs(target.max_output_slots.max(1));
 
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 target.trace_id,
@@ -2274,7 +2223,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
-            release_force_token(handle);
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
@@ -2321,7 +2269,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
 
         // jf_savedata already correct in jf_frame memory.
         let (_, exception) = take_pending_jit_exception_state();
-        release_force_token(handle);
+
         let jf_ptr = exec.jf_gcref.0;
         if !exception.is_null() {
             unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
@@ -2555,7 +2503,7 @@ fn call_assembler_fast_path(
         // Handle nested call_assembler DEADFRAME propagation
         if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
             let frame = take_call_assembler_deadframe_from_outputs(&outputs);
-            release_force_token(handle);
+
             let handle = store_call_assembler_deadframe(frame);
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
@@ -2567,7 +2515,6 @@ fn call_assembler_fast_path(
         let fail_descr = &target.fail_descrs[fail_index as usize];
 
         if fail_descr.is_finish() {
-            release_force_token(handle);
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
@@ -2594,7 +2541,6 @@ fn call_assembler_fast_path(
         // If a bridge is attached, execute it instead of calling force_fn.
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
-            release_force_token(handle);
             // RPython rebuild_state_after_failure parity: materialize virtual
             // objects before bridge dispatch. Virtual Ref slots are null (0)
             // with their fields in trailing Int slots.
@@ -2627,8 +2573,6 @@ fn call_assembler_fast_path(
             return 0;
         }
         let _ = bridge_guard;
-
-        release_force_token(handle);
 
         // resume.py:1312 blackhole_from_resumedata parity: materialize
         // virtuals before blackhole resume.
@@ -2691,15 +2635,13 @@ fn call_assembler_fast_path_heap(
         target.num_ref_roots,
         target.max_output_slots,
         inputs,
-        target.needs_force_frame,
     );
     let fail_index = exec.fail_index;
-    let handle = exec.force_handle;
     let outputs = exec.extract_outputs(actual_outputs);
 
     if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
         let frame = take_call_assembler_deadframe_from_outputs(&outputs);
-        release_force_token(handle);
+
         let handle = store_call_assembler_deadframe(frame);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
@@ -2711,7 +2653,6 @@ fn call_assembler_fast_path_heap(
     let fail_descr = &target.fail_descrs[fail_index as usize];
 
     if fail_descr.is_finish() {
-        release_force_token(handle);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
@@ -2736,7 +2677,6 @@ fn call_assembler_fast_path_heap(
 
     let bridge_guard = fail_descr.bridge_ref();
     if let Some(ref bridge) = *bridge_guard {
-        release_force_token(handle);
         let mut frame =
             CraneliftBackend::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
@@ -2757,8 +2697,6 @@ fn call_assembler_fast_path_heap(
         return 0;
     }
     let _ = bridge_guard;
-
-    release_force_token(handle);
 
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
@@ -4235,9 +4173,6 @@ struct CompiledLoop {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
-    /// Whether any guard in this loop uses FORCE_TOKEN slots.
-    /// When false, force frame registration can be skipped entirely.
-    needs_force_frame: bool,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -4354,8 +4289,6 @@ struct JitExecResult {
     heap_owner: Option<Vec<i64>>,
     fail_index: u32,
     direct_descr: Option<Arc<CraneliftFailDescr>>,
-    force_handle: u64,
-    force_frame: Option<Arc<ActiveForceFrame>>,
     gc_runtime_id: Option<u64>,
 }
 
@@ -4381,7 +4314,6 @@ fn run_compiled_code(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
-    needs_force_frame: bool,
 ) -> JitExecResult {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
@@ -4452,20 +4384,13 @@ fn run_compiled_code(
 
     let _jitted_guard = majit_backend::JittedGuard::enter();
 
-    let (handle, force_frame) = if needs_force_frame {
-        let (h, f) = register_force_frame();
-        (h, Some(f))
-    } else {
-        (0, None)
-    };
-
     // _call_header_shadowstack (assembler.py:1122-1128) parity:
     // Push jf_ptr as GcRef onto the jitframe shadow stack. The GC
     // treats this as a root: if in nursery, copies jitframe to old gen
     // and updates the GcRef in place.
     let jf_shadow_depth = majit_gc::shadow_stack::push_jf(jf_gcref);
 
-    let result_jf = with_active_force_frame(handle, || unsafe { func(jf_ptr) });
+    let result_jf = unsafe { func(jf_ptr) };
 
     // _call_footer_shadowstack (assembler.py:1130-1136) parity:
     majit_gc::shadow_stack::pop_jf_to(jf_shadow_depth);
@@ -4513,8 +4438,6 @@ fn run_compiled_code(
         heap_owner,
         fail_index,
         direct_descr,
-        force_handle: handle,
-        force_frame,
         gc_runtime_id,
     }
 }
@@ -4852,7 +4775,6 @@ impl CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
-        let mut cur_needs_force_frame = compiled.needs_force_frame;
 
         loop {
             let exec = run_compiled_code(
@@ -4862,16 +4784,13 @@ impl CraneliftBackend {
                 cur_num_ref_roots,
                 cur_max_output_slots,
                 &cur_inputs,
-                cur_needs_force_frame,
             );
             let fail_index = exec.fail_index;
-            let handle = exec.force_handle;
-            let force_frame = exec.force_frame.clone();
             let direct_descr = exec.direct_descr.clone();
             let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
             // CALL_ASSEMBLER deadframe interception.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
+            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
                 return wrap_call_assembler_deadframe_with_caller_prefix(
                     frame,
                     compiled.trace_id,
@@ -4920,15 +4839,15 @@ impl CraneliftBackend {
                     cur_gc_runtime_id = compiled.gc_runtime_id;
                     cur_num_ref_roots = compiled.num_ref_roots;
                     cur_max_output_slots = compiled.max_output_slots;
-                    cur_needs_force_frame = compiled.needs_force_frame;
+
                     cur_inputs = outputs;
-                    release_force_token(handle);
+
                     continue;
                 }
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 let (_, exception) = take_pending_jit_exception_state();
-                release_force_token(handle);
+
                 let jf_ptr = exec.jf_gcref.0;
                 if !exception.is_null() {
                     unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
@@ -4970,9 +4889,9 @@ impl CraneliftBackend {
                 cur_gc_runtime_id = bridge.gc_runtime_id;
                 cur_num_ref_roots = bridge.num_ref_roots;
                 cur_max_output_slots = bridge.max_output_slots;
-                cur_needs_force_frame = bridge.needs_force_frame;
+
                 cur_inputs = bridge_inputs;
-                release_force_token(handle);
+
                 continue;
             }
             drop(bridge_guard);
@@ -4983,7 +4902,7 @@ impl CraneliftBackend {
             //   - force called → callee's set_savedata_ref wrote it
             //   - no force → zeroed alloc → 0
             let (_, exception) = take_pending_jit_exception_state();
-            release_force_token(handle);
+
             let jf_ptr = exec.jf_gcref.0;
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
@@ -5021,15 +4940,12 @@ impl CraneliftBackend {
             bridge.num_ref_roots,
             bridge.max_output_slots,
             bridge_inputs,
-            bridge.needs_force_frame,
         );
         let fail_index = exec.fail_index;
-        let handle = exec.force_handle;
-        let force_frame = exec.force_frame.clone();
         let direct_descr = exec.direct_descr.clone();
         let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
 
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 bridge.trace_id,
@@ -5051,7 +4967,7 @@ impl CraneliftBackend {
         if fail_descr.is_finish {
             // jf_savedata already correct in jf_frame memory.
             let (_, exception) = take_pending_jit_exception_state();
-            release_force_token(handle);
+
             let jf_ptr = exec.jf_gcref.0;
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
@@ -5072,14 +4988,13 @@ impl CraneliftBackend {
 
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref next_bridge) = *bridge_guard {
-            release_force_token(handle);
             return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
         }
         let _ = bridge_guard;
 
         // jf_savedata already correct in jf_frame memory.
         let (_, exception) = take_pending_jit_exception_state();
-        release_force_token(handle);
+
         let jf_ptr = exec.jf_gcref.0;
         if !exception.is_null() {
             unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
@@ -8940,20 +8855,6 @@ impl CraneliftBackend {
 
         let code_ptr = self.module.get_finalized_function(func_id);
 
-        let needs_force_frame = ops.iter().any(|op| {
-            matches!(
-                op.opcode,
-                OpCode::ForceToken
-                    | OpCode::CallMayForceI
-                    | OpCode::CallMayForceR
-                    | OpCode::CallMayForceF
-                    | OpCode::CallMayForceN
-                    | OpCode::CallAssemblerI
-                    | OpCode::CallAssemblerR
-                    | OpCode::CallAssemblerF
-                    | OpCode::CallAssemblerN
-            )
-        });
         let trace_info = CompiledTraceInfo {
             trace_id,
             input_types: inputargs.iter().map(|arg| arg.tp).collect(),
@@ -8978,7 +8879,6 @@ impl CraneliftBackend {
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
-            needs_force_frame,
         })
     }
 }
@@ -9678,7 +9578,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 num_inputs: bridge_num_inputs,
                 num_ref_roots: compiled.num_ref_roots,
                 max_output_slots: compiled.max_output_slots,
-                needs_force_frame: compiled.needs_force_frame,
+
                 invalidated_arc: Some(invalidated_arc),
             });
             // Cranelift can't patch machine code like RPython's x86 backend.
@@ -9714,7 +9614,7 @@ impl majit_backend::Backend for CraneliftBackend {
                                     num_inputs: b.num_inputs,
                                     num_ref_roots: b.num_ref_roots,
                                     max_output_slots: b.max_output_slots,
-                                    needs_force_frame: b.needs_force_frame,
+
                                     terminal_exit_layouts: UnsafeCell::new(
                                         unsafe { &*b.terminal_exit_layouts.get() }.clone(),
                                     ),
@@ -9900,7 +9800,7 @@ impl majit_backend::Backend for CraneliftBackend {
                         num_inputs: b.num_inputs,
                         num_ref_roots: b.num_ref_roots,
                         max_output_slots: b.max_output_slots,
-                        needs_force_frame: b.needs_force_frame,
+
                         terminal_exit_layouts: UnsafeCell::new(
                             unsafe { &*b.terminal_exit_layouts.get() }.clone(),
                         ),
@@ -9962,11 +9862,8 @@ impl majit_backend::Backend for CraneliftBackend {
             compiled.num_ref_roots,
             compiled.max_output_slots,
             args,
-            compiled.needs_force_frame,
         );
         let fail_index = exec.fail_index;
-        let handle = exec.force_handle;
-        let force_frame = exec.force_frame.clone();
         let direct_descr = exec.direct_descr.clone();
         let mut outputs = exec.extract_outputs(compiled.max_output_slots.max(1));
 
@@ -9976,7 +9873,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 outputs.len()
             );
         }
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
             if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
                 eprintln!("[exec-raw] fail_index=0 → call_assembler path");
             }
@@ -10047,7 +9944,6 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
-            release_force_token(handle);
             let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             let descr = frame
                 .data
@@ -10112,9 +10008,6 @@ impl majit_backend::Backend for CraneliftBackend {
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
         let (exception_class, exception) = take_pending_jit_exception_state();
-        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-            release_force_token(handle);
-        }
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);

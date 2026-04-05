@@ -8,7 +8,7 @@
 /// compiled and attached to the fail descriptor. On subsequent guard
 /// failures, execution transfers to the bridge instead of returning to
 /// the interpreter.
-use crate::compiler::{register_gc_roots, release_force_token, unregister_gc_roots};
+use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
 use majit_ir::{AccumVectorInfo, FailDescr, GcRef, Type};
@@ -47,8 +47,6 @@ pub struct BridgeData {
     pub num_ref_roots: usize,
     /// Maximum output slots for guard exits within the bridge.
     pub max_output_slots: usize,
-    /// Whether any guard in this bridge uses FORCE_TOKEN slots.
-    pub needs_force_frame: bool,
     /// Static terminal-exit layouts within the bridge trace.
     /// Write-once during bridge compilation, read-only after.
     /// No lock needed — RPython ResumeGuardDescr has no lock (GIL).
@@ -688,9 +686,6 @@ impl Drop for FrameData {
             if let Some(exception) = self.exception.as_mut() {
                 unregister_gc_roots(runtime_id, std::slice::from_mut(exception.as_mut()));
             }
-        }
-        for &handle in &self.owned_force_tokens {
-            release_force_token(handle);
         }
     }
 }
