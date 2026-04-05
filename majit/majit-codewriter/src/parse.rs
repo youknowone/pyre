@@ -88,6 +88,8 @@ pub struct InherentMethodInfo {
     pub self_ty_root: Option<String>,
     pub name: String,
     pub graph: crate::model::FunctionGraph,
+    /// RPython: op.result.concretetype — return type for array identity.
+    pub return_type: Option<String>,
 }
 
 /// Parsed representation of an interpreter source file.
@@ -147,7 +149,10 @@ pub fn find_opcode_dispatch_match(parsed: &ParsedInterpreter) -> Option<&ExprMat
 }
 
 /// Extract trait implementations AND trait default methods from the parsed source.
-pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
+pub fn extract_trait_impls(
+    parsed: &ParsedInterpreter,
+    struct_fields: &crate::front::StructFieldRegistry,
+) -> Vec<TraitImplInfo> {
     let mut impls = Vec::new();
 
     for item in &parsed.file.items {
@@ -176,12 +181,20 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
                                         crate::front::ast::build_function_graph_with_self_ty_pub(
                                             &fake_fn,
                                             self_ty_root.clone(),
+                                            struct_fields,
                                         );
                                     Some(sf.graph)
+                                };
+                                let return_type = match &method.sig.output {
+                                    syn::ReturnType::Type(_, ty) => {
+                                        crate::front::ast::full_type_string(ty)
+                                    }
+                                    syn::ReturnType::Default => None,
                                 };
                                 Some(MethodInfo {
                                     name: method.sig.ident.to_string(),
                                     graph,
+                                    return_type,
                                 })
                             } else {
                                 None
@@ -213,11 +226,20 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
                                     block: Box::new(block.clone()),
                                 };
                                 let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                    &fake_fn, None,
+                                    &fake_fn,
+                                    None,
+                                    struct_fields,
                                 );
+                                let return_type = match &method.sig.output {
+                                    syn::ReturnType::Type(_, ty) => {
+                                        crate::front::ast::full_type_string(ty)
+                                    }
+                                    syn::ReturnType::Default => None,
+                                };
                                 MethodInfo {
                                     name: method.sig.ident.to_string(),
                                     graph: Some(sf.graph),
+                                    return_type,
                                 }
                             })
                         } else {
@@ -241,7 +263,10 @@ pub fn extract_trait_impls(parsed: &ParsedInterpreter) -> Vec<TraitImplInfo> {
 }
 
 /// Extract inherent impl methods (impl Type { ... }) as canonical call targets.
-pub fn extract_inherent_impl_methods(parsed: &ParsedInterpreter) -> Vec<InherentMethodInfo> {
+pub fn extract_inherent_impl_methods(
+    parsed: &ParsedInterpreter,
+    struct_fields: &crate::front::StructFieldRegistry,
+) -> Vec<InherentMethodInfo> {
     let mut methods = Vec::new();
 
     for item in &parsed.file.items {
@@ -265,12 +290,18 @@ pub fn extract_inherent_impl_methods(parsed: &ParsedInterpreter) -> Vec<Inherent
                 let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                     &fake_fn,
                     self_ty_root.clone(),
+                    struct_fields,
                 );
+                let return_type = match &method.sig.output {
+                    syn::ReturnType::Type(_, ty) => crate::front::ast::full_type_string(ty),
+                    syn::ReturnType::Default => None,
+                };
                 methods.push(InherentMethodInfo {
                     for_type: for_type.clone(),
                     self_ty_root: self_ty_root.clone(),
                     name: method.sig.ident.to_string(),
                     graph: sf.graph,
+                    return_type,
                 });
             }
         }
@@ -596,7 +627,7 @@ mod tests {
             }
         "#,
         );
-        let impls = extract_trait_impls(&parsed);
+        let impls = extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
         let helper = impls[0]
             .methods
             .iter()

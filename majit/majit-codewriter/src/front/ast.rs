@@ -144,17 +144,65 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     parsed_files: &[ParsedInterpreter],
     options: &AstGraphOptions,
 ) -> SemanticProgram {
-    let mut program = SemanticProgram::default();
+    // RPython: annotator/rtyper provides whole-program type info before
+    // the codewriter runs. We emulate this with a 2-pass approach:
+    // Pass 1: collect ALL struct definitions across ALL files.
+    let mut known_struct_names = std::collections::HashSet::new();
+    let mut struct_fields = StructFieldRegistry::default();
     for parsed in parsed_files {
-        let sub = build_semantic_program_with_options(parsed, options);
-        program.functions.extend(sub.functions);
-        program.known_struct_names.extend(sub.known_struct_names);
-        program
-            .struct_fields
-            .fields
-            .extend(sub.struct_fields.fields);
+        for item in &parsed.file.items {
+            if let Item::Struct(s) = item {
+                let name = s.ident.to_string();
+                known_struct_names.insert(name.clone());
+                let fields: Vec<(String, String)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        let field_name = f.ident.as_ref()?.to_string();
+                        let field_type = full_type_string(&f.ty)?;
+                        Some((field_name, field_type))
+                    })
+                    .collect();
+                struct_fields.fields.insert(name, fields);
+            }
+        }
     }
-    program
+    // Pass 2: build function graphs with merged struct_fields visible.
+    let mut functions = Vec::new();
+    for parsed in parsed_files {
+        for item in &parsed.file.items {
+            match item {
+                Item::Fn(func) => {
+                    functions.push(build_function_graph(func, options, None, &struct_fields));
+                }
+                Item::Impl(impl_block) => {
+                    let self_ty_root = type_root_ident(&impl_block.self_ty);
+                    for item in &impl_block.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            let fake_fn = ItemFn {
+                                attrs: method.attrs.clone(),
+                                vis: syn::Visibility::Inherited,
+                                sig: method.sig.clone(),
+                                block: Box::new(method.block.clone()),
+                            };
+                            functions.push(build_function_graph(
+                                &fake_fn,
+                                options,
+                                self_ty_root.clone(),
+                                &struct_fields,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    SemanticProgram {
+        functions,
+        known_struct_names,
+        struct_fields,
+    }
 }
 
 /// Public entry for building a graph from a single function AST node.
@@ -186,13 +234,13 @@ pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
 pub fn build_function_graph_with_self_ty_pub(
     func: &ItemFn,
     self_ty_root: Option<String>,
+    struct_fields: &StructFieldRegistry,
 ) -> SemanticFunction {
-    let empty_registry = StructFieldRegistry::default();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
         self_ty_root,
-        &empty_registry,
+        struct_fields,
     )
 }
 
@@ -203,7 +251,7 @@ struct GraphBuildContext<'a> {
     /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
     /// element type that determines the ARRAY identity for `cpu.arraydescrof()`.
-    local_element_types: HashMap<String, String>,
+    local_array_types: HashMap<String, String>,
     /// RPython: program-level struct field types, available for resolving
     /// field access array identity (e.g. `self.array[i]` → owner.field_type).
     struct_fields: &'a StructFieldRegistry,
@@ -213,7 +261,7 @@ impl<'a> GraphBuildContext<'a> {
     fn new(struct_fields: &'a StructFieldRegistry) -> Self {
         Self {
             local_type_roots: HashMap::new(),
-            local_element_types: HashMap::new(),
+            local_array_types: HashMap::new(),
             struct_fields,
         }
     }
@@ -253,8 +301,8 @@ fn build_function_graph(
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
                     ctx.local_type_roots.insert(name.clone(), type_root);
                 }
-                if let Some(elem_type) = array_element_type(&pat_type.ty) {
-                    ctx.local_element_types.insert(name.clone(), elem_type);
+                if let Some(full_type) = full_type_string(&pat_type.ty) {
+                    ctx.local_array_types.insert(name.clone(), full_type);
                 }
                 if let Some(vid) = graph.push_op(
                     entry,
@@ -330,8 +378,8 @@ fn lower_stmt(
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
                     ctx.local_type_roots.insert(name.clone(), type_root);
                 }
-                if let Some(elem_type) = array_element_type(&pat_type.ty) {
-                    ctx.local_element_types.insert(name.clone(), elem_type);
+                if let Some(full_type) = full_type_string(&pat_type.ty) {
+                    ctx.local_array_types.insert(name.clone(), full_type);
                 }
             }
             if let Some(init) = &local.init {
@@ -376,23 +424,55 @@ fn lower_expr(
     ctx: &mut GraphBuildContext,
 ) -> Option<ValueId> {
     match expr {
-        // ── receiver.field ──
+        // ── receiver.field / arr[i].field ──
         syn::Expr::Field(field) => {
-            let base = lower_expr(graph, block, &field.base, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
-            let field_name = member_name(&field.member);
-            graph.push_op(
-                *block,
-                OpKind::FieldRead {
-                    base,
-                    field: crate::model::FieldDescriptor::new(
-                        field_name,
-                        receiver_type_root(&field.base, ctx),
-                    ),
-                    ty: ValueType::Unknown,
-                },
-                true,
-            )
+            if let syn::Expr::Index(idx) = &*field.base {
+                // RPython: getinteriorfield_gc — arr[i].field as a single op.
+                let base = lower_expr(graph, block, &idx.expr, options, ctx)
+                    .unwrap_or_else(|| graph.alloc_value());
+                let index = lower_expr(graph, block, &idx.index, options, ctx)
+                    .unwrap_or_else(|| graph.alloc_value());
+                let field_name = member_name(&field.member);
+                let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
+                // Element struct type is the field owner for interiorfield descriptors.
+                let elem_type = array_type_id
+                    .as_ref()
+                    .and_then(|atid| extract_element_type_from_str(atid));
+                // RPython: getkind(op.result.concretetype) — resolve field type
+                // from struct field registry for the kind suffix (i/r/f).
+                let item_ty = elem_type
+                    .as_ref()
+                    .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                    .map(type_string_to_value_type)
+                    .unwrap_or(ValueType::Unknown);
+                graph.push_op(
+                    *block,
+                    OpKind::InteriorFieldRead {
+                        base,
+                        index,
+                        field: crate::model::FieldDescriptor::new(field_name, elem_type),
+                        item_ty,
+                        array_type_id,
+                    },
+                    true,
+                )
+            } else {
+                let base = lower_expr(graph, block, &field.base, options, ctx)
+                    .unwrap_or_else(|| graph.alloc_value());
+                let field_name = member_name(&field.member);
+                graph.push_op(
+                    *block,
+                    OpKind::FieldRead {
+                        base,
+                        field: crate::model::FieldDescriptor::new(
+                            field_name,
+                            receiver_type_root(&field.base, ctx),
+                        ),
+                        ty: ValueType::Unknown,
+                    },
+                    true,
+                )
+            }
         }
 
         // ── base[index] ──
@@ -421,22 +501,54 @@ fn lower_expr(
 
             match &*assign.left {
                 syn::Expr::Field(field) => {
-                    let base = lower_expr(graph, block, &field.base, options, ctx)
-                        .unwrap_or_else(|| graph.alloc_value());
-                    let field_name = member_name(&field.member);
-                    graph.push_op(
-                        *block,
-                        OpKind::FieldWrite {
-                            base,
-                            field: crate::model::FieldDescriptor::new(
-                                field_name,
-                                receiver_type_root(&field.base, ctx),
-                            ),
-                            value,
-                            ty: ValueType::Unknown,
-                        },
-                        false,
-                    );
+                    if let syn::Expr::Index(idx) = &*field.base {
+                        // RPython: setinteriorfield_gc — arr[i].field = value.
+                        let base = lower_expr(graph, block, &idx.expr, options, ctx)
+                            .unwrap_or_else(|| graph.alloc_value());
+                        let index = lower_expr(graph, block, &idx.index, options, ctx)
+                            .unwrap_or_else(|| graph.alloc_value());
+                        let field_name = member_name(&field.member);
+                        let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
+                        let elem_type = array_type_id
+                            .as_ref()
+                            .and_then(|atid| extract_element_type_from_str(atid));
+                        // RPython: getkind(v_value.concretetype) — resolve field type
+                        // from struct field registry for the kind suffix (i/r/f).
+                        let item_ty = elem_type
+                            .as_ref()
+                            .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                            .map(type_string_to_value_type)
+                            .unwrap_or(ValueType::Unknown);
+                        graph.push_op(
+                            *block,
+                            OpKind::InteriorFieldWrite {
+                                base,
+                                index,
+                                field: crate::model::FieldDescriptor::new(field_name, elem_type),
+                                value,
+                                item_ty,
+                                array_type_id,
+                            },
+                            false,
+                        );
+                    } else {
+                        let base = lower_expr(graph, block, &field.base, options, ctx)
+                            .unwrap_or_else(|| graph.alloc_value());
+                        let field_name = member_name(&field.member);
+                        graph.push_op(
+                            *block,
+                            OpKind::FieldWrite {
+                                base,
+                                field: crate::model::FieldDescriptor::new(
+                                    field_name,
+                                    receiver_type_root(&field.base, ctx),
+                                ),
+                                value,
+                                ty: ValueType::Unknown,
+                            },
+                            false,
+                        );
+                    }
                 }
                 syn::Expr::Index(idx) => {
                     let base = lower_expr(graph, block, &idx.expr, options, ctx)
@@ -1070,7 +1182,7 @@ fn array_element_type(ty: &syn::Type) -> Option<String> {
 ///
 /// Produces a string that includes generic arguments,
 /// e.g. `Vec<Point>` → `"Vec<Point>"`, `Point` → `"Point"`.
-fn full_type_string(ty: &syn::Type) -> Option<String> {
+pub fn full_type_string(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(path) => {
             let segments: Vec<String> = path
@@ -1106,26 +1218,69 @@ fn full_type_string(ty: &syn::Type) -> Option<String> {
         syn::Type::Paren(p) => full_type_string(&p.elem),
         syn::Type::Group(g) => full_type_string(&g.elem),
         syn::Type::Slice(s) => full_type_string(&s.elem).map(|t| format!("[{}]", t)),
-        syn::Type::Array(a) => full_type_string(&a.elem).map(|t| format!("[{}]", t)),
+        // RPython: ARRAY identity preserves full type including length.
+        // [Point; 4] and [Point; 8] are different ARRAY types.
+        syn::Type::Array(a) => {
+            let elem = full_type_string(&a.elem)?;
+            // Extract length from Expr::Lit if possible.
+            let len_str = match &a.len {
+                syn::Expr::Lit(lit) => match &lit.lit {
+                    syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
+                    _ => "N".to_string(),
+                },
+                _ => "N".to_string(),
+            };
+            Some(format!("[{};{}]", elem, len_str))
+        }
         _ => None,
     }
 }
 
 /// RPython: resolve ARRAY identity from an expression.
 ///
+/// RPython: `getkind(TYPE)[0]` — map type string to ValueType for kind suffix.
+/// Used by InteriorFieldRead/Write to determine the i/r/f suffix.
+fn type_string_to_value_type(type_str: &str) -> ValueType {
+    match type_str {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+        | "bool" => ValueType::Int,
+        "f32" | "f64" => ValueType::Float,
+        "()" => ValueType::Void,
+        _ => ValueType::Ref,
+    }
+}
+
 /// For `arr[idx]`, returns the ELEMENT TYPE of `arr` from context.
 /// This is the Rust equivalent of RPython's `op.args[0].concretetype.TO`
 /// which gives `GcArray(T)` — the `T` is what distinguishes array types.
-/// Extract element type from a type string like `"Vec<Point>"` → `"Point"`.
-/// RPython equivalent: `ARRAY.OF` from `GcArray(T)` → `T`.
+/// RPython: `ARRAY.OF` — extract element type from full ARRAY type string.
+///
+/// Handles all Rust array/container notations:
+/// - `Vec<Point>` → `"Point"` (angle brackets)
+/// - `[i64]` → `"i64"` (slice)
+/// - `[Point; 10]` → `"Point"` (fixed-size array)
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    let start = type_str.find('<')?;
-    let end = type_str.rfind('>')?;
-    if start < end {
-        Some(type_str[start + 1..end].trim().to_string())
-    } else {
-        None
+    let s = type_str.trim();
+    // Angle brackets: Vec<T>, Box<T>, etc.
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return Some(s[start + 1..end].trim().to_string());
+        }
     }
+    // Square brackets: [T] or [T; N]
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        // [T; N] → T (strip "; N" suffix)
+        let elem = if let Some(semi) = inner.find(';') {
+            inner[..semi].trim()
+        } else {
+            inner.trim()
+        };
+        if !elem.is_empty() {
+            return Some(elem.to_string());
+        }
+    }
+    None
 }
 
 fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
@@ -1133,7 +1288,7 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
         syn::Expr::Path(path) => path
             .path
             .get_ident()
-            .and_then(|ident| ctx.local_element_types.get(&ident.to_string()).cloned()),
+            .and_then(|ident| ctx.local_array_types.get(&ident.to_string()).cloned()),
         syn::Expr::Reference(r) => array_type_id_from_expr(&r.expr, ctx),
         syn::Expr::Paren(p) => array_type_id_from_expr(&p.expr, ctx),
         // RPython: op.args[0].concretetype — for field access like `self.array`,
@@ -1141,8 +1296,9 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
         syn::Expr::Field(field) => {
             let owner_type = receiver_type_root(&field.base, ctx)?;
             let field_name = member_name(&field.member);
+            // RPython: op.args[0].concretetype — returns full ARRAY type.
             let field_type_str = ctx.struct_fields.field_type(&owner_type, &field_name)?;
-            extract_element_type_from_str(field_type_str)
+            Some(field_type_str.to_string())
         }
         _ => None,
     }
@@ -1355,6 +1511,61 @@ mod tests {
             })
             .expect("binop");
         assert_eq!(op, "add");
+    }
+
+    #[test]
+    fn lowers_array_field_to_interiorfield_read() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct Point { x: i64, y: i64 }
+            fn read_point(points: Vec<Point>, i: usize) -> i64 {
+                points[i].x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::InteriorFieldRead { field, item_ty, .. }
+                    if field.name == "x" && *item_ty == ValueType::Int
+            )),
+            "expected InteriorFieldRead for 'x' with item_ty=Int, got {:?}",
+            ops
+        );
+        // Should NOT generate a separate ArrayRead + FieldRead pair.
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "x"
+            )),
+            "should not have FieldRead for 'x' when InteriorFieldRead is present"
+        );
+    }
+
+    #[test]
+    fn lowers_array_field_to_interiorfield_write() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct Point { x: i64, y: i64 }
+            fn write_point(points: Vec<Point>, i: usize) {
+                points[i].x = 42;
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::InteriorFieldWrite { field, .. } if field.name == "x"
+            )),
+            "expected InteriorFieldWrite for 'x', got {:?}",
+            ops
+        );
     }
 
     #[test]

@@ -208,6 +208,130 @@ pub struct CallControl {
     /// `basesize = carray.items.offset = sizeof(Signed) = WORD`.
     /// Default: WORD (8 on 64-bit) matching RPython's standard GcArray.
     pub array_header_size: usize,
+
+    /// RPython: `symbolic.get_field_token(STRUCT, fieldname, tsc)` / `symbolic.get_size()`.
+    /// Pre-computed struct layouts from actual runtime (std::mem::offset_of! etc.).
+    /// When registered, provides exact (offset, size) for struct fields,
+    /// bypassing the type-string heuristic. The runtime/proc-macro populates
+    /// this via `set_struct_layout()`.
+    pub struct_layouts: HashMap<String, StructLayout>,
+}
+
+/// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
+///
+/// RPython delegates to `ll2ctypes.get_ctypes_type(STRUCT)` or `llmemory.offsetof()`
+/// for actual C-level layout. This struct holds heuristic approximations computed
+/// from Rust type strings via `from_type_strings()`. Offsets and sizes may diverge
+/// from actual `#[repr(C)]` layout. The runtime SHOULD override via
+/// `set_struct_layout()` with values from `std::mem::offset_of!()` /
+/// `std::mem::size_of::<T>()` for production use.
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    /// RPython: `symbolic.get_size(STRUCT, tsc)` — total struct size.
+    pub size: usize,
+    /// Per-field layout: (field_name, offset, size, type).
+    /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
+    pub fields: Vec<StructFieldLayout>,
+}
+
+/// Single field within a `StructLayout`.
+#[derive(Debug, Clone)]
+pub struct StructFieldLayout {
+    pub name: String,
+    /// RPython: `cfield.offset`
+    pub offset: usize,
+    /// RPython: `cfield.size`
+    pub size: usize,
+    /// RPython: `get_type_flag(getattr(STRUCT, fieldname))`
+    pub flag: majit_ir::descr::ArrayFlag,
+    /// IR type classification.
+    pub field_type: majit_ir::value::Type,
+}
+
+impl StructLayout {
+    /// Build a StructLayout from type-string heuristic.
+    /// Used at pipeline init to populate struct_layouts from struct_fields.
+    /// The runtime can later override with actual layout via set_struct_layout().
+    pub fn from_type_strings(
+        fields: &[(String, String)],
+        known_structs: &std::collections::HashSet<String>,
+        known_struct_sizes: &std::collections::HashMap<String, usize>,
+    ) -> Self {
+        // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
+        // even those with nested structs. UnsupportedFieldExc only affects
+        // all_interiorfielddescrs (field enumeration), NOT the struct size.
+        // So we always compute the full size, but mark has_nested_struct to
+        // clear interior field descriptors.
+        let has_nested_struct = fields
+            .iter()
+            .any(|(_, type_str)| known_structs.contains(type_str.as_str()));
+        let mut offset: usize = 0;
+        let mut layout_fields = Vec::new();
+        for (name, type_str) in fields {
+            let (flag, field_type, field_size) = if known_structs.contains(type_str.as_str()) {
+                // RPython: symbolic.get_field_token(STRUCT, fieldname) returns the
+                // actual embedded struct size, not just a pointer size.
+                let nested_size = known_struct_sizes
+                    .get(type_str.as_str())
+                    .copied()
+                    .unwrap_or(std::mem::size_of::<usize>());
+                (
+                    majit_ir::descr::ArrayFlag::Struct,
+                    majit_ir::value::Type::Ref,
+                    nested_size,
+                )
+            } else {
+                get_type_flag(type_str)
+            };
+            if field_type == majit_ir::value::Type::Void || field_size == 0 {
+                continue;
+            }
+            // RPython: alignment is typically min(field_size, WORD).
+            let align = field_size.min(std::mem::size_of::<usize>());
+            offset = (offset + align - 1) & !(align - 1);
+            layout_fields.push(StructFieldLayout {
+                name: name.clone(),
+                offset,
+                size: field_size,
+                flag,
+                field_type,
+            });
+            offset += field_size;
+        }
+        // RPython: heaptracker.py:89-90 — if nested struct exists,
+        // all_interiorfielddescrs raises UnsupportedFieldExc, so
+        // interior field descriptors are not enumerable. Clear fields
+        // but keep the correct size.
+        if has_nested_struct {
+            layout_fields.clear();
+        }
+        let max_align = fields
+            .iter()
+            .map(|(_, ty)| {
+                if known_structs.contains(ty.as_str()) {
+                    // Use actual nested struct size for alignment.
+                    known_struct_sizes
+                        .get(ty.as_str())
+                        .copied()
+                        .unwrap_or(std::mem::size_of::<usize>())
+                        .min(std::mem::size_of::<usize>())
+                } else {
+                    get_type_flag(ty).2
+                }
+            })
+            .filter(|s| *s > 0)
+            .max()
+            .unwrap_or(8);
+        let size = if offset > 0 {
+            (offset + max_align - 1) & !(max_align - 1)
+        } else {
+            0
+        };
+        StructLayout {
+            size,
+            fields: layout_fields,
+        }
+    }
 }
 
 /// Sequential descriptor index assignment — majit equivalent of
@@ -232,8 +356,14 @@ pub struct DescrIndexRegistry {
     /// (item_ty_discriminant, array_type_id) → bit index (0..63)
     /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
     array_indices: HashMap<(u8, Option<String>), u32>,
+    /// (array_type_id, field_name) → bit index (0..63)
+    /// RPython: cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()
+    /// Separate from field_indices — RPython keys on (ARRAY, fieldname)
+    /// not (STRUCT, fieldname).
+    interiorfield_indices: HashMap<(Option<String>, String), u32>,
     next_field_index: u32,
     next_array_index: u32,
+    next_interiorfield_index: u32,
 }
 
 impl DescrIndexRegistry {
@@ -262,6 +392,21 @@ impl DescrIndexRegistry {
             idx
         })
     }
+
+    /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
+    ///
+    /// Keys on `(array_type_id, field_name)` — matches RPython's cache key
+    /// `(ARRAY, name, arrayfieldname)` in `get_interiorfield_descr()`.
+    /// Separate namespace from field_indices: two different array types
+    /// with the same element struct get different interiorfield indices.
+    pub fn interiorfield_index(&mut self, array_type_id: &Option<String>, field_name: &str) -> u32 {
+        let key = (array_type_id.clone(), field_name.to_string());
+        *self.interiorfield_indices.entry(key).or_insert_with(|| {
+            let idx = self.next_interiorfield_index % 64;
+            self.next_interiorfield_index += 1;
+            idx
+        })
+    }
 }
 
 impl CallControl {
@@ -286,7 +431,9 @@ impl CallControl {
             return_types: HashMap::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
+            //
             array_header_size: std::mem::size_of::<usize>(),
+            struct_layouts: HashMap::new(),
         }
     }
 
@@ -305,6 +452,12 @@ impl CallControl {
         self.known_struct_names.contains(name)
     }
 
+    /// RPython: register actual struct layout from `symbolic.get_field_token()`.
+    /// The runtime calls this with layouts from `std::mem::offset_of!()` etc.
+    pub fn set_struct_layout(&mut self, struct_name: String, layout: StructLayout) {
+        self.struct_layouts.insert(struct_name, layout);
+    }
+
     /// RPython: resolve a struct field's type string.
     /// For `owner::field_name`, returns the full type of the field.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
@@ -313,29 +466,34 @@ impl CallControl {
 
     /// RPython: `cpu.arraydescrof(ARRAY)` — descr.py:348-378.
     ///
-    /// Create an array descriptor with layout metadata from the runtime
-    /// configuration (array_header_size) and struct field registry.
-    /// This is the single entry point for array descriptor creation,
-    /// matching RPython where `cpu.arraydescrof()` delegates to
-    /// `get_array_descr(gccache, ARRAY)`.
+    /// `array_type_id`: full ARRAY type string (e.g. `"Vec<Point>"`), matching
+    /// RPython's ARRAY lltype identity. The element type is extracted via
+    /// `extract_element_type_from_str()` for struct checks and flag resolution.
     pub fn arraydescrof(
         &self,
         idx: u32,
-        resolved_id: &Option<String>,
+        array_type_id: &Option<String>,
         ir_type: majit_ir::value::Type,
     ) -> majit_ir::descr::DescrRef {
-        let elem_name = resolved_id.as_deref();
-        let is_struct = elem_name.is_some_and(|n| self.is_known_struct(n));
+        // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
+        let elem_name = array_type_id
+            .as_deref()
+            .and_then(|s| extract_element_type_from_str(s).or_else(|| Some(s.to_string())))
+            .as_deref()
+            .map(String::from);
+        let elem_ref = elem_name.as_deref();
+        let is_struct = elem_ref.is_some_and(|n| self.is_known_struct(n));
         // RPython: descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF)
+        // RPython: descr.py:354 — itemsize from symbolic.get_array_token().
+        // descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF).
+        // descr.py:365 — ArrayDescr(basesize, itemsize, ..., flag).
+        // Even for struct(struct), itemsize is correct from symbolic.
         let (flag, item_size) = if is_struct {
             (
                 majit_ir::descr::ArrayFlag::Struct,
-                elem_name
-                    .map(|n| compute_struct_size(self, n))
-                    .filter(|s| *s > 0)
-                    .unwrap_or(8),
+                elem_ref.map(|n| compute_struct_size(self, n)).unwrap_or(8),
             )
-        } else if let Some(elem) = resolved_id {
+        } else if let Some(elem) = elem_ref {
             let (f, _, s) = get_type_flag(elem);
             (f, s)
         } else {
@@ -351,7 +509,7 @@ impl CallControl {
         );
         // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
         if is_struct {
-            if let Some(struct_name) = elem_name {
+            if let Some(struct_name) = elem_ref {
                 let ad_arc = std::sync::Arc::new(ad);
                 let (descrs, _) = all_interiorfielddescrs(self, struct_name, ad_arc.clone());
                 if !descrs.is_empty() {
@@ -679,8 +837,15 @@ impl CallControl {
                 name,
                 receiver_root,
             } => {
-                // resolve_method finds the concrete impl type.
-                // We use that type to build a qualified path.
+                // RPython: direct_call → funcobj.graph. Try qualified path first
+                // so inherent methods resolve by direct graph linkage.
+                if let Some(receiver) = receiver_root.as_deref() {
+                    let qualified = CallPath::from_segments([receiver, name.as_str()]);
+                    if self.function_graphs.contains_key(&qualified) {
+                        return Some(qualified);
+                    }
+                }
+                // Fall back to trait method resolution for polymorphic calls.
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
                 Some(CallPath::from_segments([impl_type, name.as_str()]))
             }
@@ -1325,6 +1490,8 @@ fn effectinfo_from_writeanalyze(
             write_descrs_fields: !0,
             readonly_descrs_arrays: !0,
             write_descrs_arrays: !0,
+            readonly_descrs_interiorfields: !0,
+            write_descrs_interiorfields: !0,
             single_write_descr_array: None,
             can_invalidate,
         };
@@ -1348,6 +1515,9 @@ fn effectinfo_from_writeanalyze(
     // effectinfo.py:201-206: collect actual array write DescrRefs.
     let mut array_write_descrs: Vec<majit_ir::descr::DescrRef> = Vec::new();
 
+    let mut read_interiorfields: u64 = 0;
+    let mut write_interiorfields: u64 = 0;
+
     if let Some(path) = cc.target_to_path(target) {
         let mut seen = HashSet::new();
         collect_readwrite_effects(
@@ -1360,6 +1530,8 @@ fn effectinfo_from_writeanalyze(
             &mut write_fields,
             &mut read_arrays,
             &mut write_arrays,
+            &mut read_interiorfields,
+            &mut write_interiorfields,
             &mut array_write_descrs,
         );
     }
@@ -1394,6 +1566,13 @@ fn effectinfo_from_writeanalyze(
         None
     };
 
+    // RPython effectinfo.py:349-354: interiorfield readonly = reads & ~writes.
+    let readonly_descrs_interiorfields = read_interiorfields & !write_interiorfields;
+    let mut write_descrs_interiorfields = write_interiorfields;
+    if ignore_writes {
+        write_descrs_interiorfields = 0;
+    }
+
     EffectInfo {
         extra_effect: extraeffect,
         oopspec_index: oopspecindex,
@@ -1401,30 +1580,27 @@ fn effectinfo_from_writeanalyze(
         write_descrs_fields,
         readonly_descrs_arrays,
         write_descrs_arrays,
+        readonly_descrs_interiorfields,
+        write_descrs_interiorfields,
         single_write_descr_array,
         can_invalidate,
     }
 }
 
-/// RPython: `op.args[0].concretetype` — resolve ARRAY identity.
+/// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.
 ///
-/// In RPython, array identity is the ARRAY lltype (e.g. `GcArray(Signed)`),
-/// determined by the ELEMENT TYPE, not by which field holds the array.
-/// Two fields `a: GcArray(Signed)` and `b: GcArray(Signed)` share the
-/// same descriptor because they have the same element type.
-///
-/// Resolution order:
-/// RPython: `op.args[0].concretetype` — resolve the ARRAY identity
-/// for an array access base expression.
+/// Returns the full ARRAY type string (e.g. `"Vec<Point>"`, `"Vec<i64>"`),
+/// matching RPython's ARRAY lltype which is the cache key for
+/// `cpu.arraydescrof(ARRAY)` (descr.py:348-351).
 ///
 /// Resolution order:
-/// 1. Parser-set `array_type_id` (direct variable access)
-/// 2. Producer chain trace-back:
-///    - FieldRead: look up field type in struct_fields
-///    - ArrayRead: propagate the array's own array_type_id (nested array)
-///    - Call: look up return type from function graphs
-///    - Input: propagate the input's array_type_id if set
-/// 3. None (conservative: falls back to item_ty-only keying)
+/// 1. Parser-set `array_type_id` (full container type from variable decl)
+/// 2. Producer chain trace-back for `op.args[0].concretetype`:
+///    - FieldRead: field type from struct_fields (full type string)
+///    - ArrayRead: propagate the array's own array_type_id
+///    - Call: return type from CallControl.return_types
+/// 3. Phi/link source chain (limited depth)
+/// 4. None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
@@ -1439,11 +1615,12 @@ fn resolve_array_identity(
     // 2. Trace back to producer — RPython: op.args[0].concretetype.
     if let Some(producer) = value_producers.get(base) {
         match producer {
-            // FieldRead: self.array → look up field type in struct registry.
+            // FieldRead: self.array → full ARRAY type from struct registry.
+            // RPython: op.args[0].concretetype is the ARRAY lltype directly.
             OpKind::FieldRead { field, .. } => {
                 if let Some(owner) = &field.owner_root {
                     if let Some(field_type_str) = cc.field_type(owner, &field.name) {
-                        return extract_element_type_from_str(field_type_str);
+                        return Some(field_type_str.to_string());
                     }
                 }
             }
@@ -1453,11 +1630,11 @@ fn resolve_array_identity(
                     return array_type_id.clone();
                 }
             }
-            // Call result: RPython resolves via result.concretetype.
+            // Call result: RPython resolves via result.concretetype → full type.
             OpKind::Call { target, .. } => {
                 if let Some(callee_path) = cc.target_to_path(target) {
                     if let Some(ret_type) = cc.return_types.get(&callee_path) {
-                        return extract_element_type_from_str(ret_type);
+                        return Some(ret_type.clone());
                     }
                 }
             }
@@ -1476,7 +1653,7 @@ fn resolve_array_identity(
                     OpKind::FieldRead { field, .. } => {
                         if let Some(owner) = &field.owner_root {
                             if let Some(fts) = cc.field_type(owner, &field.name) {
-                                return extract_element_type_from_str(fts);
+                                return Some(fts.to_string());
                             }
                         }
                     }
@@ -1486,7 +1663,7 @@ fn resolve_array_identity(
                     OpKind::Call { target, .. } => {
                         if let Some(cp) = cc.target_to_path(target) {
                             if let Some(rt) = cc.return_types.get(&cp) {
-                                return extract_element_type_from_str(rt);
+                                return Some(rt.clone());
                             }
                         }
                     }
@@ -1501,17 +1678,33 @@ fn resolve_array_identity(
     None
 }
 
-/// Extract element type from a type string like `"Vec<Point>"` → `"Point"`.
-/// RPython equivalent: `ARRAY.OF` from `GcArray(T)` → `T`.
+/// RPython: `ARRAY.OF` — extract element type from full ARRAY type string.
+///
+/// Handles all Rust array/container notations:
+/// - `Vec<Point>` → `"Point"` (angle brackets)
+/// - `[i64]` → `"i64"` (slice)
+/// - `[Point; 10]` → `"Point"` (fixed-size array)
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    // Find first '<' and matching '>'
-    let start = type_str.find('<')?;
-    let end = type_str.rfind('>')?;
-    if start < end {
-        Some(type_str[start + 1..end].trim().to_string())
-    } else {
-        None
+    let s = type_str.trim();
+    // Angle brackets: Vec<T>, Box<T>, etc.
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return Some(s[start + 1..end].trim().to_string());
+        }
     }
+    // Square brackets: [T] or [T; N]
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let elem = if let Some(semi) = inner.find(';') {
+            inner[..semi].trim()
+        } else {
+            inner.trim()
+        };
+        if !elem.is_empty() {
+            return Some(elem.to_string());
+        }
+    }
+    None
 }
 
 /// Transitive read/write effect collection.
@@ -1532,6 +1725,9 @@ fn collect_readwrite_effects(
     write_fields: &mut u64,
     read_arrays: &mut u64,
     write_arrays: &mut u64,
+    // effectinfo.py:313-325: interiorfield descriptor bitsets.
+    read_interiorfields: &mut u64,
+    write_interiorfields: &mut u64,
     // effectinfo.py:201-206: collect actual array write DescrRefs
     // for single_write_descr_array population.
     array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
@@ -1547,6 +1743,8 @@ fn collect_readwrite_effects(
             *write_fields = !0;
             *read_arrays = !0;
             *write_arrays = !0;
+            *read_interiorfields = !0;
+            *write_interiorfields = !0;
             return;
         }
     };
@@ -1662,6 +1860,63 @@ fn collect_readwrite_effects(
                         array_write_descrs.push(cc.arraydescrof(idx, &resolved_id, ir_type));
                     }
                 }
+                // RPython: ("readinteriorfield", T, fieldname)
+                // effectinfo.py:351-354: records interiorfield descriptor.
+                // effectinfo.py:327-340: ALSO implicitly records array read.
+                OpKind::InteriorFieldRead {
+                    base,
+                    field,
+                    array_type_id,
+                    ..
+                } => {
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    );
+                    // Interior field bit — keyed on (ARRAY, fieldname),
+                    // matching cpu.interiorfielddescrof(ARRAY, fieldname).
+                    let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
+                    *read_interiorfields |= 1u64 << ifield_idx;
+                    // effectinfo.py:327-340: implicit array read.
+                    // RPython: cpu.arraydescrof(ARRAY) uses get_type_flag(ARRAY.OF).
+                    // Interior fields only exist in struct arrays → element type is Ref.
+                    let arr_idx = descr_indices.array_index(
+                        value_type_discriminant(&crate::model::ValueType::Ref),
+                        &resolved_id,
+                    );
+                    *read_arrays |= 1u64 << arr_idx;
+                }
+                // RPython: ("interiorfield", T, fieldname)
+                // effectinfo.py:349-350: records interiorfield descriptor.
+                // effectinfo.py:327-340: ALSO implicitly records array write.
+                OpKind::InteriorFieldWrite {
+                    base,
+                    field,
+                    array_type_id,
+                    ..
+                } => {
+                    let resolved_id = resolve_array_identity(
+                        base,
+                        array_type_id,
+                        &value_producers,
+                        &phi_sources,
+                        cc,
+                    );
+                    // Interior field bit — keyed on (ARRAY, fieldname),
+                    // matching cpu.interiorfielddescrof(ARRAY, fieldname).
+                    let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
+                    *write_interiorfields |= 1u64 << ifield_idx;
+                    // effectinfo.py:327-340: implicit array write.
+                    // RPython: cpu.arraydescrof(ARRAY) — struct arrays are always Ref.
+                    let arr_idx = descr_indices.array_index(
+                        value_type_discriminant(&crate::model::ValueType::Ref),
+                        &resolved_id,
+                    );
+                    *write_arrays |= 1u64 << arr_idx;
+                }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {
                     if let Some(callee_path) = cc.target_to_path(target) {
@@ -1675,14 +1930,19 @@ fn collect_readwrite_effects(
                             write_fields,
                             read_arrays,
                             write_arrays,
+                            read_interiorfields,
+                            write_interiorfields,
                             array_write_descrs,
                         );
                     } else {
                         // Unresolvable call → top_set.
+                        // effectinfo.py:285: effects is top_set → all descriptor sets None.
                         *read_fields = !0;
                         *write_fields = !0;
                         *read_arrays = !0;
                         *write_arrays = !0;
+                        *read_interiorfields = !0;
+                        *write_interiorfields = !0;
                         return;
                     }
                 }
@@ -1694,35 +1954,58 @@ fn collect_readwrite_effects(
 
 /// RPython: `heaptracker.all_interiorfielddescrs(gccache, ARRAY)`.
 ///
-/// For an array-of-structs (element type is a known struct), iterate
-/// `STRUCT._names` and create `InteriorFieldDescr(arraydescr, fielddescr)`
-/// for each field. This mirrors heaptracker.py:74-92 with
-/// `get_field_descr=get_interiorfield_descr` (descr.py:373-375).
+/// For an array-of-structs, iterate `STRUCT._names` and create
+/// `InteriorFieldDescr(arraydescr, fielddescr)` for each field.
+/// Mirrors heaptracker.py:74-92 with `get_field_descr=get_interiorfield_descr`.
 ///
-/// Each interior field descriptor wraps:
-/// - The parent `ArrayDescr` (shared Arc)
-/// - A `FieldDescr` with actual offset/size/type from the struct definition
+/// Layout source priority (RPython: `symbolic.get_field_token()`):
+/// 1. `cc.struct_layouts[struct_name]` — actual layout from runtime
+/// 2. Type-string heuristic fallback from `get_type_flag()`
 ///
-/// Returns `(fielddescrs, item_size)` where `item_size` is the total
-/// struct size (RPython: `symbolic.get_array_token(ARRAY, tsc)[1]`).
+/// Returns `(fielddescrs, item_size)`.
 fn all_interiorfielddescrs(
     cc: &CallControl,
     struct_name: &str,
     array_descr: std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
 ) -> (Vec<majit_ir::descr::DescrRef>, usize) {
+    // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
+    if let Some(layout) = cc.struct_layouts.get(struct_name) {
+        let mut result = Vec::new();
+        // RPython: heaptracker.get_fielddescr_index_in() — counts non-Void fields.
+        let mut index_in_parent: u32 = 0;
+        for fl in &layout.fields {
+            if fl.field_type == majit_ir::value::Type::Void {
+                continue;
+            }
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct {
+                return (Vec::new(), 0);
+            }
+            let is_signed = fl.flag == majit_ir::descr::ArrayFlag::Signed;
+            let fd = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                index_in_parent,
+                fl.offset,
+                fl.size,
+                fl.field_type,
+                false,
+                is_signed,
+                format!("{}.{}", struct_name, fl.name),
+            ));
+            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new(
+                index_in_parent,
+                array_descr.clone(),
+                fd,
+            );
+            result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
+            index_in_parent += 1;
+        }
+        return (result, layout.size);
+    }
+
+    // Path 2: type-string heuristic fallback
     let fields = match cc.struct_fields.fields.get(struct_name) {
         Some(f) => f,
         None => return (Vec::new(), 0),
     };
-    // RPython: heaptracker.py:83-91 — iterate STRUCT._names,
-    // skip Void fields and typeptr.
-    //
-    // RPython: heaptracker.py:89-90 —
-    //   isinstance(FIELD, lltype.Struct) → raise UnsupportedFieldExc
-    // If ANY field is a nested struct, the entire all_interiorfielddescrs
-    // call fails and arraydescr.all_interiorfielddescrs remains None.
-    // This is NOT a per-field skip — the exception propagates from
-    // get_array_descr (descr.py:373) and prevents setting the field.
     for (_, field_type_str) in fields.iter() {
         if cc.is_known_struct(field_type_str) {
             return (Vec::new(), 0);
@@ -1730,30 +2013,27 @@ fn all_interiorfielddescrs(
     }
     let mut offset: usize = 0;
     let mut result = Vec::new();
-    for (i, (field_name, field_type_str)) in fields.iter().enumerate() {
-        // RPython: FIELD = getattr(STRUCT, name); if FIELD is Void: continue
-        let (_flag, field_type, field_size) = get_type_flag(field_type_str);
+    // RPython: heaptracker.get_fielddescr_index_in() — counts non-Void fields.
+    let mut index_in_parent: u32 = 0;
+    for (_i, (field_name, field_type_str)) in fields.iter().enumerate() {
+        let (flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
-        // RPython: get_field_descr(gccache, REALARRAY.OF, name)
-        // → FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
-        let align = field_size;
+        let align = field_size.min(std::mem::size_of::<usize>());
         if align > 0 {
             offset = (offset + align - 1) & !(align - 1);
         }
-        // RPython: index_in_parent = heaptracker.get_fielddescr_index_in(STRUCT, name)
-        let index_in_parent = i as u32;
-        let is_immutable = false;
+        let is_signed = flag == majit_ir::descr::ArrayFlag::Signed;
         let fd = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
             index_in_parent,
             offset,
             field_size,
             field_type,
-            is_immutable,
+            false,
+            is_signed,
             format!("{}.{}", struct_name, field_name),
         ));
-        // RPython: descr.py:436 — InteriorFieldDescr(arraydescr, fielddescr)
         let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new(
             index_in_parent,
             array_descr.clone(),
@@ -1761,9 +2041,8 @@ fn all_interiorfielddescrs(
         );
         result.push(std::sync::Arc::new(ifd) as majit_ir::descr::DescrRef);
         offset += field_size;
+        index_in_parent += 1;
     }
-    // RPython: symbolic.get_array_token(ARRAY, tsc) → (basesize, itemsize, ofs_length)
-    // item_size = total struct size, aligned to max field alignment.
     let max_align = fields
         .iter()
         .map(|(_, ty)| get_type_flag(ty).2)
@@ -1778,33 +2057,55 @@ fn all_interiorfielddescrs(
     (result, item_size)
 }
 
-/// RPython: `symbolic.get_array_token(ARRAY, tsc)[1]`.
+/// RPython: `symbolic.get_array_token(ARRAY, tsc)[1]` — struct item_size.
 ///
-/// Compute the total size of a struct (the item_size for an array-of-structs).
-/// This uses the same layout calculation as `all_interiorfielddescrs`.
+/// Layout source priority:
+/// 1. `cc.struct_layouts[struct_name].size` — actual layout
+/// 2. Type-string heuristic fallback
 fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
+    // Path 1: actual layout from runtime (RPython: symbolic.get_size(STRUCT))
+    if let Some(layout) = cc.struct_layouts.get(struct_name) {
+        return layout.size;
+    }
+    // Path 2: heuristic fallback — RPython: symbolic always computes the full
+    // struct size, even with nested structs. Nested struct sizes are looked up
+    // recursively from struct_layouts.
     let fields = match cc.struct_fields.fields.get(struct_name) {
         Some(f) => f,
         None => return 0,
     };
-    // Check for nested structs — RPython: UnsupportedFieldExc.
-    for (_, field_type_str) in fields.iter() {
-        if cc.is_known_struct(field_type_str) {
-            return 0;
-        }
-    }
     let mut offset: usize = 0;
     for (_, field_type_str) in fields.iter() {
-        let (_, field_type, field_size) = get_type_flag(field_type_str);
-        if field_type == majit_ir::value::Type::Void || field_size == 0 {
-            continue;
-        }
-        offset = (offset + field_size - 1) & !(field_size - 1);
+        let field_size = if cc.is_known_struct(field_type_str) {
+            // RPython: symbolic.get_field_token() uses actual nested struct size.
+            cc.struct_layouts
+                .get(field_type_str.as_str())
+                .map(|l| l.size)
+                .unwrap_or(std::mem::size_of::<usize>())
+        } else {
+            let (_, field_type, s) = get_type_flag(field_type_str);
+            if field_type == majit_ir::value::Type::Void || s == 0 {
+                continue;
+            }
+            s
+        };
+        let align = field_size.min(std::mem::size_of::<usize>());
+        offset = (offset + align - 1) & !(align - 1);
         offset += field_size;
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| get_type_flag(ty).2)
+        .map(|(_, ty)| {
+            if cc.is_known_struct(ty) {
+                cc.struct_layouts
+                    .get(ty.as_str())
+                    .map(|l| l.size)
+                    .unwrap_or(std::mem::size_of::<usize>())
+                    .min(std::mem::size_of::<usize>())
+            } else {
+                get_type_flag(ty).2
+            }
+        })
         .filter(|s| *s > 0)
         .max()
         .unwrap_or(8);
@@ -1882,6 +2183,8 @@ fn op_can_raise(op: &OpKind, ignore_memoryerror: bool) -> bool {
         OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => false,
         // RPython LL: getarrayitem_gc, setarrayitem_gc → cannot raise
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => false,
+        // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
+        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => false,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
         // (non-ovf, non-div arithmetic)
         OpKind::BinOp { op, .. }
@@ -2832,5 +3135,45 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let result = cc.canraise(&target, &mut cache);
         assert_eq!(result, CanRaise::MemoryErrorOnly);
+    }
+
+    #[test]
+    fn struct_layout_depth3_nested_fixed_point() {
+        // A contains B, B contains C.  Fixed-point iteration must
+        // produce correct sizes regardless of HashMap iteration order.
+        // struct C { x: i64 }            → size 8
+        // struct B { c: C, y: i64 }      → size 16
+        // struct A { b: B, z: i64 }      → size 24
+        let mut known_structs: HashSet<String> = HashSet::new();
+        known_structs.insert("C".into());
+        known_structs.insert("B".into());
+        known_structs.insert("A".into());
+
+        let fields_c: Vec<(String, String)> = vec![("x".into(), "i64".into())];
+        let fields_b: Vec<(String, String)> =
+            vec![("c".into(), "C".into()), ("y".into(), "i64".into())];
+        let fields_a: Vec<(String, String)> =
+            vec![("b".into(), "B".into()), ("z".into(), "i64".into())];
+
+        // Fixed-point iteration (same algorithm as lib.rs).
+        let mut known_sizes: HashMap<String, usize> = HashMap::new();
+        let all_fields: Vec<(&str, &Vec<(String, String)>)> =
+            vec![("A", &fields_a), ("B", &fields_b), ("C", &fields_c)];
+        loop {
+            let mut changed = false;
+            for (name, fields) in &all_fields {
+                let layout = StructLayout::from_type_strings(fields, &known_structs, &known_sizes);
+                if known_sizes.get(*name) != Some(&layout.size) {
+                    known_sizes.insert(name.to_string(), layout.size);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        assert_eq!(known_sizes["C"], 8, "C: single i64");
+        assert_eq!(known_sizes["B"], 16, "B: C(8) + i64(8)");
+        assert_eq!(known_sizes["A"], 24, "A: B(16) + i64(8)");
     }
 }

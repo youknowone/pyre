@@ -144,6 +144,27 @@ pub enum OpKind {
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,
     },
+    /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
+    /// effectinfo.py:313-325: generates "readinteriorfield" effect.
+    /// effectinfo.py:327-340: also implicitly generates "readarray" effect.
+    InteriorFieldRead {
+        base: ValueId,
+        index: ValueId,
+        field: FieldDescriptor,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
+    /// RPython: setinteriorfield_gc — write a field of an array-of-structs element.
+    /// effectinfo.py:349-350: generates "interiorfield" effect.
+    /// effectinfo.py:327-340: also implicitly generates "array" effect.
+    InteriorFieldWrite {
+        base: ValueId,
+        index: ValueId,
+        field: FieldDescriptor,
+        value: ValueId,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
+    },
     Call {
         target: CallTarget,
         args: Vec<ValueId>,
