@@ -2481,7 +2481,9 @@ pub(crate) fn decode_and_restore_guard_failure(
         if rd_numb.is_empty() {
             decode_exit_layout_values(raw_values, exit_layout)
         } else {
-            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
+            let (t, _rd_numb_pc) =
+                rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
+            t
         }
     };
     if majit_metainterp::majit_log_enabled() {
@@ -2539,6 +2541,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     };
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
 
+    // virtualizable.py:126: write fields from resumedata to frame.
     // virtualizable.py:126: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -2642,12 +2645,17 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
 /// `majit_ir::resumedata::rebuild_from_numbering`. Each slot is TAGBOX
 /// (deadframe), TAGCONST (constant), TAGINT (small int), or TAGVIRTUAL
 /// (virtual to materialize). Single-frame only (no per-jitcode liveness).
+///
+/// Returns `(typed_values, rd_numb_frame_pc)`. The frame PC from rd_numb
+/// is the liveness PC used by get_list_of_active_boxes during encoding.
+/// The recovery side MUST use this same PC for expand — NOT next_instr
+/// (which may differ by 1+ due to cache slots).
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
-) -> Vec<Value> {
+) -> (Vec<Value>, Option<usize>) {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     let (_num_failargs, vable_values, _vref_values, frames) =
@@ -2760,7 +2768,10 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    typed
+    // resume.py:1383 parity: liveness PC = frame.pc from rd_numb
+    // (the same PC used by get_list_of_active_boxes during encoding).
+    let rd_numb_pc = frames.last().map(|f| f.pc as usize);
+    (typed, rd_numb_pc)
 }
 
 /// Decode rd_numb into per-frame ResumedFrame chain via

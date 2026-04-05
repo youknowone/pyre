@@ -104,6 +104,12 @@ thread_local! {
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
 pub(crate) fn jitcode_for(code: *const CodeObject) -> *const JitCode {
+    // Register global frame_value_count callback on first use.
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
+    });
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 

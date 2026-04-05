@@ -115,11 +115,16 @@ impl LiveVars {
                         }
                     }
                     // LoadFastBorrowLoadFastBorrow reads two locals.
-                    // GEN for both is correct per RPython liveness semantics,
-                    // but adding it changes the snapshot composition and
-                    // exposes a bridge compilation bug (segfault in nbody,
-                    // fannkuch, spectral_norm). Deferred until the bridge
-                    // issue is resolved.
+                    // GEN for both is correct per RPython liveness semantics.
+                    // Currently disabled: enabling changes snapshot composition
+                    // and exposes a guard failure recovery bug where the
+                    // blackhole/bridge restore path misaligns values.
+                    // Root cause: get_list_of_active_boxes uses orgpc as
+                    // liveness PC, but some recovery paths use next_instr
+                    // (orgpc + 1 + caches). The disagreement causes compact
+                    // array misalignment when liveness differs between PCs.
+                    // TODO: fix recovery to use frame.pc from rd_numb
+                    // consistently, then re-enable.
                     // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
                     //     for i in [u32::from(pair.idx_1()) as usize,
