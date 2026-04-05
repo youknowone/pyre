@@ -1111,13 +1111,16 @@ impl Optimizer {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved);
             }
         }
-        if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
-            if info.is_virtual() {
-                // RPython optimizer.py:624: self.force_box(arg)
-                // force_box→emit_extra routes through pass chain.
-                let forced = info.force_box(resolved, ctx);
-                return ctx.get_box_replacement(forced);
-            }
+        if ctx
+            .get_ptr_info(resolved)
+            .is_some_and(|info| info.is_virtual())
+        {
+            // RPython: info.force_box() sets _is_virtual=False in-place.
+            // Take ownership so the Virtual PtrInfo is removed. force_box_impl
+            // installs a non-virtual (Instance/Struct) at the alloc_ref.
+            let mut info = ctx.take_ptr_info(resolved).unwrap();
+            let forced = info.force_box(resolved, ctx);
+            return ctx.get_box_replacement(forced);
         }
         resolved
     }
@@ -2375,8 +2378,6 @@ impl Optimizer {
     fn drain_extra_operations_from(&mut self, _start_pass: usize, ctx: &mut OptContext) {
         let end_pass = self.extra_operation_end_pass();
         let mut pending = std::collections::VecDeque::new();
-        // RPython emit_extra(op, emit=False) parity: operations queued
-        // with a specific start pass skip earlier passes.
         while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
             pending.push_back((start, op));
         }
@@ -2468,6 +2469,7 @@ impl Optimizer {
         // RPython optimizer.py:614: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
+        let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
@@ -2508,7 +2510,7 @@ impl Optimizer {
                             );
                         }
                         ctx.new_operations[target_pos] = op.clone();
-                        ctx.in_final_emission = false;
+                        ctx.in_final_emission = saved_in_final_emission;
                         return;
                     }
                 }
@@ -2727,7 +2729,7 @@ impl Optimizer {
                 },
             );
         }
-        ctx.in_final_emission = false;
+        ctx.in_final_emission = saved_in_final_emission;
     }
 
     /// optimizer.py:722-752 store_final_boxes_in_guard
