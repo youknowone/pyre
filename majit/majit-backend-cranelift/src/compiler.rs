@@ -5262,16 +5262,13 @@ impl CraneliftBackend {
             ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
             // llgraph/runner.py:1184-1191 fail_guard: if bridge attached,
-            // raise Jump(bridge_target, values) — switch to bridge trace.
+            // raise Jump(target, values).
+            // llgraph's values are concrete (self.env[box]). In Cranelift,
+            // the jitframe uses recovery_layout encoding for virtuals.
+            // rebuild_state_after_failure decodes this to match what the
+            // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
             let bridge_guard = fail_descr.bridge_ref();
             if let Some(ref bridge) = *bridge_guard {
-                // llgraph/runner.py:1189-1191:
-                //   target = (descr._llgraph_bridge, -1)
-                //   values = [v for v in values if v is not None]
-                //   raise Jump(target, values)
-                //
-                // resume.py: rebuild_state_after_failure materializes virtuals
-                // in the fail_args before they become bridge inputs.
                 let mut bridge_outputs = outputs;
                 rebuild_state_after_failure(
                     &mut bridge_outputs,
