@@ -2302,49 +2302,33 @@ extern "C" fn record_guard_not_forced_2_shim(fail_index: u64, values_ptr: u64, n
     }
 }
 
+/// llmodel.py:270-274 force() as a free function.
+/// force_token is the JitFrame pointer (FORCE_TOKEN returns jf_ptr).
 pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
-    let handle = force_token.0 as u64;
-    let Some(frame) = lookup_force_frame(handle) else {
-        panic!("invalid force token {handle}");
+    assert!(force_token.0 != 0, "force_token_to_dead_frame: null token");
+    let jf_ptr = force_token.0 as *mut i64;
+    let jf_ptr = jitframe_resolve(jf_ptr);
+    // frame.jf_descr = frame.jf_force_descr
+    let jf_force_descr = unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) };
+    unsafe { *jf_ptr.add(JF_DESCR_OFS as usize / 8) = jf_force_descr };
+    let jf_gcref = GcRef(jf_ptr as usize);
+    let descr_ptr = jf_force_descr as usize as *const CraneliftFailDescr;
+    assert!(
+        !descr_ptr.is_null(),
+        "force_token_to_dead_frame: jf_force_descr is null"
+    );
+    let fail_descr = unsafe {
+        Arc::increment_strong_count(descr_ptr);
+        Arc::from_raw(descr_ptr)
     };
-
-    {
-        let pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
-        if let Some(pending) = pending_may_force.last_mut() {
-            assert!(
-                !pending.was_forced,
-                "force token {handle} was already forced during call_may_force"
-            );
-            pending.was_forced = true;
-            return DeadFrame {
-                data: Box::new(PreviewFrameData::new(
-                    pending.preview.materialized_raw_values(),
-                    pending.preview.fail_descr.clone(),
-                    frame.gc_runtime_id,
-                    frame.clone(),
-                )),
-            };
-        }
-    }
-
-    let frame = FORCE_FRAMES
-        .with(|ff| ff.borrow_mut().remove(&handle))
-        .unwrap_or_else(|| panic!("invalid force token {handle}"));
-    let pending = unsafe { &mut *frame.pending_force.get() }
-        .take()
-        .unwrap_or_else(|| panic!("force token {handle} has no pending GUARD_NOT_FORCED_2"));
-    let fail_descr = pending.fail_descr.clone();
-    let raw_values = pending.into_raw_values(frame.gc_runtime_id);
-    let saved_data = take_force_frame_saved_data(&frame);
-    let (exception_class, exception) = take_pending_jit_exception_state();
+    let gc_runtime_id = fail_descr.gc_runtime_id;
     DeadFrame {
-        data: Box::new(FrameData::new_with_savedata_and_exception(
-            raw_values,
+        data: Box::new(JitFrameDeadFrame::new(
+            jf_gcref,
             fail_descr,
-            frame.gc_runtime_id,
-            saved_data,
-            exception_class,
-            (!exception.is_null()).then_some(exception),
+            gc_runtime_id,
+            Vec::new(),
+            None,
         )),
     }
 }
@@ -5393,9 +5377,13 @@ impl CraneliftBackend {
             let jf_ptr = exec.jf_gcref.0;
             if let Some(sd) = saved_data {
                 unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+            } else {
+                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
             }
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
+            } else {
+                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
             }
             return DeadFrame {
                 data: Box::new(JitFrameDeadFrame::new(
@@ -5501,6 +5489,7 @@ impl CraneliftBackend {
             source_guard,
             caller_layout,
             &self.constants,
+            self.gc_runtime_id,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -6401,35 +6390,23 @@ impl CraneliftBackend {
                     builder.seal_block(cont_block);
                 }
                 OpCode::GuardNotForced2 => {
+                    // x86/assembler.py:2662-2669 store_force_descr:
+                    //   guard_token = self.implement_guard_recovery(...)
+                    //   self._finish_gcmap = guard_token.gcmap
+                    //   self._store_force_index(op)
+                    //   self.store_info_on_descr(0, guard_token)
+                    // x86/regalloc.py:1411-1417 consider_guard_not_forced_2:
+                    //   self.assembler.store_force_descr(op, fail_locs, frame_depth)
+                    // No inline branch — just store fail descr to jf_force_descr.
+                    // force() reads this when the frame is forced during
+                    // call_assembler execution.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let arg_bytes = (info.fail_arg_refs.len().max(1) * 8) as u32;
-                    let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        arg_bytes,
-                        3,
-                    ));
-                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        let raw = resolve_opref(&mut builder, &constants, arg_ref);
-                        builder
-                            .ins()
-                            .stack_store(raw, args_slot, (index * 8) as i32);
-                    }
-                    let args_ptr = builder.ins().stack_addr(ptr_type, args_slot, 0);
-                    let fail_index = builder.ins().iconst(cl_types::I64, info.fail_index as i64);
-                    let num_values = builder
+                    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    builder
                         .ins()
-                        .iconst(cl_types::I64, info.fail_arg_refs.len() as i64);
-                    let args_ptr = ptr_arg_as_i64(&mut builder, args_ptr, ptr_type);
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        record_guard_not_forced_2_shim as *const () as usize,
-                        &[fail_index, args_ptr, num_values],
-                        None,
-                    );
+                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
                 }
 
                 OpCode::GuardNotInvalidated => {
@@ -7178,9 +7155,26 @@ impl CraneliftBackend {
                 | OpCode::CallReleaseGilR
                 | OpCode::CallReleaseGilF
                 | OpCode::CallReleaseGilN => {
-                    // Release-GIL calls: spill roots, release GIL, call,
-                    // reacquire GIL, reload roots.
-                    // In Rust, "GIL" is modeled as a pre/post hook pair.
+                    // x86/assembler.py:2242-2244 _genop_call_release_gil:
+                    //   self._store_force_index(self._find_nearby_operation(+1))
+                    //   self._genop_call(op, arglocs, result_loc, is_call_release_gil=True)
+                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2.
+                    let next_op = ops.get(op_idx + 1);
+                    let is_paired_guard = next_op.is_some_and(|o| {
+                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
+                    });
+                    if !is_paired_guard {
+                        return Err(unsupported_semantics(
+                            op.opcode,
+                            "call_release_gil: ops[position+1] must be guard_not_forced(_2)",
+                        ));
+                    }
+                    let info = &guard_infos[guard_idx];
+                    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+
                     let descr = op
                         .descr
                         .as_ref()
@@ -9305,6 +9299,7 @@ fn collect_guards(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &HashMap<u32, i64>,
+    gc_runtime_id: Option<u64>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
@@ -9683,6 +9678,7 @@ fn collect_guards(
         };
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
+        descr.gc_runtime_id = gc_runtime_id;
         let descr = Arc::new(descr);
         // compile.py:826-830 store_hash: assign unique jitcounter slot.
         // RPython calls store_hash inside store_final_boxes at compile time.
@@ -10492,20 +10488,13 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
-        // llmodel.py:270-274 parity (with Rust wrapper overhead):
+        // llmodel.py:270-274:
         //   frame = rffi.cast(JITFRAMEPTR, addr_of_force_token)
         //   frame = frame.resolve()
         //   frame.jf_descr = frame.jf_force_descr
         //   return cast_opaque_ptr(GCREF, frame)
-        // Rust needs a JitFrameDeadFrame wrapper + Arc for the descr.
-        // No exception or metadata manipulation — force() only sets
-        // jf_descr and returns the frame.
         if force_token.0 == 0 {
             return None;
-        }
-        // Legacy handle (small integer) → old HashMap path.
-        if force_token.0 < 0x10000 {
-            return Some(force_token_to_dead_frame(force_token));
         }
         let jf_ptr = force_token.0 as *mut i64;
         let jf_ptr = jitframe_resolve(jf_ptr);
@@ -10514,18 +10503,17 @@ impl majit_backend::Backend for CraneliftBackend {
         unsafe { *jf_ptr.add(JF_DESCR_OFS as usize / 8) = jf_force_descr };
         let jf_gcref = GcRef(jf_ptr as usize);
         let descr_ptr = jf_force_descr as usize as *const CraneliftFailDescr;
-        if descr_ptr.is_null() {
-            return Some(force_token_to_dead_frame(force_token));
-        }
+        assert!(
+            !descr_ptr.is_null(),
+            "force(): jf_force_descr is null — _store_force_index was not called"
+        );
         let fail_descr = unsafe {
             Arc::increment_strong_count(descr_ptr);
             Arc::from_raw(descr_ptr)
         };
-        // Use ACTIVE_GC_RUNTIME_ID for GC root registration.
-        // RPython doesn't need this because GCREF is natively tracked.
-        // In Rust, the wrapper must register the jf_gcref as a root
-        // to prevent GC from collecting the frame.
-        let gc_runtime_id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get());
+        // Rust wrapper overhead: register jf_gcref as GC root.
+        // RPython doesn't need this (GCREF natively tracked).
+        let gc_runtime_id = fail_descr.gc_runtime_id;
         Some(DeadFrame {
             data: Box::new(JitFrameDeadFrame::new(
                 jf_gcref,
