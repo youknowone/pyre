@@ -9772,6 +9772,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn store_bridge_guard_hashes(
         &self,
         token: &JitCellToken,
+        source_trace_id: u64,
         source_fail_index: u32,
         hashes: &[u64],
     ) {
@@ -9780,7 +9781,13 @@ impl majit_backend::Backend for CraneliftBackend {
             .as_ref()
             .and_then(|c| c.downcast_ref::<CompiledLoop>());
         if let Some(compiled) = compiled {
-            if let Some(descr) = compiled.fail_descrs.get(source_fail_index as usize) {
+            // Use recursive search matching compiled_bridge_fail_descr_layouts.
+            let source_descr = find_fail_descr_in_fail_descrs(
+                &compiled.fail_descrs,
+                source_trace_id,
+                source_fail_index,
+            );
+            if let Some(descr) = source_descr {
                 let bridge_guard = descr.bridge_ref();
                 if let Some(ref bridge) = *bridge_guard {
                     for (i, &hash) in hashes.iter().enumerate() {
