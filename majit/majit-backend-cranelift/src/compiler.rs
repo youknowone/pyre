@@ -513,16 +513,6 @@ pub fn jit_exc_value_raw() -> i64 {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn take_pending_jit_exception_state() -> (i64, GcRef) {
-    let value = JIT_EXC_VALUE.swap(0, std::sync::atomic::Ordering::Relaxed);
-    let exc_type = JIT_EXC_TYPE.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if value == 0 {
-        (0, GcRef::NULL)
-    } else {
-        (exc_type, GcRef(value as usize))
-    }
-}
-
 // ── Thread-local reference access shims ──
 
 /// Read a thread-local slot at the given offset.
@@ -2215,14 +2205,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     } // end loop
 }
 
-/// Stack-allocated output buffer size for the fast path.
-/// Traces with more output slots fall back to the normal path.
-const FAST_PATH_MAX_OUTPUTS: usize = 16;
-/// Stack-allocated GC root buffer size for the fast path.
-/// Traces with more live ref roots must use the heap path to avoid
-/// overwriting the fixed stack scratch space.
-const FAST_PATH_MAX_ROOTS: usize = 8;
-
 /// RPython assembler_call_helper parity: handle guard failure from
 /// direct call_assembler path. Checks for bridge first, falls back
 /// to force_fn. Called from codegen's direct non-finish block.
@@ -2382,162 +2364,7 @@ fn call_assembler_fast_path(
         return result as u64;
     }
 
-    // RPython parity: always use heap-allocated JitFrame (no stack buffer).
-    return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
-
-    #[allow(unreachable_code)]
-    {
-        let actual_outputs = target.max_output_slots.max(1);
-        let actual_roots = target.num_ref_roots.max(1);
-        if actual_outputs + actual_roots > FAST_PATH_MAX_OUTPUTS {
-            return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
-        }
-
-        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
-            unsafe { std::mem::transmute(target.code_ptr) };
-
-        let _jitted_guard = majit_backend::JittedGuard::enter();
-
-        let handle = 0u64;
-
-        // jf_buf: header + output slots + ref root slots (all in one buffer).
-        const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
-        let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS + FAST_PATH_MAX_ROOTS];
-        // jitframe.py:48-52 jitframe_allocate: set jf_frame length for GC bounds check.
-        let frame_depth = actual_outputs + actual_roots;
-        jf_buf[JF_FRAME_LENGTH_OFS as usize / 8] = frame_depth as i64;
-        for (i, &val) in inputs.iter().enumerate() {
-            jf_buf[HEADER_WORDS + i] = val;
-        }
-
-        let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
-        let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-        let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-            CALL_ASSEMBLER_DEADFRAME_SENTINEL
-        } else if jf_descr_raw == 0 {
-            0u32
-        } else {
-            unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
-        };
-        let outputs = {
-            let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
-            out.copy_from_slice(&jf_buf[HEADER_WORDS..HEADER_WORDS + FAST_PATH_MAX_OUTPUTS]);
-            out
-        };
-
-        drop(_jitted_guard);
-
-        // Handle nested call_assembler DEADFRAME propagation
-        if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
-            let frame = take_call_assembler_deadframe_from_outputs(&outputs);
-
-            let handle = store_call_assembler_deadframe(frame);
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-                *outcome.add(1) = handle as i64;
-            }
-            return 0;
-        }
-
-        let fail_descr = &target.fail_descrs[fail_index as usize];
-
-        if fail_descr.is_finish() {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return match fail_descr.fail_arg_types() {
-                [] | [Type::Void] => 0,
-                // compile.py:649 DoneWithThisFrameDescr*.get_result:
-                // cpu.get_{int,ref,float}_value(deadframe, 0)
-                [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
-                other => unreachable!("call_assembler finish with unsupported layout: {other:?}"),
-            };
-        }
-
-        // Guard failure — check for bridge, then fall back to force
-        fail_descr.increment_fail_count();
-        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
-
-        // If a bridge is attached, execute it instead of calling force_fn.
-        let bridge_guard = fail_descr.bridge_ref();
-        if let Some(ref bridge) = *bridge_guard {
-            // RPython rebuild_state_after_failure parity: materialize virtual
-            // objects before bridge dispatch. Virtual Ref slots are null (0)
-            // with their fields in trailing Int slots.
-            let mut bridge_outputs = outputs.to_vec();
-            rebuild_state_after_failure(
-                &mut bridge_outputs,
-                &fail_descr.fail_arg_types,
-                fail_descr.recovery_layout_ref().as_ref(),
-                bridge.num_inputs,
-            );
-            let outputs_slice = &bridge_outputs[..bridge_outputs.len().min(actual_outputs)];
-            let mut frame =
-                CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
-            let bridge_descr = get_latest_descr_from_deadframe(&frame)
-                .expect("bridge deadframe must have a descriptor");
-            if bridge_descr.is_finish() {
-                unsafe {
-                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                    *outcome.add(1) = 0;
-                }
-                return finish_result_from_deadframe(&mut frame)
-                    .expect("finish_result_from_deadframe failed") as u64;
-            }
-            // Bridge didn't finish — store as deadframe for caller
-            let df_handle = store_call_assembler_deadframe(frame);
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-                *outcome.add(1) = df_handle as i64;
-            }
-            return 0;
-        }
-        let _ = bridge_guard;
-
-        // resume.py:1312 blackhole_from_resumedata parity: materialize
-        // virtuals before blackhole resume.
-        if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-            let green_key = target.green_key;
-            let trace_id = target.trace_id;
-            let raw_num = fail_descr.fail_arg_types.len();
-            let raw_outputs = outputs.to_vec(); // raw deadframe before rebuild
-            let mut bh_outputs = outputs.to_vec();
-            rebuild_state_after_failure(
-                &mut bh_outputs,
-                &fail_descr.fail_arg_types,
-                fail_descr.recovery_layout_ref().as_ref(),
-                raw_num,
-            );
-            let num_outputs = bh_outputs.len();
-            if let Some(result) = bh_fn(
-                green_key,
-                trace_id,
-                fail_index,
-                bh_outputs.as_ptr(),
-                num_outputs,
-                raw_outputs.as_ptr(),
-                raw_num,
-            ) {
-                unsafe {
-                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                    *outcome.add(1) = 0;
-                }
-                return result as u64;
-            }
-        }
-
-        // RPython assembler_call_helper: force_fn receives the callee frame.
-        // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
-        // but force_fn needs the callee frame which is inputs[0].
-        let callee_frame_ptr = inputs[0];
-        let result = force_fn(callee_frame_ptr);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        result as u64
-    } // end #[allow(unreachable_code)]
+    call_assembler_fast_path_heap(target, inputs, outcome, force_fn)
 }
 
 /// Heap path for call_assembler — uses heap-allocated JitFrame
@@ -3755,19 +3582,6 @@ fn emit_pop_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, per_call_gcmap:
     builder
         .ins()
         .store(MemFlags::trusted(), zero, jf_ptr, JF_GCMAP_OFS);
-}
-
-fn output_transfers_current_force_token(
-    fail_descr: &CraneliftFailDescr,
-    outputs: &[i64],
-    handle: u64,
-) -> bool {
-    handle != 0
-        && fail_descr
-            .force_token_slots
-            .iter()
-            .copied()
-            .any(|slot| outputs.get(slot).copied() == Some(handle as i64))
 }
 
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
