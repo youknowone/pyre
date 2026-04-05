@@ -154,10 +154,20 @@ pub trait FailDescr: Descr {
         &[]
     }
 
-    /// compile.py:741-745: read hash from status for must_compile.
-    /// Returns the jitcounter hash assigned at compile time (store_hash).
-    fn get_status_hash(&self) -> u64 {
+    /// compile.py:741-745: read status for must_compile.
+    fn get_status(&self) -> u64 {
         0
+    }
+
+    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    fn start_compiling(&self) {}
+
+    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    fn done_compiling(&self) {}
+
+    /// compile.py:750: check ST_BUSY_FLAG.
+    fn is_compiling(&self) -> bool {
+        false
     }
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info

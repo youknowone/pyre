@@ -1506,12 +1506,9 @@ impl OptRewrite {
                         return OptimizationResult::PassOn;
                     }
                     // rewrite.py:335-347: replace old guard with GUARD_VALUE.
-                    // Find the old guard in new_operations by op.pos.
-                    let old_guard_pos_val = old_guard.pos;
-                    if let Some(old_nop_idx) = ctx
-                        .new_operations
-                        .iter()
-                        .position(|o| o.pos == old_guard_pos_val)
+                    // last_guard_pos is a _newoperations index (info.py:100-103).
+                    if let Some(old_idx) =
+                        ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos())
                     {
                         // rewrite.py:335-338: copy_and_change with fresh descr.
                         let mut replacement =
@@ -1526,7 +1523,7 @@ impl OptRewrite {
                         // descr is intentionally NOT copied — fresh descr
                         // (rewrite.py:335: descr = compile.ResumeGuardDescr())
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
-                        ctx.new_operations[old_nop_idx] = replacement;
+                        ctx.new_operations[old_idx] = replacement;
                         // rewrite.py:345-346: info.reset_last_guard_pos()
                         if let Some(info_mut) = ctx.get_ptr_info_mut(obj) {
                             info_mut.reset_last_guard_pos();
@@ -2353,13 +2350,13 @@ impl Optimization for OptRewrite {
                     }
                 }
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
+                // make_nonnull runs immediately; mark_last_guard deferred
+                // until emit adds the guard to new_operations.
                 if ctx.get_ptr_info(obj).is_none() {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
-                // rewrite.py:282: mark_last_guard(self.optimizer)
-                // Guard strengthening: record this guard's position for the arg.
-                // Future GUARD_NONNULL_CLASS/GUARD_CLASS can replace it.
-                ctx.mark_last_guard(obj);
+                // rewrite.py:282: mark_last_guard deferred to emit_operation
+                ctx.pending_mark_last_guard = Some(obj);
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
@@ -2414,13 +2411,10 @@ impl Optimization for OptRewrite {
                 if let Some(old_guard) = ctx.get_last_guard(obj) {
                     if old_guard.opcode == OpCode::GuardNonnull && op.num_args() >= 2 {
                         // rewrite.py:408-427: replace GUARD_NONNULL with GUARD_NONNULL_CLASS.
-                        // Find the old guard in new_operations by op.pos.
-                        let old_guard_pos_val = old_guard.pos;
-                        let old_nop_idx = ctx
-                            .new_operations
-                            .iter()
-                            .position(|o| o.pos == old_guard_pos_val);
-                        if let Some(old_idx) = old_nop_idx {
+                        // last_guard_pos is _newoperations index.
+                        let old_guard_idx =
+                            ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
+                        if let Some(old_idx) = old_guard_idx {
                             let mut combined =
                                 Op::new(OpCode::GuardNonnullClass, &[old_guard.arg(0), op.arg(1)]);
                             combined.pos = old_guard.pos;
@@ -2442,13 +2436,9 @@ impl Optimization for OptRewrite {
                         }
                     }
                 }
-                // rewrite.py:430-436 postprocess_GUARD_CLASS:
-                //   info = getptrinfo(op.getarg(0))
-                //   old_guard_op = info.get_last_guard(self.optimizer)
-                //   update_last_guard = not old_guard_op or isinstance(
-                //       old_guard_op.getdescr(), compile.ResumeAtPositionDescr)
-                //   self.make_constant_class(op.getarg(0), expectedclassbox,
-                //                            update_last_guard)
+                // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
+                // Register deferred postprocess — executed by emit_operation
+                // after the guard is added to new_operations.
                 if op.num_args() >= 2 {
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)) {
                         let is_virtual = ctx
@@ -2456,36 +2446,11 @@ impl Optimization for OptRewrite {
                             .map(|info| info.is_virtual())
                             .unwrap_or(false);
                         if !is_virtual {
-                            // rewrite.py:433-434: get_last_guard(optimizer)
-                            // info.py:100-103: last_guard_pos is an INDEX
-                            // into _newoperations, not an op.pos.
-                            let old_guard_pos = ctx
-                                .get_ptr_info(obj)
-                                .and_then(|info| info.last_guard_pos())
-                                .unwrap_or(-1);
-                            let update_last_guard =
-                                old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
-                            // optimizer.py:137-151 make_constant_class:
-                            //   if update_last_guard: mark_last_guard(optimizer)
-                            // RPython info.py:117 uses len(_newoperations) - 1
-                            // because postprocess runs AFTER emit. In majit,
-                            // the postprocess logic is inlined BEFORE emit
-                            // (multi-pass: rewrite runs before virtualize),
-                            // so the guard is not yet in new_operations.
-                            // Use op.pos as unique guard identity instead.
-                            let new_guard_pos = if update_last_guard {
-                                op.pos.0 as i32
-                            } else {
-                                old_guard_pos
-                            };
-                            ctx.set_ptr_info(
-                                obj,
-                                crate::optimizeopt::info::PtrInfo::KnownClass {
-                                    class_ptr: majit_ir::GcRef(class_val as usize),
-                                    is_nonnull: true,
-                                    last_guard_pos: new_guard_pos,
-                                },
-                            );
+                            ctx.pending_guard_class_postprocess =
+                                Some(crate::optimizeopt::PendingGuardClassPostprocess {
+                                    obj,
+                                    class_val,
+                                });
                         }
                     }
                 }

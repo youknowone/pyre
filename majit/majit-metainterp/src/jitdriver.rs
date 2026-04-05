@@ -1238,6 +1238,8 @@ impl<S: JitState> JitDriver<S> {
             let trace_id = result.trace_id;
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
+            let status = result.status;
+            let descr_addr = result.descr_addr;
             let _exit_meta = result.meta.clone();
             drop(result);
 
@@ -1252,6 +1254,8 @@ impl<S: JitState> JitDriver<S> {
                 trace_id,
                 fail_index,
                 &raw_values,
+                status,
+                descr_addr,
             );
 
             // Extract guard_resume_pc from fail_args (last Int value).
@@ -2141,6 +2145,8 @@ impl<S: JitState> JitDriver<S> {
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
+        let status = result.status;
+        let descr_addr = result.descr_addr;
         drop(result);
 
         // memmgr.py:58-61: keep_loop_alive(loop_token)
@@ -2164,16 +2170,19 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py:701-717 handle_fail / must_compile: single tick+check.
-        // Use rd_loop_token from exit_layout (= guard's owning loop key,
-        // RPython rd_loop_token parity) instead of dispatch green_key.
         let guard_loop_key = if exit_layout.rd_loop_token != 0 {
             exit_layout.rd_loop_token
         } else {
             green_key
         };
-        let (should_bridge, owning_key) =
-            self.meta
-                .must_compile_with_values(guard_loop_key, trace_id, fail_index, &raw_values);
+        let (should_bridge, owning_key) = self.meta.must_compile_with_values(
+            guard_loop_key,
+            trace_id,
+            fail_index,
+            &raw_values,
+            status,
+            descr_addr,
+        );
 
         // Return raw guard failure data. State restoration and bridge/
         // blackhole decision happen in the caller's handle_fail().
@@ -2713,6 +2722,8 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = result.typed_values;
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
+            let status = result.status;
+            let descr_addr = result.descr_addr;
 
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
@@ -2751,9 +2762,14 @@ impl<S: JitState> JitDriver<S> {
             //       resume_in_blackhole(...)
             //   assert 0, "unreachable"
 
-            let (should_bridge, _owning_key) =
-                self.meta
-                    .must_compile_with_values(key_hash, trace_id, fail_index, &raw_values);
+            let (should_bridge, _owning_key) = self.meta.must_compile_with_values(
+                key_hash,
+                trace_id,
+                fail_index,
+                &raw_values,
+                status,
+                descr_addr,
+            );
 
             // Extract guard_resume_pc from fail_args.
             // The last Int value is the bytecode pc at the guard point,

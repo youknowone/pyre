@@ -101,6 +101,11 @@ pub struct CompileResult<'a, M> {
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
+    /// compile.py:741-745: ResumeGuardDescr.status read at guard failure.
+    pub status: u64,
+    /// compile.py:780: current_object_addr_as_int(self) — descriptor identity
+    /// for GUARD_VALUE per-value hash. Raw pointer to the failed FailDescr.
+    pub descr_addr: usize,
 }
 
 /// Raw (lightweight) result from running compiled code.
@@ -114,6 +119,10 @@ pub struct RawCompileResult<'a, M> {
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
+    /// compile.py:741-745: ResumeGuardDescr.status read at guard failure.
+    pub status: u64,
+    /// compile.py:780: current_object_addr_as_int(self) — descriptor identity.
+    pub descr_addr: usize,
 }
 
 /// Terminal exit layout for a FINISH or JUMP op.

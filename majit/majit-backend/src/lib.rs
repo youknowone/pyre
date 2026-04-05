@@ -34,6 +34,10 @@ pub struct RawExecResult {
     pub trace_id: u64,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
+    /// compile.py:741-745: ResumeGuardDescr.status at guard failure time.
+    pub status: u64,
+    /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
+    pub descr_addr: usize,
 }
 
 /// Backend-neutral static metadata for a compiled trace.
@@ -778,6 +782,28 @@ pub trait Backend: Send {
     /// explicitly copied when the compiled loop is replaced.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
+    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
+    /// Returns true if descriptor was found in this token.
+    fn start_guard_compiling(
+        &self,
+        _token: &JitCellToken,
+        _trace_id: u64,
+        _fail_index: u32,
+    ) -> bool {
+        false
+    }
+
+    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG on descriptor.
+    /// Returns true if descriptor was found in this token.
+    fn done_guard_compiling(
+        &self,
+        _token: &JitCellToken,
+        _trace_id: u64,
+        _fail_index: u32,
+    ) -> bool {
+        false
+    }
+
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 
@@ -837,6 +863,8 @@ pub trait Backend: Send {
             fail_index: descr.fail_index(),
             trace_id: descr.trace_id(),
             is_finish: descr.is_finish(),
+            status: descr.get_status(),
+            descr_addr: descr as *const dyn majit_ir::descr::FailDescr as *const () as usize,
         }
     }
 

@@ -2127,6 +2127,8 @@ fn jit_ca_handle_guard_failure(
     fail_index: u32,
     raw_values_ptr: *const i64,
     num_values: usize,
+    status: u64,
+    descr_addr: usize,
 ) -> bool {
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
@@ -2136,9 +2138,9 @@ fn jit_ca_handle_guard_failure(
     // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
     let (should_bridge, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .must_compile_with_values(green_key, trace_id, fail_index, raw_values)
+        driver.meta_interp_mut().must_compile_with_values(
+            green_key, trace_id, fail_index, raw_values, status, descr_addr,
+        )
     };
     if !should_bridge {
         return false;
@@ -2176,7 +2178,7 @@ fn jit_ca_handle_guard_failure(
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
-            .set_guard_compiling(owning_key, trace_id, fail_index, true);
+            .start_guard_compiling(owning_key, trace_id, fail_index);
     }
 
     // compile.py:706-708 _trace_and_compile_from_bridge
@@ -2194,7 +2196,7 @@ fn jit_ca_handle_guard_failure(
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
-            .set_guard_compiling(owning_key, trace_id, fail_index, false);
+            .done_guard_compiling(owning_key, trace_id, fail_index);
     }
 
     if majit_metainterp::majit_log_enabled() {

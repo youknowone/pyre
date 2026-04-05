@@ -50,7 +50,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     crate::fail_descr::make_resume_at_position_descr()
 }
 
-/// Result of an optimization pass processing an operation.
+/// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
 pub enum OptimizationResult {
     /// Emit this operation (possibly modified).
@@ -61,6 +61,16 @@ pub enum OptimizationResult {
     Remove,
     /// Pass the operation to the next pass unchanged.
     PassOn,
+}
+
+/// optimizer.py:47-54: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
+/// RPython's postprocess_GUARD_CLASS runs after the guard is emitted to
+/// _newoperations. In majit, recorded here by rewrite and executed by
+/// emit_operation.
+#[derive(Debug)]
+pub struct PendingGuardClassPostprocess {
+    pub obj: majit_ir::OpRef,
+    pub class_val: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +142,13 @@ pub struct OptContext {
     /// Used by heap's force_lazy_set to route ops through remaining passes
     /// without re-entering the heap pass itself.
     pub(crate) extra_operations_after: VecDeque<(usize, Op)>,
+    /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
+    /// Set by rewrite pass, executed by emit_operation after the guard
+    /// is added to new_operations (matching RPython's callback pattern).
+    pub(crate) pending_guard_class_postprocess: Option<PendingGuardClassPostprocess>,
+    /// rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard.
+    /// Deferred until emit adds the guard to new_operations.
+    pub(crate) pending_mark_last_guard: Option<OpRef>,
     // ptr_info merged into forwarded (Forwarded::Info variant)
     /// Known lower bounds for integer-typed OpRefs, shared across passes.
     ///
@@ -646,6 +663,8 @@ impl OptContext {
             next_pos: 0,
             next_const_pos: OpRef::CONST_BASE,
             extra_operations_after: VecDeque::new(),
+            pending_guard_class_postprocess: None,
+            pending_mark_last_guard: None,
             int_lower_bounds: HashMap::new(),
             int_bounds: Vec::new(),
             imported_int_bounds: HashMap::new(),
@@ -701,6 +720,8 @@ impl OptContext {
             next_pos: num_inputs as u32,
             next_const_pos: OpRef::CONST_BASE,
             extra_operations_after: VecDeque::new(),
+            pending_guard_class_postprocess: None,
+            pending_mark_last_guard: None,
             int_lower_bounds: HashMap::new(),
             int_bounds: Vec::new(),
             imported_int_bounds: HashMap::new(),
@@ -1097,6 +1118,10 @@ impl OptContext {
             }
         }
         // unroll.py:38: return preamble_op.op
+        // RPython uses a single Box identity for Phase 1 and Phase 2.
+        // In majit, preamble_source (Phase 1) and result (Phase 2) are
+        // distinct OpRefs. Phase 2 operations reference `result`, so
+        // returning it is structurally equivalent to RPython's `return op`.
         result
     }
 
@@ -1473,13 +1498,10 @@ impl OptContext {
     /// info.py:111-118: mark_last_guard — record the last guard position
     /// on the PtrInfo for an OpRef. RPython: opinfo.mark_last_guard(optimizer).
     /// info.py:111-118: mark_last_guard.
-    /// RPython stores `len(_newoperations) - 1` (index) because
-    /// postprocess runs after emit. In majit, last_guard_pos stores
-    /// `op.pos` (unique guard identity) because postprocess logic is
-    /// inlined before emit in the multi-pass pipeline.
+    /// last_guard_pos = len(_newoperations) - 1.
     pub fn mark_last_guard(&mut self, opref: OpRef) {
         let pos = match self.new_operations.last() {
-            Some(op) if op.opcode.is_guard() => op.pos.0 as i32,
+            Some(op) if op.opcode.is_guard() => (self.new_operations.len() - 1) as i32,
             _ => return,
         };
         if let Some(info) = self.get_ptr_info_mut(opref) {
@@ -1487,13 +1509,11 @@ impl OptContext {
         }
     }
 
-    /// info.py:100-103: get_last_guard — retrieve the last guard op.
-    /// Searches by op.pos (guard identity), not by index.
+    /// info.py:100-103: get_last_guard.
+    /// _newoperations[last_guard_pos].
     pub fn get_last_guard(&self, opref: OpRef) -> Option<&Op> {
-        let guard_pos = self.get_ptr_info(opref)?.get_last_guard_pos()?;
-        self.new_operations
-            .iter()
-            .find(|op| op.pos.0 == guard_pos as u32 && op.opcode.is_guard())
+        let pos = self.get_ptr_info(opref)?.get_last_guard_pos()?;
+        self.new_operations.get(pos)
     }
 
     /// resoperation.py:57-68 get_box_replacement: follow the forwarding
@@ -2421,17 +2441,13 @@ impl OptContext {
 
     /// rewrite.py:434-435: isinstance(old_guard_op.getdescr(),
     /// compile.ResumeAtPositionDescr).
-    ///
-    /// RPython uses _newoperations index (info.py:100-103). In majit,
-    /// last_guard_pos stores op.pos (guard identity, see rewrite.rs
-    /// postprocess_GUARD_CLASS comment), so we search by op.pos.
+    /// guard_pos is a _newoperations index (info.py:100-103).
     pub fn is_resume_at_position_guard(&self, guard_pos: i32) -> bool {
         if guard_pos < 0 {
             return false;
         }
         self.new_operations
-            .iter()
-            .find(|op| op.pos.0 == guard_pos as u32 && op.opcode.is_guard())
+            .get(guard_pos as usize)
             .and_then(|op| op.descr.as_ref())
             .map_or(false, |descr| descr.is_resume_at_position())
     }

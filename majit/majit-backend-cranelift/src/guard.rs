@@ -303,16 +303,54 @@ impl CraneliftFailDescr {
             .store(code_ptr, std::sync::atomic::Ordering::Release);
     }
 
+    // compile.py:687-696 status encoding constants.
+    pub const ST_BUSY_FLAG: u64 = 0x01;
+    pub const ST_TYPE_MASK: u64 = 0x06;
+    pub const ST_SHIFT: u32 = 3;
+    pub const ST_SHIFT_MASK: u64 = !((1u64 << Self::ST_SHIFT) - 1); // -(1 << ST_SHIFT)
+    pub const TY_NONE: u64 = 0x00;
+    pub const TY_INT: u64 = 0x02;
+    pub const TY_REF: u64 = 0x04;
+    pub const TY_FLOAT: u64 = 0x06;
+
     /// compile.py:826-830 store_hash: assign a unique jitcounter hash.
-    /// Called at compile time, matching RPython's store_final_boxes path.
+    /// `self.status = hash & self.ST_SHIFT_MASK`
     pub fn store_hash(&self, hash: u64) {
-        self.status
-            .store(hash, std::sync::atomic::Ordering::Release);
+        self.status.store(
+            hash & Self::ST_SHIFT_MASK,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
-    /// compile.py:741-745: read hash from status for must_compile.
-    pub fn get_status_hash(&self) -> u64 {
+    /// compile.py:741-745: read status for must_compile.
+    pub fn get_status(&self) -> u64 {
         self.status.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    pub fn start_compiling(&self) {
+        self.status
+            .fetch_or(Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    pub fn done_compiling(&self) {
+        self.status
+            .fetch_and(!Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// compile.py:750: check ST_BUSY_FLAG.
+    pub fn is_compiling(&self) -> bool {
+        self.status.load(std::sync::atomic::Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
+    }
+
+    /// compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
+    /// encode the fail_arg index and type tag in status.
+    /// `self.status = ty | (index << ST_SHIFT)`
+    pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
+        self.status
+            .store(status, std::sync::atomic::Ordering::Release);
     }
 
     /// Take the bridge data out of this fail descriptor, leaving None.
@@ -412,8 +450,20 @@ impl FailDescr for CraneliftFailDescr {
         self.vector_info.clone()
     }
 
-    fn get_status_hash(&self) -> u64 {
-        self.get_status_hash()
+    fn get_status(&self) -> u64 {
+        self.get_status()
+    }
+
+    fn start_compiling(&self) {
+        self.start_compiling()
+    }
+
+    fn done_compiling(&self) {
+        self.done_compiling()
+    }
+
+    fn is_compiling(&self) -> bool {
+        self.is_compiling()
     }
 }
 

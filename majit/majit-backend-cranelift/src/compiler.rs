@@ -1394,10 +1394,10 @@ pub fn register_call_assembler_blackhole(
 }
 
 /// compile.py:701-717 handle_fail callback for call_assembler guard failures.
-/// (green_key, trace_id, fail_index, raw_values_ptr, num_values) -> bridge_compiled.
-/// Checks must_compile (jitcounter.tick) and traces bridge if threshold reached.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> bool> =
-    OnceLock::new();
+/// (green_key, trace_id, fail_index, raw_values_ptr, num_values, status, descr_addr) -> bridge_compiled.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<
+    fn(u64, u64, u32, *const i64, usize, u64, usize) -> bool,
+> = OnceLock::new();
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
 // for force_fn to re-box before interpreter execution.
@@ -1650,7 +1650,7 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize) -> bool) {
+pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize, u64, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2444,6 +2444,8 @@ extern "C" fn call_assembler_guard_failure(
             fail_index,
             outputs_ptr,
             raw_num,
+            fail_descr.get_status(),
+            Arc::as_ptr(fail_descr) as usize,
         ) {
             // Bridge compiled — dispatch with finish check.
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
@@ -9434,6 +9436,25 @@ fn collect_guards(
             );
             descr.store_hash(hash);
         }
+        // regalloc.py:496-501 consider_guard_value / compile.py:813-824
+        // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
+        // index + type tag in status (overrides store_hash).
+        // regalloc.py:496-501 consider_guard_value / compile.py:813-824
+        // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
+        // index + type tag in status (overrides store_hash).
+        if op.opcode == majit_ir::OpCode::GuardValue {
+            if let Some(fa) = op.fail_args.as_ref() {
+                let arg0 = op.arg(0);
+                if let Some(idx) = fa.iter().position(|&r| r == arg0) {
+                    let type_tag = match descr.fail_arg_types.get(idx) {
+                        Some(majit_ir::Type::Ref) => CraneliftFailDescr::TY_REF,
+                        Some(majit_ir::Type::Float) => CraneliftFailDescr::TY_FLOAT,
+                        _ => CraneliftFailDescr::TY_INT,
+                    };
+                    descr.make_a_counter_per_value(idx as u32, type_tag);
+                }
+            }
+        }
         // assembler.py:2126 get_gcref_from_faildescr parity:
         // store the FailDescr pointer (not index) in jf_descr.
         let fail_descr_ptr = Arc::as_ptr(&descr) as i64;
@@ -9754,6 +9775,39 @@ impl majit_backend::Backend for CraneliftBackend {
         Ok(info)
     }
 
+    fn start_guard_compiling(&self, token: &JitCellToken, trace_id: u64, fail_index: u32) -> bool {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        if let Some(compiled) = compiled {
+            // Recursive search: root fail_descrs + bridge fail_descrs.
+            if let Some(descr) =
+                find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
+            {
+                descr.start_compiling();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn done_guard_compiling(&self, token: &JitCellToken, trace_id: u64, fail_index: u32) -> bool {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        if let Some(compiled) = compiled {
+            if let Some(descr) =
+                find_fail_descr_in_fail_descrs(&compiled.fail_descrs, trace_id, fail_index)
+            {
+                descr.done_compiling();
+                return true;
+            }
+        }
+        false
+    }
+
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
         let old_compiled = old_token
             .compiled
@@ -9926,6 +9980,8 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_index: descr.fail_index(),
                 trace_id: descr.trace_id(),
                 is_finish: descr.is_finish(),
+                status: descr.get_status(),
+                descr_addr: descr as *const dyn FailDescr as *const () as usize,
             };
         }
 
@@ -9993,6 +10049,8 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
                 is_finish: descr.fail_descr.is_finish(),
+                status: descr.fail_descr.get_status(),
+                descr_addr: Arc::as_ptr(&descr.fail_descr) as usize,
             };
         }
         let _ = bridge_guard;
@@ -10031,6 +10089,8 @@ impl majit_backend::Backend for CraneliftBackend {
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),
+            status: fail_descr.get_status(),
+            descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
         }
     }
 

@@ -73,30 +73,6 @@ pub enum CompileOutcome {
     Aborted,
 }
 
-/// Per-guard failure tracking for bridge compilation decisions.
-/// compile.py:685-696: ResumeGuardDescr.status field packs ST_BUSY_FLAG
-/// + ST_TYPE_MASK + jitcounter hash into a single integer.
-pub(crate) struct GuardFailureInfo {
-    /// compile.py:746: hash for jitcounter.tick(). Assigned at compile
-    /// time via store_hash() (compile.py:826-830).
-    /// For GUARD_VALUE, this is overridden per-failure with a value-based
-    /// hash (compile.py:780-781).
-    pub(crate) guard_hash: u64,
-    /// compile.py:741-751, 786-795: ST_BUSY_FLAG — true while bridge
-    /// compilation is in progress for this guard. Prevents re-entrant
-    /// tracing from the same guard during recursive calls.
-    pub(crate) compiling: bool,
-    /// compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
-    /// the fail_arg index + type tag used to compute per-value hash.
-    /// None for non-GUARD_VALUE guards (TY_NONE).
-    pub(crate) per_value: Option<(u32, Type)>,
-    /// compile.py:832-843: ResumeGuardCopiedDescr — if Some, this guard
-    /// shares resume data with another guard (the "prev" descr).
-    /// Points to (trace_id, fail_index) of the original guard.
-    /// Blackhole resume should use the original's resume data.
-    pub(crate) copied_from: Option<(u64, u32)>,
-}
-
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -353,8 +329,6 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) retraced_count: u32,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
-    /// Per-guard failure tracking, keyed by (trace_id, fail_index).
-    pub(crate) guard_failures: HashMap<(u64, u32), GuardFailureInfo>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
     pub(crate) traces: HashMap<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
@@ -560,29 +534,6 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             trace_id
         }
-    }
-
-    /// compile.py:830 store_hash: deterministic guard hash.
-    ///
-    /// RPython uses fetch_next_hash() (sequential counter) tied to the
-    /// guard descriptor object, which dies on invalidation. pyre
-    /// invalidates more aggressively, so we derive a stable hash from
-    /// (green_key, trace_id, fail_index) to preserve accumulated failure
-    /// counts across invalidation/re-compilation cycles.
-    /// compile.py:829: jitcounter.fetch_next_hash().
-    /// RPython assigns a unique hash per guard at compile time.
-    /// In majit, assigned lazily at first guard failure, but uses the
-    /// same fetch_next_hash() to guarantee unique counter slots.
-    fn stable_guard_hash(_green_key: u64, _trace_id: u64, _fail_index: u32) -> u64 {
-        // Delegate to JitCounter::fetch_next_hash via thread-local.
-        // This is called from or_insert_with closures that don't have
-        // &mut self access. Use a global atomic counter as equivalent.
-        static NEXT_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let result = NEXT_HASH.fetch_add(
-            1 | (1u64 << 21) | (1u64 << (21 - 16)),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        result
     }
 
     fn trace_for_exit<'a>(
@@ -2329,18 +2280,11 @@ impl<M: Clone> MetaInterp<M> {
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
-                // RPython parity: preserve guard failure counters across
-                // recompilations. In RPython, guard failure counters live in
-                // the ResumeGuardDescr (per guard, not per JitCellToken).
-                // When a loop is recompiled, the new guards inherit the old
-                // counters so bridge threshold accumulates across compilations.
-                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift-specific: migrate existing bridges to new token.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
-                    inherited_guard_failures = old_entry.guard_failures;
                     // RPython parity: ResumeGuardDescr lives on the guard
                     // and never gets discarded. Preserve old trace metadata
                     // so guards from previous compilations can still find
@@ -2365,7 +2309,6 @@ impl<M: Clone> MetaInterp<M> {
                         },
                         retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
-                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },
@@ -2951,13 +2894,11 @@ impl<M: Clone> MetaInterp<M> {
                 );
 
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
-                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift-specific: migrate existing bridges to new token.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
-                    inherited_guard_failures = old_entry.guard_failures;
                     for (tid, ct) in old_entry.traces {
                         traces.entry(tid).or_insert(ct);
                     }
@@ -2978,7 +2919,6 @@ impl<M: Clone> MetaInterp<M> {
                         },
                         retraced_count: unroll_opt.retraced_count,
                         root_trace_id: trace_id,
-                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },
@@ -3378,11 +3318,9 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.retraced_count)
                         .unwrap_or(0);
-                    let mut inherited_guard_failures = HashMap::new();
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
-                        inherited_guard_failures = old_entry.guard_failures;
                         for (tid, ct) in old_entry.traces {
                             traces.entry(tid).or_insert(ct);
                         }
@@ -3396,7 +3334,6 @@ impl<M: Clone> MetaInterp<M> {
                             front_target_tokens: ft,
                             retraced_count: rc,
                             root_trace_id: trace_id,
-                            guard_failures: inherited_guard_failures,
                             traces,
                             previous_tokens,
                         },
@@ -3671,11 +3608,9 @@ impl<M: Clone> MetaInterp<M> {
                 // This is the LABEL that bridges can close back to.
                 let target_token = crate::optimizeopt::unroll::TargetToken::new_preamble(token_num);
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
-                let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
-                    inherited_guard_failures = old_entry.guard_failures;
                     for (tid, ct) in old_entry.traces {
                         traces.entry(tid).or_insert(ct);
                     }
@@ -3689,7 +3624,6 @@ impl<M: Clone> MetaInterp<M> {
                         front_target_tokens: vec![target_token],
                         retraced_count: 0,
                         root_trace_id: trace_id,
-                        guard_failures: inherited_guard_failures,
                         traces,
                         previous_tokens,
                     },
@@ -3774,19 +3708,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
-        // Track guard failures for bridge compilation decisions.
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -3828,17 +3750,6 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -3876,17 +3787,6 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -3923,17 +3823,6 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if !result.is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -4049,16 +3938,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         if !effective_is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -4089,6 +3968,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata: result.savedata,
             exception,
+            status: result.status,
+            descr_addr: result.descr_addr,
         })
     }
 
@@ -4182,16 +4063,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         if !effective_is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -4221,6 +4092,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata: result.savedata,
             exception,
+            status: result.status,
+            descr_addr: result.descr_addr,
         })
     }
 
@@ -4247,19 +4120,7 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         Self::finish_compiled_run_io(is_finish);
 
-        // Track guard failures
         if !is_finish {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let info = compiled
-                .guard_failures
-                .entry((trace_id, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, trace_id, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-            // compile.py:783-784: jitcounter.tick(hash, increment)
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
@@ -4337,6 +4198,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata,
             exception,
+            status: descr.get_status(),
+            descr_addr: descr as *const dyn majit_ir::FailDescr as *const () as usize,
         })
     }
 
@@ -4416,9 +4279,8 @@ impl<M: Clone> MetaInterp<M> {
         Self::finish_compiled_run_io(is_finish);
 
         // RPython: guard failure counter tick and bridge compilation happen
-        // in handle_fail → must_compile (compile.py:701-784). The single
-        // tick point is must_compile() called by jitdriver. Do NOT create
-        // guard_failures entries or tick here — must_compile handles both.
+        // in handle_fail → must_compile (compile.py:701-784).
+        // must_compile handles tick.
         if !is_finish {
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
@@ -4497,6 +4359,8 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout,
             savedata,
             exception,
+            status: descr.get_status(),
+            descr_addr: descr as *const dyn majit_ir::FailDescr as *const () as usize,
         })
     }
 
@@ -4694,25 +4558,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Check if a guard's counter would fire (read-only).
-    pub fn get_guard_failure_count(&self, green_key: u64, fail_index: u32) -> u32 {
-        let would = self
-            .compiled_loops
-            .get(&green_key)
-            .and_then(|c| c.guard_failures.get(&(c.root_trace_id, fail_index)))
-            .is_some_and(|info| {
-                self.warm_state.counter.would_fire_with_increment(
-                    info.guard_hash,
-                    self.warm_state.increment_trace_eagerness(),
-                )
-            });
-        if would {
-            self.warm_state.trace_eagerness()
-        } else {
-            0
-        }
-    }
-
     /// rstack.py stack_almost_full: True if stack is > 15/16th full.
     /// compile.py:703: skip bridge compilation when stack space is low.
     #[inline]
@@ -4785,30 +4630,6 @@ impl<M: Clone> MetaInterp<M> {
                 eprintln!("[jit][memmgr] evicted loop key={}", key);
             }
         }
-    }
-
-    /// compile.py:826-830: get the jitcounter hash for a guard.
-    /// Returns the stable hash derived from (green_key, trace_id, fail_index).
-    /// Looks up by trace_id across all compiled loops.
-    pub fn guard_hash_for_trace(&mut self, trace_id: u64, fail_index: u32) -> u64 {
-        // Find which compiled loop owns this trace_id.
-        for (&gk, compiled) in self.compiled_loops.iter_mut() {
-            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-            if norm_tid == compiled.root_trace_id || compiled.traces.contains_key(&norm_tid) {
-                let info = compiled
-                    .guard_failures
-                    .entry((norm_tid, fail_index))
-                    .or_insert_with(|| GuardFailureInfo {
-                        guard_hash: Self::stable_guard_hash(gk, norm_tid, fail_index),
-                        compiling: false,
-                        per_value: None,
-                        copied_from: None,
-                    });
-                return info.guard_hash;
-            }
-        }
-        // Fallback: no owning loop found.
-        Self::stable_guard_hash(0, trace_id, fail_index)
     }
 
     /// Get the number of fail_arg_types for a guard.
@@ -4955,85 +4776,61 @@ impl<M: Clone> MetaInterp<M> {
         self.result_type == Type::Int
     }
 
-    /// compile.py:701-717 handle_fail / must_compile parity.
-    ///
-    /// RPython's must_compile does tick + threshold check in a single
-    /// call (jitcounter.tick returns whether threshold was reached).
-    /// Returns (should_compile, owning_green_key).
-    ///
-    /// RPython uses guard descr's rd_loop_token to find the owning
-    /// compiled loop. In majit, search all compiled entries when the
-    /// dispatch key doesn't own this guard's trace.
-    pub fn must_compile(&mut self, green_key: u64, trace_id: u64, fail_index: u32) -> (bool, u64) {
-        self.must_compile_with_values(green_key, trace_id, fail_index, &[])
-    }
+    // compile.py:687-696 status encoding constants.
+    const ST_BUSY_FLAG: u64 = 0x01;
+    const ST_TYPE_MASK: u64 = 0x06;
+    const ST_SHIFT: u32 = 3;
+    const TY_INT: u64 = 0x02;
+    const TY_REF: u64 = 0x04;
+    const TY_FLOAT: u64 = 0x06;
 
-    /// compile.py:738-784: must_compile with fail_values for GUARD_VALUE per-value hash.
+    /// compile.py:738-784: must_compile — read status from descriptor,
+    /// compute hash, tick jitcounter.
+    /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
         &mut self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
+        status: u64,
+        descr_addr: usize,
     ) -> (bool, u64) {
         let owning_key = self.find_owning_key(green_key, trace_id);
-        let Some(compiled) = self.compiled_loops.get_mut(&owning_key) else {
+        if self.compiled_loops.get(&owning_key).is_none() {
             return (false, green_key);
-        };
-        let tid = Self::normalize_trace_id(compiled, trace_id);
-        // compile.py:826-830 store_hash: RPython assigns unique hash per
-        // guard at compile time. In majit, assigned lazily at first failure
-        // via stable_guard_hash() which uses fetch_next_hash() internally.
-        let info = compiled
-            .guard_failures
-            .entry((tid, fail_index))
-            .or_insert_with(|| {
-                let guard_hash = Self::stable_guard_hash(green_key, tid, fail_index);
-                // compile.py:813-824 make_a_counter_per_value parity:
-                // if this guard is GUARD_VALUE, set up per-value counting
-                // immediately (RPython does this at backend regalloc time).
-                let per_value = compiled
-                    .traces
-                    .get(&tid)
-                    .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
-                    .and_then(|op_idx| compiled.traces.get(&tid).and_then(|t| t.ops.get(op_idx)))
-                    .filter(|op| op.opcode == OpCode::GuardValue)
-                    .and_then(|guard_op| {
-                        let fa = guard_op.fail_args.as_ref()?;
-                        let arg0 = guard_op.arg(0);
-                        let idx = fa.iter().position(|&r| r == arg0)?;
-                        // compile.py:816-823: box.type → TY_INT/TY_REF/TY_FLOAT
-                        let tp = guard_op
-                            .fail_arg_types
-                            .as_ref()
-                            .and_then(|ts| ts.get(idx).copied())
-                            .unwrap_or(Type::Int);
-                        Some((idx as u32, tp))
-                    });
-                GuardFailureInfo {
-                    guard_hash,
-                    compiling: false,
-                    per_value,
-                    copied_from: None,
-                }
-            });
-        // compile.py:750-751: ST_BUSY_FLAG + stack_almost_full
-        // RPython only uses ST_BUSY_FLAG — no permanent bridge failure seal.
-        if info.compiling || Self::stack_almost_full() {
-            return (false, owning_key);
         }
-        // compile.py:780-781: GUARD_VALUE per-value hash.
-        // hash = current_object_addr_as_int(self) * 777767777 + intval * 1442968193
-        // guard_hash (from fetch_next_hash) serves as the unique guard
-        // identity, same role as RPython's descriptor address.
-        let hash = if let Some((idx, _tp)) = info.per_value {
-            let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
-            info.guard_hash
+        // compile.py:741-751: decode status to get hash
+        let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
+            // compile.py:745: common case — TY_NONE, not busy.
+            // The status itself is the jitcounter hash.
+            status
+        } else if status & Self::ST_BUSY_FLAG != 0 {
+            // compile.py:750-751: already busy tracing.
+            return (false, owning_key);
+        } else {
+            // compile.py:753-781: GUARD_VALUE — extract index + type tag,
+            // compute per-value hash from the actual fail arg value.
+            let index = (status >> Self::ST_SHIFT) as u32;
+            let typetag = status & Self::ST_TYPE_MASK;
+            let raw = fail_values.get(index as usize).copied().unwrap_or(0);
+            // compile.py:761-771: gethash_fast(floatval) = float2longlong
+            // On 64-bit, float2longlong is just the raw bit pattern as i64.
+            let intval: i64 = match typetag {
+                Self::TY_INT => raw,
+                Self::TY_REF => raw,
+                Self::TY_FLOAT => raw, // float2longlong: raw bits
+                _ => raw,
+            };
+            // compile.py:780-781: current_object_addr_as_int(self) * 777767777
+            //   + intval * 1442968193
+            (descr_addr as u64)
                 .wrapping_mul(777767777)
                 .wrapping_add((intval as u64).wrapping_mul(1442968193))
-        } else {
-            info.guard_hash
         };
+        if Self::stack_almost_full() {
+            return (false, owning_key);
+        }
         // compile.py:783-784: jitcounter.tick(hash, increment)
         let fired = self.warm_state.tick_guard_failure(hash);
         if fired && crate::majit_log_enabled() {
@@ -5052,20 +4849,46 @@ impl<M: Clone> MetaInterp<M> {
         // TODO: implement loop aging when memory_manager is added.
     }
 
-    /// compile.py:786-795: start_compiling / done_compiling — set/clear
-    /// ST_BUSY_FLAG on a guard's GuardFailureInfo.
-    pub fn set_guard_compiling(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        compiling: bool,
-    ) {
-        let owning_key = self.find_owning_key(green_key, trace_id);
-        if let Some(compiled) = self.compiled_loops.get_mut(&owning_key) {
-            let tid = Self::normalize_trace_id(compiled, trace_id);
-            if let Some(info) = compiled.guard_failures.get_mut(&(tid, fail_index)) {
-                info.compiling = compiling;
+    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
+    /// RPython: self.start_compiling() on the failed descriptor itself.
+    /// Search current token + previous_tokens by trace_id to find the
+    /// exact descriptor that failed (not just the current token's).
+    pub fn start_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+            // Try current token first, then previous_tokens.
+            if self
+                .backend
+                .start_guard_compiling(&compiled.token, trace_id, fail_index)
+            {
+                return;
+            }
+            for prev in &compiled.previous_tokens {
+                if self
+                    .backend
+                    .start_guard_compiling(prev, trace_id, fail_index)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG on descriptor.
+    pub fn done_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+            if self
+                .backend
+                .done_guard_compiling(&compiled.token, trace_id, fail_index)
+            {
+                return;
+            }
+            for prev in &compiled.previous_tokens {
+                if self
+                    .backend
+                    .done_guard_compiling(prev, trace_id, fail_index)
+                {
+                    return;
+                }
             }
         }
     }
@@ -5646,16 +5469,6 @@ impl<M: Clone> MetaInterp<M> {
                             trace_id
                         }
                     };
-                    compiled
-                        .guard_failures
-                        .entry((source_trace_id, fail_index))
-                        .or_insert_with(|| GuardFailureInfo {
-                            guard_hash: source_trace_id
-                                ^ (fail_index as u64).wrapping_mul(777767777),
-                            compiling: false,
-                            per_value: None,
-                            copied_from: None,
-                        });
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(
                             bridge_inputargs,
@@ -6067,77 +5880,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
 
-        // compile.py:826-830: store_hash — ALL guards get a counter hash.
-        // compile.py:813-824: make_a_counter_per_value — GUARD_VALUE gets
-        // per-value counting on first failure.
-        {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-            let info = compiled
-                .guard_failures
-                .entry((norm_tid, fail_index))
-                .or_insert_with(|| GuardFailureInfo {
-                    guard_hash: Self::stable_guard_hash(green_key, norm_tid, fail_index),
-                    compiling: false,
-                    per_value: None,
-                    copied_from: None,
-                });
-            // compile.py:813-824: GUARD_VALUE per-value setup
-            if info.per_value.is_none() {
-                if let Some(guard_op_idx) = compiled
-                    .traces
-                    .get(&norm_tid)
-                    .and_then(|t| t.guard_op_indices.get(&fail_index).copied())
-                {
-                    if let Some(guard_op) = compiled
-                        .traces
-                        .get(&norm_tid)
-                        .and_then(|t| t.ops.get(guard_op_idx))
-                    {
-                        if guard_op.opcode == OpCode::GuardValue {
-                            if let Some(ref fa) = guard_op.fail_args {
-                                let arg0 = guard_op.arg(0);
-                                let idx = fa.iter().position(|&r| r == arg0);
-                                if let Some(idx) = idx {
-                                    let tp = typed_fail_values
-                                        .and_then(|tv| tv.get(idx))
-                                        .map(|v| v.get_type())
-                                        .unwrap_or(Type::Int);
-                                    info.per_value = Some((idx as u32, tp));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // compile.py:738-784: must_compile — tick counter and check threshold.
-        // For GUARD_VALUE: per-value hash. For all others: per-guard hash.
-        let action = {
-            let compiled = self.compiled_loops.get(&green_key).unwrap();
-            let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-            // compile.py:738-784: must_compile
-            // Guard counter tick happens in must_compile_with_values
-            // (the single tick point, matching RPython compile.py:784).
-            // This path only checks if the guard is ready for compilation.
-            let must_compile = compiled
-                .guard_failures
-                .get(&(norm_tid, fail_index))
-                .is_some_and(|info| {
-                    !info.compiling
-                        && !Self::stack_almost_full()
-                        && self.warm_state.counter.would_fire_with_increment(
-                            info.guard_hash,
-                            self.warm_state.increment_trace_eagerness(),
-                        )
-                });
-            if must_compile {
-                GuardRecoveryAction::CompileBridge
-            } else {
-                GuardRecoveryAction::ResumeInterpreter
-            }
-        };
+        let action = GuardRecoveryAction::ResumeInterpreter;
 
         Some(GuardRecovery {
             trace_id,
@@ -7368,7 +7111,7 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-                guard_failures: HashMap::new(),
+
                 traces,
                 previous_tokens: Vec::new(),
             },
@@ -7811,7 +7554,7 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-                guard_failures: HashMap::new(),
+
                 traces,
                 previous_tokens: Vec::new(),
             },
@@ -7920,7 +7663,7 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-                guard_failures: HashMap::new(),
+
                 traces,
                 previous_tokens: Vec::new(),
             },
@@ -8219,7 +7962,7 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-                guard_failures: HashMap::new(),
+
                 traces,
                 previous_tokens: Vec::new(),
             },
@@ -9350,7 +9093,7 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-                guard_failures: HashMap::new(),
+
                 traces,
                 previous_tokens: Vec::new(),
             },
