@@ -138,11 +138,13 @@ fn analyze_pipeline_from_parsed(
             parsed,
             &program.struct_fields,
             &program.fn_return_types,
+            &program.known_struct_names,
         ));
         canonical_inherent_methods.extend(parse::extract_inherent_impl_methods(
             parsed,
             &program.struct_fields,
             &program.fn_return_types,
+            &program.known_struct_names,
         ));
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
@@ -186,7 +188,7 @@ fn analyze_pipeline_from_parsed(
         for (struct_name, fields) in &program.struct_fields.fields {
             let layout = call::StructLayout::from_type_strings(
                 fields,
-                &program.known_struct_names,
+                &std::collections::HashSet::new(),
                 &known_sizes,
             );
             if known_sizes.get(struct_name) != Some(&layout.size) {
@@ -202,7 +204,7 @@ fn analyze_pipeline_from_parsed(
     for (struct_name, fields) in &program.struct_fields.fields {
         let layout = call::StructLayout::from_type_strings(
             fields,
-            &program.known_struct_names,
+            &std::collections::HashSet::new(),
             &known_sizes,
         );
         call_control.set_struct_layout(struct_name.clone(), layout);
@@ -330,7 +332,13 @@ fn analyze_pipeline_from_parsed(
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
-                    "gc_effects" => call_control.mark_external_gc_effects(p.clone()),
+                    // RPython: random_effects_on_gcobjs is on external funcobj only.
+                    // Only register for paths WITHOUT a graph (external functions).
+                    "gc_effects" => {
+                        if !call_control.function_graphs().contains_key(p) {
+                            call_control.mark_external_gc_effects(p.clone());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -772,7 +780,14 @@ mod tests {
         let empty_frt = std::collections::HashMap::new();
         let trait_impls: Vec<_> = parsed_files
             .iter()
-            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf, &empty_frt))
+            .flat_map(|p| {
+                parse::extract_trait_impls(
+                    p,
+                    &empty_sf,
+                    &empty_frt,
+                    &std::collections::HashSet::new(),
+                )
+            })
             .collect();
 
         eprintln!("=== Multi-file Analysis ===");
@@ -1217,11 +1232,13 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1278,11 +1295,13 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1327,11 +1346,13 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1383,11 +1404,13 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1431,11 +1454,13 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let function_graphs = std::collections::HashMap::new();
         let handler_calls = vec![parse::ExtractedHandlerCall::Method {
@@ -1483,7 +1508,14 @@ mod tests {
         let empty_frt2 = std::collections::HashMap::new();
         let trait_impls: Vec<TraitImplInfo> = parsed_files
             .iter()
-            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf2, &empty_frt2))
+            .flat_map(|p| {
+                parse::extract_trait_impls(
+                    p,
+                    &empty_sf2,
+                    &empty_frt2,
+                    &std::collections::HashSet::new(),
+                )
+            })
             .collect();
         for impl_info in &trait_impls {
             let impl_type = impl_info
