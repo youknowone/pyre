@@ -2165,13 +2165,14 @@ fn jit_ca_handle_guard_failure(
     let raw_values = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
 
     // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
-    let (should_bridge, owning_key) = {
+    let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().must_compile_with_values(
             green_key, trace_id, fail_index, raw_values, status, descr_addr,
         )
     };
-    if !should_bridge {
+    // compile.py:702-703: must_compile() and not stack_almost_full()
+    if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
         return false;
     }
 
@@ -2183,11 +2184,13 @@ fn jit_ca_handle_guard_failure(
     }
 
     // compile.py:719-726: get exit_layout from the compiled trace.
+    // Use owning_key (not green_key) — after retrace the descriptor
+    // may belong to a different compiled entry than green_key.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp()
-            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .get_compiled_exit_layout_in_trace(owning_key, trace_id, fail_index)
     };
     let Some(exit_layout) = exit_layout else {
         return false;

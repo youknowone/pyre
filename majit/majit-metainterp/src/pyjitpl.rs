@@ -4786,6 +4786,9 @@ impl<M: Clone> MetaInterp<M> {
 
     /// compile.py:738-784: must_compile — read status from descriptor,
     /// compute hash, tick jitcounter.
+    ///
+    /// RPython: must_compile ALWAYS ticks the counter. stack_almost_full
+    /// is checked by the caller in handle_fail (compile.py:702-703).
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
         &mut self,
@@ -4814,8 +4817,7 @@ impl<M: Clone> MetaInterp<M> {
             let index = (status >> Self::ST_SHIFT) as u32;
             let typetag = status & Self::ST_TYPE_MASK;
             let raw = fail_values.get(index as usize).copied().unwrap_or(0);
-            // compile.py:761-771: gethash_fast(floatval) = float2longlong
-            // On 64-bit, float2longlong is just the raw bit pattern as i64.
+            // compile.py:761-771
             let intval: i64 = match typetag {
                 Self::TY_INT => raw,
                 Self::TY_REF => raw,
@@ -4828,10 +4830,9 @@ impl<M: Clone> MetaInterp<M> {
                 .wrapping_mul(777767777)
                 .wrapping_add((intval as u64).wrapping_mul(1442968193))
         };
-        if Self::stack_almost_full() {
-            return (false, owning_key);
-        }
         // compile.py:783-784: jitcounter.tick(hash, increment)
+        // NOTE: tick always runs. stack_almost_full is checked by caller
+        // (compile.py:702-703: must_compile() and not stack_almost_full()).
         let fired = self.warm_state.tick_guard_failure(hash);
         if fired && crate::majit_log_enabled() {
             eprintln!(
@@ -5815,6 +5816,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `handle_guard_failure_in_trace()` variant that also carries backend savedata.
+    ///
     pub fn handle_guard_failure_in_trace_with_savedata(
         &mut self,
         green_key: u64,
