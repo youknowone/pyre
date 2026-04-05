@@ -1615,7 +1615,10 @@ pub fn export_state(
             info
         })
         .collect();
-    let (slot_schedule, numnotvirtuals) = build_export_slot_schedule(&state, oprefs, ctx);
+    // Sequential slots: each leaf gets a unique slot.
+    // import_virtual_state_from_label_args uses a sequential label_slot
+    // counter, so export must match — no cache-based dedup.
+    let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&state);
     VirtualState::new_with_slot_schedule(state, slot_schedule, numnotvirtuals)
 }
 
@@ -1832,98 +1835,6 @@ fn append_sequential_slots(
         | VirtualStateInfo::Unknown => {
             schedule.push(*next_slot);
             *next_slot += 1;
-        }
-    }
-}
-
-fn build_export_slot_schedule(
-    state: &[VirtualStateInfo],
-    oprefs: &[OpRef],
-    ctx: &OptContext,
-) -> (Vec<usize>, usize) {
-    let mut cache: HashMap<OpRef, usize> = HashMap::new();
-    let mut schedule = Vec::new();
-    let mut next_slot = 0usize;
-    for (info, &opref) in state.iter().zip(oprefs.iter()) {
-        append_export_slots(info, opref, ctx, &mut cache, &mut schedule, &mut next_slot);
-    }
-    (schedule, next_slot)
-}
-
-fn append_export_slots(
-    info: &VirtualStateInfo,
-    opref: OpRef,
-    ctx: &OptContext,
-    cache: &mut HashMap<OpRef, usize>,
-    schedule: &mut Vec<usize>,
-    next_slot: &mut usize,
-) {
-    match info {
-        VirtualStateInfo::Constant(_) => {}
-        VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
-            let resolved = ctx.get_box_replacement(opref);
-            let ptr_info = ctx.get_ptr_info(resolved);
-            for (field_idx, child) in fields {
-                let field_ref = ptr_info
-                    .and_then(|pi| pi.getfield(*field_idx))
-                    .map(|field| ctx.get_box_replacement(field))
-                    .unwrap_or(OpRef::NONE);
-                append_export_slots(child, field_ref, ctx, cache, schedule, next_slot);
-            }
-        }
-        VirtualStateInfo::VArray { items, .. } => {
-            let resolved = ctx.get_box_replacement(opref);
-            let ptr_info = ctx.get_ptr_info(resolved);
-            for (index, child) in items.iter().enumerate() {
-                let item_ref = ptr_info
-                    .and_then(|pi| pi.getitem(index))
-                    .map(|item| ctx.get_box_replacement(item))
-                    .unwrap_or(OpRef::NONE);
-                append_export_slots(child, item_ref, ctx, cache, schedule, next_slot);
-            }
-        }
-        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
-            let resolved = ctx.get_box_replacement(opref);
-            let ptr_info = ctx.get_ptr_info(resolved);
-            let mut flat_index = 0usize;
-            for fields in element_fields {
-                for (_, child) in fields {
-                    let item_ref = ptr_info
-                        .and_then(|pi| pi.getitem(flat_index))
-                        .map(|item| ctx.get_box_replacement(item))
-                        .unwrap_or(OpRef::NONE);
-                    append_export_slots(child, item_ref, ctx, cache, schedule, next_slot);
-                    flat_index += 1;
-                }
-            }
-        }
-        VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-            let resolved = ctx.get_box_replacement(opref);
-            let ptr_info = ctx.get_ptr_info(resolved);
-            for (index, (_, _, child)) in entries.iter().enumerate() {
-                let entry_ref = ptr_info
-                    .and_then(|pi| match pi {
-                        PtrInfo::VirtualRawBuffer(vinfo) => {
-                            vinfo.entries.get(index).map(|(_, _, value)| *value)
-                        }
-                        _ => None,
-                    })
-                    .map(|entry| ctx.get_box_replacement(entry))
-                    .unwrap_or(OpRef::NONE);
-                append_export_slots(child, entry_ref, ctx, cache, schedule, next_slot);
-            }
-        }
-        VirtualStateInfo::KnownClass { .. }
-        | VirtualStateInfo::NonNull
-        | VirtualStateInfo::IntBounded(_)
-        | VirtualStateInfo::Unknown => {
-            let resolved = ctx.get_box_replacement(opref);
-            let slot = *cache.entry(resolved).or_insert_with(|| {
-                let slot = *next_slot;
-                *next_slot += 1;
-                slot
-            });
-            schedule.push(slot);
         }
     }
 }
