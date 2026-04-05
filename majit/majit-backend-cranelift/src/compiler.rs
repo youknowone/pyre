@@ -6168,19 +6168,22 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardClass => {
-                    // pyre convention: GuardClass arg0 is the ob_type value
-                    // (already extracted by GetfieldGcPureI or constant-folded).
-                    // Direct comparison: ob_type == expected_class.
-                    // Note: GuardNonnullClass takes the OBJECT as arg0 and the
-                    // backend loads ob_type. GuardClass is always post-extraction.
+                    // llgraph/runner.py:1245-1251 execute_guard_class:
+                    //   value = cast_opaque_ptr(OBJECTPTR, arg)
+                    //   if value.typeptr != expected_class: fail_guard
+                    // arg0 = object box, arg1 = expected class pointer.
+                    // Load typeptr from object (offset 0), compare.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let (a, b) = resolve_binop(&mut builder, &constants, op);
+                    let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
                     let exit_block = builder.create_block();
                     let cont_block = builder.create_block();
 
-                    let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
+                    let actual_class = builder.ins().load(ptr_type, MemFlags::trusted(), obj, 0);
+                    let neq = builder
+                        .ins()
+                        .icmp(IntCC::NotEqual, actual_class, expected_class);
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
@@ -9704,6 +9707,17 @@ fn collect_guards(
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
         let descr = Arc::new(descr);
+        // compile.py:826-830 store_hash: assign unique jitcounter slot.
+        // RPython calls store_hash inside store_final_boxes at compile time.
+        if !is_finish && !is_external_jump {
+            static NEXT_GUARD_HASH: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let hash = NEXT_GUARD_HASH.fetch_add(
+                1 | (1u64 << 21) | (1u64 << 5), // counter.py:151 increment
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            descr.store_hash(hash);
+        }
         // assembler.py:2126 get_gcref_from_faildescr parity:
         // store the FailDescr pointer (not index) in jf_descr.
         let fail_descr_ptr = Arc::as_ptr(&descr) as i64;

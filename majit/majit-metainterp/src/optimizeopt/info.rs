@@ -235,6 +235,26 @@ impl PtrInfo {
         if pos < 0 { None } else { Some(pos as usize) }
     }
 
+    /// Raw last_guard_pos value as i32 (-1 if none).
+    pub fn last_guard_pos(&self) -> Option<i32> {
+        let pos = match self {
+            PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos,
+            PtrInfo::KnownClass { last_guard_pos, .. } => *last_guard_pos,
+            PtrInfo::Instance(i) => i.last_guard_pos,
+            PtrInfo::Struct(s) => s.last_guard_pos,
+            PtrInfo::Array(a) => a.last_guard_pos,
+            PtrInfo::Virtual(v) => v.last_guard_pos,
+            PtrInfo::VirtualArray(v) => v.last_guard_pos,
+            PtrInfo::VirtualStruct(v) => v.last_guard_pos,
+            PtrInfo::VirtualArrayStruct(v) => v.last_guard_pos,
+            PtrInfo::VirtualRawBuffer(v) => v.last_guard_pos,
+            PtrInfo::Virtualizable(v) => v.last_guard_pos,
+            PtrInfo::Str(s) => s.last_guard_pos,
+            PtrInfo::Constant(_) => return None,
+        };
+        Some(pos)
+    }
+
     /// info.py:111-118: mark_last_guard
     pub fn set_last_guard_pos(&mut self, pos: i32) {
         match self {

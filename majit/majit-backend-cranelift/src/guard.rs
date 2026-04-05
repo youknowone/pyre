@@ -125,6 +125,11 @@ pub struct CraneliftFailDescr {
     pub trace_info: UnsafeCell<Option<CompiledTraceInfo>>,
     /// Write-once during bridge compilation, read-only after.
     pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
+    /// compile.py:688-692 ResumeGuardDescr.status:
+    /// Stores jitcounter hash (from store_hash / fetch_next_hash).
+    /// Used by must_compile() to tick the guard's counter slot.
+    /// Assigned at compile time, read at guard failure time.
+    pub status: std::sync::atomic::AtomicU64,
     /// Number of times this guard has failed (for bridge compilation heuristics).
     pub fail_count: AtomicU32,
     /// schedule.py:654-655 / history.py:143-147 — vector guard metadata
@@ -236,6 +241,7 @@ impl CraneliftFailDescr {
             force_token_slots,
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
+            status: std::sync::atomic::AtomicU64::new(0),
             fail_count: AtomicU32::new(0),
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
@@ -290,6 +296,18 @@ impl CraneliftFailDescr {
         unsafe { *self.bridge.get() = Some(bridge) };
         self.bridge_code_ptr_cache
             .store(code_ptr, std::sync::atomic::Ordering::Release);
+    }
+
+    /// compile.py:826-830 store_hash: assign a unique jitcounter hash.
+    /// Called at compile time, matching RPython's store_final_boxes path.
+    pub fn store_hash(&self, hash: u64) {
+        self.status
+            .store(hash, std::sync::atomic::Ordering::Release);
+    }
+
+    /// compile.py:741-745: read hash from status for must_compile.
+    pub fn get_status_hash(&self) -> u64 {
+        self.status.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Take the bridge data out of this fail descriptor, leaving None.
@@ -387,6 +405,10 @@ impl FailDescr for CraneliftFailDescr {
 
     fn vector_info(&self) -> Vec<AccumVectorInfo> {
         self.vector_info.clone()
+    }
+
+    fn get_status_hash(&self) -> u64 {
+        self.get_status_hash()
     }
 }
 

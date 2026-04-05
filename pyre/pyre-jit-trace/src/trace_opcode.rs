@@ -1435,10 +1435,9 @@ impl MIFrame {
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
         self.record_guard(ctx, OpCode::GuardNonnullClass, &[obj, expected_type_const]);
+        // heapcache.py:470-473: class_now_known sets class + nullity.
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(expected_type as usize));
-        // GuardNonnullClass implies non-null
-        ctx.heap_cache_mut().nullity_now_known(obj, true);
     }
 
     fn trace_guarded_int_payload(&mut self, ctx: &mut TraceCtx, int_obj: OpRef) -> OpRef {
@@ -2020,11 +2019,9 @@ impl MIFrame {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             // Unbox a float object to raw f64.
             let unbox_float = |this: &mut MIFrame, ctx: &mut TraceCtx, obj: OpRef| -> OpRef {
-                if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
-                    let ob_type =
-                        trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
+                if !ctx.heap_cache().is_class_known(obj) {
                     let type_const = ctx.const_int(float_type_addr);
-                    this.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+                    this.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
                     ctx.heap_cache_mut()
                         .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
                 }
@@ -3960,16 +3957,8 @@ impl MIFrame {
         if !self.sym().last_exc_value.is_null() {
             let exc_obj = self.sym().last_exc_value;
 
-            // RPython parity: deterministic raise (opimpl_raise set
-            // class_of_last_exc_is_const=true) needs no GUARD_EXCEPTION.
-            if self.sym().class_of_last_exc_is_const {
-                let exc_box = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
-                self.sym_mut().last_exc_box = exc_box;
-                return self.finishframe_exception(code, pc);
-            }
-
-            // pyjitpl.py:3383: GUARD_EXCEPTION(exception_class)
-            // Residual call raised — need guard to check exception type.
+            // pyjitpl.py:3382-3384: ALWAYS emit GUARD_EXCEPTION first,
+            // regardless of class_of_last_exc_is_const.
             let exc_type_ptr = unsafe {
                 (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
                     .ob_header
@@ -4054,10 +4043,20 @@ impl MIFrame {
                 op
             });
 
-            // pyjitpl.py:3386-3389: last_exc_box = guard op result.
-            self.sym_mut().last_exc_box = guard_op;
-
-            // pyjitpl.py:3390
+            // pyjitpl.py:3385-3392:
+            //   val = cast_opaque_ptr(GCREF, self.last_exc_value)
+            //   if self.class_of_last_exc_is_const:
+            //       self.last_exc_box = ConstPtr(val)
+            //   else:
+            //       self.last_exc_box = op
+            //       op.setref_base(val)
+            //   self.class_of_last_exc_is_const = True
+            if self.sym().class_of_last_exc_is_const {
+                let exc_box = self.with_ctx(|_this, ctx| ctx.const_ref(exc_obj as i64));
+                self.sym_mut().last_exc_box = exc_box;
+            } else {
+                self.sym_mut().last_exc_box = guard_op;
+            }
             self.sym_mut().class_of_last_exc_is_const = true;
 
             self.finishframe_exception(code, pc)
@@ -5340,9 +5339,10 @@ impl OpcodeStepExecutor for MIFrame {
         if argc >= 2 {
             let _cause = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         }
-        // pyjitpl.py:1690-1693: GUARD_CLASS on the exception value.
-        // guard_object_class skips the guard if heapcache already knows
-        // the class (pyjitpl.py:1690 is_class_known check).
+        // pyjitpl.py:1688-1693 opimpl_raise:
+        //   if not heapcache.is_class_known(exc_value_box):
+        //       clsbox = cls_of_box(exc_value_box)
+        //       generate_guard(GUARD_CLASS, exc_value_box, clsbox, resumepc=orgpc)
         let concrete_exc = exc_val.concrete.to_pyobj();
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
@@ -5351,11 +5351,14 @@ impl OpcodeStepExecutor for MIFrame {
                     .ob_type
             };
             self.with_ctx(|this, ctx| {
-                // pyjitpl.py:1690-1693: GUARD_CLASS only if class unknown.
-                // RPython parity: no residual call — the metainterp sets
-                // class_of_last_exc_is_const and handle_possible_exception
-                // skips GUARD_EXCEPTION for deterministic raises.
-                this.guard_object_class(ctx, exc_val.opref, exc_class_ptr);
+                // pyjitpl.py:1690-1693: generate_guard(GUARD_CLASS,
+                // exc_value_box, clsbox, resumepc=orgpc).
+                if !ctx.heap_cache().is_class_known(exc_val.opref) {
+                    let cls_const = ctx.const_int(exc_class_ptr as usize as i64);
+                    this.record_guard(ctx, OpCode::GuardClass, &[exc_val.opref, cls_const]);
+                    ctx.heap_cache_mut()
+                        .class_now_known(exc_val.opref, majit_ir::GcRef(exc_class_ptr as usize));
+                }
             });
         }
         // RPython pyjitpl.py:2745 execute_ll_raised: store concrete

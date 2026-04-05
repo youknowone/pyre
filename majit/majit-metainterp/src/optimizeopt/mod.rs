@@ -1471,9 +1471,14 @@ impl OptContext {
     /// get_box_replacement stopping at _forwarded=Info).
     /// info.py:111-118: mark_last_guard — record the last guard position
     /// on the PtrInfo for an OpRef. RPython: opinfo.mark_last_guard(optimizer).
+    /// info.py:111-118: mark_last_guard.
+    /// RPython stores `len(_newoperations) - 1` (index) because
+    /// postprocess runs after emit. In majit, last_guard_pos stores
+    /// `op.pos` (unique guard identity) because postprocess logic is
+    /// inlined before emit in the multi-pass pipeline.
     pub fn mark_last_guard(&mut self, opref: OpRef) {
         let pos = match self.new_operations.last() {
-            Some(op) if op.opcode.is_guard() => (self.new_operations.len() - 1) as i32,
+            Some(op) if op.opcode.is_guard() => op.pos.0 as i32,
             _ => return,
         };
         if let Some(info) = self.get_ptr_info_mut(opref) {
@@ -1481,10 +1486,13 @@ impl OptContext {
         }
     }
 
-    /// info.py:100-103: get_last_guard — retrieve the last guard op via PtrInfo.
+    /// info.py:100-103: get_last_guard — retrieve the last guard op.
+    /// Searches by op.pos (guard identity), not by index.
     pub fn get_last_guard(&self, opref: OpRef) -> Option<&Op> {
-        let pos = self.get_ptr_info(opref)?.get_last_guard_pos()?;
-        self.new_operations.get(pos)
+        let guard_pos = self.get_ptr_info(opref)?.get_last_guard_pos()?;
+        self.new_operations
+            .iter()
+            .find(|op| op.pos.0 == guard_pos as u32 && op.opcode.is_guard())
     }
 
     /// resoperation.py:57-68 get_box_replacement: follow the forwarding
@@ -2408,6 +2416,23 @@ impl OptContext {
                 last_guard_pos: -1,
             }),
         );
+    }
+
+    /// rewrite.py:434-435: isinstance(old_guard_op.getdescr(),
+    /// compile.ResumeAtPositionDescr).
+    ///
+    /// RPython uses _newoperations index (info.py:100-103). In majit,
+    /// last_guard_pos stores op.pos (guard identity, see rewrite.rs
+    /// postprocess_GUARD_CLASS comment), so we search by op.pos.
+    pub fn is_resume_at_position_guard(&self, guard_pos: i32) -> bool {
+        if guard_pos < 0 {
+            return false;
+        }
+        self.new_operations
+            .iter()
+            .find(|op| op.pos.0 == guard_pos as u32 && op.opcode.is_guard())
+            .and_then(|op| op.descr.as_ref())
+            .map_or(false, |descr| descr.is_resume_at_position())
     }
 
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
