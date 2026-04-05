@@ -2111,7 +2111,7 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(jf.get_exception_ref())
+    Ok(jf.grab_exc_value())
 }
 
 pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
@@ -2119,7 +2119,7 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(jf.get_exception_class())
+    Ok(jf.grab_exc_class())
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -9886,8 +9886,8 @@ impl majit_backend::Backend for CraneliftBackend {
                 exit_layout: Some(descr.fail_descr.layout()),
                 force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
                 savedata: descr.try_get_savedata_ref(),
-                exception_class: descr.get_exception_class(),
-                exception_value: descr.get_exception_ref(),
+                exception_class: descr.grab_exc_class(),
+                exception_value: descr.grab_exc_value(),
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
                 is_finish: descr.fail_descr.is_finish(),

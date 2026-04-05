@@ -545,7 +545,7 @@ impl JitFrameDeadFrame {
     }
 
     #[inline]
-    pub fn get_exception_ref(&self) -> GcRef {
+    pub fn grab_exc_value(&self) -> GcRef {
         GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
     }
 
@@ -554,8 +554,8 @@ impl JitFrameDeadFrame {
     ///   exc_class = ptr2int(exception_obj.typeptr) if exception_obj else 0
     /// Reads typeptr at offset 0 of jf_guard_exc (same as GUARD_CLASS).
     #[inline]
-    pub fn get_exception_class(&self) -> i64 {
-        let exc_ref = self.get_exception_ref();
+    pub fn grab_exc_class(&self) -> i64 {
+        let exc_ref = self.grab_exc_value();
         if exc_ref.is_null() {
             0
         } else {
