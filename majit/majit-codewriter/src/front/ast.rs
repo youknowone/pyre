@@ -189,7 +189,14 @@ fn collect_fields_and_returns(
                 }
             }
             Item::Fn(func) => {
-                if let Some(ret_ty) = return_type_string(&func.sig) {
+                // RPython: op.result.concretetype — module-qualified return type.
+                let ret_ty = match &func.sig.output {
+                    syn::ReturnType::Type(_, ty) => {
+                        qualified_full_type_string(ty, prefix, known_struct_names)
+                    }
+                    syn::ReturnType::Default => None,
+                };
+                if let Some(ret_ty) = ret_ty {
                     let key = if prefix.is_empty() {
                         func.sig.ident.to_string()
                     } else {
@@ -202,7 +209,13 @@ fn collect_fields_and_returns(
                 let self_ty_root = type_root_ident(&impl_block.self_ty);
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
-                        if let Some(ret_ty) = return_type_string(&method.sig) {
+                        let ret_ty = match &method.sig.output {
+                            syn::ReturnType::Type(_, ty) => {
+                                qualified_full_type_string(ty, prefix, known_struct_names)
+                            }
+                            syn::ReturnType::Default => None,
+                        };
+                        if let Some(ret_ty) = ret_ty {
                             if let Some(ref ty_root) = self_ty_root {
                                 let qualified_ty = qualify_type_name(ty_root, prefix);
                                 fn_return_types.insert(
@@ -1553,7 +1566,7 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
 /// This function qualifies single-segment leaf types that are KNOWN structs
 /// (in `known_struct_names`) with the module prefix, so `Bar` in `mod a`
 /// becomes `a::Bar`. Uses the actual struct name set, not a heuristic.
-fn qualified_full_type_string(
+pub(crate) fn qualified_full_type_string(
     ty: &syn::Type,
     prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
