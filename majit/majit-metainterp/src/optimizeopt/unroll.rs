@@ -453,6 +453,22 @@ impl UnrollOptimizer {
 
         let p2_ops =
             opt_p2.optimize_with_constants_and_inputs(&ops, &mut consts_p2, body_num_inputs);
+        // Phase 2 may discover new constants via make_constant (e.g., guard
+        // class pointers from collect_use_box_guards OpRef(10600+) range).
+        // Merge back into consts_p2 so the backend can resolve them.
+        if let Some(ref final_ctx) = opt_p2.final_ctx {
+            for (idx, val) in final_ctx.constants.iter().enumerate() {
+                if let Some(v) = val {
+                    let raw = match v {
+                        majit_ir::Value::Int(v) => *v,
+                        majit_ir::Value::Float(f) => f.to_bits() as i64,
+                        majit_ir::Value::Ref(r) => r.0 as i64,
+                        majit_ir::Value::Void => 0,
+                    };
+                    consts_p2.entry(idx as u32).or_insert(raw);
+                }
+            }
+        }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         // resume.py:570-574: collect per-guard optimizer knowledge from both phases.

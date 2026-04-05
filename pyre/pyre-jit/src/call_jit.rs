@@ -887,10 +887,9 @@ pub fn resume_in_blackhole(
         let vsd = section.vsd;
         let stack_only = vsd.saturating_sub(nlocals);
 
+        // jitcode.py:14 parity: is_portal is fixed per CodeObject
+        // (determined by transform_graph_to_jitcode from code.obj_name).
         let pyjitcode = crate::jit::codewriter::get_jitcode(code, &writer);
-        // RPython blackhole_from_resumedata does NOT pre-check for abort
-        // opcodes. If the blackhole hits BC_ABORT during execution, it
-        // sets bh.aborted=true and the _run_forever loop handles it.
         let jitcode_pc = if py_pc < pyjitcode.pc_map.len() {
             pyjitcode.pc_map[py_pc]
         } else {

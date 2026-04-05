@@ -2742,6 +2742,14 @@ fn build_resumed_frames(
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
+    // resume.py:1049 parity: consume_boxes(f.get_current_position_info(), ...)
+    // uses per-jitcode liveness (all_liveness from codewriter) to split
+    // multi-frame sections. Requires encoder and decoder to use the SAME
+    // liveness source. Currently pyre's encoder uses snapshot-based data
+    // while the JitCode liveness is a separate system. Until they are
+    // unified, use single-frame fallback (None) which works for all
+    // current single-function traces.
+    // TODO: unify rd_numb encoding with JitCode liveness for multi-frame.
     let (_num_failargs, vable_values, _vref_values, frames) =
         rebuild_from_numbering(rd_numb, rd_consts);
 

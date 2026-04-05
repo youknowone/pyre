@@ -461,30 +461,17 @@ impl Optimizer {
     }
 
     fn install_imported_virtuals(&self, ctx: &mut OptContext) {
-        // RPython: virtual field values come from the virtuals portion of
-        // short_args (= label_args + virtuals). Use imported_virtual_args
-        // which has (base_len, short_args) to start from the right offset.
-        // RPython: virtual field values are at positions AFTER the
-        // non-virtual args in the flattened boxes array from make_inputargs.
-        // label_slot starts at the number of non-virtual state entries.
+        // virtualstate.py:655-670 make_inputargs + 627-634 _enum parity:
+        // label_args are laid out by recursive _enum traversal where each
+        // NotVirtualStateInfo leaf gets a position_in_notvirtuals slot.
+        // Virtual states don't consume slots directly — their non-virtual
+        // FIELD sub-states do, interleaved with top-level non-virtual states.
+        // Traverse ALL states in order, advancing label_slot for each leaf.
         let imported_label_args = self
             .imported_label_args
             .as_ref()
             .expect("install_imported_virtuals requires imported_label_args");
-        // Count non-virtual top-level states to determine the starting slot
-        // for virtual field values. This matches RPython's position_in_notvirtuals.
-        let num_notvirtual = if let Some(ref exported) = self.imported_loop_state {
-            exported
-                .virtual_state
-                .state
-                .iter()
-                .filter(|s| !s.is_virtual())
-                .map(|s| crate::optimizeopt::virtualstate::VirtualState::count_forced_boxes_for_entry_static(s))
-                .sum()
-        } else {
-            0
-        };
-        let mut label_slot = num_notvirtual;
+        let mut label_slot = 0usize;
         if crate::optimizeopt::majit_log_enabled() {
             eprintln!(
                 "[jit] install_virt: label_slot={} label_args_len={} label_args={:?}",
@@ -518,41 +505,63 @@ impl Optimizer {
         // Track leaf field positions that need SameAs (position, entry_idx, field_idx).
         let mut same_as_targets: Vec<(OpRef, usize, usize)> = Vec::new();
 
-        for iv in &self.imported_virtuals {
-            let raw = OpRef(iv.inputarg_index as u32);
-            let virtual_head = ctx.get_box_replacement(raw);
-            let mut fields = Vec::new();
-            let mut field_descrs = Vec::new();
-            for (descr, field_info) in &iv.fields {
-                let field_ref = Self::import_virtual_state_from_label_args(
-                    field_info,
-                    imported_label_args,
-                    &mut label_slot,
-                    ctx,
-                );
-                let field_idx = fields.len();
-                // Record leaf field values that need SameAs protection.
-                if ctx.skip_flush_mode
-                    && !field_ref.is_none()
-                    && field_ref.0 < 10_000
-                    // Only for leaf values — Constant/Virtual heads already have
-                    // unique positions from alloc_op_position.
-                    && ctx.get_ptr_info(field_ref).map_or(true, |info| !info.is_virtual())
-                    && ctx.get_constant(field_ref).is_none()
-                {
-                    same_as_targets.push((field_ref, entries.len(), field_idx));
+        // RPython parity: traverse ALL states in order (not just virtuals).
+        // Non-virtual states advance label_slot without creating entries.
+        // Virtual states create entries with fields from label_args.
+        // Build a map from inputarg_index to imported_virtual for virtual lookup.
+        let iv_map: std::collections::HashMap<usize, &_> = self
+            .imported_virtuals
+            .iter()
+            .map(|iv| (iv.inputarg_index, iv))
+            .collect();
+        let all_states = self
+            .imported_loop_state
+            .as_ref()
+            .map(|s| &s.virtual_state.state[..])
+            .unwrap_or(&[]);
+        for (state_idx, state_info) in all_states.iter().enumerate() {
+            if let Some(iv) = iv_map.get(&state_idx) {
+                // Virtual state: process fields recursively, consuming slots
+                // for non-virtual leaf fields.
+                let raw = OpRef(iv.inputarg_index as u32);
+                let virtual_head = ctx.get_box_replacement(raw);
+                let mut fields = Vec::new();
+                let mut field_descrs = Vec::new();
+                for (descr, field_info) in &iv.fields {
+                    let field_ref = Self::import_virtual_state_from_label_args(
+                        field_info,
+                        imported_label_args,
+                        &mut label_slot,
+                        ctx,
+                    );
+                    let field_idx = fields.len();
+                    if ctx.skip_flush_mode
+                        && !field_ref.is_none()
+                        && field_ref.0 < 10_000
+                        && ctx
+                            .get_ptr_info(field_ref)
+                            .map_or(true, |info| !info.is_virtual())
+                        && ctx.get_constant(field_ref).is_none()
+                    {
+                        same_as_targets.push((field_ref, entries.len(), field_idx));
+                    }
+                    fields.push((descr.index(), field_ref));
+                    field_descrs.push((descr.index(), descr.clone()));
                 }
-                fields.push((descr.index(), field_ref));
-                field_descrs.push((descr.index(), descr.clone()));
+                entries.push(VirtualEntry {
+                    head: virtual_head,
+                    size_descr: iv.size_descr.clone(),
+                    fields,
+                    field_descrs,
+                    kind: iv.kind.clone(),
+                    head_load_descr_index: iv.head_load_descr_index,
+                });
+            } else {
+                // Non-virtual state: advance label_slot to match RPython's
+                // position_in_notvirtuals enumeration order.
+                let count = crate::optimizeopt::virtualstate::VirtualState::count_forced_boxes_for_entry_static(state_info);
+                label_slot += count;
             }
-            entries.push(VirtualEntry {
-                head: virtual_head,
-                size_descr: iv.size_descr.clone(),
-                fields,
-                field_descrs,
-                kind: iv.kind.clone(),
-                head_load_descr_index: iv.head_load_descr_index,
-            });
         }
 
         // Pass 2: allocate SameAs ops for leaf field values.
