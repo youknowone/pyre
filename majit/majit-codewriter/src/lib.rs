@@ -144,18 +144,30 @@ fn analyze_pipeline_from_parsed(
         call_control.register_function_graph(path.clone(), graph.clone());
     }
     // RPython: op.result.concretetype — register return types for Call result
-    // array identity resolution. Both bare functions and impl methods.
-    for func in &program.functions {
-        if let Some(ref ret_type) = func.return_type {
-            if let Some(ref owner) = func.self_ty_root {
-                // impl method: path = ["owner", "method_name"]
+    // array identity resolution. Register under ALL paths that
+    // canonical_function_graphs uses (e.g. ["foo"] AND ["crate", "foo"])
+    // so resolve_array_identity's target_to_path lookup never misses.
+    {
+        let return_type_by_name: std::collections::HashMap<&str, &str> = program
+            .functions
+            .iter()
+            .filter_map(|f| f.return_type.as_deref().map(|rt| (f.name.as_str(), rt)))
+            .collect();
+        for (path, _graph) in &canonical_function_graphs {
+            let func_name = path.segments.last().map(String::as_str).unwrap_or("");
+            if let Some(&ret_type) = return_type_by_name.get(func_name) {
+                call_control
+                    .return_types
+                    .insert(path.clone(), ret_type.to_string());
+            }
+        }
+        // impl methods: path = ["owner", "method_name"]
+        for func in &program.functions {
+            if let (Some(ret_type), Some(owner)) = (&func.return_type, &func.self_ty_root) {
                 let path =
                     crate::parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
                 call_control.return_types.insert(path, ret_type.clone());
             }
-            // Also register bare function path for free functions.
-            let path = crate::parse::CallPath::from_segments([func.name.as_str()]);
-            call_control.return_types.insert(path, ret_type.clone());
         }
     }
     for impl_info in &canonical_trait_impls {
