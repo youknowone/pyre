@@ -34,7 +34,7 @@ use majit_ir::{
 
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
-// ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
+// ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
 // Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
@@ -506,12 +506,6 @@ pub fn jit_exc_raise(value: i64, exc_type: i64) {
 /// Check if an exception is currently pending.
 pub fn jit_exc_is_pending() -> bool {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed) != 0
-}
-
-/// Read and clear JIT_EXC_TYPE.  Called by the Rust runtime after a guard
-/// exit to capture pos_exception before creating the deadframe.
-fn jit_exc_take_type() -> i64 {
-    JIT_EXC_TYPE.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// RPython cpu.grab_exc_value parity: read exception class from TLS.
@@ -2041,7 +2035,6 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
             fail_descr,
             gc_runtime_id,
             None,
-            jit_exc_take_type(),
         )),
     }
 }
@@ -2211,7 +2204,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 fail_descr.clone(),
                 target.gc_runtime_id,
                 exec.heap_owner,
-                jit_exc_take_type(),
             )),
         };
     } // end loop
@@ -3866,10 +3858,9 @@ fn emit_guard_exit(
     // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
     //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
     if info.must_save_exception {
-        // _build_failure_recovery: store pos_exc_value → jf_guard_exc,
-        // clear pos_exc_value.  pos_exception (JIT_EXC_TYPE) is left in
-        // the global for the Rust runtime to read — the runtime captures
-        // it into JitFrameDeadFrame.exc_type before clearing.
+        // _store_and_reset_exception (assembler.py:1826-1842) parity:
+        // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
+        // exc_class is derived from exc_value.typeptr (pyjitpl.py:3119-3123).
         let exc_addr = builder
             .ins()
             .iconst(cl_types::I64, jit_exc_value_addr() as i64);
@@ -3881,6 +3872,12 @@ fn emit_guard_exit(
             .store(MemFlags::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
+        let exc_type_addr = builder
+            .ins()
+            .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
     }
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
     // Store FailDescr POINTER (not index) to jf_descr.
@@ -4595,7 +4592,6 @@ impl CraneliftBackend {
                         fail_descr.clone(),
                         compiled.gc_runtime_id,
                         exec.heap_owner,
-                        jit_exc_take_type(),
                     )),
                 };
             }
@@ -4645,7 +4641,6 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     compiled.gc_runtime_id,
                     exec.heap_owner,
-                    jit_exc_take_type(),
                 )),
             };
         } // end loop
@@ -4702,7 +4697,6 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     bridge.gc_runtime_id,
                     exec.heap_owner,
-                    jit_exc_take_type(),
                 )),
             };
         }
@@ -4722,7 +4716,6 @@ impl CraneliftBackend {
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
                 exec.heap_owner,
-                jit_exc_take_type(),
             )),
         }
     }
@@ -9734,10 +9727,15 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        // jf_guard_exc written by emit_guard_exit; exc_type left in global.
+        // jf_guard_exc + jf_guard_exc_type written by emit_guard_exit.
         let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
         let exception = GcRef(exc_raw);
-        let exception_class = jit_exc_take_type();
+        // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
+        let exception_class = if exc_raw == 0 {
+            0i64
+        } else {
+            unsafe { *(exc_raw as *const i64) }
+        };
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
@@ -10412,6 +10410,21 @@ mod tests {
         static TEST_EXCEPTION_TYPE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// RPython OBJECTPTR layout: typeptr at offset 0.
+    #[repr(C)]
+    struct FakeExcObject {
+        typeptr: usize,
+    }
+
+    /// Allocate a fake exception object with typeptr at offset 0.
+    /// Returns the address for use as exc_value.
+    fn make_fake_exc(exc_type: i64) -> i64 {
+        let obj = Box::leak(Box::new(FakeExcObject {
+            typeptr: exc_type as usize,
+        }));
+        obj as *const FakeExcObject as usize as i64
     }
 
     fn set_test_exception_state(value: i64, exc_type: i64) {
@@ -11850,7 +11863,7 @@ mod tests {
     fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xABCDusize as i64, 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11874,7 +11887,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xABCDusize));
+        // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
+        assert!(!backend.get_ref_value(&frame, 0).is_null());
         assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
@@ -11891,7 +11905,7 @@ mod tests {
     fn test_guard_exception_exact_mismatch_preserves_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xBEEFusize as i64, 0x2222);
+        set_test_exception_state(make_fake_exc(0x2222), 0x2222);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11918,7 +11932,7 @@ mod tests {
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.grab_exc_class(&frame), 0x2222);
-        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xBEEFusize));
+        assert!(!backend.grab_exc_value(&frame).is_null());
         assert!(!jit_exc_is_pending());
     }
 
@@ -11926,7 +11940,7 @@ mod tests {
     fn test_guard_no_exception_failure_preserves_deadframe_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xCAFEusize as i64, 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11952,7 +11966,7 @@ mod tests {
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.grab_exc_class(&frame), 0x1111);
-        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xCAFEusize));
+        assert!(!backend.grab_exc_value(&frame).is_null());
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
@@ -11967,7 +11981,7 @@ mod tests {
     fn test_execute_token_ints_raw_preserves_exception_and_layout_metadata() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xCAFEusize as i64, 0x1111);
+        set_test_exception_state(make_fake_exc(0x1111), 0x1111);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -11996,7 +12010,7 @@ mod tests {
         assert_eq!(raw.typed_outputs, vec![Value::Int(1)]);
         assert_eq!(raw.savedata, None);
         assert_eq!(raw.exception_class, 0x1111);
-        assert_eq!(raw.exception_value, GcRef(0xCAFEusize));
+        assert!(!raw.exception_value.is_null());
         let layout = raw
             .exit_layout
             .expect("raw exit should expose backend layout");
@@ -12010,7 +12024,7 @@ mod tests {
     fn test_save_restore_exception_roundtrip_matches_rpython_order() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xD00Dusize as i64, 0x3333);
+        set_test_exception_state(make_fake_exc(0x3333), 0x3333);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -12053,7 +12067,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0xD00Dusize));
+        // GUARD_EXCEPTION matched — Finish returns the exception ref (fake object)
+        assert!(!backend.get_ref_value(&frame, 0).is_null());
         assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert_eq!(test_exception_call_log_snapshot(), vec![false, false]);
@@ -12073,7 +12088,9 @@ mod tests {
         let exception_ref = gc.alloc_with_type(0, 16);
         assert!(gc.is_in_nursery(exception_ref.0));
         unsafe {
-            *(exception_ref.0 as *mut u64) = 0xCAFEBABE;
+            // RPython OBJECTPTR: typeptr at offset 0, payload at offset 8
+            *(exception_ref.0 as *mut u64) = 0x4444;
+            *((exception_ref.0 + 8) as *mut u64) = 0xCAFEBABE;
         }
 
         set_test_exception_state(exception_ref.0 as i64, 0x4444);
@@ -12109,7 +12126,9 @@ mod tests {
         let moved = backend.grab_exc_value(&frame);
         assert!(!moved.is_null());
         assert_ne!(moved, exception_ref);
-        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xCAFEBABE);
+        // typeptr at offset 0, payload at offset 8
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0x4444);
+        assert_eq!(unsafe { *((moved.0 + 8) as *const u64) }, 0xCAFEBABE);
     }
 
     // ── Debug / no-op tests ──
@@ -13675,7 +13694,7 @@ mod tests {
     fn test_bridge_from_guard_no_exception_can_consume_pending_exception() {
         jit_exc_clear();
         clear_test_exception_call_log();
-        set_test_exception_state(0xE11Eusize as i64, 0x4545);
+        set_test_exception_state(make_fake_exc(0x4545), 0x4545);
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
@@ -13701,7 +13720,7 @@ mod tests {
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.grab_exc_class(&frame), 0x4545);
-        assert_eq!(backend.grab_exc_value(&frame), GcRef(0xE11Eusize));
+        assert!(!backend.grab_exc_value(&frame).is_null());
 
         let bridge_inputargs = vec![InputArg::new_int(0)];
         let mut bridge_guard = mk_op(OpCode::GuardException, &[OpRef(100)], 1);

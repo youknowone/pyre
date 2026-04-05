@@ -481,10 +481,6 @@ pub struct JitFrameDeadFrame {
     pub gc_runtime_id: Option<u64>,
     /// Keeps the frame memory alive for non-GC allocations.
     pub _heap_owner: Option<Vec<i64>>,
-    /// pos_exception (exc_type) captured from JIT_EXC_TYPE global after
-    /// guard exit.  Not stored in jf_frame — the jf_frame ABI matches
-    /// RPython's JITFRAME exactly (jf_frame_info at offset 0).
-    pub exc_type: i64,
 }
 
 /// Byte offset from JitFrame start to jf_frame[0].
@@ -493,18 +489,17 @@ const JF_FRAME_ITEM0_BYTES: usize = 64;
 const JF_SAVEDATA_BYTES: usize = 32;
 /// Byte offset to jf_guard_exc field.
 const JF_GUARD_EXC_BYTES: usize = 40;
+
 impl JitFrameDeadFrame {
     pub fn new(
         jf_gcref: GcRef,
         fail_descr: Arc<CraneliftFailDescr>,
         gc_runtime_id: Option<u64>,
         heap_owner: Option<Vec<i64>>,
-        exc_type: i64,
     ) -> Self {
         let mut frame = JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
-            exc_type,
             gc_runtime_id,
             _heap_owner: heap_owner,
         };
@@ -554,10 +549,15 @@ impl JitFrameDeadFrame {
         GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
     }
 
-    /// Read pos_exception (exc_type) captured from JIT_EXC_TYPE global.
+    /// pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
     #[inline]
     pub fn grab_exc_class(&self) -> i64 {
-        self.exc_type
+        let exc_ref = self.grab_exc_value();
+        if exc_ref.is_null() {
+            0
+        } else {
+            unsafe { *(exc_ref.0 as *const i64) }
+        }
     }
 }
 
