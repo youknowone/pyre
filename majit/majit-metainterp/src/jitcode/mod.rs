@@ -94,6 +94,8 @@ pub(crate) const BC_RERAISE: u8 = 78;
 pub(crate) const BC_INT_GUARD_VALUE: u8 = 79;
 /// pyjitpl.py opimpl_ref_guard_value: promote ref to constant via GUARD_VALUE.
 pub(crate) const BC_REF_GUARD_VALUE: u8 = 80;
+/// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
+pub(crate) const BC_JIT_MERGE_POINT: u8 = 81;
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// GC liveness metadata at a specific bytecode PC.

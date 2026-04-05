@@ -17,16 +17,16 @@ use super::{
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
     BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JUMP, BC_JUMP_TARGET,
-    BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
-    BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
-    BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REQUIRE_STACK,
-    BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY,
-    BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY, MIFrame,
-    MIFrameStack,
+    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE, BC_JIT_MERGE_POINT, BC_JUMP,
+    BC_JUMP_TARGET, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY,
+    BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I,
+    BC_POP_DISCARD, BC_POP_F, BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO,
+    BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
+    BC_REQUIRE_STACK, BC_RESIDUAL_CALL_VOID, BC_SET_SELECTED, BC_SETARRAYITEM_VABLE_F,
+    BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I,
+    BC_SETFIELD_VABLE_R, BC_STORE_DOWN, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
+    BC_STORE_STATE_VARRAY, BC_SWAP_STACK, JitArgKind, JitCallArg, JitCallTarget, JitCode,
+    MAX_HOST_CALL_ARITY, MIFrame, MIFrameStack,
 };
 use crate::{SymbolicStack, TraceAction, TraceCtx};
 
@@ -1740,10 +1740,21 @@ where
                     self.frames.current_mut().code_cursor = target;
                 }
             }
-            BC_JUMP_TARGET => {
+            BC_JIT_MERGE_POINT => {
+                // blackhole.py:1066 bhimpl_jit_merge_point parity.
+                // Portal merge point: close the loop if at the traced header.
                 let pc = self.frames.current_mut().pc;
-                // RPython parity: reached_loop_header checks ALL green keys.
-                // Only close if both pc AND selected match the header.
+                if runtime.label_at(pc) == sym.loop_header_pc()
+                    && (!sym.close_requires_header_selected()
+                        || sym.current_selected() == sym.header_selected())
+                {
+                    return TraceAction::CloseLoop;
+                }
+            }
+            BC_JUMP_TARGET => {
+                // Non-portal loop header marker (helper jitcodes only).
+                // Same CloseLoop check: helper inner loops may still close.
+                let pc = self.frames.current_mut().pc;
                 if runtime.label_at(pc) == sym.loop_header_pc()
                     && (!sym.close_requires_header_selected()
                         || sym.current_selected() == sym.header_selected())

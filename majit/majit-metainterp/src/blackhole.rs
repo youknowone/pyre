@@ -791,8 +791,8 @@ use crate::jitcode::{
     BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID,
     BC_COPY_FROM_BOTTOM, BC_DUP_STACK, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
     BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JUMP, BC_JUMP_TARGET, BC_LOAD_CONST_F,
-    BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
+    BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_JIT_MERGE_POINT, BC_JUMP, BC_JUMP_TARGET,
+    BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD,
     BC_LOAD_STATE_VARRAY, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PEEK_I, BC_POP_DISCARD, BC_POP_F,
     BC_POP_I, BC_POP_R, BC_PUSH_F, BC_PUSH_I, BC_PUSH_R, BC_PUSH_TO, BC_RAISE, BC_RECORD_BINOP_F,
     BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_REQUIRE_STACK,
@@ -1585,32 +1585,25 @@ impl BlackholeInterpreter {
                     );
                 }
                 if cond == 0 {
-                    if self.merge_point_jitcode_pc == Some(target) {
-                        self.position = target;
-                        self.reached_merge_point = true;
-                        return Err(DispatchError::LeaveFrame);
-                    }
                     self.position = target;
                 }
             }
             BC_JUMP => {
                 let target = self.next_u16() as usize;
-                if self.merge_point_jitcode_pc == Some(target) {
-                    self.position = target;
-                    self.reached_merge_point = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
                 self.position = target;
             }
-            BC_JUMP_TARGET => {
-                // blackhole.py:1066-1083 bhimpl_jit_merge_point parity:
-                // BC_JUMP_TARGET marks the loop header. When the blackhole
-                // reaches it (via fall-through after backward branch),
-                // check if this is the merge point to hand back to JIT.
+            BC_JIT_MERGE_POINT => {
+                // blackhole.py:1066 bhimpl_jit_merge_point.
+                // Portal merge point: merge_point_jitcode_pc selects the
+                // active merge point (pyre traces any loop header, unlike
+                // RPython's single jit_merge_point per portal).
                 if self.merge_point_jitcode_pc == Some(self.last_opcode_position) {
                     self.reached_merge_point = true;
                     return Err(DispatchError::LeaveFrame);
                 }
+            }
+            BC_JUMP_TARGET => {
+                // Non-portal loop header marker (helper jitcodes only).
             }
             BC_SET_SELECTED => {
                 self.current_selected = self.next_u16() as usize;
