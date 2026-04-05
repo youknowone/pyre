@@ -141,6 +141,10 @@ pub struct CraneliftFailDescr {
     pub bridge: UnsafeCell<Option<BridgeData>>,
     /// Atomic cache of bridge code_ptr for lock-free dispatch.
     pub bridge_code_ptr_cache: std::sync::atomic::AtomicUsize,
+    /// GC runtime that owns the compiled loop this guard belongs to.
+    /// Used by force() to register the JitFrame as a GC root without
+    /// relying on thread-local ACTIVE_GC_RUNTIME_ID.
+    pub gc_runtime_id: Option<u64>,
 }
 
 impl std::fmt::Debug for CraneliftFailDescr {
@@ -246,6 +250,7 @@ impl CraneliftFailDescr {
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
+            gc_runtime_id: None,
         }
     }
 
