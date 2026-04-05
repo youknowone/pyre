@@ -3780,7 +3780,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -3833,7 +3832,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -3882,7 +3880,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -3930,7 +3927,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
 
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -4057,7 +4053,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -4191,7 +4186,6 @@ impl<M: Clone> MetaInterp<M> {
                     per_value: None,
                     copied_from: None,
                 });
-            self.warm_state.tick_guard_failure(info.guard_hash);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] guard failure at key={}, guard={}",
@@ -4260,7 +4254,6 @@ impl<M: Clone> MetaInterp<M> {
                     copied_from: None,
                 });
             // compile.py:783-784: jitcounter.tick(hash, increment)
-            self.warm_state.tick_guard_failure(info.guard_hash);
             self.stats.guard_failures += 1;
             self.warm_state.log_guard_failure(fail_index);
 
@@ -6119,24 +6112,20 @@ impl<M: Clone> MetaInterp<M> {
         let action = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+            // compile.py:738-784: must_compile
+            // Guard counter tick happens in must_compile_with_values
+            // (the single tick point, matching RPython compile.py:784).
+            // This path only checks if the guard is ready for compilation.
             let must_compile = compiled
                 .guard_failures
                 .get(&(norm_tid, fail_index))
                 .is_some_and(|info| {
-                    if info.compiling || Self::stack_almost_full() {
-                        return false;
-                    }
-                    let hash = if let Some((idx, _tp)) = info.per_value {
-                        // compile.py:780-781: per-value hash for GUARD_VALUE
-                        let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
-                        info.guard_hash
-                            .wrapping_mul(777767777)
-                            .wrapping_add((intval as u64).wrapping_mul(1442968193))
-                    } else {
-                        // compile.py:753: generic guards use stored hash
-                        info.guard_hash
-                    };
-                    self.warm_state.tick_guard_failure(hash)
+                    !info.compiling
+                        && !Self::stack_almost_full()
+                        && self.warm_state.counter.would_fire_with_increment(
+                            info.guard_hash,
+                            self.warm_state.increment_trace_eagerness(),
+                        )
                 });
             if must_compile {
                 GuardRecoveryAction::CompileBridge
