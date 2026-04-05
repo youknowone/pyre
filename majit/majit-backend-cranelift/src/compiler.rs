@@ -1382,8 +1382,8 @@ pub fn register_call_assembler_blackhole(
 }
 
 /// compile.py:701-717 handle_fail callback for call_assembler guard failures.
-/// (green_key, trace_id, fail_index, raw_values_ptr, num_values) -> bridge_compiled.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> bool> =
+/// (green_key, trace_id, fail_index, raw_values_ptr, num_values, descr_addr) -> bridge_compiled.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize, usize) -> bool> =
     OnceLock::new();
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
@@ -1637,7 +1637,7 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize) -> bool) {
+pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2419,6 +2419,7 @@ extern "C" fn call_assembler_guard_failure(
             fail_index,
             outputs_ptr,
             raw_num,
+            Arc::as_ptr(fail_descr) as usize,
         ) {
             // Bridge compiled — dispatch with finish check.
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
@@ -9791,6 +9792,32 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
         false
+    }
+
+    fn read_descr_status(&self, descr_addr: usize) -> u64 {
+        if descr_addr == 0 {
+            return 0;
+        }
+        // Safety: descr_addr is Arc::as_ptr from a CraneliftFailDescr that is
+        // alive in compiled_loops or previous_tokens. AtomicU64 read is safe.
+        let descr = unsafe { &*(descr_addr as *const CraneliftFailDescr) };
+        descr.get_status()
+    }
+
+    fn start_compiling_descr(&self, descr_addr: usize) {
+        if descr_addr == 0 {
+            return;
+        }
+        let descr = unsafe { &*(descr_addr as *const CraneliftFailDescr) };
+        descr.start_compiling();
+    }
+
+    fn done_compiling_descr(&self, descr_addr: usize) {
+        if descr_addr == 0 {
+            return;
+        }
+        let descr = unsafe { &*(descr_addr as *const CraneliftFailDescr) };
+        descr.done_compiling();
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {

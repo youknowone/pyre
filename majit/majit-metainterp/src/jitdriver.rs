@@ -1238,6 +1238,7 @@ impl<S: JitState> JitDriver<S> {
             let trace_id = result.trace_id;
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
+            let descr_addr = result.descr_addr;
             let _exit_meta = result.meta.clone();
             drop(result);
 
@@ -1252,6 +1253,7 @@ impl<S: JitState> JitDriver<S> {
                 trace_id,
                 fail_index,
                 &raw_values,
+                descr_addr,
             );
             // compile.py:702-703: must_compile() and not stack_almost_full()
             let should_bridge =
@@ -2145,6 +2147,7 @@ impl<S: JitState> JitDriver<S> {
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
+        let descr_addr = result.descr_addr;
         drop(result);
 
         // memmgr.py:58-61: keep_loop_alive(loop_token)
@@ -2173,9 +2176,13 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (must_compile, owning_key) =
-            self.meta
-                .must_compile_with_values(guard_loop_key, trace_id, fail_index, &raw_values);
+        let (must_compile, owning_key) = self.meta.must_compile_with_values(
+            guard_loop_key,
+            trace_id,
+            fail_index,
+            &raw_values,
+            descr_addr,
+        );
         // compile.py:702-703: must_compile() and not stack_almost_full()
         let should_bridge =
             must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
@@ -2187,6 +2194,7 @@ impl<S: JitState> JitDriver<S> {
             trace_id,
             should_bridge,
             owning_key,
+            descr_addr,
             raw_values,
             exit_layout,
         }
@@ -2718,6 +2726,7 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = result.typed_values;
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
+            let descr_addr = result.descr_addr;
 
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
@@ -2756,17 +2765,20 @@ impl<S: JitState> JitDriver<S> {
             //       resume_in_blackhole(...)
             //   assert 0, "unreachable"
 
-            let (must_compile, _owning_key) =
-                self.meta
-                    .must_compile_with_values(key_hash, trace_id, fail_index, &raw_values);
+            let (must_compile, owning_key) = self.meta.must_compile_with_values(
+                key_hash,
+                trace_id,
+                fail_index,
+                &raw_values,
+                descr_addr,
+            );
             // compile.py:702-703: must_compile() and not stack_almost_full()
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
             // Extract guard_resume_pc from fail_args.
-            // The last Int value is the bytecode pc at the guard point,
-            // appended by jitcode or force_finish_trace segmenting.
-            let num_inputs = self.meta.compiled_num_inputs(key_hash);
+            // compile.py:800-809: use owning_key (rd_loop_token).
+            let num_inputs = self.meta.compiled_num_inputs(owning_key);
             let guard_resume_pc = if raw_values.len() > num_inputs {
                 raw_values[raw_values.len() - 1] as usize
             } else {
@@ -2782,7 +2794,7 @@ impl<S: JitState> JitDriver<S> {
                 self.sync_after(state, &result_meta, descriptor.as_ref());
 
                 let bridge_ok = self.start_bridge_tracing(
-                    key_hash, trace_id, fail_index, state, env, resume_pc, target_pc,
+                    owning_key, trace_id, fail_index, state, env, resume_pc, target_pc,
                 );
                 if crate::majit_log_enabled() {
                     eprintln!(

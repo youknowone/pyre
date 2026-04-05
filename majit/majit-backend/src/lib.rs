@@ -817,6 +817,26 @@ pub trait Backend: Send {
         false
     }
 
+    /// compile.py:741: self.status — read status from the failed descriptor
+    /// directly by its raw address (no re-lookup). RPython calls self.status
+    /// on the same descriptor object; descr_addr IS that object's identity.
+    ///
+    /// # Safety
+    /// descr_addr must be a valid pointer returned from a guard failure in
+    /// the same compilation session. The descriptor must still be alive
+    /// (held by compiled_loops or previous_tokens).
+    fn read_descr_status(&self, _descr_addr: usize) -> u64 {
+        0
+    }
+
+    /// compile.py:786-788: self.start_compiling() — on the exact failed
+    /// descriptor. Sets ST_BUSY_FLAG via the raw address.
+    fn start_compiling_descr(&self, _descr_addr: usize) {}
+
+    /// compile.py:790-795: self.done_compiling() — on the exact failed
+    /// descriptor. Clears ST_BUSY_FLAG via the raw address.
+    fn done_compiling_descr(&self, _descr_addr: usize) {}
+
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
 

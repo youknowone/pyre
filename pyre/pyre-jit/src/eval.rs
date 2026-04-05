@@ -1159,6 +1159,7 @@ fn handle_fail(
     fail_index: u32,
     should_bridge: bool,
     owning_key: u64,
+    descr_addr: usize,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -1170,13 +1171,10 @@ fn handle_fail(
             driver.is_tracing()
         };
         if !is_tracing {
-            // compile.py:704: start_compiling (set ST_BUSY_FLAG)
-            // RPython: self.start_compiling() — on the descriptor that failed.
+            // compile.py:704: self.start_compiling() (set ST_BUSY_FLAG)
             {
                 let (driver, _) = driver_pair();
-                driver
-                    .meta_interp_mut()
-                    .start_guard_compiling(owning_key, trace_id, fail_index);
+                driver.meta_interp_mut().start_guard_compiling(descr_addr);
             }
             // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
             let compiled = crate::call_jit::trace_and_compile_from_bridge(
@@ -1187,12 +1185,10 @@ fn handle_fail(
                 raw_values,
                 exit_layout,
             );
-            // compile.py:709: done_compiling (clear ST_BUSY_FLAG)
+            // compile.py:709: self.done_compiling() (clear ST_BUSY_FLAG)
             {
                 let (driver, _) = driver_pair();
-                driver
-                    .meta_interp_mut()
-                    .done_guard_compiling(owning_key, trace_id, fail_index);
+                driver.meta_interp_mut().done_guard_compiling(descr_addr);
             }
             if compiled {
                 return HandleFailOutcome::BridgeCompiled;
@@ -1304,6 +1300,7 @@ fn execute_assembler(
             trace_id,
             should_bridge,
             owning_key,
+            descr_addr,
             ref raw_values,
             ref exit_layout,
         } => match handle_fail(
@@ -1313,6 +1310,7 @@ fn execute_assembler(
             fail_index,
             should_bridge,
             owning_key,
+            descr_addr,
             exit_layout,
             raw_values,
             info,
@@ -1475,6 +1473,7 @@ fn bound_reached(
             trace_id,
             should_bridge,
             owning_key,
+            descr_addr,
             ref raw_values,
             ref exit_layout,
         } = outcome
@@ -1486,6 +1485,7 @@ fn bound_reached(
                 fail_index,
                 should_bridge,
                 owning_key,
+                descr_addr,
                 exit_layout,
                 raw_values,
                 info,
@@ -1610,6 +1610,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             trace_id,
             should_bridge,
             owning_key,
+            descr_addr,
             ref raw_values,
             ref exit_layout,
         } = outcome
@@ -1621,6 +1622,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 fail_index,
                 should_bridge,
                 owning_key,
+                descr_addr,
                 exit_layout,
                 raw_values,
                 info,
