@@ -1148,10 +1148,12 @@ impl OptVirtualize {
 
         // KnownClass check — RPython rewrite.py:401-404 equivalent.
         // Only remove if KnownClass was set by a PRIOR guard (not the
-        // current one). In RPython, postprocess runs after emit, so
-        // downstream passes never see KnownClass from the same guard.
-        // In majit, OptRewrite's postprocess tags KnownClass with the
-        // guard's position; skip if it matches this guard.
+        // current one). In RPython's single-pass, postprocess runs after
+        // emit so downstream never sees KnownClass from the same guard.
+        // In majit's multi-pass, rewrite's postprocess sets KnownClass
+        // before virtualize runs. last_guard_pos stores op.pos (unique
+        // guard identity) because the guard is not yet in new_operations
+        // when postprocess runs.
         if let Some(info) = ctx.get_ptr_info(obj_ref) {
             if let PtrInfo::KnownClass {
                 class_ptr,

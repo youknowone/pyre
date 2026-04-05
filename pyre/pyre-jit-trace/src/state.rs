@@ -817,10 +817,11 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
-        let ob_type = trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
+    // pyjitpl.py GUARD_CLASS(box, cls): guard takes object box directly,
+    // backend loads typeptr at offset 0.
+    if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(type_addr);
-        frame.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+        frame.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(type_addr as usize));
     }
@@ -841,10 +842,9 @@ pub(crate) fn trace_unbox_float_with_resume(
     obj: OpRef,
     float_type_addr: i64,
 ) -> OpRef {
-    if obj.0 < 10_000 && !ctx.heap_cache().is_class_known(obj) {
-        let ob_type = trace_gc_object_int_field(ctx, obj, crate::descr::ob_type_descr());
+    if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
-        frame.record_guard(ctx, OpCode::GuardClass, &[ob_type, type_const]);
+        frame.record_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
     }

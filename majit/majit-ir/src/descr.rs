@@ -154,6 +154,12 @@ pub trait FailDescr: Descr {
         &[]
     }
 
+    /// compile.py:741-745: read hash from status for must_compile.
+    /// Returns the jitcounter hash assigned at compile time (store_hash).
+    fn get_status_hash(&self) -> u64 {
+        0
+    }
+
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
     fn attach_vector_info(&self, _info: AccumVectorInfo) {}

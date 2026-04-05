@@ -772,13 +772,11 @@ pub trait Backend: Send {
         // Default no-op — backends that support bridge re-entry override this.
     }
 
-    /// Migrate bridges from an old token to a new token after retrace.
-    /// Guards in the old compiled loop that have attached bridges should
-    /// have those bridges re-attached to the corresponding guards in the
-    /// new compiled loop (matched by trace_id + fail_index).
-    fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {
-        // Default no-op — backends that manage bridge state override this.
-    }
+    /// Cranelift-specific: migrate existing bridges from old token to new
+    /// token after retrace. RPython doesn't need this because x86 patches
+    /// machine code in-place. Cranelift can't patch, so bridges must be
+    /// explicitly copied when the compiled loop is replaced.
+    fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;

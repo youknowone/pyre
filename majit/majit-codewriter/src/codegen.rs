@@ -150,14 +150,13 @@ pub fn trace_unbox_int(
     fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    // heapcache: skip GuardClass if class already known or obj is constant
-    // (constant objects have known types at trace time).
+    // GUARD_CLASS(box, cls): guard takes object box directly,
+    // backend loads typeptr at offset 0 (llgraph/runner.py:1245).
     if !ctx.heap_cache().is_class_known(obj) {
-        let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
         let type_const = ctx.const_int(int_type_addr);
         ctx.record_guard_typed_with_fail_args(
             OpCode::GuardClass,
-            &[ob_type, type_const],
+            &[obj, type_const],
             vec![majit_ir::Type::Ref; fail_args.len()],
             fail_args,
         );
@@ -288,11 +287,10 @@ pub fn trace_unbox_float(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     if !ctx.heap_cache().is_class_known(obj) {
-        let ob_type = trace_getfield_gc_int_pureornot(ctx, obj, ob_type_descr);
         let type_const = ctx.const_int(float_type_addr);
         ctx.record_guard_typed_with_fail_args(
             OpCode::GuardClass,
-            &[ob_type, type_const],
+            &[obj, type_const],
             vec![majit_ir::Type::Ref; fail_args.len()],
             fail_args,
         );

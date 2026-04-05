@@ -739,14 +739,16 @@ impl HeapCache {
     }
 
     /// Record that the class of an object is now known (e.g., after GUARD_CLASS).
+    /// heapcache.py:470-473: class_now_known sets both class AND nullity.
+    ///   self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
     pub fn class_now_known(&mut self, opref: OpRef, class: GcRef) {
-        {
-            let _i = opref.0 as usize;
-            if _i >= self.known_class.len() {
-                self.known_class.resize(_i + 1, None);
-            }
-            self.known_class[_i] = Some(class);
-        };
+        let i = opref.0 as usize;
+        if i >= self.known_class.len() {
+            self.known_class.resize(i + 1, None);
+        }
+        self.known_class[i] = Some(class);
+        // HF_KNOWN_NULLITY: knowing the class implies nonnull.
+        self.nullity_now_known(opref, true);
     }
 
     /// Check if the class of an object is known.

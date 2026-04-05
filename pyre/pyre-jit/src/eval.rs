@@ -1098,8 +1098,9 @@ fn maybe_compile_and_run(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    // PYRE_NO_JIT: disable JIT entirely, run interpreter only.
-    // Checked once and cached for the process lifetime.
+    // pyre-local extension: PYRE_NO_JIT disables JIT entirely.
+    // No RPython counterpart — kept for development debugging only.
+    // TODO: remove when JIT is stable enough to not need a kill switch.
     static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
@@ -2163,8 +2164,11 @@ fn materialize_virtual_from_rd(
                 return Value::Ref(majit_ir::GcRef::NULL);
             }
         }
-        // resume.py:634-637: VStructInfo.allocate — allocate_with_vtable when
-        // vtable present. heaptracker.py:66 excludes typeptr from fielddescrs.
+        // resume.py:633-637: VStructInfo.allocate → allocate_struct.
+        // resume.py:618-619: VirtualInfo.allocate → allocate_with_vtable.
+        // VirtualKind::Struct may contain objects with vtable that
+        // should be VirtualInfo — use vtable presence to dispatch
+        // until VirtualKind classification is fixed upstream.
         VirtualKind::Struct { typedescr, type_id } => {
             if let Some(td) = typedescr {
                 let sd = td

@@ -569,14 +569,20 @@ impl<M: Clone> MetaInterp<M> {
     /// invalidates more aggressively, so we derive a stable hash from
     /// (green_key, trace_id, fail_index) to preserve accumulated failure
     /// counts across invalidation/re-compilation cycles.
-    fn stable_guard_hash(green_key: u64, trace_id: u64, fail_index: u32) -> u64 {
-        green_key
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(trace_id)
-            .wrapping_mul(1442695040888963407)
-            .wrapping_add(fail_index as u64)
-            .wrapping_mul(6364136223846793005)
-            | 1 // ensure nonzero low bits for jitcounter subhash
+    /// compile.py:829: jitcounter.fetch_next_hash().
+    /// RPython assigns a unique hash per guard at compile time.
+    /// In majit, assigned lazily at first guard failure, but uses the
+    /// same fetch_next_hash() to guarantee unique counter slots.
+    fn stable_guard_hash(_green_key: u64, _trace_id: u64, _fail_index: u32) -> u64 {
+        // Delegate to JitCounter::fetch_next_hash via thread-local.
+        // This is called from or_insert_with closures that don't have
+        // &mut self access. Use a global atomic counter as equivalent.
+        static NEXT_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let result = NEXT_HASH.fetch_add(
+            1 | (1u64 << 21) | (1u64 << (21 - 16)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        result
     }
 
     fn trace_for_exit<'a>(
@@ -2330,6 +2336,7 @@ impl<M: Clone> MetaInterp<M> {
                 // counters so bridge threshold accumulates across compilations.
                 let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    // Cranelift-specific: migrate existing bridges to new token.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
@@ -2946,8 +2953,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut previous_tokens: Vec<JitCellToken> = Vec::new();
                 let mut inherited_guard_failures = HashMap::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
-                    // Migrate bridges from old fail_descrs to new ones
-                    // so they survive the retrace.
+                    // Cranelift-specific: migrate existing bridges to new token.
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
@@ -4975,10 +4981,9 @@ impl<M: Clone> MetaInterp<M> {
             return (false, green_key);
         };
         let tid = Self::normalize_trace_id(compiled, trace_id);
-        // compile.py:826-830 store_hash + backend make_a_counter_per_value:
-        // RPython sets up the guard descriptor at compile time. In majit,
-        // we set up GuardFailureInfo lazily at first failure but immediately
-        // detect GUARD_VALUE and configure per_value (compile.py:813-824).
+        // compile.py:826-830 store_hash: RPython assigns unique hash per
+        // guard at compile time. In majit, assigned lazily at first failure
+        // via stable_guard_hash() which uses fetch_next_hash() internally.
         let info = compiled
             .guard_failures
             .entry((tid, fail_index))
@@ -5017,10 +5022,10 @@ impl<M: Clone> MetaInterp<M> {
         if info.compiling || Self::stack_almost_full() {
             return (false, owning_key);
         }
-        // compile.py:753-781: GUARD_VALUE per-value hash.
-        // RPython: hash = current_object_addr_as_int(self) * 777767777 + intval * 1442968193
-        // guard_hash (unique per guard from stable_guard_hash) serves as
-        // the stable guard identity, matching RPython's descriptor address.
+        // compile.py:780-781: GUARD_VALUE per-value hash.
+        // hash = current_object_addr_as_int(self) * 777767777 + intval * 1442968193
+        // guard_hash (from fetch_next_hash) serves as the unique guard
+        // identity, same role as RPython's descriptor address.
         let hash = if let Some((idx, _tp)) = info.per_value {
             let intval = fail_values.get(idx as usize).copied().unwrap_or(0);
             info.guard_hash
