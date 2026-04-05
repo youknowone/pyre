@@ -27,6 +27,14 @@ pub struct SemanticFunction {
     /// Used to construct the full CallPath for return_type registration.
     #[serde(default)]
     pub self_ty_root: Option<String>,
+    /// RPython: function-level hints set by GC transformer / decorators.
+    /// "close_stack" → _gctransformer_hint_close_stack_
+    /// "cannot_collect" → _gctransformer_hint_cannot_collect_
+    /// "gc_effects" → random_effects_on_gcobjs
+    /// "elidable" → _elidable_function_
+    /// "loopinvariant" → _jit_loop_invariant_
+    #[serde(default)]
+    pub hints: Vec<String>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -62,6 +70,12 @@ pub struct SemanticProgram {
     /// RPython: struct field types for resolving `op.args[0].concretetype`
     /// on FieldRead-produced array bases.
     pub struct_fields: StructFieldRegistry,
+    /// RPython: op.result.concretetype — whole-program function return types.
+    /// Maps exact callee path (e.g. "a::helper", "Type::method") → return type.
+    /// Stored here so that downstream consumers (parse.rs method graph building)
+    /// can use them for array type identity resolution.
+    #[serde(default)]
+    pub fn_return_types: HashMap<String, String>,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
@@ -74,46 +88,148 @@ pub fn build_semantic_program_from_parsed_files(
     build_semantic_program_from_parsed_files_with_options(parsed_files, &AstGraphOptions::default())
 }
 
-pub fn build_semantic_program_with_options(
-    parsed: &ParsedInterpreter,
-    options: &AstGraphOptions,
-) -> SemanticProgram {
-    let mut functions = Vec::new();
-    let mut known_struct_names = std::collections::HashSet::new();
-    let mut struct_fields = StructFieldRegistry::default();
-
-    // Pass 1: collect all struct definitions first.
-    // RPython equivalent: the annotator/rtyper resolves all types before
-    // the codewriter runs, so field types are globally available.
-    for item in &parsed.file.items {
-        if let Item::Struct(s) = item {
-            let name = s.ident.to_string();
-            known_struct_names.insert(name.clone());
-            let fields: Vec<(String, String)> = s
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    let field_name = f.ident.as_ref()?.to_string();
-                    let field_type = full_type_string(&f.ty)?;
-                    Some((field_name, field_type))
-                })
-                .collect();
-            struct_fields.fields.insert(name, fields);
-        }
+/// Qualify a bare type name with module prefix.
+/// "Foo" with prefix "a" → "a::Foo". Already-qualified "a::Foo" unchanged.
+/// Empty prefix → return bare name as-is.
+pub(crate) fn qualify_type_name(bare: &str, prefix: &str) -> String {
+    if prefix.is_empty() || bare.contains("::") {
+        bare.to_string()
+    } else {
+        format!("{}::{}", prefix, bare)
     }
+}
 
-    // Pass 2: build function graphs with struct_fields available.
-    // This allows array_type_id_from_expr to resolve field access
-    // (e.g. self.array[i]) at parse time.
-    for item in &parsed.file.items {
+/// RPython: annotator whole-program type collection.
+/// Recursively collects struct definitions, function return types, and impl
+/// method return types from items, handling `mod` blocks with qualified paths.
+/// The `prefix` carries the module path (e.g. "a::b") to produce exact callee
+/// identities matching what `canonical_call_target` generates at call sites.
+fn collect_types_from_items(
+    items: &[Item],
+    prefix: &str,
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut StructFieldRegistry,
+    fn_return_types: &mut HashMap<String, String>,
+) {
+    for item in items {
         match item {
+            Item::Struct(s) => {
+                let bare_name = s.ident.to_string();
+                // RPython: T.TO gives the actual lltype object, not a string.
+                // Use qualified_full_type_string to qualify inner type refs
+                // at the source, matching RPython's lltype identity.
+                let fields: Vec<(String, String)> = s
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        let field_name = f.ident.as_ref()?.to_string();
+                        let field_type = qualified_full_type_string(&f.ty, prefix)?;
+                        Some((field_name, field_type))
+                    })
+                    .collect();
+                // RPython: lltype.Struct has globally unique identity.
+                // Register under qualified name to avoid collision between
+                // structs with the same bare name in different modules.
+                if prefix.is_empty() {
+                    known_struct_names.insert(bare_name.clone());
+                    struct_fields.fields.insert(bare_name, fields);
+                } else {
+                    let qualified = format!("{}::{}", prefix, bare_name);
+                    known_struct_names.insert(qualified.clone());
+                    struct_fields.fields.insert(qualified, fields.clone());
+                    // Also register bare name for parameter type lookups
+                    // within the same module (fn f(x: Foo) refers to mod::Foo).
+                    known_struct_names.insert(bare_name.clone());
+                    struct_fields.fields.entry(bare_name).or_insert(fields);
+                }
+            }
             Item::Fn(func) => {
-                functions.push(build_function_graph(func, options, None, &struct_fields))
+                if let Some(ret_ty) = return_type_string(&func.sig) {
+                    // RPython: exact graph identity. With module prefix this becomes
+                    // e.g. "a::make_points" matching canonical_call_target segments.
+                    let key = if prefix.is_empty() {
+                        func.sig.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, func.sig.ident)
+                    };
+                    fn_return_types.insert(key, ret_ty);
+                }
             }
             Item::Impl(impl_block) => {
                 let self_ty_root = type_root_ident(&impl_block.self_ty);
-                for item in &impl_block.items {
-                    if let syn::ImplItem::Fn(method) = item {
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
+                        if let Some(ret_ty) = return_type_string(&method.sig) {
+                            // RPython: exact callee graph identity — "Type::method".
+                            // Qualify bare type name with module prefix to avoid
+                            // collision between same-named types in different modules.
+                            if let Some(ref ty_root) = self_ty_root {
+                                let qualified_ty = qualify_type_name(ty_root, prefix);
+                                fn_return_types.insert(
+                                    format!("{}::{}", qualified_ty, method.sig.ident),
+                                    ret_ty,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Item::Mod(m) => {
+                // Recurse into mod blocks with qualified prefix.
+                if let Some((_, ref items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_types_from_items(
+                        items,
+                        &mod_prefix,
+                        known_struct_names,
+                        struct_fields,
+                        fn_return_types,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// RPython: pass 2 graph building with Item::Mod recursion.
+/// Mirrors collect_types_from_items traversal so that module-internal
+/// functions get proper SemanticFunction entries with qualified names.
+fn build_graphs_from_items(
+    items: &[Item],
+    prefix: &str,
+    options: &AstGraphOptions,
+    struct_fields: &StructFieldRegistry,
+    fn_return_types: &HashMap<String, String>,
+    functions: &mut Vec<SemanticFunction>,
+) {
+    for item in items {
+        match item {
+            Item::Fn(func) => {
+                let mut sf = build_function_graph(
+                    func,
+                    options,
+                    None,
+                    struct_fields,
+                    fn_return_types,
+                    prefix,
+                );
+                // RPython: exact graph identity — module-qualified name.
+                if !prefix.is_empty() {
+                    sf.name = format!("{}::{}", prefix, sf.name);
+                }
+                functions.push(sf);
+            }
+            Item::Impl(impl_block) => {
+                // Qualify bare self type with module prefix (RPython: unique type identity).
+                let self_ty_root =
+                    type_root_ident(&impl_block.self_ty).map(|t| qualify_type_name(&t, prefix));
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
                         let fake_fn = ItemFn {
                             attrs: method.attrs.clone(),
                             vis: syn::Visibility::Inherited,
@@ -124,19 +240,73 @@ pub fn build_semantic_program_with_options(
                             &fake_fn,
                             options,
                             self_ty_root.clone(),
-                            &struct_fields,
+                            struct_fields,
+                            fn_return_types,
+                            prefix,
                         ));
                     }
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    build_graphs_from_items(
+                        items,
+                        &mod_prefix,
+                        options,
+                        struct_fields,
+                        fn_return_types,
+                        functions,
+                    );
                 }
             }
             _ => {}
         }
     }
+}
+
+pub fn build_semantic_program_with_options(
+    parsed: &ParsedInterpreter,
+    options: &AstGraphOptions,
+) -> SemanticProgram {
+    let mut functions = Vec::new();
+    let mut known_struct_names = std::collections::HashSet::new();
+    let mut struct_fields = StructFieldRegistry::default();
+
+    // Pass 1: collect all struct definitions and function return types.
+    // RPython: annotator/rtyper resolves all types in a whole-program pass.
+    // We recursively traverse Item::Mod to register module-qualified paths
+    // matching the exact callee identity that canonical_call_target produces.
+    let mut fn_return_types: HashMap<String, String> = HashMap::new();
+    collect_types_from_items(
+        &parsed.file.items,
+        "",
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut fn_return_types,
+    );
+
+    // Pass 2: build function graphs with struct_fields + fn_return_types.
+    // Field types are already module-qualified at the source (via
+    // qualified_full_type_string), matching RPython's lltype identity.
+    build_graphs_from_items(
+        &parsed.file.items,
+        "",
+        options,
+        &struct_fields,
+        &fn_return_types,
+        &mut functions,
+    );
 
     SemanticProgram {
         functions,
         known_struct_names,
         struct_fields,
+        fn_return_types,
     }
 }
 
@@ -146,62 +316,39 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 ) -> SemanticProgram {
     // RPython: annotator/rtyper provides whole-program type info before
     // the codewriter runs. We emulate this with a 2-pass approach:
-    // Pass 1: collect ALL struct definitions across ALL files.
+    // Pass 1: collect ALL struct definitions and function return types across ALL files.
+    // Uses collect_types_from_items to handle Item::Mod recursively with
+    // qualified paths matching canonical_call_target identity.
     let mut known_struct_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
+    let mut fn_return_types: HashMap<String, String> = HashMap::new();
     for parsed in parsed_files {
-        for item in &parsed.file.items {
-            if let Item::Struct(s) = item {
-                let name = s.ident.to_string();
-                known_struct_names.insert(name.clone());
-                let fields: Vec<(String, String)> = s
-                    .fields
-                    .iter()
-                    .filter_map(|f| {
-                        let field_name = f.ident.as_ref()?.to_string();
-                        let field_type = full_type_string(&f.ty)?;
-                        Some((field_name, field_type))
-                    })
-                    .collect();
-                struct_fields.fields.insert(name, fields);
-            }
-        }
+        collect_types_from_items(
+            &parsed.file.items,
+            "",
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut fn_return_types,
+        );
     }
-    // Pass 2: build function graphs with merged struct_fields visible.
+    // Pass 2: build function graphs with merged struct_fields + fn_return_types visible.
+    // Field types already module-qualified at source (qualified_full_type_string).
     let mut functions = Vec::new();
     for parsed in parsed_files {
-        for item in &parsed.file.items {
-            match item {
-                Item::Fn(func) => {
-                    functions.push(build_function_graph(func, options, None, &struct_fields));
-                }
-                Item::Impl(impl_block) => {
-                    let self_ty_root = type_root_ident(&impl_block.self_ty);
-                    for item in &impl_block.items {
-                        if let syn::ImplItem::Fn(method) = item {
-                            let fake_fn = ItemFn {
-                                attrs: method.attrs.clone(),
-                                vis: syn::Visibility::Inherited,
-                                sig: method.sig.clone(),
-                                block: Box::new(method.block.clone()),
-                            };
-                            functions.push(build_function_graph(
-                                &fake_fn,
-                                options,
-                                self_ty_root.clone(),
-                                &struct_fields,
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        build_graphs_from_items(
+            &parsed.file.items,
+            "",
+            options,
+            &struct_fields,
+            &fn_return_types,
+            &mut functions,
+        );
     }
     SemanticProgram {
         functions,
         known_struct_names,
         struct_fields,
+        fn_return_types,
     }
 }
 
@@ -211,7 +358,8 @@ pub fn build_semantic_program_from_parsed_files_with_options(
 pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
-    let mut ctx = GraphBuildContext::new(&empty_registry);
+    let empty_fn_ret = HashMap::new();
+    let mut ctx = GraphBuildContext::new(&empty_registry, &empty_fn_ret, "");
     let result = lower_expr(
         graph,
         &mut block,
@@ -228,19 +376,31 @@ pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
 
 pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
     let empty_registry = StructFieldRegistry::default();
-    build_function_graph(func, &AstGraphOptions::default(), None, &empty_registry)
+    let empty_fn_ret = HashMap::new();
+    build_function_graph(
+        func,
+        &AstGraphOptions::default(),
+        None,
+        &empty_registry,
+        &empty_fn_ret,
+        "",
+    )
 }
 
 pub fn build_function_graph_with_self_ty_pub(
     func: &ItemFn,
     self_ty_root: Option<String>,
     struct_fields: &StructFieldRegistry,
+    fn_return_types: &HashMap<String, String>,
+    module_prefix: &str,
 ) -> SemanticFunction {
     build_function_graph(
         func,
         &AstGraphOptions::default(),
         self_ty_root,
         struct_fields,
+        fn_return_types,
+        module_prefix,
     )
 }
 
@@ -255,14 +415,28 @@ struct GraphBuildContext<'a> {
     /// RPython: program-level struct field types, available for resolving
     /// field access array identity (e.g. `self.array[i]` → owner.field_type).
     struct_fields: &'a StructFieldRegistry,
+    /// RPython: op.result.concretetype — function return types from the annotator.
+    /// Maps function name (or "Type::method") → return type string.
+    /// Used by array_type_id_from_expr to resolve Call/MethodCall expressions.
+    fn_return_types: &'a HashMap<String, String>,
+    /// Module path prefix for qualifying bare type names.
+    /// RPython: lltype identity is globally unique — bare "Foo" in mod "a"
+    /// must resolve to "a::Foo" in struct_fields lookups.
+    module_prefix: String,
 }
 
 impl<'a> GraphBuildContext<'a> {
-    fn new(struct_fields: &'a StructFieldRegistry) -> Self {
+    fn new(
+        struct_fields: &'a StructFieldRegistry,
+        fn_return_types: &'a HashMap<String, String>,
+        module_prefix: &str,
+    ) -> Self {
         Self {
             local_type_roots: HashMap::new(),
             local_array_types: HashMap::new(),
             struct_fields,
+            fn_return_types,
+            module_prefix: module_prefix.to_string(),
         }
     }
 }
@@ -272,10 +446,12 @@ fn build_function_graph(
     options: &AstGraphOptions,
     self_ty_root: Option<String>,
     struct_fields: &StructFieldRegistry,
+    fn_return_types: &HashMap<String, String>,
+    module_prefix: &str,
 ) -> SemanticFunction {
     let mut graph = FunctionGraph::new(func.sig.ident.to_string());
     let mut entry = graph.startblock;
-    let mut ctx = GraphBuildContext::new(struct_fields);
+    let mut ctx = GraphBuildContext::new(struct_fields, fn_return_types, module_prefix);
 
     // Register function parameters as Input ops (RPython: Block.inputargs)
     for param in &func.sig.inputs {
@@ -299,7 +475,9 @@ fn build_function_graph(
             syn::FnArg::Typed(pat_type) => {
                 let name = canonical_pat_name(&pat_type.pat);
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
-                    ctx.local_type_roots.insert(name.clone(), type_root);
+                    // Qualify bare type with module prefix for exact identity.
+                    let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
+                    ctx.local_type_roots.insert(name.clone(), qualified);
                 }
                 if let Some(full_type) = full_type_string(&pat_type.ty) {
                     ctx.local_array_types.insert(name.clone(), full_type);
@@ -334,12 +512,38 @@ fn build_function_graph(
         syn::ReturnType::Default => None,
     };
 
+    // RPython: function-level hints from decorators / GC transformer.
+    // Scan #[jit_*] attributes to detect elidable, loopinvariant,
+    // close_stack, cannot_collect, gc_effects.
+    let hints = collect_jit_hints(&func.attrs);
+
     SemanticFunction {
         name: func.sig.ident.to_string(),
         graph,
         return_type,
         self_ty_root,
+        hints,
     }
+}
+
+/// RPython: extract function-level JIT hints from attributes.
+/// Maps #[jit_elidable] → "elidable", #[jit_close_stack] → "close_stack", etc.
+fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut hints = Vec::new();
+    for attr in attrs {
+        if let Some(ident) = attr.path().get_ident() {
+            let name = ident.to_string();
+            match name.as_str() {
+                "jit_elidable" => hints.push("elidable".into()),
+                "jit_loop_invariant" => hints.push("loopinvariant".into()),
+                "jit_close_stack" => hints.push("close_stack".into()),
+                "jit_cannot_collect" => hints.push("cannot_collect".into()),
+                "jit_gc_effects" => hints.push("gc_effects".into()),
+                _ => {}
+            }
+        }
+    }
+    hints
 }
 
 // ── Statement lowering ──────────────────────────────────────────
@@ -349,7 +553,8 @@ fn build_function_graph(
 pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stmt) {
     let mut block = block;
     let empty_registry = StructFieldRegistry::default();
-    let mut ctx = GraphBuildContext::new(&empty_registry);
+    let empty_fn_ret = HashMap::new();
+    let mut ctx = GraphBuildContext::new(&empty_registry, &empty_fn_ret, "");
     lower_stmt(
         graph,
         &mut block,
@@ -376,7 +581,8 @@ fn lower_stmt(
             if let syn::Pat::Type(pat_type) = &local.pat {
                 let name = canonical_pat_name(&pat_type.pat);
                 if let Some(type_root) = type_root_ident(&pat_type.ty) {
-                    ctx.local_type_roots.insert(name.clone(), type_root);
+                    let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
+                    ctx.local_type_roots.insert(name.clone(), qualified);
                 }
                 if let Some(full_type) = full_type_string(&pat_type.ty) {
                     ctx.local_array_types.insert(name.clone(), full_type);
@@ -1136,9 +1342,25 @@ fn canonical_pat_name(pat: &syn::Pat) -> String {
     }
 }
 
+/// RPython: lltype graph identity — returns the full type path.
+/// For `Foo` → "Foo", for `a::Foo` → "a::Foo".
+/// RPython's lltype.Struct objects have globally unique identities;
+/// returning all path segments ensures `a::Foo` and `b::Foo` don't alias.
 fn type_root_ident(ty: &syn::Type) -> Option<String> {
     match ty {
-        syn::Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        syn::Type::Path(path) => {
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.is_empty() {
+                None
+            } else {
+                Some(segments.join("::"))
+            }
+        }
         syn::Type::Reference(reference) => type_root_ident(&reference.elem),
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
@@ -1236,6 +1458,128 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
     }
 }
 
+/// RPython: lltype identity — `full_type_string` with module-prefix qualification.
+///
+/// RPython's `T.TO` always returns the actual lltype object.
+/// This function is the equivalent: single-segment leaf types that could be
+/// user structs (uppercase, not primitives/std) are qualified with the module
+/// prefix so that `Bar` in `mod a` becomes `a::Bar`.
+///
+/// Container names like `Vec`, `Option`, `HashMap` are NOT qualified because
+/// they have generic arguments (the inner types ARE qualified recursively).
+fn qualified_full_type_string(ty: &syn::Type, prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return full_type_string(ty);
+    }
+    match ty {
+        syn::Type::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| {
+                    let name = seg.ident.to_string();
+                    match &seg.arguments {
+                        syn::PathArguments::None => {
+                            // Leaf type (no generics). Qualify if it looks like
+                            // a user struct: starts with uppercase, single segment.
+                            if path.path.segments.len() == 1 && looks_like_user_type(&name) {
+                                qualify_type_name(&name, prefix)
+                            } else {
+                                name
+                            }
+                        }
+                        syn::PathArguments::AngleBracketed(args) => {
+                            // Container<T,...> — qualify inner types, not the container.
+                            let inner: Vec<String> = args
+                                .args
+                                .iter()
+                                .filter_map(|arg| match arg {
+                                    syn::GenericArgument::Type(t) => {
+                                        qualified_full_type_string(t, prefix)
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            if inner.is_empty() {
+                                name
+                            } else {
+                                format!("{}<{}>", name, inner.join(","))
+                            }
+                        }
+                        syn::PathArguments::Parenthesized(_) => name,
+                    }
+                })
+                .collect();
+            Some(segments.join("::"))
+        }
+        syn::Type::Reference(r) => qualified_full_type_string(&r.elem, prefix),
+        syn::Type::Paren(p) => qualified_full_type_string(&p.elem, prefix),
+        syn::Type::Group(g) => qualified_full_type_string(&g.elem, prefix),
+        syn::Type::Slice(s) => {
+            qualified_full_type_string(&s.elem, prefix).map(|t| format!("[{}]", t))
+        }
+        syn::Type::Array(a) => {
+            let elem = qualified_full_type_string(&a.elem, prefix)?;
+            let len_str = match &a.len {
+                syn::Expr::Lit(lit) => match &lit.lit {
+                    syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
+                    _ => "N".to_string(),
+                },
+                _ => "N".to_string(),
+            };
+            Some(format!("[{};{}]", elem, len_str))
+        }
+        _ => None,
+    }
+}
+
+/// Heuristic: does this type name look like a user-defined struct?
+/// True for uppercase-starting names that are NOT common std/primitive types.
+fn looks_like_user_type(name: &str) -> bool {
+    let first = match name.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+    // Common std types that should NOT be module-qualified.
+    !matches!(
+        name,
+        "Vec"
+            | "Option"
+            | "Box"
+            | "String"
+            | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "Rc"
+            | "Arc"
+            | "Cell"
+            | "RefCell"
+            | "Mutex"
+            | "RwLock"
+            | "Cow"
+            | "Pin"
+            | "PhantomData"
+            | "Result"
+            | "Ordering"
+            | "Duration"
+            | "Instant"
+    )
+}
+
+/// RPython: annotator resolves function return types for op.result.concretetype.
+/// Extract return type string from a function signature.
+fn return_type_string(sig: &syn::Signature) -> Option<String> {
+    match &sig.output {
+        syn::ReturnType::Type(_, ty) => full_type_string(ty),
+        syn::ReturnType::Default => None,
+    }
+}
+
 /// RPython: resolve ARRAY identity from an expression.
 ///
 /// RPython: `getkind(TYPE)[0]` — map type string to ValueType for kind suffix.
@@ -1299,6 +1643,47 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
             // RPython: op.args[0].concretetype — returns full ARRAY type.
             let field_type_str = ctx.struct_fields.field_type(&owner_type, &field_name)?;
             Some(field_type_str.to_string())
+        }
+        // RPython: op.result.concretetype — for call expressions like `make_points()[i]`,
+        // resolve the return type from the exact callee graph (fn_return_types in pass 1).
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(path) = &*call.func {
+                // RPython: exact graph identity — join path segments to match
+                // the key format produced by collect_types_from_items.
+                // e.g. `a::make_points()` → "a::make_points"
+                // e.g. `make_points()` → "make_points"
+                // No bare name fallback — exact path match only.
+                let key: String = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                ctx.fn_return_types.get(&key).cloned()
+            } else {
+                None
+            }
+        }
+        // RPython: op.result.concretetype — for method calls like `self.make_points()[i]`.
+        // RPython resolves via the exact callee graph — no bare name fallback.
+        syn::Expr::MethodCall(mc) => {
+            let method_name = mc.method.to_string();
+            let receiver_ty = receiver_type_root(&mc.receiver, ctx)?;
+            let key = format!("{}::{}", receiver_ty, method_name);
+            ctx.fn_return_types.get(&key).cloned()
+        }
+        // RPython: op.result.concretetype — for nested index like `matrix[i][j]`,
+        // resolve the outer array's element type.
+        syn::Expr::Index(idx) => {
+            let outer_type = array_type_id_from_expr(&idx.expr, ctx)?;
+            let elem = extract_element_type_from_str(&outer_type)?;
+            // If the element type is itself an array type, return it
+            if elem.starts_with("Vec<") || elem.starts_with('[') {
+                Some(elem)
+            } else {
+                None
+            }
         }
         _ => None,
     }

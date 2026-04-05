@@ -90,6 +90,8 @@ pub struct InherentMethodInfo {
     pub graph: crate::model::FunctionGraph,
     /// RPython: op.result.concretetype — return type for array identity.
     pub return_type: Option<String>,
+    /// RPython: function-level JIT hints (elidable, close_stack, etc.).
+    pub hints: Vec<String>,
 }
 
 /// Parsed representation of an interpreter source file.
@@ -149,13 +151,31 @@ pub fn find_opcode_dispatch_match(parsed: &ParsedInterpreter) -> Option<&ExprMat
 }
 
 /// Extract trait implementations AND trait default methods from the parsed source.
+/// Recurses into `Item::Mod` for whole-program visibility (RPython parity).
 pub fn extract_trait_impls(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
+    fn_return_types: &std::collections::HashMap<String, String>,
 ) -> Vec<TraitImplInfo> {
     let mut impls = Vec::new();
+    collect_trait_impls_from_items(
+        &parsed.file.items,
+        "",
+        struct_fields,
+        fn_return_types,
+        &mut impls,
+    );
+    impls
+}
 
-    for item in &parsed.file.items {
+fn collect_trait_impls_from_items(
+    items: &[Item],
+    prefix: &str,
+    struct_fields: &crate::front::StructFieldRegistry,
+    fn_return_types: &std::collections::HashMap<String, String>,
+    impls: &mut Vec<TraitImplInfo>,
+) {
+    for item in items {
         match item {
             // Concrete trait impls (impl Trait for Type)
             Item::Impl(impl_block) => {
@@ -163,14 +183,15 @@ pub fn extract_trait_impls(
                     let trait_name = canonical_path_name(trait_path);
                     let self_ty = &impl_block.self_ty;
                     let for_type = canonical_type_name(self_ty);
-                    let self_ty_root = type_root_ident(self_ty);
+                    // Qualify bare type name with module prefix (RPython: unique type identity).
+                    let self_ty_root = type_root_ident(self_ty)
+                        .map(|t| crate::front::ast::qualify_type_name(&t, prefix));
                     let methods: Vec<MethodInfo> = impl_block
                         .items
                         .iter()
                         .filter_map(|item| {
                             if let syn::ImplItem::Fn(method) = item {
-                                // Build semantic graph directly from AST (no re-parse needed)
-                                let graph = {
+                                let (graph, hints) = {
                                     let fake_fn = syn::ItemFn {
                                         attrs: method.attrs.clone(),
                                         vis: syn::Visibility::Inherited,
@@ -182,8 +203,10 @@ pub fn extract_trait_impls(
                                             &fake_fn,
                                             self_ty_root.clone(),
                                             struct_fields,
+                                            fn_return_types,
+                                            prefix,
                                         );
-                                    Some(sf.graph)
+                                    (Some(sf.graph), sf.hints)
                                 };
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
@@ -195,6 +218,7 @@ pub fn extract_trait_impls(
                                     name: method.sig.ident.to_string(),
                                     graph,
                                     return_type,
+                                    hints,
                                 })
                             } else {
                                 None
@@ -217,7 +241,6 @@ pub fn extract_trait_impls(
                     .iter()
                     .filter_map(|item| {
                         if let syn::TraitItem::Fn(method) = item {
-                            // Only include methods with a default body
                             method.default.as_ref().map(|block| {
                                 let fake_fn = syn::ItemFn {
                                     attrs: method.attrs.clone(),
@@ -229,6 +252,8 @@ pub fn extract_trait_impls(
                                     &fake_fn,
                                     None,
                                     struct_fields,
+                                    fn_return_types,
+                                    prefix,
                                 );
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
@@ -240,6 +265,7 @@ pub fn extract_trait_impls(
                                     name: method.sig.ident.to_string(),
                                     graph: Some(sf.graph),
                                     return_type,
+                                    hints: sf.hints,
                                 }
                             })
                         } else {
@@ -256,58 +282,113 @@ pub fn extract_trait_impls(
                     });
                 }
             }
+            // Recurse into module blocks with qualified prefix.
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_trait_impls_from_items(
+                        sub_items,
+                        &mod_prefix,
+                        struct_fields,
+                        fn_return_types,
+                        impls,
+                    );
+                }
+            }
             _ => {}
         }
     }
-    impls
 }
 
 /// Extract inherent impl methods (impl Type { ... }) as canonical call targets.
+/// Recurses into `Item::Mod` for whole-program visibility (RPython parity).
 pub fn extract_inherent_impl_methods(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
+    fn_return_types: &std::collections::HashMap<String, String>,
 ) -> Vec<InherentMethodInfo> {
     let mut methods = Vec::new();
+    collect_inherent_methods_from_items(
+        &parsed.file.items,
+        "",
+        struct_fields,
+        fn_return_types,
+        &mut methods,
+    );
+    methods
+}
 
-    for item in &parsed.file.items {
-        let Item::Impl(impl_block) = item else {
-            continue;
-        };
-        if impl_block.trait_.is_some() {
-            continue;
-        }
-
-        let for_type = canonical_type_name(&impl_block.self_ty);
-        let self_ty_root = type_root_ident(&impl_block.self_ty);
-        for item in &impl_block.items {
-            if let syn::ImplItem::Fn(method) = item {
-                let fake_fn = syn::ItemFn {
-                    attrs: method.attrs.clone(),
-                    vis: syn::Visibility::Inherited,
-                    sig: method.sig.clone(),
-                    block: Box::new(method.block.clone()),
-                };
-                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                    &fake_fn,
-                    self_ty_root.clone(),
-                    struct_fields,
-                );
-                let return_type = match &method.sig.output {
-                    syn::ReturnType::Type(_, ty) => crate::front::ast::full_type_string(ty),
-                    syn::ReturnType::Default => None,
-                };
-                methods.push(InherentMethodInfo {
-                    for_type: for_type.clone(),
-                    self_ty_root: self_ty_root.clone(),
-                    name: method.sig.ident.to_string(),
-                    graph: sf.graph,
-                    return_type,
-                });
+fn collect_inherent_methods_from_items(
+    items: &[Item],
+    prefix: &str,
+    struct_fields: &crate::front::StructFieldRegistry,
+    fn_return_types: &std::collections::HashMap<String, String>,
+    methods: &mut Vec<InherentMethodInfo>,
+) {
+    for item in items {
+        match item {
+            Item::Impl(impl_block) => {
+                if impl_block.trait_.is_some() {
+                    continue;
+                }
+                let for_type = canonical_type_name(&impl_block.self_ty);
+                // Qualify bare type name with module prefix (RPython: unique type identity).
+                let self_ty_root = type_root_ident(&impl_block.self_ty)
+                    .map(|t| crate::front::ast::qualify_type_name(&t, prefix));
+                for sub in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = sub {
+                        let fake_fn = syn::ItemFn {
+                            attrs: method.attrs.clone(),
+                            vis: syn::Visibility::Inherited,
+                            sig: method.sig.clone(),
+                            block: Box::new(method.block.clone()),
+                        };
+                        let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                            &fake_fn,
+                            self_ty_root.clone(),
+                            struct_fields,
+                            fn_return_types,
+                            prefix,
+                        );
+                        let return_type = match &method.sig.output {
+                            syn::ReturnType::Type(_, ty) => crate::front::ast::full_type_string(ty),
+                            syn::ReturnType::Default => None,
+                        };
+                        methods.push(InherentMethodInfo {
+                            for_type: for_type.clone(),
+                            self_ty_root: self_ty_root.clone(),
+                            name: method.sig.ident.to_string(),
+                            graph: sf.graph,
+                            return_type,
+                            hints: sf.hints,
+                        });
+                    }
+                }
             }
+            // Recurse into module blocks with qualified prefix.
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_inherent_methods_from_items(
+                        sub_items,
+                        &mod_prefix,
+                        struct_fields,
+                        fn_return_types,
+                        methods,
+                    );
+                }
+            }
+            _ => {}
         }
     }
-
-    methods
 }
 
 /// Extract canonical opcode dispatch arms from `execute_opcode_step`.
@@ -544,9 +625,23 @@ fn extract_receiver_trait_bindings(func: &ItemFn) -> ReceiverTraitBindings {
     }
 }
 
+/// Returns full type path — all segments joined by "::".
+/// RPython: lltype.Struct has globally unique identity.
 fn type_root_ident(ty: &syn::Type) -> Option<String> {
     match ty {
-        syn::Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        syn::Type::Path(path) => {
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.is_empty() {
+                None
+            } else {
+                Some(segments.join("::"))
+            }
+        }
         syn::Type::Reference(reference) => type_root_ident(&reference.elem),
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
@@ -627,7 +722,11 @@ mod tests {
             }
         "#,
         );
-        let impls = extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let impls = extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let helper = impls[0]
             .methods
             .iter()

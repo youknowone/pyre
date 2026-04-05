@@ -48,9 +48,29 @@ pub struct AnalysisCache {
     forces_virtualizable: HashMap<CallPath, bool>,
     random_effects: HashMap<CallPath, bool>,
     can_invalidate: HashMap<CallPath, bool>,
+    /// RPython: collect_analyzer (collectanalyze.py) — can this call trigger GC?
+    can_collect: HashMap<CallPath, bool>,
     /// RPython: `cpu.fielddescrof(T, fieldname)` / `cpu.arraydescrof(ARRAY)`.
     /// Assigns sequential, collision-free ei_index values for bitstrings.
     pub descr_indices: DescrIndexRegistry,
+}
+
+/// RPython: readwrite_analyzer.analyze(op) return value.
+///
+/// Represents the set of read/write effects collected from graph traversal.
+/// RPython uses a set of tuples like ("struct", T, fieldname); we use bitsets.
+/// This is passed as the first argument to effectinfo_from_writeanalyze(),
+/// matching RPython's `effects` parameter (effectinfo.py:276).
+pub struct WriteAnalysis {
+    pub read_fields: u64,
+    pub write_fields: u64,
+    pub read_arrays: u64,
+    pub write_arrays: u64,
+    pub read_interiorfields: u64,
+    pub write_interiorfields: u64,
+    pub array_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    /// RPython: `effects is top_set` — unanalyzable (random effects).
+    pub is_top: bool,
 }
 
 /// Call descriptor — associates a call target with its effect info.
@@ -215,6 +235,18 @@ pub struct CallControl {
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`.
     pub struct_layouts: HashMap<String, StructLayout>,
+    /// RPython: collectanalyze.py:15 — _gctransformer_hint_cannot_collect_.
+    /// Functions known not to trigger GC collection. The collect_analyzer
+    /// returns False immediately for these.
+    pub cannot_collect_targets: HashSet<CallPath>,
+    /// RPython: call.py:129-134 — _gctransformer_hint_close_stack_.
+    /// Functions that close the stack must never produce JitCode — they are
+    /// always classified as 'residual' by guess_call_kind.
+    pub close_stack_targets: HashSet<CallPath>,
+    /// RPython: collectanalyze.py:21-25 — funcobj.random_effects_on_gcobjs.
+    /// External functions whose calls may have random effects on GC objects.
+    /// analyze_can_collect returns True immediately for these.
+    pub external_gc_effects: HashSet<CallPath>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -434,6 +466,9 @@ impl CallControl {
             //
             array_header_size: std::mem::size_of::<usize>(),
             struct_layouts: HashMap::new(),
+            cannot_collect_targets: HashSet::new(),
+            close_stack_targets: HashSet::new(),
+            external_gc_effects: HashSet::new(),
         }
     }
 
@@ -700,9 +735,17 @@ impl CallControl {
     /// RPython call.py:155-172: creates JitCode(graph.name, fnaddr, calldescr)
     /// and adds graph to unfinished_graphs for later assembly.
     pub fn get_jitcode(&mut self, path: &CallPath) -> usize {
+        // RPython call.py:157-158: try: return self.jitcodes[graph]
         if let Some(&index) = self.jitcodes.get(path) {
             return index;
         }
+        // RPython call.py:159-165: except KeyError:
+        //   must never produce JitCode for close_stack.
+        assert!(
+            !self.close_stack_targets.contains(path),
+            "{:?} has _gctransformer_hint_close_stack_",
+            path
+        );
         let index = self.next_jitcode_index;
         self.next_jitcode_index += 1;
         self.jitcodes.insert(path.clone(), index);
@@ -760,14 +803,12 @@ impl CallControl {
     ///
     /// RPython: `CallControl.guess_call_kind(op, is_candidate)` (call.py:116-139).
     ///
-    /// Exact RPython decision logic:
+    /// Exact RPython decision logic (call.py:117-139):
     /// 1. Is portal runner → 'recursive'
-    /// 2. Has oopspec → 'builtin'
-    /// 3. `graphs_from(target) is None` → 'residual'
-    /// 4. Otherwise → 'regular'
-    ///
-    /// Step 3 is the key: graphs_from returns None when the callee graph
-    /// is not available OR not a candidate.
+    /// 2. `_gctransformer_hint_close_stack_` → 'residual'
+    /// 3. Has oopspec → 'builtin'
+    /// 4. `graphs_from(target) is None` → 'residual'
+    /// 5. Otherwise → 'regular'
     pub fn guess_call_kind(&self, target: &CallTarget) -> CallKind {
         // Step 1: recursive (RPython call.py:119-120)
         let path = self.target_to_path(target);
@@ -776,7 +817,15 @@ impl CallControl {
                 return CallKind::Recursive;
             }
         }
-        // Step 2: builtin (RPython call.py:135-136)
+        // RPython call.py:129-134: _gctransformer_hint_close_stack_ → 'residual'.
+        // Must never produce JitCode for close_stack functions.
+        // Checked BEFORE builtin (RPython checks close_stack first at line 132).
+        if let Some(ref p) = path {
+            if self.close_stack_targets.contains(p) {
+                return CallKind::Residual;
+            }
+        }
+        // RPython call.py:135-136: has oopspec → 'builtin'
         if let Some(ref p) = path {
             if self.builtin_targets.contains(p) {
                 return CallKind::Builtin;
@@ -972,6 +1021,24 @@ impl CallControl {
             .is_some_and(|p| self.loopinvariant_targets.contains(&p))
     }
 
+    /// RPython: call.py:129-134 — `_gctransformer_hint_close_stack_`.
+    /// Mark a target as close_stack (must never produce JitCode).
+    pub fn mark_close_stack(&mut self, path: CallPath) {
+        self.close_stack_targets.insert(path);
+    }
+
+    /// RPython: collectanalyze.py:21 — `funcobj.random_effects_on_gcobjs`.
+    /// Mark an external target as having random GC effects.
+    pub fn mark_external_gc_effects(&mut self, path: CallPath) {
+        self.external_gc_effects.insert(path);
+    }
+
+    /// RPython: collectanalyze.py:15 — `_gctransformer_hint_cannot_collect_`.
+    /// Mark a target as known not to trigger GC collection.
+    pub fn mark_cannot_collect(&mut self, path: CallPath) {
+        self.cannot_collect_targets.insert(path);
+    }
+
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────
 
     /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
@@ -1095,18 +1162,19 @@ impl CallControl {
     /// `analyze_external_call` returns `bottom_result()` = False
     /// (graphanalyze.py:60-69). "No graph" ≠ random effects in RPython.
     ///
-    /// In majit: functions without graphs are treated as external calls
-    /// → returns False (matching RPython's default external call behavior).
+    /// In majit: functions without graphs are external calls — returns
+    /// True if in `external_gc_effects`, False otherwise.
     fn analyze_random_effects(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
         if !seen.insert(path.clone()) {
             return false; // cycle → bottom_result
         }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
-            // RPython: external call → analyze_external_call() → bottom_result
-            // (False) unless funcobj.random_effects_on_gcobjs. In majit, we
-            // don't have that flag, so external functions default to False.
-            None => return false,
+            None => {
+                // RPython: analyze_external_call → bottom_result (False)
+                // unless funcobj.random_effects_on_gcobjs → True.
+                return self.external_gc_effects.contains(path);
+            }
         };
         // RPython: analyze_simple_operation always returns False.
         // Only recursive calls into graphs can propagate random effects.
@@ -1152,6 +1220,66 @@ impl CallControl {
                         None => continue,
                     };
                     if self.analyze_can_invalidate(&callee_path, seen) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// RPython: CollectAnalyzer (collectanalyze.py).
+    ///
+    /// RPython: CollectAnalyzer.analyze_direct_call(graph, seen)
+    /// (collectanalyze.py + graphanalyze.py:139).
+    ///
+    /// Traverses graph ops with:
+    /// - analyze_simple_operation (collectanalyze.py:27-33): checks malloc/
+    ///   malloc_varsize with GC flavor, LL_OPERATIONS[op].canmallocgc.
+    ///   In majit the codewriter graph has no LL_OPERATIONS; allocations are
+    ///   only reachable transitively through calls.
+    /// - analyze_direct_call: recurse into callee graphs.
+    /// - analyze_external_call (graphanalyze.py:60): bottom_result() (False).
+    /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py:15-16):
+    ///   functions in `cannot_collect_targets` are known not to collect.
+    fn analyze_can_collect(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+        if !seen.insert(path.clone()) {
+            return false;
+        }
+        // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
+        if self.cannot_collect_targets.contains(path) {
+            return false;
+        }
+        // collectanalyze.py:15: _gctransformer_hint_close_stack_ → True.
+        // close_stack functions always can collect.
+        if self.close_stack_targets.contains(path) {
+            return true;
+        }
+        let graph = match self.function_graphs.get(path) {
+            Some(g) => g,
+            None => {
+                // collectanalyze.py:21-25: analyze_external_call —
+                // if funcobj.random_effects_on_gcobjs → True,
+                // else → bottom_result() (False).
+                return self.external_gc_effects.contains(path);
+            }
+        };
+        for block in &graph.blocks {
+            for op in &block.operations {
+                // collectanalyze.py:27-33: analyze_simple_operation
+                // RPython checks: malloc/malloc_varsize with flavor='gc' → True
+                //                 LL_OPERATIONS[op.opname].canmallocgc → True
+                // majit codewriter graphs have no LL_OPERATIONS; the only
+                // operations that can trigger GC are transitive through calls.
+                // (All other OpKind variants are pure/field/array ops.)
+                if let OpKind::Call { target, .. } = &op.kind {
+                    // graphanalyze.py:139-164: analyze_direct_call — recurse
+                    let callee_path = match self.target_to_path(target) {
+                        Some(p) => p,
+                        // graphanalyze.py:60: external call → bottom_result (False)
+                        None => continue,
+                    };
+                    if self.analyze_can_collect(&callee_path, seen) {
                         return true;
                     }
                 }
@@ -1245,6 +1373,24 @@ impl CallControl {
         let mut seen = HashSet::new();
         let result = self.analyze_can_invalidate(&path, &mut seen);
         cache.can_invalidate.insert(path, result);
+        result
+    }
+
+    /// Cached version of analyze_can_collect for a CallTarget.
+    /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
+    /// graphanalyze.py:60: analyze_external_call → bottom_result() (False).
+    fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            // graphanalyze.py:60: analyze_external_call → bottom_result() (False)
+            None => return false,
+        };
+        if let Some(&result) = cache.can_collect.get(&path) {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let result = self.analyze_can_collect(&path, &mut seen);
+        cache.can_collect.insert(path, result);
         result
     }
 
@@ -1412,15 +1558,25 @@ impl CallControl {
             }
         }
 
-        // RPython call.py:320-324: effectinfo_from_writeanalyze(...)
-        let effectinfo = effectinfo_from_writeanalyze(
+        // RPython call.py:320-324:
+        // effectinfo = effectinfo_from_writeanalyze(
+        //     self.readwrite_analyzer.analyze(op, self.seen_rw),
+        //     self.cpu, extraeffect, oopspecindex, can_invalidate,
+        //     call_release_gil_target, extradescr,
+        //     self.collect_analyzer.analyze(op, self.seen_gc))
+        let effects = analyze_readwrite(
             target,
-            extraeffect,
-            oopspecindex,
-            can_invalidate,
             &self.function_graphs,
             self,
             &mut cache.descr_indices,
+        );
+        let can_collect = self.cached_can_collect(target, cache);
+        let effectinfo = effectinfo_from_writeanalyze(
+            effects,
+            extraeffect,
+            oopspecindex,
+            can_invalidate,
+            can_collect,
         );
 
         // RPython call.py:326-332: assert post-conditions
@@ -1452,10 +1608,56 @@ impl Default for CallControl {
     }
 }
 
-// ── effectinfo_from_writeanalyze (effectinfo.py:276-378) ──────────
+// ── readwrite_analyzer / collect_analyzer (effectinfo.py:276-378) ──
 //
-// RPython: effectinfo_from_writeanalyze(effects, cpu, extraeffect, ...)
-// Builds EffectInfo from the write-analysis result set.
+// RPython: self.readwrite_analyzer.analyze(op, self.seen_rw) → effects
+// RPython: self.collect_analyzer.analyze(op, self.seen_gc) → can_collect
+// Then: effectinfo_from_writeanalyze(effects, cpu, ..., can_collect)
+
+/// RPython: readwrite_analyzer.analyze(op, self.seen_rw).
+///
+/// Traverses the call graph to collect read/write effects as a WriteAnalysis.
+/// This is the Rust equivalent of RPython's ReadWriteAnalyzer producing a
+/// set of ("struct"/"array"/"interiorfield", T, fieldname) tuples.
+fn analyze_readwrite(
+    target: &CallTarget,
+    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    cc: &CallControl,
+    descr_indices: &mut DescrIndexRegistry,
+) -> WriteAnalysis {
+    let mut analysis = WriteAnalysis {
+        read_fields: 0,
+        write_fields: 0,
+        read_arrays: 0,
+        write_arrays: 0,
+        read_interiorfields: 0,
+        write_interiorfields: 0,
+        array_write_descrs: Vec::new(),
+        is_top: false,
+    };
+    if let Some(path) = cc.target_to_path(target) {
+        let mut seen = HashSet::new();
+        collect_readwrite_effects(
+            &path,
+            function_graphs,
+            cc,
+            descr_indices,
+            &mut seen,
+            &mut analysis.read_fields,
+            &mut analysis.write_fields,
+            &mut analysis.read_arrays,
+            &mut analysis.write_arrays,
+            &mut analysis.read_interiorfields,
+            &mut analysis.write_interiorfields,
+            &mut analysis.array_write_descrs,
+        );
+        // RPython: top_set only occurs from gc_add_memory_pressure (writeanalyze.py:72).
+        // External calls return empty_set (bottom_result), not top_set.
+        // We currently don't have gc_add_memory_pressure, so is_top stays false.
+    }
+    analysis
+}
+
 //
 // In RPython, the ReadWriteAnalyzer produces a set of tuples like:
 //   ("struct", T, fieldname), ("readstruct", T, fieldname),
@@ -1470,23 +1672,25 @@ impl Default for CallControl {
 ///
 /// Scans the callee's graph for field/array read/write operations
 /// and populates the corresponding bitset fields in EffectInfo.
+/// RPython: effectinfo_from_writeanalyze(effects, cpu, extraeffect, oopspecindex,
+///     can_invalidate, call_release_gil_target, extradescr, can_collect)
+/// effectinfo.py:276-378.
+///
+/// Takes pre-analyzed `effects` (from readwrite_analyzer) and `can_collect`
+/// (from collect_analyzer) and constructs an EffectInfo.
 fn effectinfo_from_writeanalyze(
-    target: &CallTarget,
+    effects: WriteAnalysis,
     extraeffect: ExtraEffect,
     oopspecindex: OopSpecIndex,
     can_invalidate: bool,
-    function_graphs: &HashMap<CallPath, FunctionGraph>,
-    cc: &CallControl,
-    descr_indices: &mut DescrIndexRegistry,
+    can_collect: bool,
 ) -> EffectInfo {
-    // RPython effectinfo.py:279-281:
-    // if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
-    //     readonly/write = None (=> check_* always returns True)
-    if extraeffect == ExtraEffect::RandomEffects {
+    // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
+    if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
         return EffectInfo {
             extra_effect: ExtraEffect::RandomEffects,
             oopspec_index: oopspecindex,
-            readonly_descrs_fields: !0, // all bits set = top_set
+            readonly_descrs_fields: !0, // all bits set = top_set (None in RPython)
             write_descrs_fields: !0,
             readonly_descrs_arrays: !0,
             write_descrs_arrays: !0,
@@ -1494,84 +1698,49 @@ fn effectinfo_from_writeanalyze(
             write_descrs_interiorfields: !0,
             single_write_descr_array: None,
             can_invalidate,
+            can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
         };
     }
 
-    // For elidable/loopinvariant: ignore writes (effectinfo.py:181-186).
-    // RPython: if elidable or loopinvariant: write_descrs = frozenset()
-    let ignore_writes = matches!(
+    // effectinfo.py:345-360: readonly = reads that have NO corresponding write.
+    let readonly_descrs_fields = effects.read_fields & !effects.write_fields;
+    let readonly_descrs_arrays = effects.read_arrays & !effects.write_arrays;
+    let readonly_descrs_interiorfields =
+        effects.read_interiorfields & !effects.write_interiorfields;
+
+    let mut write_descrs_fields = effects.write_fields;
+    let mut write_descrs_arrays = effects.write_arrays;
+    let mut write_descrs_interiorfields = effects.write_interiorfields;
+    let mut array_write_descrs = effects.array_write_descrs;
+
+    // effectinfo.py:169-181: for elidable/loopinvariant, ignore writes.
+    if matches!(
         extraeffect,
         ExtraEffect::ElidableCannotRaise
             | ExtraEffect::ElidableOrMemoryError
             | ExtraEffect::ElidableCanRaise
             | ExtraEffect::LoopInvariant
-    );
-
-    // Collect raw read/write bitsets from graph traversal.
-    let mut read_fields: u64 = 0;
-    let mut write_fields: u64 = 0;
-    let mut read_arrays: u64 = 0;
-    let mut write_arrays: u64 = 0;
-    // effectinfo.py:201-206: collect actual array write DescrRefs.
-    let mut array_write_descrs: Vec<majit_ir::descr::DescrRef> = Vec::new();
-
-    let mut read_interiorfields: u64 = 0;
-    let mut write_interiorfields: u64 = 0;
-
-    if let Some(path) = cc.target_to_path(target) {
-        let mut seen = HashSet::new();
-        collect_readwrite_effects(
-            &path,
-            function_graphs,
-            cc,
-            descr_indices,
-            &mut seen,
-            &mut read_fields,
-            &mut write_fields,
-            &mut read_arrays,
-            &mut write_arrays,
-            &mut read_interiorfields,
-            &mut write_interiorfields,
-            &mut array_write_descrs,
-        );
-    }
-
-    // RPython effectinfo.py:345-360: readonly = reads that have NO
-    // corresponding write. If a field is both read and written, it
-    // goes into write_descrs only, NOT readonly_descrs.
-    //
-    // effectinfo.py:346: tupw = ("struct",) + tup[1:]
-    //                    if tupw not in effects:
-    //                        add_struct(readonly_descrs_fields, tup)
-    let readonly_descrs_fields = read_fields & !write_fields;
-    let readonly_descrs_arrays = read_arrays & !write_arrays;
-    let mut write_descrs_fields = write_fields;
-    let mut write_descrs_arrays = write_arrays;
-
-    // RPython effectinfo.py:169-181: for elidable/loopinvariant,
-    // ignore writes (_write_descrs_* = frozenset()).
-    // This must clear BOTH the bitset AND the descr set, so that
-    // single_write_descr_array becomes None (effectinfo.py:201-206).
-    if ignore_writes {
+    ) {
         write_descrs_fields = 0;
         write_descrs_arrays = 0;
+        write_descrs_interiorfields = 0;
         array_write_descrs.clear();
     }
 
     // effectinfo.py:201-206: single_write_descr_array
-    // RPython: if len(_write_descrs_arrays) == 1: [single] = _write_descrs_arrays
     let single_write_descr_array = if array_write_descrs.len() == 1 {
         Some(array_write_descrs.into_iter().next().unwrap())
     } else {
         None
     };
 
-    // RPython effectinfo.py:349-354: interiorfield readonly = reads & ~writes.
-    let readonly_descrs_interiorfields = read_interiorfields & !write_interiorfields;
-    let mut write_descrs_interiorfields = write_interiorfields;
-    if ignore_writes {
-        write_descrs_interiorfields = 0;
-    }
+    // effectinfo.py:364-365: if extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE:
+    //     can_collect = True
+    let can_collect = if extraeffect >= ExtraEffect::ForcesVirtualOrVirtualizable {
+        true
+    } else {
+        can_collect
+    };
 
     EffectInfo {
         extra_effect: extraeffect,
@@ -1584,6 +1753,7 @@ fn effectinfo_from_writeanalyze(
         write_descrs_interiorfields,
         single_write_descr_array,
         can_invalidate,
+        can_collect,
     }
 }
 
@@ -1738,13 +1908,9 @@ fn collect_readwrite_effects(
     let graph = match function_graphs.get(path) {
         Some(g) => g,
         None => {
-            // No graph available → top_set (all bits set).
-            *read_fields = !0;
-            *write_fields = !0;
-            *read_arrays = !0;
-            *write_arrays = !0;
-            *read_interiorfields = !0;
-            *write_interiorfields = !0;
+            // RPython: analyze_external_call() returns bottom_result() (empty_set),
+            // NOT top_set. External calls have no KNOWN read/write effects.
+            // The extraeffect (CanRaise etc.) is determined separately.
             return;
         }
     };
@@ -1935,15 +2101,9 @@ fn collect_readwrite_effects(
                             array_write_descrs,
                         );
                     } else {
-                        // Unresolvable call → top_set.
-                        // effectinfo.py:285: effects is top_set → all descriptor sets None.
-                        *read_fields = !0;
-                        *write_fields = !0;
-                        *read_arrays = !0;
-                        *write_arrays = !0;
-                        *read_interiorfields = !0;
-                        *write_interiorfields = !0;
-                        return;
+                        // RPython: analyze_external_call() → bottom_result() (empty_set).
+                        // External calls have no known read/write effects.
+                        // (NOT top_set — that only comes from gc_add_memory_pressure.)
                     }
                 }
                 _ => {}
