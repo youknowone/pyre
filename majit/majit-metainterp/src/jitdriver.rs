@@ -1249,20 +1249,19 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 green_key
             };
-            let (must_compile, _owning_key) = self.meta.must_compile_with_values(
+            let (must_compile, owning_key) = self.meta.must_compile_with_values(
                 guard_loop_key,
                 trace_id,
                 fail_index,
                 &raw_values,
-                status,
-                descr_addr,
             );
             // compile.py:702-703: must_compile() and not stack_almost_full()
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
             // Extract guard_resume_pc from fail_args (last Int value).
-            let num_inputs = self.meta.compiled_num_inputs(green_key);
+            // compile.py:800-809: use owning_key (rd_loop_token) for bridge attachment.
+            let num_inputs = self.meta.compiled_num_inputs(owning_key);
             let guard_resume_pc = if raw_values.len() > num_inputs {
                 raw_values[raw_values.len() - 1] as usize
             } else {
@@ -1272,7 +1271,7 @@ impl<S: JitState> JitDriver<S> {
             if should_bridge {
                 // compile.py:704-709: _trace_and_compile_from_bridge
                 let bridge_ok = self.start_bridge_tracing(
-                    green_key,
+                    owning_key,
                     trace_id,
                     fail_index,
                     state,
@@ -2178,14 +2177,9 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (must_compile, owning_key) = self.meta.must_compile_with_values(
-            guard_loop_key,
-            trace_id,
-            fail_index,
-            &raw_values,
-            status,
-            descr_addr,
-        );
+        let (must_compile, owning_key) =
+            self.meta
+                .must_compile_with_values(guard_loop_key, trace_id, fail_index, &raw_values);
         // compile.py:702-703: must_compile() and not stack_almost_full()
         let should_bridge =
             must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
@@ -2768,14 +2762,9 @@ impl<S: JitState> JitDriver<S> {
             //       resume_in_blackhole(...)
             //   assert 0, "unreachable"
 
-            let (must_compile, _owning_key) = self.meta.must_compile_with_values(
-                key_hash,
-                trace_id,
-                fail_index,
-                &raw_values,
-                status,
-                descr_addr,
-            );
+            let (must_compile, _owning_key) =
+                self.meta
+                    .must_compile_with_values(key_hash, trace_id, fail_index, &raw_values);
             // compile.py:702-703: must_compile() and not stack_almost_full()
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();

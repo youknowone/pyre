@@ -4784,11 +4784,12 @@ impl<M: Clone> MetaInterp<M> {
     const TY_REF: u64 = 0x04;
     const TY_FLOAT: u64 = 0x06;
 
-    /// compile.py:738-784: must_compile — read status from descriptor,
-    /// compute hash, tick jitcounter.
+    /// compile.py:738-784: must_compile — read self.status from descriptor
+    /// LIVE (not a snapshot), compute hash, tick jitcounter.
     ///
-    /// RPython: must_compile ALWAYS ticks the counter. stack_almost_full
-    /// is checked by the caller in handle_fail (compile.py:702-703).
+    /// RPython: must_compile reads self.status at call time (compile.py:741).
+    /// ALWAYS ticks the counter. stack_almost_full is checked by the caller
+    /// in handle_fail (compile.py:702-703).
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
         &mut self,
@@ -4796,32 +4797,28 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
-        status: u64,
-        descr_addr: usize,
     ) -> (bool, u64) {
         let owning_key = self.find_owning_key(green_key, trace_id);
-        if self.compiled_loops.get(&owning_key).is_none() {
-            return (false, green_key);
-        }
+        // compile.py:741: read self.status from the descriptor LIVE.
+        // RPython: must_compile is a method on the descriptor → self.status.
+        // majit: look up descriptor via get_guard_status(trace_id, fail_index).
+        let (status, descr_addr) = self.get_guard_status(owning_key, trace_id, fail_index);
         // compile.py:741-751: decode status to get hash
         let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
             // compile.py:745: common case — TY_NONE, not busy.
-            // The status itself is the jitcounter hash.
             status
         } else if status & Self::ST_BUSY_FLAG != 0 {
             // compile.py:750-751: already busy tracing.
             return (false, owning_key);
         } else {
-            // compile.py:753-781: GUARD_VALUE — extract index + type tag,
-            // compute per-value hash from the actual fail arg value.
+            // compile.py:753-781: GUARD_VALUE per-value hash.
             let index = (status >> Self::ST_SHIFT) as u32;
             let typetag = status & Self::ST_TYPE_MASK;
             let raw = fail_values.get(index as usize).copied().unwrap_or(0);
-            // compile.py:761-771
             let intval: i64 = match typetag {
                 Self::TY_INT => raw,
                 Self::TY_REF => raw,
-                Self::TY_FLOAT => raw, // float2longlong: raw bits
+                Self::TY_FLOAT => raw,
                 _ => raw,
             };
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
@@ -4831,8 +4828,6 @@ impl<M: Clone> MetaInterp<M> {
                 .wrapping_add((intval as u64).wrapping_mul(1442968193))
         };
         // compile.py:783-784: jitcounter.tick(hash, increment)
-        // NOTE: tick always runs. stack_almost_full is checked by caller
-        // (compile.py:702-703: must_compile() and not stack_almost_full()).
         let fired = self.warm_state.tick_guard_failure(hash);
         if fired && crate::majit_log_enabled() {
             eprintln!(
