@@ -495,10 +495,22 @@ extern "C" fn jit_exc_restore(value: i64, exc_type: i64) {
     JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Set exception state from a call that may raise.
-/// This is called by external code that wants to signal an exception
-/// to the JIT-compiled code.
+/// llmodel.py:194-199 _store_exception parity: set exception state.
+///
+/// `value` must be a valid OBJECTPTR whose typeptr (offset 0) equals
+/// `exc_type`.  This invariant mirrors RPython where pos_exception
+/// is always `ptr2int(pos_exc_value().typeptr)`.
 pub fn jit_exc_raise(value: i64, exc_type: i64) {
+    debug_assert!(
+        value == 0 || unsafe { *(value as *const i64) } == exc_type,
+        "jit_exc_raise: value.typeptr ({:#x}) != exc_type ({:#x})",
+        if value != 0 {
+            unsafe { *(value as *const i64) }
+        } else {
+            0
+        },
+        exc_type,
+    );
     JIT_EXC_VALUE.store(value, std::sync::atomic::Ordering::Relaxed);
     JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
 }
@@ -9727,7 +9739,7 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        // jf_guard_exc + jf_guard_exc_type written by emit_guard_exit.
+        // jf_guard_exc written by emit_guard_exit; exc_class derived from typeptr.
         let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
         let exception = GcRef(exc_raw);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
