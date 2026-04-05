@@ -245,8 +245,11 @@ pub(crate) fn build_guard_metadata(
             // Multi-frame: push_frame per frame with correct pc.
             if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                let fvc = majit_ir::resumedata::get_frame_value_count_fn();
+                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                 let (_num_failargs, vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, None);
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, fvc_ref);
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -324,8 +327,11 @@ pub(crate) fn build_guard_metadata(
             let frames_layout =
                 if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+                    let fvc = majit_ir::resumedata::get_frame_value_count_fn();
+                    let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
+                        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
                     let (_num_failargs, _vable_values, vref_values, frames) =
-                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data, None);
+                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data, fvc_ref);
                     // TODO: vref_array parity (resume.py:1386,1431).
                     // pyre does not yet use virtual references.
                     debug_assert!(

@@ -8,6 +8,31 @@ use std::collections::HashMap;
 use crate::resumecode;
 use crate::{BoxEnv, OpRef, Type};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Global frame_value_count callback for RPython-parity multi-frame decode.
+/// resume.py:1049: consume_boxes(f.get_current_position_info(), ...) uses
+/// per-jitcode liveness at the decode site. pyre registers this callback
+/// from pyre-jit-trace::state so that all callers of rebuild_from_numbering
+/// (including those in majit-metainterp and majit-backend-cranelift) can
+/// split multi-frame sections correctly.
+static FRAME_VALUE_COUNT_FN: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the global frame_value_count callback.
+pub fn set_frame_value_count_fn(f: fn(i32, i32) -> usize) {
+    FRAME_VALUE_COUNT_FN.store(f as usize, Ordering::Relaxed);
+}
+
+/// Get the registered frame_value_count callback (if any).
+pub fn get_frame_value_count_fn() -> Option<fn(i32, i32) -> usize> {
+    let p = FRAME_VALUE_COUNT_FN.load(Ordering::Relaxed);
+    if p == 0 {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute(p) })
+    }
+}
+
 // resume.py:123-132 — tag constants
 pub const TAGCONST: u8 = 0;
 pub const TAGINT: u8 = 1;
