@@ -2191,6 +2191,8 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
+                // compile.py:826-830 store_hash: assign jitcounter hashes.
+                self.assign_guard_hashes(&token);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -2812,6 +2814,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
+                self.assign_guard_hashes(&token);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -3216,6 +3219,7 @@ impl<M: Clone> MetaInterp<M> {
             .compile_loop(&inputargs, &optimized_ops, &mut token)
         {
             Ok(_) => {
+                self.assign_guard_hashes(&token);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -3515,6 +3519,7 @@ impl<M: Clone> MetaInterp<M> {
             .compile_loop(&inputargs, &optimized_ops, &mut token)
         {
             Ok(_) => {
+                self.assign_guard_hashes(&token);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -4850,6 +4855,19 @@ impl<M: Clone> MetaInterp<M> {
         // TODO: implement loop aging when memory_manager is added.
     }
 
+    /// compile.py:826-830 store_hash: assign jitcounter hashes to guards
+    /// after compile_loop/compile_bridge. RPython calls store_hash during
+    /// optimizer emit (store_final_boxes_in_guard); in majit the backend
+    /// creates fail_descrs, so we assign hashes after compilation.
+    fn assign_guard_hashes(&mut self, token: &JitCellToken) {
+        let layouts = self.backend.compiled_fail_descr_layouts(token);
+        let num_guards = layouts.map(|l| l.len()).unwrap_or(0);
+        let hashes: Vec<u64> = (0..num_guards)
+            .map(|_| self.warm_state.fetch_next_hash())
+            .collect();
+        self.backend.store_guard_hashes(token, &hashes);
+    }
+
     /// compile.py:741-745: look up (status, descr_addr) for a guard.
     /// Search current token + previous_tokens by (trace_id, fail_index)
     /// to find the exact descriptor — same pattern as start_guard_compiling.
@@ -5454,6 +5472,26 @@ impl<M: Clone> MetaInterp<M> {
                         "[jit] compiled bridge at key={}, guard={}",
                         green_key, fail_index
                     );
+                }
+                // compile.py:826-830 store_hash for bridge guards.
+                {
+                    let compiled = self.compiled_loops.get(&green_key);
+                    if let Some(compiled) = compiled {
+                        let bridge_layouts = self.backend.compiled_bridge_fail_descr_layouts(
+                            &compiled.token,
+                            fail_descr.trace_id(),
+                            fail_index,
+                        );
+                        let num_guards = bridge_layouts.map(|l| l.len()).unwrap_or(0);
+                        let hashes: Vec<u64> = (0..num_guards)
+                            .map(|_| self.warm_state.fetch_next_hash())
+                            .collect();
+                        self.backend.store_bridge_guard_hashes(
+                            &compiled.token,
+                            fail_index,
+                            &hashes,
+                        );
+                    }
                 }
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
