@@ -4859,13 +4859,48 @@ impl<M: Clone> MetaInterp<M> {
     /// after compile_loop/compile_bridge. RPython calls store_hash during
     /// optimizer emit (store_final_boxes_in_guard); in majit the backend
     /// creates fail_descrs, so we assign hashes after compilation.
+    /// Only allocates hashes for real guards (not FINISH/external JUMP).
     fn assign_guard_hashes(&mut self, token: &JitCellToken) {
         let layouts = self.backend.compiled_fail_descr_layouts(token);
-        let num_guards = layouts.map(|l| l.len()).unwrap_or(0);
-        let hashes: Vec<u64> = (0..num_guards)
-            .map(|_| self.warm_state.fetch_next_hash())
+        let hashes: Vec<u64> = layouts
+            .iter()
+            .flatten()
+            .map(|layout| {
+                if layout.is_finish {
+                    0 // FINISH/external JUMP — no hash needed
+                } else {
+                    self.warm_state.fetch_next_hash()
+                }
+            })
             .collect();
         self.backend.store_guard_hashes(token, &hashes);
+    }
+
+    /// compile.py:826-830 store_hash for bridge guards.
+    fn assign_bridge_guard_hashes(
+        &mut self,
+        token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) {
+        let layouts = self.backend.compiled_bridge_fail_descr_layouts(
+            token,
+            source_trace_id,
+            source_fail_index,
+        );
+        let hashes: Vec<u64> = layouts
+            .iter()
+            .flatten()
+            .map(|layout| {
+                if layout.is_finish {
+                    0
+                } else {
+                    self.warm_state.fetch_next_hash()
+                }
+            })
+            .collect();
+        self.backend
+            .store_bridge_guard_hashes(token, source_trace_id, source_fail_index, &hashes);
     }
 
     /// compile.py:741-745: look up (status, descr_addr) for a guard.
@@ -5474,24 +5509,37 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // compile.py:826-830 store_hash for bridge guards.
-                {
-                    let compiled = self.compiled_loops.get(&green_key);
-                    if let Some(compiled) = compiled {
-                        let bridge_layouts = self.backend.compiled_bridge_fail_descr_layouts(
-                            &compiled.token,
-                            fail_descr.trace_id(),
-                            fail_index,
-                        );
-                        let num_guards = bridge_layouts.map(|l| l.len()).unwrap_or(0);
-                        let hashes: Vec<u64> = (0..num_guards)
-                            .map(|_| self.warm_state.fetch_next_hash())
-                            .collect();
-                        self.backend.store_bridge_guard_hashes(
-                            &compiled.token,
-                            fail_index,
-                            &hashes,
-                        );
-                    }
+                if let Some(compiled) = self.compiled_loops.get(&green_key) {
+                    let source_trace_id = {
+                        let tid = fail_descr.trace_id();
+                        if tid == 0 {
+                            compiled.root_trace_id
+                        } else {
+                            tid
+                        }
+                    };
+                    let layouts = self.backend.compiled_bridge_fail_descr_layouts(
+                        &compiled.token,
+                        source_trace_id,
+                        fail_index,
+                    );
+                    let hashes: Vec<u64> = layouts
+                        .iter()
+                        .flatten()
+                        .map(|layout| {
+                            if layout.is_finish {
+                                0
+                            } else {
+                                self.warm_state.fetch_next_hash()
+                            }
+                        })
+                        .collect();
+                    self.backend.store_bridge_guard_hashes(
+                        &compiled.token,
+                        source_trace_id,
+                        fail_index,
+                        &hashes,
+                    );
                 }
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {

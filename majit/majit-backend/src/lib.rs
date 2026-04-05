@@ -803,9 +803,11 @@ pub trait Backend: Send {
 
     /// store_hash for bridge guards — same as store_guard_hashes but for
     /// the most recently compiled bridge on the given guard.
+    /// Uses (trace_id, fail_index) for recursive descriptor lookup.
     fn store_bridge_guard_hashes(
         &self,
         _token: &JitCellToken,
+        _source_trace_id: u64,
         _source_fail_index: u32,
         _hashes: &[u64],
     ) {
