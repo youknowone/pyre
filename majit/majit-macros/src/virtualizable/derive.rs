@@ -375,7 +375,6 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VableMetaRole {
-    MergePc,
     NumLocals,
     Valuestackdepth,
     SlotTypes,
@@ -384,7 +383,6 @@ enum VableMetaRole {
 
 fn parse_vable_meta_role(s: &str) -> Option<VableMetaRole> {
     match s {
-        "merge_pc" => Some(VableMetaRole::MergePc),
         "num_locals" => Some(VableMetaRole::NumLocals),
         "valuestackdepth" => Some(VableMetaRole::Valuestackdepth),
         "slot_types" => Some(VableMetaRole::SlotTypes),
@@ -434,10 +432,6 @@ pub fn expand_meta(input: DeriveInput) -> TokenStream {
     let struct_name = &input.ident;
     let vable_fields = extract_vable_meta_fields(&input);
 
-    let merge_pc_field = vable_fields
-        .iter()
-        .find(|f| f.role == VableMetaRole::MergePc)
-        .map(|f| &f.ident);
     let num_locals_field = vable_fields
         .iter()
         .find(|f| f.role == VableMetaRole::NumLocals)

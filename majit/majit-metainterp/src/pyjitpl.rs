@@ -1814,7 +1814,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
-        // the new header PC so meta.merge_pc can be updated after insert.
+        // the new header PC so meta can be updated after insert.
         // RPython parity: only cut the trace if no compiled entry already
         // exists at the inner loop's green_key. If the inner loop was already
         // compiled independently, its entry has correct code+meta. Cutting

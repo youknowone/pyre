@@ -1146,7 +1146,6 @@ pub fn derive_virtualizable_sym(input: TokenStream) -> TokenStream {
 /// Derive macro for virtualizable meta structs.
 ///
 /// Recognizes `#[vable(...)]` attributes on fields:
-/// - `#[vable(merge_pc)]` — merge point PC
 /// - `#[vable(num_locals)]` — number of locals
 /// - `#[vable(valuestackdepth)]` — value stack depth
 /// - `#[vable(slot_types)]` — slot type vector

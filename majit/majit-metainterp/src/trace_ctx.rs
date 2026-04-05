@@ -106,7 +106,7 @@ pub struct MergePoint {
     /// majit stores types alongside OpRefs for compile_retrace parity.
     pub original_box_types: Vec<Type>,
     /// Bytecode PC of this loop header. Used by cut_trace_from to update
-    /// meta.merge_pc when the trace closes at a different loop.
+    /// meta when the trace closes at a different loop.
     pub header_pc: usize,
 }
 

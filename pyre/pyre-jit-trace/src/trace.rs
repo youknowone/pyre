@@ -46,7 +46,7 @@ pub fn trace_bytecode(
     let mut metainterp = PyreMetaInterp::new(code as *const CodeObject, std::ptr::null_mut());
     metainterp.framestack.push(frame);
 
-    // RPython pyjitpl.py:2971-2973: register the initial merge point so
+    // pyjitpl.py:2971-2973: register the initial merge point so
     // reached_loop_header recognizes the trace start backedge and closes
     // the loop instead of unrolling it as a first-visit inner loop.
     let start_key = crate::driver::make_green_key(code as *const CodeObject, start_pc);

@@ -329,8 +329,6 @@ pub struct PyreJitState {
 /// Meta information for a trace — describes the shape of the code being traced.
 #[derive(Clone, majit_macros::VirtualizableMeta)]
 pub struct PyreMeta {
-    #[vable(merge_pc)]
-    pub merge_pc: usize,
     #[vable(num_locals)]
     pub num_locals: usize,
     pub ns_keys: Vec<String>,
@@ -1954,7 +1952,6 @@ impl JitState for PyreJitState {
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
         PyreMeta {
-            merge_pc: header_pc,
             num_locals,
             ns_keys: self.namespace_keys(),
             valuestackdepth: vsd,
@@ -2011,7 +2008,7 @@ impl JitState for PyreJitState {
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
         // warmstate.py:503-511: RPython enters assembler unconditionally
-        // when procedure_token exists. No next_instr/merge_pc check —
+        // when procedure_token exists. No next_instr check —
         // the compiled code's preamble handles entry from any PC.
         // Shape checks (nlocals, namespace) ensure frame layout matches.
         self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_keys.len()
@@ -2097,7 +2094,6 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
-        meta.merge_pc = header_pc;
         // Update valuestackdepth from the merge point's box layout.
         // Layout: [Ref(frame), Int(ni), Int(vsd), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
@@ -2130,7 +2126,6 @@ impl JitState for PyreJitState {
             provisional.valuestackdepth
         };
         PyreMeta {
-            merge_pc: header_pc,
             num_locals: provisional.num_locals,
             ns_keys: provisional.ns_keys.clone(),
             valuestackdepth: vsd,
@@ -2176,8 +2171,8 @@ impl JitState for PyreJitState {
                 Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
             });
             eprintln!(
-                "[jit][restore_values] before arg0={:?} meta.pc={} meta.vsd={} has_vable={} values={:?}",
-                arg0, meta.merge_pc, meta.valuestackdepth, meta.has_virtualizable, values
+                "[jit][restore_values] before arg0={:?} meta.vsd={} has_vable={} values={:?}",
+                arg0, meta.valuestackdepth, meta.has_virtualizable, values
             );
         }
         if values.len() == 1 {
@@ -2185,8 +2180,8 @@ impl JitState for PyreJitState {
         }
 
         if meta.has_virtualizable {
-            // RPython parity: loop JUMPs resume at the loop header merge point.
-            self.set_next_instr(meta.merge_pc);
+            // next_instr is already synced to the PyFrame heap by the
+            // compiled code's virtualizable sync before JUMP.
             self.set_valuestackdepth(meta.valuestackdepth);
             let nlocals = self.local_count();
             let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
@@ -2702,7 +2697,6 @@ mod tests {
 
     fn empty_meta() -> PyreMeta {
         PyreMeta {
-            merge_pc: 0,
             num_locals: 0,
             ns_keys: Vec::new(),
             valuestackdepth: 0,
@@ -3012,7 +3006,6 @@ mod tests {
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {
-            merge_pc: 0,
             num_locals: 4,
             ns_keys: Vec::new(),
             valuestackdepth: 4,
