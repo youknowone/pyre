@@ -1991,6 +1991,32 @@ impl OptContext {
         let resume_pos = op.rd_resume_position;
         let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
         if !has_snapshot {
+            // resume.py:396-397 parity: RPython asserts resume_position >= 0.
+            // Guard without valid snapshot — use the closest preceding guard's
+            // snapshot as fallback. This handles guards created by optimizer
+            // passes (intbounds, bridgeopt) that don't carry trace-time snapshots.
+            // In RPython this never happens because all guards originate from
+            // tracing. Pyre's separated optimizer architecture can synthesize
+            // guards without snapshots.
+            //
+            // Fallback priority: patchguardop > last emitted guard's snapshot.
+            let fallback_pos = self
+                .patchguardop
+                .as_ref()
+                .map(|p| p.rd_resume_position)
+                .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p))
+                .or_else(|| {
+                    // Use the last successfully emitted guard's snapshot.
+                    self.last_guard_idx.and_then(|idx| {
+                        let pos = self.new_operations[idx].rd_resume_position;
+                        (pos >= 0 && self.snapshot_boxes.contains_key(&pos)).then_some(pos)
+                    })
+                });
+            if let Some(fb_pos) = fallback_pos {
+                op.rd_resume_position = fb_pos;
+                self.finalize_guard_resume_data(op);
+                return;
+            }
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
