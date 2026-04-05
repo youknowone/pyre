@@ -2608,19 +2608,27 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         } else {
             None
         };
-        let (exception_class, exception) = take_pending_jit_exception_state();
-        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-            release_force_token(handle);
+        let (_, exception) = take_pending_jit_exception_state();
+        let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+        let jf_ptr = exec.jf_gcref.0;
+        if let Some(sd) = saved_data {
+            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+        } else {
+            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
+        }
+        if !exception.is_null() {
+            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
+        } else {
+            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
         }
 
         return DeadFrame {
-            data: Box::new(FrameData::new_with_savedata_and_exception(
-                outputs,
+            data: Box::new(JitFrameDeadFrame::new(
+                exec.jf_gcref,
                 fail_descr.clone(),
                 target.gc_runtime_id,
-                saved_data,
-                exception_class,
-                (!exception.is_null()).then_some(exception),
+                force_tokens,
+                exec.heap_owner,
             )),
         };
     } // end loop
@@ -5236,15 +5244,19 @@ impl CraneliftBackend {
                 } else {
                     None
                 };
-                let (exception_class, exception) = take_pending_jit_exception_state();
+                let (_, exception) = take_pending_jit_exception_state();
                 let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
                 // Write savedata/exception to JitFrame header (llmodel.py parity).
                 let jf_ptr = exec.jf_gcref.0;
                 if let Some(sd) = saved_data {
                     unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+                } else {
+                    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
                 }
                 if !exception.is_null() {
                     unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
+                } else {
+                    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
                 }
                 return DeadFrame {
                     data: Box::new(JitFrameDeadFrame::new(
@@ -5252,7 +5264,6 @@ impl CraneliftBackend {
                         fail_descr.clone(),
                         compiled.gc_runtime_id,
                         force_tokens,
-                        exception_class,
                         exec.heap_owner,
                     )),
                 };
@@ -5297,14 +5308,18 @@ impl CraneliftBackend {
             } else {
                 None
             };
-            let (exception_class, exception) = take_pending_jit_exception_state();
+            let (_, exception) = take_pending_jit_exception_state();
             let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
             let jf_ptr = exec.jf_gcref.0;
             if let Some(sd) = saved_data {
                 unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+            } else {
+                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
             }
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
+            } else {
+                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
             }
 
             return DeadFrame {
@@ -5313,7 +5328,6 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     compiled.gc_runtime_id,
                     force_tokens,
-                    exception_class,
                     exec.heap_owner,
                 )),
             };
@@ -5374,7 +5388,7 @@ impl CraneliftBackend {
             } else {
                 None
             };
-            let (exception_class, exception) = take_pending_jit_exception_state();
+            let (_, exception) = take_pending_jit_exception_state();
             let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
             let jf_ptr = exec.jf_gcref.0;
             if let Some(sd) = saved_data {
@@ -5389,7 +5403,6 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     bridge.gc_runtime_id,
                     force_tokens,
-                    exception_class,
                     exec.heap_owner,
                 )),
             };
@@ -5409,14 +5422,18 @@ impl CraneliftBackend {
         } else {
             None
         };
-        let (exception_class, exception) = take_pending_jit_exception_state();
+        let (_, exception) = take_pending_jit_exception_state();
         let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
         let jf_ptr = exec.jf_gcref.0;
         if let Some(sd) = saved_data {
             unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+        } else {
+            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
         }
         if !exception.is_null() {
             unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
+        } else {
+            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
         }
 
         DeadFrame {
@@ -5425,7 +5442,6 @@ impl CraneliftBackend {
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
                 force_tokens,
-                exception_class,
                 exec.heap_owner,
             )),
         }
@@ -6353,32 +6369,24 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNotForced => {
-                    // Intervening non-guard ops between CallMayForce and
-                    // GuardNotForced are allowed. We only require that a
-                    // preceding CallMayForce exists somewhere earlier in the
-                    // trace (the push/pop shim mechanism is position-independent).
-                    let has_preceding_call_may_force =
-                        ops[..op_idx].iter().any(|o| o.opcode.is_call_may_force());
-                    if !has_preceding_call_may_force {
-                        return Err(unsupported_semantics(
-                            op.opcode,
-                            "guard_not_forced requires a preceding call_may_force",
-                        ));
-                    }
+                    // x86/assembler.py:2228-2232 genop_guard_guard_not_forced:
+                    //   ofs = self.cpu.get_ofs_of_frame_field('jf_descr')
+                    //   self.mc.CMP_bi(ofs, 0)
+                    //   self.guard_success_cc = rx86.Conditions['E']
+                    //   self.implement_guard(guard_token)
+                    // Pairing validation is done by CALL_MAY_FORCE (forward
+                    // lookup, _find_nearby_operation(+1) parity).
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let was_forced = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        finish_may_force_guard_shim as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("guard_not_forced shim must return a value");
+                    let jf_descr = builder.ins().load(
+                        cl_types::I64,
+                        MemFlags::trusted(),
+                        jf_ptr,
+                        JF_DESCR_OFS,
+                    );
                     let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_forced = builder.ins().icmp(IntCC::NotEqual, was_forced, zero);
+                    let is_forced = builder.ins().icmp(IntCC::NotEqual, jf_descr, zero);
                     let exit_block = builder.create_block();
                     let cont_block = builder.create_block();
                     builder
@@ -7113,58 +7121,33 @@ impl CraneliftBackend {
                 | OpCode::CallMayForceR
                 | OpCode::CallMayForceF
                 | OpCode::CallMayForceN => {
-                    // Intervening non-guard ops (SameAs, SaveException, etc.)
-                    // are allowed between CallMayForce and GuardNotForced.
-                    // The push/pop mechanism in pending_may_force is
-                    // position-independent; we only require that a matching
-                    // GuardNotForced appears later in the trace.
-                    let has_guard_not_forced = ops[op_idx + 1..]
-                        .iter()
-                        .any(|o| o.opcode == OpCode::GuardNotForced);
-                    if !has_guard_not_forced {
+                    // x86/assembler.py:2234-2235 _genop_call_may_force:
+                    //   self._store_force_index(self._find_nearby_operation(+1))
+                    //   self._genop_call(op, arglocs, result_loc)
+                    // _find_nearby_operation(+1) = operations[position + 1]
+                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2
+                    let next_op = ops.get(op_idx + 1);
+                    let is_paired_guard = next_op.is_some_and(|o| {
+                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
+                    });
+                    if !is_paired_guard {
                         return Err(unsupported_semantics(
                             op.opcode,
-                            "call_may_force must be followed by guard_not_forced",
+                            "call_may_force: ops[position+1] must be guard_not_forced(_2)",
                         ));
                     }
                     let info = &guard_infos[guard_idx];
 
-                    let preview_bytes = (info.fail_arg_refs.len().max(1) * 8) as u32;
-                    let preview_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        preview_bytes,
-                        3,
-                    ));
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        // Values defined at or after this op (vi) are not yet
-                        // available — use zero as a placeholder in the preview
-                        // snapshot.  Constants (stored in the constants map)
-                        // are always resolvable regardless of position.
-                        let raw = if arg_ref.0 >= vi && !constants.contains_key(&arg_ref.0) {
-                            zero
-                        } else {
-                            resolve_opref(&mut builder, &constants, arg_ref)
-                        };
-                        builder
-                            .ins()
-                            .stack_store(raw, preview_slot, (index * 8) as i32);
-                    }
-                    let preview_ptr = builder.ins().stack_addr(ptr_type, preview_slot, 0);
-                    let preview_ptr = ptr_arg_as_i64(&mut builder, preview_ptr, ptr_type);
-                    let fail_index = builder.ins().iconst(cl_types::I64, info.fail_index as i64);
-                    let num_values = builder
+                    // x86/assembler.py _store_force_index parity:
+                    // Store the GUARD_NOT_FORCED fail descriptor pointer
+                    // into jf_force_descr before the call. If the callee
+                    // forces the frame, force() reads this to set jf_descr.
+                    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                    builder
                         .ins()
-                        .iconst(cl_types::I64, info.fail_arg_refs.len() as i64);
-                    let _ = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        begin_may_force_call_shim as *const () as usize,
-                        &[fail_index, preview_ptr, num_values],
-                        None,
-                    );
+                        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
 
+                    // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
                     let descr = op.descr.as_ref().expect("call op must have a descriptor");
                     let call_descr = descr
                         .as_call_descr()
@@ -8434,16 +8417,10 @@ impl CraneliftBackend {
 
                 // ── ForceToken ──
                 OpCode::ForceToken => {
-                    let token = emit_host_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        current_force_token_shim as *const () as usize,
-                        &[],
-                        Some(cl_types::I64),
-                    )
-                    .expect("force_token shim must return a value");
-                    builder.def_var(var(vi), token);
+                    // x86/assembler.py genop_force_token: mov resloc, ebp
+                    // FORCE_TOKEN returns the JitFrame pointer itself.
+                    // resoperation.py:1090: "returns the jitframe"
+                    builder.def_var(var(vi), jf_ptr);
                 }
 
                 // ── VirtualRef operations ──
@@ -10515,7 +10492,49 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
-        Some(force_token_to_dead_frame(force_token))
+        // llmodel.py:270-274 parity (with Rust wrapper overhead):
+        //   frame = rffi.cast(JITFRAMEPTR, addr_of_force_token)
+        //   frame = frame.resolve()
+        //   frame.jf_descr = frame.jf_force_descr
+        //   return cast_opaque_ptr(GCREF, frame)
+        // Rust needs a JitFrameDeadFrame wrapper + Arc for the descr.
+        // No exception or metadata manipulation — force() only sets
+        // jf_descr and returns the frame.
+        if force_token.0 == 0 {
+            return None;
+        }
+        // Legacy handle (small integer) → old HashMap path.
+        if force_token.0 < 0x10000 {
+            return Some(force_token_to_dead_frame(force_token));
+        }
+        let jf_ptr = force_token.0 as *mut i64;
+        let jf_ptr = jitframe_resolve(jf_ptr);
+        // frame.jf_descr = frame.jf_force_descr
+        let jf_force_descr = unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) };
+        unsafe { *jf_ptr.add(JF_DESCR_OFS as usize / 8) = jf_force_descr };
+        let jf_gcref = GcRef(jf_ptr as usize);
+        let descr_ptr = jf_force_descr as usize as *const CraneliftFailDescr;
+        if descr_ptr.is_null() {
+            return Some(force_token_to_dead_frame(force_token));
+        }
+        let fail_descr = unsafe {
+            Arc::increment_strong_count(descr_ptr);
+            Arc::from_raw(descr_ptr)
+        };
+        // Use ACTIVE_GC_RUNTIME_ID for GC root registration.
+        // RPython doesn't need this because GCREF is natively tracked.
+        // In Rust, the wrapper must register the jf_gcref as a root
+        // to prevent GC from collecting the frame.
+        let gc_runtime_id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get());
+        Some(DeadFrame {
+            data: Box::new(JitFrameDeadFrame::new(
+                jf_gcref,
+                fail_descr,
+                gc_runtime_id,
+                Vec::new(),
+                None,
+            )),
+        })
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {

@@ -656,8 +656,6 @@ pub struct JitFrameDeadFrame {
     pub gc_runtime_id: Option<u64>,
     /// Opaque force-token handles owned by this dead frame.
     pub owned_force_tokens: Vec<u64>,
-    /// Pending exception class (same semantics as FrameData).
-    pub exception_class: i64,
     /// Keeps the frame memory alive for non-GC allocations.
     pub _heap_owner: Option<Vec<i64>>,
 }
@@ -675,7 +673,6 @@ impl JitFrameDeadFrame {
         fail_descr: Arc<CraneliftFailDescr>,
         gc_runtime_id: Option<u64>,
         owned_force_tokens: Vec<u64>,
-        exception_class: i64,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {
         let mut frame = JitFrameDeadFrame {
@@ -683,7 +680,6 @@ impl JitFrameDeadFrame {
             fail_descr,
             gc_runtime_id,
             owned_force_tokens,
-            exception_class,
             _heap_owner: heap_owner,
         };
         if let Some(runtime_id) = gc_runtime_id {
@@ -738,9 +734,18 @@ impl JitFrameDeadFrame {
         GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
     }
 
+    /// pyjitpl.py:3119-3123 parity:
+    ///   exception_obj = cast_opaque_ptr(OBJECTPTR, exception)
+    ///   exc_class = ptr2int(exception_obj.typeptr) if exception_obj else 0
+    /// Reads typeptr at offset 0 of jf_guard_exc (same as GUARD_CLASS).
     #[inline]
     pub fn get_exception_class(&self) -> i64 {
-        self.exception_class
+        let exc_ref = self.get_exception_ref();
+        if exc_ref.is_null() {
+            0
+        } else {
+            unsafe { *(exc_ref.0 as *const i64) }
+        }
     }
 }
 
