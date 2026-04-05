@@ -1930,11 +1930,18 @@ extern "C" fn ffi_maybe_force(force_token: i64, flag: i64) -> i64 {
     flag * 2
 }
 
+/// OBJECTPTR layout: typeptr at offset 0 (pyjitpl.py:3119-3123).
+#[repr(C)]
+struct FakeExcObject {
+    typeptr: usize,
+}
+
 /// FFI function that sets a pending exception via jit_exc_raise.
+/// Allocates a fake OBJECTPTR so grab_exc_class can derive typeptr.
 extern "C" fn ffi_raise_exception(val: i64) -> i64 {
     if val != 0 {
-        // Set a non-zero exception value + type to signal an exception
-        jit_exc_raise(val, 0xEE);
+        let obj = Box::leak(Box::new(FakeExcObject { typeptr: 0xEE }));
+        jit_exc_raise(obj as *const FakeExcObject as usize as i64, 0xEE);
     }
     val
 }
