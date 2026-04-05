@@ -1203,7 +1203,19 @@ impl OptContext {
         let mut remap: std::collections::HashMap<OpRef, OpRef> = std::collections::HashMap::new();
         for (i, (placeholder, value)) in const_pool.into_iter().enumerate() {
             let real = OpRef(10600 + i as u32);
-            self.make_constant(real, value);
+            // Store directly: make_constant early-returns for is_constant()
+            // OpRefs (>= 10000), so we must bypass it for the constants Vec.
+            let idx = real.0 as usize;
+            if idx >= self.constants.len() {
+                self.constants.resize(idx + 1, None);
+            }
+            self.constants[idx] = Some(value.clone());
+            // Also set forwarded so get_constant() and optimizer can see it.
+            if idx >= self.forwarded.len() {
+                self.forwarded
+                    .resize(idx + 1, crate::optimizeopt::info::Forwarded::None);
+            }
+            self.forwarded[idx] = crate::optimizeopt::info::Forwarded::Const(value);
             remap.insert(placeholder, real);
         }
         if !remap.is_empty() {

@@ -933,9 +933,11 @@ thread_local! {
 
 /// Get or compile JitCode for a CodeObject.
 ///
-/// RPython: CallControl.get_jitcode() deduplicates per graph.
-/// pyre: deduplicate per CodeObject pointer (thread-local cache).
-/// RPython: CallControl.get_jitcode(graph, called_from)
+/// jitcode.py:14 parity: is_portal is determined by the CodeObject itself
+/// (jitdriver_sd is not None for portal jitcodes). pyre determines this
+/// from code.obj_name inside transform_graph_to_jitcode, matching RPython's
+/// make_jitcodes() which sets jitdriver_sd on the main portal graph.
+/// The result is cached per CodeObject pointer — is_portal is fixed per code.
 pub fn get_jitcode(code: &CodeObject, writer: &CodeWriter) -> &'static PyJitCode {
     let key = code as *const CodeObject as usize;
     JITCODE_CACHE.with(|cell| {

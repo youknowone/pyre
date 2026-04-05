@@ -4,6 +4,19 @@ use pyre_interpreter::bytecode::{CodeObject, Instruction};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Skip Cache pseudo-instructions starting at `pos`.
+/// Returns the index of the first non-Cache instruction at or after `pos`.
+fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
+    while pos < code.instructions.len() {
+        if let Some((Instruction::Cache, _)) = pyre_interpreter::decode_instruction_at(code, pos) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 /// codewriter/liveness.py parity: bytecode liveness analysis.
 /// For each bytecode PC, tracks which locals are live (may be read
 /// on some path before being reassigned) and the operand stack depth.
@@ -60,23 +73,25 @@ impl LiveVars {
                     live[w] = live_bits[next_base + w];
                 }
                 // Branch targets: union with target's live set.
+                // CPython 3.13+ jump deltas are relative to NEXT_INSTR
+                // (past any cache slots). Must use skip_caches to match
+                // the codewriter's target calculation.
+                let next = skip_caches(code, pc + 1);
                 let target: Option<usize> = match instr {
-                    Instruction::JumpForward { delta } => {
-                        Some(pc + 1 + delta.get(op_arg).as_usize())
-                    }
+                    Instruction::JumpForward { delta } => Some(next + delta.get(op_arg).as_usize()),
                     Instruction::JumpBackward { delta }
                     | Instruction::JumpBackwardNoInterrupt { delta } => {
-                        Some(pc.saturating_sub(delta.get(op_arg).as_usize()))
+                        Some(next.saturating_sub(delta.get(op_arg).as_usize()))
                     }
                     Instruction::PopJumpIfTrue { delta }
                     | Instruction::PopJumpIfFalse { delta } => {
-                        Some(pc + 1 + delta.get(op_arg).as_usize())
+                        Some(next + delta.get(op_arg).as_usize())
                     }
                     Instruction::PopJumpIfNone { delta }
                     | Instruction::PopJumpIfNotNone { delta } => {
-                        Some(pc + 1 + delta.get(op_arg).as_usize())
+                        Some(next + delta.get(op_arg).as_usize())
                     }
-                    Instruction::ForIter { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+                    Instruction::ForIter { delta } => Some(next + delta.get(op_arg).as_usize()),
                     _ => None,
                 };
                 if let Some(tgt) = target {
@@ -99,6 +114,20 @@ impl LiveVars {
                             live[word] |= 1u64 << (i % 64);
                         }
                     }
+                    // LoadFastBorrowLoadFastBorrow reads two locals.
+                    // GEN for both is correct per RPython liveness semantics,
+                    // but adding it changes the snapshot composition and
+                    // exposes a bridge compilation bug (segfault in nbody,
+                    // fannkuch, spectral_norm). Deferred until the bridge
+                    // issue is resolved.
+                    // Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                    //     let pair = var_nums.get(op_arg);
+                    //     for i in [u32::from(pair.idx_1()) as usize,
+                    //               u32::from(pair.idx_2()) as usize] {
+                    //         let word = i / 64;
+                    //         if word < words_per_pc { live[word] |= 1u64 << (i % 64); }
+                    //     }
+                    // }
                     Instruction::StoreFast { var_num } | Instruction::DeleteFast { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
                         let word = i / 64;
@@ -145,7 +174,7 @@ impl LiveVars {
                     sd_changed = true;
                 }
                 // Branch target.
-                if let Some(tgt) = target_pc(&instr, pc, op_arg) {
+                if let Some(tgt) = target_pc(code, &instr, pc, op_arg) {
                     if tgt <= n && br_d < stack_depth_at[tgt] {
                         stack_depth_at[tgt] = br_d;
                         sd_changed = true;
@@ -213,6 +242,8 @@ fn stack_effects(
         | Instruction::PushNull
         | Instruction::Copy { .. }
         | Instruction::PushExcInfo => (d + 1, d + 1),
+        // Push two (super-instruction: load two locals)
+        Instruction::LoadFastBorrowLoadFastBorrow { .. } => (d + 2, d + 2),
         // Pop one
         Instruction::PopTop
         | Instruction::StoreFast { .. }
@@ -331,22 +362,26 @@ fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> boo
 }
 
 /// Branch target PC for branching instructions.
+/// Uses skip_caches to account for cache slots after the instruction,
+/// matching the codewriter's target calculation.
 fn target_pc(
+    code: &CodeObject,
     instr: &pyre_interpreter::bytecode::Instruction,
     pc: usize,
     op_arg: pyre_interpreter::OpArg,
 ) -> Option<usize> {
     use pyre_interpreter::bytecode::Instruction;
+    let next = skip_caches(code, pc + 1);
     match instr {
-        Instruction::JumpForward { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+        Instruction::JumpForward { delta } => Some(next + delta.get(op_arg).as_usize()),
         Instruction::JumpBackward { delta } | Instruction::JumpBackwardNoInterrupt { delta } => {
-            Some(pc.saturating_sub(delta.get(op_arg).as_usize()))
+            Some(next.saturating_sub(delta.get(op_arg).as_usize()))
         }
         Instruction::PopJumpIfTrue { delta }
         | Instruction::PopJumpIfFalse { delta }
         | Instruction::PopJumpIfNone { delta }
-        | Instruction::PopJumpIfNotNone { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
-        Instruction::ForIter { delta } => Some(pc + 1 + delta.get(op_arg).as_usize()),
+        | Instruction::PopJumpIfNotNone { delta } => Some(next + delta.get(op_arg).as_usize()),
+        Instruction::ForIter { delta } => Some(next + delta.get(op_arg).as_usize()),
         _ => None,
     }
 }
