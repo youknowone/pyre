@@ -2107,7 +2107,6 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
             jf_gcref,
             fail_descr,
             gc_runtime_id,
-            Vec::new(),
             None,
         )),
     }
@@ -2342,7 +2341,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             None
         };
         let (_, exception) = take_pending_jit_exception_state();
-        let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+        release_force_token(handle);
         let jf_ptr = exec.jf_gcref.0;
         if let Some(sd) = saved_data {
             unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
@@ -2360,7 +2359,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 exec.jf_gcref,
                 fail_descr.clone(),
                 target.gc_runtime_id,
-                force_tokens,
                 exec.heap_owner,
             )),
         };
@@ -3963,21 +3961,6 @@ fn output_transfers_current_force_token(
             .any(|slot| outputs.get(slot).copied() == Some(handle as i64))
 }
 
-/// Extract owned force tokens from fail_args, releasing the handle
-/// if the output doesn't transfer it.
-fn extract_force_tokens(fail_descr: &CraneliftFailDescr, outputs: &[i64], handle: u64) -> Vec<u64> {
-    let mut tokens = Vec::new();
-    for &slot in &fail_descr.force_token_slots {
-        if let Some(&val) = outputs.get(slot) {
-            tokens.push(val as u64);
-        }
-    }
-    if handle != 0 && !output_transfers_current_force_token(fail_descr, outputs, handle) {
-        release_force_token(handle);
-    }
-    tokens
-}
-
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
     if size == 0 {
         return;
@@ -4978,7 +4961,7 @@ impl CraneliftBackend {
                     None
                 };
                 let (_, exception) = take_pending_jit_exception_state();
-                let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+                release_force_token(handle);
                 // Write savedata/exception to JitFrame header (llmodel.py parity).
                 let jf_ptr = exec.jf_gcref.0;
                 if let Some(sd) = saved_data {
@@ -4996,7 +4979,6 @@ impl CraneliftBackend {
                         exec.jf_gcref,
                         fail_descr.clone(),
                         compiled.gc_runtime_id,
-                        force_tokens,
                         exec.heap_owner,
                     )),
                 };
@@ -5042,7 +5024,7 @@ impl CraneliftBackend {
                 None
             };
             let (_, exception) = take_pending_jit_exception_state();
-            let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+            release_force_token(handle);
             let jf_ptr = exec.jf_gcref.0;
             if let Some(sd) = saved_data {
                 unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
@@ -5060,7 +5042,6 @@ impl CraneliftBackend {
                     exec.jf_gcref,
                     fail_descr.clone(),
                     compiled.gc_runtime_id,
-                    force_tokens,
                     exec.heap_owner,
                 )),
             };
@@ -5122,7 +5103,7 @@ impl CraneliftBackend {
                 None
             };
             let (_, exception) = take_pending_jit_exception_state();
-            let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+            release_force_token(handle);
             let jf_ptr = exec.jf_gcref.0;
             if let Some(sd) = saved_data {
                 unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
@@ -5139,7 +5120,6 @@ impl CraneliftBackend {
                     exec.jf_gcref,
                     fail_descr.clone(),
                     bridge.gc_runtime_id,
-                    force_tokens,
                     exec.heap_owner,
                 )),
             };
@@ -5160,7 +5140,7 @@ impl CraneliftBackend {
             None
         };
         let (_, exception) = take_pending_jit_exception_state();
-        let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+        release_force_token(handle);
         let jf_ptr = exec.jf_gcref.0;
         if let Some(sd) = saved_data {
             unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
@@ -5178,7 +5158,6 @@ impl CraneliftBackend {
                 exec.jf_gcref,
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
-                force_tokens,
                 exec.heap_owner,
             )),
         }
@@ -6140,22 +6119,37 @@ impl CraneliftBackend {
                 }
                 OpCode::GuardNotForced2 => {
                     // x86/assembler.py:2662-2669 store_force_descr:
-                    //   guard_token = self.implement_guard_recovery(...)
-                    //   self._finish_gcmap = guard_token.gcmap
-                    //   self._store_force_index(op)
-                    //   self.store_info_on_descr(0, guard_token)
+                    //   guard_token = implement_guard_recovery(...)
+                    //   _store_force_index(op)
+                    //   store_info_on_descr(0, guard_token)
                     // x86/regalloc.py:1411-1417 consider_guard_not_forced_2:
-                    //   self.assembler.store_force_descr(op, fail_locs, frame_depth)
-                    // No inline branch — just store fail descr to jf_force_descr.
-                    // force() reads this when the frame is forced during
-                    // call_assembler execution.
+                    //   assembler.store_force_descr(op, fail_locs, frame_depth)
+                    //
+                    // RPython's recovery code (_update_at_exit) writes fail_arg
+                    // values from registers to jf_frame[rd_locs[i]]. In majit,
+                    // emit_guard_exit does this for inline guards. For
+                    // GUARD_NOT_FORCED_2 (no inline branch), we write fail_args
+                    // to jf_frame[0..n] here so force() sees correct values.
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
+                    // _store_force_index(op): store descr to jf_force_descr
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     builder
                         .ins()
                         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+
+                    // implement_guard_recovery / _update_at_exit parity:
+                    // Write fail_arg values to jf_frame[0..n] in fail_args order.
+                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        let raw = resolve_opref(&mut builder, &constants, arg_ref);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            raw,
+                            outputs_ptr,
+                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+                        );
+                    }
                 }
 
                 OpCode::GuardNotInvalidated => {
@@ -10268,7 +10262,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 jf_gcref,
                 fail_descr,
                 gc_runtime_id,
-                Vec::new(),
                 None,
             )),
         })

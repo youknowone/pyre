@@ -659,8 +659,6 @@ pub struct JitFrameDeadFrame {
     pub fail_descr: Arc<CraneliftFailDescr>,
     /// GC runtime id for root cleanup on Drop.
     pub gc_runtime_id: Option<u64>,
-    /// Opaque force-token handles owned by this dead frame.
-    pub owned_force_tokens: Vec<u64>,
     /// Keeps the frame memory alive for non-GC allocations.
     pub _heap_owner: Option<Vec<i64>>,
 }
@@ -677,14 +675,12 @@ impl JitFrameDeadFrame {
         jf_gcref: GcRef,
         fail_descr: Arc<CraneliftFailDescr>,
         gc_runtime_id: Option<u64>,
-        owned_force_tokens: Vec<u64>,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {
         let mut frame = JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
             gc_runtime_id,
-            owned_force_tokens,
             _heap_owner: heap_owner,
         };
         if let Some(runtime_id) = gc_runtime_id {
@@ -709,12 +705,6 @@ impl JitFrameDeadFrame {
     }
 
     pub fn take_ref_for_call_result(&mut self, index: usize) -> GcRef {
-        if self.fail_descr.is_force_token_slot(index) {
-            let handle = self.get_int(index) as u64;
-            if let Some(pos) = self.owned_force_tokens.iter().position(|h| *h == handle) {
-                self.owned_force_tokens.swap_remove(pos);
-            }
-        }
         GcRef(self.get_int(index) as usize)
     }
 
@@ -758,9 +748,6 @@ impl Drop for JitFrameDeadFrame {
     fn drop(&mut self) {
         if let Some(runtime_id) = self.gc_runtime_id {
             unregister_gc_roots(runtime_id, std::slice::from_mut(&mut self.jf_gcref));
-        }
-        for &handle in &self.owned_force_tokens {
-            release_force_token(handle);
         }
     }
 }
