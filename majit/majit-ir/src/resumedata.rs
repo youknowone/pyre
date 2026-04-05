@@ -391,16 +391,20 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
 
 /// Decode rd_numb back into vable/vref values and per-frame tagged values.
 ///
-/// NOTE: Frame format differs from RPython. RPython encodes frames as
-/// `jitcode_index, pc, [tagged_values...]` and uses jitcode.position_info
-/// (liveness) at the decode site to know how many values each frame has
-/// (resume.py:249-253, resume.py:1049-1055). majit encodes an explicit
-/// `box_count` field: `jitcode_index, pc, box_count, [tagged_values...]`.
-/// This is necessary because jitcode liveness info is not available at
-/// the decode site in majit's architecture.
+/// resume.py:249-253, resume.py:1049-1055: RPython encodes frames as
+/// `jitcode_index, pc, [tagged_values...]` and uses jitcode liveness
+/// (`get_current_position_info`) at the decode site to know how many
+/// values each frame has.
+///
+/// `frame_value_count`: when `Some(f)`, `f(jitcode_index, pc)` returns
+/// the number of tagged values for that frame (RPython parity: liveness-
+/// driven decode). When `None`, all remaining items after `(jitcode_index,
+/// pc)` are consumed as a single frame (backward-compat for callers that
+/// only ever see single-frame data).
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
+    frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
@@ -429,8 +433,8 @@ pub fn rebuild_from_numbering(
         vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // Frame section: jitcode_index, pc, box_count, [tagged_values...].
-    // Each frame has an explicit box_count to delimit boundaries.
+    // resume.py:1049-1055: frame section — jitcode_index, pc, [tagged_values...].
+    // RPython uses consume_one_section → enumerate_vars(liveness) to split frames.
     let mut frames = Vec::new();
     while reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
@@ -439,10 +443,12 @@ pub fn rebuild_from_numbering(
         } else {
             0
         };
-        let box_count = if reader.has_more() && reader.items_read < total_size as usize {
-            reader.next_item().max(0) as usize
+        let box_count = if let Some(f) = &frame_value_count {
+            // RPython parity: liveness-driven frame boundary.
+            f(jitcode_index, pc)
         } else {
-            0
+            // Single-frame fallback: consume all remaining items.
+            (total_size as usize).saturating_sub(reader.items_read)
         };
         let mut values = Vec::with_capacity(box_count);
         for _ in 0..box_count {

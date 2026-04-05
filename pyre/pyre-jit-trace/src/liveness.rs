@@ -210,6 +210,11 @@ impl LiveVars {
             .get(pc)
             .map_or(true, |&depth| stack_idx < depth)
     }
+
+    /// Number of live stack slots at the given PC.
+    pub fn stack_depth_at(&self, pc: usize) -> usize {
+        self.stack_depth_at.get(pc).copied().unwrap_or(0)
+    }
 }
 
 /// Stack effects: (fallthrough_depth, branch_depth).

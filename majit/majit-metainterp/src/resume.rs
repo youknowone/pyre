@@ -3130,13 +3130,12 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, box_count, [tagged_values...].
-        // box_count is majit-specific — RPython omits it and uses
-        // jitcode.get_live_vars_info(pc) at decode time instead.
+        // Per-frame: jitcode_index, pc, [tagged_values...].
+        // RPython uses jitcode.get_live_vars_info(pc) at decode time
+        // to know how many tagged values each frame has.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
-            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -5030,7 +5029,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts());
+            rebuild_from_numbering(&rd_numb, memo.consts(), None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
@@ -5055,7 +5054,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts());
+            rebuild_from_numbering(&rd_numb, memo.consts(), None);
         assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
@@ -5117,18 +5116,35 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
-        // Multi-frame encoding produces valid numbering bytes.
-        // rebuild_from_numbering supports single-frame decoding only
-        // (RPython uses jitcode.position_info to split multi-frame),
-        // so we verify the encoding succeeds and num_boxes is correct.
+        // Multi-frame encoding: no box_count, RPython parity.
         let items = crate::resumecode::unpack_all(&rd_numb);
         assert_eq!(items[1], 3); // num_failargs: 3 boxes patched
-        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6..8]=tagged
+        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6..7]=tagged
         assert_eq!(items[4], 0);
         assert_eq!(items[5], 10);
-        // Frame 1: items[8]=jitcode(1), items[9]=pc(20), items[10..12]=tagged
+        // Frame 1: items[8]=jitcode(1), items[9]=pc(20), items[10..11]=tagged
         assert_eq!(items[8], 1);
         assert_eq!(items[9], 20);
+
+        // Roundtrip with liveness-based closure.
+        let rd_consts: Vec<(i64, majit_ir::Type)> = memo.consts().to_vec();
+        let frame_count = |jitcode_index: i32, _pc: i32| -> usize {
+            match jitcode_index {
+                0 => 2, // Frame 0 has 2 boxes
+                1 => 2, // Frame 1 has 2 boxes
+                _ => 0,
+            }
+        };
+        let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
+            rebuild_from_numbering(&rd_numb, &rd_consts, Some(&frame_count));
+        assert_eq!(num_failargs, 3);
+        assert_eq!(rebuilt_frames.len(), 2);
+        assert_eq!(rebuilt_frames[0].jitcode_index, 0);
+        assert_eq!(rebuilt_frames[0].pc, 10);
+        assert_eq!(rebuilt_frames[0].values.len(), 2);
+        assert_eq!(rebuilt_frames[1].jitcode_index, 1);
+        assert_eq!(rebuilt_frames[1].pc, 20);
+        assert_eq!(rebuilt_frames[1].values.len(), 2);
     }
 
     #[test]
@@ -5152,7 +5168,7 @@ mod tests {
 
         // rd_numb should be valid
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts);
+            rebuild_from_numbering(&rd_numb, &rd_consts, None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));

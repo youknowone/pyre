@@ -2651,7 +2651,7 @@ fn rebuild_typed_from_rd_numb(
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts);
+        rebuild_from_numbering(rd_numb, rd_consts, None);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
     // vable_array format: [frame_ptr, ni, vsd, locals..., stack...]
@@ -2776,15 +2776,10 @@ fn build_resumed_frames(
     use majit_ir::resumedata::rebuild_from_numbering;
 
     // resume.py:1049 parity: consume_boxes(f.get_current_position_info(), ...)
-    // uses per-jitcode liveness (all_liveness from codewriter) to split
-    // multi-frame sections. Requires encoder and decoder to use the SAME
-    // liveness source. Currently pyre's encoder uses snapshot-based data
-    // while the JitCode liveness is a separate system. Until they are
-    // unified, use single-frame fallback (None) which works for all
-    // current single-function traces.
-    // TODO: unify rd_numb encoding with JitCode liveness for multi-frame.
+    // uses per-jitcode liveness to split multi-frame sections.
+    let frame_count_fn = pyre_jit_trace::state::frame_value_count_at;
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts);
+        rebuild_from_numbering(rd_numb, rd_consts, Some(&frame_count_fn));
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {
