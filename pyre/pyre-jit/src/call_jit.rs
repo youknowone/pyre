@@ -1663,6 +1663,17 @@ fn jit_blackhole_resume_from_guard(
         // Without this, unboxed ints are treated as pointers → SIGSEGV.
         let deadframe_types =
             driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index);
+        // PYRE DEVIATION: RPython's bhimpl_jit_merge_point is a dedicated
+        // bytecode; the blackhole exits there unconditionally (bottommost)
+        // or recurses (recursive portal).  pyre has BC_JUMP_TARGET at every
+        // loop header, so we inject the compiled loop's merge_pc to select
+        // the correct one.  Structural parity requires BC_JIT_MERGE_POINT
+        // as a separate opcode, but that needs codewriter-level feedback of
+        // which loop header was traced (currently a runtime decision).
+        let merge_py_pc = driver
+            .meta_interp()
+            .get_compiled_meta(actual_green_key)
+            .map(|m| m.merge_pc);
         let result = blackhole_resume_via_rd_numb(
             &rd_numb,
             &rd_consts,
@@ -1670,6 +1681,7 @@ fn jit_blackhole_resume_from_guard(
             None,
             rd_virtuals_ref,
             deadframe_types.as_deref(),
+            merge_py_pc,
         );
         return handle_blackhole_result(result, fail_values);
     }
@@ -1689,6 +1701,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
     deadframe_types: Option<&[majit_ir::Type]>,
+    merge_py_pc: Option<usize>,
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
@@ -1781,6 +1794,22 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
+
+    // Set merge_point_jitcode_pc on outermost blackhole so it stops
+    // at the correct loop header (not inner loops).
+    // Uses backward search (jitcode_pc_for_loop_header) for Cache offset.
+    if let Some(merge_pc) = merge_py_pc {
+        let mut cursor = &mut bh;
+        while let Some(ref mut next) = cursor.nextblackholeinterp {
+            cursor = next;
+        }
+        if let Some(merge_jitcode_pc) = crate::jit::codewriter::jitcode_pc_for_loop_header(
+            &cursor.jitcode.py_to_jit_pc,
+            merge_pc,
+        ) {
+            cursor.merge_point_jitcode_pc = Some(merge_jitcode_pc);
+        }
+    }
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);

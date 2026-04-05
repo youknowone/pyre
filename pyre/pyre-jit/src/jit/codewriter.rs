@@ -241,6 +241,10 @@ impl CodeWriter {
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
+        // jitcode.py:9 jitdriver_sd: portal has a jitdriver.
+        // Computed early for BC_JIT_MERGE_POINT vs BC_JUMP_TARGET selection.
+        let is_portal = &*code.obj_name != "<module>";
+
         for py_pc in 0..num_instrs {
             // Exception handler entry: Python resets stack depth to the
             // handler's specified depth. Correct current_depth to match.
@@ -252,12 +256,15 @@ impl CodeWriter {
             pc_map[py_pc] = assembler.current_pos();
             depth_at_pc[py_pc] = current_depth;
 
-            // RPython jtransform.py:1690 + blackhole.py:1066 parity:
-            // Emit BC_JUMP_TARGET at loop headers (JUMP_BACKWARD targets).
-            // RPython emits jit_merge_point opcode; pyre uses BC_JUMP_TARGET.
-            // The blackhole checks this to detect merge point arrival.
+            // blackhole.py:1066 bhimpl_jit_merge_point parity:
+            // Portal jitcodes get BC_JIT_MERGE_POINT at loop headers;
+            // non-portal helpers get BC_JUMP_TARGET (no merge semantics).
             if loop_header_pcs.contains(&py_pc) {
-                assembler.jump_target();
+                if is_portal {
+                    assembler.jit_merge_point();
+                } else {
+                    assembler.jump_target();
+                }
             }
 
             let code_unit = code.instructions[py_pc];
@@ -782,6 +789,8 @@ impl CodeWriter {
         // RPython parity: forward PC map (py_pc → jitcode_pc) so
         // get_list_of_active_boxes can look up LivenessInfo by Python PC.
         jitcode.py_to_jit_pc = pc_map.clone();
+
+        jitcode.is_portal = is_portal;
 
         // blackhole.py handle_exception_in_frame: build exception handler table
         // from Python's code.exceptiontable. Maps Python PC ranges to JitCode PCs.
