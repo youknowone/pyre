@@ -388,9 +388,19 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
     }
 }
 
-/// resume.py:1042-1057 rebuild_from_numbering parity.
+/// Low-level rd_numb decoder: header + vable + vref + flat frame values.
+///
 /// Returns (num_failargs, vable_values, vref_values, frames).
-/// resume.py:1044-1047: vable/vref decoded before frame sections.
+///
+/// NOTE: This is NOT RPython's `rebuild_from_resumedata` (resume.py:1042).
+/// RPython uses liveness info (jitcode.get_live_vars_info) to split the
+/// frame section per-frame.  This function lacks liveness info and reads
+/// all remaining tagged values as a single frame.
+///
+/// For RPython-parity multi-frame decode, use
+/// `majit_metainterp::resume::blackhole_from_resumedata` which drives
+/// `ResumeDataDirectReader::consume_one_section` with liveness-based
+/// per-frame splitting (resume.py:1312-1343 parity).
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
@@ -422,13 +432,9 @@ pub fn rebuild_from_numbering(
         vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // resume.py:1042-1057: per-frame decode.
-    // Per-frame: jitcode_index, pc, [tagged_values...].
-    // RPython uses jitcode.get_live_vars_info(pc) to determine value
-    // count per frame. This function lacks liveness info, so it reads
-    // all remaining items as a single frame. Multi-frame rd_numb
-    // requires liveness-based decode (consume_one_section in
-    // blackhole_from_resumedata).
+    // Frame section: jitcode_index, pc, [tagged_values...].
+    // Without liveness info, reads all remaining items as a single frame.
+    // Multi-frame rd_numb requires ResumeDataDirectReader.consume_one_section.
     let mut frames = Vec::new();
     if reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();

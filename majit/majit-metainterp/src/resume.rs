@@ -3704,9 +3704,15 @@ impl<'a> ResumeDataReader<'a> {
 // ═══════════════════════════════════════════════════════════════
 // resume.py:1042-1080 rebuild_from_resumedata — tagged numbering
 // deserialization.
+//
+// RPython-parity multi-frame decode lives in:
+//   blackhole_from_resumedata() below (resume.py:1312)
+//   + ResumeDataDirectReader::consume_one_section (resume.py:1381)
+// which uses liveness info for per-frame splitting.
+//
+// For flat single-frame decode without liveness info, callers use
+// majit_ir::resumedata::rebuild_from_numbering.
 // ═══════════════════════════════════════════════════════════════
-
-/// Use `majit_ir::resumedata::RebuiltFrame` — local duplicate removed.
 
 /// resume.py:576-728 VirtualInfo parity.
 /// Describes a virtual object's fields for materialization.
@@ -3748,9 +3754,9 @@ pub struct OptimizerKnowledgeForResume {
 
 // VirtualFieldInfo removed: replaced by majit_ir::VirtualFieldsInfo.
 // finish() now discovers virtual fields via env.get_virtual_fields().
-
-/// Use `majit_ir::resumedata::RebuiltValue` — local duplicate removed.
-/// Use `majit_ir::resumedata::rebuild_from_numbering` — local stale copy removed.
+//
+// RebuiltValue, RebuiltFrame, decode_tagged, rebuild_from_numbering:
+// canonical implementations live in majit_ir::resumedata.
 
 #[cfg(test)]
 mod tests {

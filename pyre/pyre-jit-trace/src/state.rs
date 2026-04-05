@@ -2024,12 +2024,11 @@ impl JitState for PyreJitState {
         );
     }
 
-    /// resume.py:1042-1057 rebuild_from_resumedata parity.
+    /// Decode rd_numb into vable/vref/frame values (flat single-frame).
     ///
-    /// RPython: ResumeDataBoxReader reads rd_numb sequentially:
-    ///   1. consume_vref_and_vable_boxes(vinfo, ginfo)
-    ///   2. while not done: read jitcode_pos, pc → newframe → consume_boxes
-    ///   3. return (liveboxes, virtualizable_boxes, virtualref_boxes)
+    /// RPython's rebuild_from_resumedata (resume.py:1042) uses liveness
+    /// info for per-frame splitting; this uses the flat decoder instead.
+    /// Multi-frame parity: blackhole_from_resumedata + consume_one_section.
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         _fail_arg_types: &[Type],
@@ -2041,7 +2040,8 @@ impl JitState for PyreJitState {
         let rd_numb = rd_numb?;
         let rd_consts = rd_consts.unwrap_or(&[]);
 
-        // resume.py:1044: ResumeDataBoxReader.__init__ + _init + _prepare
+        // Flat single-frame decode (no liveness info at this level).
+        // RPython-parity multi-frame: blackhole_from_resumedata.
         let (_num_failargs, vable_values, vref_values, frames) =
             rebuild_from_numbering(rd_numb, rd_consts);
 
