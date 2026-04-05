@@ -4850,6 +4850,27 @@ impl<M: Clone> MetaInterp<M> {
         // TODO: implement loop aging when memory_manager is added.
     }
 
+    /// compile.py:741-745: look up (status, descr_addr) for a guard.
+    /// Search current token + previous_tokens by (trace_id, fail_index)
+    /// to find the exact descriptor — same pattern as start_guard_compiling.
+    pub fn get_guard_status(&self, green_key: u64, trace_id: u64, fail_index: u32) -> (u64, usize) {
+        if let Some(compiled) = self.compiled_loops.get(&green_key) {
+            let (s, a) = self
+                .backend
+                .get_guard_status(&compiled.token, trace_id, fail_index);
+            if a != 0 {
+                return (s, a);
+            }
+            for prev in &compiled.previous_tokens {
+                let (s, a) = self.backend.get_guard_status(prev, trace_id, fail_index);
+                if a != 0 {
+                    return (s, a);
+                }
+            }
+        }
+        (0, 0)
+    }
+
     /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
     /// RPython: self.start_compiling() on the failed descriptor itself.
     /// Search current token + previous_tokens by trace_id to find the
