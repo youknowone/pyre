@@ -35,12 +35,9 @@ use majit_ir::{
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
-// Header: [guard_exc_type:8, descr:8, force_descr:8, gcmap:8,
+// Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
-/// Byte offset of `jf_guard_exc_type` — pos_exception() class stored on
-/// guard exit.  Reuses the RPython jf_frame_info slot (unused in Cranelift).
-const JF_GUARD_EXC_TYPE_OFS: i32 = 0;
 /// Byte offset of `jf_descr` from JitFrame start.
 const JF_DESCR_OFS: i32 = 8;
 const JF_FORCE_DESCR_OFS: i32 = 16;
@@ -509,6 +506,12 @@ pub fn jit_exc_raise(value: i64, exc_type: i64) {
 /// Check if an exception is currently pending.
 pub fn jit_exc_is_pending() -> bool {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Read and clear JIT_EXC_TYPE.  Called by the Rust runtime after a guard
+/// exit to capture pos_exception before creating the deadframe.
+fn jit_exc_take_type() -> i64 {
+    JIT_EXC_TYPE.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// RPython cpu.grab_exc_value parity: read exception class from TLS.
@@ -2038,6 +2041,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
             fail_descr,
             gc_runtime_id,
             None,
+            jit_exc_take_type(),
         )),
     }
 }
@@ -2207,6 +2211,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 fail_descr.clone(),
                 target.gc_runtime_id,
                 exec.heap_owner,
+                jit_exc_take_type(),
             )),
         };
     } // end loop
@@ -3861,6 +3866,10 @@ fn emit_guard_exit(
     // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
     //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
     if info.must_save_exception {
+        // _build_failure_recovery: store pos_exc_value → jf_guard_exc,
+        // clear pos_exc_value.  pos_exception (JIT_EXC_TYPE) is left in
+        // the global for the Rust runtime to read — the runtime captures
+        // it into JitFrameDeadFrame.exc_type before clearing.
         let exc_addr = builder
             .ins()
             .iconst(cl_types::I64, jit_exc_value_addr() as i64);
@@ -3870,25 +3879,8 @@ fn emit_guard_exit(
         builder
             .ins()
             .store(MemFlags::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
-        // Also store pos_exception (exc_type) to jf_guard_exc_type slot.
-        let exc_type_addr = builder
-            .ins()
-            .iconst(cl_types::I64, jit_exc_type_addr() as i64);
-        let exc_type_val = builder
-            .ins()
-            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
-        builder.ins().store(
-            MemFlags::trusted(),
-            exc_type_val,
-            jf_ptr,
-            JF_GUARD_EXC_TYPE_OFS,
-        );
-        // Clear TLS: pos_exc_value = 0, pos_exception = 0
         let zero = builder.ins().iconst(cl_types::I64, 0);
         builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
-        builder
-            .ins()
-            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
     }
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
     // Store FailDescr POINTER (not index) to jf_descr.
@@ -4603,6 +4595,7 @@ impl CraneliftBackend {
                         fail_descr.clone(),
                         compiled.gc_runtime_id,
                         exec.heap_owner,
+                        jit_exc_take_type(),
                     )),
                 };
             }
@@ -4652,6 +4645,7 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     compiled.gc_runtime_id,
                     exec.heap_owner,
+                    jit_exc_take_type(),
                 )),
             };
         } // end loop
@@ -4708,6 +4702,7 @@ impl CraneliftBackend {
                     fail_descr.clone(),
                     bridge.gc_runtime_id,
                     exec.heap_owner,
+                    jit_exc_take_type(),
                 )),
             };
         }
@@ -4727,6 +4722,7 @@ impl CraneliftBackend {
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
                 exec.heap_owner,
+                jit_exc_take_type(),
             )),
         }
     }
@@ -9735,11 +9731,10 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        // jf_guard_exc + jf_guard_exc_type already written by emit_guard_exit.
+        // jf_guard_exc written by emit_guard_exit; exc_type left in global.
         let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
         let exception = GcRef(exc_raw);
-        let exception_class =
-            unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_TYPE_OFS as usize) as *const i64) };
+        let exception_class = jit_exc_take_type();
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
