@@ -388,26 +388,25 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
     }
 }
 
-/// Low-level rd_numb decoder: header + vable + vref + flat frame values.
+/// resume.py:1042-1057 rebuild_from_resumedata decoder.
 ///
-/// Returns (num_failargs, vable_values, vref_values, frames).
+/// Decodes rd_numb produced by `ResumeDataLoopMemo::number()` back into
+/// vable/vref values and per-frame tagged values.
 ///
-/// NOTE: This is NOT RPython's `rebuild_from_resumedata` (resume.py:1042).
-/// RPython uses liveness info (jitcode.get_live_vars_info) to split the
-/// frame section per-frame.  This function lacks liveness info and reads
-/// all remaining tagged values as a single frame.
-///
-/// For RPython-parity multi-frame decode, use
-/// `majit_metainterp::resume::blackhole_from_resumedata` which drives
-/// `ResumeDataDirectReader::consume_one_section` with liveness-based
-/// per-frame splitting (resume.py:1312-1343 parity).
+/// `frame_slot_count`: optional callback `(jitcode_index, pc) -> slot_count`.
+/// RPython parity: `jitcode.get_live_vars_info(pc)` → `enumerate_vars` →
+/// total callbacks = `length_i + length_r + length_f`.
+/// When `Some`, enables multi-frame decode (resume.py:1049-1055 loop).
+/// When `None`, falls back to consuming all remaining items as one frame.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
+    frame_slot_count: Option<&dyn Fn(i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
-    let total_size = reader.next_item();
+    // resume.py:919-921: _init reads items_resume_section + count.
+    let items_resume_section = reader.next_item();
     let num_failargs = reader.next_item();
 
     // resume.py:1045: consume_vref_and_vable_boxes — virtualizable array.
@@ -421,7 +420,7 @@ pub fn rebuild_from_numbering(
         vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // resume.py:1045: virtualref array (pairs).
+    // resume.py:1096: virtualref array (pairs).
     let vref_len = reader.next_item();
     let mut vref_values = Vec::new();
     for _ in 0..(vref_len * 2) {
@@ -432,27 +431,57 @@ pub fn rebuild_from_numbering(
         vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // Frame section: jitcode_index, pc, [tagged_values...].
-    // Without liveness info, reads all remaining items as a single frame.
-    // Multi-frame rd_numb requires ResumeDataDirectReader.consume_one_section.
+    // resume.py:1049-1055: while not resumereader.done_reading():
+    //     jitcode_pos, pc = resumereader.read_jitcode_pos_pc()
+    //     jitcode = metainterp.staticdata.jitcodes[jitcode_pos]
+    //     resumereader.consume_boxes(f.get_current_position_info(), ...)
     let mut frames = Vec::new();
-    if reader.items_read < total_size as usize && reader.has_more() {
-        let jitcode_index = reader.next_item();
-        let pc = if reader.has_more() {
-            reader.next_item()
-        } else {
-            0
-        };
-        let mut values = Vec::new();
-        while reader.items_read < total_size as usize && reader.has_more() {
-            let tagged = reader.next_item() as i16;
-            values.push(decode_tagged(tagged, num_failargs, rd_consts));
+    let done_reading = |r: &resumecode::Reader| r.items_read >= items_resume_section as usize;
+
+    match frame_slot_count {
+        Some(slot_count_fn) => {
+            // Multi-frame: use liveness to split frame sections.
+            while !done_reading(&reader) && reader.has_more() {
+                let jitcode_index = reader.next_item();
+                let pc = reader.next_item();
+                let count = slot_count_fn(jitcode_index, pc);
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if done_reading(&reader) || !reader.has_more() {
+                        break;
+                    }
+                    let tagged = reader.next_item() as i16;
+                    values.push(decode_tagged(tagged, num_failargs, rd_consts));
+                }
+                frames.push(RebuiltFrame {
+                    jitcode_index,
+                    pc,
+                    values,
+                });
+            }
         }
-        frames.push(RebuiltFrame {
-            jitcode_index,
-            pc,
-            values,
-        });
+        None => {
+            // Single-frame fallback: no liveness info available.
+            // Reads all remaining tagged items as one frame.
+            if !done_reading(&reader) && reader.has_more() {
+                let jitcode_index = reader.next_item();
+                let pc = if reader.has_more() {
+                    reader.next_item()
+                } else {
+                    0
+                };
+                let mut values = Vec::new();
+                while !done_reading(&reader) && reader.has_more() {
+                    let tagged = reader.next_item() as i16;
+                    values.push(decode_tagged(tagged, num_failargs, rd_consts));
+                }
+                frames.push(RebuiltFrame {
+                    jitcode_index,
+                    pc,
+                    values,
+                });
+            }
+        }
     }
     (num_failargs, vable_values, vref_values, frames)
 }

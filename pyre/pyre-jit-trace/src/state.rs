@@ -2024,11 +2024,11 @@ impl JitState for PyreJitState {
         );
     }
 
-    /// Decode rd_numb into vable/vref/frame values (flat single-frame).
+    /// resume.py:1042-1057 rebuild_from_resumedata partial.
     ///
-    /// RPython's rebuild_from_resumedata (resume.py:1042) uses liveness
-    /// info for per-frame splitting; this uses the flat decoder instead.
-    /// Multi-frame parity: blackhole_from_resumedata + consume_one_section.
+    /// Decodes rd_numb via `majit_ir::resumedata::rebuild_from_numbering`.
+    /// Limitation: single-frame only (RPython uses per-jitcode liveness
+    /// info via consume_boxes to split multi-frame sections).
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         _fail_arg_types: &[Type],
@@ -2043,7 +2043,7 @@ impl JitState for PyreJitState {
         // Flat single-frame decode (no liveness info at this level).
         // RPython-parity multi-frame: blackhole_from_resumedata.
         let (_num_failargs, vable_values, vref_values, frames) =
-            rebuild_from_numbering(rd_numb, rd_consts);
+            rebuild_from_numbering(rd_numb, rd_consts, None);
 
         if frames.is_empty() {
             return None;
