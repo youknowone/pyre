@@ -4208,11 +4208,12 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
-    /// pyre-specific: unbox Ref→Int where compiled trace expects Int.
-    /// pyre traces start with all-Ref locals (PyObjectRef) but trace-internal
-    /// operations unbox to Int/Float. At compiled entry, live_values carry
-    /// Ref pointers that must be unboxed to match the trace's typed label.
-    /// RPython doesn't need this because wrap() sets Box types before tracing.
+    /// Pyre-specific: unbox Ref→Int values to match compiled trace types.
+    ///
+    /// Pyre's virtualizable stores all locals as PyObjectRef (Ref). When
+    /// the compiled trace has Int-typed inputargs (optimizer unboxed),
+    /// the live values must be unboxed before entering compiled code.
+    /// RPython doesn't need this because MIFrame registers are typed.
     pub fn adapt_live_values_to_trace_types(
         &self,
         green_key: u64,
@@ -4248,6 +4249,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             if let (Value::Ref(r), Type::Int) = (&values[i], tp) {
                 let ptr = r.as_usize();
+                // W_IntObject layout: [ob_type: 8 bytes][intval: 8 bytes]
+                // Unbox by reading *(ptr + 8) as i64.
                 if ptr >= 0x1_0000 && ptr < (1u64 << 56) as usize && (ptr & 7) == 0 {
                     values[i] = Value::Int(unsafe { *((ptr + 8) as *const i64) });
                 } else {

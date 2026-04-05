@@ -331,6 +331,7 @@ impl PtrInfo {
         PtrInfo::Virtual(VirtualInfo {
             descr,
             known_class,
+            ob_type_descr: None,
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
@@ -1238,7 +1239,13 @@ pub struct VirtualInfo {
     pub descr: DescrRef,
     /// Known class (if any).
     pub known_class: Option<GcRef>,
+    /// ob_type field descriptor for force path. In RPython the vtable is
+    /// set by allocate_with_vtable, not as a struct field. pyre stores
+    /// ob_type at offset 0 explicitly. This descr lets force emit
+    /// SetfieldGc(ob_type) without polluting `fields` (which feeds rd_virtuals).
+    pub ob_type_descr: Option<DescrRef>,
     /// Field values: (field_descr_index, value_opref).
+    /// Does NOT include ob_type — handled via known_class + ob_type_descr.
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors, preserving offset/size/type info for forcing.
     pub field_descrs: Vec<(u32, DescrRef)>,

@@ -519,8 +519,10 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     func_frame.fix_array_ptrs();
 
     // warmspot.py:1021 assembler_call_helper: execute callee in
-    // plain interpreter. Do NOT change EVAL_OVERRIDE — it's a global
-    // OnceLock that must stay as eval_with_jit for all other calls.
+    // plain interpreter. Force helpers must NOT re-enter compiled code
+    // (RPython: handle_fail → resume_in_blackhole, no portal re-entry).
+    // force_plain_eval ensures nested user-calls also stay plain.
+    let _plain_guard = pyre_interpreter::call::force_plain_eval();
     let result = match pyre_interpreter::eval::eval_frame_plain(&mut func_frame) {
         Ok(r) => r,
         Err(_) => pyre_object::PY_NULL,
@@ -610,7 +612,9 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
         }
     }
 
-    match crate::eval::eval_with_jit(frame) {
+    // warmspot.py:1021 assembler_call_helper: force path runs in
+    // plain interpreter, no JIT re-entry.
+    match pyre_interpreter::eval::eval_frame_plain(frame) {
         Ok(result) => {
             let value = match protocol {
                 FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
@@ -619,7 +623,6 @@ fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
                 FinishProtocol::RawInt => result as i64,
                 FinishProtocol::Boxed => result as i64,
             };
-            // force cache removed
             value
         }
         Err(err) => panic!("jit force callee frame raw failed: {err}"),
@@ -660,10 +663,9 @@ pub fn resume_in_blackhole_pub(frame: &mut PyFrame) -> pyre_object::PyObjectRef 
 /// a BlackholeInterpreter, loads frame state, and runs it.
 /// The blackhole has NO JIT entry points — structural isolation.
 fn blackhole_from_jit_frame(frame: &mut PyFrame) -> PyObjectRef {
-    // RPython parity: blackhole has no jit_merge_point, but
-    // bhimpl_recursive_call calls portal_runner which CAN enter JIT.
-    // eval_frame_plain handles THIS frame without JIT hooks;
-    // nested calls go through eval_with_jit normally.
+    // RPython parity: blackhole has no jit_merge_point.
+    // bh_call_fn_impl uses force_plain_eval so all nested calls
+    // stay in the plain interpreter (no JIT re-entry).
     let code = unsafe { &*frame.code };
     let py_pc = frame.next_instr;
 
@@ -1154,11 +1156,12 @@ pub fn resume_in_blackhole(
             builder.release_interp(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                // blackhole.py:1752 _run_forever parity: exception in topmost
-                // frame with no caller → propagate to JIT driver.
-                // TODO: currently returns Failed because the blackhole may be
-                // executing on corrupt state (resume data bug). Once blackhole
-                // resume is sound, this should return DoneWithThisFrame(Err).
+                // blackhole.py:1679 _exit_frame_with_exception:
+                //   raise ExitFrameWithExceptionRef(e)
+                // RPython: propagates as DoneWithThisFrame(Err).
+                // pyre: blackhole resume data produces spurious exceptions
+                // from incorrect state reconstruction. Return Failed until
+                // consume_one_section is compatible with pyre JitCode liveness.
                 return BlackholeResult::Failed;
             };
 
@@ -1339,7 +1342,8 @@ extern "C" fn jit_force_callee_frame_interp_nocache(frame_ptr: i64) -> i64 {
     let green_key = crate::eval::make_green_key(frame.code, frame.next_instr);
     let protocol = finish_protocol(green_key);
 
-    match crate::eval::eval_with_jit(frame) {
+    // warmspot.py:1021 assembler_call_helper: force path, plain interpreter.
+    match pyre_interpreter::eval::eval_frame_plain(frame) {
         Ok(result) => match protocol {
             FinishProtocol::RawInt if !result.is_null() && unsafe { is_int(result) } => unsafe {
                 w_int_get_value(result)
@@ -1441,9 +1445,14 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
 /// Keeps the boxed helper path off the generic callable redispatch and
 /// blackhole fallback route. This mirrors the specialized raw helper:
 /// the callee frame is created directly from the caller's code/globals.
+/// RPython warmspot.py:941 portal_runner parity.
+///
 pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: i64) -> i64 {
     let _suspend_inline_result = pyre_interpreter::call::suspend_inline_handled_result();
     let boxed_arg_ref = boxed_arg as PyObjectRef;
+    if caller_frame == 0 {
+        return boxed_arg;
+    }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let green_key = crate::eval::make_green_key(caller.code, 0);
     if matches!(finish_protocol(green_key), FinishProtocol::RawInt)
@@ -1456,10 +1465,11 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     }
 
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
-    // RPython warmspot.py:941 portal_runner parity
+    // warmspot.py:1021 assembler_call_helper: force path runs in plain
+    // interpreter. RPython: handle_fail → resume_in_blackhole, no portal.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        match crate::eval::eval_with_jit(frame) {
+        match pyre_interpreter::eval::eval_frame_plain(frame) {
             Ok(r) => r as i64,
             Err(_) => 0i64,
         }
@@ -1550,10 +1560,11 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // RPython warmspot.py:941 portal_runner parity
+    // warmspot.py:1021 assembler_call_helper: force path runs in plain
+    // interpreter. RPython: handle_fail → resume_in_blackhole, no portal.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let pr_result = match crate::eval::eval_with_jit(frame) {
+        let pr_result = match pyre_interpreter::eval::eval_frame_plain(frame) {
             Ok(r) => r,
             Err(_) => pyre_object::PY_NULL,
         };

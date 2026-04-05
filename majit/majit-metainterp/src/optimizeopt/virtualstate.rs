@@ -124,6 +124,8 @@ pub enum VirtualStateInfo {
     Virtual {
         descr: DescrRef,
         known_class: Option<GcRef>,
+        /// ob_type field descriptor for force path (pyre offset 0).
+        ob_type_descr: Option<DescrRef>,
         /// Field values as VirtualStateInfo (recursive).
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
         /// Original field descriptors for each field index.
@@ -1692,6 +1694,7 @@ fn export_single_value(
                 return VirtualStateInfo::Virtual {
                     descr: vinfo.descr.clone(),
                     known_class: vinfo.known_class,
+                    ob_type_descr: vinfo.ob_type_descr.clone(),
                     fields,
                     field_descrs: vinfo.field_descrs.clone(),
                 };
@@ -1897,6 +1900,7 @@ fn import_single_value(
         VirtualStateInfo::Virtual {
             descr,
             known_class,
+            ob_type_descr,
             fields,
             field_descrs,
         } => {
@@ -1910,11 +1914,22 @@ fn import_single_value(
                     .unwrap_or_else(|| imported_value_type(field_info));
                 let field_opref = import_child_placeholder(ctx, field_tp);
                 import_single_value(field_info, field_opref, ctx, ptr_info);
+                // ob_type (offset 0) is a GcRef pointer stored as Int.
+                // Register as Ref for correct fail_arg_types and decode_ref.
+                let offset = field_descrs
+                    .iter()
+                    .find(|(di, _)| *di == *field_idx)
+                    .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
+                if offset == Some(0) && known_class.is_some() {
+                    ctx.constant_types_for_numbering
+                        .insert(field_opref.0, majit_ir::Type::Ref);
+                }
                 vfields.push((*field_idx, field_opref));
             }
             ptr_info[idx] = Some(PtrInfo::Virtual(VirtualInfo {
                 descr: descr.clone(),
                 known_class: *known_class,
+                ob_type_descr: ob_type_descr.clone(),
                 fields: vfields,
                 field_descrs: field_descrs.clone(),
                 last_guard_pos: -1,
@@ -2260,6 +2275,7 @@ mod tests {
         ptr_info[opref.0 as usize] = Some(PtrInfo::Virtual(VirtualInfo {
             descr: descr.clone(),
             known_class: None,
+            ob_type_descr: None,
             fields: vec![(0, field_ref)],
             field_descrs: Vec::new(),
             last_guard_pos: -1,
