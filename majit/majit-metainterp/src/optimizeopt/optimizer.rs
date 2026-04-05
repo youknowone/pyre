@@ -205,11 +205,6 @@ pub struct Optimizer {
     /// receives transformed ops (after fold_box/elide). This map covers
     /// positions that were removed during trace transformation.
     pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// opencoder.py:259 parity: fresh Phase 2 inputarg OpRefs.
-    /// RPython TraceIterator creates fresh Box objects for each phase.
-    /// In majit, split_and_optimize remaps Phase 2 OpRefs to fresh
-    /// positions and stores the remapped inputargs here for import_state.
-    pub phase2_inputargs: Option<Vec<OpRef>>,
 }
 
 fn value_from_backend_constant_bits(opref: OpRef, raw: i64, ops: &[Op]) -> majit_ir::Value {
@@ -525,12 +520,7 @@ impl Optimizer {
 
         for iv in &self.imported_virtuals {
             let raw = OpRef(iv.inputarg_index as u32);
-            let mapped = self
-                .phase2_inputargs
-                .as_ref()
-                .and_then(|ia| ia.get(iv.inputarg_index).copied())
-                .unwrap_or(raw);
-            let virtual_head = ctx.get_box_replacement(mapped);
+            let virtual_head = ctx.get_box_replacement(raw);
             let mut fields = Vec::new();
             let mut field_descrs = Vec::new();
             for (descr, field_info) in &iv.fields {
@@ -875,7 +865,6 @@ impl Optimizer {
             snapshot_box_types: std::collections::HashMap::new(),
             prev_phase_value_types: std::collections::HashMap::new(),
             original_trace_op_types: std::collections::HashMap::new(),
-            phase2_inputargs: None,
         }
     }
 
@@ -1110,17 +1099,16 @@ impl Optimizer {
 
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
-    /// Returns the concrete OpRef (unchanged if not virtual).
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
         let resolved = ctx.get_box_replacement(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op)
-        // RPython uses ONLY the resolved op — no fallback paths.
-        if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
+        // → sb.add_preamble_op(preamble_op)
+        if let Some(preamble_op) = ctx.take_potential_extra_op(resolved) {
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved);
             } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved);
             }
         }
         if let Some(mut info) = ctx.get_ptr_info(resolved).cloned() {
@@ -1441,11 +1429,6 @@ impl Optimizer {
         //    Highest priority — override all others.
         for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
             ctx.value_types.insert(i as u32, tp);
-            if let Some(ref ia) = self.phase2_inputargs {
-                if let Some(&fresh) = ia.get(i) {
-                    ctx.value_types.insert(fresh.0, tp);
-                }
-            }
         }
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
@@ -1525,15 +1508,13 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            // opencoder.py:259 parity: Phase 2 inputargs are fresh OpRefs
-            // (from TraceIterator in RPython, from split_and_optimize remap
-            // in majit). import_state connects them to Phase 1 outputs.
+            // unroll.py:479-504: import_state(trace.inputargs, exported_state)
+            // Phase 2 inputargs are OpRef(0..n) — same positions as the
+            // original trace. Each phase has its own OptContext, so the
+            // forwarding for these positions is independent (like RPython's
+            // separate _cache per TraceIterator).
             let n = exported_state.next_iteration_args.len();
-            let targetargs: Vec<OpRef> = self
-                .phase2_inputargs
-                .as_ref()
-                .map(|ia| ia[..n].to_vec())
-                .unwrap_or_else(|| (0..n).map(|i| OpRef(i as u32)).collect());
+            let targetargs: Vec<OpRef> = (0..n).map(|i| OpRef(i as u32)).collect();
             let (label_args, source_slots) =
                 crate::optimizeopt::unroll::import_state_with_source_slots(
                     &targetargs,
@@ -1623,39 +1604,11 @@ impl Optimizer {
         // forcing relies on OptVirtualize's JUMP handler for now.
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
-                // optimizer.py:346,351-354: pop potential_extra_ops using
-                // get_box_replacement(op) only, WITHOUT virtual materialization.
-                // RPython calls force_box after make_inputargs(force_boxes=True)
-                // so virtuals are already materialized. majit hasn't run
-                // make_inputargs yet, so skip the force_box virtual path.
+                // RPython: Phase 2 JUMP is NOT sent through optimization
+                // passes. potential_extra_ops are consumed during normal
+                // _emit_operation → force_box, not at the end.
                 for arg in &mut terminal_op.args {
-                    let resolved = ctx.get_box_replacement(*arg);
-                    if let Some(tracked) = ctx.take_potential_extra_op(resolved) {
-                        if let Some(builder) = ctx.active_short_preamble_producer_mut() {
-                            builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
-                        } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                            builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
-                        }
-                    }
-                    *arg = resolved;
-                }
-                // Remap workaround: potential_extra_ops keys may not match
-                // JUMP arg OpRefs due to the fresh OpRef namespace from
-                // split_and_optimize's remap. Drain remaining entries.
-                // RPython's Box identity prevents this mismatch.
-                {
-                    let remaining: Vec<OpRef> = ctx.potential_extra_ops.keys().copied().collect();
-                    for key in remaining {
-                        let resolved = ctx.get_box_replacement(key);
-                        if let Some(tracked) = ctx
-                            .take_potential_extra_op(resolved)
-                            .or_else(|| ctx.take_potential_extra_op(key))
-                        {
-                            if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
-                                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
-                            }
-                        }
-                    }
+                    *arg = ctx.get_box_replacement(*arg);
                 }
                 self.terminal_op = Some(terminal_op);
             } else {

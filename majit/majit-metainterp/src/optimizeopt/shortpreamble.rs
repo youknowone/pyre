@@ -1297,15 +1297,23 @@ impl ShortPreambleBuilder {
         self.produced_short_boxes.get(&result).cloned()
     }
 
-    pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
-        self.state.record_preamble_use(result, produced);
+    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
+    /// Called from optimizer.force_box when popping from potential_extra_ops.
+    pub fn add_preamble_op_from_pop(
+        &mut self,
+        preamble_op: &crate::optimizeopt::info::PreambleOp,
+        resolved_op: OpRef,
+    ) {
+        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op) {
+            self.state.record_preamble_use(preamble_op.op, produced);
+        }
     }
 
     pub fn add_preamble_op(&mut self, result: OpRef) -> bool {
         let Some(produced) = self.produced_short_boxes.get(&result).cloned() else {
             return false;
         };
-        self.add_tracked_preamble_op(result, &produced);
+        self.state.record_preamble_use(result, &produced);
         true
     }
 
@@ -1534,7 +1542,18 @@ impl ExtendedShortPreambleBuilder {
         Some(preamble_op)
     }
 
-    /// shortpreamble.py:471-477: add_preamble_op
+    /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
+    pub fn add_preamble_op_from_pop(
+        &mut self,
+        preamble_op: &crate::optimizeopt::info::PreambleOp,
+        _resolved_op: OpRef,
+    ) {
+        if let Some(produced) = self.produced_short_boxes.get(&preamble_op.op).cloned() {
+            self.add_tracked_preamble_op(preamble_op.op, &produced);
+        }
+    }
+
+    /// shortpreamble.py:471-477: add_preamble_op (internal)
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
         let current_result = produced.preamble_op.pos;
         if produced.invented_name {

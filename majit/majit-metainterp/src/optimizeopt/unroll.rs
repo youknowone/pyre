@@ -380,75 +380,12 @@ impl UnrollOptimizer {
             );
         }
 
-        // ── opencoder.py:259-404 parity: Phase 2 trace remap ──
-        let max_trace_pos = ops
-            .iter()
-            .map(|op| op.pos.0)
-            .filter(|&p| p != u32::MAX)
-            .max()
-            .unwrap_or(0);
-        let max_phase1_pos = self
-            .phase1_value_types
-            .keys()
-            .copied()
-            .filter(|&k| k < 10_000)
-            .max()
-            .unwrap_or(0)
-            .max(
-                exported_state
-                    .next_iteration_args
-                    .iter()
-                    .chain(exported_state.end_args.iter())
-                    .map(|r| r.0)
-                    .filter(|&p| p < 10_000)
-                    .max()
-                    .unwrap_or(0),
-            );
-        let mut next_fresh = max_trace_pos.max(max_phase1_pos) + 1;
-        let mut phase2_remap: HashMap<u32, OpRef> = HashMap::new();
-        for i in 0..num_inputs {
-            phase2_remap.insert(i as u32, OpRef(next_fresh));
-            next_fresh += 1;
-        }
-        for op in ops {
-            if !op.pos.is_none()
-                && op.pos.0 < 10_000
-                && op.result_type() != Type::Void
-                && !phase2_remap.contains_key(&op.pos.0)
-            {
-                phase2_remap.insert(op.pos.0, OpRef(next_fresh));
-                next_fresh += 1;
-            }
-        }
-        let remap_ref = |opref: OpRef| -> OpRef {
-            if opref.is_none() || opref.0 >= 10_000 {
-                return opref;
-            }
-            phase2_remap.get(&opref.0).copied().unwrap_or(opref)
-        };
-        let remapped_ops: Vec<Op> = ops
-            .iter()
-            .map(|op| {
-                let mut new_op = op.clone();
-                new_op.pos = remap_ref(new_op.pos);
-                for arg in &mut new_op.args {
-                    *arg = remap_ref(*arg);
-                }
-                if let Some(ref mut fa) = new_op.fail_args {
-                    for arg in fa.iter_mut() {
-                        *arg = remap_ref(*arg);
-                    }
-                }
-                new_op
-            })
-            .collect();
-
+        // opencoder.py:259-404 parity: Phase 2 uses the same ops as Phase 1.
+        // RPython TraceIterator creates fresh Box objects per phase — each
+        // iterator has its own _cache, so Phase 2 results never collide with
+        // Phase 1. In majit, Phase 2 gets a separate OptContext, achieving
+        // the same isolation.
         let mut consts_p2 = consts_p1.clone();
-        for (&old_key, &val) in consts_p1.iter() {
-            if let Some(&fresh) = phase2_remap.get(&old_key) {
-                consts_p2.insert(fresh.0, val);
-            }
-        }
 
         let mut opt_p2 = match vable_config.as_ref() {
             Some(c) => {
@@ -458,56 +395,16 @@ impl UnrollOptimizer {
             }
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
-        // opencoder.py:259 parity: store fresh Phase 2 inputarg OpRefs.
-        // RPython TraceIterator.inputargs creates fresh Box objects per phase.
-        opt_p2.phase2_inputargs = Some(
-            (0..num_inputs)
-                .map(|i| {
-                    phase2_remap
-                        .get(&(i as u32))
-                        .copied()
-                        .unwrap_or(OpRef(i as u32))
-                })
-                .collect(),
-        );
         opt_p2.constant_types = self.constant_types.clone();
-        for (&k, &v) in &self.constant_types {
-            if let Some(&fresh) = phase2_remap.get(&k) {
-                opt_p2.constant_types.insert(fresh.0, v);
-            }
-        }
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
-        for (&k, &v) in &self.numbering_type_overrides {
-            if let Some(&fresh) = phase2_remap.get(&k) {
-                opt_p2.numbering_type_overrides.insert(fresh.0, v);
-            }
-        }
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.original_trace_op_types = self.original_trace_op_types.clone();
-        for (&k, &v) in &self.original_trace_op_types {
-            if let Some(&fresh) = phase2_remap.get(&k) {
-                opt_p2.original_trace_op_types.insert(fresh.0, v);
-            }
-        }
-        // Phase 1's emitted op types: NOT remapped — Phase 1 namespace.
         opt_p2.prev_phase_value_types = self.phase1_value_types.clone();
-        opt_p2.snapshot_boxes = self
-            .snapshot_boxes
-            .iter()
-            .map(|(&k, v)| (k, v.iter().map(|&r| remap_ref(r)).collect()))
-            .collect();
+        opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
-        opt_p2.snapshot_vable_boxes = self
-            .snapshot_vable_boxes
-            .iter()
-            .map(|(&k, v)| (k, v.iter().map(|&r| remap_ref(r)).collect()))
-            .collect();
+        opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        opt_p2.snapshot_box_types = self
-            .snapshot_box_types
-            .iter()
-            .map(|(&k, &v)| (phase2_remap.get(&k).map(|r| r.0).unwrap_or(k), v))
-            .collect();
+        opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
         // which sets patchguardop. optimizer.py:294 parity — no synthetic
@@ -545,20 +442,17 @@ impl UnrollOptimizer {
         // RPython: Phase 2 heap cache is populated by inline_short_preamble
         // replaying HeapOps through send_extra_operation.
         if std::env::var_os("MAJIT_LOG").is_some() {
-            let gc_before = remapped_ops.iter().filter(|o| o.opcode.is_guard()).count();
+            let gc_before = ops.iter().filter(|o| o.opcode.is_guard()).count();
             eprintln!(
                 "[jit] phase 2 input: {} ops, {} guards, body_ni={}",
-                remapped_ops.len(),
+                ops.len(),
                 gc_before,
                 body_num_inputs
             );
         }
 
-        let p2_ops = opt_p2.optimize_with_constants_and_inputs(
-            &remapped_ops,
-            &mut consts_p2,
-            body_num_inputs,
-        );
+        let p2_ops =
+            opt_p2.optimize_with_constants_and_inputs(&ops, &mut consts_p2, body_num_inputs);
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         // resume.py:570-574: collect per-guard optimizer knowledge from both phases.
@@ -2406,14 +2300,14 @@ impl OptUnroll {
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            // unroll.py:485: assert source is not target — guaranteed by
-            // Phase 2 trace remap (all sources are fresh OpRef).
-            assert_ne!(
-                source, *target,
-                "import_state: source must not be target (slot {i})"
-            );
-            // unroll.py:486: source.set_forwarded(target)
-            ctx.replace_op(source, *target);
+            // unroll.py:485: assert source is not target
+            // RPython uses Box object identity (pointer comparison).
+            // In majit, OpRef is a value type — source == target when the
+            // preamble didn't modify the value. No forwarding needed.
+            if source != *target {
+                // unroll.py:486: source.set_forwarded(target)
+                ctx.replace_op(source, *target);
+            }
             // unroll.py:487-490
             if let Some(info) = exported_state.exported_infos.get(target) {
                 // unroll.py:53-54: op = get_box_replacement(op)
@@ -3236,11 +3130,6 @@ impl OptUnroll {
                     if let Some(info) = ctx.get_ptr_info_mut(obj_resolved) {
                         info.set_preamble_field(descr_idx, pop.clone());
                     }
-                    // Fallback: register (source, field) in the context map.
-                    // Phase 2 getfield may resolve to source (forwarding
-                    // stops at Info(NonNull)), missing the PtrInfo-based
-                    // preamble_field. The heap pass checks this map too.
-                    ctx.preamble_field_fallback.insert((source, descr_idx), pop);
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
                             "[jit] import_short_heap_field: obj={obj:?} descr_idx={descr_idx} value={value:?} preamble_op={source:?}"
