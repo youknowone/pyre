@@ -782,6 +782,19 @@ pub trait Backend: Send {
     /// explicitly copied when the compiled loop is replaced.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
+    /// compile.py:741-745: look up (status, descr_addr) for a guard.
+    /// Uses (trace_id, fail_index) to find the exact descriptor, including
+    /// bridge guards and previous tokens — matching start_guard_compiling's
+    /// find_fail_descr_in_fail_descrs pattern.
+    fn get_guard_status(
+        &self,
+        _token: &JitCellToken,
+        _trace_id: u64,
+        _fail_index: u32,
+    ) -> (u64, usize) {
+        (0, 0)
+    }
+
     /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
     /// Returns true if descriptor was found in this token.
     fn start_guard_compiling(
