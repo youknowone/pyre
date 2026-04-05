@@ -32,7 +32,7 @@ use majit_ir::{
     OpRef, Type, Value,
 };
 
-use crate::guard::{BridgeData, CraneliftFailDescr, FrameData, JitFrameDeadFrame};
+use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
 // Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
@@ -317,9 +317,6 @@ struct OverlayFrameData {
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
         return Some(jf.fail_descr.layout());
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Some(frame_data.fail_descr.layout());
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return Some(overlay.fail_descr.layout());
@@ -1968,9 +1965,6 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
             if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
                 return Ok(jf.take_ref_for_call_result(0).as_usize() as i64);
             }
-            if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
-                return Ok(frame_data.take_ref_for_call_result(0).as_usize() as i64);
-            }
             Err(BackendError::Unsupported(
                 "unsupported dead frame type for Ref finish result".to_string(),
             ))
@@ -2054,139 +2048,77 @@ pub fn set_savedata_ref_on_deadframe(
     frame: &mut DeadFrame,
     data: GcRef,
 ) -> Result<(), BackendError> {
-    if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
-        jf.set_savedata_ref(data);
-        return Ok(());
-    }
-    if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
-        frame_data.set_savedata_ref(data);
-        return Ok(());
-    }
-    if let Some(overlay) = frame.data.downcast_mut::<OverlayFrameData>() {
-        set_savedata_ref_on_deadframe(&mut overlay.inner, data)?;
-        return Ok(());
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for saved-data".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_mut::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    jf.set_savedata_ref(data);
+    Ok(())
 }
 
 pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDescr, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.fail_descr.as_ref());
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.fail_descr.as_ref());
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return Ok(overlay.fail_descr.as_ref());
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for get_latest_descr".to_string(),
-    ))
+    // llmodel.py:411-419 get_latest_descr: cast deadframe → JITFRAMEPTR,
+    // read jf_descr, show() → AbstractFailDescr.
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.fail_descr.as_ref())
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_int(index));
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_int(index));
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return get_int_from_deadframe(&overlay.inner, index);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for get_int".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_int(index))
 }
 
 pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_float(index));
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_float(index));
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return get_float_from_deadframe(&overlay.inner, index);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for get_float".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_float(index))
 }
 
 pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_ref(index));
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_ref(index));
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return get_ref_from_deadframe(&overlay.inner, index);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for get_ref".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_ref(index))
 }
 
 pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_savedata_ref());
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_savedata_ref());
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return get_savedata_ref_from_deadframe(&overlay.inner);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for get_savedata_ref".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_savedata_ref())
 }
 
 pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return jf.try_get_savedata_ref();
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return frame_data.try_get_savedata_ref();
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return grab_savedata_ref_from_deadframe(&overlay.inner);
-    }
-    None
+    frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .and_then(|jf| jf.try_get_savedata_ref())
 }
 
 pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_exception_ref());
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_exception_ref());
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return grab_exc_value_from_deadframe(&overlay.inner);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for exception value".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_exception_ref())
 }
 
 pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Ok(jf.get_exception_class());
-    }
-    if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
-        return Ok(frame_data.get_exception_class());
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return grab_exc_class_from_deadframe(&overlay.inner);
-    }
-    Err(BackendError::Unsupported(
-        "unsupported dead frame type for exception class".to_string(),
-    ))
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(jf.get_exception_class())
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -2524,13 +2456,7 @@ fn call_assembler_fast_path(
                 // compile.py:649 DoneWithThisFrameDescr*.get_result:
                 // cpu.get_{int,ref,float}_value(deadframe, 0)
                 [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
-                _ => {
-                    let outputs_vec = outputs[..actual_outputs].to_vec();
-                    let mut frame =
-                        build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
-                    finish_result_from_deadframe(&mut frame)
-                        .expect("finish_result_from_deadframe failed") as u64
-                }
+                other => unreachable!("call_assembler finish with unsupported layout: {other:?}"),
             };
         }
 
@@ -2662,13 +2588,7 @@ fn call_assembler_fast_path_heap(
             // compile.py:649 DoneWithThisFrameDescr*.get_result:
             // cpu.get_{int,ref,float}_value(deadframe, 0)
             [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
-            _ => {
-                let outputs_vec = outputs[..actual_outputs].to_vec();
-                let mut frame =
-                    build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
-                finish_result_from_deadframe(&mut frame)
-                    .expect("finish_result_from_deadframe failed") as u64
-            }
+            other => unreachable!("call_assembler finish with unsupported layout: {other:?}"),
         };
     }
 
@@ -2739,26 +2659,6 @@ fn call_assembler_fast_path_heap(
         *outcome.add(1) = 0;
     }
     result as u64
-}
-
-/// Build a DeadFrame from raw outputs for cases where the fast path
-/// can't extract the result directly (e.g. Ref-typed results).
-fn build_deadframe_from_outputs(
-    outputs: Vec<i64>,
-    fail_descr: &Arc<CraneliftFailDescr>,
-    gc_runtime_id: Option<u64>,
-) -> DeadFrame {
-    let (exception_class, exception) = take_pending_jit_exception_state();
-    DeadFrame {
-        data: Box::new(FrameData::new_with_savedata_and_exception(
-            outputs,
-            fail_descr.clone(),
-            gc_runtime_id,
-            None,
-            exception_class,
-            (!exception.is_null()).then_some(exception),
-        )),
-    }
 }
 
 extern "C" fn call_assembler_shim(
@@ -9947,7 +9847,7 @@ impl majit_backend::Backend for CraneliftBackend {
             let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
             let descr = frame
                 .data
-                .downcast_ref::<FrameData>()
+                .downcast_ref::<JitFrameDeadFrame>()
                 .expect("bridge returned unexpected frame type");
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
@@ -14809,8 +14709,8 @@ mod tests {
         let failed = backend.execute_token(&callee, &[Value::Int(0)]);
         let guard_descr = failed
             .data
-            .downcast_ref::<FrameData>()
-            .expect("callee guard should produce FrameData")
+            .downcast_ref::<JitFrameDeadFrame>()
+            .expect("callee guard should produce JitFrameDeadFrame")
             .fail_descr
             .clone();
 
@@ -15120,8 +15020,8 @@ mod tests {
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
         let guard_descr = failed
             .data
-            .downcast_ref::<FrameData>()
-            .expect("base-case guard should produce FrameData")
+            .downcast_ref::<JitFrameDeadFrame>()
+            .expect("base-case guard should produce JitFrameDeadFrame")
             .fail_descr
             .clone();
 
