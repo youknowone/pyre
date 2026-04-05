@@ -142,7 +142,10 @@ impl ConstantPool {
     /// Release shadow stack roots.
     fn release_roots(&mut self) {
         if !self.rooted_refs.is_empty() {
-            shadow_stack::pop_to(self.shadow_stack_base);
+            let current = shadow_stack::depth();
+            if current >= self.shadow_stack_base {
+                shadow_stack::pop_to(self.shadow_stack_base);
+            }
             self.rooted_refs.clear();
         }
     }

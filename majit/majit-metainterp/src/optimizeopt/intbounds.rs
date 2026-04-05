@@ -37,6 +37,10 @@ pub struct OptIntBounds {
     /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
     /// Key: (opcode, arg0, arg1), Value: result OpRef.
     pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
+    /// Ops seen by this pass, keyed by result OpRef. Heap's postpone may
+    /// delay emission to new_operations; this map lets propagate_bounds
+    /// find producing ops regardless.
+    seen_ops: std::collections::HashMap<u32, Op>,
 }
 
 impl OptIntBounds {
@@ -48,6 +52,7 @@ impl OptIntBounds {
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
             pending_overflow_guard: None,
+            seen_ops: std::collections::HashMap::new(),
         }
     }
 
@@ -759,24 +764,29 @@ impl OptIntBounds {
         OptimizationResult::PassOn
     }
 
-    /// Find the operation that produced cond_ref by searching new_operations.
-    fn find_producing_op<'a>(&self, cond_ref: OpRef, ctx: &'a OptContext) -> Option<&'a Op> {
-        // First try direct index (when OpRef matches new_operations index)
+    /// Find the operation that produced cond_ref.
+    ///
+    /// Heap's postpone may delay comparison ops from reaching new_operations,
+    /// so also check seen_ops which records every op this pass has processed.
+    fn find_producing_op<'a>(&'a self, cond_ref: OpRef, ctx: &'a OptContext) -> Option<&'a Op> {
+        // First try new_operations (direct index, then linear search)
         let idx = cond_ref.0 as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos == cond_ref {
             return Some(&ctx.new_operations[idx]);
         }
-        // Otherwise search by pos field
-        ctx.new_operations.iter().rfind(|op| op.pos == cond_ref)
+        if let Some(op) = ctx.new_operations.iter().rfind(|op| op.pos == cond_ref) {
+            return Some(op);
+        }
+        // Fallback: check ops seen by this pass (may be postponed by Heap)
+        self.seen_ops.get(&cond_ref.0)
     }
 
     /// Propagate bounds backward after GUARD_TRUE.
     /// The condition (cond_ref) is known to produce a nonzero value (true).
     fn propagate_bounds_from_guard_true(&mut self, cond_ref: OpRef, ctx: &OptContext) {
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
+        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx).cloned() {
             if producing_op.opcode.returns_bool() {
                 self.setintbound(cond_ref, IntBound::from_constant(1));
-                let producing_op = producing_op.clone();
                 self.propagate_bounds_from_comparison(&producing_op, true, ctx);
                 return;
             }
@@ -795,9 +805,8 @@ impl OptIntBounds {
     fn propagate_bounds_from_guard_false(&mut self, cond_ref: OpRef, ctx: &OptContext) {
         self.setintbound(cond_ref, IntBound::from_constant(0));
 
-        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx) {
+        if let Some(producing_op) = self.find_producing_op(cond_ref, ctx).cloned() {
             if producing_op.opcode.returns_bool() {
-                let producing_op = producing_op.clone();
                 self.propagate_bounds_from_comparison(&producing_op, false, ctx);
             }
         }
@@ -1179,6 +1188,13 @@ impl Default for OptIntBounds {
 
 impl Optimization for OptIntBounds {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // Record comparison/ovf ops so find_producing_op can locate them
+        // even if a later pass (Heap) postpones their emission.
+        if op.opcode.is_comparison() || op.opcode.is_ovf() {
+            if !op.pos.is_none() {
+                self.seen_ops.insert(op.pos.0, op.clone());
+            }
+        }
         let result = match op.opcode {
             // ── Comparisons ──
             OpCode::IntLt => self.optimize_int_lt(op, ctx),
@@ -1424,6 +1440,7 @@ impl Optimization for OptIntBounds {
         self.last_emitted_args.clear();
         self.last_emitted_ref = OpRef::NONE;
         self.pending_overflow_guard = None;
+        self.seen_ops.clear();
     }
 
     fn name(&self) -> &'static str {

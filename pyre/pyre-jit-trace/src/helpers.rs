@@ -262,16 +262,15 @@ pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> Op
     )
 }
 
+/// RPython ConstPtr parity: boxed-object constants are Ref-typed.
+/// The optimizer can constant-fold immutable field reads from Ref
+/// constants (heap.py:640 constant_fold).
 pub fn emit_trace_int_constant(ctx: &mut TraceCtx, value: i64) -> OpRef {
-    let opref = ctx.const_int(w_int_new(value) as i64);
-    ctx.root_const_for_gc(opref);
-    opref
+    ctx.const_ref(w_int_new(value) as i64)
 }
 
 pub fn emit_trace_float_constant(ctx: &mut TraceCtx, value: f64) -> OpRef {
-    let opref = ctx.const_int(box_float_constant(value) as i64);
-    ctx.root_const_for_gc(opref);
-    opref
+    ctx.const_ref(box_float_constant(value) as i64)
 }
 
 pub fn emit_trace_unary_negative_value(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
@@ -447,11 +446,7 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_bigint_constant(&mut self, value: &PyBigInt) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(box_bigint_constant(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(box_bigint_constant(value) as i64)))
     }
 
     fn trace_float_constant(&mut self, value: f64) -> Result<OpRef, PyError> {
@@ -459,19 +454,11 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_bool_constant(&mut self, value: bool) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(w_bool_from(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(w_bool_from(value) as i64)))
     }
 
     fn trace_str_constant(&mut self, value: &str) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(box_str_constant(value) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(box_str_constant(value) as i64)))
     }
 
     fn trace_code_constant(
@@ -479,18 +466,12 @@ pub trait TraceHelperAccess {
         code: &pyre_interpreter::CodeObject,
     ) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(pyre_interpreter::box_code_constant(code) as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
+            Ok(ctx.const_ref(pyre_interpreter::box_code_constant(code) as i64))
         })
     }
 
     fn trace_none_constant(&mut self) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| {
-            let opref = ctx.const_int(w_none() as i64);
-            ctx.root_const_for_gc(opref);
-            Ok(opref)
-        })
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(w_none() as i64)))
     }
 }
 
@@ -513,11 +494,8 @@ pub fn emit_box_int_inline(
     // heapcache: track allocation as unescaped
     ctx.heap_cache_mut().new_object(new_op);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)
-    // RPython ConstPtr parity: type descriptor is a GcRef pointer.
-    // Use const_int (Cranelift treats as i64) but register Ref type so
-    // resume data / consumer switchover correctly identifies it as Ref.
+    // cls_of_box parity: ptr2int(typeptr) → ConstInt.
     let type_const = ctx.const_int(int_type_addr);
-    ctx.mark_const_type(type_const, majit_ir::Type::Ref);
     let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
     ctx.heap_cache_mut()
@@ -542,7 +520,6 @@ pub fn emit_box_float_inline(
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
     let type_const = ctx.const_int(float_type_addr);
-    ctx.mark_const_type(type_const, majit_ir::Type::Ref);
     let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
     ctx.heap_cache_mut()
