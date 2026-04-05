@@ -1325,8 +1325,8 @@ fn effectinfo_from_writeanalyze(
             write_descrs_fields: !0,
             readonly_descrs_arrays: !0,
             write_descrs_arrays: !0,
-            can_invalidate,
             single_write_descr_array: None,
+            can_invalidate,
         };
     }
 
@@ -1401,8 +1401,8 @@ fn effectinfo_from_writeanalyze(
         write_descrs_fields,
         readonly_descrs_arrays,
         write_descrs_arrays,
-        can_invalidate,
         single_write_descr_array,
+        can_invalidate,
     }
 }
 

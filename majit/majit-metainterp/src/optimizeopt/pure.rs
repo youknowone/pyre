@@ -622,6 +622,12 @@ impl Default for OptPure {
 
 impl Optimization for OptPure {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // optimizer.py: pure_from_args1 parity — consume pending registrations
+        // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships).
+        for (opcode, arg0, result) in ctx.pending_pure_from_args.drain(..) {
+            self.pure_from_args1(opcode, arg0, result);
+        }
+
         // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
         if op.opcode != OpCode::GuardNoException {
             self.last_emitted_was_removed = false;
