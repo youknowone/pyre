@@ -309,19 +309,11 @@ struct RegisteredLoopTarget {
 unsafe impl Send for RegisteredLoopTarget {}
 unsafe impl Sync for RegisteredLoopTarget {}
 
-struct OverlayFrameData {
-    inner: DeadFrame,
-    fail_descr: Arc<CraneliftFailDescr>,
-}
-
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
-    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
-        return Some(jf.fail_descr.layout());
-    }
-    if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
-        return Some(overlay.fail_descr.layout());
-    }
-    None
+    frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .map(|jf| jf.fail_descr.layout())
 }
 
 fn overlay_deadframe_fail_descr(
@@ -396,7 +388,7 @@ fn caller_prefix_recovery_layout(
 }
 
 fn wrap_call_assembler_deadframe_with_caller_prefix(
-    frame: DeadFrame,
+    mut frame: DeadFrame,
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
@@ -421,12 +413,16 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     );
     let recovery_layout = inner_recovery_layout.prefixed_by(Some(&caller_layout));
 
-    DeadFrame {
-        data: Box::new(OverlayFrameData {
-            inner: frame,
-            fail_descr: overlay_deadframe_fail_descr(&layout, recovery_layout),
-        }),
+    // Replace fail_descr on the inner JitFrameDeadFrame to carry the
+    // caller-prefixed recovery layout.  RPython has no overlay wrapper —
+    // the jitframe IS the deadframe with the correct descr.
+    let overlay_descr = overlay_deadframe_fail_descr(&layout, recovery_layout);
+    if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
+        jf.fail_descr = overlay_descr;
+        return frame;
     }
+    // Fallback: return as-is (should not happen after FrameData removal).
+    frame
 }
 
 /// Global exception state for JIT-compiled code.
