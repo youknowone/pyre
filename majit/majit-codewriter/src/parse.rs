@@ -214,7 +214,11 @@ fn collect_trait_impls_from_items(
                                 };
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::full_type_string(ty)
+                                        crate::front::ast::qualified_full_type_string(
+                                            ty,
+                                            prefix,
+                                            known_struct_names,
+                                        )
                                     }
                                     syn::ReturnType::Default => None,
                                 };
@@ -262,7 +266,11 @@ fn collect_trait_impls_from_items(
                                 );
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::full_type_string(ty)
+                                        crate::front::ast::qualified_full_type_string(
+                                            ty,
+                                            prefix,
+                                            known_struct_names,
+                                        )
                                     }
                                     syn::ReturnType::Default => None,
                                 };
@@ -365,7 +373,13 @@ fn collect_inherent_methods_from_items(
                             known_struct_names,
                         );
                         let return_type = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => crate::front::ast::full_type_string(ty),
+                            syn::ReturnType::Type(_, ty) => {
+                                crate::front::ast::qualified_full_type_string(
+                                    ty,
+                                    prefix,
+                                    known_struct_names,
+                                )
+                            }
                             syn::ReturnType::Default => None,
                         };
                         methods.push(InherentMethodInfo {
