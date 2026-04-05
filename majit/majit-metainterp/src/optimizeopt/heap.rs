@@ -1650,17 +1650,18 @@ impl OptHeap {
             OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, ctx),
             OpCode::SetarrayitemRaw => OptimizationResult::Emit(op.clone()),
 
-            // ── heap.py: Interior field reads (array-of-structs pattern) ──
+            // ── Interior field reads ──
+            // info.py:682: "heapcache does not work for interiorfields"
+            // RPython has no optimize_GETINTERIORFIELD_GC handler — falls
+            // through to optimize_default (just emit). GETINTERIORFIELD has
+            // no side effect so emitting_operation returns early (heap.py:428).
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF => {
-                // Interior fields use the same field cache as regular fields.
-                // The key is (array_opref, interior_field_descr_index).
-                self.optimize_getfield(op, ctx)
-            }
-
-            // ── heap.py: Interior field writes ──
-            OpCode::SetinteriorfieldGc => self.optimize_setfield(op, ctx),
+            | OpCode::GetinteriorfieldGcF => OptimizationResult::Emit(op.clone()),
+            // SETINTERIORFIELD_GC: NOT matched here — falls through to
+            // handle_side_effects (the `_` arm). RPython heap.py:463-464:
+            // SETINTERIORFIELD_GC is NOT in the emitting_operation exclusion
+            // list, so it triggers force_all_lazy_sets + clean_caches.
 
             // ── heap.py: ARRAYLEN_GC — cache array lengths ──
             OpCode::ArraylenGc => {

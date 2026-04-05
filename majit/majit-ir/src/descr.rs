@@ -590,6 +590,9 @@ pub struct EffectInfo {
     pub write_descrs_interiorfields: u64,
     /// effectinfo.py: can_invalidate
     pub can_invalidate: bool,
+    /// effectinfo.py:194: can_collect — whether this call can trigger GC collection.
+    /// RPython: set by collect_analyzer.analyze(op, self.seen_gc).
+    pub can_collect: bool,
     /// effectinfo.py:201-206: single_write_descr_array
     #[serde(skip)]
     pub single_write_descr_array: Option<DescrRef>,
@@ -608,6 +611,7 @@ impl PartialEq for EffectInfo {
             && self.readonly_descrs_interiorfields == other.readonly_descrs_interiorfields
             && self.write_descrs_interiorfields == other.write_descrs_interiorfields
             && self.can_invalidate == other.can_invalidate
+            && self.can_collect == other.can_collect
     }
 }
 
@@ -626,6 +630,8 @@ impl Default for EffectInfo {
             write_descrs_interiorfields: 0,
             single_write_descr_array: None,
             can_invalidate: false,
+            // RPython effectinfo.py:125: can_collect=True default
+            can_collect: true,
         }
     }
 }
@@ -755,10 +761,10 @@ impl EffectInfo {
         self.can_invalidate
     }
 
-    /// Whether this call can trigger GC collection.
-    /// RPython: `effectinfo.can_collect()`
+    /// effectinfo.py: check_can_collect() — whether this call can trigger GC collection.
+    /// RPython: stored as field from collect_analyzer result.
     pub fn can_collect(&self) -> bool {
-        self.extra_effect >= ExtraEffect::CanRaise
+        self.can_collect
     }
 
     /// effectinfo.py: check_forces_virtual_or_virtualizable()
@@ -813,6 +819,7 @@ impl EffectInfo {
             write_descrs_interiorfields: 0,
             single_write_descr_array: None,
             can_invalidate: false,
+            can_collect: true,
         }
     }
 
@@ -863,6 +870,18 @@ impl EffectInfo {
     /// effectinfo.py: check_write_descr_array(arraydescr)
     pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
         descr_idx < 64 && (self.write_descrs_arrays & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py:223-224: check_readonly_descr_interiorfield
+    /// NOTE: this is not used so far (matches RPython comment)
+    pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.readonly_descrs_interiorfields & (1u64 << descr_idx)) != 0
+    }
+
+    /// effectinfo.py:227-228: check_write_descr_interiorfield
+    /// NOTE: this is not used so far (matches RPython comment)
+    pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
+        descr_idx < 64 && (self.write_descrs_interiorfields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py: check_is_elidable()
