@@ -1508,13 +1508,37 @@ impl Optimizer {
         }
 
         if let Some(exported_state) = self.imported_loop_state.as_ref() {
-            // unroll.py:479-504: import_state(trace.inputargs, exported_state)
-            // Phase 2 inputargs are OpRef(0..n) — same positions as the
-            // original trace. Each phase has its own OptContext, so the
-            // forwarding for these positions is independent (like RPython's
-            // separate _cache per TraceIterator).
-            let n = exported_state.next_iteration_args.len();
-            let targetargs: Vec<OpRef> = (0..n).map(|i| OpRef(i as u32)).collect();
+            // opencoder.py:259 parity: RPython allocates fresh InputArg Box
+            // objects for each Phase 2 iteration. In majit's flat OpRef model,
+            // source == target creates a forwarding cycle, so fresh allocation
+            // is only applied for cross-slot collisions (target[i] == source[j],
+            // i!=j). The source == target case is a no-op in replace_op.
+            let nia = &exported_state.next_iteration_args;
+            let n = nia.len();
+            let source_set: std::collections::HashSet<OpRef> =
+                (0..n).map(|i| OpRef(i as u32)).collect();
+            let targetargs: Vec<OpRef> = (0..n)
+                .map(|i| {
+                    let source = OpRef(i as u32);
+                    let target = nia[i];
+                    // Constants (>= CONST_BASE) don't participate in forwarding.
+                    if target.0 >= majit_ir::OpRef::CONST_BASE {
+                        return source;
+                    }
+                    // Cross-slot collision: target is another slot's source.
+                    // Allocate fresh to avoid forwarding overwrite.
+                    if target != source && source_set.contains(&target) {
+                        let fresh = ctx.alloc_op_position();
+                        if let Some(&tp) = ctx.value_types.get(&source.0) {
+                            ctx.value_types.insert(fresh.0, tp);
+                        }
+                        ctx.replace_op(source, fresh);
+                        fresh
+                    } else {
+                        source
+                    }
+                })
+                .collect();
             let (label_args, source_slots) =
                 crate::optimizeopt::unroll::import_state_with_source_slots(
                     &targetargs,

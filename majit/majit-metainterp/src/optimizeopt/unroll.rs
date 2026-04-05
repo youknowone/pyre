@@ -2300,14 +2300,13 @@ impl OptUnroll {
         }
         for (i, target) in exported_state.next_iteration_args.iter().enumerate() {
             let source = targetargs[i];
-            // unroll.py:485: assert source is not target
-            // RPython uses Box object identity (pointer comparison).
-            // In majit, OpRef is a value type — source == target when the
-            // preamble didn't modify the value. No forwarding needed.
-            if source != *target {
-                // unroll.py:486: source.set_forwarded(target)
-                ctx.replace_op(source, *target);
-            }
+            // unroll.py:485-486: source.set_forwarded(target)
+            // RPython guarantees source is not target via fresh Box identity.
+            // majit: source == target is possible when both phases share a
+            // trace position — replace_op(x, x) is a no-op, matching the
+            // RPython invariant that self-forwarding never occurs.
+            // Cross-slot collisions are handled in optimizer.rs.
+            ctx.replace_op(source, *target);
             // unroll.py:487-490
             if let Some(info) = exported_state.exported_infos.get(target) {
                 // unroll.py:53-54: op = get_box_replacement(op)
