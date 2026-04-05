@@ -312,9 +312,7 @@ unsafe impl Sync for RegisteredLoopTarget {}
 
 /// RPython virtualref.py force token state — single-threaded, no lock needed.
 /// RPython has no lock here (GIL-protected). pyre is single-threaded.
-struct ActiveForceFrame {
-    saved_data_root: UnsafeCell<Option<Box<GcRef>>>,
-}
+struct ActiveForceFrame {}
 
 // Safety: single-threaded access only. Write-once or scoped mutation
 // during force/bridge compilation, never concurrent.
@@ -849,9 +847,7 @@ pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
 
 fn register_force_frame() -> (u64, Arc<ActiveForceFrame>) {
     let handle = NEXT_FORCE_TOKEN_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let frame = Arc::new(ActiveForceFrame {
-        saved_data_root: UnsafeCell::new(None),
-    });
+    let frame = Arc::new(ActiveForceFrame {});
     FORCE_FRAMES.with(|ff| ff.borrow_mut().insert(handle, frame.clone()));
     (handle, frame)
 }
@@ -1330,19 +1326,11 @@ fn resolve_virtual_field_value_with_materialized(
     }
 }
 
-fn take_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
-    let saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
-    let saved_data = saved_data_root.take()?;
-    Some(*saved_data)
-}
-
 pub(crate) fn release_force_token(handle: u64) {
     if handle == 0 {
         return;
     }
-    if let Some(frame) = FORCE_FRAMES.with(|ff| ff.borrow_mut().remove(&handle)) {
-        let _ = take_force_frame_saved_data(&frame);
-    }
+    FORCE_FRAMES.with(|ff| ff.borrow_mut().remove(&handle));
 }
 
 fn with_active_force_frame<R>(handle: u64, f: impl FnOnce() -> R) -> R {
@@ -2055,13 +2043,9 @@ fn maybe_take_call_assembler_deadframe(
     fail_index: u32,
     outputs: &[i64],
     handle: u64,
-    force_frame: Option<&Arc<ActiveForceFrame>>,
 ) -> Option<DeadFrame> {
     if fail_index != CALL_ASSEMBLER_DEADFRAME_SENTINEL {
         return None;
-    }
-    if let Some(force_frame) = force_frame {
-        take_force_frame_saved_data(force_frame);
     }
     release_force_token(handle);
     Some(take_call_assembler_deadframe_from_outputs(outputs))
@@ -2101,6 +2085,9 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         Arc::increment_strong_count(descr_ptr);
         Arc::from_raw(descr_ptr)
     };
+    // Register jf_gcref as GC root so moving GC can update the
+    // pointer. Shadow stack keeps the object alive, but does NOT
+    // update this separate copy of jf_gcref.
     let gc_runtime_id = fail_descr.gc_runtime_id;
     DeadFrame {
         data: Box::new(JitFrameDeadFrame::new(
@@ -2269,9 +2256,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let direct_descr = exec.direct_descr.clone();
         let outputs = exec.extract_outputs(target.max_output_slots.max(1));
 
-        if let Some(frame) =
-            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-        {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 target.trace_id,
@@ -2335,19 +2320,10 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // Bridge compilation is decided by MetaInterp.must_compile()
         // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
 
-        let saved_data = if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff)
-        } else {
-            None
-        };
+        // jf_savedata already correct in jf_frame memory.
         let (_, exception) = take_pending_jit_exception_state();
         release_force_token(handle);
         let jf_ptr = exec.jf_gcref.0;
-        if let Some(sd) = saved_data {
-            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
-        } else {
-            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
-        }
         if !exception.is_null() {
             unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
         } else {
@@ -4897,12 +4873,7 @@ impl CraneliftBackend {
             let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
             // CALL_ASSEMBLER deadframe interception.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(
-                fail_index,
-                &outputs,
-                handle,
-                force_frame.as_ref(),
-            ) {
+            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
                 return wrap_call_assembler_deadframe_with_caller_prefix(
                     frame,
                     compiled.trace_id,
@@ -4957,20 +4928,10 @@ impl CraneliftBackend {
                     continue;
                 }
                 // Real FINISH — function completed.
-                let saved_data = if let Some(ref ff) = force_frame {
-                    take_force_frame_saved_data(ff)
-                } else {
-                    None
-                };
+                // jf_savedata already correct in jf_frame memory.
                 let (_, exception) = take_pending_jit_exception_state();
                 release_force_token(handle);
-                // Write savedata/exception to JitFrame header (llmodel.py parity).
                 let jf_ptr = exec.jf_gcref.0;
-                if let Some(sd) = saved_data {
-                    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
-                } else {
-                    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
-                }
                 if !exception.is_null() {
                     unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
                 } else {
@@ -5020,19 +4981,12 @@ impl CraneliftBackend {
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge →
             // ExecutionFinished(LLDeadFrame).
-            let saved_data = if let Some(ref ff) = force_frame {
-                take_force_frame_saved_data(ff)
-            } else {
-                None
-            };
+            // jf_savedata is already correct in jf_frame memory:
+            //   - force called → callee's set_savedata_ref wrote it
+            //   - no force → zeroed alloc → 0
             let (_, exception) = take_pending_jit_exception_state();
             release_force_token(handle);
             let jf_ptr = exec.jf_gcref.0;
-            if let Some(sd) = saved_data {
-                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
-            } else {
-                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
-            }
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
             } else {
@@ -5077,9 +5031,7 @@ impl CraneliftBackend {
         let direct_descr = exec.direct_descr.clone();
         let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
 
-        if let Some(frame) =
-            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-        {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
                 bridge.trace_id,
@@ -5099,19 +5051,10 @@ impl CraneliftBackend {
         // just like in execute_with_inputs. Without this, the FINISH
         // bridge's exit is misinterpreted as a guard failure.
         if fail_descr.is_finish {
-            let saved_data = if let Some(ref ff) = force_frame {
-                take_force_frame_saved_data(ff)
-            } else {
-                None
-            };
+            // jf_savedata already correct in jf_frame memory.
             let (_, exception) = take_pending_jit_exception_state();
             release_force_token(handle);
             let jf_ptr = exec.jf_gcref.0;
-            if let Some(sd) = saved_data {
-                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
-            } else {
-                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
-            }
             if !exception.is_null() {
                 unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
             } else {
@@ -5136,19 +5079,10 @@ impl CraneliftBackend {
         }
         let _ = bridge_guard;
 
-        let saved_data = if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff)
-        } else {
-            None
-        };
+        // jf_savedata already correct in jf_frame memory.
         let (_, exception) = take_pending_jit_exception_state();
         release_force_token(handle);
         let jf_ptr = exec.jf_gcref.0;
-        if let Some(sd) = saved_data {
-            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
-        } else {
-            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = 0 };
-        }
         if !exception.is_null() {
             unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
         } else {
@@ -6869,6 +6803,24 @@ impl CraneliftBackend {
                         .ins()
                         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
 
+                    // regalloc.py before_call() parity: spill fail_args to
+                    // jf_frame so force_token_to_dead_frame() reads correct
+                    // values if the callee forces the frame.
+                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        // The call result (vi) is not yet available — write 0.
+                        let raw = if arg_ref.0 == vi && !constants.contains_key(&arg_ref.0) {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        } else {
+                            resolve_opref(&mut builder, &constants, arg_ref)
+                        };
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            raw,
+                            outputs_ptr,
+                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+                        );
+                    }
+
                     // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
                     let descr = op.descr.as_ref().expect("call op must have a descriptor");
                     let call_descr = descr
@@ -6919,6 +6871,23 @@ impl CraneliftBackend {
                     builder
                         .ins()
                         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_FORCE_DESCR_OFS);
+
+                    // regalloc.py before_call() parity: spill fail_args to
+                    // jf_frame so force_token_to_dead_frame() reads correct
+                    // values if the callee forces the frame.
+                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        let raw = if arg_ref.0 == vi && !constants.contains_key(&arg_ref.0) {
+                            builder.ins().iconst(cl_types::I64, 0)
+                        } else {
+                            resolve_opref(&mut builder, &constants, arg_ref)
+                        };
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            raw,
+                            outputs_ptr,
+                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+                        );
+                    }
 
                     let descr = op
                         .descr
@@ -9924,9 +9893,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 outputs.len()
             );
         }
-        if let Some(frame) =
-            maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
-        {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs, handle) {
             if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
                 eprintln!("[exec-raw] fail_index=0 → call_assembler path");
             }
@@ -10056,10 +10023,10 @@ impl majit_backend::Backend for CraneliftBackend {
         let _ = bridge_guard;
 
         // No bridge — skip DeadFrame, return outputs directly.
-        let savedata = if let Some(ref ff) = force_frame {
-            take_force_frame_saved_data(ff)
-        } else {
-            None
+        // Read savedata directly from jf_frame memory.
+        let savedata = {
+            let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
+            if raw != 0 { Some(GcRef(raw)) } else { None }
         };
         let (exception_class, exception) = take_pending_jit_exception_state();
         if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
@@ -10291,40 +10258,11 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
-        // llmodel.py:270-274:
-        //   frame = rffi.cast(JITFRAMEPTR, addr_of_force_token)
-        //   frame = frame.resolve()
-        //   frame.jf_descr = frame.jf_force_descr
-        //   return cast_opaque_ptr(GCREF, frame)
+        // llmodel.py:270-274
         if force_token.0 == 0 {
             return None;
         }
-        let jf_ptr = force_token.0 as *mut i64;
-        let jf_ptr = jitframe_resolve(jf_ptr);
-        // frame.jf_descr = frame.jf_force_descr
-        let jf_force_descr = unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) };
-        unsafe { *jf_ptr.add(JF_DESCR_OFS as usize / 8) = jf_force_descr };
-        let jf_gcref = GcRef(jf_ptr as usize);
-        let descr_ptr = jf_force_descr as usize as *const CraneliftFailDescr;
-        assert!(
-            !descr_ptr.is_null(),
-            "force(): jf_force_descr is null — _store_force_index was not called"
-        );
-        let fail_descr = unsafe {
-            Arc::increment_strong_count(descr_ptr);
-            Arc::from_raw(descr_ptr)
-        };
-        // Rust wrapper overhead: register jf_gcref as GC root.
-        // RPython doesn't need this (GCREF natively tracked).
-        let gc_runtime_id = fail_descr.gc_runtime_id;
-        Some(DeadFrame {
-            data: Box::new(JitFrameDeadFrame::new(
-                jf_gcref,
-                fail_descr,
-                gc_runtime_id,
-                None,
-            )),
-        })
+        Some(force_token_to_dead_frame(force_token))
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
