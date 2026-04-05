@@ -693,6 +693,12 @@ pub fn generate_trace_code_from_pipeline(result: &passes::ProgramPipelineResult)
     codegen::generate_from_pipeline(result)
 }
 
+/// Produce a recognition report: how much the pipeline understands.
+pub fn recognition_report(result: &passes::ProgramPipelineResult) -> codegen::RecognitionReport {
+    codegen::recognition_report(result)
+}
+pub use codegen::{OpcodeRecognition, RecognitionReport};
+
 /// Generate code from graph pipeline results.
 #[cfg(test)]
 pub fn generate_graph_code(result: &passes::ProgramPipelineResult) -> String {
@@ -925,6 +931,57 @@ mod tests {
         for (i, line) in code.lines().enumerate().take(50) {
             eprintln!("{:3}: {}", i + 1, line);
         }
+    }
+
+    #[test]
+    fn test_recognition_report() {
+        let sources = read_all_pyre_sources();
+        let source_refs: Vec<_> = sources.iter().map(String::as_str).collect();
+        let result = analyze_multiple_pipeline_with_config(
+            &source_refs,
+            &crate::test_support::pyre_analyze_config(),
+        );
+        let report = recognition_report(&result);
+
+        eprintln!("=== Recognition Report ===");
+        eprintln!(
+            "Total opcodes: {}, Flattened: {} ({:.0}%)",
+            report.total_opcodes,
+            report.flattened,
+            if report.total_opcodes > 0 {
+                report.flattened as f64 / report.total_opcodes as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        eprintln!(
+            "Total flat ops: {}, Unknown: {}, Unresolved calls: {}",
+            report.total_flat_ops, report.unknown_ops, report.unresolved_calls
+        );
+        eprintln!("\nPer-opcode:");
+        for opc in &report.per_opcode {
+            let status = if opc.flat_ops > 0 {
+                format!(
+                    "{} ops ({}U {}C)",
+                    opc.flat_ops, opc.unknowns, opc.unresolved
+                )
+            } else {
+                "unflattened".to_string()
+            };
+            eprintln!("  {:40} {}", opc.selector, status);
+        }
+
+        // Scoreboard assertions
+        assert!(
+            report.total_opcodes > 20,
+            "expected >20 opcodes, got {}",
+            report.total_opcodes
+        );
+        assert!(
+            report.flattened >= 10,
+            "expected >=10 flattened, got {}",
+            report.flattened
+        );
     }
 
     #[test]

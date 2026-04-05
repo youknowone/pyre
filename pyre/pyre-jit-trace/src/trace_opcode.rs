@@ -1920,77 +1920,62 @@ impl MIFrame {
             }
         };
 
-        let op_code = match op {
-            BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::IntAddOvf,
-            BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::IntSubOvf,
-            BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::IntMulOvf,
-            BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-                let Some((lhs, rhs)) = concrete else {
-                    return self.trace_binary_value(a, b, op);
-                };
-                if lhs < 0 || rhs <= 0 {
-                    return self.trace_binary_value(a, b, op);
-                }
-                OpCode::IntFloorDiv
-            }
-            BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-                let Some((lhs, rhs)) = concrete else {
-                    return self.trace_binary_value(a, b, op);
-                };
-                if lhs < 0 || rhs <= 0 {
-                    return self.trace_binary_value(a, b, op);
-                }
-                OpCode::IntMod
-            }
-            BinaryOperator::And | BinaryOperator::InplaceAnd => OpCode::IntAnd,
-            BinaryOperator::Or | BinaryOperator::InplaceOr => OpCode::IntOr,
-            BinaryOperator::Xor | BinaryOperator::InplaceXor => OpCode::IntXor,
-            BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                let Some((lhs, rhs)) = concrete else {
-                    return self.trace_binary_value(a, b, op);
-                };
-                let Ok(shift) = u32::try_from(rhs) else {
-                    return self.trace_binary_value(a, b, op);
-                };
-                if shift >= i64::BITS {
-                    return self.trace_binary_value(a, b, op);
-                }
-                // intobject.py:207 ovfcheck(a << b): if the shift overflows
-                // i64 range, fall back to interpreter for long promotion.
-                let result = lhs.wrapping_shl(shift);
-                if result.wrapping_shr(shift) != lhs {
-                    return self.trace_binary_value(a, b, op);
-                }
-                OpCode::IntLshift
-            }
-            BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                let Some((lhs, rhs)) = concrete else {
-                    return self.trace_binary_value(a, b, op);
-                };
-                // intobject.py:225: r_uint(b) >= LONG_BIT
-                let Ok(shift) = u32::try_from(rhs) else {
-                    // intobject.py:227: negative shift → ValueError
-                    return self.trace_binary_value(a, b, op);
-                };
-                if shift >= i64::BITS {
-                    // intobject.py:229-231: large shift → 0 or -1
-                    let result = if lhs < 0 { -1i64 } else { 0i64 };
-                    return self.with_ctx(|this, ctx| {
-                        let raw = ctx.const_int(result);
-                        let boxed = box_traced_raw_int(ctx, raw);
-                        this.remember_value_type(boxed, Type::Ref);
-                        Ok(boxed)
-                    });
-                }
-                OpCode::IntRshift
-            }
-            _ => return self.trace_binary_value(a, b, op),
+        // Table lookup: BinaryOperator → (OpCode, has_overflow, needs_concrete_check)
+        let Some((op_code, has_overflow, needs_concrete_check)) = crate::int_binop_lookup(op)
+        else {
+            return self.trace_binary_value(a, b, op);
         };
 
-        let has_overflow = matches!(
-            op_code,
-            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-        );
+        // Operators needing concrete value validation before trace emission
+        if needs_concrete_check {
+            match op_code {
+                OpCode::IntFloorDiv | OpCode::IntMod => {
+                    let Some((lhs, rhs)) = concrete else {
+                        return self.trace_binary_value(a, b, op);
+                    };
+                    if lhs < 0 || rhs <= 0 {
+                        return self.trace_binary_value(a, b, op);
+                    }
+                }
+                OpCode::IntLshift => {
+                    let Some((lhs, rhs)) = concrete else {
+                        return self.trace_binary_value(a, b, op);
+                    };
+                    let Ok(shift) = u32::try_from(rhs) else {
+                        return self.trace_binary_value(a, b, op);
+                    };
+                    if shift >= i64::BITS {
+                        return self.trace_binary_value(a, b, op);
+                    }
+                    // intobject.py:207 ovfcheck(a << b): if the shift overflows
+                    // i64 range, fall back to interpreter for long promotion.
+                    let result = lhs.wrapping_shl(shift);
+                    if result.wrapping_shr(shift) != lhs {
+                        return self.trace_binary_value(a, b, op);
+                    }
+                }
+                OpCode::IntRshift => {
+                    let Some((lhs, rhs)) = concrete else {
+                        return self.trace_binary_value(a, b, op);
+                    };
+                    // intobject.py:225: r_uint(b) >= LONG_BIT
+                    let Ok(shift) = u32::try_from(rhs) else {
+                        return self.trace_binary_value(a, b, op);
+                    };
+                    if shift >= i64::BITS {
+                        // intobject.py:229-231: large shift → 0 or -1
+                        let result = if lhs < 0 { -1i64 } else { 0i64 };
+                        return self.with_ctx(|this, ctx| {
+                            let raw = ctx.const_int(result);
+                            let boxed = box_traced_raw_int(ctx, raw);
+                            this.remember_value_type(boxed, Type::Ref);
+                            Ok(boxed)
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
         self.with_ctx(|this, ctx| {
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             let lhs_raw = if this.value_type(a) == Type::Int {
@@ -2024,18 +2009,15 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
+        // Power uses call_elidable_float_typed(pow), not a simple float op.
         let is_power = matches!(op, BinaryOperator::Power | BinaryOperator::InplacePower);
-        let op_code = match op {
-            BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
-            BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
-            BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::FloatMul,
-            BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-                OpCode::FloatFloorDiv
-            }
-            BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => OpCode::FloatMod,
-            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
-            BinaryOperator::Power | BinaryOperator::InplacePower => OpCode::FloatMul, // unused: is_power branch calls float_pow directly
-            _ => return self.trace_binary_value(a, b, op),
+        // Table lookup: BinaryOperator → OpCode (Power excluded from table)
+        let op_code = if is_power {
+            OpCode::FloatMul // unused: is_power branch calls float_pow directly
+        } else if let Some(opcode) = crate::float_binop_lookup(op) {
+            opcode
+        } else {
+            return self.trace_binary_value(a, b, op);
         };
 
         // Determine which operands are int (need int→float cast) vs float.
@@ -2095,13 +2077,59 @@ impl MIFrame {
                 unbox_float(this, ctx, b)
             };
             let result = if is_power {
-                // Emit CallPureF(pow, lhs, rhs) with raw float args.
-                // Avoids boxing floats for a residual Python-level call.
-                extern "C" fn float_pow(x: f64, y: f64) -> f64 {
-                    x.powf(y)
+                // floatobject.py:561 descr_pow → _pow().
+                // Emit CallPureF with Python-correct float power semantics.
+                extern "C" fn float_pow_python(x: f64, y: f64) -> f64 {
+                    // floatobject.py:799-881 _pow: special cases
+                    if y == 2.0 {
+                        return x * x;
+                    }
+                    if y == 0.0 {
+                        return 1.0;
+                    }
+                    if x.is_nan() {
+                        return x;
+                    }
+                    if y.is_nan() {
+                        return if x == 1.0 { 1.0 } else { y };
+                    }
+                    if y.is_infinite() {
+                        let ax = x.abs();
+                        if ax == 1.0 {
+                            return 1.0;
+                        }
+                        return if (y > 0.0) == (ax > 1.0) {
+                            f64::INFINITY
+                        } else {
+                            0.0
+                        };
+                    }
+                    if x.is_infinite() {
+                        let y_is_odd = y.abs() % 2.0 == 1.0;
+                        if y > 0.0 {
+                            return if y_is_odd { x } else { x.abs() };
+                        } else {
+                            return if y_is_odd { f64::copysign(0.0, x) } else { 0.0 };
+                        }
+                    }
+                    // Negative base: integer exponent only
+                    let mut bx = x;
+                    let mut negate = false;
+                    if bx < 0.0 {
+                        if y.floor() != y {
+                            return f64::NAN;
+                        } // PowDomainError
+                        bx = -bx;
+                        negate = y.abs() % 2.0 == 1.0;
+                    }
+                    if bx == 1.0 {
+                        return if negate { -1.0 } else { 1.0 };
+                    }
+                    let z = bx.powf(y);
+                    if negate { -z } else { z }
                 }
                 ctx.call_elidable_float_typed(
-                    float_pow as *const (),
+                    float_pow_python as *const (),
                     &[lhs_raw, rhs_raw],
                     &[Type::Float, Type::Float],
                 )
@@ -2132,14 +2160,7 @@ impl MIFrame {
 
         unsafe {
             if is_int(lhs_obj) && is_int(rhs_obj) {
-                let cmp = match op {
-                    ComparisonOperator::Less => OpCode::IntLt,
-                    ComparisonOperator::LessOrEqual => OpCode::IntLe,
-                    ComparisonOperator::Greater => OpCode::IntGt,
-                    ComparisonOperator::GreaterOrEqual => OpCode::IntGe,
-                    ComparisonOperator::Equal => OpCode::IntEq,
-                    ComparisonOperator::NotEqual => OpCode::IntNe,
-                };
+                let cmp = crate::int_compare_lookup(op);
                 return self.with_ctx(|this, ctx| {
                     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                     let lhs_raw = if this.value_type(a) == Type::Int {
@@ -2171,14 +2192,7 @@ impl MIFrame {
                 });
             }
             if is_float(lhs_obj) && is_float(rhs_obj) {
-                let cmp = match op {
-                    ComparisonOperator::Less => OpCode::FloatLt,
-                    ComparisonOperator::LessOrEqual => OpCode::FloatLe,
-                    ComparisonOperator::Greater => OpCode::FloatGt,
-                    ComparisonOperator::GreaterOrEqual => OpCode::FloatGe,
-                    ComparisonOperator::Equal => OpCode::FloatEq,
-                    ComparisonOperator::NotEqual => OpCode::FloatNe,
-                };
+                let cmp = crate::float_compare_lookup(op);
                 return self.with_ctx(|this, ctx| {
                     let float_type_addr = &FLOAT_TYPE as *const _ as i64;
                     let lhs_raw = if this.value_type(a) == Type::Float {
@@ -4940,35 +4954,15 @@ impl ArithmeticOpcodeHandler for MIFrame {
                     } else {
                         0.0
                     };
-                    let result = match op {
-                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs_f + rhs_f,
-                        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs_f - rhs_f,
-                        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs_f * rhs_f,
-                        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
-                            if rhs_f != 0.0 =>
+                    if let Some(result) = crate::concrete_float_binop(op, lhs_f, rhs_f) {
+                        if !result.is_nan()
+                            || matches!(
+                                op,
+                                BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
+                            )
                         {
-                            lhs_f / rhs_f
+                            result_concrete = ConcreteValue::Float(result);
                         }
-                        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
-                            if rhs_f != 0.0 =>
-                        {
-                            (lhs_f / rhs_f).floor()
-                        }
-                        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder
-                            if rhs_f != 0.0 =>
-                        {
-                            lhs_f % rhs_f
-                        }
-                        BinaryOperator::Power | BinaryOperator::InplacePower => lhs_f.powf(rhs_f),
-                        _ => f64::NAN,
-                    };
-                    if !result.is_nan()
-                        || matches!(
-                            op,
-                            BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide
-                        )
-                    {
-                        result_concrete = ConcreteValue::Float(result);
                     }
                 }
             }
@@ -4983,56 +4977,7 @@ impl ArithmeticOpcodeHandler for MIFrame {
                     // intobject.py:205 _lshift: ovfcheck(a << b).
                     // Use checked arithmetic; on overflow, skip this fast path
                     // and fall through to the objspace slow path.
-                    let result: Option<i64> = match op {
-                        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.checked_add(rhs),
-                        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-                            lhs.checked_sub(rhs)
-                        }
-                        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-                            lhs.checked_mul(rhs)
-                        }
-                        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder
-                            if rhs != 0 =>
-                        {
-                            Some(((lhs % rhs) + rhs) % rhs)
-                        }
-                        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide
-                            if rhs != 0 =>
-                        {
-                            lhs.checked_div(rhs).map(|d| {
-                                if (lhs ^ rhs) < 0 && d * rhs != lhs {
-                                    d - 1
-                                } else {
-                                    d
-                                }
-                            })
-                        }
-                        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(lhs & rhs),
-                        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(lhs | rhs),
-                        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
-                        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-                            let shift = rhs as u32;
-                            if shift >= 64 {
-                                None
-                            } else {
-                                let r = lhs.wrapping_shl(shift);
-                                if r.wrapping_shr(shift) != lhs {
-                                    None
-                                } else {
-                                    Some(r)
-                                }
-                            }
-                        }
-                        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-                            let shift = rhs as u32;
-                            if shift >= 64 {
-                                Some(if lhs < 0 { -1 } else { 0 })
-                            } else {
-                                Some(lhs >> shift)
-                            }
-                        }
-                        _ => None,
-                    };
+                    let result: Option<i64> = crate::concrete_int_binop(op, lhs, rhs);
                     if let Some(r) = result {
                         result_concrete = ConcreteValue::Int(r);
                     }
