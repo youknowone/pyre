@@ -311,6 +311,61 @@ impl CallControl {
         self.struct_fields.field_type(owner, field_name)
     }
 
+    /// RPython: `cpu.arraydescrof(ARRAY)` — descr.py:348-378.
+    ///
+    /// Create an array descriptor with layout metadata from the runtime
+    /// configuration (array_header_size) and struct field registry.
+    /// This is the single entry point for array descriptor creation,
+    /// matching RPython where `cpu.arraydescrof()` delegates to
+    /// `get_array_descr(gccache, ARRAY)`.
+    pub fn arraydescrof(
+        &self,
+        idx: u32,
+        resolved_id: &Option<String>,
+        ir_type: majit_ir::value::Type,
+    ) -> majit_ir::descr::DescrRef {
+        let elem_name = resolved_id.as_deref();
+        let is_struct = elem_name.is_some_and(|n| self.is_known_struct(n));
+        // RPython: descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF)
+        let (flag, item_size) = if is_struct {
+            (
+                majit_ir::descr::ArrayFlag::Struct,
+                elem_name
+                    .map(|n| compute_struct_size(self, n))
+                    .filter(|s| *s > 0)
+                    .unwrap_or(8),
+            )
+        } else if let Some(elem) = resolved_id {
+            let (f, _, s) = get_type_flag(elem);
+            (f, s)
+        } else {
+            (
+                majit_ir::descr::ArrayFlag::from_item_type(ir_type, false),
+                8,
+            )
+        };
+        // RPython: basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
+        let base_size = self.array_header_size;
+        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+            idx, base_size, item_size, 0, ir_type, flag,
+        );
+        // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
+        if is_struct {
+            if let Some(struct_name) = elem_name {
+                let ad_arc = std::sync::Arc::new(ad);
+                let (descrs, _) = all_interiorfielddescrs(self, struct_name, ad_arc.clone());
+                if !descrs.is_empty() {
+                    let mut ad_mut = (*ad_arc).clone();
+                    ad_mut.set_all_interiorfielddescrs(descrs);
+                    return std::sync::Arc::new(ad_mut);
+                } else {
+                    return ad_arc;
+                }
+            }
+        }
+        std::sync::Arc::new(ad)
+    }
+
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
     pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
@@ -1591,8 +1646,7 @@ fn collect_readwrite_effects(
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
                     *write_arrays |= 1u64 << idx;
-                    // effectinfo.py:298,307: cpu.arraydescrof(ARRAY) → DescrRef.
-                    // Keyed on (item_ty, resolved_id) for ARRAY identity.
+                    // RPython: effectinfo.py:307-311 — cpu.arraydescrof(ARRAY).
                     // Dedup by descriptor index (frozenset semantics).
                     if !array_write_descrs.iter().any(|d| d.index() == idx) {
                         let ir_type = match item_ty {
@@ -1605,59 +1659,7 @@ fn collect_readwrite_effects(
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                         };
-                        // RPython: descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF)
-                        let elem_name = resolved_id.as_deref();
-                        let is_struct = elem_name.is_some_and(|n| cc.is_known_struct(n));
-                        let (flag, item_size) = if is_struct {
-                            // RPython: isinstance(TYPE, lltype.Struct) → FLAG_STRUCT
-                            (
-                                majit_ir::descr::ArrayFlag::Struct,
-                                elem_name
-                                    .map(|n| compute_struct_size(cc, n))
-                                    .filter(|s| *s > 0)
-                                    .unwrap_or(8),
-                            )
-                        } else if let Some(ref elem) = resolved_id {
-                            // RPython: get_type_flag(ARRAY.OF) from element type.
-                            let (f, _, s) = get_type_flag(elem);
-                            (f, s)
-                        } else {
-                            // Fallback: derive from item_ty (less precise).
-                            (
-                                majit_ir::descr::ArrayFlag::from_item_type(ir_type, false),
-                                8,
-                            )
-                        };
-                        // RPython: get_array_descr(gccache, ARRAY) — descr.py:348-378.
-                        //   basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
-                        //   arraydescr = ArrayDescr(basesize, itemsize, lendescr, flag)
-                        // basesize from runtime: symbolic.get_array_token(ARRAY)[0].
-                        let base_size = cc.array_header_size;
-                        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                            idx, base_size, item_size, 0, ir_type, flag,
-                        );
-                        // RPython: descr.py:372-375 — for array-of-structs:
-                        //   descrs = heaptracker.all_interiorfielddescrs(
-                        //       gccache, ARRAY, get_field_descr=get_interiorfield_descr)
-                        //   arraydescr.all_interiorfielddescrs = descrs
-                        if is_struct {
-                            if let Some(struct_name) = elem_name {
-                                let ad_arc = std::sync::Arc::new(ad);
-                                let (descrs, _) =
-                                    all_interiorfielddescrs(cc, struct_name, ad_arc.clone());
-                                if !descrs.is_empty() {
-                                    let mut ad_mut = (*ad_arc).clone();
-                                    ad_mut.set_all_interiorfielddescrs(descrs);
-                                    array_write_descrs.push(std::sync::Arc::new(ad_mut));
-                                } else {
-                                    array_write_descrs.push(ad_arc);
-                                }
-                            } else {
-                                array_write_descrs.push(std::sync::Arc::new(ad));
-                            }
-                        } else {
-                            array_write_descrs.push(std::sync::Arc::new(ad));
-                        }
+                        array_write_descrs.push(cc.arraydescrof(idx, &resolved_id, ir_type));
                     }
                 }
                 // Recursive: follow calls.
