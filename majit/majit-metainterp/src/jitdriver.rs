@@ -1238,8 +1238,6 @@ impl<S: JitState> JitDriver<S> {
             let trace_id = result.trace_id;
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
-            let status = result.status;
-            let descr_addr = result.descr_addr;
             let _exit_meta = result.meta.clone();
             drop(result);
 
@@ -2147,8 +2145,6 @@ impl<S: JitState> JitDriver<S> {
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
-        let status = result.status;
-        let descr_addr = result.descr_addr;
         drop(result);
 
         // memmgr.py:58-61: keep_loop_alive(loop_token)
@@ -2722,8 +2718,6 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = result.typed_values;
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
-            let status = result.status;
-            let descr_addr = result.descr_addr;
 
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
