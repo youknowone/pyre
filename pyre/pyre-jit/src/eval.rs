@@ -935,6 +935,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*frame.code };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
+    // jitcode.py:14 parity: jitdriver_sd is not None for portals.
+    // RPython: only functions annotated with jit_merge_point are portals.
+    // pyre: every named function is a potential portal. Module-level code
+    // ("<module>") is excluded — it runs once and matches RPython's model
+    // where only repeatedly-called functions have jitdrivers.
     let is_portal: bool = &*code.obj_name != "<module>";
 
     loop {

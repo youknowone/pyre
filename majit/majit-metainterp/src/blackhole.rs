@@ -1587,15 +1587,20 @@ impl BlackholeInterpreter {
                 self.position = target;
             }
             BC_JIT_MERGE_POINT => {
-                // blackhole.py:1068 bhimpl_jit_merge_point:
-                // if self.nextblackholeinterp is None → ContinueRunningNormally
+                // blackhole.py:1067-1093 bhimpl_jit_merge_point
                 if self.nextblackholeinterp.is_none() {
+                    // blackhole.py:1068: bottommost → ContinueRunningNormally
                     self.reached_merge_point = true;
                     return Err(DispatchError::LeaveFrame);
                 }
-                // else: inner frame (helper called by portal) — no-op.
-                // RPython would handle recursive_call here, but pyre
-                // lets the helper continue to RETURN_VALUE normally.
+                // blackhole.py:1074-1093: recursive portal level.
+                // RPython calls bhimpl_recursive_call_{v,i,r,f} which
+                // invokes portal_runner (enabling JIT re-entry), then
+                // dispatches bhimpl_{void,int,ref,float}_return.
+                // pyre: no-op — the blackhole continues executing the
+                // function body to RETURN_VALUE. Functionally correct
+                // but misses JIT re-entry opportunity at recursive depth.
+                // TODO: implement portal_runner callback for recursive case.
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
