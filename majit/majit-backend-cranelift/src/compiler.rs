@@ -310,20 +310,9 @@ struct RegisteredLoopTarget {
 unsafe impl Send for RegisteredLoopTarget {}
 unsafe impl Sync for RegisteredLoopTarget {}
 
-struct PendingForceFrame {
-    fail_descr: Arc<CraneliftFailDescr>,
-    raw_values: Vec<i64>,
-    rooted_refs: Vec<GcRef>,
-    ref_slot_map: Vec<Option<usize>>,
-}
-
 /// RPython virtualref.py force token state — single-threaded, no lock needed.
 /// RPython has no lock here (GIL-protected). pyre is single-threaded.
 struct ActiveForceFrame {
-    fail_descrs: Vec<Arc<CraneliftFailDescr>>,
-    gc_runtime_id: Option<u64>,
-    pending_force: UnsafeCell<Option<PendingForceFrame>>,
-    pending_may_force: UnsafeCell<Vec<PendingMayForceFrame>>,
     saved_data_root: UnsafeCell<Option<Box<GcRef>>>,
 }
 
@@ -332,77 +321,9 @@ struct ActiveForceFrame {
 unsafe impl Send for ActiveForceFrame {}
 unsafe impl Sync for ActiveForceFrame {}
 
-struct PendingMayForceFrame {
-    preview: PendingForceFrame,
-    was_forced: bool,
-}
-
-struct PreviewFrameData {
-    frame: FrameData,
-    active_force_frame: Arc<ActiveForceFrame>,
-}
-
 struct OverlayFrameData {
     inner: DeadFrame,
     fail_descr: Arc<CraneliftFailDescr>,
-}
-
-impl PendingForceFrame {
-    fn new(
-        fail_descr: Arc<CraneliftFailDescr>,
-        gc_runtime_id: Option<u64>,
-        raw_values: Vec<i64>,
-    ) -> Self {
-        let mut rooted_refs = Vec::new();
-        let mut ref_slot_map = vec![None; fail_descr.fail_arg_types.len()];
-        for (index, tp) in fail_descr.fail_arg_types.iter().enumerate() {
-            if *tp == Type::Ref && !fail_descr.is_force_token_slot(index) {
-                ref_slot_map[index] = Some(rooted_refs.len());
-                rooted_refs.push(GcRef(raw_values[index] as usize));
-            }
-        }
-        if let Some(runtime_id) = gc_runtime_id {
-            register_gc_roots(runtime_id, &mut rooted_refs);
-        }
-        PendingForceFrame {
-            fail_descr,
-            raw_values,
-            rooted_refs,
-            ref_slot_map,
-        }
-    }
-
-    fn materialized_raw_values(&self) -> Vec<i64> {
-        let mut raw_values = self.raw_values.clone();
-        for (slot, rooted_index) in self.ref_slot_map.iter().enumerate() {
-            if let Some(rooted_index) = rooted_index {
-                raw_values[slot] = self.rooted_refs[*rooted_index].0 as i64;
-            }
-        }
-        raw_values
-    }
-
-    fn into_raw_values(mut self, gc_runtime_id: Option<u64>) -> Vec<i64> {
-        self.raw_values = self.materialized_raw_values();
-        if let Some(runtime_id) = gc_runtime_id {
-            unregister_gc_roots(runtime_id, &mut self.rooted_refs);
-        }
-        self.raw_values
-    }
-}
-
-impl PreviewFrameData {
-    fn new(
-        raw_values: Vec<i64>,
-        fail_descr: Arc<CraneliftFailDescr>,
-        gc_runtime_id: Option<u64>,
-        active_force_frame: Arc<ActiveForceFrame>,
-    ) -> Self {
-        PreviewFrameData {
-            frame: FrameData::new_preview(raw_values, fail_descr, gc_runtime_id),
-            active_force_frame,
-        }
-    }
 }
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
@@ -411,9 +332,6 @@ fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Some(frame_data.fail_descr.layout());
-    }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Some(preview.frame.fail_descr.layout());
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return Some(overlay.fail_descr.layout());
@@ -929,44 +847,13 @@ pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     });
 }
 
-fn register_force_frame(
-    fail_descrs: &[Arc<CraneliftFailDescr>],
-    gc_runtime_id: Option<u64>,
-) -> (u64, Arc<ActiveForceFrame>) {
+fn register_force_frame() -> (u64, Arc<ActiveForceFrame>) {
     let handle = NEXT_FORCE_TOKEN_HANDLE.fetch_add(1, Ordering::Relaxed);
     let frame = Arc::new(ActiveForceFrame {
-        fail_descrs: fail_descrs.to_vec(),
-        gc_runtime_id,
-        pending_force: UnsafeCell::new(None),
-        pending_may_force: UnsafeCell::new(Vec::new()),
         saved_data_root: UnsafeCell::new(None),
     });
     FORCE_FRAMES.with(|ff| ff.borrow_mut().insert(handle, frame.clone()));
     (handle, frame)
-}
-
-fn lookup_force_frame(handle: u64) -> Option<Arc<ActiveForceFrame>> {
-    FORCE_FRAMES.with(|ff| ff.borrow().get(&handle).cloned())
-}
-
-fn set_force_frame_saved_data(frame: &ActiveForceFrame, data: GcRef) {
-    let saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
-    if let Some(saved_data) = saved_data_root.as_mut() {
-        if let Some(runtime_id) = frame.gc_runtime_id {
-            unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
-        }
-        **saved_data = data;
-        if let Some(runtime_id) = frame.gc_runtime_id {
-            register_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
-        }
-        return;
-    }
-
-    let mut saved_data = Box::new(data);
-    if let Some(runtime_id) = frame.gc_runtime_id {
-        register_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
-    }
-    *saved_data_root = Some(saved_data);
 }
 
 /// RPython rebuild_state_after_failure parity: materialize virtual objects
@@ -1443,18 +1330,9 @@ fn resolve_virtual_field_value_with_materialized(
     }
 }
 
-fn get_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
-    unsafe { &*frame.saved_data_root.get() }
-        .as_ref()
-        .map(|saved_data| **saved_data)
-}
-
 fn take_force_frame_saved_data(frame: &ActiveForceFrame) -> Option<GcRef> {
     let saved_data_root = unsafe { &mut *frame.saved_data_root.get() };
-    let mut saved_data = saved_data_root.take()?;
-    if let Some(runtime_id) = frame.gc_runtime_id {
-        unregister_gc_roots(runtime_id, std::slice::from_mut(saved_data.as_mut()));
-    }
+    let saved_data = saved_data_root.take()?;
     Some(*saved_data)
 }
 
@@ -1463,18 +1341,8 @@ pub(crate) fn release_force_token(handle: u64) {
         return;
     }
     if let Some(frame) = FORCE_FRAMES.with(|ff| ff.borrow_mut().remove(&handle)) {
-        if let Some(pending) = unsafe { &mut *frame.pending_force.get() }.take() {
-            let _ = pending.into_raw_values(frame.gc_runtime_id);
-        }
-        for pending in unsafe { &mut *frame.pending_may_force.get() }.drain(..) {
-            let _ = pending.preview.into_raw_values(frame.gc_runtime_id);
-        }
         let _ = take_force_frame_saved_data(&frame);
     }
-}
-
-fn current_force_frame_handle() -> u64 {
-    CURRENT_FORCE_FRAME_HANDLE.with(Cell::get)
 }
 
 fn with_active_force_frame<R>(handle: u64, f: impl FnOnce() -> R) -> R {
@@ -2160,9 +2028,6 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
             if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
                 return Ok(frame_data.take_ref_for_call_result(0).as_usize() as i64);
             }
-            if let Some(preview) = frame.data.downcast_mut::<PreviewFrameData>() {
-                return Ok(preview.frame.get_ref(0).as_usize() as i64);
-            }
             Err(BackendError::Unsupported(
                 "unsupported dead frame type for Ref finish result".to_string(),
             ))
@@ -2217,91 +2082,6 @@ fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, Backe
     }
 }
 
-extern "C" fn current_force_token_shim() -> u64 {
-    let handle = current_force_frame_handle();
-    assert!(
-        handle != 0,
-        "force_token used without an active compiled frame"
-    );
-    handle
-}
-
-extern "C" fn begin_may_force_call_shim(fail_index: u64, values_ptr: u64, num_values: u64) {
-    let handle = current_force_frame_handle();
-    assert!(
-        handle != 0,
-        "call_may_force used without an active compiled frame"
-    );
-    let frame = lookup_force_frame(handle)
-        .unwrap_or_else(|| panic!("missing active force frame for handle {handle}"));
-    let fail_descr = frame
-        .fail_descrs
-        .get(fail_index as usize)
-        .unwrap_or_else(|| panic!("missing fail descr {fail_index} for handle {handle}"))
-        .clone();
-    let raw_values = if num_values == 0 {
-        Vec::new()
-    } else {
-        unsafe {
-            std::slice::from_raw_parts(values_ptr as usize as *const i64, num_values as usize)
-        }
-        .to_vec()
-    };
-    let preview = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
-    let pending_may_force = unsafe { &mut *frame.pending_may_force.get() };
-    pending_may_force.push(PendingMayForceFrame {
-        preview,
-        was_forced: false,
-    });
-}
-
-extern "C" fn finish_may_force_guard_shim() -> u64 {
-    let handle = current_force_frame_handle();
-    assert!(
-        handle != 0,
-        "guard_not_forced used without an active compiled frame"
-    );
-    let frame = lookup_force_frame(handle)
-        .unwrap_or_else(|| panic!("missing active force frame for handle {handle}"));
-    let pending = unsafe { &mut *frame.pending_may_force.get() }
-        .pop()
-        .expect("guard_not_forced without a preceding call_may_force");
-    let was_forced = pending.was_forced;
-    let _ = pending.preview.into_raw_values(frame.gc_runtime_id);
-    was_forced as u64
-}
-
-extern "C" fn record_guard_not_forced_2_shim(fail_index: u64, values_ptr: u64, num_values: u64) {
-    let handle = current_force_frame_handle();
-    assert!(
-        handle != 0,
-        "guard_not_forced_2 used without an active compiled frame"
-    );
-    let frame = lookup_force_frame(handle)
-        .unwrap_or_else(|| panic!("missing active force frame for handle {handle}"));
-    let fail_descr = frame
-        .fail_descrs
-        .get(fail_index as usize)
-        .unwrap_or_else(|| panic!("missing fail descr {fail_index} for handle {handle}"))
-        .clone();
-    let raw_values = if num_values == 0 {
-        Vec::new()
-    } else {
-        unsafe {
-            std::slice::from_raw_parts(values_ptr as usize as *const i64, num_values as usize)
-        }
-        .to_vec()
-    };
-    let pending = PendingForceFrame::new(fail_descr, frame.gc_runtime_id, raw_values);
-    let previous = {
-        let pending_force = unsafe { &mut *frame.pending_force.get() };
-        pending_force.replace(pending)
-    };
-    if let Some(previous) = previous {
-        let _ = previous.into_raw_values(frame.gc_runtime_id);
-    }
-}
-
 /// llmodel.py:270-274 force() as a free function.
 /// force_token is the JitFrame pointer (FORCE_TOKEN returns jf_ptr).
 pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
@@ -2345,11 +2125,6 @@ pub fn set_savedata_ref_on_deadframe(
         frame_data.set_savedata_ref(data);
         return Ok(());
     }
-    if let Some(preview) = frame.data.downcast_mut::<PreviewFrameData>() {
-        preview.frame.set_savedata_ref(data);
-        set_force_frame_saved_data(&preview.active_force_frame, data);
-        return Ok(());
-    }
     if let Some(overlay) = frame.data.downcast_mut::<OverlayFrameData>() {
         set_savedata_ref_on_deadframe(&mut overlay.inner, data)?;
         return Ok(());
@@ -2366,9 +2141,6 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.fail_descr.as_ref());
     }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Ok(preview.frame.fail_descr.as_ref());
-    }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return Ok(overlay.fail_descr.as_ref());
     }
@@ -2383,9 +2155,6 @@ pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, Ba
     }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_int(index));
-    }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Ok(preview.frame.get_int(index));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_int_from_deadframe(&overlay.inner, index);
@@ -2402,9 +2171,6 @@ pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, 
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_float(index));
     }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Ok(preview.frame.get_float(index));
-    }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_float_from_deadframe(&overlay.inner, index);
     }
@@ -2419,9 +2185,6 @@ pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, 
     }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_ref(index));
-    }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Ok(preview.frame.get_ref(index));
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_ref_from_deadframe(&overlay.inner, index);
@@ -2438,10 +2201,6 @@ pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backe
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_savedata_ref());
     }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return Ok(get_force_frame_saved_data(&preview.active_force_frame)
-            .unwrap_or_else(|| preview.frame.get_savedata_ref()));
-    }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return get_savedata_ref_from_deadframe(&overlay.inner);
     }
@@ -2457,10 +2216,6 @@ pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return frame_data.try_get_savedata_ref();
     }
-    if let Some(preview) = frame.data.downcast_ref::<PreviewFrameData>() {
-        return get_force_frame_saved_data(&preview.active_force_frame)
-            .or_else(|| preview.frame.try_get_savedata_ref());
-    }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return grab_savedata_ref_from_deadframe(&overlay.inner);
     }
@@ -2473,9 +2228,6 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
     }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_exception_ref());
-    }
-    if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
-        return Ok(GcRef::NULL);
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return grab_exc_value_from_deadframe(&overlay.inner);
@@ -2491,9 +2243,6 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
     }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_exception_class());
-    }
-    if frame.data.downcast_ref::<PreviewFrameData>().is_some() {
-        return Ok(0);
     }
     if let Some(overlay) = frame.data.downcast_ref::<OverlayFrameData>() {
         return grab_exc_class_from_deadframe(&overlay.inner);
@@ -4745,7 +4494,7 @@ fn run_compiled_code(
     let _jitted_guard = majit_backend::JittedGuard::enter();
 
     let (handle, force_frame) = if needs_force_frame {
-        let (h, f) = register_force_frame(fail_descrs, gc_runtime_id);
+        let (h, f) = register_force_frame();
         (h, Some(f))
     } else {
         (0, None)
