@@ -156,6 +156,7 @@ pub fn extract_trait_impls(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
 ) -> Vec<TraitImplInfo> {
     let mut impls = Vec::new();
     collect_trait_impls_from_items(
@@ -163,6 +164,7 @@ pub fn extract_trait_impls(
         "",
         struct_fields,
         fn_return_types,
+        known_struct_names,
         &mut impls,
     );
     impls
@@ -173,6 +175,7 @@ fn collect_trait_impls_from_items(
     prefix: &str,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
     impls: &mut Vec<TraitImplInfo>,
 ) {
     for item in items {
@@ -205,6 +208,7 @@ fn collect_trait_impls_from_items(
                                             struct_fields,
                                             fn_return_types,
                                             prefix,
+                                            known_struct_names,
                                         );
                                     (Some(sf.graph), sf.hints)
                                 };
@@ -254,6 +258,7 @@ fn collect_trait_impls_from_items(
                                     struct_fields,
                                     fn_return_types,
                                     prefix,
+                                    known_struct_names,
                                 );
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
@@ -295,6 +300,7 @@ fn collect_trait_impls_from_items(
                         &mod_prefix,
                         struct_fields,
                         fn_return_types,
+                        known_struct_names,
                         impls,
                     );
                 }
@@ -310,6 +316,7 @@ pub fn extract_inherent_impl_methods(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
 ) -> Vec<InherentMethodInfo> {
     let mut methods = Vec::new();
     collect_inherent_methods_from_items(
@@ -317,6 +324,7 @@ pub fn extract_inherent_impl_methods(
         "",
         struct_fields,
         fn_return_types,
+        known_struct_names,
         &mut methods,
     );
     methods
@@ -327,6 +335,7 @@ fn collect_inherent_methods_from_items(
     prefix: &str,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
+    known_struct_names: &std::collections::HashSet<String>,
     methods: &mut Vec<InherentMethodInfo>,
 ) {
     for item in items {
@@ -353,6 +362,7 @@ fn collect_inherent_methods_from_items(
                             struct_fields,
                             fn_return_types,
                             prefix,
+                            known_struct_names,
                         );
                         let return_type = match &method.sig.output {
                             syn::ReturnType::Type(_, ty) => crate::front::ast::full_type_string(ty),
@@ -382,6 +392,7 @@ fn collect_inherent_methods_from_items(
                         &mod_prefix,
                         struct_fields,
                         fn_return_types,
+                        known_struct_names,
                         methods,
                     );
                 }
@@ -726,6 +737,7 @@ mod tests {
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let helper = impls[0]
             .methods
