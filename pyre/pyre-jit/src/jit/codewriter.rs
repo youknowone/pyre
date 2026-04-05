@@ -241,8 +241,11 @@ impl CodeWriter {
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
-        // jitcode.py:9 jitdriver_sd: portal has a jitdriver.
-        let is_portal = &*code.obj_name != "<module>";
+        // jitcode.py:14 jitdriver_sd: portal has a jitdriver.
+        // RPython: jitdriver_sd is not None for portal jitcodes.
+        // pyre: every jitcode with loop headers is a potential portal
+        // (any function's hot loop can be independently traced).
+        let is_portal = !loop_header_pcs.is_empty();
         // RPython: one jit_merge_point per jitcode (the first loop header).
         // All other loop headers get loop_header (= BC_JUMP_TARGET, no-op
         // in blackhole). The blackhole handler checks nextblackholeinterp
