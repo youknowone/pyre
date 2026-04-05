@@ -436,6 +436,11 @@ pub fn jit_exc_value_addr() -> usize {
     &JIT_EXC_VALUE as *const _ as usize
 }
 
+/// Return the address of JIT_EXC_TYPE for direct memory store in JIT code.
+fn jit_exc_type_addr() -> usize {
+    &JIT_EXC_TYPE as *const _ as usize
+}
+
 thread_local! {
     /// Thread-local reference storage for JIT-compiled code.
     ///
@@ -2196,14 +2201,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
 
         // jf_savedata already correct in jf_frame memory.
-        let (_, exception) = take_pending_jit_exception_state();
-
-        let jf_ptr = exec.jf_gcref.0;
-        if !exception.is_null() {
-            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
-        } else {
-            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
-        }
+        // jf_guard_exc already written by emit_guard_exit
+        // (_build_failure_recovery parity).
 
         return DeadFrame {
             data: Box::new(JitFrameDeadFrame::new(
@@ -4037,6 +4036,29 @@ fn emit_guard_exit(
             .ins()
             .store(MemFlags::trusted(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     }
+    // _build_failure_recovery (assembler.py:2089-2096) parity:
+    // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
+    //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
+    if info.must_save_exception {
+        let exc_addr = builder
+            .ins()
+            .iconst(cl_types::I64, jit_exc_value_addr() as i64);
+        let exc_val = builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), exc_addr, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+        // Clear TLS: pos_exc_value = 0, pos_exception = 0
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
+        let exc_type_addr = builder
+            .ins()
+            .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+    }
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
     // Store FailDescr POINTER (not index) to jf_descr.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
@@ -4044,8 +4066,6 @@ fn emit_guard_exit(
         .ins()
         .store(MemFlags::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
     // _call_footer (assembler.py:1097): mov eax, ebp; ret
-    // Also return descr_val in rdx for caller hot-path (avoids memory load).
-    // _call_footer: mov eax, ebp; ret — return jf_ptr only.
     builder.ins().return_(&[jf_ptr]);
 }
 
@@ -4341,6 +4361,9 @@ fn run_compiled_code(
 struct GuardInfo {
     fail_index: u32,
     fail_arg_refs: Vec<OpRef>,
+    /// assembler.py:40-44 must_save_exception(): true for
+    /// GUARD_EXCEPTION, GUARD_NO_EXCEPTION, GUARD_NOT_FORCED.
+    must_save_exception: bool,
     /// gcmap bitmap: bit i set ⇔ fail_arg[i] is Ref type.
     /// allocate_gcmap (gcmap.py:7-18) parity.
     gcmap: u64,
@@ -4742,14 +4765,7 @@ impl CraneliftBackend {
                 }
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
-                let (_, exception) = take_pending_jit_exception_state();
-
-                let jf_ptr = exec.jf_gcref.0;
-                if !exception.is_null() {
-                    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
-                } else {
-                    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
-                }
+                // jf_guard_exc already written by emit_guard_exit.
                 return DeadFrame {
                     data: Box::new(JitFrameDeadFrame::new(
                         exec.jf_gcref,
@@ -4797,14 +4813,7 @@ impl CraneliftBackend {
             // jf_savedata is already correct in jf_frame memory:
             //   - force called → callee's set_savedata_ref wrote it
             //   - no force → zeroed alloc → 0
-            let (_, exception) = take_pending_jit_exception_state();
-
-            let jf_ptr = exec.jf_gcref.0;
-            if !exception.is_null() {
-                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
-            } else {
-                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
-            }
+            // jf_guard_exc already written by emit_guard_exit.
 
             return DeadFrame {
                 data: Box::new(JitFrameDeadFrame::new(
@@ -4861,15 +4870,7 @@ impl CraneliftBackend {
         // just like in execute_with_inputs. Without this, the FINISH
         // bridge's exit is misinterpreted as a guard failure.
         if fail_descr.is_finish {
-            // jf_savedata already correct in jf_frame memory.
-            let (_, exception) = take_pending_jit_exception_state();
-
-            let jf_ptr = exec.jf_gcref.0;
-            if !exception.is_null() {
-                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
-            } else {
-                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
-            }
+            // jf_guard_exc already written by emit_guard_exit.
             return DeadFrame {
                 data: Box::new(JitFrameDeadFrame::new(
                     exec.jf_gcref,
@@ -4888,16 +4889,7 @@ impl CraneliftBackend {
         }
         let _ = bridge_guard;
 
-        // jf_savedata already correct in jf_frame memory.
-        let (_, exception) = take_pending_jit_exception_state();
-
-        let jf_ptr = exec.jf_gcref.0;
-        if !exception.is_null() {
-            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
-        } else {
-            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = 0 };
-        }
-
+        // jf_guard_exc already written by emit_guard_exit.
         DeadFrame {
             data: Box::new(JitFrameDeadFrame::new(
                 exec.jf_gcref,
@@ -9211,9 +9203,17 @@ fn collect_guards(
         // store the FailDescr pointer (not index) in jf_descr.
         let fail_descr_ptr = Arc::as_ptr(&descr) as i64;
         fail_descrs.push(descr);
+        // assembler.py:40-44 must_save_exception parity:
+        let must_save_exception = matches!(
+            op.opcode,
+            majit_ir::OpCode::GuardException
+                | majit_ir::OpCode::GuardNoException
+                | majit_ir::OpCode::GuardNotForced
+        );
         guard_infos.push(GuardInfo {
             fail_index,
             fail_arg_refs,
+            must_save_exception,
             gcmap,
             fail_descr_ptr,
             accum_info,
@@ -9903,7 +9903,15 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        let (exception_class, exception) = take_pending_jit_exception_state();
+        // jf_guard_exc already written by emit_guard_exit.
+        // Read exception from jf_frame header (same as grab_exc_value).
+        let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
+        let exception = GcRef(exc_raw);
+        let exception_class = if exc_raw == 0 {
+            0i64
+        } else {
+            unsafe { *(exc_raw as *const i64) } // typeptr at offset 0
+        };
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
