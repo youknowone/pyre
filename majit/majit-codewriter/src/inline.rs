@@ -321,6 +321,34 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
+        OpKind::InteriorFieldRead {
+            base,
+            index,
+            field,
+            item_ty,
+            array_type_id,
+        } => OpKind::InteriorFieldRead {
+            base: remap(base),
+            index: remap(index),
+            field: field.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
+        OpKind::InteriorFieldWrite {
+            base,
+            index,
+            field,
+            value,
+            item_ty,
+            array_type_id,
+        } => OpKind::InteriorFieldWrite {
+            base: remap(base),
+            index: remap(index),
+            field: field.clone(),
+            value: remap(value),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::Call {
             target,
             args,
@@ -514,6 +542,10 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::FieldWrite { base, value, .. } => vec![*base, *value],
         OpKind::ArrayRead { base, index, .. } => vec![*base, *index],
         OpKind::ArrayWrite {
+            base, index, value, ..
+        } => vec![*base, *index, *value],
+        OpKind::InteriorFieldRead { base, index, .. } => vec![*base, *index],
+        OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => vec![*base, *index, *value],
         OpKind::Call { args, .. } => args.clone(),

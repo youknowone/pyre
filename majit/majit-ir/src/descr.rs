@@ -565,22 +565,22 @@ pub struct EffectInfo {
     pub extra_effect: ExtraEffect,
     pub oopspec_index: OopSpecIndex,
     /// effectinfo.py: bitstring_readonly_descrs_fields
-    /// Bitset of field descriptor indices that may be read by this call.
     pub readonly_descrs_fields: u64,
     /// effectinfo.py: bitstring_write_descrs_fields
-    /// Bitset of field descriptor indices that may be written by this call.
     pub write_descrs_fields: u64,
     /// effectinfo.py: bitstring_readonly_descrs_arrays
-    /// Bitset of array descriptor indices that may be read.
     pub readonly_descrs_arrays: u64,
     /// effectinfo.py: bitstring_write_descrs_arrays
-    /// Bitset of array descriptor indices that may be written.
     pub write_descrs_arrays: u64,
+    /// effectinfo.py: bitstring_readonly_descrs_interiorfields
+    /// Bitset of interior field descriptor indices that may be read.
+    /// effectinfo.py:327-340: interiorfield reads also set array read bits.
+    pub readonly_descrs_interiorfields: u64,
+    /// effectinfo.py: bitstring_write_descrs_interiorfields
+    pub write_descrs_interiorfields: u64,
     /// effectinfo.py: can_invalidate
     pub can_invalidate: bool,
     /// effectinfo.py:201-206: single_write_descr_array
-    /// When exactly one array write descriptor exists (ARRAYCOPY/ARRAYMOVE),
-    /// this holds the actual array DescrRef for typed GET/SETARRAYITEM emission.
     #[serde(skip)]
     pub single_write_descr_array: Option<DescrRef>,
 }
@@ -595,6 +595,8 @@ impl PartialEq for EffectInfo {
             && self.write_descrs_fields == other.write_descrs_fields
             && self.readonly_descrs_arrays == other.readonly_descrs_arrays
             && self.write_descrs_arrays == other.write_descrs_arrays
+            && self.readonly_descrs_interiorfields == other.readonly_descrs_interiorfields
+            && self.write_descrs_interiorfields == other.write_descrs_interiorfields
             && self.can_invalidate == other.can_invalidate
     }
 }
@@ -610,6 +612,8 @@ impl Default for EffectInfo {
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
             write_descrs_arrays: 0,
+            readonly_descrs_interiorfields: 0,
+            write_descrs_interiorfields: 0,
             single_write_descr_array: None,
             can_invalidate: false,
         }
@@ -795,6 +799,8 @@ impl EffectInfo {
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
             write_descrs_arrays: 0,
+            readonly_descrs_interiorfields: 0,
+            write_descrs_interiorfields: 0,
             single_write_descr_array: None,
             can_invalidate: false,
         }
@@ -915,12 +921,14 @@ impl SimpleFieldDescr {
 
     /// RPython: FieldDescr(name, offset, size, flag, index_in_parent, is_pure).
     /// `name` format: `"STRUCT.fieldname"` (descr.py:227).
+    /// `is_signed`: RPython flag == FLAG_SIGNED (descr.py:241-254).
     pub fn new_with_name(
         index: u32,
         offset: usize,
         field_size: usize,
         field_type: Type,
         is_immutable: bool,
+        is_signed: bool,
         name: String,
     ) -> Self {
         SimpleFieldDescr {
@@ -930,7 +938,7 @@ impl SimpleFieldDescr {
             field_size,
             field_type,
             is_immutable,
-            is_signed: field_type == Type::Int,
+            is_signed,
             virtualizable: false,
         }
     }
