@@ -2447,6 +2447,12 @@ impl Optimizer {
                     current_op = op;
                 }
                 OptimizationResult::Remove => {
+                    // RPython parity: postprocess callbacks only run when the
+                    // op survives to emission (optimizer.py:586-589). If any
+                    // pass removes the op, discard pending postprocess state
+                    // to prevent it from leaking into the next emitted op.
+                    ctx.pending_mark_last_guard = None;
+                    ctx.pending_guard_class_postprocess = None;
                     return;
                 }
                 OptimizationResult::PassOn => {}

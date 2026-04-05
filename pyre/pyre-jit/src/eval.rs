@@ -2616,7 +2616,7 @@ fn rebuild_typed_from_rd_numb(
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, None);
+        rebuild_from_numbering(rd_numb, rd_consts);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
     // vable_array format: [frame_ptr, ni, vsd, locals..., stack...]
@@ -2741,7 +2741,7 @@ fn build_resumed_frames(
     use majit_ir::resumedata::rebuild_from_numbering;
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, None);
+        rebuild_from_numbering(rd_numb, rd_consts);
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {

@@ -3116,11 +3116,13 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
-        // RPython uses jitcode.position_info for value count; no box_count.
+        // Per-frame: jitcode_index, pc, box_count, [tagged_values...].
+        // box_count is majit-specific — RPython omits it and uses
+        // jitcode.get_live_vars_info(pc) at decode time instead.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -5008,7 +5010,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), None);
+            rebuild_from_numbering(&rd_numb, memo.consts());
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
@@ -5033,7 +5035,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts(), None);
+            rebuild_from_numbering(&rd_numb, memo.consts());
         assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
@@ -5130,7 +5132,7 @@ mod tests {
 
         // rd_numb should be valid
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, None);
+            rebuild_from_numbering(&rd_numb, &rd_consts);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));

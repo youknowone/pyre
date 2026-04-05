@@ -494,7 +494,13 @@ pub fn emit_box_int_inline(
     // heapcache: track allocation as unescaped
     ctx.heap_cache_mut().new_object(new_op);
     // Emit: SetfieldGc(v, ob_type, INT_TYPE)
-    // cls_of_box parity: ptr2int(typeptr) → ConstInt.
+    // RPython filters out explicit setfield on typeptr (jtransform.py:908-911)
+    // — new_with_vtable writes it via write_int_at_mem (llmodel.py:778-782).
+    // pyre emits explicit SetfieldGc since NewWithVtable doesn't auto-set it.
+    // typeptr is Ptr(OBJECT_VTABLE) where OBJECT_VTABLE is non-GC →
+    // FLAG_UNSIGNED field descriptor (descr.py:241-246), no GC root tracking.
+    // mark_const_type(Ref) not needed: virtual materialization skips offset-0
+    // field (eval.rs), and INT_TYPE is a static address (no GC movement).
     let type_const = ctx.const_int(int_type_addr);
     let ob_type_idx = ob_type_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);

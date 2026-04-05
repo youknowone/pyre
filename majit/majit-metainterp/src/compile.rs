@@ -246,7 +246,7 @@ pub(crate) fn build_guard_metadata(
             if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                 let (_num_failargs, vable_values, _vref_values, frames) =
-                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data, None);
+                    rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -325,7 +325,7 @@ pub(crate) fn build_guard_metadata(
                 if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                     let (_num_failargs, _vable_values, vref_values, frames) =
-                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data, None);
+                        rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
                     // TODO: vref_array parity (resume.py:1386,1431).
                     // pyre does not yet use virtual references.
                     debug_assert!(
