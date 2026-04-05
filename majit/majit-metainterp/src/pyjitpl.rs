@@ -4801,8 +4801,13 @@ impl<M: Clone> MetaInterp<M> {
         let owning_key = self.find_owning_key(green_key, trace_id);
         // compile.py:741: read self.status from the descriptor LIVE.
         // RPython: must_compile is a method on the descriptor → self.status.
-        // majit: look up descriptor via get_guard_status(trace_id, fail_index).
-        let (status, descr_addr) = self.get_guard_status(owning_key, trace_id, fail_index);
+        // In RPython the descriptor always exists (handle_fail is called on
+        // it). If we can't find the descriptor, the compiled code was released
+        // — no tick, no compile.
+        let Some((status, descr_addr)) = self.get_guard_status(owning_key, trace_id, fail_index)
+        else {
+            return (false, owning_key);
+        };
         // compile.py:741-751: decode status to get hash
         let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
             // compile.py:745: common case — TY_NONE, not busy.
@@ -4848,22 +4853,28 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py:741-745: look up (status, descr_addr) for a guard.
     /// Search current token + previous_tokens by (trace_id, fail_index)
     /// to find the exact descriptor — same pattern as start_guard_compiling.
-    pub fn get_guard_status(&self, green_key: u64, trace_id: u64, fail_index: u32) -> (u64, usize) {
-        if let Some(compiled) = self.compiled_loops.get(&green_key) {
-            let (s, a) = self
-                .backend
-                .get_guard_status(&compiled.token, trace_id, fail_index);
+    /// Returns None if descriptor not found (no tick should happen).
+    pub fn get_guard_status(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(u64, usize)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let tid = Self::normalize_trace_id(compiled, trace_id);
+        let (s, a) = self
+            .backend
+            .get_guard_status(&compiled.token, tid, fail_index);
+        if a != 0 {
+            return Some((s, a));
+        }
+        for prev in &compiled.previous_tokens {
+            let (s, a) = self.backend.get_guard_status(prev, tid, fail_index);
             if a != 0 {
-                return (s, a);
-            }
-            for prev in &compiled.previous_tokens {
-                let (s, a) = self.backend.get_guard_status(prev, trace_id, fail_index);
-                if a != 0 {
-                    return (s, a);
-                }
+                return Some((s, a));
             }
         }
-        (0, 0)
+        None
     }
 
     /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
@@ -4871,41 +4882,38 @@ impl<M: Clone> MetaInterp<M> {
     /// Search current token + previous_tokens by trace_id to find the
     /// exact descriptor that failed (not just the current token's).
     pub fn start_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
-        if let Some(compiled) = self.compiled_loops.get(&green_key) {
-            // Try current token first, then previous_tokens.
-            if self
-                .backend
-                .start_guard_compiling(&compiled.token, trace_id, fail_index)
-            {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return;
+        };
+        let tid = Self::normalize_trace_id(compiled, trace_id);
+        if self
+            .backend
+            .start_guard_compiling(&compiled.token, tid, fail_index)
+        {
+            return;
+        }
+        for prev in &compiled.previous_tokens {
+            if self.backend.start_guard_compiling(prev, tid, fail_index) {
                 return;
-            }
-            for prev in &compiled.previous_tokens {
-                if self
-                    .backend
-                    .start_guard_compiling(prev, trace_id, fail_index)
-                {
-                    return;
-                }
             }
         }
     }
 
     /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG on descriptor.
     pub fn done_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
-        if let Some(compiled) = self.compiled_loops.get(&green_key) {
-            if self
-                .backend
-                .done_guard_compiling(&compiled.token, trace_id, fail_index)
-            {
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return;
+        };
+        let tid = Self::normalize_trace_id(compiled, trace_id);
+        if self
+            .backend
+            .done_guard_compiling(&compiled.token, tid, fail_index)
+        {
+            return;
+        }
+        for prev in &compiled.previous_tokens {
+            if self.backend.done_guard_compiling(prev, tid, fail_index) {
                 return;
-            }
-            for prev in &compiled.previous_tokens {
-                if self
-                    .backend
-                    .done_guard_compiling(prev, trace_id, fail_index)
-                {
-                    return;
-                }
             }
         }
     }
