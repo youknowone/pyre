@@ -11,15 +11,20 @@ use crate::pyobject::*;
 
 /// Python dict object.
 ///
-/// Layout: `[ob_type | entries | len]`
+/// Layout: `[ob_type | entries | len | namespace_proxy]`
 ///
 /// Keys are PyObjectRef compared by dict_keys_equal.
 /// PyPy uses multiple dict strategies; pyre uses a single Vec for simplicity.
+///
+/// `namespace_proxy`: when non-null, mutations to this dict are also
+/// written to the backing PyNamespace (used by `globals()` to provide
+/// a live view of the module namespace).
 #[repr(C)]
 pub struct W_DictObject {
     pub ob_header: PyObject,
     pub entries: *mut Vec<(PyObjectRef, PyObjectRef)>,
     pub len: usize,
+    pub namespace_proxy: *mut u8,
 }
 
 /// Field offset of `len` within `W_DictObject`, for JIT field access.
@@ -33,6 +38,21 @@ pub fn w_dict_new() -> PyObjectRef {
         },
         entries: Box::into_raw(Box::new(Vec::new())),
         len: 0,
+        namespace_proxy: std::ptr::null_mut(),
+    });
+    Box::into_raw(obj) as PyObjectRef
+}
+
+/// Allocate a dict backed by a PyNamespace (for `globals()`).
+/// Mutations to this dict also update the backing namespace.
+pub fn w_dict_new_with_namespace(ns: *mut u8) -> PyObjectRef {
+    let obj = Box::new(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+        },
+        entries: Box::into_raw(Box::new(Vec::new())),
+        len: 0,
+        namespace_proxy: ns,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -93,6 +113,12 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
     }
     entries.push((key, value));
     dict.len += 1;
+}
+
+/// Get the namespace_proxy pointer from a dict (used by interpreter for
+/// live globals sync).
+pub unsafe fn w_dict_get_namespace_proxy(obj: PyObjectRef) -> *mut u8 {
+    (*(obj as *const W_DictObject)).namespace_proxy
 }
 
 /// Get a value by int key (convenience wrapper).

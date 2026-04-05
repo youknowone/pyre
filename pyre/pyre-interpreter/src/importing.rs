@@ -25,6 +25,9 @@ use crate::pyframe::PyFrame;
 
 thread_local! {
     static SYS_MODULES: RefCell<HashMap<String, PyObjectRef>> = RefCell::new(HashMap::new());
+    /// The Python-visible `sys.modules` dict. Kept in sync with SYS_MODULES
+    /// so that `sys.modules['name']` lookups work from Python code.
+    static SYS_MODULES_DICT: std::cell::Cell<PyObjectRef> = const { std::cell::Cell::new(pyre_object::PY_NULL) };
     /// sys.path equivalent — list of directories to search for modules.
     #[cfg(feature = "host_env")]
     static SYS_PATH: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -71,6 +74,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_thread", init_thread);
     register_builtin_module("itertools", init_itertools);
     register_builtin_module("_contextvars", init_contextvars);
+    register_builtin_module("copyreg", init_copyreg);
     for name in &[
         "_signal",
         "_string",
@@ -80,7 +84,6 @@ pub fn install_builtin_modules() {
         "_warnings",
         "_imp",
         "_collections",
-        "copyreg",
         "_heapq",
         "_opcode",
         "_tokenize",
@@ -405,6 +408,18 @@ fn init_thread(ns: &mut PyNamespace) {
     );
 }
 
+/// copyreg stub — PyPy: pypy/module/copyreg/
+fn init_copyreg(ns: &mut PyNamespace) {
+    // copyreg.pickle(type, reduce_func, constructor=None) — register a
+    // pickle reducer. Stub: ignore (pyre doesn't support pickle).
+    crate::namespace_store(
+        ns,
+        "pickle",
+        crate::builtin_code_new("pickle", |_| Ok(pyre_object::w_none())),
+    );
+    crate::namespace_store(ns, "dispatch_table", pyre_object::w_dict_new());
+}
+
 /// Try to load a builtin module by name.
 ///
 /// PyPy equivalent: find_module() → C_BUILTIN path →
@@ -503,6 +518,30 @@ fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
 fn set_sys_module(name: &str, module: PyObjectRef) {
     SYS_MODULES.with(|m| {
         m.borrow_mut().insert(name.to_string(), module);
+    });
+    // Keep the Python-visible sys.modules dict in sync.
+    SYS_MODULES_DICT.with(|d| {
+        let dict = d.get();
+        if !dict.is_null() {
+            unsafe {
+                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
+            }
+        }
+    });
+}
+
+/// Set the Python-visible sys.modules dict reference. Called during sys
+/// module initialization so subsequent set_sys_module calls keep it in sync.
+/// Also copies all previously cached modules into the dict.
+pub fn set_sys_modules_dict(dict: PyObjectRef) {
+    SYS_MODULES_DICT.with(|d| d.set(dict));
+    // Populate with all modules already in the cache.
+    SYS_MODULES.with(|m| {
+        for (name, &module) in m.borrow().iter() {
+            unsafe {
+                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
+            }
+        }
     });
 }
 
@@ -731,7 +770,12 @@ fn load_part(
     let module = match info {
         #[cfg(feature = "host_env")]
         FindInfo::SourceFile { pathname } => {
-            load_source_module(modulename, &pathname, execution_context)?
+            match load_source_module(modulename, &pathname, execution_context) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
         #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
@@ -916,7 +960,11 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Option<String> {
 //
 // Get an attribute from the module on TOS. Like `space.getattr(w_module, w_name)`.
 
-pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+pub fn import_from(
+    module: PyObjectRef,
+    name: &str,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
     // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup)
     if unsafe { is_module(module) } {
         let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
@@ -929,13 +977,48 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     }
 
     // Fallback: try getattr (for non-module objects or attrs set via setattr)
-    match crate::baseobjspace::getattr(module, name) {
-        Ok(value) => Ok(value),
-        Err(_) => Err(crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("cannot import name '{name}'"),
-        )),
+    if let Ok(value) = crate::baseobjspace::getattr(module, name) {
+        return Ok(value);
     }
+
+    // PyPy: pyopcode.py _import_from — try importing as a submodule.
+    // Build fullname = module.__name__ + "." + name and import it.
+    if unsafe { is_module(module) } {
+        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
+        if !ns_ptr.is_null() {
+            let ns = unsafe { &*ns_ptr };
+            if let Some(&modname_obj) = ns.get("__name__") {
+                if !modname_obj.is_null() && unsafe { pyre_object::is_str(modname_obj) } {
+                    let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
+                    let fullname = format!("{modname}.{name}");
+                    if importhook(
+                        &fullname,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                        execution_context,
+                    )
+                    .is_ok()
+                    {
+                        // importhook returns the top-level module when
+                        // fromlist is empty. Retrieve the actual leaf
+                        // module from sys.modules.
+                        if let Some(submod) = check_sys_modules(&fullname) {
+                            unsafe {
+                                crate::namespace_store(&mut *ns_ptr, name, submod);
+                            }
+                            return Ok(submod);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(crate::PyError::new(
+        crate::PyErrorKind::ImportError,
+        format!("cannot import name '{name}'"),
+    ))
 }
 
 // ── import_all_from ──────────────────────────────────────────────────

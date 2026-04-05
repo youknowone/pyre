@@ -1425,7 +1425,19 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         } else if is_dict(obj) {
             match w_dict_lookup(obj, index) {
                 Some(val) => Ok(val),
-                None => Err(PyError::new(PyErrorKind::KeyError, "key not found")),
+                None => {
+                    let key_repr = if is_str(index) {
+                        format!("'{}'", w_str_get_value(index))
+                    } else if is_int(index) {
+                        format!("{}", w_int_get_value(index))
+                    } else {
+                        "key".to_string()
+                    };
+                    Err(PyError::new(
+                        PyErrorKind::KeyError,
+                        format!("KeyError: {key_repr}"),
+                    ))
+                }
             }
         } else if is_str(obj) {
             let s = w_str_get_value(obj);
@@ -1511,6 +1523,61 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 "'{}' object is not subscriptable",
                 w_type_get_name(w_instance_get_type(obj)),
             )))
+        } else if is_range_iter(obj) {
+            let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+            let len = if r.step > 0 {
+                (r.stop - r.current + r.step - 1) / r.step
+            } else if r.step < 0 {
+                (r.current - r.stop - r.step - 1) / (-r.step)
+            } else {
+                0
+            };
+            if is_int(index) {
+                // range[i]
+                let i = w_int_get_value(index);
+                let idx = if i < 0 { len + i } else { i };
+                if idx < 0 || idx >= len {
+                    Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        "range object index out of range",
+                    ))
+                } else {
+                    Ok(w_int_new(r.current + idx * r.step))
+                }
+            } else if is_slice(index) {
+                // range[start:stop:step] → returns a list
+                let s_raw = w_slice_get_start(index);
+                let e_raw = w_slice_get_stop(index);
+                let step_raw = w_slice_get_step(index);
+                let s = if is_none(s_raw) {
+                    0
+                } else {
+                    w_int_get_value(s_raw)
+                };
+                let e = if is_none(e_raw) {
+                    len
+                } else {
+                    w_int_get_value(e_raw)
+                };
+                let sl_step = if is_none(step_raw) {
+                    1
+                } else {
+                    w_int_get_value(step_raw)
+                };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) };
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) };
+                let mut items = Vec::new();
+                let mut i = s;
+                while (sl_step > 0 && i < e) || (sl_step < 0 && i > e) {
+                    items.push(w_int_new(r.current + i * r.step));
+                    i += sl_step;
+                }
+                Ok(w_list_new(items))
+            } else {
+                Err(PyError::type_error(
+                    "range indices must be integers or slices",
+                ))
+            }
         } else {
             Err(PyError::type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1542,8 +1609,40 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
     let value = unwrap_cell(value);
     unsafe {
         if is_list(obj) {
+            if is_slice(index) {
+                // list[start:stop] = value — slice assignment
+                let len = w_list_len(obj) as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let s = if is_none(start) {
+                    0
+                } else {
+                    w_int_get_value(start)
+                };
+                let e = if is_none(stop) {
+                    len
+                } else {
+                    w_int_get_value(stop)
+                };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                // Replace items[s..e] with the iterable value
+                let new_items = crate::builtins::collect_iterable(value)?;
+                let list_obj = &mut *(obj as *mut pyre_object::listobject::W_ListObject);
+                let mut items = pyre_object::listobject::items_to_vec(list_obj);
+                items.splice(s..e, new_items);
+                pyre_object::listobject::rebuild_object_items(list_obj, items);
+                return Ok(w_none());
+            }
             if !is_int(index) {
-                return Err(PyError::type_error("list indices must be integers"));
+                let tp = if index.is_null() {
+                    "NULL"
+                } else {
+                    (*(*index).ob_type).tp_name
+                };
+                return Err(PyError::type_error(format!(
+                    "list indices must be integers, not {tp}"
+                )));
             }
             let idx = w_int_get_value(index);
             if w_list_setitem(obj, idx, value) {
@@ -2141,33 +2240,58 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         });
         return Ok(d);
     }
+    // All other objects: use side table
+    // Check ATTR_TABLE first so __class__ overrides (for int subclasses)
+    // take priority over the static type registry.
+    let found = ATTR_TABLE.with(|table| {
+        let table = table.borrow();
+        let key = obj as usize;
+        table.get(&key).and_then(|dict| dict.get(name).copied())
+    });
+    if let Some(value) = found {
+        return Ok(value);
+    }
+
+    // __class__: return from type registry if not overridden in ATTR_TABLE
     if name == "__class__" {
         if let Some(tp) = crate::typedef::r#type(obj) {
             return Ok(tp);
         }
     }
 
-    // All other objects: use side table
-    ATTR_TABLE.with(|table| {
+    // If the object has an overridden __class__ (int subclass), do MRO
+    // lookup on that class for method resolution.
+    let overridden_class = ATTR_TABLE.with(|table| {
         let table = table.borrow();
-        let key = obj as usize;
-        if let Some(dict) = table.get(&key) {
-            if let Some(&value) = dict.get(name) {
-                return Ok(value);
+        table
+            .get(&(obj as usize))
+            .and_then(|dict| dict.get("__class__").copied())
+    });
+    if let Some(w_class) = overridden_class {
+        if unsafe { is_type(w_class) } {
+            if let Some(method) = unsafe { lookup_in_type_where(w_class, name) } {
+                if unsafe { crate::is_builtin_code(method) } {
+                    return Ok(pyre_object::w_method_new(method, obj, w_class));
+                }
+                if let Some(result) = unsafe { get(method, obj, w_class) } {
+                    return Ok(result);
+                }
+                return Ok(method);
             }
         }
-        unsafe {
-            let tp_name = if obj.is_null() {
-                "NULL"
-            } else {
-                (*(*obj).ob_type).tp_name
-            };
-            Err(PyError::new(
-                PyErrorKind::AttributeError,
-                format!("'{tp_name}' object has no attribute '{name}'"),
-            ))
-        }
-    })
+    }
+
+    unsafe {
+        let tp_name = if obj.is_null() {
+            "NULL"
+        } else {
+            (*(*obj).ob_type).tp_name
+        };
+        Err(PyError::new(
+            PyErrorKind::AttributeError,
+            format!("'{tp_name}' object has no attribute '{name}'"),
+        ))
+    }
 }
 
 // Builtin type method implementations moved to type_methods.rs
@@ -3281,19 +3405,44 @@ fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 /// Delete item: `del obj[index]`
+///
+/// PyPy: descroperation.py delitem → dispatches to type-specific __delitem__.
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
-        if is_list(obj) && is_int(index) {
-            let i = w_int_get_value(index);
-            let len = w_list_len(obj) as i64;
-            let idx = if i < 0 { len + i } else { i };
-            if idx >= 0 && idx < len {
-                // For Phase 1: set to PY_NULL (proper removal needs list mutation API)
-                w_list_setitem(obj, idx, PY_NULL);
+        if is_list(obj) {
+            if is_int(index) {
+                let i = w_int_get_value(index);
+                let len = w_list_len(obj) as i64;
+                let idx = if i < 0 { len + i } else { i };
+                if idx >= 0 && idx < len {
+                    w_list_pop(obj, idx);
+                    return Ok(());
+                }
+                return Err(PyError::type_error("list index out of range"));
+            }
+            if is_slice(index) {
+                let len = w_list_len(obj) as i64;
+                let start = w_slice_get_start(index);
+                let stop = w_slice_get_stop(index);
+                let s = if is_none(start) {
+                    0
+                } else {
+                    let v = w_int_get_value(start);
+                    if v < 0 { (len + v).max(0) } else { v.min(len) }
+                } as usize;
+                let e = if is_none(stop) {
+                    len
+                } else {
+                    let v = w_int_get_value(stop);
+                    if v < 0 { (len + v).max(0) } else { v.min(len) }
+                } as usize;
+                w_list_delslice(obj, s, e);
                 return Ok(());
             }
-            return Err(PyError::type_error("list index out of range"));
+        }
+        if is_dict(obj) {
+            return dict_delitem(obj, index);
         }
     }
     // Instance __delitem__ — PyPy: descroperation.py delitem
@@ -3308,6 +3457,32 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
         }
     }
     Err(PyError::type_error("object does not support item deletion"))
+}
+
+/// Delete item from dict by key.
+fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
+    use pyre_object::*;
+    unsafe {
+        let dict = &mut *(obj as *mut dictobject::W_DictObject);
+        let entries = &mut *dict.entries;
+        for i in 0..entries.len() {
+            let eq = if std::ptr::eq(entries[i].0, key) {
+                true
+            } else if is_int(entries[i].0) && is_int(key) {
+                w_int_get_value(entries[i].0) == w_int_get_value(key)
+            } else if is_str(entries[i].0) && is_str(key) {
+                w_str_get_value(entries[i].0) == w_str_get_value(key)
+            } else {
+                false
+            };
+            if eq {
+                entries.remove(i);
+                dict.len -= 1;
+                return Ok(());
+            }
+        }
+    }
+    Err(PyError::type_error("KeyError"))
 }
 
 // py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).
