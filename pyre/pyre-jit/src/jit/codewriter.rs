@@ -242,8 +242,13 @@ impl CodeWriter {
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
 
         // jitcode.py:9 jitdriver_sd: portal has a jitdriver.
-        // Computed early for BC_JIT_MERGE_POINT vs BC_JUMP_TARGET selection.
         let is_portal = &*code.obj_name != "<module>";
+        // RPython: one jit_merge_point per jitcode (the first loop header).
+        // All other loop headers get loop_header (= BC_JUMP_TARGET, no-op
+        // in blackhole). The blackhole handler checks nextblackholeinterp
+        // to decide whether to exit (outermost) or no-op (inner helper).
+        let merge_point_pc = loop_header_pcs.iter().copied().min();
+        let mut emitted_merge_point = false;
 
         for py_pc in 0..num_instrs {
             // Exception handler entry: Python resets stack depth to the
@@ -256,12 +261,12 @@ impl CodeWriter {
             pc_map[py_pc] = assembler.current_pos();
             depth_at_pc[py_pc] = current_depth;
 
-            // blackhole.py:1066 bhimpl_jit_merge_point parity:
-            // Portal jitcodes get BC_JIT_MERGE_POINT at loop headers;
-            // non-portal helpers get BC_JUMP_TARGET (no merge semantics).
+            // jtransform.py: jit_merge_point at the portal's merge point;
+            // loop_header (BC_JUMP_TARGET) at all other backward jump targets.
             if loop_header_pcs.contains(&py_pc) {
-                if is_portal {
+                if merge_point_pc == Some(py_pc) && !emitted_merge_point {
                     assembler.jit_merge_point();
+                    emitted_merge_point = true;
                 } else {
                     assembler.jump_target();
                 }
@@ -900,25 +905,6 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
         }
     }
     pos
-}
-
-/// Compute JitCode PC for a Python loop_header_pc.
-/// The interpreter's loop_header_pc includes Cache skip, but the
-/// codewriter's label targets don't. Search pc_map backwards from
-/// loop_header_pc to find the matching JitCode offset.
-pub fn jitcode_pc_for_loop_header(pc_map: &[usize], loop_header_pc: usize) -> Option<usize> {
-    // pc_map[loop_header_pc] is the JitCode PC for that code unit.
-    // But the codewriter may have placed the label at a slightly earlier
-    // code unit (before Cache instructions). Try exact match first,
-    // then search backwards.
-    for offset in 0..4 {
-        let py_pc = loop_header_pc.checked_sub(offset)?;
-        let jitcode_pc = *pc_map.get(py_pc)?;
-        if jitcode_pc > 0 || py_pc == 0 {
-            return Some(jitcode_pc);
-        }
-    }
-    pc_map.get(loop_header_pc).copied()
 }
 
 // ---------------------------------------------------------------------------

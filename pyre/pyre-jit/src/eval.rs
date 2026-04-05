@@ -1115,7 +1115,7 @@ fn maybe_compile_and_run(
     }
     // warmstate.py:503-511: procedure_token exists → EnterJitAssembler.
     // RPython enters assembler unconditionally when a compiled loop is
-    // available for this green_key. No merge_pc compatibility check.
+    // available for this green_key.
     if driver.has_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
@@ -1229,8 +1229,7 @@ fn resume_in_blackhole_from_exit_layout(
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
     let guard_frames = take_last_guard_frames();
     if let Some(ref frames) = guard_frames {
-        let entry_pc = frame.next_instr;
-        crate::call_jit::resume_in_blackhole(frame, frames, entry_pc)
+        crate::call_jit::resume_in_blackhole(frame, frames)
     } else {
         BlackholeResult::Failed
     }
@@ -1586,7 +1585,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     if driver.has_compiled_loop(green_key) {
         // Same gate as maybe_compile_and_run: only enter compiled code
-        // when the compiled loop's merge_pc matches the current PC.
+        // when a compiled loop exists for this green_key.
         // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(

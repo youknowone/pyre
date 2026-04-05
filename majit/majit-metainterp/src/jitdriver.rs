@@ -782,7 +782,7 @@ impl<S: JitState> JitDriver<S> {
                     let provisional_meta = self.trace_meta.take().unwrap();
                     // When cross-loop cut redirects to a different header_pc,
                     // rebuild meta from merge point to get the inner header's
-                    // frame layout (vsd, slot_types, merge_pc).
+                    // frame layout (vsd, slot_types).
                     let meta = {
                         if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
                             S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)

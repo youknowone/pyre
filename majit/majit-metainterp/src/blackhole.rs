@@ -860,11 +860,6 @@ pub struct BlackholeInterpreter {
     runtime_stacks: Vec<Vec<i64>>,
     /// Current selected storage index.
     current_selected: usize,
-    /// RPython bhimpl_jit_merge_point parity: when set, BC_JUMP targeting
-    /// this JitCode PC exits the blackhole with ContinueRunningNormally
-    /// instead of looping. The outermost blackhole frame uses this to
-    /// hand control back to the JIT dispatch loop at the merge point.
-    pub merge_point_jitcode_pc: Option<usize>,
     /// Set to true when `run()` exited via merge point (not LeaveFrame).
     pub reached_merge_point: bool,
     /// True when run() hit BC_ABORT (unsupported bytecode). Callers
@@ -930,7 +925,6 @@ impl BlackholeInterpreter {
             return_type: BhReturnType::Void,
             runtime_stacks: Vec::new(),
             current_selected: 0,
-            merge_point_jitcode_pc: None,
             reached_merge_point: false,
             aborted: false,
             got_exception: false,
@@ -1593,14 +1587,15 @@ impl BlackholeInterpreter {
                 self.position = target;
             }
             BC_JIT_MERGE_POINT => {
-                // blackhole.py:1066 bhimpl_jit_merge_point.
-                // Portal merge point: merge_point_jitcode_pc selects the
-                // active merge point (pyre traces any loop header, unlike
-                // RPython's single jit_merge_point per portal).
-                if self.merge_point_jitcode_pc == Some(self.last_opcode_position) {
+                // blackhole.py:1068 bhimpl_jit_merge_point:
+                // if self.nextblackholeinterp is None → ContinueRunningNormally
+                if self.nextblackholeinterp.is_none() {
                     self.reached_merge_point = true;
                     return Err(DispatchError::LeaveFrame);
                 }
+                // else: inner frame (helper called by portal) — no-op.
+                // RPython would handle recursive_call here, but pyre
+                // lets the helper continue to RETURN_VALUE normally.
             }
             BC_JUMP_TARGET => {
                 // Non-portal loop header marker (helper jitcodes only).
@@ -2068,7 +2063,6 @@ impl BlackholeInterpBuilder {
         // Pool management (RPython uses linked-list via .back; Rust uses Vec)
         interp.nextblackholeinterp = None;
         interp.runtime_stacks.clear();
-        interp.merge_point_jitcode_pc = None;
         interp.reached_merge_point = false;
         interp.aborted = false;
         interp.got_exception = false;
