@@ -2603,13 +2603,10 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
     }]
 }
 
-/// Decode rd_numb to produce typed values for JIT state restore.
-/// Each slot is either TAGBOX (from deadframe), TAGCONST
-/// (compile-time constant), TAGINT (small inline int), or TAGVIRTUAL
-/// (virtual object to materialize later by rebuild_state_after_failure_with_exit_layout).
-///
-/// Uses flat single-frame decoder (rebuild_from_numbering).
-/// The RPython-parity multi-frame path is blackhole_from_resumedata.
+/// Decode rd_numb to produce typed values via
+/// `majit_ir::resumedata::rebuild_from_numbering`. Each slot is TAGBOX
+/// (deadframe), TAGCONST (constant), TAGINT (small int), or TAGVIRTUAL
+/// (virtual to materialize). Single-frame only (no per-jitcode liveness).
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -2619,7 +2616,7 @@ fn rebuild_typed_from_rd_numb(
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts);
+        rebuild_from_numbering(rd_numb, rd_consts, None);
 
     // resume.py:1045 consume_vref_and_vable_boxes parity.
     // vable_array format: [frame_ptr, ni, vsd, locals..., stack...]
@@ -2731,12 +2728,10 @@ fn rebuild_typed_from_rd_numb(
     typed
 }
 
-/// Decode rd_numb into per-frame ResumedFrame chain.
-/// Each frame gets its own resolved values, code pointer, and py_pc.
-///
-/// NOTE: Uses rebuild_from_numbering (flat single-frame decoder).
-/// For RPython-parity multi-frame decode with liveness-based splitting,
-/// see majit_metainterp::resume::blackhole_from_resumedata.
+/// Decode rd_numb into per-frame ResumedFrame chain via
+/// `majit_ir::resumedata::rebuild_from_numbering`.
+/// Single-frame only (RPython's blackhole_from_resumedata uses
+/// per-jitcode liveness for multi-frame decode).
 fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -2746,7 +2741,7 @@ fn build_resumed_frames(
     use majit_ir::resumedata::rebuild_from_numbering;
 
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts);
+        rebuild_from_numbering(rd_numb, rd_consts, None);
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {

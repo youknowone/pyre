@@ -5748,13 +5748,14 @@ impl<M: Clone> MetaInterp<M> {
 
     // ── Guard Failure Recovery ─────────────────────────────────
 
-    /// Handle a guard failure: recover interpreter state using resume data
-    /// and optionally decide whether to compile a bridge.
+    /// Handle a guard failure: recover interpreter state using resume data.
     ///
     /// This is the central guard failure handler, equivalent to RPython's
     /// `handle_guard_failure()` in pyjitpl.py.
     ///
-    /// Returns `GuardRecovery` describing the recovered state and recommended action.
+    /// Returns `GuardRecovery` describing the recovered state.
+    /// Bridge-vs-blackhole is decided by the caller from `must_compile()`,
+    /// matching compile.py:701-717 handle_fail flow.
     pub fn handle_guard_failure(
         &mut self,
         green_key: u64,
@@ -5880,8 +5881,6 @@ impl<M: Clone> MetaInterp<M> {
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
 
-        let action = GuardRecoveryAction::ResumeInterpreter;
-
         Some(GuardRecovery {
             trace_id,
             fail_index,
@@ -5895,7 +5894,6 @@ impl<M: Clone> MetaInterp<M> {
             pending_field_writes,
             savedata,
             exception,
-            action,
         })
     }
 
@@ -6746,17 +6744,6 @@ pub struct GuardRecovery {
     pub savedata: Option<GcRef>,
     /// Pending exception state captured from the failing deadframe.
     pub exception: ExceptionState,
-    /// Recommended action after recovery.
-    pub action: GuardRecoveryAction,
-}
-
-/// What should be done after a guard failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GuardRecoveryAction {
-    /// compile.py:711-716: resume_in_blackhole — resume interpreter.
-    ResumeInterpreter,
-    /// compile.py:704-709: _trace_and_compile_from_bridge.
-    CompileBridge,
 }
 
 /// Result of running compiled code with automatic recovery.
@@ -7578,7 +7565,6 @@ mod tests {
         assert_eq!(recovery.fail_values, vec![11, 22]);
         assert_eq!(recovery.exception.exc_class, 0x1234);
         assert_eq!(recovery.exception.exc_value, 0xABCD);
-        assert_eq!(recovery.action, GuardRecoveryAction::ResumeInterpreter);
         assert!(recovery.materialized_virtuals.is_empty());
 
         let reconstructed = recovery

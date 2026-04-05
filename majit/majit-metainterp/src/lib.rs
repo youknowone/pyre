@@ -62,8 +62,7 @@ pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_
 pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, CompileOutcome, CompiledExitLayout,
     CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome,
-    DriverRunOutcome, GuardRecoveryAction, InlineDecision, JitHooks, JitStats, MetaInterp,
-    RawCompileResult,
+    DriverRunOutcome, InlineDecision, JitHooks, JitStats, MetaInterp, RawCompileResult,
 };
 pub use quasiimmut::QuasiImmut;
 pub use symbolic_stack::SymbolicStack;

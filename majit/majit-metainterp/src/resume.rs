@@ -2762,7 +2762,8 @@ impl Default for ResumeDataVirtualAdder {
 ///
 /// NOTE: RPython's ResumeDataLoopMemo also stores `metainterp_sd` and `cpu`
 /// (for box allocation during rebuild). pyre doesn't need these: the BoxEnv
-/// trait provides box access, and rebuild_from_numbering is a pure decoder.
+/// trait provides box access. The canonical decoder lives in
+/// `majit_ir::resumedata::rebuild_from_numbering`.
 /// RPython's nvirtuals/nvholes/nvreused stats are kept for monitoring.
 pub struct ResumeDataLoopMemo {
     /// resume.py:147 — shared constant pool.
@@ -3701,19 +3702,6 @@ impl<'a> ResumeDataReader<'a> {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// resume.py:1042-1080 rebuild_from_resumedata — tagged numbering
-// deserialization.
-//
-// RPython-parity multi-frame decode lives in:
-//   blackhole_from_resumedata() below (resume.py:1312)
-//   + ResumeDataDirectReader::consume_one_section (resume.py:1381)
-// which uses liveness info for per-frame splitting.
-//
-// For flat single-frame decode without liveness info, callers use
-// majit_ir::resumedata::rebuild_from_numbering.
-// ═══════════════════════════════════════════════════════════════
-
 /// resume.py:576-728 VirtualInfo parity.
 /// Describes a virtual object's fields for materialization.
 /// RPython uses a class hierarchy (VirtualInfo, VStructInfo, VArrayInfoClear, etc.).
@@ -3754,9 +3742,6 @@ pub struct OptimizerKnowledgeForResume {
 
 // VirtualFieldInfo removed: replaced by majit_ir::VirtualFieldsInfo.
 // finish() now discovers virtual fields via env.get_virtual_fields().
-//
-// RebuiltValue, RebuiltFrame, decode_tagged, rebuild_from_numbering:
-// canonical implementations live in majit_ir::resumedata.
 
 #[cfg(test)]
 mod tests {
@@ -5023,7 +5008,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts());
+            rebuild_from_numbering(&rd_numb, memo.consts(), None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
@@ -5048,7 +5033,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, memo.consts());
+            rebuild_from_numbering(&rd_numb, memo.consts(), None);
         assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Box(0));
@@ -5145,7 +5130,7 @@ mod tests {
 
         // rd_numb should be valid
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts);
+            rebuild_from_numbering(&rd_numb, &rd_consts, None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
