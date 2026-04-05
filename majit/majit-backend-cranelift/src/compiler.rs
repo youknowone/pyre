@@ -9392,20 +9392,9 @@ fn collect_guards(
         descr.green_key = header_pc;
         descr.gc_runtime_id = gc_runtime_id;
         let descr = Arc::new(descr);
-        // compile.py:826-830 store_hash: assign unique jitcounter slot.
-        // RPython calls store_hash inside store_final_boxes at compile time.
-        if !is_finish && !is_external_jump {
-            static NEXT_GUARD_HASH: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let hash = NEXT_GUARD_HASH.fetch_add(
-                1 | (1u64 << 21) | (1u64 << 5), // counter.py:151 increment
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            descr.store_hash(hash);
-        }
-        // regalloc.py:496-501 consider_guard_value / compile.py:813-824
-        // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
-        // index + type tag in status (overrides store_hash).
+        // store_hash is called after compile_loop by pyjitpl.rs using
+        // jitcounter.fetch_next_hash() (compile.py:826-830 parity).
+        //
         // regalloc.py:496-501 consider_guard_value / compile.py:813-824
         // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
         // index + type tag in status (overrides store_hash).
@@ -9760,6 +9749,50 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
         (0, 0)
+    }
+
+    fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        if let Some(compiled) = compiled {
+            for (i, &hash) in hashes.iter().enumerate() {
+                if let Some(descr) = compiled.fail_descrs.get(i) {
+                    // Skip FINISH, external JUMP, and GUARD_VALUE
+                    // (make_a_counter_per_value already set status).
+                    if !descr.is_finish && descr.get_status() == 0 {
+                        descr.store_hash(hash);
+                    }
+                }
+            }
+        }
+    }
+
+    fn store_bridge_guard_hashes(
+        &self,
+        token: &JitCellToken,
+        source_fail_index: u32,
+        hashes: &[u64],
+    ) {
+        let compiled = token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+        if let Some(compiled) = compiled {
+            if let Some(descr) = compiled.fail_descrs.get(source_fail_index as usize) {
+                let bridge_guard = descr.bridge_ref();
+                if let Some(ref bridge) = *bridge_guard {
+                    for (i, &hash) in hashes.iter().enumerate() {
+                        if let Some(bd) = bridge.fail_descrs.get(i) {
+                            if !bd.is_finish && bd.get_status() == 0 {
+                                bd.store_hash(hash);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn start_guard_compiling(&self, token: &JitCellToken, trace_id: u64, fail_index: u32) -> bool {

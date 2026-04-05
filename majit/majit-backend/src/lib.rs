@@ -795,6 +795,22 @@ pub trait Backend: Send {
         (0, 0)
     }
 
+    /// compile.py:826-830 store_hash: assign jitcounter hashes to guards.
+    /// Called after compile_loop/compile_bridge with hashes from
+    /// jitcounter.fetch_next_hash(). Skips guards that already have
+    /// status set by make_a_counter_per_value (GUARD_VALUE).
+    fn store_guard_hashes(&self, _token: &JitCellToken, _hashes: &[u64]) {}
+
+    /// store_hash for bridge guards — same as store_guard_hashes but for
+    /// the most recently compiled bridge on the given guard.
+    fn store_bridge_guard_hashes(
+        &self,
+        _token: &JitCellToken,
+        _source_fail_index: u32,
+        _hashes: &[u64],
+    ) {
+    }
+
     /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
     /// Returns true if descriptor was found in this token.
     fn start_guard_compiling(
