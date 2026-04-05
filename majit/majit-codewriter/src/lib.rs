@@ -86,6 +86,9 @@ pub struct MethodInfo {
     /// RPython: op.result.concretetype — return type for array identity.
     #[serde(default)]
     pub return_type: Option<String>,
+    /// RPython: function-level JIT hints (elidable, close_stack, etc.).
+    #[serde(default)]
+    pub hints: Vec<String>,
 }
 
 /// Canonical single-file analysis entry point.
@@ -131,10 +134,15 @@ fn analyze_pipeline_from_parsed(
     let mut canonical_function_graphs = std::collections::HashMap::new();
 
     for parsed in parsed_files {
-        canonical_trait_impls.extend(parse::extract_trait_impls(parsed, &program.struct_fields));
+        canonical_trait_impls.extend(parse::extract_trait_impls(
+            parsed,
+            &program.struct_fields,
+            &program.fn_return_types,
+        ));
         canonical_inherent_methods.extend(parse::extract_inherent_impl_methods(
             parsed,
             &program.struct_fields,
+            &program.fn_return_types,
         ));
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
@@ -142,10 +150,15 @@ fn analyze_pipeline_from_parsed(
     // context, NOT re-parsed graphs (which lose array_type_id etc.).
     for func in &program.functions {
         if func.self_ty_root.is_none() {
-            // Free function: register under [name] and [crate, name].
-            let path = parse::CallPath::from_segments([func.name.as_str()]);
+            // Free function: register under qualified segments.
+            // func.name may be "a::helper" for module-internal functions.
+            let segments: Vec<&str> = func.name.split("::").collect();
+            let path = parse::CallPath::from_segments(segments.iter().copied());
             canonical_function_graphs.insert(path, func.graph.clone());
-            let crate_path = parse::CallPath::from_segments(["crate", func.name.as_str()]);
+            // Also register under ["crate", ...segments].
+            let mut crate_segs = vec!["crate"];
+            crate_segs.extend(segments.iter().copied());
+            let crate_path = parse::CallPath::from_segments(crate_segs);
             canonical_function_graphs.insert(crate_path, func.graph.clone());
         }
     }
@@ -212,11 +225,13 @@ fn analyze_pipeline_from_parsed(
                     crate::parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
                 call_control.return_types.insert(path, ret_type.clone());
             } else {
-                // free function: register under all canonical paths
-                let path = crate::parse::CallPath::from_segments([func.name.as_str()]);
+                // free function: register under qualified segments.
+                let segments: Vec<&str> = func.name.split("::").collect();
+                let path = crate::parse::CallPath::from_segments(segments.iter().copied());
                 call_control.return_types.insert(path, ret_type.clone());
-                let crate_path =
-                    crate::parse::CallPath::from_segments(["crate", func.name.as_str()]);
+                let mut crate_segs = vec!["crate"];
+                crate_segs.extend(segments.iter().copied());
+                let crate_path = crate::parse::CallPath::from_segments(crate_segs);
                 call_control
                     .return_types
                     .insert(crate_path, ret_type.clone());
@@ -233,9 +248,22 @@ fn analyze_pipeline_from_parsed(
                 call_control.register_trait_method(&method.name, impl_type, graph.clone());
             }
             // RPython: op.result.concretetype for trait/default method calls.
+            let path = crate::parse::CallPath::from_segments([impl_type, method.name.as_str()]);
             if let Some(ref ret_type) = method.return_type {
-                let path = crate::parse::CallPath::from_segments([impl_type, method.name.as_str()]);
-                call_control.return_types.insert(path, ret_type.clone());
+                call_control
+                    .return_types
+                    .insert(path.clone(), ret_type.clone());
+            }
+            // RPython: hints bound to graph identity.
+            for hint in &method.hints {
+                match hint.as_str() {
+                    "elidable" => call_control.mark_elidable(path.clone()),
+                    "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
+                    "close_stack" => call_control.mark_close_stack(path.clone()),
+                    "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
+                    "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
+                    _ => {}
+                }
             }
         }
     }
@@ -250,9 +278,65 @@ fn analyze_pipeline_from_parsed(
         let path = crate::parse::CallPath::from_segments([impl_type, method_info.name.as_str()]);
         call_control.register_function_graph(path.clone(), method_info.graph.clone());
         if let Some(ref ret_type) = method_info.return_type {
-            call_control.return_types.insert(path, ret_type.clone());
+            call_control
+                .return_types
+                .insert(path.clone(), ret_type.clone());
+        }
+        // RPython: hints bound to graph identity.
+        for hint in &method_info.hints {
+            match hint.as_str() {
+                "elidable" => call_control.mark_elidable(path.clone()),
+                "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
+                "close_stack" => call_control.mark_close_stack(path.clone()),
+                "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
+                "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
+                _ => {}
+            }
         }
     }
+    // RPython: GC transformer sets _gctransformer_hint_close_stack_,
+    // _gctransformer_hint_cannot_collect_ on functions, and
+    // random_effects_on_gcobjs on external function objects.
+    // In majit, detect these from #[jit_close_stack], #[jit_cannot_collect],
+    // #[jit_gc_effects] attributes on functions in the parsed source.
+    // RPython: hints are bound to the function/graph object, not the name.
+    // Register under ALL canonical paths so any call-site lookup finds them.
+    for func in &program.functions {
+        if func.hints.is_empty() {
+            continue;
+        }
+        // Build all canonical paths for this function.
+        let mut paths = Vec::new();
+        if let Some(ref owner) = func.self_ty_root {
+            // impl method: ["owner", "method"]
+            paths.push(crate::parse::CallPath::from_segments([
+                owner.as_str(),
+                func.name.as_str(),
+            ]));
+        } else {
+            // free function: register under qualified segments + crate:: alias
+            let segments: Vec<&str> = func.name.split("::").collect();
+            paths.push(crate::parse::CallPath::from_segments(
+                segments.iter().copied(),
+            ));
+            let mut crate_segs = vec!["crate"];
+            crate_segs.extend(segments.iter().copied());
+            paths.push(crate::parse::CallPath::from_segments(crate_segs));
+        }
+        for hint in &func.hints {
+            for p in &paths {
+                match hint.as_str() {
+                    "elidable" => call_control.mark_elidable(p.clone()),
+                    "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
+                    "close_stack" => call_control.mark_close_stack(p.clone()),
+                    "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
+                    "gc_effects" => call_control.mark_external_gc_effects(p.clone()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // RPython: setup_jitdriver(jitdriver_sd) — register portal + green/red layout.
     // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
     //                      reds = ['frame', 'ec']
@@ -685,9 +769,10 @@ mod tests {
             &crate::test_support::pyre_analyze_config(),
         );
         let empty_sf = crate::front::StructFieldRegistry::default();
+        let empty_frt = std::collections::HashMap::new();
         let trait_impls: Vec<_> = parsed_files
             .iter()
-            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf))
+            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf, &empty_frt))
             .collect();
 
         eprintln!("=== Multi-file Analysis ===");
@@ -1128,11 +1213,15 @@ mod tests {
         "#;
 
         let parsed = parse::parse_source(source);
-        let trait_impls =
-            parse::extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let trait_impls = parse::extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1185,11 +1274,15 @@ mod tests {
         "#;
 
         let parsed = parse::parse_source(source);
-        let trait_impls =
-            parse::extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let trait_impls = parse::extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1230,11 +1323,15 @@ mod tests {
         "#;
 
         let parsed = parse::parse_source(source);
-        let trait_impls =
-            parse::extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let trait_impls = parse::extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1282,11 +1379,15 @@ mod tests {
         "#;
 
         let parsed = parse::parse_source(source);
-        let trait_impls =
-            parse::extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let trait_impls = parse::extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
         );
         let mut function_graphs = std::collections::HashMap::new();
         parse::collect_function_graphs(&parsed, &mut function_graphs);
@@ -1326,11 +1427,15 @@ mod tests {
 
         let parsed = parse::parse_source(source);
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
-        let trait_impls =
-            parse::extract_trait_impls(&parsed, &crate::front::StructFieldRegistry::default());
+        let trait_impls = parse::extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+        );
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
         );
         let function_graphs = std::collections::HashMap::new();
         let handler_calls = vec![parse::ExtractedHandlerCall::Method {
@@ -1375,9 +1480,10 @@ mod tests {
             call_control.register_function_graph(path.clone(), graph.clone());
         }
         let empty_sf2 = crate::front::StructFieldRegistry::default();
+        let empty_frt2 = std::collections::HashMap::new();
         let trait_impls: Vec<TraitImplInfo> = parsed_files
             .iter()
-            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf2))
+            .flat_map(|p| parse::extract_trait_impls(p, &empty_sf2, &empty_frt2))
             .collect();
         for impl_info in &trait_impls {
             let impl_type = impl_info
