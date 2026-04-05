@@ -22,8 +22,10 @@ pub mod virtualizable_spec;
 /// Auto-generated trace functions from majit-codewriter.
 #[allow(dead_code, unused_imports)]
 pub mod generated {
+    use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
     include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
 }
 
 // Re-export top-level auto-generated functions for crate-level access
+use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
 include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));

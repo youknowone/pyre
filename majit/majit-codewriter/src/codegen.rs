@@ -57,6 +57,8 @@ pub fn generate_from_pipeline(result: &crate::passes::ProgramPipelineResult) -> 
 
     generate_graph_function_summary(&mut out, result);
     generate_canonical_dispatch_table(&mut out, result);
+    generate_dispatch_tables(&mut out);
+    generate_concrete_computation(&mut out);
     generate_trace_functions(&mut out);
 
     let flattened_count = result
@@ -71,6 +73,88 @@ pub fn generate_from_pipeline(result: &crate::passes::ProgramPipelineResult) -> 
     ));
 
     out
+}
+
+/// Recognition report for pipeline analysis diagnostic.
+///
+/// Quantifies how much of the input source the pipeline recognizes,
+/// surfacing Unknown ops and unresolved calls per opcode arm.
+#[derive(Debug, Clone)]
+pub struct RecognitionReport {
+    pub total_opcodes: usize,
+    pub flattened: usize,
+    pub total_flat_ops: usize,
+    pub unknown_ops: usize,
+    pub unresolved_calls: usize,
+    pub per_opcode: Vec<OpcodeRecognition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpcodeRecognition {
+    pub selector: String,
+    pub flat_ops: usize,
+    pub unknowns: usize,
+    pub unresolved: usize,
+}
+
+/// Analyze pipeline results to produce a recognition report.
+pub fn recognition_report(result: &crate::passes::ProgramPipelineResult) -> RecognitionReport {
+    use crate::model::OpKind;
+    use crate::passes::flatten::FlatOp;
+
+    let mut report = RecognitionReport {
+        total_opcodes: result.opcode_dispatch.len(),
+        flattened: 0,
+        total_flat_ops: 0,
+        unknown_ops: 0,
+        unresolved_calls: 0,
+        per_opcode: Vec::new(),
+    };
+
+    for arm in &result.opcode_dispatch {
+        let selector = arm.selector.canonical_key();
+        let Some(ssa) = &arm.flattened else {
+            report.per_opcode.push(OpcodeRecognition {
+                selector,
+                flat_ops: 0,
+                unknowns: 0,
+                unresolved: 0,
+            });
+            continue;
+        };
+
+        report.flattened += 1;
+        let mut unknowns = 0;
+        let mut unresolved = 0;
+        let mut flat_ops = 0;
+
+        for insn in &ssa.insns {
+            if let FlatOp::Op(op) = insn {
+                flat_ops += 1;
+                match &op.kind {
+                    OpKind::Unknown { .. } => unknowns += 1,
+                    OpKind::Call { target, .. } => {
+                        if matches!(target, crate::model::CallTarget::UnsupportedExpr) {
+                            unresolved += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        report.total_flat_ops += flat_ops;
+        report.unknown_ops += unknowns;
+        report.unresolved_calls += unresolved;
+        report.per_opcode.push(OpcodeRecognition {
+            selector,
+            flat_ops,
+            unknowns,
+            unresolved,
+        });
+    }
+
+    report
 }
 
 fn generate_graph_function_summary(
@@ -108,6 +192,236 @@ fn generate_canonical_dispatch_table(
         ));
     }
     out.push_str("];\n\n");
+}
+
+fn generate_dispatch_tables(out: &mut String) {
+    // ── Operator → OpCode dispatch tables ──
+    // Generated from BinaryOperator/ComparisonOperator → majit_ir::OpCode mapping.
+    // Consumed by trace_opcode.rs to replace manual match arms.
+
+    // Int binary: BinaryOperator → (OpCode, has_overflow, needs_concrete_check)
+    //
+    // needs_concrete_check: FloorDiv/Mod need non-negative operands,
+    // Lshift/Rshift need shift-in-range validation at concrete level.
+    out.push_str(r#"
+/// Int binary operator dispatch: `(base_op, inplace_op, opcode, has_overflow, needs_concrete_check)`.
+pub const INT_BINOP_TABLE: &[(
+    BinaryOperator, BinaryOperator, majit_ir::OpCode, bool, bool,
+)] = &[
+    (BinaryOperator::Add, BinaryOperator::InplaceAdd, majit_ir::OpCode::IntAddOvf, true, false),
+    (BinaryOperator::Subtract, BinaryOperator::InplaceSubtract, majit_ir::OpCode::IntSubOvf, true, false),
+    (BinaryOperator::Multiply, BinaryOperator::InplaceMultiply, majit_ir::OpCode::IntMulOvf, true, false),
+    (BinaryOperator::FloorDivide, BinaryOperator::InplaceFloorDivide, majit_ir::OpCode::IntFloorDiv, false, true),
+    (BinaryOperator::Remainder, BinaryOperator::InplaceRemainder, majit_ir::OpCode::IntMod, false, true),
+    (BinaryOperator::And, BinaryOperator::InplaceAnd, majit_ir::OpCode::IntAnd, false, false),
+    (BinaryOperator::Or, BinaryOperator::InplaceOr, majit_ir::OpCode::IntOr, false, false),
+    (BinaryOperator::Xor, BinaryOperator::InplaceXor, majit_ir::OpCode::IntXor, false, false),
+    (BinaryOperator::Lshift, BinaryOperator::InplaceLshift, majit_ir::OpCode::IntLshift, false, true),
+    (BinaryOperator::Rshift, BinaryOperator::InplaceRshift, majit_ir::OpCode::IntRshift, false, true),
+];
+
+/// Look up int binary operator dispatch entry.
+pub fn int_binop_lookup(op: BinaryOperator) -> Option<(majit_ir::OpCode, bool, bool)> {
+    INT_BINOP_TABLE
+        .iter()
+        .find(|(base, inplace, _, _, _)| *base == op || *inplace == op)
+        .map(|(_, _, opcode, ovf, concrete)| (*opcode, *ovf, *concrete))
+}
+
+/// Float binary operator dispatch: `(base_op, inplace_op, opcode)`.
+/// Power is excluded — it uses call_elidable_float_typed(pow).
+pub const FLOAT_BINOP_TABLE: &[(
+    BinaryOperator, BinaryOperator, majit_ir::OpCode,
+)] = &[
+    (BinaryOperator::Add, BinaryOperator::InplaceAdd, majit_ir::OpCode::FloatAdd),
+    (BinaryOperator::Subtract, BinaryOperator::InplaceSubtract, majit_ir::OpCode::FloatSub),
+    (BinaryOperator::Multiply, BinaryOperator::InplaceMultiply, majit_ir::OpCode::FloatMul),
+    (BinaryOperator::FloorDivide, BinaryOperator::InplaceFloorDivide, majit_ir::OpCode::FloatFloorDiv),
+    (BinaryOperator::Remainder, BinaryOperator::InplaceRemainder, majit_ir::OpCode::FloatMod),
+    (BinaryOperator::TrueDivide, BinaryOperator::InplaceTrueDivide, majit_ir::OpCode::FloatTrueDiv),
+];
+
+/// Look up float binary operator dispatch entry.
+/// Returns None for Power (handled separately) and unsupported ops.
+pub fn float_binop_lookup(op: BinaryOperator) -> Option<majit_ir::OpCode> {
+    FLOAT_BINOP_TABLE
+        .iter()
+        .find(|(base, inplace, _)| *base == op || *inplace == op)
+        .map(|(_, _, opcode)| *opcode)
+}
+
+/// Comparison operator dispatch: `(comp_op, int_opcode, float_opcode)`.
+pub const COMPARE_TABLE: &[(
+    ComparisonOperator, majit_ir::OpCode, majit_ir::OpCode,
+)] = &[
+    (ComparisonOperator::Less, majit_ir::OpCode::IntLt, majit_ir::OpCode::FloatLt),
+    (ComparisonOperator::LessOrEqual, majit_ir::OpCode::IntLe, majit_ir::OpCode::FloatLe),
+    (ComparisonOperator::Greater, majit_ir::OpCode::IntGt, majit_ir::OpCode::FloatGt),
+    (ComparisonOperator::GreaterOrEqual, majit_ir::OpCode::IntGe, majit_ir::OpCode::FloatGe),
+    (ComparisonOperator::Equal, majit_ir::OpCode::IntEq, majit_ir::OpCode::FloatEq),
+    (ComparisonOperator::NotEqual, majit_ir::OpCode::IntNe, majit_ir::OpCode::FloatNe),
+];
+
+/// Look up comparison operator dispatch for int operands.
+pub fn int_compare_lookup(op: ComparisonOperator) -> majit_ir::OpCode {
+    COMPARE_TABLE
+        .iter()
+        .find(|(cmp, _, _)| *cmp == op)
+        .map(|(_, int_op, _)| *int_op)
+        .expect("all ComparisonOperator variants are covered")
+}
+
+/// Look up comparison operator dispatch for float operands.
+pub fn float_compare_lookup(op: ComparisonOperator) -> majit_ir::OpCode {
+    COMPARE_TABLE
+        .iter()
+        .find(|(cmp, _, _)| *cmp == op)
+        .map(|(_, _, float_op)| *float_op)
+        .expect("all ComparisonOperator variants are covered")
+}
+"#);
+}
+
+fn generate_concrete_computation(out: &mut String) {
+    // ── Concrete computation helpers ──
+    // Used by binary_value() to compute the concrete Python result during tracing.
+    // Extracted from trace_opcode.rs match arms.
+
+    out.push_str(
+        r#"
+/// Compute concrete float binary operation result.
+/// Returns None for unsupported ops or division by zero.
+///
+/// floatobject.py: descr_add/sub/mul/truediv/floordiv/mod/pow
+pub fn concrete_float_binop(op: BinaryOperator, lhs: f64, rhs: f64) -> Option<f64> {
+    match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(lhs + rhs),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(lhs - rhs),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(lhs * rhs),
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide if rhs != 0.0 => {
+            Some(lhs / rhs)
+        }
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0.0 => {
+            Some((lhs / rhs).floor())
+        }
+        // floatobject.py:520-540 descr_mod: math_fmod + sign correction + copysign
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0.0 => {
+            Some(float_mod(lhs, rhs))
+        }
+        // floatobject.py:561 descr_pow → _pow()
+        BinaryOperator::Power | BinaryOperator::InplacePower => float_pow(lhs, rhs),
+        _ => None,
+    }
+}
+
+/// floatobject.py:520-540: float modulo with sign correction.
+/// Uses fmod + denominator sign correction + copysign for zero remainder.
+fn float_mod(x: f64, y: f64) -> f64 {
+    let mut m = x % y; // C fmod semantics (same as Rust %)
+    if m != 0.0 {
+        // ensure the remainder has the same sign as the denominator
+        if (y < 0.0) != (m < 0.0) {
+            m += y;
+        }
+    } else {
+        // the remainder is zero: ensure it has the same sign as the denominator
+        m = f64::copysign(0.0, y);
+    }
+    m
+}
+
+/// floatobject.py:799-881: _pow with special-case handling.
+/// Returns None for domain errors (negative base with fractional exponent).
+fn float_pow(x: f64, y: f64) -> Option<f64> {
+    if y == 2.0 {
+        return Some(x * x);
+    }
+    if y == 0.0 {
+        return Some(1.0);
+    }
+    if x.is_nan() {
+        return Some(x);
+    }
+    if y.is_nan() {
+        return Some(if x == 1.0 { 1.0 } else { y });
+    }
+    if y.is_infinite() {
+        let ax = x.abs();
+        if ax == 1.0 {
+            return Some(1.0);
+        } else if (y > 0.0) == (ax > 1.0) {
+            return Some(f64::INFINITY);
+        } else {
+            return Some(0.0);
+        }
+    }
+    if x.is_infinite() {
+        let y_is_odd = y.abs() % 2.0 == 1.0;
+        if y > 0.0 {
+            return Some(if y_is_odd { x } else { x.abs() });
+        } else {
+            return Some(if y_is_odd { f64::copysign(0.0, x) } else { 0.0 });
+        }
+    }
+    if x == 0.0 && y < 0.0 {
+        return None; // ZeroDivisionError
+    }
+    let mut negate_result = false;
+    let mut bx = x;
+    if bx < 0.0 {
+        if y.floor() != y {
+            return None; // PowDomainError → ValueError
+        }
+        bx = -bx;
+        negate_result = y.abs() % 2.0 == 1.0;
+    }
+    if bx == 1.0 {
+        return Some(if negate_result { -1.0 } else { 1.0 });
+    }
+    let z = bx.powf(y);
+    if z.is_infinite() || z.is_nan() {
+        return None;
+    }
+    Some(if negate_result { -z } else { z })
+}
+
+/// Compute concrete int binary operation result.
+/// Returns None for overflow, division by zero, or unsupported ops.
+pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64> {
+    match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => lhs.checked_add(rhs),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lhs.checked_sub(rhs),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lhs.checked_mul(rhs),
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0 => {
+            Some(((lhs % rhs) + rhs) % rhs)
+        }
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0 => {
+            lhs.checked_div(rhs).map(|d| {
+                if (lhs ^ rhs) < 0 && d * rhs != lhs { d - 1 } else { d }
+            })
+        }
+        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(lhs & rhs),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(lhs | rhs),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
+            let shift = rhs as u32;
+            if shift >= 64 { return None; }
+            let r = lhs.wrapping_shl(shift);
+            if r.wrapping_shr(shift) != lhs { None } else { Some(r) }
+        }
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
+            let shift = rhs as u32;
+            if shift >= 64 {
+                Some(if lhs < 0 { -1 } else { 0 })
+            } else {
+                Some(lhs >> shift)
+            }
+        }
+        _ => None,
+    }
+}
+"#,
+    );
 }
 
 fn generate_trace_functions(out: &mut String) {
@@ -423,5 +737,55 @@ mod tests {
         assert!(code.contains("canonical pipeline"));
         assert!(code.contains("GRAPH_FUNCTIONS"));
         assert!(code.contains("CANONICAL_TRACE_PATTERNS"));
+    }
+
+    #[test]
+    fn generate_dispatch_tables_emits_all_tables() {
+        let pipeline = crate::passes::ProgramPipelineResult {
+            functions: Vec::new(),
+            opcode_dispatch: Vec::new(),
+            jitcodes: Vec::new(),
+            total_blocks: 0,
+            total_ops: 0,
+            total_vable_rewrites: 0,
+        };
+        let code = generate_from_pipeline(&pipeline);
+        // Int binary dispatch table
+        assert!(
+            code.contains("INT_BINOP_TABLE"),
+            "should emit INT_BINOP_TABLE"
+        );
+        assert!(
+            code.contains("int_binop_lookup"),
+            "should emit int_binop_lookup"
+        );
+        // Float binary dispatch table
+        assert!(
+            code.contains("FLOAT_BINOP_TABLE"),
+            "should emit FLOAT_BINOP_TABLE"
+        );
+        assert!(
+            code.contains("float_binop_lookup"),
+            "should emit float_binop_lookup"
+        );
+        // Comparison dispatch table
+        assert!(code.contains("COMPARE_TABLE"), "should emit COMPARE_TABLE");
+        assert!(
+            code.contains("int_compare_lookup"),
+            "should emit int_compare_lookup"
+        );
+        assert!(
+            code.contains("float_compare_lookup"),
+            "should emit float_compare_lookup"
+        );
+        // Concrete computation helpers
+        assert!(
+            code.contains("concrete_float_binop"),
+            "should emit concrete_float_binop"
+        );
+        assert!(
+            code.contains("concrete_int_binop"),
+            "should emit concrete_int_binop"
+        );
     }
 }
