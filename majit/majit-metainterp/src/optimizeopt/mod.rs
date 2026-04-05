@@ -2452,6 +2452,24 @@ impl OptContext {
             .map_or(false, |descr| descr.is_resume_at_position())
     }
 
+    /// Take ownership of PtrInfo, replacing with None.
+    /// Used by force_box to mutate info in-place (RPython parity).
+    pub fn take_ptr_info(&mut self, opref: OpRef) -> Option<PtrInfo> {
+        use crate::optimizeopt::info::Forwarded;
+        let r = self.get_box_replacement(opref);
+        let slot = self.forwarded.get_mut(r.0 as usize)?;
+        match slot {
+            Forwarded::Info(_) => {
+                let old = std::mem::replace(slot, Forwarded::None);
+                match old {
+                    Forwarded::Info(info) => Some(info),
+                    _ => unreachable!(),
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn set_ptr_info(&mut self, opref: OpRef, info: PtrInfo) {
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.0 as usize;

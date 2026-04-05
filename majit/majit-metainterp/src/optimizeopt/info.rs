@@ -627,10 +627,10 @@ impl PtrInfo {
 
         fn force_child(value_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
             let value_ref = ctx.get_box_replacement(value_ref);
-            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
-                if info.is_virtual() {
-                    return info.force_box_impl(value_ref, ctx);
-                }
+            if ctx.get_ptr_info(value_ref).is_some_and(|i| i.is_virtual()) {
+                let mut info = ctx.take_ptr_info(value_ref).unwrap();
+                let forced = info.force_box_impl(value_ref, ctx);
+                return ctx.get_box_replacement(forced);
             }
             value_ref
         }
