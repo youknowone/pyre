@@ -2605,10 +2605,13 @@ fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::Resu
     }]
 }
 
-/// resume.py:1042-1057 rebuild_from_numbering: decode rd_numb to produce
-/// typed values. Each slot is either TAGBOX (from deadframe), TAGCONST
+/// Decode rd_numb to produce typed values for JIT state restore.
+/// Each slot is either TAGBOX (from deadframe), TAGCONST
 /// (compile-time constant), TAGINT (small inline int), or TAGVIRTUAL
 /// (virtual object to materialize later by rebuild_state_after_failure_with_exit_layout).
+///
+/// Uses flat single-frame decoder (rebuild_from_numbering).
+/// The RPython-parity multi-frame path is blackhole_from_resumedata.
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -2730,9 +2733,12 @@ fn rebuild_typed_from_rd_numb(
     typed
 }
 
-/// resume.py:1333-1343 blackhole_from_resumedata parity:
 /// Decode rd_numb into per-frame ResumedFrame chain.
 /// Each frame gets its own resolved values, code pointer, and py_pc.
+///
+/// NOTE: Uses rebuild_from_numbering (flat single-frame decoder).
+/// For RPython-parity multi-frame decode with liveness-based splitting,
+/// see majit_metainterp::resume::blackhole_from_resumedata.
 fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
