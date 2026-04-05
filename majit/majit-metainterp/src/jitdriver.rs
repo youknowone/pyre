@@ -1249,7 +1249,7 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 green_key
             };
-            let (should_bridge, _owning_key) = self.meta.must_compile_with_values(
+            let (must_compile, _owning_key) = self.meta.must_compile_with_values(
                 guard_loop_key,
                 trace_id,
                 fail_index,
@@ -1257,6 +1257,9 @@ impl<S: JitState> JitDriver<S> {
                 status,
                 descr_addr,
             );
+            // compile.py:702-703: must_compile() and not stack_almost_full()
+            let should_bridge =
+                must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
             // Extract guard_resume_pc from fail_args (last Int value).
             let num_inputs = self.meta.compiled_num_inputs(green_key);
@@ -2175,7 +2178,7 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (should_bridge, owning_key) = self.meta.must_compile_with_values(
+        let (must_compile, owning_key) = self.meta.must_compile_with_values(
             guard_loop_key,
             trace_id,
             fail_index,
@@ -2183,6 +2186,9 @@ impl<S: JitState> JitDriver<S> {
             status,
             descr_addr,
         );
+        // compile.py:702-703: must_compile() and not stack_almost_full()
+        let should_bridge =
+            must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
         // Return raw guard failure data. State restoration and bridge/
         // blackhole decision happen in the caller's handle_fail().
@@ -2762,7 +2768,7 @@ impl<S: JitState> JitDriver<S> {
             //       resume_in_blackhole(...)
             //   assert 0, "unreachable"
 
-            let (should_bridge, _owning_key) = self.meta.must_compile_with_values(
+            let (must_compile, _owning_key) = self.meta.must_compile_with_values(
                 key_hash,
                 trace_id,
                 fail_index,
@@ -2770,6 +2776,9 @@ impl<S: JitState> JitDriver<S> {
                 status,
                 descr_addr,
             );
+            // compile.py:702-703: must_compile() and not stack_almost_full()
+            let should_bridge =
+                must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
             // Extract guard_resume_pc from fail_args.
             // The last Int value is the bytecode pc at the guard point,
