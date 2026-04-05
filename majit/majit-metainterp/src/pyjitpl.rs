@@ -4784,10 +4784,12 @@ impl<M: Clone> MetaInterp<M> {
     const TY_REF: u64 = 0x04;
     const TY_FLOAT: u64 = 0x06;
 
-    /// compile.py:738-784: must_compile — read self.status from descriptor
-    /// LIVE (not a snapshot), compute hash, tick jitcounter.
+    /// compile.py:738-784: must_compile — read self.status directly from
+    /// the failed descriptor (by descr_addr), compute hash, tick jitcounter.
     ///
-    /// RPython: must_compile reads self.status at call time (compile.py:741).
+    /// RPython: must_compile is a method ON the failed descriptor. self.status
+    /// reads the live status of that exact object. descr_addr IS the identity
+    /// of that descriptor (current_object_addr_as_int(self) in RPython).
     /// ALWAYS ticks the counter. stack_almost_full is checked by the caller
     /// in handle_fail (compile.py:702-703).
     /// Returns (should_compile, owning_green_key).
@@ -4797,17 +4799,15 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
+        descr_addr: usize,
     ) -> (bool, u64) {
         let owning_key = self.find_owning_key(green_key, trace_id);
-        // compile.py:741: read self.status from the descriptor LIVE.
-        // RPython: must_compile is a method on the descriptor → self.status.
-        // In RPython the descriptor always exists (handle_fail is called on
-        // it). If we can't find the descriptor, the compiled code was released
-        // — no tick, no compile.
-        let Some((status, descr_addr)) = self.get_guard_status(owning_key, trace_id, fail_index)
-        else {
+        if descr_addr == 0 {
             return (false, owning_key);
-        };
+        }
+        // compile.py:741: self.status — read live status directly from the
+        // failed descriptor object (not a re-lookup by trace_id/fail_index).
+        let status = self.backend.read_descr_status(descr_addr);
         // compile.py:741-751: decode status to get hash
         let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
             // compile.py:745: common case — TY_NONE, not busy.
@@ -4877,45 +4877,16 @@ impl<M: Clone> MetaInterp<M> {
         None
     }
 
-    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG on descriptor.
-    /// RPython: self.start_compiling() on the failed descriptor itself.
-    /// Search current token + previous_tokens by trace_id to find the
-    /// exact descriptor that failed (not just the current token's).
-    pub fn start_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return;
-        };
-        let tid = Self::normalize_trace_id(compiled, trace_id);
-        if self
-            .backend
-            .start_guard_compiling(&compiled.token, tid, fail_index)
-        {
-            return;
-        }
-        for prev in &compiled.previous_tokens {
-            if self.backend.start_guard_compiling(prev, tid, fail_index) {
-                return;
-            }
-        }
+    /// compile.py:786-788: self.start_compiling() — set ST_BUSY_FLAG
+    /// on the exact failed descriptor (by descr_addr, not re-lookup).
+    pub fn start_guard_compiling(&self, descr_addr: usize) {
+        self.backend.start_compiling_descr(descr_addr);
     }
 
-    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG on descriptor.
-    pub fn done_guard_compiling(&self, green_key: u64, trace_id: u64, fail_index: u32) {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return;
-        };
-        let tid = Self::normalize_trace_id(compiled, trace_id);
-        if self
-            .backend
-            .done_guard_compiling(&compiled.token, tid, fail_index)
-        {
-            return;
-        }
-        for prev in &compiled.previous_tokens {
-            if self.backend.done_guard_compiling(prev, tid, fail_index) {
-                return;
-            }
-        }
+    /// compile.py:790-795: self.done_compiling() — clear ST_BUSY_FLAG
+    /// on the exact failed descriptor (by descr_addr, not re-lookup).
+    pub fn done_guard_compiling(&self, descr_addr: usize) {
+        self.backend.done_compiling_descr(descr_addr);
     }
 
     /// Find the compiled_loops key that owns a given trace_id.
@@ -6874,6 +6845,9 @@ pub enum DetailedDriverRunOutcome {
         should_bridge: bool,
         /// compile.py: rd_loop_token — owning compiled loop key.
         owning_key: u64,
+        /// compile.py:780: current_object_addr_as_int(self) — the exact
+        /// descriptor that failed. Used for start/done_compiling.
+        descr_addr: usize,
         /// Raw register values from compiled code exit.
         raw_values: Vec<i64>,
         /// Guard exit layout (rd_numb, fail_arg_types, etc.).

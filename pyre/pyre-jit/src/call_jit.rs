@@ -2156,6 +2156,7 @@ fn jit_ca_handle_guard_failure(
     fail_index: u32,
     raw_values_ptr: *const i64,
     num_values: usize,
+    descr_addr: usize,
 ) -> bool {
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
@@ -2167,7 +2168,7 @@ fn jit_ca_handle_guard_failure(
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
-            .must_compile_with_values(green_key, trace_id, fail_index, raw_values)
+            .must_compile_with_values(green_key, trace_id, fail_index, raw_values, descr_addr)
     };
     // compile.py:702-703: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
@@ -2203,12 +2204,10 @@ fn jit_ca_handle_guard_failure(
     }
     let frame = unsafe { &mut *frame_ptr };
 
-    // compile.py:786-788 start_compiling: set ST_BUSY_FLAG
+    // compile.py:786-788 self.start_compiling(): set ST_BUSY_FLAG
     {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .start_guard_compiling(owning_key, trace_id, fail_index);
+        driver.meta_interp_mut().start_guard_compiling(descr_addr);
     }
 
     // compile.py:706-708 _trace_and_compile_from_bridge
@@ -2221,12 +2220,10 @@ fn jit_ca_handle_guard_failure(
         &exit_layout,
     );
 
-    // compile.py:790-795 done_compiling: clear ST_BUSY_FLAG
+    // compile.py:790-795 self.done_compiling(): clear ST_BUSY_FLAG
     {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .done_guard_compiling(owning_key, trace_id, fail_index);
+        driver.meta_interp_mut().done_guard_compiling(descr_addr);
     }
 
     if majit_metainterp::majit_log_enabled() {
