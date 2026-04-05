@@ -239,6 +239,10 @@ pub struct OptContext {
     /// before a guard, consumed by emit_operation() to encode into
     /// the guard's rd_pendingfields.
     pub pending_for_guard: Vec<Op>,
+    /// optimizer.py: pure_from_args1 parity — reverse-pure relationships
+    /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
+    /// Each entry: (opcode, arg0, result) meaning pure(opcode, arg0) = result.
+    pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef)>,
     /// optimizer.py:787: constant_fold allocator callback.
     /// When set, the optimizer can fold immutable virtuals filled with
     /// constants into compile-time constant pointers (info.py:140-145).
@@ -682,6 +686,7 @@ impl OptContext {
 
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            pending_pure_from_args: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
@@ -737,6 +742,7 @@ impl OptContext {
 
             in_final_emission: false,
             pending_for_guard: Vec::new(),
+            pending_pure_from_args: Vec::new(),
             constant_fold_alloc: None,
             quasi_immutable_deps: HashSet::new(),
             snapshot_boxes: HashMap::new(),
@@ -1451,6 +1457,13 @@ impl OptContext {
     /// cross-slot fresh allocation) still operates on majit's flat OpRef
     /// model, not RPython's per-Box identity. See XXX comments in
     /// unroll.rs:import_state and optimizer.rs:imported_loop_state.
+    /// optimizer.py: pure_from_args1 parity.
+    /// Register reverse-pure: pure(opcode, result) = arg0.
+    /// Consumed by OptPure at flush time.
+    pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
+        self.pending_pure_from_args.push((opcode, result, arg0));
+    }
+
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new {
             return;

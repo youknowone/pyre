@@ -3994,17 +3994,48 @@ impl MIFrame {
                     fa
                 };
 
-                // capture_resumedata parity: snapshot before guard.
-                let snapshot_boxes =
-                    Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &fail_arg_types, ctx);
-                let vable_boxes = Self::build_virtualizable_boxes(this.sym(), ctx);
+                // capture_resumedata parity: full framestack snapshot.
+                // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
+                let mut frames = vec![majit_trace::recorder::SnapshotFrame {
+                    jitcode_index,
+                    pc: resume_pc as u32,
+                    boxes: Self::fail_args_to_snapshot_boxes_typed(
+                        &active_boxes,
+                        &fail_arg_types,
+                        ctx,
+                    ),
+                }];
+                let mut all_fail_args = fail_args.clone();
+                let mut all_types = fail_arg_types.clone();
+                // Include parent frames (RPython: full self.framestack).
+                for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &this.parent_frames {
+                    let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+                    let parent_active = if pfa.len() > __n {
+                        &pfa[__n..]
+                    } else {
+                        &pfa[..]
+                    };
+                    frames.push(majit_trace::recorder::SnapshotFrame {
+                        jitcode_index: *pfa_jitcode_index as u32,
+                        pc: *pfa_resumepc as u32,
+                        boxes: Self::fail_args_to_snapshot_boxes_typed(
+                            parent_active,
+                            pfa_types,
+                            ctx,
+                        ),
+                    });
+                    all_fail_args.extend_from_slice(pfa);
+                    let pt = if pfa_types.is_empty() {
+                        fail_arg_types_for_virtualizable_state(pfa.len())
+                    } else {
+                        pfa_types.clone()
+                    };
+                    all_types.extend_from_slice(&pt);
+                }
+                let vable_boxes = Self::build_virtualizable_boxes(this.sym(), ctx);
                 let snapshot = majit_trace::recorder::Snapshot {
-                    frames: vec![majit_trace::recorder::SnapshotFrame {
-                        jitcode_index,
-                        pc: resume_pc as u32,
-                        boxes: snapshot_boxes,
-                    }],
+                    frames,
                     vable_boxes,
                     vref_boxes: Self::build_virtualref_boxes(this.sym(), ctx),
                 };
@@ -4014,8 +4045,8 @@ impl MIFrame {
                 let op = ctx.record_guard_typed_with_fail_args(
                     majit_ir::OpCode::GuardException,
                     &[exc_type_const],
-                    fail_arg_types,
-                    &fail_args,
+                    all_types,
+                    &all_fail_args,
                 );
                 ctx.set_last_guard_resume_position(snapshot_id);
 

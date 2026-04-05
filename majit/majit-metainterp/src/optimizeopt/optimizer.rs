@@ -1320,10 +1320,7 @@ impl Optimizer {
                 .map(|p| p as i32)
                 .unwrap_or(-1);
             let mut new_info = PtrInfo::known_class(class_ptr, true);
-            // Restore last_guard_pos from old info.
-            if let PtrInfo::KnownClass { last_guard_pos, .. } = &mut new_info {
-                *last_guard_pos = old_guard_pos;
-            }
+            new_info.set_last_guard_pos(old_guard_pos);
             ctx.set_ptr_info(resolved, new_info);
         }
         // optimizer.py:150-151: if update_last_guard: mark_last_guard

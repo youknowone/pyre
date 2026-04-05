@@ -32,7 +32,7 @@ use majit_ir::{
     OpRef, Type, Value,
 };
 
-use crate::guard::{BridgeData, CraneliftFailDescr, FrameData};
+use crate::guard::{BridgeData, CraneliftFailDescr, FrameData, JitFrameDeadFrame};
 
 // ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
 // Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
@@ -406,6 +406,9 @@ impl PreviewFrameData {
 }
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Some(jf.fail_descr.layout());
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Some(frame_data.fail_descr.layout());
     }
@@ -2151,6 +2154,9 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
         [] => Ok(0),
         [Type::Int] => get_int_from_deadframe(frame, 0),
         [Type::Ref] => {
+            if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
+                return Ok(jf.take_ref_for_call_result(0).as_usize() as i64);
+            }
             if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
                 return Ok(frame_data.take_ref_for_call_result(0).as_usize() as i64);
             }
@@ -2347,6 +2353,10 @@ pub fn set_savedata_ref_on_deadframe(
     frame: &mut DeadFrame,
     data: GcRef,
 ) -> Result<(), BackendError> {
+    if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
+        jf.set_savedata_ref(data);
+        return Ok(());
+    }
     if let Some(frame_data) = frame.data.downcast_mut::<FrameData>() {
         frame_data.set_savedata_ref(data);
         return Ok(());
@@ -2366,6 +2376,9 @@ pub fn set_savedata_ref_on_deadframe(
 }
 
 pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDescr, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.fail_descr.as_ref());
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.fail_descr.as_ref());
     }
@@ -2381,6 +2394,9 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_int(index));
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_int(index));
     }
@@ -2396,6 +2412,9 @@ pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, Ba
 }
 
 pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_float(index));
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_float(index));
     }
@@ -2411,6 +2430,9 @@ pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, 
 }
 
 pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_ref(index));
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_ref(index));
     }
@@ -2426,6 +2448,9 @@ pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, 
 }
 
 pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_savedata_ref());
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_savedata_ref());
     }
@@ -2442,6 +2467,9 @@ pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backe
 }
 
 pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return jf.try_get_savedata_ref();
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return frame_data.try_get_savedata_ref();
     }
@@ -2456,6 +2484,9 @@ pub fn grab_savedata_ref_from_deadframe(frame: &DeadFrame) -> Option<GcRef> {
 }
 
 pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_exception_ref());
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_exception_ref());
     }
@@ -2471,6 +2502,9 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
 }
 
 pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
+    if let Some(jf) = frame.data.downcast_ref::<JitFrameDeadFrame>() {
+        return Ok(jf.get_exception_class());
+    }
     if let Some(frame_data) = frame.data.downcast_ref::<FrameData>() {
         return Ok(frame_data.get_exception_class());
     }
@@ -2488,7 +2522,7 @@ pub fn grab_exc_class_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendEr
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut current_inputs = inputs.to_vec();
     loop {
-        let (fail_index, outputs, handle, force_frame, direct_descr) = run_compiled_code(
+        let exec = run_compiled_code(
             target.code_ptr,
             &target.fail_descrs,
             target.gc_runtime_id,
@@ -2497,6 +2531,11 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             &current_inputs,
             target.needs_force_frame,
         );
+        let fail_index = exec.fail_index;
+        let handle = exec.force_handle;
+        let force_frame = exec.force_frame.clone();
+        let direct_descr = exec.direct_descr.clone();
+        let outputs = exec.extract_outputs(target.max_output_slots.max(1));
 
         if let Some(frame) =
             maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
@@ -2753,170 +2792,176 @@ fn call_assembler_fast_path(
         return result as u64;
     }
 
-    let actual_outputs = target.max_output_slots.max(1);
-    let actual_roots = target.num_ref_roots.max(1);
-    if actual_outputs + actual_roots > FAST_PATH_MAX_OUTPUTS {
-        return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
-    }
+    // RPython parity: always use heap-allocated JitFrame (no stack buffer).
+    return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
 
-    let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
-        unsafe { std::mem::transmute(target.code_ptr) };
-
-    let _jitted_guard = majit_backend::JittedGuard::enter();
-
-    let handle = 0u64;
-
-    // jf_buf: header + output slots + ref root slots (all in one buffer).
-    const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
-    let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS + FAST_PATH_MAX_ROOTS];
-    // jitframe.py:48-52 jitframe_allocate: set jf_frame length for GC bounds check.
-    let frame_depth = actual_outputs + actual_roots;
-    jf_buf[JF_FRAME_LENGTH_OFS as usize / 8] = frame_depth as i64;
-    for (i, &val) in inputs.iter().enumerate() {
-        jf_buf[HEADER_WORDS + i] = val;
-    }
-
-    let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
-    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-    let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-        CALL_ASSEMBLER_DEADFRAME_SENTINEL
-    } else if jf_descr_raw == 0 {
-        0u32
-    } else {
-        unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
-    };
-    let outputs = {
-        let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
-        out.copy_from_slice(&jf_buf[HEADER_WORDS..HEADER_WORDS + FAST_PATH_MAX_OUTPUTS]);
-        out
-    };
-
-    drop(_jitted_guard);
-
-    // Handle nested call_assembler DEADFRAME propagation
-    if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
-        let frame = take_call_assembler_deadframe_from_outputs(&outputs);
-        release_force_token(handle);
-        let handle = store_call_assembler_deadframe(frame);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-            *outcome.add(1) = handle as i64;
+    #[allow(unreachable_code)]
+    {
+        let actual_outputs = target.max_output_slots.max(1);
+        let actual_roots = target.num_ref_roots.max(1);
+        if actual_outputs + actual_roots > FAST_PATH_MAX_OUTPUTS {
+            return call_assembler_fast_path_heap(target, inputs, outcome, force_fn);
         }
-        return 0;
-    }
 
-    let fail_descr = &target.fail_descrs[fail_index as usize];
+        let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+            unsafe { std::mem::transmute(target.code_ptr) };
 
-    if fail_descr.is_finish() {
+        let _jitted_guard = majit_backend::JittedGuard::enter();
+
+        let handle = 0u64;
+
+        // jf_buf: header + output slots + ref root slots (all in one buffer).
+        const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
+        let mut jf_buf = [0i64; HEADER_WORDS + FAST_PATH_MAX_OUTPUTS + FAST_PATH_MAX_ROOTS];
+        // jitframe.py:48-52 jitframe_allocate: set jf_frame length for GC bounds check.
+        let frame_depth = actual_outputs + actual_roots;
+        jf_buf[JF_FRAME_LENGTH_OFS as usize / 8] = frame_depth as i64;
+        for (i, &val) in inputs.iter().enumerate() {
+            jf_buf[HEADER_WORDS + i] = val;
+        }
+
+        let result_jf = unsafe { func(jf_buf.as_mut_ptr()) };
+        let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+        let fail_index = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+            CALL_ASSEMBLER_DEADFRAME_SENTINEL
+        } else if jf_descr_raw == 0 {
+            0u32
+        } else {
+            unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) }.fail_index()
+        };
+        let outputs = {
+            let mut out = [0i64; FAST_PATH_MAX_OUTPUTS];
+            out.copy_from_slice(&jf_buf[HEADER_WORDS..HEADER_WORDS + FAST_PATH_MAX_OUTPUTS]);
+            out
+        };
+
+        drop(_jitted_guard);
+
+        // Handle nested call_assembler DEADFRAME propagation
+        if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
+            let frame = take_call_assembler_deadframe_from_outputs(&outputs);
+            release_force_token(handle);
+            let handle = store_call_assembler_deadframe(frame);
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+                *outcome.add(1) = handle as i64;
+            }
+            return 0;
+        }
+
+        let fail_descr = &target.fail_descrs[fail_index as usize];
+
+        if fail_descr.is_finish() {
+            release_force_token(handle);
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                *outcome.add(1) = 0;
+            }
+            return match fail_descr.fail_arg_types() {
+                [] | [Type::Void] => 0,
+                // compile.py:649 DoneWithThisFrameDescr*.get_result:
+                // cpu.get_{int,ref,float}_value(deadframe, 0)
+                [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
+                _ => {
+                    let outputs_vec = outputs[..actual_outputs].to_vec();
+                    let mut frame =
+                        build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
+                    finish_result_from_deadframe(&mut frame)
+                        .expect("finish_result_from_deadframe failed") as u64
+                }
+            };
+        }
+
+        // Guard failure — check for bridge, then fall back to force
+        fail_descr.increment_fail_count();
+        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
+
+        // If a bridge is attached, execute it instead of calling force_fn.
+        let bridge_guard = fail_descr.bridge_ref();
+        if let Some(ref bridge) = *bridge_guard {
+            release_force_token(handle);
+            // RPython rebuild_state_after_failure parity: materialize virtual
+            // objects before bridge dispatch. Virtual Ref slots are null (0)
+            // with their fields in trailing Int slots.
+            let mut bridge_outputs = outputs.to_vec();
+            rebuild_state_after_failure(
+                &mut bridge_outputs,
+                &fail_descr.fail_arg_types,
+                fail_descr.recovery_layout_ref().as_ref(),
+                bridge.num_inputs,
+            );
+            let outputs_slice = &bridge_outputs[..bridge_outputs.len().min(actual_outputs)];
+            let mut frame =
+                CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
+            let bridge_descr = get_latest_descr_from_deadframe(&frame)
+                .expect("bridge deadframe must have a descriptor");
+            if bridge_descr.is_finish() {
+                unsafe {
+                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                    *outcome.add(1) = 0;
+                }
+                return finish_result_from_deadframe(&mut frame)
+                    .expect("finish_result_from_deadframe failed") as u64;
+            }
+            // Bridge didn't finish — store as deadframe for caller
+            let df_handle = store_call_assembler_deadframe(frame);
+            unsafe {
+                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+                *outcome.add(1) = df_handle as i64;
+            }
+            return 0;
+        }
+        let _ = bridge_guard;
+
         release_force_token(handle);
+
+        // resume.py:1312 blackhole_from_resumedata parity: materialize
+        // virtuals before blackhole resume.
+        if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
+            let green_key = target.green_key;
+            let trace_id = target.trace_id;
+            let raw_num = fail_descr.fail_arg_types.len();
+            let raw_outputs = outputs.to_vec(); // raw deadframe before rebuild
+            let mut bh_outputs = outputs.to_vec();
+            rebuild_state_after_failure(
+                &mut bh_outputs,
+                &fail_descr.fail_arg_types,
+                fail_descr.recovery_layout_ref().as_ref(),
+                raw_num,
+            );
+            let num_outputs = bh_outputs.len();
+            if let Some(result) = bh_fn(
+                green_key,
+                trace_id,
+                fail_index,
+                bh_outputs.as_ptr(),
+                num_outputs,
+                raw_outputs.as_ptr(),
+                raw_num,
+            ) {
+                unsafe {
+                    *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+                    *outcome.add(1) = 0;
+                }
+                return result as u64;
+            }
+        }
+
+        // RPython assembler_call_helper: force_fn receives the callee frame.
+        // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
+        // but force_fn needs the callee frame which is inputs[0].
+        let callee_frame_ptr = inputs[0];
+        let result = force_fn(callee_frame_ptr);
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
         }
-        return match fail_descr.fail_arg_types() {
-            [] | [Type::Void] => 0,
-            // compile.py:649 DoneWithThisFrameDescr*.get_result:
-            // cpu.get_{int,ref,float}_value(deadframe, 0)
-            [Type::Int] | [Type::Float] | [Type::Ref] => outputs[0] as u64,
-            _ => {
-                let outputs_vec = outputs[..actual_outputs].to_vec();
-                let mut frame =
-                    build_deadframe_from_outputs(outputs_vec, fail_descr, target.gc_runtime_id);
-                finish_result_from_deadframe(&mut frame)
-                    .expect("finish_result_from_deadframe failed") as u64
-            }
-        };
-    }
-
-    // Guard failure — check for bridge, then fall back to force
-    fail_descr.increment_fail_count();
-    ACTIVE_GC_RUNTIME_ID.with(|c| c.set(target.gc_runtime_id));
-
-    // If a bridge is attached, execute it instead of calling force_fn.
-    let bridge_guard = fail_descr.bridge_ref();
-    if let Some(ref bridge) = *bridge_guard {
-        release_force_token(handle);
-        // RPython rebuild_state_after_failure parity: materialize virtual
-        // objects before bridge dispatch. Virtual Ref slots are null (0)
-        // with their fields in trailing Int slots.
-        let mut bridge_outputs = outputs.to_vec();
-        rebuild_state_after_failure(
-            &mut bridge_outputs,
-            &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
-            bridge.num_inputs,
-        );
-        let outputs_slice = &bridge_outputs[..bridge_outputs.len().min(actual_outputs)];
-        let mut frame =
-            CraneliftBackend::execute_bridge(bridge, outputs_slice, &fail_descr.fail_arg_types);
-        let bridge_descr = get_latest_descr_from_deadframe(&frame)
-            .expect("bridge deadframe must have a descriptor");
-        if bridge_descr.is_finish() {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return finish_result_from_deadframe(&mut frame)
-                .expect("finish_result_from_deadframe failed") as u64;
-        }
-        // Bridge didn't finish — store as deadframe for caller
-        let df_handle = store_call_assembler_deadframe(frame);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-            *outcome.add(1) = df_handle as i64;
-        }
-        return 0;
-    }
-    let _ = bridge_guard;
-
-    release_force_token(handle);
-
-    // resume.py:1312 blackhole_from_resumedata parity: materialize
-    // virtuals before blackhole resume.
-    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.green_key;
-        let trace_id = target.trace_id;
-        let raw_num = fail_descr.fail_arg_types.len();
-        let raw_outputs = outputs.to_vec(); // raw deadframe before rebuild
-        let mut bh_outputs = outputs.to_vec();
-        rebuild_state_after_failure(
-            &mut bh_outputs,
-            &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
-            raw_num,
-        );
-        let num_outputs = bh_outputs.len();
-        if let Some(result) = bh_fn(
-            green_key,
-            trace_id,
-            fail_index,
-            bh_outputs.as_ptr(),
-            num_outputs,
-            raw_outputs.as_ptr(),
-            raw_num,
-        ) {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return result as u64;
-        }
-    }
-
-    // RPython assembler_call_helper: force_fn receives the callee frame.
-    // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
-    // but force_fn needs the callee frame which is inputs[0].
-    let callee_frame_ptr = inputs[0];
-    let result = force_fn(callee_frame_ptr);
-    unsafe {
-        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-        *outcome.add(1) = 0;
-    }
-    result as u64
+        result as u64
+    } // end #[allow(unreachable_code)]
 }
 
-/// Heap-allocated fallback for call_assembler_fast_path when outputs
-/// exceed the stack buffer size.
+/// Heap path for call_assembler — uses heap-allocated JitFrame
+/// via run_compiled_code.
 fn call_assembler_fast_path_heap(
     target: &RegisteredLoopTarget,
     inputs: &[i64],
@@ -2924,7 +2969,7 @@ fn call_assembler_fast_path_heap(
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
     let actual_outputs = target.max_output_slots.max(1);
-    let (fail_index, outputs, handle, _force_frame, _direct_descr) = run_compiled_code(
+    let exec = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
         target.gc_runtime_id,
@@ -2933,6 +2978,9 @@ fn call_assembler_fast_path_heap(
         inputs,
         target.needs_force_frame,
     );
+    let fail_index = exec.fail_index;
+    let handle = exec.force_handle;
+    let outputs = exec.extract_outputs(actual_outputs);
 
     if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
         let frame = take_call_assembler_deadframe_from_outputs(&outputs);
@@ -4174,6 +4222,21 @@ fn output_transfers_current_force_token(
             .any(|slot| outputs.get(slot).copied() == Some(handle as i64))
 }
 
+/// Extract owned force tokens from fail_args, releasing the handle
+/// if the output doesn't transfer it.
+fn extract_force_tokens(fail_descr: &CraneliftFailDescr, outputs: &[i64], handle: u64) -> Vec<u64> {
+    let mut tokens = Vec::new();
+    for &slot in &fail_descr.force_token_slots {
+        if let Some(&val) = outputs.get(slot) {
+            tokens.push(val as u64);
+        }
+    }
+    if handle != 0 && !output_transfers_current_force_token(fail_descr, outputs, handle) {
+        release_force_token(handle);
+    }
+    tokens
+}
+
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
     if size == 0 {
         return;
@@ -4582,6 +4645,35 @@ fn find_fail_descr_in_fail_descrs(
     None
 }
 
+/// Result of `run_compiled_code` — RPython llmodel.py:328 parity.
+///
+/// Instead of copying values out of jf_frame into Vec<i64>,
+/// the JitFrame GcRef is returned directly. Values stay in place.
+struct JitExecResult {
+    jf_gcref: GcRef,
+    heap_owner: Option<Vec<i64>>,
+    fail_index: u32,
+    direct_descr: Option<Arc<CraneliftFailDescr>>,
+    force_handle: u64,
+    force_frame: Option<Arc<ActiveForceFrame>>,
+    gc_runtime_id: Option<u64>,
+}
+
+impl JitExecResult {
+    const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
+
+    /// Read jf_frame[index] as i64.
+    #[inline]
+    fn get_jf_int(&self, index: usize) -> i64 {
+        unsafe { *((self.jf_gcref.0 + JF_FRAME_ITEM0_OFS as usize + index * 8) as *const i64) }
+    }
+
+    /// Extract raw i64 values from jf_frame for legacy callers.
+    fn extract_outputs(&self, arity: usize) -> Vec<i64> {
+        (0..arity).map(|i| self.get_jf_int(i)).collect()
+    }
+}
+
 fn run_compiled_code(
     code_ptr: *const u8,
     fail_descrs: &[Arc<CraneliftFailDescr>],
@@ -4590,13 +4682,7 @@ fn run_compiled_code(
     max_output_slots: usize,
     inputs: &[i64],
     needs_force_frame: bool,
-) -> (
-    u32,
-    Vec<i64>,
-    u64,
-    Option<Arc<ActiveForceFrame>>,
-    Option<Arc<CraneliftFailDescr>>,
-) {
+) -> JitExecResult {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
     let depth = max_output_slots.max(inputs.len()).max(1);
@@ -4626,7 +4712,7 @@ fn run_compiled_code(
     let use_gc_alloc = gc_runtime_id
         .map(|id| with_gc_runtime(id, |gc| gc.type_count() > 0))
         .unwrap_or(false);
-    let (jf_gcref, _jf_buf_keepalive): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
+    let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let runtime_id = gc_runtime_id.unwrap();
         let gcref = with_gc_runtime(runtime_id, |gc| {
             gc.alloc_nursery_no_collect_typed(JITFRAME_GC_TYPE_ID, payload_bytes)
@@ -4717,13 +4803,20 @@ fn run_compiled_code(
     // lltrace. run_compiled_code simply returns the guard failure to the
     // caller without dispatching bridges.
 
-    let mut outputs = vec![0i64; max_output_slots.max(1)];
-    for i in 0..max_output_slots.min(depth) {
-        outputs[i] = unsafe { *result_jf.add(header_words + i) };
-    }
+    // RPython llmodel.py:328 parity: return ll_frame.
+    // Values stay in jf_frame — no copying.
+    let jf_gcref = GcRef(result_jf as usize);
 
     drop(_jitted_guard);
-    (fail_index, outputs, handle, force_frame, direct_descr)
+    JitExecResult {
+        jf_gcref,
+        heap_owner,
+        fail_index,
+        direct_descr,
+        force_handle: handle,
+        force_frame,
+        gc_runtime_id,
+    }
 }
 
 struct GuardInfo {
@@ -5062,7 +5155,7 @@ impl CraneliftBackend {
         let mut cur_needs_force_frame = compiled.needs_force_frame;
 
         loop {
-            let (fail_index, outputs, handle, force_frame, direct_descr) = run_compiled_code(
+            let exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
                 cur_gc_runtime_id,
@@ -5071,6 +5164,11 @@ impl CraneliftBackend {
                 &cur_inputs,
                 cur_needs_force_frame,
             );
+            let fail_index = exec.fail_index;
+            let handle = exec.force_handle;
+            let force_frame = exec.force_frame.clone();
+            let direct_descr = exec.direct_descr.clone();
+            let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
             // CALL_ASSEMBLER deadframe interception.
             if let Some(frame) = maybe_take_call_assembler_deadframe(
@@ -5139,22 +5237,27 @@ impl CraneliftBackend {
                     None
                 };
                 let (exception_class, exception) = take_pending_jit_exception_state();
-                if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-                    release_force_token(handle);
+                let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+                // Write savedata/exception to JitFrame header (llmodel.py parity).
+                let jf_ptr = exec.jf_gcref.0;
+                if let Some(sd) = saved_data {
+                    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+                }
+                if !exception.is_null() {
+                    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
                 }
                 return DeadFrame {
-                    data: Box::new(FrameData::new_with_savedata_and_exception(
-                        outputs,
+                    data: Box::new(JitFrameDeadFrame::new(
+                        exec.jf_gcref,
                         fail_descr.clone(),
                         compiled.gc_runtime_id,
-                        saved_data,
+                        force_tokens,
                         exception_class,
-                        (!exception.is_null()).then_some(exception),
+                        exec.heap_owner,
                     )),
                 };
             }
 
-            // Increment guard failure count.
             fail_descr.increment_fail_count();
             ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
@@ -5198,18 +5301,23 @@ impl CraneliftBackend {
                 None
             };
             let (exception_class, exception) = take_pending_jit_exception_state();
-            if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-                release_force_token(handle);
+            let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+            let jf_ptr = exec.jf_gcref.0;
+            if let Some(sd) = saved_data {
+                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+            }
+            if !exception.is_null() {
+                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
             }
 
             return DeadFrame {
-                data: Box::new(FrameData::new_with_savedata_and_exception(
-                    outputs,
+                data: Box::new(JitFrameDeadFrame::new(
+                    exec.jf_gcref,
                     fail_descr.clone(),
                     compiled.gc_runtime_id,
-                    saved_data,
+                    force_tokens,
                     exception_class,
-                    (!exception.is_null()).then_some(exception),
+                    exec.heap_owner,
                 )),
             };
         } // end loop
@@ -5227,7 +5335,7 @@ impl CraneliftBackend {
         let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
         let bridge_inputs = &parent_outputs[..num_bridge_inputs];
 
-        let (fail_index, outputs, handle, force_frame, direct_descr) = run_compiled_code(
+        let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
             bridge.gc_runtime_id,
@@ -5236,6 +5344,11 @@ impl CraneliftBackend {
             bridge_inputs,
             bridge.needs_force_frame,
         );
+        let fail_index = exec.fail_index;
+        let handle = exec.force_handle;
+        let force_frame = exec.force_frame.clone();
+        let direct_descr = exec.direct_descr.clone();
+        let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
 
         if let Some(frame) =
             maybe_take_call_assembler_deadframe(fail_index, &outputs, handle, force_frame.as_ref())
@@ -5265,24 +5378,28 @@ impl CraneliftBackend {
                 None
             };
             let (exception_class, exception) = take_pending_jit_exception_state();
-            if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-                release_force_token(handle);
+            let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+            let jf_ptr = exec.jf_gcref.0;
+            if let Some(sd) = saved_data {
+                unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+            }
+            if !exception.is_null() {
+                unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
             }
             return DeadFrame {
-                data: Box::new(FrameData::new_with_savedata_and_exception(
-                    outputs,
+                data: Box::new(JitFrameDeadFrame::new(
+                    exec.jf_gcref,
                     fail_descr.clone(),
                     bridge.gc_runtime_id,
-                    saved_data,
+                    force_tokens,
                     exception_class,
-                    (!exception.is_null()).then_some(exception),
+                    exec.heap_owner,
                 )),
             };
         }
 
         fail_descr.increment_fail_count();
 
-        // Check for chained bridges (RPython: bridge-on-bridge).
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref next_bridge) = *bridge_guard {
             release_force_token(handle);
@@ -5290,31 +5407,29 @@ impl CraneliftBackend {
         }
         let _ = bridge_guard;
 
-        // compile.py:701-717: handle_fail / must_compile — trigger bridge
-        // compilation for bridge guards just like for loop guards.
         let saved_data = if let Some(ref ff) = force_frame {
             take_force_frame_saved_data(ff)
         } else {
             None
         };
         let (exception_class, exception) = take_pending_jit_exception_state();
-        if !output_transfers_current_force_token(fail_descr, &outputs, handle) {
-            release_force_token(handle);
+        let force_tokens = extract_force_tokens(fail_descr, &outputs, handle);
+        let jf_ptr = exec.jf_gcref.0;
+        if let Some(sd) = saved_data {
+            unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *mut usize) = sd.0 };
+        }
+        if !exception.is_null() {
+            unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *mut usize) = exception.0 };
         }
 
-        // Bridge guard failure: return bridge's deadframe directly.
-        // The bridge's fail_args contain the full frame state needed
-        // for interpreter resume (bridge inputargs include parent locals).
-        // RPython resume.py:rebuild_state_after_failure uses the bridge's
-        // rd_numb/rd_virtuals to reconstruct frame state.
         DeadFrame {
-            data: Box::new(FrameData::new_with_savedata_and_exception(
-                outputs,
+            data: Box::new(JitFrameDeadFrame::new(
+                exec.jf_gcref,
                 fail_descr.clone(),
                 bridge.gc_runtime_id,
-                saved_data,
+                force_tokens,
                 exception_class,
-                (!exception.is_null()).then_some(exception),
+                exec.heap_owner,
             )),
         }
     }
@@ -9925,15 +10040,40 @@ impl majit_backend::Backend for CraneliftBackend {
             return;
         };
         for old_fd in &old.fail_descrs {
-            if !old_fd.has_bridge() {
+            let bridge_guard = old_fd.bridge_ref();
+            let Some(ref b) = *bridge_guard else {
                 continue;
-            }
-            let target = new.fail_descrs.iter().find(|d| {
-                d.fail_index == old_fd.fail_index && d.fail_arg_types == old_fd.fail_arg_types
-            });
+            };
+            // Match by (trace_id, fail_index) — same key used by
+            // find_fail_descr_in_fail_descrs and BridgeData.source_guard.
+            let target = find_fail_descr_in_fail_descrs(
+                &new.fail_descrs,
+                old_fd.trace_id,
+                old_fd.fail_index,
+            );
             if let Some(new_fd) = target {
-                if let Some(bridge) = old_fd.take_bridge() {
-                    new_fd.attach_bridge(bridge);
+                if !new_fd.has_bridge() {
+                    // Clone the bridge (don't take_bridge — old code may
+                    // still reference old_fd and needs bridge dispatch).
+                    new_fd.attach_bridge(BridgeData {
+                        trace_id: b.trace_id,
+                        input_types: b.input_types.clone(),
+                        header_pc: b.header_pc,
+                        source_guard: b.source_guard,
+                        caller_prefix_layout: b.caller_prefix_layout.clone(),
+                        code_ptr: b.code_ptr,
+                        fail_descrs: b.fail_descrs.clone(),
+                        gc_runtime_id: b.gc_runtime_id,
+                        num_inputs: b.num_inputs,
+                        num_ref_roots: b.num_ref_roots,
+                        max_output_slots: b.max_output_slots,
+                        needs_force_frame: b.needs_force_frame,
+                        terminal_exit_layouts: UnsafeCell::new(
+                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                        ),
+                        loop_reentry: b.loop_reentry,
+                        invalidated_arc: b.invalidated_arc.clone(),
+                    });
                 }
             }
         }
@@ -9982,7 +10122,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        let (fail_index, mut outputs, handle, force_frame, direct_descr) = run_compiled_code(
+        let exec = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
             compiled.gc_runtime_id,
@@ -9991,6 +10131,11 @@ impl majit_backend::Backend for CraneliftBackend {
             args,
             compiled.needs_force_frame,
         );
+        let fail_index = exec.fail_index;
+        let handle = exec.force_handle;
+        let force_frame = exec.force_frame.clone();
+        let direct_descr = exec.direct_descr.clone();
+        let mut outputs = exec.extract_outputs(compiled.max_output_slots.max(1));
 
         if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
             eprintln!(

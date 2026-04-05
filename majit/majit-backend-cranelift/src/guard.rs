@@ -617,3 +617,118 @@ impl Drop for FrameData {
         }
     }
 }
+
+// ── JitFrameDeadFrame (llmodel.py deadframe-as-jitframe parity) ─────
+
+/// RPython llmodel.py parity: the deadframe IS the JitFrame.
+///
+/// In RPython, `execute_token` returns the JitFrame GCREF directly as
+/// the deadframe. Values stay in `jf_frame[]` — no copying to `Vec<i64>`.
+/// `get_int_value(deadframe, index)` reads directly from `jf_frame[index]`.
+pub struct JitFrameDeadFrame {
+    /// GcRef pointing to the heap-allocated JitFrame.
+    pub jf_gcref: GcRef,
+    /// The fail descriptor for this exit.
+    pub fail_descr: Arc<CraneliftFailDescr>,
+    /// GC runtime id for root cleanup on Drop.
+    pub gc_runtime_id: Option<u64>,
+    /// Opaque force-token handles owned by this dead frame.
+    pub owned_force_tokens: Vec<u64>,
+    /// Pending exception class (same semantics as FrameData).
+    pub exception_class: i64,
+    /// Keeps the frame memory alive for non-GC allocations.
+    pub _heap_owner: Option<Vec<i64>>,
+}
+
+/// Byte offset from JitFrame start to jf_frame[0].
+const JF_FRAME_ITEM0_BYTES: usize = 64;
+/// Byte offset to jf_savedata field.
+const JF_SAVEDATA_BYTES: usize = 32;
+/// Byte offset to jf_guard_exc field.
+const JF_GUARD_EXC_BYTES: usize = 40;
+
+impl JitFrameDeadFrame {
+    pub fn new(
+        jf_gcref: GcRef,
+        fail_descr: Arc<CraneliftFailDescr>,
+        gc_runtime_id: Option<u64>,
+        owned_force_tokens: Vec<u64>,
+        exception_class: i64,
+        heap_owner: Option<Vec<i64>>,
+    ) -> Self {
+        let mut frame = JitFrameDeadFrame {
+            jf_gcref,
+            fail_descr,
+            gc_runtime_id,
+            owned_force_tokens,
+            exception_class,
+            _heap_owner: heap_owner,
+        };
+        if let Some(runtime_id) = gc_runtime_id {
+            register_gc_roots(runtime_id, std::slice::from_mut(&mut frame.jf_gcref));
+        }
+        frame
+    }
+
+    #[inline]
+    pub fn get_int(&self, index: usize) -> i64 {
+        unsafe { *((self.jf_gcref.0 + JF_FRAME_ITEM0_BYTES + index * 8) as *const i64) }
+    }
+
+    #[inline]
+    pub fn get_float(&self, index: usize) -> f64 {
+        f64::from_bits(self.get_int(index) as u64)
+    }
+
+    #[inline]
+    pub fn get_ref(&self, index: usize) -> GcRef {
+        GcRef(self.get_int(index) as usize)
+    }
+
+    pub fn take_ref_for_call_result(&mut self, index: usize) -> GcRef {
+        if self.fail_descr.is_force_token_slot(index) {
+            let handle = self.get_int(index) as u64;
+            if let Some(pos) = self.owned_force_tokens.iter().position(|h| *h == handle) {
+                self.owned_force_tokens.swap_remove(pos);
+            }
+        }
+        GcRef(self.get_int(index) as usize)
+    }
+
+    #[inline]
+    pub fn get_savedata_ref(&self) -> GcRef {
+        GcRef(unsafe { *((self.jf_gcref.0 + JF_SAVEDATA_BYTES) as *const usize) })
+    }
+
+    #[inline]
+    pub fn try_get_savedata_ref(&self) -> Option<GcRef> {
+        let r = self.get_savedata_ref();
+        if r.is_null() { None } else { Some(r) }
+    }
+
+    #[inline]
+    pub fn set_savedata_ref(&mut self, data: GcRef) {
+        unsafe { *((self.jf_gcref.0 + JF_SAVEDATA_BYTES) as *mut usize) = data.0 };
+    }
+
+    #[inline]
+    pub fn get_exception_ref(&self) -> GcRef {
+        GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
+    }
+
+    #[inline]
+    pub fn get_exception_class(&self) -> i64 {
+        self.exception_class
+    }
+}
+
+impl Drop for JitFrameDeadFrame {
+    fn drop(&mut self) {
+        if let Some(runtime_id) = self.gc_runtime_id {
+            unregister_gc_roots(runtime_id, std::slice::from_mut(&mut self.jf_gcref));
+        }
+        for &handle in &self.owned_force_tokens {
+            release_force_token(handle);
+        }
+    }
+}

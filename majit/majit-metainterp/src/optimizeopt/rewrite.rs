@@ -1609,13 +1609,13 @@ impl OptRewrite {
         //   return self.getintbound(op).getnullness()
         let b = ctx.getintbound(opref);
         // intutils.py:1318-1329: IntBound.getnullness()
-        if b.known_gt_const(0) || b.known_lt_const(0) {
-            return Nullness::Nonnull;
+        // known_gt(0) or known_lt(0) or tvalue != 0
+        let nullness = b.getnullness();
+        match nullness {
+            1 => Nullness::Nonnull,
+            -1 => Nullness::Null,
+            _ => Nullness::Unknown,
         }
-        if b.is_constant() && b.get_constant() == 0 {
-            return Nullness::Null;
-        }
-        Nullness::Unknown
     }
 
     /// Check if an OpRef is Ref-typed.
@@ -1879,22 +1879,23 @@ impl OptRewrite {
                 return false;
             }
             // rewrite.py:628-629: all_fdescrs = arraydescr.get_all_fielddescrs()
-            // RPython: get field descriptors from the array descriptor metadata,
-            // NOT from the virtual's current contents (which may be sparse).
-            let all_fdescr_indices: Vec<u32> = ctx
-                .get_ptr_info(source_box)
-                .and_then(|info| match info {
-                    // Use VirtualArrayStructInfo.fielddescrs (from the descriptor
-                    // metadata) to enumerate ALL fields, including those not yet
-                    // materialized in the virtual.
-                    crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
-                        if v.fielddescrs.is_empty() {
-                            None
-                        } else {
-                            Some(v.fielddescrs.iter().map(|d| d.index()).collect())
+            // → all_interiorfielddescrs in descr.py:291.
+            let all_fdescr_indices: Vec<u32> = arraydescr
+                .as_array_descr()
+                .and_then(|ad| ad.get_all_interiorfielddescrs())
+                .map(|fds| fds.iter().map(|d| d.index()).collect())
+                .or_else(|| {
+                    // Fallback: get from virtual's metadata
+                    ctx.get_ptr_info(source_box).and_then(|info| match info {
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                            if v.fielddescrs.is_empty() {
+                                None
+                            } else {
+                                Some(v.fielddescrs.iter().map(|d| d.index()).collect())
+                            }
                         }
-                    }
-                    _ => None,
+                        _ => None,
+                    })
                 })
                 .unwrap_or_default();
             if all_fdescr_indices.is_empty() {
@@ -2623,9 +2624,14 @@ impl Optimization for OptRewrite {
 
             // ── Cast round-trip elimination ──
             // rewrite.py:807-813: register pure inverse for CSE, then emit.
-            // CAST_PTR_TO_INT / CAST_INT_TO_PTR change types and must not
-            // be eliminated — only round-trips are removed by pure.rs.
-            OpCode::CastPtrToInt | OpCode::CastIntToPtr => OptimizationResult::PassOn,
+            OpCode::CastPtrToInt => {
+                ctx.register_pure_from_args1(OpCode::CastIntToPtr, op.pos, op.arg(0));
+                OptimizationResult::PassOn
+            }
+            OpCode::CastIntToPtr => {
+                ctx.register_pure_from_args1(OpCode::CastPtrToInt, op.pos, op.arg(0));
+                OptimizationResult::PassOn
+            }
             // jtransform.py:1264-1266: CAST_OPAQUE_PTR is identity (no-op).
             OpCode::CastOpaquePtr => {
                 ctx.replace_op(op.pos, op.arg(0));
@@ -2638,7 +2644,20 @@ impl Optimization for OptRewrite {
             // it changes the bit representation. But if we later see
             // CONVERT_LONGLONG_BYTES_TO_FLOAT(result), pure.rs can
             // recognize the round-trip and recover x.
-            OpCode::ConvertFloatBytesToLonglong | OpCode::ConvertLonglongBytesToFloat => {
+            OpCode::ConvertFloatBytesToLonglong => {
+                ctx.register_pure_from_args1(
+                    OpCode::ConvertLonglongBytesToFloat,
+                    op.pos,
+                    op.arg(0),
+                );
+                OptimizationResult::PassOn
+            }
+            OpCode::ConvertLonglongBytesToFloat => {
+                ctx.register_pure_from_args1(
+                    OpCode::ConvertFloatBytesToLonglong,
+                    op.pos,
+                    op.arg(0),
+                );
                 OptimizationResult::PassOn
             }
 
@@ -4224,8 +4243,8 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
+        // PassOn: op is emitted, no replacement registered.
         assert!(matches!(result, OptimizationResult::PassOn));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
     }
 
     // ── GUARD_NO_EXCEPTION tests ──

@@ -391,8 +391,9 @@ pub trait ArrayDescr: Descr {
         false
     }
 
-    /// RPython: descr.py ArrayDescr.get_all_interiorfielddescrs().
-    /// For array-of-structs, returns interior field descriptors.
+    /// descr.py:291 ArrayDescr.get_all_fielddescrs() →
+    /// all_interiorfielddescrs. For array-of-structs, returns
+    /// interior field descriptors.
     fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
         None
     }
@@ -602,8 +603,8 @@ impl Default for EffectInfo {
             readonly_descrs_fields: 0,
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
-            single_write_descr_array: None,
             write_descrs_arrays: 0,
+            single_write_descr_array: None,
             can_invalidate: false,
         }
     }
@@ -788,8 +789,8 @@ impl EffectInfo {
             write_descrs_fields: 0,
             readonly_descrs_arrays: 0,
             write_descrs_arrays: 0,
-            can_invalidate: false,
             single_write_descr_array: None,
+            can_invalidate: false,
         }
     }
 
