@@ -148,9 +148,12 @@ fn analyze_pipeline_from_parsed(
     // canonical_function_graphs uses (e.g. ["foo"] AND ["crate", "foo"])
     // so resolve_array_identity's target_to_path lookup never misses.
     {
+        // Only free functions (self_ty_root == None) to avoid name collision
+        // with impl methods sharing the same function name.
         let return_type_by_name: std::collections::HashMap<&str, &str> = program
             .functions
             .iter()
+            .filter(|f| f.self_ty_root.is_none())
             .filter_map(|f| f.return_type.as_deref().map(|rt| (f.name.as_str(), rt)))
             .collect();
         for (path, _graph) in &canonical_function_graphs {
