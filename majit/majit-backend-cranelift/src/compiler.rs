@@ -35,9 +35,12 @@ use majit_ir::{
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── JitFrame layout constants (jitframe.py:93-101) ──────────────────
-// Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
+// Header: [guard_exc_type:8, descr:8, force_descr:8, gcmap:8,
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
+/// Byte offset of `jf_guard_exc_type` — pos_exception() class stored on
+/// guard exit.  Reuses the RPython jf_frame_info slot (unused in Cranelift).
+const JF_GUARD_EXC_TYPE_OFS: i32 = 0;
 /// Byte offset of `jf_descr` from JitFrame start.
 const JF_DESCR_OFS: i32 = 8;
 const JF_FORCE_DESCR_OFS: i32 = 16;
@@ -416,8 +419,13 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     // Replace fail_descr on the inner JitFrameDeadFrame to carry the
     // caller-prefixed recovery layout.  RPython has no overlay wrapper —
     // the jitframe IS the deadframe with the correct descr.
+    // Write to both the Rust wrapper AND the actual jf_frame header so
+    // get_latest_descr (reading wrapper) and raw jf_descr consumers agree.
     let overlay_descr = overlay_deadframe_fail_descr(&layout, recovery_layout);
     if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
+        // llmodel.py:270 parity: frame.jf_descr = descr  (writes to frame header)
+        let descr_ptr = Arc::as_ptr(&overlay_descr) as usize;
+        unsafe { *((jf.jf_gcref.0 + JF_DESCR_OFS as usize) as *mut usize) = descr_ptr };
         jf.fail_descr = overlay_descr;
         return frame;
     }
@@ -3863,12 +3871,22 @@ fn emit_guard_exit(
         builder
             .ins()
             .store(MemFlags::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
-        // Clear TLS: pos_exc_value = 0, pos_exception = 0
-        let zero = builder.ins().iconst(cl_types::I64, 0);
-        builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
+        // Also store pos_exception (exc_type) to jf_guard_exc_type slot.
         let exc_type_addr = builder
             .ins()
             .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+        let exc_type_val = builder
+            .ins()
+            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
+        builder.ins().store(
+            MemFlags::trusted(),
+            exc_type_val,
+            jf_ptr,
+            JF_GUARD_EXC_TYPE_OFS,
+        );
+        // Clear TLS: pos_exc_value = 0, pos_exception = 0
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
         builder
             .ins()
             .store(MemFlags::trusted(), zero, exc_type_addr, 0);
@@ -9717,15 +9735,11 @@ impl majit_backend::Backend for CraneliftBackend {
             let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
             if raw != 0 { Some(GcRef(raw)) } else { None }
         };
-        // jf_guard_exc already written by emit_guard_exit.
-        // Read exception from jf_frame header (same as grab_exc_value).
+        // jf_guard_exc + jf_guard_exc_type already written by emit_guard_exit.
         let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
         let exception = GcRef(exc_raw);
-        let exception_class = if exc_raw == 0 {
-            0i64
-        } else {
-            unsafe { *(exc_raw as *const i64) } // typeptr at offset 0
-        };
+        let exception_class =
+            unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_TYPE_OFS as usize) as *const i64) };
 
         let exit_arity = fail_descr.fail_arg_types().len();
         outputs.truncate(exit_arity);
@@ -11188,6 +11202,8 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 17,
+                clear: false,
+                kind: 1,
                 items: vec![
                     majit_backend::ExitValueSourceLayout::ExitValue(0),
                     majit_backend::ExitValueSourceLayout::Constant(44),
@@ -11365,6 +11381,8 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 17,
+                clear: false,
+                kind: 1,
                 items: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
@@ -11435,6 +11453,8 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 descr_index: 99,
+                clear: false,
+                kind: 1,
                 items: vec![
                     majit_backend::ExitValueSourceLayout::ExitValue(0),
                     majit_backend::ExitValueSourceLayout::Constant(55),
@@ -11839,7 +11859,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
@@ -11850,7 +11870,6 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
-        constants.insert(102, 1);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(25);
@@ -11864,7 +11883,7 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
-        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
         assert_eq!(backend.grab_exc_class(&frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
@@ -11881,7 +11900,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
@@ -11892,7 +11911,6 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x1111);
-        constants.insert(102, 1);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(26);
@@ -11917,18 +11935,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(102, 1);
-        constants.insert(103, 0);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(27);
@@ -11960,18 +11976,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(102, 1);
-        constants.insert(103, 0);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(27_001);
@@ -12005,7 +12019,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardException, &[OpRef(101)], 3);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(
@@ -12034,7 +12048,6 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
         constants.insert(101, 0x3333);
-        constants.insert(102, 1);
         constants.insert(103, 0);
         backend.set_constants(constants);
 
@@ -12076,18 +12089,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(102)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(103)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(102, 1);
-        constants.insert(103, 0);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(29);
@@ -13678,12 +13689,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op_with_descr(OpCode::CallN, &[OpRef(100), OpRef(0)], OpRef::NONE.0, descr),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(101)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
 
         let mut constants = HashMap::new();
         constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(202);

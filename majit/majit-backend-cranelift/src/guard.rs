@@ -489,6 +489,8 @@ const JF_FRAME_ITEM0_BYTES: usize = 64;
 const JF_SAVEDATA_BYTES: usize = 32;
 /// Byte offset to jf_guard_exc field.
 const JF_GUARD_EXC_BYTES: usize = 40;
+/// Byte offset to jf_guard_exc_type field (pos_exception class, stored at offset 0).
+const JF_GUARD_EXC_TYPE_BYTES: usize = 0;
 
 impl JitFrameDeadFrame {
     pub fn new(
@@ -549,18 +551,10 @@ impl JitFrameDeadFrame {
         GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
     }
 
-    /// pyjitpl.py:3119-3123 parity:
-    ///   exception_obj = cast_opaque_ptr(OBJECTPTR, exception)
-    ///   exc_class = ptr2int(exception_obj.typeptr) if exception_obj else 0
-    /// Reads typeptr at offset 0 of jf_guard_exc (same as GUARD_CLASS).
+    /// Read pos_exception (exc_type) stored by emit_guard_exit into jf_guard_exc_type.
     #[inline]
     pub fn grab_exc_class(&self) -> i64 {
-        let exc_ref = self.grab_exc_value();
-        if exc_ref.is_null() {
-            0
-        } else {
-            unsafe { *(exc_ref.0 as *const i64) }
-        }
+        unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_TYPE_BYTES) as *const i64) }
     }
 }
 
