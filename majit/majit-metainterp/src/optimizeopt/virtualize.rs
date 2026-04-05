@@ -1692,7 +1692,7 @@ impl Optimization for OptVirtualize {
         match op.opcode {
             // virtualize.py:207-209: optimize_NEW_WITH_VTABLE → make_virtual.
             // InstancePtrInfo(descr, known_class, is_virtual=True)
-            OpCode::NewWithVtable => self.optimize_new(op, ctx),
+            OpCode::NewWithVtable => self.optimize_new_with_vtable(op, ctx),
             OpCode::New => self.optimize_new(op, ctx),
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),
 
