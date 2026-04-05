@@ -2043,7 +2043,7 @@ impl JitState for PyreJitState {
         // Flat single-frame decode (no liveness info at this level).
         // RPython-parity multi-frame: blackhole_from_resumedata.
         let (_num_failargs, vable_values, vref_values, frames) =
-            rebuild_from_numbering(rd_numb, rd_consts, None);
+            rebuild_from_numbering(rd_numb, rd_consts);
 
         if frames.is_empty() {
             return None;

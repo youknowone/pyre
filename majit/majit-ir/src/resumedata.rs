@@ -319,12 +319,13 @@ impl ResumeDataLoopMemo {
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
-        // RPython uses jitcode.position_info to determine value count;
-        // no box_count field in the stream.
+        // Per-frame: jitcode_index, pc, box_count, [tagged_values...].
+        // box_count is majit-specific — RPython omits it and uses
+        // jitcode.get_live_vars_info(pc) at decode time instead.
         for frame in &snapshot.framestack {
             numb_state.append_int(frame.jitcode_index);
             numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.boxes.len() as i32);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -388,25 +389,22 @@ fn decode_tagged(tagged: i16, num_failargs: i32, rd_consts: &[(i64, Type)]) -> R
     }
 }
 
-/// resume.py:1042-1057 rebuild_from_resumedata decoder.
+/// Decode rd_numb back into vable/vref values and per-frame tagged values.
 ///
-/// Decodes rd_numb produced by `ResumeDataLoopMemo::number()` back into
-/// vable/vref values and per-frame tagged values.
-///
-/// `frame_slot_count`: optional callback `(jitcode_index, pc) -> slot_count`.
-/// RPython parity: `jitcode.get_live_vars_info(pc)` → `enumerate_vars` →
-/// total callbacks = `length_i + length_r + length_f`.
-/// When `Some`, enables multi-frame decode (resume.py:1049-1055 loop).
-/// When `None`, falls back to consuming all remaining items as one frame.
+/// NOTE: Frame format differs from RPython. RPython encodes frames as
+/// `jitcode_index, pc, [tagged_values...]` and uses jitcode.position_info
+/// (liveness) at the decode site to know how many values each frame has
+/// (resume.py:249-253, resume.py:1049-1055). majit encodes an explicit
+/// `box_count` field: `jitcode_index, pc, box_count, [tagged_values...]`.
+/// This is necessary because jitcode liveness info is not available at
+/// the decode site in majit's architecture.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
     rd_consts: &[(i64, Type)],
-    frame_slot_count: Option<&dyn Fn(i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
     let mut reader = resumecode::Reader::new(rd_numb);
 
-    // resume.py:919-921: _init reads items_resume_section + count.
-    let items_resume_section = reader.next_item();
+    let total_size = reader.next_item();
     let num_failargs = reader.next_item();
 
     // resume.py:1045: consume_vref_and_vable_boxes — virtualizable array.
@@ -420,7 +418,7 @@ pub fn rebuild_from_numbering(
         vable_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // resume.py:1096: virtualref array (pairs).
+    // resume.py:1045: virtualref array (pairs).
     let vref_len = reader.next_item();
     let mut vref_values = Vec::new();
     for _ in 0..(vref_len * 2) {
@@ -431,57 +429,34 @@ pub fn rebuild_from_numbering(
         vref_values.push(decode_tagged(tagged, num_failargs, rd_consts));
     }
 
-    // resume.py:1049-1055: while not resumereader.done_reading():
-    //     jitcode_pos, pc = resumereader.read_jitcode_pos_pc()
-    //     jitcode = metainterp.staticdata.jitcodes[jitcode_pos]
-    //     resumereader.consume_boxes(f.get_current_position_info(), ...)
+    // Frame section: jitcode_index, pc, box_count, [tagged_values...].
+    // Each frame has an explicit box_count to delimit boundaries.
     let mut frames = Vec::new();
-    let done_reading = |r: &resumecode::Reader| r.items_read >= items_resume_section as usize;
-
-    match frame_slot_count {
-        Some(slot_count_fn) => {
-            // Multi-frame: use liveness to split frame sections.
-            while !done_reading(&reader) && reader.has_more() {
-                let jitcode_index = reader.next_item();
-                let pc = reader.next_item();
-                let count = slot_count_fn(jitcode_index, pc);
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if done_reading(&reader) || !reader.has_more() {
-                        break;
-                    }
-                    let tagged = reader.next_item() as i16;
-                    values.push(decode_tagged(tagged, num_failargs, rd_consts));
-                }
-                frames.push(RebuiltFrame {
-                    jitcode_index,
-                    pc,
-                    values,
-                });
+    while reader.items_read < total_size as usize && reader.has_more() {
+        let jitcode_index = reader.next_item();
+        let pc = if reader.has_more() && reader.items_read < total_size as usize {
+            reader.next_item()
+        } else {
+            0
+        };
+        let box_count = if reader.has_more() && reader.items_read < total_size as usize {
+            reader.next_item().max(0) as usize
+        } else {
+            0
+        };
+        let mut values = Vec::with_capacity(box_count);
+        for _ in 0..box_count {
+            if !reader.has_more() {
+                break;
             }
+            let tagged = reader.next_item() as i16;
+            values.push(decode_tagged(tagged, num_failargs, rd_consts));
         }
-        None => {
-            // Single-frame fallback: no liveness info available.
-            // Reads all remaining tagged items as one frame.
-            if !done_reading(&reader) && reader.has_more() {
-                let jitcode_index = reader.next_item();
-                let pc = if reader.has_more() {
-                    reader.next_item()
-                } else {
-                    0
-                };
-                let mut values = Vec::new();
-                while !done_reading(&reader) && reader.has_more() {
-                    let tagged = reader.next_item() as i16;
-                    values.push(decode_tagged(tagged, num_failargs, rd_consts));
-                }
-                frames.push(RebuiltFrame {
-                    jitcode_index,
-                    pc,
-                    values,
-                });
-            }
-        }
+        frames.push(RebuiltFrame {
+            jitcode_index,
+            pc,
+            values,
+        });
     }
     (num_failargs, vable_values, vref_values, frames)
 }

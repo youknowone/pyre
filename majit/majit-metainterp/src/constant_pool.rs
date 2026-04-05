@@ -140,11 +140,22 @@ impl ConstantPool {
     }
 
     /// Release shadow stack roots.
+    ///
+    /// Requires LIFO ordering: inner pools (higher base) must be released
+    /// before outer pools (lower base). If this invariant is violated
+    /// (e.g., abort path drops outer pool after inner pool already popped),
+    /// we skip the pop and log a warning rather than panicking.
     fn release_roots(&mut self) {
         if !self.rooted_refs.is_empty() {
             let current = shadow_stack::depth();
             if current >= self.shadow_stack_base {
                 shadow_stack::pop_to(self.shadow_stack_base);
+            } else {
+                debug_assert!(
+                    false,
+                    "shadow stack LIFO violation: depth {} < base {}",
+                    current, self.shadow_stack_base
+                );
             }
             self.rooted_refs.clear();
         }
