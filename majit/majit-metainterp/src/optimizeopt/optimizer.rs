@@ -2694,6 +2694,39 @@ impl Optimizer {
                 ctx.new_operations.len()
             );
         }
+        // optimizer.py:47-54: run deferred postprocess after emit.
+        // RPython calls OptimizationResult.callback() → propagate_postprocess.
+        // rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard
+        if let Some(opref) = ctx.pending_mark_last_guard.take() {
+            ctx.mark_last_guard(opref);
+        }
+        if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
+            // rewrite.py:430-436 postprocess_GUARD_CLASS:
+            //   update_last_guard = not old_guard or isinstance(descr, ResumeAtPositionDescr)
+            //   make_constant_class(arg0, expectedclassbox, update_last_guard)
+            let old_guard_pos = ctx
+                .get_ptr_info(pp.obj)
+                .and_then(|info| info.last_guard_pos())
+                .unwrap_or(-1);
+            let update_last_guard =
+                old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
+            // optimizer.py:137-151 make_constant_class:
+            //   opinfo._known_class = class_const
+            //   if update_last_guard: mark_last_guard → len(_newoperations) - 1
+            let new_guard_pos = if update_last_guard {
+                (ctx.new_operations.len() as i32) - 1 // NOW correct: guard is in new_operations
+            } else {
+                old_guard_pos
+            };
+            ctx.set_ptr_info(
+                pp.obj,
+                crate::optimizeopt::info::PtrInfo::KnownClass {
+                    class_ptr: majit_ir::GcRef(pp.class_val as usize),
+                    is_nonnull: true,
+                    last_guard_pos: new_guard_pos,
+                },
+            );
+        }
         ctx.in_final_emission = false;
     }
 
@@ -3815,14 +3848,10 @@ mod tests {
         );
         ctx.potential_extra_ops.insert(
             OpRef(14),
-            crate::optimizeopt::TrackedPreambleUse {
-                result: OpRef(14),
-                produced: crate::optimizeopt::shortpreamble::ProducedShortOp {
-                    kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
-                    preamble_op: preamble_op.clone(),
-                    invented_name: false,
-                    same_as_source: None,
-                },
+            crate::optimizeopt::info::PreambleOp {
+                op: OpRef(14),
+                resolved: OpRef(14),
+                invented_name: false,
             },
         );
 

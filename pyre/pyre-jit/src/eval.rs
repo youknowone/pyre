@@ -1171,16 +1171,14 @@ fn handle_fail(
         };
         if !is_tracing {
             // compile.py:704: start_compiling (set ST_BUSY_FLAG)
+            // RPython: self.start_compiling() — on the descriptor that failed.
             {
                 let (driver, _) = driver_pair();
                 driver
                     .meta_interp_mut()
-                    .set_guard_compiling(owning_key, trace_id, fail_index, true);
+                    .start_guard_compiling(owning_key, trace_id, fail_index);
             }
             // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
-            // RPython passes deadframe directly — MetaInterp restores
-            // via rebuild_from_resumedata (resume.py:1042) inside
-            // handle_guard_failure (pyjitpl.py:2904).
             let compiled = crate::call_jit::trace_and_compile_from_bridge(
                 owning_key,
                 trace_id,
@@ -1194,7 +1192,7 @@ fn handle_fail(
                 let (driver, _) = driver_pair();
                 driver
                     .meta_interp_mut()
-                    .set_guard_compiling(owning_key, trace_id, fail_index, false);
+                    .done_guard_compiling(owning_key, trace_id, fail_index);
             }
             if compiled {
                 return HandleFailOutcome::BridgeCompiled;
