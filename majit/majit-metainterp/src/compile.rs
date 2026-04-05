@@ -427,6 +427,7 @@ pub(crate) fn build_guard_metadata(
                                         descr: descr.clone(),
                                         type_id: *type_id,
                                         descr_index: *descr_index,
+                                        known_class: *known_class,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
                                         fielddescrs: fielddescrs.clone(),

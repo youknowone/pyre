@@ -365,37 +365,48 @@ impl OptVirtualize {
         vinfo: VirtualInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // info.py:147-156: self._is_virtual = False, newop.set_forwarded(self).
-        // Same PtrInfo (now non-virtual) stays on newop with fields intact.
+        // RPython info.py:137-156: _is_virtual = False.
+        // info.py:225: self._fields[i] = None before emit_extra(setfieldop).
+        // Clear field values so heap cache doesn't suppress SetfieldGc.
         let preserved = PtrInfo::Instance(crate::optimizeopt::info::InstancePtrInfo {
             descr: Some(vinfo.descr.clone()),
             known_class: vinfo.known_class,
-            fields: vinfo.fields.clone(),
+            fields: Vec::new(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
+        // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
+        // Emit the NEW_WITH_VTABLE
         let mut alloc_op = Op::new(OpCode::NewWithVtable, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
 
+        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
 
+        // Set forwarding only when the refs differ (avoids self-loop)
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // info.py:216-226 _force_elements: for each field, read value,
-        // force_box, clear self._fields[i] = None, THEN emit_extra.
+        // Emit ob_type SETFIELD_GC from known_class BEFORE data fields.
+        // pyre GC allocator doesn't set ob_type, so we emit it explicitly.
+        // ob_type is not in vinfo.fields (separated into known_class).
+        if let (Some(gc_ref), Some(descr)) = (vinfo.known_class, &vinfo.ob_type_descr) {
+            let class_val = gc_ref.as_usize() as i64;
+            let class_ref = self.emit_constant_int(ctx, class_val);
+            let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, class_ref]);
+            set_op.descr = Some(descr.clone());
+            ctx.emit_extra(ctx.current_pass_idx, set_op);
+        }
+
+        // info.py:216-226 _force_elements: emit SETFIELD_GC for data fields.
         for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
-            // info.py:225: self._fields[i] = None — clear BEFORE emit_extra
-            if let Some(info) = ctx.get_ptr_info_mut(alloc_ref) {
-                info.clear_field(field_idx);
-            }
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
             set_op.descr = Some(
                 get_field_descr(&vinfo.field_descrs, field_idx)
@@ -447,36 +458,39 @@ impl OptVirtualize {
         vinfo: VirtualStructInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // info.py:147-156: self._is_virtual = False, newop.set_forwarded(self).
-        // Same PtrInfo (now non-virtual) stays on newop with fields intact.
+        // RPython info.py:147-156: _is_virtual = False, _fields retained.
+        // newop.set_forwarded(self) — the same PtrInfo (now non-virtual)
+        // stays accessible via get_ptr_info(alloc_ref).
+        // RPython info.py:147-156: _is_virtual = False, _fields retained
+        // BUT info.py:225: self._fields[i] = None before emit_extra(setfieldop).
+        // Preserve descr+field_descrs for type resolution, but clear field VALUES
+        // so the heap cache doesn't suppress the SetfieldGc emissions.
         let preserved = PtrInfo::Struct(crate::optimizeopt::info::StructPtrInfo {
             descr: vinfo.descr.clone(),
-            fields: vinfo.fields.clone(),
+            fields: Vec::new(),
             field_descrs: vinfo.field_descrs.clone(),
             preamble_fields: Vec::new(),
             last_guard_pos: -1,
         });
+        // Mark as no longer virtual FIRST (avoids infinite recursion)
         ctx.set_ptr_info(opref, PtrInfo::nonnull());
 
+        // Emit NEW
         let mut alloc_op = Op::new(OpCode::New, &[]);
         alloc_op.descr = Some(vinfo.descr.clone());
         let alloc_ref = ctx.emit_extra(ctx.current_pass_idx, alloc_op);
 
+        // RPython: newop.set_forwarded(self) — preserved info on alloc_ref
         ctx.set_ptr_info(alloc_ref, preserved);
 
         if opref != alloc_ref {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // info.py:216-226 _force_elements: for each field, read value,
-        // force_box, clear self._fields[i] = None, THEN emit_extra.
+        // RPython info.py:226: optforce.emit_extra(setfieldop)
         for (field_idx, value_ref) in &vinfo.fields {
             let value_ref = self.force_virtual(*value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
-            // info.py:225: self._fields[i] = None — clear BEFORE emit_extra
-            if let Some(info) = ctx.get_ptr_info_mut(alloc_ref) {
-                info.clear_field(*field_idx);
-            }
             let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
                 .unwrap_or_else(|| make_field_index_descr(*field_idx));
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -645,6 +659,7 @@ impl OptVirtualize {
         let vinfo = VirtualInfo {
             descr,
             known_class,
+            ob_type_descr: None,
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
@@ -718,21 +733,26 @@ impl OptVirtualize {
             if info.is_virtual() {
                 match info {
                     PtrInfo::Virtual(vinfo) => {
-                        set_field(&mut vinfo.fields, field_idx, value_ref);
-                        if let Some(descr) = &op.descr {
-                            set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
-                        }
-                        // RPython: NewWithVtable carries the class directly.
-                        // pyre: New() + SetfieldGc(offset=0, class_ptr).
-                        // When setting ob_type (offset 0) to a constant,
-                        // capture it as known_class for rd_virtuals
-                        // materialization (resume.py:612 VirtualInfo.allocate).
-                        if vinfo.known_class.is_none() {
-                            let offset = extract_field_offset(field_idx);
-                            if offset == Some(0) {
+                        // info.py:203-206 setfield: _fields[fielddescr.get_index()] = op.
+                        // ob_type (offset 0) is NOT a regular field — it's the
+                        // vtable pointer stored as known_class (info.py:318).
+                        let offset = extract_field_offset(field_idx);
+                        if offset == Some(0) {
+                            // Capture ob_type as known_class + ob_type_descr.
+                            if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(majit_ir::GcRef(class_val));
                                 }
+                            }
+                            vinfo.ob_type_descr = op.descr.clone();
+                            // ob_type constant is a GcRef pointer stored as
+                            // Value::Int. Register as Ref for fail_arg_types.
+                            ctx.constant_types_for_numbering
+                                .insert(value_ref.0, majit_ir::Type::Ref);
+                        } else {
+                            set_field(&mut vinfo.fields, field_idx, value_ref);
+                            if let Some(descr) = &op.descr {
+                                set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
                             }
                         }
                         return OptimizationResult::Remove;
@@ -793,6 +813,19 @@ impl OptVirtualize {
         }
 
         if let Some(info) = ctx.get_ptr_info(struct_ref).cloned() {
+            // info.py:212-214 getfield: return _fields[fielddescr.get_index()].
+            // For Virtual, ob_type (offset 0) is not in fields — fold from
+            // known_class (info.py:324-325 get_known_class).
+            if let PtrInfo::Virtual(ref vinfo) = info {
+                let offset = extract_field_offset(field_idx);
+                if offset == Some(0) {
+                    if let Some(gc_ref) = vinfo.known_class {
+                        let class_val = gc_ref.as_usize() as i64;
+                        ctx.make_constant(op.pos, majit_ir::Value::Int(class_val));
+                        return OptimizationResult::Remove;
+                    }
+                }
+            }
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
@@ -1657,12 +1690,8 @@ impl Optimization for OptVirtualize {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.ensure_vable_setup(ctx);
         match op.opcode {
-            // Allocation — create virtual
             // virtualize.py:207-209: optimize_NEW_WITH_VTABLE → make_virtual.
-            // XXX RPython incompatibility: should be optimize_new_with_vtable
-            // (virtualize.py:207-209), but PtrInfo::Virtual export/import is
-            // not yet fully wired. Using optimize_new (VirtualStruct) as
-            // workaround until export_state handles Virtual correctly.
+            // InstancePtrInfo(descr, known_class, is_virtual=True)
             OpCode::NewWithVtable => self.optimize_new(op, ctx),
             OpCode::New => self.optimize_new(op, ctx),
             OpCode::NewArray | OpCode::NewArrayClear => self.optimize_new_array(op, ctx),

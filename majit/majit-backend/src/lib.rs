@@ -96,6 +96,8 @@ pub enum ExitVirtualLayout {
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
+        /// info.py:318 _known_class — vtable pointer for allocate_with_vtable.
+        known_class: Option<i64>,
         fields: Vec<(u32, ExitValueSourceLayout)>,
         target_slot: Option<usize>,
         /// resume.py:593 fielddescrs for setfield dispatch.
@@ -151,6 +153,7 @@ impl ExitVirtualLayout {
                 descr,
                 type_id,
                 descr_index,
+                known_class,
                 fields,
                 target_slot,
                 fielddescrs,
@@ -159,6 +162,7 @@ impl ExitVirtualLayout {
                 descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
+                known_class: *known_class,
                 fields: fields
                     .iter()
                     .map(|(fi, src)| (*fi, src.shifted_virtuals(virtual_offset)))
@@ -257,6 +261,7 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Object {
                     type_id: a1,
                     descr_index: a2,
+                    known_class: a7,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
@@ -266,13 +271,14 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Object {
                     type_id: b1,
                     descr_index: b2,
+                    known_class: b7,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
                     descr_size: b6,
                     ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 && a7 == b7,
             (
                 Self::Struct {
                     type_id: a1,

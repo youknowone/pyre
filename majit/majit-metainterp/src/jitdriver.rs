@@ -1111,12 +1111,16 @@ impl<S: JitState> JitDriver<S> {
             // "if not self.partial_trace" — compile_trace is skipped
             // only during retrace (partial_trace != None). Bridge tracing
             // and normal tracing both attempt this path.
-            // pyre has no retrace yet, so the condition is always true.
             if has_trace_ops && self.meta.has_compiled_targets(green_key) {
                 if let Some(sym) = self.sym.as_ref() {
                     let jump_args = S::collect_jump_args(sym);
+                    // pyjitpl.py:2974-2976: resumekey is ResumeGuardDescr
+                    // for bridges, ResumeFromInterpDescr for loops.
+                    // compile_trace uses bridge_origin to distinguish.
+                    let bridge_origin = self.bridge_origin();
                     if matches!(
-                        self.meta.compile_trace(green_key, &jump_args, None),
+                        self.meta
+                            .compile_trace(green_key, &jump_args, bridge_origin),
                         crate::pyjitpl::CompileOutcome::Compiled { .. }
                     ) {
                         // pyjitpl.py:3196: raise_if_successful aborts the
@@ -2079,6 +2083,16 @@ impl<S: JitState> JitDriver<S> {
                 .collect();
             eprintln!("[jit] BRIDGE live_values: {}", vals.join(", "));
         }
+        // Pyre-specific: unbox Ref→Int to match compiled trace types.
+        // RPython has no adapt-live because MIFrame registers are typed.
+        // In pyre, all locals are Ref — the compiled trace may expect Int
+        // at positions where the optimizer unboxed.
+        let live_values = if target_pc == 0 {
+            self.meta
+                .adapt_live_values_to_trace_types(green_key, live_values)
+        } else {
+            live_values
+        };
         if !Self::live_values_match_descriptor(descriptor.as_ref(), &live_values) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -2110,18 +2124,6 @@ impl<S: JitState> JitDriver<S> {
                 restored: false,
                 via_blackhole: false,
             };
-        };
-        // Pyre-specific: unbox Ref→Int to match compiled trace types.
-        // RPython has no adapt-live because MIFrame registers are typed.
-        // In pyre, all values are Ref — the compiled trace may expect Int
-        // at positions where the optimizer unboxed (e.g. finish_and_compile
-        // traces have no preamble). compile_loop traces with preamble
-        // peeling do NOT need this (preamble handles conversion).
-        let live_values = if target_pc == 0 {
-            self.meta
-                .adapt_live_values_to_trace_types(green_key, live_values)
-        } else {
-            live_values
         };
         pre_run();
         let Some(result) = self

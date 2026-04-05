@@ -398,6 +398,8 @@ pub enum ResumeVirtualLayoutSummary {
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
+        /// info.py:318 _known_class — vtable pointer.
+        known_class: Option<i64>,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
@@ -593,6 +595,7 @@ impl ResumeVirtualLayoutSummary {
                 descr,
                 type_id,
                 descr_index,
+                known_class,
                 fields,
                 fielddescrs,
                 descr_size,
@@ -600,6 +603,7 @@ impl ResumeVirtualLayoutSummary {
                 descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
+                known_class: *known_class,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.to_resume_source()))
@@ -666,6 +670,7 @@ impl ResumeVirtualLayoutSummary {
                 descr,
                 type_id,
                 descr_index,
+                known_class,
                 fields,
                 fielddescrs,
                 descr_size,
@@ -673,6 +678,7 @@ impl ResumeVirtualLayoutSummary {
                 descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
+                known_class: *known_class,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.to_exit_source(virtual_offset)))
@@ -1135,6 +1141,8 @@ pub enum VirtualInfo {
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
+        /// info.py:318 _known_class — vtable pointer.
+        known_class: Option<i64>,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
@@ -1329,6 +1337,7 @@ impl VirtualInfo {
                 descr,
                 type_id,
                 descr_index,
+                known_class,
                 fields,
                 fielddescrs,
                 descr_size,
@@ -1336,6 +1345,7 @@ impl VirtualInfo {
                 descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
+                known_class: *known_class,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.layout_summary()))
@@ -1473,10 +1483,10 @@ pub fn rd_virtual_to_virtual_info(
             descr,
             type_id,
             descr_index,
+            known_class,
             fielddescrs,
             fieldnums,
             descr_size,
-            ..
         } => {
             let fields = fielddescrs
                 .iter()
@@ -1487,6 +1497,7 @@ pub fn rd_virtual_to_virtual_info(
                 descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
+                known_class: *known_class,
                 fields,
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -1591,6 +1602,7 @@ pub fn rd_virtual_to_virtual_info(
             descr: None,
             type_id: 0,
             descr_index: 0,
+            known_class: None,
             fields: vec![],
             fielddescrs: vec![],
             descr_size: 0,
@@ -2567,6 +2579,7 @@ impl ResumeDataVirtualAdder {
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
+        known_class: Option<i64>,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
@@ -2575,6 +2588,7 @@ impl ResumeDataVirtualAdder {
             descr,
             type_id,
             descr_index,
+            known_class,
             fields,
             fielddescrs,
             descr_size,
@@ -3178,8 +3192,7 @@ impl ResumeDataLoopMemo {
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern).
-        let mut virtual_fields: std::collections::BTreeMap<u32, majit_ir::VirtualFieldsInfo> =
-            std::collections::BTreeMap::new();
+        let mut virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo> = HashMap::new();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<u32> = Vec::new();
@@ -3367,7 +3380,6 @@ impl ResumeDataLoopMemo {
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
 
-            // BTreeMap provides deterministic iteration by key order.
             for (&opref_id, vf) in &virtual_fields {
                 // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
                 // Check both numb_state.liveboxes (env virtuals) and
@@ -4244,7 +4256,15 @@ mod tests {
     fn test_builder_add_virtual_convenience() {
         let mut builder = ResumeDataVirtualAdder::new();
         builder.push_frame(0);
-        let v0 = builder.add_virtual_obj(1, 10, vec![(0, VirtualFieldSource::FailArg(0))]);
+        let v0 = builder.add_virtual_obj(
+            None,
+            1,
+            10,
+            None,
+            vec![(0, VirtualFieldSource::FailArg(0))],
+            vec![],
+            0,
+        );
         let v1 = builder.add_virtual_array(
             20,
             vec![

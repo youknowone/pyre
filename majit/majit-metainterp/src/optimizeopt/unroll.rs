@@ -3320,6 +3320,7 @@ fn build_imported_virtuals_from_state(
                 known_class,
                 fields,
                 field_descrs,
+                ..
             } => {
                 result.push(crate::optimizeopt::optimizer::ImportedVirtual {
                     inputarg_index: idx,

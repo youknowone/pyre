@@ -987,21 +987,22 @@ fn materialize_virtual_recursive(
         // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable(descr).
         majit_backend::ExitVirtualLayout::Object {
             descr,
+            known_class,
             fields,
             fielddescrs,
             descr_size,
             type_id,
             ..
         } => {
-            let vals: Vec<i64> = fields
-                .iter()
-                .map(|(_, src)| resolve_virtual_field_value(src, outputs).unwrap_or(0))
-                .collect();
-            let ob_type = vals.first().copied().unwrap_or(0);
+            let ob_type = known_class.unwrap_or(0);
 
-            // Fast path: W_IntObject/W_FloatObject (2-field boxed)
-            if fields.len() == 2 && ob_type != 0 {
-                let mut temp = vec![0i64, ob_type, vals.get(1).copied().unwrap_or(0)];
+            // Fast path: W_IntObject/W_FloatObject (1 data field + known_class)
+            if fields.len() == 1 && ob_type != 0 {
+                let data_val = fields
+                    .first()
+                    .and_then(|(_, src)| resolve_virtual_field_value(src, outputs))
+                    .unwrap_or(0);
+                let mut temp = vec![0i64, ob_type, data_val];
                 let temp_types = vec![
                     majit_ir::Type::Ref,
                     majit_ir::Type::Int,
@@ -1026,7 +1027,7 @@ fn materialize_virtual_recursive(
                 .and_then(|d| d.as_size_descr())
                 .map(|sd| (sd.size(), sd.type_id()))
                 .unwrap_or((*descr_size, *type_id));
-            if fielddescrs.is_empty() && alloc_size == 0 {
+            if fielddescrs.is_empty() && alloc_size == 0 && ob_type == 0 {
                 return 0;
             }
             let size = if alloc_size > 0 { alloc_size } else { 16 };
@@ -1112,13 +1113,11 @@ fn materialize_virtual_recursive(
             fielddescrs,
             ..
         } => {
-            let ob_type = fields
-                .first()
-                .and_then(|(_, src)| resolve_virtual_field_value(src, outputs))
-                .unwrap_or(0);
+            // ob_type is set from known_class during allocation (Phase 1).
+            // fields only contain data fields (ob_type excluded).
             for (i, (_, src)) in fields.iter().enumerate() {
                 if let Some(fd) = fielddescrs.get(i) {
-                    if fd.offset > 0 || ob_type == 0 {
+                    {
                         // Resolve with materialized (nested virtuals now available)
                         let val = resolve_virtual_field_value_with_materialized(
                             src,
@@ -8854,6 +8853,7 @@ fn collect_guards(
                                 descr: descr.clone(),
                                 type_id: *type_id,
                                 descr_index: *descr_index,
+                                known_class: *known_class,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
                                 fielddescrs: fielddescrs.clone(),
@@ -14535,12 +14535,8 @@ mod tests {
             .unwrap();
 
         let failed = backend.execute_token(&callee, &[Value::Int(0)]);
-        let guard_descr = failed
-            .data
-            .downcast_ref::<JitFrameDeadFrame>()
-            .expect("callee guard should produce JitFrameDeadFrame")
-            .fail_descr
-            .clone();
+        let guard_descr = get_latest_descr_from_deadframe(&failed)
+            .expect("callee guard should produce a valid descr");
 
         backend.set_next_trace_id(1500_231);
         let bridge_inputargs = vec![InputArg::new_int(0)];
@@ -14553,13 +14549,7 @@ mod tests {
         constants.insert(100, 100);
         backend.set_constants(constants);
         backend
-            .compile_bridge(
-                guard_descr.as_ref(),
-                &bridge_inputargs,
-                &bridge_ops,
-                &callee,
-                &[],
-            )
+            .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &callee, &[])
             .unwrap();
 
         backend.set_constants(HashMap::new());
@@ -14846,12 +14836,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
-        let guard_descr = failed
-            .data
-            .downcast_ref::<JitFrameDeadFrame>()
-            .expect("base-case guard should produce JitFrameDeadFrame")
-            .fail_descr
-            .clone();
+        let guard_descr = get_latest_descr_from_deadframe(&failed)
+            .expect("base-case guard should produce a valid descr");
 
         backend.set_constants(HashMap::new());
         let bridge_ops = vec![
@@ -14859,7 +14845,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
         backend
-            .compile_bridge(guard_descr.as_ref(), &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
             .unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(4)]);

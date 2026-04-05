@@ -324,12 +324,24 @@ impl Optimizer {
             VirtualStateInfo::Virtual {
                 descr,
                 known_class,
+                ob_type_descr,
                 fields,
                 field_descrs,
             } => {
                 let mut imported_fields = Vec::new();
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
+                    // ob_type (offset 0) constants are GcRef pointers stored
+                    // as Value::Int. Register as Ref in constant_types so
+                    // fail_arg_types + blackhole decode_ref handle them correctly.
+                    let offset = field_descrs
+                        .iter()
+                        .find(|(di, _)| *di == *field_idx)
+                        .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
+                    if offset == Some(0) && known_class.is_some() {
+                        ctx.constant_types_for_numbering
+                            .insert(field_ref.0, majit_ir::Type::Ref);
+                    }
                     imported_fields.push((*field_idx, field_ref));
                 }
                 ctx.set_ptr_info(
@@ -338,6 +350,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualInfo {
                             descr: descr.clone(),
                             known_class: *known_class,
+                            ob_type_descr: ob_type_descr.clone(),
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
@@ -612,6 +625,7 @@ impl Optimizer {
                             crate::optimizeopt::info::VirtualInfo {
                                 descr: entry.size_descr,
                                 known_class: *known_class,
+                                ob_type_descr: None,
                                 fields: entry.fields,
                                 field_descrs: entry.field_descrs,
                                 last_guard_pos: -1,
@@ -653,22 +667,29 @@ impl Optimizer {
             VirtualStateInfo::Virtual {
                 descr,
                 known_class,
+                ob_type_descr,
                 fields,
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
-                let imported_fields = fields
+                let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
-                        (
-                            *field_idx,
-                            Self::import_virtual_state_from_label_args(
-                                field_info,
-                                imported_label_args,
-                                label_slot,
-                                ctx,
-                            ),
-                        )
+                        let field_ref = Self::import_virtual_state_from_label_args(
+                            field_info,
+                            imported_label_args,
+                            label_slot,
+                            ctx,
+                        );
+                        let offset = field_descrs
+                            .iter()
+                            .find(|(di, _)| *di == *field_idx)
+                            .and_then(|(_, d)| d.as_field_descr().map(|fd| fd.offset()));
+                        if offset == Some(0) && known_class.is_some() {
+                            ctx.constant_types_for_numbering
+                                .insert(field_ref.0, majit_ir::Type::Ref);
+                        }
+                        (*field_idx, field_ref)
                     })
                     .collect();
                 ctx.set_ptr_info(
@@ -677,6 +698,7 @@ impl Optimizer {
                         crate::optimizeopt::info::VirtualInfo {
                             descr: descr.clone(),
                             known_class: *known_class,
+                            ob_type_descr: ob_type_descr.clone(),
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
@@ -1636,8 +1658,9 @@ impl Optimizer {
         }
 
         // Process JUMP/FINISH through passes to force virtual args.
-        // RPython doesn't send JUMP through passes, but majit's virtual
-        // forcing relies on OptVirtualize's JUMP handler for now.
+        // RPython doesn't send Phase 1 JUMP through passes (flush=False),
+        // but majit's virtual forcing relies on OptVirtualize's JUMP handler.
+        // VirtualState was already captured above in pre_jump_virtual_state.
         if let Some(mut terminal_op) = last_op {
             if self.skip_flush {
                 // RPython: Phase 2 JUMP is NOT sent through optimization

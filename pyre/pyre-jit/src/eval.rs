@@ -768,6 +768,10 @@ fn stack_almost_full() -> bool {
 ///
 /// This is the main entry point for pyre-jit.
 pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
+    eval_with_jit_inner(frame)
+}
+
+fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
@@ -1131,7 +1135,10 @@ fn maybe_compile_and_run(
 }
 
 /// compile.py:701-717 handle_fail outcome.
-/// RPython's handle_fail always succeeds (bridge or blackhole).
+/// compile.py:701-717: handle_fail NEVER returns in RPython — it raises
+/// ContinueRunningNormally or DoneWithThisFrame. In pyre, we return the
+/// equivalent BlackholeResult.
+/// compile.py:701-717 handle_fail outcome.
 enum HandleFailOutcome {
     /// Bridge compiled successfully — continue in compiled code.
     BridgeCompiled,
@@ -1142,16 +1149,11 @@ enum HandleFailOutcome {
 /// compile.py:701-717 handle_fail.
 ///
 /// Single function containing the complete guard failure handling:
-/// must_compile decision (already computed by jitdriver) → if bridge:
-/// start_compiling + _trace_and_compile_from_bridge + done_compiling;
-/// else: restore state for blackhole resume.
+/// compile.py:701-717 handle_fail.
 ///
-/// RPython: deadframe is passed to _trace_and_compile_from_bridge which
-/// creates a fresh MetaInterp (compile.py:730). No state restoration
-/// happens before the bridge/blackhole decision. Pyre differs: we call
-/// compile.py:701-717 handle_fail: pass deadframe directly to
-/// bridge or blackhole path. RPython does NO state restoration
-/// before the decision — each path restores internally.
+/// RPython: handle_fail NEVER returns — both paths raise
+/// ContinueRunningNormally or DoneWithThisFrame.
+/// pyre: returns BlackholeResult (equivalent to RPython's exceptions).
 fn handle_fail(
     frame: &mut PyFrame,
     green_key: u64,
@@ -1177,32 +1179,61 @@ fn handle_fail(
                 driver.meta_interp_mut().start_guard_compiling(descr_addr);
             }
             // compile.py:706-708: _trace_and_compile_from_bridge(deadframe)
-            let compiled = crate::call_jit::trace_and_compile_from_bridge(
-                owning_key,
-                trace_id,
-                fail_index,
-                frame,
-                raw_values,
-                exit_layout,
-            );
-            // compile.py:709: self.done_compiling() (clear ST_BUSY_FLAG)
+            // force_plain_eval prevents concrete calls during bridge
+            // tracing from re-entering compiled code.
+            let compiled = {
+                let _plain = pyre_interpreter::call::force_plain_eval();
+                crate::call_jit::trace_and_compile_from_bridge(
+                    owning_key,
+                    trace_id,
+                    fail_index,
+                    frame,
+                    raw_values,
+                    exit_layout,
+                )
+            };
+            // compile.py:709: done_compiling (clear ST_BUSY_FLAG)
             {
                 let (driver, _) = driver_pair();
                 driver.meta_interp_mut().done_guard_compiling(descr_addr);
             }
             if compiled {
+                // compile.py:708: bridge compiled → ContinueRunningNormally.
+                // RPython: the bridge is attached to the guard descr;
+                // re-entering compiled code will follow the bridge.
                 return HandleFailOutcome::BridgeCompiled;
             }
-            // Bridge failed → blackhole fallback (pyjitpl.py:2906
-            // SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-            build_blackhole_frames_from_deadframe(raw_values, exit_layout);
-            return HandleFailOutcome::ResumeInBlackhole;
         }
     }
-    // compile.py:710-716: resume_in_blackhole(deadframe)
-    // Blackhole path: build frames directly from deadframe.
-    build_blackhole_frames_from_deadframe(raw_values, exit_layout);
+    // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
+    // resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
     HandleFailOutcome::ResumeInBlackhole
+}
+
+/// compile.py:710-716 resume_in_blackhole parity.
+///
+/// RPython: resume_in_blackhole → blackhole_from_resumedata →
+/// consume_one_section → _run_forever → raises.
+/// pyre: build_resumed_frames → resume_in_blackhole → returns result.
+///
+/// The RPython orthodox path (blackhole_resume_via_rd_numb →
+/// consume_one_section) is not yet compatible with pyre's JitCode
+/// liveness format. Use pyre's build_resumed_frames path.
+fn resume_in_blackhole_from_exit_layout(
+    frame: &mut PyFrame,
+    raw_values: &[i64],
+    exit_layout: &CompiledExitLayout,
+) -> crate::call_jit::BlackholeResult {
+    use crate::call_jit::BlackholeResult;
+
+    build_blackhole_frames_from_deadframe(raw_values, exit_layout);
+    let guard_frames = take_last_guard_frames();
+    if let Some(ref frames) = guard_frames {
+        let entry_pc = frame.next_instr;
+        crate::call_jit::resume_in_blackhole(frame, frames, entry_pc)
+    } else {
+        BlackholeResult::Failed
+    }
 }
 
 /// RPython warmstate.py:387-423 execute_assembler.
@@ -1303,44 +1334,35 @@ fn execute_assembler(
             descr_addr,
             ref raw_values,
             ref exit_layout,
-        } => match handle_fail(
-            frame,
-            green_key,
-            trace_id,
-            fail_index,
-            should_bridge,
-            owning_key,
-            descr_addr,
-            exit_layout,
-            raw_values,
-            info,
-        ) {
-            HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
-            HandleFailOutcome::ResumeInBlackhole => {
-                // blackhole.py:1782 resume_in_blackhole →
-                // blackhole.py:1752 _run_forever
-                let guard_frames = take_last_guard_frames();
-                if let Some(ref frames) = guard_frames {
-                    match crate::call_jit::resume_in_blackhole(frame, frames, entry_pc) {
+        } => {
+            match handle_fail(
+                frame,
+                green_key,
+                trace_id,
+                fail_index,
+                should_bridge,
+                owning_key,
+                descr_addr,
+                exit_layout,
+                raw_values,
+                info,
+            ) {
+                HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
+                HandleFailOutcome::ResumeInBlackhole => {
+                    // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
+                    let bh_result =
+                        resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout);
+                    match bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                            // compile.py:711-717: RPython does NOT invalidate
-                            // after blackhole resume. Guard counter accumulates
-                            // for bridge compilation on the next failure.
                             Some(LoopResult::ContinueRunningNormally)
                         }
                         crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
                             Some(LoopResult::Done(r))
                         }
                         crate::call_jit::BlackholeResult::Failed => {
-                            // resume.py:1312: blackhole_from_resumedata never
-                            // fails in upstream — it's a contract. This path
-                            // means a pyre resume data bug. Invalidate to
-                            // prevent re-entering the broken guard. Remove
-                            // once blackhole resume is fully sound.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][BUG] blackhole failed key={} — \
-                                     invalidating compiled loop",
+                                    "[jit][BUG] blackhole failed key={} — invalidating",
                                     green_key,
                                 );
                             }
@@ -1348,11 +1370,9 @@ fn execute_assembler(
                             None
                         }
                     }
-                } else {
-                    None
                 }
             }
-        },
+        }
         DetailedDriverRunOutcome::Jump { .. } | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
@@ -1494,17 +1514,14 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    let guard_frames = take_last_guard_frames();
-                    if let Some(ref frames) = guard_frames {
-                        match crate::call_jit::resume_in_blackhole(frame, frames, loop_header_pc) {
-                            crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                                return Some(LoopResult::ContinueRunningNormally);
-                            }
-                            crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                                return Some(LoopResult::Done(r));
-                            }
-                            crate::call_jit::BlackholeResult::Failed => {}
+                    match resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout) {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                            return Some(LoopResult::ContinueRunningNormally);
                         }
+                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                            return Some(LoopResult::Done(r));
+                        }
+                        crate::call_jit::BlackholeResult::Failed => {}
                     }
                 }
             }
@@ -1628,24 +1645,27 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 info,
             ) {
                 HandleFailOutcome::BridgeCompiled => {
-                    frame.fix_array_ptrs();
-                    return None;
+                    // Bridge compiled → ContinueRunningNormally → re-enter
+                    // compiled code which will follow the new bridge.
+                    // Fall through to eval_loop_jit below.
                 }
                 HandleFailOutcome::ResumeInBlackhole => {
-                    // compile.py:710-716: resume_in_blackhole
-                    let guard_frames = take_last_guard_frames();
-                    if let Some(ref frames) = guard_frames {
-                        match crate::call_jit::resume_in_blackhole(frame, frames, frame.next_instr)
-                        {
-                            crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
-                                return Some(r);
+                    match resume_in_blackhole_from_exit_layout(frame, raw_values, exit_layout) {
+                        crate::call_jit::BlackholeResult::DoneWithThisFrame(r) => {
+                            return Some(r);
+                        }
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally => {
+                            // Fall through to eval_loop_jit
+                        }
+                        crate::call_jit::BlackholeResult::Failed => {
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][BUG] blackhole failed key={} — invalidating",
+                                    green_key,
+                                );
                             }
-                            crate::call_jit::BlackholeResult::ContinueRunningNormally => {
-                                // Fall through to eval_loop_jit
-                            }
-                            crate::call_jit::BlackholeResult::Failed => {
-                                // Fall through to interpreter
-                            }
+                            let (driver, _) = driver_pair();
+                            driver.invalidate_loop(green_key);
                         }
                     }
                 }
@@ -2208,8 +2228,13 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
         {
-            // W_IntObject fast path: fieldnums[0] = intval (offset 8)
-            if let Some(&tagged) = fieldnums.first() {
+            // W_IntObject fast path: find intval field (offset 8).
+            // fielddescrs may include ob_type (offset 0) first.
+            let intval_idx = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == 8)
+                .unwrap_or(0);
+            if let Some(&tagged) = fieldnums.get(intval_idx) {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -2233,8 +2258,12 @@ fn materialize_virtual_from_rd(
         VirtualKind::Instance { known_class, .. }
             if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
         {
-            // W_FloatObject fast path: fieldnums[0] = floatval (offset 8)
-            if let Some(&tagged) = fieldnums.first() {
+            // W_FloatObject fast path: find floatval field (offset 8).
+            let floatval_idx = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == 8)
+                .unwrap_or(0);
+            if let Some(&tagged) = fieldnums.get(floatval_idx) {
                 let val = decode_tagged_value(
                     tagged,
                     dead_frame,
@@ -3582,7 +3611,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // Allocate a fresh GC object by type_id. Fields are zeroed; the
         // caller fills them via setfield_typed. Must return a NEW object
         // (not from small-int pool) because setfield_typed mutates in-place.
-        use crate::jit::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+        use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
         match descr_index {
             W_INT_GC_TYPE_ID => {
                 let obj = Box::new(pyre_object::intobject::W_IntObject {

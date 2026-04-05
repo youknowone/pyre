@@ -1341,8 +1341,16 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
         stack: 20,
     };
 
-    assert!(!driver.back_edge_structured(green_key.clone(), 7, &mut state, &(), || {}));
-    assert!(!driver.back_edge_structured(green_key.clone(), 7, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_structured(green_key.clone(), 7, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_structured(green_key.clone(), 7, &mut state, &(), || {})
+            .is_none()
+    );
     assert!(driver.is_tracing());
 
     let ctx = driver
@@ -1367,8 +1375,16 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
     let mut driver = JitDriver::<TestState>::with_descriptor(2, descriptor.clone());
     let mut state = TestState { frame: 3, stack: 4 };
 
-    assert!(!driver.back_edge_keyed(key, 11, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(key, 11, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(key, 11, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(key, 11, &mut state, &(), || {})
+            .is_none()
+    );
     assert!(driver.is_tracing());
 
     let ctx = driver
@@ -1400,14 +1416,16 @@ fn declarative_driver_trait_builds_runtime_driver_without_manual_descriptor_plum
     let mut state = TestState { frame: 1, stack: 2 };
 
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<DeclarativeDriver>(&[13, 21], 13, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(driver.is_tracing());
 
@@ -1443,14 +1461,16 @@ fn declarative_driver_rejects_live_value_count_mismatch() {
     let mut state = BadLiveState { frame: 9 };
 
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(!driver.is_tracing());
 }
@@ -1469,14 +1489,16 @@ fn declarative_driver_preserves_typed_red_inputargs_on_trace_start() {
     };
 
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<TypedDeclarativeDriver>(&[17, 23], 17, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(driver.is_tracing());
 
@@ -1503,14 +1525,16 @@ fn declarative_driver_rejects_live_value_type_mismatch() {
     };
 
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(
-        !driver
+        driver
             .back_edge_declarative::<TypedDeclarativeDriver>(&[19, 29], 19, &mut state, &(), || {})
             .expect("green key should build")
+            .is_none()
     );
     assert!(!driver.is_tracing());
 }
@@ -1530,8 +1554,16 @@ fn declarative_driver_can_reject_virtualizable_sync_before_tracing_starts() {
         reject_sync: true,
     };
 
-    assert!(!driver.back_edge_keyed(77, 77, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(77, 77, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(77, 77, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(77, 77, &mut state, &(), || {})
+            .is_none()
+    );
     assert_eq!(state.before_sync_calls, 2);
     assert_eq!(state.after_sync_calls, 0);
     assert!(!driver.is_tracing());
@@ -1550,8 +1582,16 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
         top: 5,
     };
 
-    assert!(!driver.back_edge_keyed(444, 444, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(444, 444, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(444, 444, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(444, 444, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1602,8 +1642,16 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         materialize_calls: 0,
     };
 
-    assert!(!driver.back_edge_keyed(555, 555, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(555, 555, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(555, 555, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(555, 555, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1669,8 +1717,10 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
         0,
     );
     let outer = resume.add_virtual_obj(
+        None,
         0,
         20,
+        None,
         vec![
             (
                 0,
@@ -1678,6 +1728,8 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
             ),
             (1, majit_metainterp::resume::ResumeValueSource::Constant(99)),
         ],
+        vec![],
+        0,
     );
     resume.set_slot_virtual(0, outer);
     resume.set_slot_virtual(1, inner);
@@ -1753,8 +1805,16 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
         flag: 0,
     };
 
-    assert!(!driver.back_edge_keyed(666, 666, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(666, 666, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(666, 666, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(666, 666, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1805,8 +1865,16 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
         flag: 0,
     };
 
-    assert!(!driver.back_edge_keyed(888, 888, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(888, 888, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(888, 888, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(888, 888, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1858,8 +1926,16 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
         restored_pcs: Vec::new(),
     };
 
-    assert!(!driver.back_edge_keyed(777, 777, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(777, 777, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(777, 777, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(777, 777, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1914,8 +1990,16 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
         materialize_calls: 0,
     };
 
-    assert!(!driver.back_edge_keyed(778, 778, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(778, 778, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(778, 778, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(778, 778, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -1976,8 +2060,16 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
         materialize_calls: 0,
     };
 
-    assert!(!driver.back_edge_keyed(779, 779, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(779, 779, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(779, 779, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(779, 779, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
@@ -2035,8 +2127,16 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
         restored_frames: Vec::new(),
     };
 
-    assert!(!driver.back_edge_keyed(780, 780, &mut state, &(), || {}));
-    assert!(!driver.back_edge_keyed(780, 780, &mut state, &(), || {}));
+    assert!(
+        driver
+            .back_edge_keyed(780, 780, &mut state, &(), || {})
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_keyed(780, 780, &mut state, &(), || {})
+            .is_none()
+    );
     driver.merge_point(|ctx, sym| {
         ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[sym[1]], 1, &[sym[1]]);
         let one = ctx.const_int(1);
