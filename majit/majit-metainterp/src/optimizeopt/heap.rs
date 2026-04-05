@@ -1091,20 +1091,18 @@ impl OptHeap {
         if !is_vable_field {
             // heap.py:177-187: CachedField._getfield — PreambleOp detection.
             // info.py:716: ConstPtrInfo._get_info delegates to const_infos.
+            // heap.py:177-187: CachedField._getfield PreambleOp detection.
             let pop = ctx
                 .get_ptr_info_mut(obj)
                 .and_then(|info| info.take_preamble_field(field_idx))
                 .or_else(|| {
                     ctx.get_const_info_mut(obj)
                         .and_then(|info| info.take_preamble_field(field_idx))
-                })
-                .or_else(|| ctx.preamble_field_fallback.remove(&(obj, field_idx)));
+                });
             if let Some(pop) = pop {
                 let cached = pop.resolved;
-                // RPython heap.py:185-186: always force PreambleOp.
-                // force_op_from_preamble registers with short preamble
-                // builder (use_box + potential_extra_ops).
-                ctx.force_op_from_preamble(cached);
+                // heap.py:185-186: force_op_from_preamble(res)
+                ctx.force_op_from_preamble_op(&pop);
                 let d = op.descr.clone();
                 let is_immutable = d.as_ref().map_or(false, |dd| dd.is_always_pure());
                 if is_immutable {

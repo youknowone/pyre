@@ -101,12 +101,6 @@ pub struct ImportedShortSource {
     pub source: OpRef,
 }
 
-#[derive(Clone, Debug)]
-pub struct TrackedPreambleUse {
-    pub result: OpRef,
-    pub produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
-}
-
 /// optimizer.py:787-789: constant_fold — allocate an immutable object at
 /// compile time when all fields are constants. The callback receives the
 /// SizeDescr size_bytes, and returns a raw pointer (GcRef) to freshly
@@ -197,9 +191,9 @@ pub struct OptContext {
     pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
-    /// RPython unroll.py: potential_extra_ops populated by force_op_from_preamble
-    /// and later consumed by optimizer.force_box().
-    pub(crate) potential_extra_ops: HashMap<OpRef, TrackedPreambleUse>,
+    /// unroll.py:37 / optimizer.py:354: potential_extra_ops[op] = preamble_op
+    /// Populated by force_op_from_preamble, consumed by force_box.
+    pub(crate) potential_extra_ops: HashMap<OpRef, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -282,11 +276,6 @@ pub struct OptContext {
     /// resume.py parity: RPython guards always get a snapshot via
     /// capture_resumedata; pyre tracks the nearest valid position.
     pub last_seen_snapshot_pos: Option<i32>,
-    /// Fallback preamble_field map for HeapField imports.
-    /// Maps (source_opref, field_idx) → PreambleOp.
-    /// Used when the PtrInfo-based lookup fails because forwarding
-    /// overwrites Op→Info after import_short_preamble_ops.
-    pub preamble_field_fallback: HashMap<(OpRef, u32), crate::optimizeopt::info::PreambleOp>,
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
@@ -699,7 +688,6 @@ impl OptContext {
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            preamble_field_fallback: HashMap::new(),
         }
     }
 
@@ -755,7 +743,6 @@ impl OptContext {
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            preamble_field_fallback: HashMap::new(),
         }
     }
 
@@ -1072,74 +1059,65 @@ impl OptContext {
             .unwrap_or(result)
     }
 
-    /// unroll.py:26-39: force_op_from_preamble
-    /// Calls use_box (shortpreamble.py:382-407) with info/guard replay,
-    /// then registers in potential_extra_ops for later force_box.
-    pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        // unroll.py:27: check isinstance BEFORE get_box_replacement
-        let preamble_source = self.imported_short_source(result);
+    /// unroll.py:26-39: force_op_from_preamble(preamble_op)
+    ///
+    /// RPython receives a PreambleOp with invented_name already set.
+    /// Calls use_box then registers in potential_extra_ops.
+    pub fn force_op_from_preamble_op(
+        &mut self,
+        preamble_op: &crate::optimizeopt::info::PreambleOp,
+    ) -> OpRef {
+        let preamble_source = preamble_op.op;
+        let result = preamble_op.resolved;
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
-            // shortpreamble.py:389,396,406: info.make_guards → self.short
-            let (arg_guards, result_guards) = self.collect_use_box_guards(preamble_source);
-
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self)
-            let tracked = if let Some(mut builder) = self.active_short_preamble_producer.take() {
-                // shortpreamble.py:478-481: ExtendedShortPreambleBuilder.use_box
-                let ok = builder
-                    .use_box(preamble_source, &arg_guards, &result_guards)
-                    .is_some();
+            let (arg_guards, result_guards) = self.collect_use_box_guards(preamble_source);
+            if let Some(mut builder) = self.active_short_preamble_producer.take() {
+                builder.use_box(preamble_source, &arg_guards, &result_guards);
                 self.active_short_preamble_producer = Some(builder);
-                ok
             } else if let Some(mut builder) = self.imported_short_preamble_builder.take() {
-                let ok = builder
-                    .use_box(preamble_source, &arg_guards, &result_guards)
-                    .is_some();
+                builder.use_box(preamble_source, &arg_guards, &result_guards);
                 self.imported_short_preamble_builder = Some(builder);
-                ok
-            } else {
-                false
-            };
-            // shortpreamble.py:404: setinfo_from_preamble(box, info, None)
+            }
+            // shortpreamble.py:404: optimizer.setinfo_from_preamble(box, info, None)
             if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
                 self.setinfo_from_preamble(result, &info, None);
             }
-
-            // unroll.py:33-37: potential_extra_ops[op] = preamble_op
-            //
-            // shortpreamble.py:471-477: add_preamble_op — track used ops.
-            // RPython relies on force_box (optimizer.py:354-359) to pop from
-            // potential_extra_ops → add_preamble_op → used_boxes. In majit,
-            // OpRef identity doesn't always match between potential_extra_ops
-            // keys and force_box args, so also register immediately.
-            if tracked && !is_constant {
-                let produced = self
-                    .imported_short_preamble_builder
-                    .as_ref()
-                    .and_then(|b| b.produced_short_op(preamble_source))
-                    .or_else(|| {
-                        self.active_short_preamble_producer
-                            .as_ref()
-                            .and_then(|b| b.produced_short_op(preamble_source))
-                    });
-                if let Some(produced) = produced {
-                    let key = if produced.invented_name {
-                        self.get_box_replacement(preamble_source)
-                    } else {
-                        preamble_source
-                    };
-                    // Register in potential_extra_ops for force_box path.
-                    self.potential_extra_ops.insert(
-                        key,
-                        TrackedPreambleUse {
-                            result: preamble_source,
-                            produced: produced.clone(),
-                        },
-                    );
-                }
+            // unroll.py:34-37: potential_extra_ops[op] = preamble_op
+            if !is_constant {
+                // unroll.py:35-36: invented_name → get_box_replacement(op)
+                let key = if preamble_op.invented_name {
+                    self.get_box_replacement(preamble_source)
+                } else {
+                    preamble_source
+                };
+                self.potential_extra_ops.insert(key, preamble_op.clone());
             }
         }
+        // unroll.py:38: return preamble_op.op
         result
+    }
+
+    /// Backward compat: force_op_from_preamble by OpRef lookup.
+    pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
+        let preamble_source = self.imported_short_source(result);
+        let invented_name = self
+            .imported_short_preamble_builder
+            .as_ref()
+            .and_then(|b| b.produced_short_op(preamble_source))
+            .or_else(|| {
+                self.active_short_preamble_producer
+                    .as_ref()
+                    .and_then(|b| b.produced_short_op(preamble_source))
+            })
+            .map_or(false, |p| p.invented_name);
+        let pop = crate::optimizeopt::info::PreambleOp {
+            op: preamble_source,
+            resolved: result,
+            invented_name,
+        };
+        self.force_op_from_preamble_op(&pop)
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from PtrInfo
@@ -1357,7 +1335,11 @@ impl OptContext {
         }
     }
 
-    pub fn take_potential_extra_op(&mut self, result: OpRef) -> Option<TrackedPreambleUse> {
+    /// optimizer.py:354: potential_extra_ops.pop(op)
+    pub fn take_potential_extra_op(
+        &mut self,
+        result: OpRef,
+    ) -> Option<crate::optimizeopt::info::PreambleOp> {
         self.potential_extra_ops.remove(&result)
     }
 
@@ -1918,11 +1900,12 @@ impl OptContext {
                     .then(|| self.take_potential_extra_op(preamble_source))
                     .flatten()
             });
-        if let Some(tracked) = tracked {
+        if let Some(preamble_op) = tracked {
+            let resolved_for_pop = self.get_box_replacement(preamble_op.op);
             if let Some(builder) = self.active_short_preamble_producer_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
-                builder.add_tracked_preamble_op(tracked.result, &tracked.produced);
+                builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
         if let Some(mut info) = self.get_ptr_info(resolved).cloned() {
