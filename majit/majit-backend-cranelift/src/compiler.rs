@@ -8763,7 +8763,7 @@ fn collect_guards(
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[(i64, Type)] = rd_consts_data;
             let (_num_failargs, _vable_values, _vref_values, frames) =
-                rebuild_from_numbering(rd_numb_bytes, rd_consts_data);
+                rebuild_from_numbering(rd_numb_bytes, rd_consts_data, None);
 
             // Rebuild frame slots from rd_numb values.
             // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.

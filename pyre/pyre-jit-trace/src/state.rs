@@ -139,6 +139,43 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
     })
 }
 
+/// resume.py:1049 consume_one_section → enumerate_vars parity:
+/// Returns the number of tagged values encoded for a frame at
+/// (jitcode_index, pc). Uses JitCode liveness (same data as
+/// get_list_of_active_boxes) for RPython-parity multi-frame decode.
+/// Falls back to LiveVars when JitCode liveness is unavailable.
+pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let idx = jitcode_index as usize;
+        let jc = match sd.jitcodes.get(idx) {
+            Some(jc) => jc,
+            None => return 0,
+        };
+        // Primary: JitCode liveness (same path as get_list_of_active_boxes).
+        if !jc.majit_jitcode.is_null() {
+            let mjc = unsafe { &*jc.majit_jitcode };
+            if let Some(&jit_pc) = mjc.py_to_jit_pc.get(pc as usize) {
+                if let Some(info) = mjc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
+                    return info.total_live();
+                }
+            }
+        }
+        // Fallback: LiveVars from CodeObject (backward-compat).
+        if !jc.code.is_null() {
+            let live = crate::liveness::liveness_for(jc.code);
+            let code_ref = unsafe { &*jc.code };
+            let nlocals = code_ref.varnames.len();
+            let live_locals = (0..nlocals)
+                .filter(|&i| live.is_local_live(pc as usize, i))
+                .count();
+            let stack_depth = live.stack_depth_at(pc as usize);
+            return live_locals + stack_depth;
+        }
+        0
+    })
+}
+
 /// Sentinel null JitCode for uninitialized PyreSym.
 static NULL_JITCODE: JitCode = JitCode {
     code: std::ptr::null(),
@@ -2037,10 +2074,10 @@ impl JitState for PyreJitState {
         let rd_numb = rd_numb?;
         let rd_consts = rd_consts.unwrap_or(&[]);
 
-        // Flat single-frame decode (no liveness info at this level).
-        // RPython-parity multi-frame: blackhole_from_resumedata.
+        // resume.py:1049 parity: liveness-driven multi-frame decode.
+        let frame_count_fn = crate::state::frame_value_count_at;
         let (_num_failargs, vable_values, vref_values, frames) =
-            rebuild_from_numbering(rd_numb, rd_consts);
+            rebuild_from_numbering(rd_numb, rd_consts, Some(&frame_count_fn));
 
         if frames.is_empty() {
             return None;
