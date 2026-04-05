@@ -2156,8 +2156,6 @@ fn jit_ca_handle_guard_failure(
     fail_index: u32,
     raw_values_ptr: *const i64,
     num_values: usize,
-    status: u64,
-    descr_addr: usize,
 ) -> bool {
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
@@ -2167,9 +2165,9 @@ fn jit_ca_handle_guard_failure(
     // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().must_compile_with_values(
-            green_key, trace_id, fail_index, raw_values, status, descr_addr,
-        )
+        driver
+            .meta_interp_mut()
+            .must_compile_with_values(green_key, trace_id, fail_index, raw_values)
     };
     // compile.py:702-703: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {

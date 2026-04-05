@@ -1382,10 +1382,9 @@ pub fn register_call_assembler_blackhole(
 }
 
 /// compile.py:701-717 handle_fail callback for call_assembler guard failures.
-/// (green_key, trace_id, fail_index, raw_values_ptr, num_values, status, descr_addr) -> bridge_compiled.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<
-    fn(u64, u64, u32, *const i64, usize, u64, usize) -> bool,
-> = OnceLock::new();
+/// (green_key, trace_id, fail_index, raw_values_ptr, num_values) -> bridge_compiled.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize) -> bool> =
+    OnceLock::new();
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
 // for force_fn to re-box before interpreter execution.
@@ -1638,7 +1637,7 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize, u64, usize) -> bool) {
+pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2420,8 +2419,6 @@ extern "C" fn call_assembler_guard_failure(
             fail_index,
             outputs_ptr,
             raw_num,
-            fail_descr.get_status(),
-            Arc::as_ptr(fail_descr) as usize,
         ) {
             // Bridge compiled — dispatch with finish check.
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
