@@ -136,55 +136,73 @@ mod tests {
     #[test]
     fn test_loop_sum() {
         // sum = 0; i = 10; while i > 0: sum += i; i -= 1
+        // Exercises: Jump, JumpIfFalse, StoreVar, LoadVar, Sub, Add, Gt
         let prog = vec![
-            ByteCode::LoadConst(0),  // 0: sum = 0
-            ByteCode::StoreVar(0),   // 1
-            ByteCode::LoadConst(10), // 2: i = 10
-            ByteCode::StoreVar(1),   // 3
-            // loop start (pc=4)
-            ByteCode::LoadVar(1),      // 4: i
-            ByteCode::LoadConst(0),    // 5: 0
-            ByteCode::Gt,              // 6: i > 0
-            ByteCode::JumpIfFalse(16), // 7: if false, goto halt
-            ByteCode::LoadVar(0),      // 8: sum
-            ByteCode::LoadVar(1),      // 9: i
+            ByteCode::LoadConst(0),  //  0: push 0
+            ByteCode::StoreVar(0),   //  1: sum = 0     (var a)
+            ByteCode::LoadConst(10), //  2: push 10
+            ByteCode::StoreVar(1),   //  3: i = 10      (var b)
+            // loop header (pc=4)
+            ByteCode::LoadVar(1),      //  4: push i
+            ByteCode::LoadConst(0),    //  5: push 0
+            ByteCode::Gt,              //  6: i > 0?
+            ByteCode::JumpIfFalse(15), //  7: if false → pc 15 (load result)
+            ByteCode::LoadVar(0),      //  8: push sum
+            ByteCode::LoadVar(1),      //  9: push i
             ByteCode::Add,             // 10: sum + i
             ByteCode::StoreVar(0),     // 11: sum = sum + i
-            ByteCode::LoadVar(1),      // 12: i
-            ByteCode::LoadConst(1),    // 13: 1
+            ByteCode::LoadVar(1),      // 12: push i
+            ByteCode::LoadConst(1),    // 13: push 1
+            ByteCode::Sub,             // 14: i - 1
+            ByteCode::StoreVar(1),     // 15: i = i - 1  — wait, JumpIfFalse(15) lands here
+                                       // Fix: JumpIfFalse target must skip the loop body entirely.
+                                       // Re-layout with correct targets:
+        ];
+        // Correct layout:
+        let prog = vec![
+            ByteCode::LoadConst(0),  //  0
+            ByteCode::StoreVar(0),   //  1: sum = 0
+            ByteCode::LoadConst(10), //  2
+            ByteCode::StoreVar(1),   //  3: i = 10
+            // loop header (pc=4)
+            ByteCode::LoadVar(1),      //  4: push i
+            ByteCode::LoadConst(0),    //  5: push 0
+            ByteCode::Gt,              //  6: i > 0?
+            ByteCode::JumpIfFalse(16), //  7: if false → pc 16 (result)
+            ByteCode::LoadVar(0),      //  8: push sum
+            ByteCode::LoadVar(1),      //  9: push i
+            ByteCode::Add,             // 10: sum + i
+            ByteCode::StoreVar(0),     // 11: sum = sum + i
+            ByteCode::LoadVar(1),      // 12: push i
+            ByteCode::LoadConst(1),    // 13: push 1
             ByteCode::Sub,             // 14: i - 1
             ByteCode::StoreVar(1),     // 15: i = i - 1
-            ByteCode::Jump(4),         // 16: goto loop start — NOT 16, fix:
-            ByteCode::LoadVar(0),      // 17: sum
+            ByteCode::Jump(4),         // 16 — but this IS pc 16, conflict
+        ];
+        // The issue: Jump(4) at pc=16 means JumpIfFalse(16) lands on Jump(4).
+        // That's wrong. Fix: JumpIfFalse should go to pc=17.
+        let prog = vec![
+            ByteCode::LoadConst(0),    //  0
+            ByteCode::StoreVar(0),     //  1: sum = 0
+            ByteCode::LoadConst(10),   //  2
+            ByteCode::StoreVar(1),     //  3: i = 10
+            ByteCode::LoadVar(1),      //  4: push i
+            ByteCode::LoadConst(0),    //  5: push 0
+            ByteCode::Gt,              //  6: i > 0?
+            ByteCode::JumpIfFalse(17), //  7: if false → pc 17 (LoadVar sum result)
+            ByteCode::LoadVar(0),      //  8: push sum
+            ByteCode::LoadVar(1),      //  9: push i
+            ByteCode::Add,             // 10: sum + i
+            ByteCode::StoreVar(0),     // 11: sum = sum + i
+            ByteCode::LoadVar(1),      // 12: push i
+            ByteCode::LoadConst(1),    // 13: push 1
+            ByteCode::Sub,             // 14: i - 1
+            ByteCode::StoreVar(1),     // 15: i = i - 1
+            ByteCode::Jump(4),         // 16: back to loop header
+            ByteCode::LoadVar(0),      // 17: push sum (result)
             ByteCode::Halt,            // 18
         ];
         let mut interp = CalcInterp::new();
-        // Note: Jump(4) at position 16 means we jump back to pc=4
-        // But position 16 is actually Jump, and position 17 is LoadVar
-        // Let me fix the indices:
-        let prog = vec![
-            ByteCode::LoadConst(0),  // 0: sum = 0
-            ByteCode::StoreVar(0),   // 1
-            ByteCode::LoadConst(10), // 2: i = 10
-            ByteCode::StoreVar(1),   // 3
-            // loop start (pc=4)
-            ByteCode::LoadVar(1),      // 4: i
-            ByteCode::LoadConst(0),    // 5: 0
-            ByteCode::Gt,              // 6: i > 0
-            ByteCode::JumpIfFalse(15), // 7: if false, goto 15 (LoadVar sum)
-            ByteCode::LoadVar(0),      // 8: sum
-            ByteCode::LoadVar(1),      // 9: i
-            ByteCode::Add,             // 10: sum + i
-            ByteCode::StoreVar(0),     // 11: sum = sum + i
-            ByteCode::LoadVar(1),      // 12: i
-            ByteCode::LoadConst(1),    // 13: 1
-            ByteCode::Sub,             // 14: i - 1
-            ByteCode::StoreVar(1),     // 15 — wait, off by one
-        ];
-        // This is getting complex, just test the simple case
-        assert_eq!(
-            interp.run(&vec![ByteCode::LoadConst(55), ByteCode::Halt,]),
-            55
-        );
+        assert_eq!(interp.run(&prog), 55); // 1+2+...+10 = 55
     }
 }
