@@ -1021,18 +1021,19 @@ impl MIFrame {
             // Snapshot boxes = active boxes only (skip [frame, ni, vsd] header).
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
                 // pfa = [frame, ni, vsd, active_boxes...]; snapshot gets [active_boxes...].
+                // pyjitpl.py:2586-2602 capture_resumedata: parent frames'
+                // snapshot stores ONLY their active boxes (the registers
+                // live at the call site), NOT the [frame, ni, vsd] header.
+                // When pfa.len() <= __n there are zero active boxes — the
+                // snapshot body must be empty, NOT the header itself.
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                let parent_active = if pfa.len() > __n {
-                    &pfa[__n..]
-                } else {
-                    &pfa[..]
-                };
+                let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
                 // pfa_types includes header [Ref, Int, Int]; snapshot needs
                 // only the active_boxes portion matching parent_active.
-                let parent_types = if pfa_types.len() > __n {
+                let parent_types: &[Type] = if pfa_types.len() > __n {
                     &pfa_types[__n..]
                 } else {
-                    pfa_types.as_slice()
+                    &[]
                 };
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
@@ -4025,15 +4026,15 @@ impl MIFrame {
                 let mut all_types = fail_arg_types.clone();
                 // Include parent frames (RPython: full self.framestack).
                 for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &this.parent_frames {
-                    let parent_active = if pfa.len() > __n {
-                        &pfa[__n..]
-                    } else {
-                        &pfa[..]
-                    };
-                    let parent_types = if pfa_types.len() > __n {
+                    // pyjitpl.py:2586-2602 capture_resumedata: parent
+                    // frames' snapshot stores ONLY their active boxes (not
+                    // the [frame, ni, vsd] header). When pfa.len() <= __n,
+                    // there are zero active boxes — body must be empty.
+                    let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
+                    let parent_types: &[Type] = if pfa_types.len() > __n {
                         &pfa_types[__n..]
                     } else {
-                        pfa_types.as_slice()
+                        &[]
                     };
                     frames.push(majit_trace::recorder::SnapshotFrame {
                         jitcode_index: *pfa_jitcode_index as u32,
