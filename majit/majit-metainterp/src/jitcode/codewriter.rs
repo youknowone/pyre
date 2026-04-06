@@ -643,54 +643,85 @@ impl JitCodeBuilder {
 
     /// RPython: `conditional_call_ir_v(condition, funcptr, calldescr, [i], [r])`
     /// Condition in cond_reg; if nonzero, call func with args. Result void.
-    pub fn conditional_call_void_args(&mut self, fn_ptr_idx: u16, cond_reg: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        // Encode: [BC] [cond_reg] [fn_ptr_idx] [n_args] [arg_types..] [arg_regs..]
+    /// `typed_args` carries per-argument kind (int/ref) — RPython make_three_lists parity.
+    pub fn conditional_call_void_typed_args(
+        &mut self,
+        fn_ptr_idx: u16,
+        cond_reg: u16,
+        typed_args: &[JitCallArg],
+    ) {
         self.touch_reg(cond_reg);
-        self.call_cond_like(BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, &args);
+        self.call_cond_like(BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, typed_args);
     }
 
     /// RPython: `conditional_call_value_ir_i(value, funcptr, calldescr, [i], [r])`
-    /// If value is zero, call func and return result. Else return value.
-    pub fn conditional_call_value_int(
+    pub fn conditional_call_value_int_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         value_reg: u16,
-        arg_regs: &[u16],
+        typed_args: &[JitCallArg],
         dst: u16,
     ) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
         self.touch_reg(value_reg);
         self.touch_reg(dst);
-        self.call_cond_value_like(BC_COND_CALL_VALUE_INT, fn_ptr_idx, value_reg, &args, dst);
+        self.call_cond_value_like(
+            BC_COND_CALL_VALUE_INT,
+            fn_ptr_idx,
+            value_reg,
+            typed_args,
+            dst,
+        );
     }
 
     /// RPython: `conditional_call_value_ir_r`
-    pub fn conditional_call_value_ref(
+    pub fn conditional_call_value_ref_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         value_reg: u16,
-        arg_regs: &[u16],
+        typed_args: &[JitCallArg],
         dst: u16,
     ) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
         self.touch_reg(value_reg);
         self.touch_reg(dst);
-        self.call_cond_value_like(BC_COND_CALL_VALUE_REF, fn_ptr_idx, value_reg, &args, dst);
+        self.call_cond_value_like(
+            BC_COND_CALL_VALUE_REF,
+            fn_ptr_idx,
+            value_reg,
+            typed_args,
+            dst,
+        );
     }
 
     /// RPython: `record_known_result_i_ir_v(result, funcptr, calldescr, [i], [r])`
-    pub fn record_known_result_int(&mut self, fn_ptr_idx: u16, result_reg: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+    pub fn record_known_result_int_typed_args(
+        &mut self,
+        fn_ptr_idx: u16,
+        result_reg: u16,
+        typed_args: &[JitCallArg],
+    ) {
         self.touch_reg(result_reg);
-        self.call_cond_like(BC_RECORD_KNOWN_RESULT_INT, fn_ptr_idx, result_reg, &args);
+        self.call_cond_like(
+            BC_RECORD_KNOWN_RESULT_INT,
+            fn_ptr_idx,
+            result_reg,
+            typed_args,
+        );
     }
 
     /// RPython: `record_known_result_r_ir_v`
-    pub fn record_known_result_ref(&mut self, fn_ptr_idx: u16, result_reg: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
+    pub fn record_known_result_ref_typed_args(
+        &mut self,
+        fn_ptr_idx: u16,
+        result_reg: u16,
+        typed_args: &[JitCallArg],
+    ) {
         self.touch_reg(result_reg);
-        self.call_cond_like(BC_RECORD_KNOWN_RESULT_REF, fn_ptr_idx, result_reg, &args);
+        self.call_cond_like(
+            BC_RECORD_KNOWN_RESULT_REF,
+            fn_ptr_idx,
+            result_reg,
+            typed_args,
+        );
     }
 
     fn call_cond_like(&mut self, bc: u8, fn_ptr_idx: u16, first_reg: u16, args: &[JitCallArg]) {

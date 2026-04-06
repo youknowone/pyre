@@ -691,18 +691,34 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         // args[0] = condition, args[1] = func path, args[2..] = function arguments
+        let func_args = &args[2..];
+        // jtransform.py:1666-1672: no floats, no more than 4 function args
+        if func_args.len() > 4 {
+            panic!("conditional_call does not support more than 4 arguments");
+        }
         let cond_binding = self.lower_value_expr(args[0])?;
         let cond_reg = cond_binding.reg;
-        let mut arg_regs = Vec::new();
-        for arg in &args[2..] {
+        // RPython make_three_lists: tag each arg with its kind (int/ref).
+        let mut typed_arg_tokens = Vec::new();
+        for arg in func_args {
             let b = self.lower_value_expr(arg)?;
-            arg_regs.push(b.reg);
+            let reg = b.reg;
+            let token = match b.kind {
+                // jtransform.py:1668: float → raise Exception
+                BindingKind::Float => {
+                    panic!("Conditional call does not support floats");
+                }
+                BindingKind::Ref => {
+                    quote! { majit_metainterp::jitcode::JitCallArg::reference(#reg) }
+                }
+                BindingKind::Int => quote! { majit_metainterp::jitcode::JitCallArg::int(#reg) },
+            };
+            typed_arg_tokens.push(token);
         }
         let func_path = args[1];
-        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
         self.statements.push(quote! {
             let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
-            __builder.conditional_call_void_args(__fn_idx, #cond_reg, &[#(#arg_reg_array),*]);
+            __builder.conditional_call_void_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
         });
         Some(())
     }
@@ -728,24 +744,42 @@ impl<'c> Lowerer<'c> {
         if args.len() < 2 {
             return None;
         }
+        let func_args = &args[2..];
+        // jtransform.py:1666-1672: no floats, no more than 4 function args
+        if func_args.len() > 4 {
+            panic!("Conditional call does not support more than 4 arguments");
+        }
         let value_binding = self.lower_value_expr(args[0])?;
         let value_reg = value_binding.reg;
-        let mut arg_regs = Vec::new();
-        for arg in &args[2..] {
+        // jtransform.py:1668: value itself must not be float
+        if matches!(value_binding.kind, BindingKind::Float) {
+            panic!("Conditional call does not support floats");
+        }
+        // RPython make_three_lists: tag each arg with its kind.
+        let mut typed_arg_tokens = Vec::new();
+        for arg in func_args {
             let b = self.lower_value_expr(arg)?;
-            arg_regs.push(b.reg);
+            let reg = b.reg;
+            let token = match b.kind {
+                BindingKind::Float => {
+                    panic!("Conditional call does not support floats");
+                }
+                BindingKind::Ref => {
+                    quote! { majit_metainterp::jitcode::JitCallArg::reference(#reg) }
+                }
+                BindingKind::Int => quote! { majit_metainterp::jitcode::JitCallArg::int(#reg) },
+            };
+            typed_arg_tokens.push(token);
         }
         let func_path = args[1];
         let result_reg = self.alloc_reg();
-        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
         // RPython jtransform.py:1687 — conditional_call_value_ir_{i|r}
-        // Split by result kind: int vs ref.
         let builder_call = match value_binding.kind {
             BindingKind::Ref => quote! {
-                __builder.conditional_call_value_ref(__fn_idx, #value_reg, &[#(#arg_reg_array),*], #result_reg);
+                __builder.conditional_call_value_ref_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
             _ => quote! {
-                __builder.conditional_call_value_int(__fn_idx, #value_reg, &[#(#arg_reg_array),*], #result_reg);
+                __builder.conditional_call_value_int_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
         };
         self.statements.push(quote! {
@@ -783,20 +817,34 @@ impl<'c> Lowerer<'c> {
         // args[0] = known result, args[1] = func path, args[2..] = function arguments
         let result_binding = self.lower_value_expr(args[0])?;
         let result_reg = result_binding.reg;
-        let mut arg_regs = Vec::new();
+        // jtransform.py:293-295: float → raise Exception
+        if matches!(result_binding.kind, BindingKind::Float) {
+            panic!("record_known_result does not support floats");
+        }
+        // RPython make_three_lists: tag each arg with its kind.
+        let mut typed_arg_tokens = Vec::new();
         for arg in &args[2..] {
             let b = self.lower_value_expr(arg)?;
-            arg_regs.push(b.reg);
+            let reg = b.reg;
+            let token = match b.kind {
+                BindingKind::Float => {
+                    panic!("record_known_result does not support floats");
+                }
+                BindingKind::Ref => {
+                    quote! { majit_metainterp::jitcode::JitCallArg::reference(#reg) }
+                }
+                BindingKind::Int => quote! { majit_metainterp::jitcode::JitCallArg::int(#reg) },
+            };
+            typed_arg_tokens.push(token);
         }
         let func_path = args[1];
-        let arg_reg_array: Vec<_> = arg_regs.iter().collect();
         // RPython jtransform.py:302-307 — record_known_result_{i|r}
         let builder_call = match result_binding.kind {
             BindingKind::Ref => quote! {
-                __builder.record_known_result_ref(__fn_idx, #result_reg, &[#(#arg_reg_array),*]);
+                __builder.record_known_result_ref_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
             _ => quote! {
-                __builder.record_known_result_int(__fn_idx, #result_reg, &[#(#arg_reg_array),*]);
+                __builder.record_known_result_int_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
         };
         self.statements.push(quote! {
