@@ -329,6 +329,18 @@ pub fn init_typeobjects() {
         new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
     );
 
+    // slice — PyPy: sliceobject.py, bases=(object,)
+    reg.insert(
+        &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
+        new_typeobject_with_base("slice", |_| {}, object_type) as usize,
+    );
+
+    // bytearray — PyPy: bytearrayobject.py, bases=(object,)
+    reg.insert(
+        &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
+        new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
+    );
+
     let _ = TYPEOBJECT_CACHE.set(reg);
 }
 
@@ -391,6 +403,13 @@ fn new_typeobject_with_base(
     }
     unsafe { w_type_set_mro(type_obj, mro) };
     type_obj
+}
+
+/// Create a named builtin type inheriting from `object`.
+///
+/// Used by extension modules (e.g. _sre) to define their own types.
+pub fn make_builtin_type(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
+    new_typeobject_with_base(name, init, w_object())
 }
 
 /// Generate a `__new__` wrapper that skips `cls` (first arg) and delegates
@@ -734,6 +753,11 @@ fn init_str_type(ns: &mut PyNamespace) {
         "expandtabs",
         builtin_code_new("expandtabs", crate::type_methods::str_method_expandtabs),
     );
+    namespace_store(
+        ns,
+        "translate",
+        builtin_code_new("translate", crate::type_methods::str_method_translate),
+    );
     // str dunder methods
     namespace_store(
         ns,
@@ -847,6 +871,27 @@ fn init_str_type(ns: &mut PyNamespace) {
                             pyre_object::w_int_new(xc as i64),
                             pyre_object::w_int_new(yc as i64),
                         );
+                    }
+                }
+            } else if args.len() == 1 && unsafe { pyre_object::is_dict(args[0]) } {
+                // 1-arg dict form: maketrans({ord_or_char: replacement, ...})
+                let src = args[0];
+                unsafe {
+                    let entries = &*((src as *const pyre_object::dictobject::W_DictObject)
+                        .as_ref()
+                        .unwrap()
+                        .entries);
+                    for &(k, v) in entries {
+                        let ord_key = if pyre_object::is_int(k) {
+                            k
+                        } else if pyre_object::is_str(k) {
+                            let s = pyre_object::w_str_get_value(k);
+                            let ch = s.chars().next().unwrap_or('\0');
+                            pyre_object::w_int_new(ch as i64)
+                        } else {
+                            k
+                        };
+                        pyre_object::w_dict_store(d, ord_key, v);
                     }
                 }
             }
@@ -1474,6 +1519,102 @@ fn init_object_type(ns: &mut PyNamespace) {
             }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::getattr(args[0], name)
+        }),
+    );
+}
+
+/// PyPy: bytearrayobject.py W_BytearrayObject.typedef
+fn init_bytearray_type(ns: &mut PyNamespace) {
+    namespace_store(
+        ns,
+        "find",
+        builtin_code_new("find", |args| {
+            assert!(args.len() >= 2, "find() takes at least 1 argument");
+            let ba = args[0];
+            let value = args[1];
+            let start = if args.len() > 2 {
+                (unsafe { pyre_object::w_int_get_value(args[2]) }) as usize
+            } else {
+                0
+            };
+            unsafe {
+                let v = pyre_object::w_int_get_value(value) as u8;
+                Ok(pyre_object::w_int_new(
+                    pyre_object::bytearrayobject::w_bytearray_find(ba, v, start),
+                ))
+            }
+        }),
+    );
+    namespace_store(
+        ns,
+        "__add__",
+        builtin_code_new("__add__", |args| {
+            assert!(args.len() >= 2, "__add__ requires 2 arguments");
+            let a = args[0];
+            let b = args[1];
+            unsafe {
+                let a_data = pyre_object::bytearrayobject::w_bytearray_data(a);
+                let b_data = if pyre_object::bytearrayobject::is_bytearray(b) {
+                    pyre_object::bytearrayobject::w_bytearray_data(b).to_vec()
+                } else {
+                    vec![]
+                };
+                let mut result = a_data.to_vec();
+                result.extend_from_slice(&b_data);
+                Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                    &result,
+                ))
+            }
+        }),
+    );
+    namespace_store(
+        ns,
+        "__iadd__",
+        builtin_code_new("__iadd__", |args| {
+            assert!(args.len() >= 2);
+            let ba = args[0];
+            let other = args[1];
+            unsafe {
+                if pyre_object::bytearrayobject::is_bytearray(other) {
+                    let data = pyre_object::bytearrayobject::w_bytearray_data(other).to_vec();
+                    pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
+                }
+            }
+            Ok(ba)
+        }),
+    );
+    namespace_store(
+        ns,
+        "translate",
+        builtin_code_new("translate", |args| {
+            assert!(args.len() >= 2);
+            let ba = args[0];
+            let table = args[1];
+            unsafe {
+                let data = pyre_object::bytearrayobject::w_bytearray_data(ba);
+                // Translation table may be bytes/bytearray, or str (because
+                // pyre treats `b'...'` literals as str). Accept both.
+                let table_bytes_owned;
+                let table_data: &[u8] = if pyre_object::bytearrayobject::is_bytearray(table) {
+                    pyre_object::bytearrayobject::w_bytearray_data(table)
+                } else if pyre_object::is_str(table) {
+                    table_bytes_owned = pyre_object::w_str_get_value(table).as_bytes();
+                    table_bytes_owned
+                } else {
+                    return Ok(ba);
+                };
+                let mut result = Vec::with_capacity(data.len());
+                for &b in data {
+                    if (b as usize) < table_data.len() {
+                        result.push(table_data[b as usize]);
+                    } else {
+                        result.push(b);
+                    }
+                }
+                Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                    &result,
+                ))
+            }
         }),
     );
 }

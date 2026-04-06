@@ -375,13 +375,13 @@ impl IterOpcodeHandler for PyFrame {
                 return Ok(());
             }
             // User-defined __iter__ — PyPy: space.iter → __iter__()
-            // Check both type MRO and instance dict (ATTR_TABLE)
+            // Delegates to baseobjspace::iter which handles type MRO,
+            // ATTR_TABLE, and __getitem__ fallback (PyPy: space.iter →
+            // PyObject_GetIter → tp_iter or PySeqIter_New).
             if pyre_object::is_instance(iter) {
-                if let Ok(iter_method) = crate::baseobjspace::getattr(iter, "__iter__") {
-                    let result = crate::call_function(iter_method, &[iter]);
-                    self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
-                    return Ok(());
-                }
+                let result = crate::baseobjspace::iter(iter)?;
+                self.locals_cells_stack_w[self.valuestackdepth - 1] = result;
+                return Ok(());
             }
             // Type object: metaclass __iter__ (NOT the type's own MRO)
             // CPython: iter(X) calls type(X).__iter__(X)
@@ -1069,14 +1069,12 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BuildSet ──
     fn build_set(&mut self, count: usize) -> Result<(), Self::Error> {
-        // PyPy: setobject.py BUILD_SET → W_SetObject
+        // Build as a set-like object backed by __data__ dict.
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             items.push(self.pop());
         }
         items.reverse();
-        // Create a proper set using the builtin set() constructor,
-        // then add each item.
         let set_obj = crate::builtins::builtin_set_from_items(&items)?;
         self.push(set_obj);
         Ok(())
@@ -1661,6 +1659,14 @@ impl OpcodeStepExecutor for PyFrame {
                         pyre_object::w_list_append(set, item);
                     }
                 }
+            } else if pyre_object::is_instance(set) {
+                // set instance backed by __data__ dict
+                if let Ok(data) = crate::baseobjspace::getattr(set, "__data__") {
+                    let items = crate::builtins::collect_iterable(iterable)?;
+                    for item in items {
+                        pyre_object::w_dict_store(data, item, pyre_object::w_none());
+                    }
+                }
             }
         }
         Ok(())
@@ -1732,8 +1738,37 @@ impl OpcodeStepExecutor for PyFrame {
                 self.push(pyre_object::w_str_new(slice));
                 return Ok(());
             }
+            if pyre_object::is_tuple(obj) {
+                let len = pyre_object::w_tuple_len(obj) as i64;
+                let s = if pyre_object::is_none(start) {
+                    0
+                } else {
+                    pyre_object::w_int_get_value(start)
+                };
+                let e = if pyre_object::is_none(stop) {
+                    len
+                } else {
+                    pyre_object::w_int_get_value(stop)
+                };
+                let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                let mut items = Vec::new();
+                for i in s..e {
+                    if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
+                        items.push(v);
+                    }
+                }
+                self.push(pyre_object::w_tuple_new(items));
+                return Ok(());
+            }
+            // Fall back to slice(start, stop) → getitem dispatch.
+            // Handles bytearray, instances with __getitem__, etc.
+            let slice_obj =
+                pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+            let result = crate::baseobjspace::getitem(obj, slice_obj)?;
+            self.push(result);
+            Ok(())
         }
-        Err(PyError::type_error("object is not subscriptable"))
     }
 
     // ── StoreSlice (a[b:c] = d) ──

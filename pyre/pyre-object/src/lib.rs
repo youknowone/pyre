@@ -1,4 +1,5 @@
 pub mod boolobject;
+pub mod bytearrayobject;
 pub mod cellobject;
 pub mod dictobject;
 pub mod excobject;
@@ -25,6 +26,7 @@ pub mod typeobject;
 pub mod unionobject;
 
 pub use boolobject::*;
+pub use bytearrayobject::*;
 pub use cellobject::*;
 pub use dictobject::*;
 pub use excobject::*;
