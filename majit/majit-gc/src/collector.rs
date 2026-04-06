@@ -178,6 +178,11 @@ pub struct MiniMarkGC {
     pinned_objects: HashSet<usize>,
     /// Registry of compiled code regions for GC root scanning.
     pub compiled_code_registry: CompiledCodeRegistry,
+    /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
+    /// arithmetically from the GC `type_info_group` base; pyre's GC
+    /// keeps an explicit table because frontends register vtables
+    /// independently of any translator pipeline.
+    vtable_to_type_id: HashMap<usize, u32>,
 }
 
 impl MiniMarkGC {
@@ -206,6 +211,7 @@ impl MiniMarkGC {
             nursery_object_starts: HashSet::new(),
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
+            vtable_to_type_id: HashMap::new(),
         }
     }
 
@@ -1389,6 +1395,20 @@ impl GcAllocator for MiniMarkGC {
             None
         }
     }
+
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        // gc.py:563-590 GcLLDescr_framework
+        //   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+        // RPython derives the typeid arithmetically:
+        //   expected_typeid = classptr - sizeof_ti - type_info_group
+        // pyre keeps an explicit vtable→type_id table populated via
+        // register_vtable_for_type, mirroring the same contract.
+        self.vtable_to_type_id.get(&classptr).copied()
+    }
+
+    fn register_vtable_for_type(&mut self, vtable: usize, type_id: u32) {
+        self.vtable_to_type_id.insert(vtable, type_id);
+    }
 }
 
 #[cfg(test)]
@@ -1690,6 +1710,39 @@ mod tests {
 
         gc.collect_nursery();
         gc.collect_full();
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr
+    /// pyre's GC stores an explicit vtable→type_id table; verify that
+    /// register_vtable_for_type / get_typeid_from_classptr_if_gcremovetypeptr
+    /// round-trip via the GcAllocator trait.
+    #[test]
+    fn test_gcremovetypeptr_vtable_lookup() {
+        let mut gc = test_gc(4096);
+        let int_tid = gc.register_type(TypeInfo::simple(16));
+        let float_tid = gc.register_type(TypeInfo::simple(16));
+
+        // Register two distinct vtables
+        let int_vtable: usize = 0x1234_5670;
+        let float_vtable: usize = 0x1234_5680;
+        crate::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
+        crate::GcAllocator::register_vtable_for_type(&mut gc, float_vtable, float_tid);
+
+        // Round-trip
+        assert_eq!(
+            crate::GcAllocator::get_typeid_from_classptr_if_gcremovetypeptr(&gc, int_vtable),
+            Some(int_tid)
+        );
+        assert_eq!(
+            crate::GcAllocator::get_typeid_from_classptr_if_gcremovetypeptr(&gc, float_vtable),
+            Some(float_tid)
+        );
+        // Unknown classptr → None
+        assert_eq!(
+            crate::GcAllocator::get_typeid_from_classptr_if_gcremovetypeptr(&gc, 0xCAFEBABE),
+            None
+        );
     }
 
     #[test]

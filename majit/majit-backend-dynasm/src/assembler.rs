@@ -110,6 +110,10 @@ pub struct Assembler386 {
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
     vtable_offset: Option<usize>,
+    /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
+    /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
+    /// the gcremovetypeptr branch of `_cmp_guard_class`.
+    classptr_to_typeid: HashMap<i64, u32>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -150,6 +154,7 @@ impl Assembler386 {
         header_pc: u64,
         constants: HashMap<u32, i64>,
         vtable_offset: Option<usize>,
+        classptr_to_typeid: HashMap<i64, u32>,
     ) -> Self {
         Assembler386 {
             mc: Assembler::new().unwrap(),
@@ -165,6 +170,7 @@ impl Assembler386 {
             guard_success_cc: None,
             loop_label: None,
             vtable_offset,
+            classptr_to_typeid,
         }
     }
 
@@ -1170,7 +1176,7 @@ impl Assembler386 {
                  to be an immediate (assert isinstance(loc_classptr, \
                  ImmedLoc) in x86/assembler.py:1887)",
             );
-            let expected_typeid = Self::lookup_typeid_from_classptr(classptr as usize).expect(
+            let expected_typeid = self.lookup_typeid_from_classptr(classptr as usize).expect(
                 "GuardClass: vtable_offset is None but the dynasm \
                      backend has no gc_ll_descr.get_typeid_from_classptr_if_\
                      gcremovetypeptr",
@@ -1199,11 +1205,11 @@ impl Assembler386 {
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-    /// Default `None` — pyre uses vtable_offset and never reaches the
-    /// gcremovetypeptr branch. A future GC layer that disables typeptr
-    /// can install a real resolver here.
-    fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
-        None
+    /// Looks up the materialized table populated by the runner from
+    /// the active gc_ll_descr. RPython resolves the same value via
+    /// `cpu.gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr`.
+    fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
+        self.classptr_to_typeid.get(&(classptr as i64)).copied()
     }
 
     fn emit_guard_jcc(&mut self, fail_cc: u8) -> DynamicLabel {

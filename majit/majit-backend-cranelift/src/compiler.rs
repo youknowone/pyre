@@ -4557,11 +4557,14 @@ impl CraneliftBackend {
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-    /// Default: None (no gc_ll_descr installed). Future GC layers can
-    /// register a translator-side resolver that maps a vtable pointer
-    /// to its typeid for the gcremovetypeptr branch of `_cmp_guard_class`.
-    fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
-        None
+    /// Delegates to the installed `GcAllocator`. RPython resolves the
+    /// typeid through `cpu.gc_ll_descr`; in majit the gc_ll_descr role
+    /// is filled by the active GC runtime registered via set_gc_allocator.
+    fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
+        let runtime_id = self.gc_runtime_id?;
+        with_gc_runtime(runtime_id, |gc| {
+            gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+        })
     }
 
     pub fn with_gc_allocator(gc: Box<dyn GcAllocator>) -> Self {
@@ -4942,11 +4945,16 @@ impl CraneliftBackend {
         let vtable_offset = self.vtable_offset;
         // llsupport/gc.py:563 GcLLDescr_framework
         //   .get_typeid_from_classptr_if_gcremovetypeptr — used by
-        // _cmp_guard_class when vtable_offset is None. Bind the closure
-        // here so emit_cmp_guard_class can resolve typeids without owning
-        // a reference to `self` (avoids borrow conflicts with func_ctx).
-        let gc_typeid_lookup = |classptr: usize| -> Option<u32> {
-            CraneliftBackend::lookup_typeid_from_classptr(classptr)
+        // _cmp_guard_class when vtable_offset is None. Capture the
+        // active runtime id so the closure can resolve typeids without
+        // owning a reference to `self` (avoids borrow conflicts with
+        // func_ctx).
+        let gc_runtime_for_typeid = self.gc_runtime_id;
+        let gc_typeid_lookup = move |classptr: usize| -> Option<u32> {
+            let runtime_id = gc_runtime_for_typeid?;
+            with_gc_runtime(runtime_id, |gc| {
+                gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+            })
         };
         let mut defined_ref_vars: HashSet<u32> = inputargs
             .iter()
@@ -10335,6 +10343,17 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         ptr
     }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Resolves the typeid via the active GC runtime, mirroring how
+    /// RPython looks the value up in `cpu.gc_ll_descr`.
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        let runtime_id = self.gc_runtime_id?;
+        with_gc_runtime(runtime_id, |gc| {
+            gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10566,6 +10585,27 @@ mod tests {
         let mut o = Op::new(opcode, args);
         o.pos = OpRef(pos);
         o
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr
+    /// Backend trait method must delegate to the active gc_ll_descr.
+    /// This test verifies that vtables registered through the GC are
+    /// resolvable via `Backend::get_typeid_from_classptr_if_gcremovetypeptr`.
+    #[test]
+    fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
+        let mut gc = MiniMarkGC::new();
+        let int_tid = gc.register_type(TypeInfo::simple(16));
+        let int_vtable: usize = 0x1111_2200;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
+
+        let mut backend = CraneliftBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
+        assert_eq!(resolved, Some(int_tid));
+        let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
+        assert_eq!(unknown, None);
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {

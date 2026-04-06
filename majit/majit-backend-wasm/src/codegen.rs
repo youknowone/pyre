@@ -45,10 +45,11 @@ fn mem64(offset: u64) -> MemArg {
 
 /// llsupport/gc.py:563 GcLLDescr_framework
 ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-/// Default `None` — the wasm backend has no gc_ll_descr installed yet.
-/// pyre always sets `vtable_offset`, so this lookup is unreached at runtime.
-fn lookup_typeid_from_classptr(_classptr: usize) -> Option<u32> {
-    None
+/// Looks up the materialized table populated by the runner from the
+/// active gc_ll_descr. RPython resolves the same value via
+/// `cpu.gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr`.
+fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Option<u32> {
+    table.get(&(classptr as i64)).copied()
 }
 
 /// Information about a guard exit collected during pre-scan.
@@ -118,6 +119,7 @@ pub fn build_wasm_module(
     ops: &[Op],
     constants: &HashMap<u32, i64>,
     vtable_offset: Option<usize>,
+    classptr_to_typeid: &HashMap<i64, u32>,
 ) -> (Vec<u8>, Vec<GuardExit>) {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let needs_call = has_call_ops(ops);
@@ -174,6 +176,7 @@ pub fn build_wasm_module(
         num_vars,
         jit_call_idx,
         vtable_offset,
+        classptr_to_typeid,
     );
     codes.function(&func);
     module.section(&codes);
@@ -188,6 +191,7 @@ fn build_function(
     num_vars: u32,
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
+    classptr_to_typeid: &HashMap<i64, u32>,
 ) -> Function {
     let mut func = Function::new(vec![(num_vars, ValType::I64)]);
     let mut sink = func.instructions();
@@ -286,11 +290,12 @@ fn build_function(
                          isinstance(loc_classptr, ImmedLoc) in \
                          x86/assembler.py:1887)",
                     );
-                    let expected_typeid = lookup_typeid_from_classptr(classptr as usize).expect(
-                        "GuardClass: vtable_offset is None but the wasm \
-                             backend has no gc_ll_descr.\
-                             get_typeid_from_classptr_if_gcremovetypeptr",
-                    );
+                    let expected_typeid =
+                        lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize).expect(
+                            "GuardClass: vtable_offset is None but the wasm \
+                                 backend has no gc_ll_descr.\
+                                 get_typeid_from_classptr_if_gcremovetypeptr",
+                        );
                     emit_resolve(&mut sink, constants, op.arg(0));
                     sink.i32_wrap_i64();
                     sink.i32_load(MemArg {
@@ -752,13 +757,14 @@ fn build_function(
                                      gcremovetypeptr requires loc_classptr to \
                                      be an immediate",
                             );
-                            let expected_typeid = lookup_typeid_from_classptr(classptr as usize)
-                                .expect(
-                                    "Guard{GcType,...}: vtable_offset is \
-                                         None but the wasm backend has no \
-                                         gc_ll_descr.get_typeid_from_classptr_\
-                                         if_gcremovetypeptr",
-                                );
+                            let expected_typeid =
+                                lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize)
+                                    .expect(
+                                        "Guard{GcType,...}: vtable_offset is \
+                                     None but the wasm backend has no \
+                                     gc_ll_descr.get_typeid_from_classptr_\
+                                     if_gcremovetypeptr",
+                                    );
                             emit_resolve(&mut sink, constants, op.arg(0));
                             sink.i32_wrap_i64();
                             sink.i32_load(MemArg {

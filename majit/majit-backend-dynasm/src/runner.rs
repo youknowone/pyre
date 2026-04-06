@@ -27,6 +27,9 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
+    /// llmodel.py self.gc_ll_descr — GC layer used by bh_new and the
+    /// gcremovetypeptr branch of `_cmp_guard_class` to look up typeids.
+    gc_ll_descr: Option<Box<dyn majit_gc::GcAllocator>>,
 }
 
 impl DynasmBackend {
@@ -36,6 +39,7 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: std::collections::HashMap::new(),
             vtable_offset: None,
+            gc_ll_descr: None,
         }
     }
 
@@ -65,12 +69,59 @@ impl DynasmBackend {
     }
     pub fn set_gc_runtime_id(&mut self, _id: u64) {}
 
-    /// Stub — GC allocator registration.
-    pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
+    /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
+    /// dynasm has no allocator codegen yet, but the gc_ll_descr is still
+    /// needed by the gcremovetypeptr branch of _cmp_guard_class.
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
+        self.gc_ll_descr = Some(gc);
+    }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
         self.vtable_offset = offset;
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Resolves a vtable pointer to its registered GC type id via the
+    /// installed gc_ll_descr (the GC backend supplied through
+    /// set_gc_allocator).
+    pub fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
+        self.gc_ll_descr
+            .as_ref()
+            .and_then(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+    }
+
+    /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
+    /// GuardNonnullClass operand seen in `ops`. RPython resolves these on
+    /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
+    /// dynasm assembler runs without a borrow of `self`, so we materialize
+    /// the resolver as a HashMap up front.
+    fn collect_classptr_typeid_table(
+        &self,
+        ops: &[Op],
+        constants: &std::collections::HashMap<u32, i64>,
+    ) -> std::collections::HashMap<i64, u32> {
+        let mut table = std::collections::HashMap::new();
+        if self.vtable_offset.is_some() || self.gc_ll_descr.is_none() {
+            // vtable_offset path doesn't need typeid lookups; without a
+            // gc_ll_descr there is nothing to resolve anyway.
+            return table;
+        }
+        for op in ops {
+            if matches!(
+                op.opcode,
+                majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
+            ) && op.args.len() >= 2
+            {
+                if let Some(&classptr) = constants.get(&op.args[1].0) {
+                    if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
+                        table.insert(classptr, tid);
+                    }
+                }
+            }
+        }
+        table
     }
 
     fn get_compiled(token: &JitCellToken) -> &CompiledCode {
@@ -95,7 +146,14 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
 
         let constants = std::mem::take(&mut self.constants);
-        let asm = Assembler386::new(trace_id, header_pc, constants, self.vtable_offset);
+        let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
+        let asm = Assembler386::new(
+            trace_id,
+            header_pc,
+            constants,
+            self.vtable_offset,
+            typeid_table,
+        );
         let compiled = asm.assemble_loop(inputargs, ops)?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -120,7 +178,8 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let constants = std::mem::take(&mut self.constants);
-        let asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset);
+        let typeid_table = self.collect_classptr_typeid_table(ops, &constants);
+        let asm = Assembler386::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
         let compiled = asm.assemble_bridge(fail_descr, inputargs, ops)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -418,10 +477,21 @@ impl Backend for DynasmBackend {
         if !ptr.is_null() {
             unsafe {
                 libc::memset(ptr, 0, size);
-                *(ptr as *mut usize) = vtable;
+                // llmodel.py:778-782 bh_new_with_vtable: write_int_at_mem(
+                //     res, self.vtable_offset, WORD, sizedescr.get_vtable())
+                if let Some(off) = self.vtable_offset {
+                    *((ptr as *mut u8).add(off) as *mut usize) = vtable;
+                }
             }
         }
         ptr as i64
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Resolves a vtable pointer through the installed gc_ll_descr.
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        self.lookup_typeid_from_classptr(classptr)
     }
 
     fn bh_setfield_gc_i(&self, struct_ptr: i64, offset: usize, value: i64) {
@@ -442,4 +512,32 @@ impl Backend for DynasmBackend {
 
     fn setup_once(&mut self) {}
     fn finish_once(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_backend::Backend;
+    use majit_gc::collector::MiniMarkGC;
+    use majit_gc::trace::TypeInfo;
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr
+    /// Verify the dynasm backend's gc_ll_descr round-trips a registered
+    /// vtable→type_id mapping (the same contract Cranelift uses).
+    #[test]
+    fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
+        let mut gc = MiniMarkGC::new();
+        let int_tid = gc.register_type(TypeInfo::simple(16));
+        let int_vtable: usize = 0x2222_3300;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
+        assert_eq!(resolved, Some(int_tid));
+        let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
+        assert_eq!(unknown, None);
+    }
 }
