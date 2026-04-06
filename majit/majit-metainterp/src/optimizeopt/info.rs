@@ -1275,6 +1275,23 @@ impl PtrInfo {
 /// A virtual object whose allocation has been removed.
 ///
 /// Fields are tracked as OpRefs to the operations that produce their values.
+///
+/// ## Invariant: `fields` NEVER contains typeptr (offset 0)
+///
+/// Matches RPython upstream: `heaptracker.py:66-67 all_fielddescrs()` skips
+/// `typeptr`, so `info.py:180 AbstractStructPtrInfo.init_fields` sizes
+/// `_fields` with typeptr excluded from the indexable range. The typeptr
+/// (offset 0) is tracked separately via `known_class` and emitted by the
+/// GC rewriter's `gen_initialize_vtable` path (rewrite.py:479-484), NOT
+/// from the force-path field loop.
+///
+/// Enforced by:
+/// - `virtualize.rs optimize_setfield_gc` Virtual arm: runtime check that
+///   returns early on `offset == Some(0)` before calling `set_field`.
+/// - `virtualize.rs force_virtual_instance`: `debug_assert_no_typeptr`
+///   at the entry of the field-emit loop.
+/// - `virtualstate.rs export_single_value` / `import_single_value`:
+///   `debug_assert_no_typeptr` on the fields collection boundary.
 #[derive(Clone, Debug)]
 pub struct VirtualInfo {
     /// The size descriptor of this object.
@@ -1286,8 +1303,8 @@ pub struct VirtualInfo {
     /// ob_type at offset 0 explicitly. This descr lets force emit
     /// SetfieldGc(ob_type) without polluting `fields` (which feeds rd_virtuals).
     pub ob_type_descr: Option<DescrRef>,
-    /// Field values: (field_descr_index, value_opref).
-    /// Does NOT include ob_type — handled via known_class + ob_type_descr.
+    /// Field values: `(field_descr_index, value_opref)`.
+    /// **Invariant**: never contains typeptr (offset 0) — see struct-level docs.
     pub fields: Vec<(u32, OpRef)>,
     /// Original field descriptors, preserving offset/size/type info for forcing.
     pub field_descrs: Vec<(u32, DescrRef)>,

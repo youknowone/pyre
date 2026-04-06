@@ -121,12 +121,18 @@ pub enum VirtualStateInfo {
     /// Value is a known constant.
     Constant(Value),
     /// Value is a virtual instance with known fields.
+    ///
+    /// **Invariant**: `fields` NEVER contains typeptr (offset 0).
+    /// Mirrors the `VirtualInfo.fields` invariant (RPython
+    /// heaptracker.py:66-67 all_fielddescrs excludes typeptr).
+    /// Enforced at export/import boundaries via
+    /// `debug_assert_no_typeptr_in_virtual_fields`.
     Virtual {
         descr: DescrRef,
         known_class: Option<GcRef>,
         /// ob_type field descriptor for force path (pyre offset 0).
         ob_type_descr: Option<DescrRef>,
-        /// Field values as VirtualStateInfo (recursive).
+        /// Field values as VirtualStateInfo (recursive). Excludes typeptr.
         fields: Vec<(u32, Box<VirtualStateInfo>)>,
         /// Original field descriptors for each field index.
         field_descrs: Vec<(u32, DescrRef)>,
@@ -1683,6 +1689,12 @@ fn export_single_value(
     if let Some(info) = ctx.get_ptr_info(opref) {
         match info {
             PtrInfo::Virtual(vinfo) => {
+                // RPython parity: heaptracker.py:66-67 excludes typeptr from
+                // all_fielddescrs(); see VirtualInfo struct-level docs.
+                crate::optimizeopt::virtualize::debug_assert_no_typeptr_in_virtual_fields(
+                    &vinfo.fields,
+                    "export_single_value::Virtual",
+                );
                 let fields = vinfo
                     .fields
                     .iter()
@@ -1916,6 +1928,12 @@ fn import_single_value(
                 import_single_value(field_info, field_opref, ctx, ptr_info);
                 vfields.push((*field_idx, field_opref));
             }
+            // RPython parity: heaptracker.py:66-67 excludes typeptr from
+            // all_fielddescrs(); see VirtualInfo struct-level docs.
+            crate::optimizeopt::virtualize::debug_assert_no_typeptr_in_virtual_fields(
+                &vfields,
+                "import_single_value::Virtual",
+            );
             ptr_info[idx] = Some(PtrInfo::Virtual(VirtualInfo {
                 descr: descr.clone(),
                 known_class: *known_class,
