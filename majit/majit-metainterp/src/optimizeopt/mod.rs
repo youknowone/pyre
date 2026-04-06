@@ -2133,21 +2133,34 @@ impl OptContext {
         None
     }
 
+    /// Allocate a fresh constant OpRef and store the value.
+    ///
+    /// RPython equivalent: `ConstInt(value)` — constants in RPython are
+    /// first-class Const objects, not boxes. majit's constant pool model
+    /// reserves an OpRef in the constant namespace (>= CONST_BASE) and
+    /// stores the value via `seed_constant`.
+    ///
+    /// NOTE: do NOT route through `make_constant`. That helper is the
+    /// `optimizer.py:make_constant(box, constbox)` analogue and is meant
+    /// to forward an existing **box** OpRef to a constant value. It bails
+    /// out early when the input is already a constant OpRef
+    /// (`is_constant()` true), which would silently drop the new entry
+    /// here because freshly allocated constant OpRefs are >= CONST_BASE.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
         let pos = self.reserve_const_pos();
-        self.make_constant(pos, Value::Int(value));
+        self.seed_constant(pos, Value::Int(value));
         pos
     }
 
     pub fn make_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos = self.reserve_const_pos();
-        self.make_constant(pos, Value::Ref(value));
+        self.seed_constant(pos, Value::Ref(value));
         pos
     }
 
     pub fn make_constant_float(&mut self, value: f64) -> OpRef {
         let pos = self.reserve_const_pos();
-        self.make_constant(pos, Value::Float(value));
+        self.seed_constant(pos, Value::Float(value));
         pos
     }
 
