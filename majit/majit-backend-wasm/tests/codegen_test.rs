@@ -40,8 +40,14 @@ fn test_empty_trace() {
         op
     }];
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -77,8 +83,14 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[OpRef(3), OpRef(2)]),
     ];
 
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -113,8 +125,14 @@ fn test_float_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -136,8 +154,14 @@ fn test_call_generates_import() {
         op
     }];
 
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -199,10 +223,87 @@ fn test_guard_types() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
+}
+
+/// Verify GuardGcType lowering matches RPython's
+/// `_cmp_guard_gc_type(loc_object, loc_expected_typeid)` (assembler.py:
+/// 1919-1922): arg1 is an immediate typeid, NOT a classptr.
+#[test]
+fn test_guard_gc_type_uses_immediate_typeid() {
+    let inputargs = vec![InputArg {
+        index: 0,
+        tp: Type::Int,
+    }];
+
+    // OpRef(10000) holds the immediate typeid 0x42
+    let mut constants = HashMap::new();
+    constants.insert(10_000, 0x42_i64);
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0)]),
+        make_guard(OpCode::GuardGcType, &[OpRef(0), OpRef(10_000)], &[OpRef(0)]),
+        Op::new(OpCode::Jump, &[OpRef(0)]),
+    ];
+
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+}
+
+/// Verify GuardIsObject lowering matches RPython's
+/// `genop_guard_guard_is_object` (assembler.py:1924-1943): reads the
+/// typeid at offset 0, indexes the type_info_group, and tests the
+/// `T_IS_RPYTHON_INSTANCE` bit. Requires both
+/// `get_translated_info_for_typeinfo` and
+/// `get_translated_info_for_guard_is_object` to be installed.
+#[test]
+fn test_guard_is_object_uses_translated_layout() {
+    let inputargs = vec![InputArg {
+        index: 0,
+        tp: Type::Int,
+    }];
+
+    let ops = vec![
+        Op::new(OpCode::Label, &[OpRef(0)]),
+        make_guard(OpCode::GuardIsObject, &[OpRef(0)], &[OpRef(0)]),
+        Op::new(OpCode::Jump, &[OpRef(0)]),
+    ];
+
+    let constants = HashMap::new();
+    let layout = codegen::WasmTypeinfoLayout {
+        // Synthetic type_info_group base; the actual address never gets
+        // dereferenced because validate_wasm only checks well-formedness.
+        typeinfo: Some((0x4000, 0, 64)),
+        guard_is_object: Some((16, 0x01)),
+        subclassrange_min_offset: None,
+    };
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        layout,
+    );
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
 }
 
 #[test]
@@ -230,8 +331,14 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, _) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
 }
 
@@ -269,8 +376,14 @@ fn test_overflow_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) =
-        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
+    let (bytes, guards) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        codegen::WasmTypeinfoLayout::default(),
+    );
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }

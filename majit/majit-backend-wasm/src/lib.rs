@@ -81,22 +81,20 @@ impl WasmBackend {
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
     /// GuardNonnullClass operand seen in `ops`. wasm codegen runs without a
     /// borrow of `self`, so we materialize the resolver as a HashMap.
+    /// Only GuardClass / GuardNonnullClass need this table — GuardGcType
+    /// already carries an immediate typeid (assembler.py:1919-1922) and
+    /// GUARD_IS_OBJECT / GUARD_SUBCLASS use a different lookup path.
     fn collect_classptr_typeid_table(&self, ops: &[Op]) -> HashMap<i64, u32> {
         let mut table = HashMap::new();
         if self.vtable_offset.is_some() || self.gc_ll_descr.is_none() {
             return table;
         }
         for op in ops {
-            let needs = matches!(
+            if matches!(
                 op.opcode,
-                majit_ir::OpCode::GuardClass
-                    | majit_ir::OpCode::GuardNonnullClass
-                    | majit_ir::OpCode::GuardGcType
-                    | majit_ir::OpCode::GuardIsObject
-                    | majit_ir::OpCode::GuardSubclass
-                    | majit_ir::OpCode::GuardCompatible
-            );
-            if needs && op.args.len() >= 2 {
+                majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
+            ) && op.args.len() >= 2
+            {
                 if let Some(&classptr) = self.constants.get(&op.args[1].0) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
@@ -105,6 +103,29 @@ impl WasmBackend {
             }
         }
         table
+    }
+
+    /// llsupport/gc.py: get_translated_info_for_typeinfo() — returns
+    /// (base_type_info, shift_by, sizeof_ti). `None` if no gc_ll_descr.
+    fn translated_info_for_typeinfo(&self) -> Option<(usize, u32, usize)> {
+        self.gc_ll_descr
+            .as_ref()
+            .and_then(|gc| gc.get_translated_info_for_typeinfo())
+    }
+
+    /// llsupport/gc.py: get_translated_info_for_guard_is_object() —
+    /// returns (infobits_offset, IS_OBJECT_FLAG).
+    fn translated_info_for_guard_is_object(&self) -> Option<(usize, u8)> {
+        self.gc_ll_descr
+            .as_ref()
+            .and_then(|gc| gc.get_translated_info_for_guard_is_object())
+    }
+
+    /// llmodel.py: cpu.subclassrange_min_offset.
+    fn subclassrange_min_offset(&self) -> Option<usize> {
+        self.gc_ll_descr
+            .as_ref()
+            .and_then(|gc| gc.subclassrange_min_offset())
     }
 
     /// Collect constants from ops (constant OpRefs that appear as args).
@@ -141,12 +162,18 @@ impl majit_backend::Backend for WasmBackend {
         self.trace_counter += 1;
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
+        let typeinfo_layout = codegen::WasmTypeinfoLayout {
+            typeinfo: self.translated_info_for_typeinfo(),
+            guard_is_object: self.translated_info_for_guard_is_object(),
+            subclassrange_min_offset: self.subclassrange_min_offset(),
+        };
         let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
             inputargs,
             ops,
             &self.constants,
             self.vtable_offset,
             &typeid_table,
+            typeinfo_layout,
         );
 
         // Build fail descriptors
