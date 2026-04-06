@@ -2060,30 +2060,26 @@ impl JitState for PyreJitState {
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
     ///
     /// Decodes rd_numb via `majit_ir::resumedata::rebuild_from_numbering`.
-    /// Prefers rd_frame_sizes (encode-time authoritative) when available;
-    /// falls back to frame_value_count_at (decode-time liveness lookup).
+    /// Frame box counts come from jitcode liveness (jitcode.position_info)
+    /// at the frame's resume pc — the same data the encoder uses via
+    /// `get_list_of_active_boxes`.
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         _fail_arg_types: &[Type],
         rd_numb: Option<&[u8]>,
         rd_consts: Option<&[(i64, Type)]>,
-        rd_frame_sizes: Option<&[usize]>,
     ) -> Option<majit_metainterp::ResumeDataResult> {
-        use majit_ir::resumedata::{
-            RebuiltValue, rebuild_from_numbering, rebuild_from_numbering_with_sizes,
-        };
+        use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
         let rd_numb = rd_numb?;
         let rd_consts = rd_consts.unwrap_or(&[]);
 
         // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
-        let (_num_failargs, vable_values, vref_values, frames) = if let Some(sizes) = rd_frame_sizes
-        {
-            rebuild_from_numbering_with_sizes(rd_numb, rd_consts, sizes)
-        } else {
-            let cb = crate::state::frame_value_count_at;
-            rebuild_from_numbering(rd_numb, rd_consts, Some(&cb))
-        };
+        // RPython uses jitcode liveness via get_current_position_info; majit
+        // routes the same lookup through `frame_value_count_at`.
+        let cb = crate::state::frame_value_count_at;
+        let (_num_failargs, vable_values, vref_values, frames) =
+            rebuild_from_numbering(rd_numb, rd_consts, Some(&cb));
 
         if frames.is_empty() {
             return None;

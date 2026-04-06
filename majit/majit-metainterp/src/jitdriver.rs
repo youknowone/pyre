@@ -2580,7 +2580,6 @@ impl<S: JitState> JitDriver<S> {
             &retrace.fail_types,
             retrace.rd_numb.as_deref(),
             retrace.rd_consts.as_deref(),
-            retrace.rd_frame_sizes.as_deref(),
         );
         if resume_data_result.is_none() {
             S::update_meta_for_bridge(&mut trace_meta, &retrace.fail_types);

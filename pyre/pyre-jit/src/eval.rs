@@ -2807,19 +2807,15 @@ fn build_resumed_frames(
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
 ) -> Vec<crate::call_jit::ResumedFrame> {
-    use majit_ir::resumedata::{rebuild_from_numbering, rebuild_from_numbering_with_sizes};
+    use majit_ir::resumedata::rebuild_from_numbering;
 
     // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
-    // RPython uses jitcode liveness to determine per-frame box count.
-    // Prefer rd_frame_sizes (encode-time authoritative) when available;
-    // fall back to frame_value_count_at (decode-time liveness lookup).
+    // RPython uses jitcode liveness (jitcode.position_info) to know how many
+    // boxes each frame contributes. There is no out-of-band frame size — the
+    // decoder reads jitcode liveness at the frame's resume pc.
+    let cb = pyre_jit_trace::state::frame_value_count_at;
     let (_num_failargs, vable_values, _vref_values, frames) =
-        if let Some(ref sizes) = exit_layout.rd_frame_sizes {
-            majit_ir::resumedata::rebuild_from_numbering_with_sizes(rd_numb, rd_consts, sizes)
-        } else {
-            let cb = pyre_jit_trace::state::frame_value_count_at;
-            rebuild_from_numbering(rd_numb, rd_consts, Some(&cb))
-        };
+        rebuild_from_numbering(rd_numb, rd_consts, Some(&cb));
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {
