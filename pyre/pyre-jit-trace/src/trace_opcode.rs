@@ -10,12 +10,38 @@ use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
-/// lloperation.py:261 — "don't implement float_pow, use math.pow instead".
-/// lloperation.py:261 — "don't implement float_pow, use math.pow instead".
-/// ll_math_pow is a can-raise helper (EF_CAN_RAISE); NOT elidable.
+/// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
+///
+/// `_pow` in floatobject.py:799-881 takes two raw floats and returns a
+/// raw float (can raise OverflowError / ValueError / ZeroDivisionError).
+/// The JIT trace records this as a `CallMayForceF(float_pow_jit, lhs, rhs)`
+/// with the same raw-float signature, followed by `GuardNoException` to
+/// propagate any raised exception back into the meta-interpreter.
+///
+/// ll_math_pow (ll_math.py:260) is the can-raise helper (EF_CAN_RAISE),
+/// NOT elidable. Using Rust's native `x.powf(y)` would drop the Python
+/// exception semantics (negative base fractional exponent → ValueError,
+/// 0.0 raised to negative → ZeroDivisionError, overflow → OverflowError).
+///
 /// Extracted to module level for stable function pointer identity.
-extern "C" fn float_pow_helper(x: f64, y: f64) -> f64 {
-    x.powf(y)
+///
+/// Must match `float_pow_impl` semantics in `baseobjspace.rs`: any
+/// divergence would cause the JIT compiled code to produce a different
+/// result from the interpreter for the same input (correctness bug).
+extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
+    match pyre_interpreter::float_pow_raw(x, y) {
+        Ok(z) => z,
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception parity: set JIT exception
+            // state so the following GuardNoException sees it and fails,
+            // propagating the raise into the meta-interpreter.
+            let exc_obj = err.to_exc_object();
+            majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+            // Return value is discarded by GuardNoException path; use NaN
+            // as a safe sentinel in case the guard is elided.
+            f64::NAN
+        }
+    }
 }
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
@@ -2109,14 +2135,21 @@ impl MIFrame {
                 unbox_float(this, ctx, b)
             };
             let result = if is_power {
-                // lloperation.py:261: "don't implement float_pow"
-                // ll_math.py:260: ll_math_pow has EF_CAN_RAISE → call_may_force, not elidable.
-                // Raw f64 powf — operates on unboxed floats, avoids Python object boxing.
-                ctx.call_may_force_float_typed(
-                    float_pow_helper as *const (),
+                // floatobject.py:561 descr_pow → _pow(space, x, y) parity.
+                // _pow takes raw floats and can raise OverflowError /
+                // ValueError / ZeroDivisionError. The trace records a
+                // CallMayForceF to float_pow_jit (which wraps the raw
+                // _pow implementation and signals exceptions via
+                // jit_exc_raise), followed by GuardNoException to
+                // propagate any raise into the meta-interpreter.
+                let call_result = ctx.call_may_force_float_typed(
+                    float_pow_jit as *const (),
                     &[lhs_raw, rhs_raw],
                     &[Type::Float, Type::Float],
-                )
+                );
+                // pyjitpl.py:3397 GUARD_NO_EXCEPTION after EF_CAN_RAISE call.
+                this.record_guard(ctx, OpCode::GuardNoException, &[]);
+                call_result
             } else {
                 ctx.record_op(op_code.unwrap(), &[lhs_raw, rhs_raw])
             };

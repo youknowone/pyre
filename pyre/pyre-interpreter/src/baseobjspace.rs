@@ -1053,54 +1053,64 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-/// floatobject.py:799-881: _pow with Python-correct float power semantics.
-/// Handles NaN/Inf edge cases and raises for domain errors.
-fn float_pow_impl(x: f64, y: f64) -> PyResult {
-    use pyre_object::{PyObjectRef as Obj, w_float_new};
+/// floatobject.py:799-881: `_pow(space, x, y)` parity — raw float power
+/// with Python-correct semantics. Handles NaN/Inf edge cases and raises
+/// ZeroDivisionError / ValueError / OverflowError for domain errors.
+///
+/// Returns raw `f64` (matching RPython which returns `r_float`) so the
+/// JIT fast path can call this directly with raw-float arguments without
+/// any intermediate W_FloatObject allocation. The interpreter wrapper
+/// `float_pow_impl` boxes the result into a W_FloatObject.
+pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     // floatobject.py:800-801
     if y == 2.0 {
-        return Ok(w_float_new(x * x));
+        return Ok(x * x);
     }
+    // floatobject.py:803-804
     if y == 0.0 {
-        return Ok(w_float_new(1.0));
+        return Ok(1.0);
     }
+    // floatobject.py:806-807
     if x.is_nan() {
-        return Ok(w_float_new(x));
+        return Ok(x);
     }
+    // floatobject.py:809-814
     if y.is_nan() {
-        return Ok(w_float_new(if x == 1.0 { 1.0 } else { y }));
+        return Ok(if x == 1.0 { 1.0 } else { y });
     }
+    // floatobject.py:815-827
     if y.is_infinite() {
         let ax = x.abs();
         if ax == 1.0 {
-            return Ok(w_float_new(1.0));
+            return Ok(1.0);
         }
-        return Ok(w_float_new(if (y > 0.0) == (ax > 1.0) {
+        return Ok(if (y > 0.0) == (ax > 1.0) {
             f64::INFINITY
         } else {
             0.0
-        }));
+        });
     }
+    // floatobject.py:828-842
     if x.is_infinite() {
         let y_is_odd = y.abs() % 2.0 == 1.0;
-        return Ok(w_float_new(if y > 0.0 {
+        return Ok(if y > 0.0 {
             if y_is_odd { x } else { x.abs() }
         } else if y_is_odd {
             f64::copysign(0.0, x)
         } else {
             0.0
-        }));
+        });
     }
-    // floatobject.py:846-847
+    // floatobject.py:844-847
     if x == 0.0 && y < 0.0 {
         return Err(PyError::zero_division(
             "0.0 cannot be raised to a negative power",
         ));
     }
+    // floatobject.py:849-862
     let mut negate_result = false;
     let mut bx = x;
     if bx < 0.0 {
-        // floatobject.py:856-857
         if y.floor() != y {
             return Err(PyError::value_error(
                 "negative number cannot be raised to a fractional power",
@@ -1109,15 +1119,24 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
         bx = -bx;
         negate_result = y.abs() % 2.0 == 1.0;
     }
+    // floatobject.py:864-869
     if bx == 1.0 {
-        return Ok(w_float_new(if negate_result { -1.0 } else { 1.0 }));
+        return Ok(if negate_result { -1.0 } else { 1.0 });
     }
+    // floatobject.py:871-877
     let z = bx.powf(y);
-    // floatobject.py:873-876
     if z.is_infinite() && !bx.is_infinite() {
         return Err(PyError::overflow_error("float power"));
     }
-    Ok(w_float_new(if negate_result { -z } else { z }))
+    // floatobject.py:879-881
+    Ok(if negate_result { -z } else { z })
+}
+
+/// floatobject.py:562 `W_FloatObject.descr_pow` boxing wrapper over `_pow`.
+/// Calls `float_pow_raw` and boxes the raw result into W_FloatObject.
+fn float_pow_impl(x: f64, y: f64) -> PyResult {
+    use pyre_object::w_float_new;
+    Ok(w_float_new(float_pow_raw(x, y)?))
 }
 
 /// Left shift dispatch (`<<` operator).
