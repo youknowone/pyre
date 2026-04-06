@@ -778,8 +778,10 @@ pub(crate) fn try_trace_const_boxed_float(
         return None;
     }
     unsafe {
+        // The result is a raw f64 bit pattern. Use const_float so the
+        // constant pool tags it as Float, mirroring ConstFloat parity.
         is_float(concrete_value)
-            .then(|| ctx.const_int(w_float_get_value(concrete_value).to_bits() as i64))
+            .then(|| ctx.const_float(w_float_get_value(concrete_value).to_bits() as i64))
     }
 }
 

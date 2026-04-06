@@ -2641,7 +2641,8 @@ impl MIFrame {
             let type_name = (*concrete_obj_type).tp_name;
             return self.with_ctx(|this, ctx| {
                 this.guard_object_class(ctx, value, concrete_obj_type);
-                Ok(ctx.const_int(pyre_object::box_str_constant(type_name) as i64))
+                // box_str_constant returns a PyObjectRef.
+                Ok(ctx.const_ref(pyre_object::box_str_constant(type_name) as i64))
             });
         }
     }
@@ -2666,7 +2667,8 @@ impl MIFrame {
                 return self.with_ctx(|this, ctx| {
                     this.guard_object_class(ctx, obj, concrete_obj_type);
                     this.guard_value(ctx, type_name, concrete_type_name as i64);
-                    Ok(ctx.const_int(w_bool_from(concrete_result) as i64))
+                    // w_bool_from returns a PyObjectRef (Ref-typed singleton).
+                    Ok(ctx.const_ref(w_bool_from(concrete_result) as i64))
                 });
             }
         }
@@ -3343,11 +3345,14 @@ impl MIFrame {
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (vable_next_instr, vable_code, vable_valuestackdepth, vable_namespace) = self
                 .with_ctx(|_, ctx| {
+                    // code_ptr and callee_globals are PyObjectRef pointers;
+                    // tag them as Ref so the typed constant pool dedupes
+                    // them with any other Ref reference to the same address.
                     (
                         ctx.const_int(0),
-                        ctx.const_int(code_ptr as i64),
+                        ctx.const_ref(code_ptr as i64),
                         ctx.const_int(callee_nlocals as i64),
-                        ctx.const_int(callee_globals as i64),
+                        ctx.const_ref(callee_globals as i64),
                     )
                 });
             sym.vable_next_instr = vable_next_instr;
@@ -4663,10 +4668,17 @@ impl NamespaceOpcodeHandler for MIFrame {
                 //    → history.cut() → trace-time constant. Our OptPure
                 //    folds via lookup_known_result → same effect.
                 let opref = self.with_ctx(|this, ctx| {
-                    let ns_const = ctx.const_int(ns as i64);
+                    // ns and concrete_value are PyObjectRef pointers (Ref-typed).
+                    // Use const_ref so the constant pool tracks them with the
+                    // correct type — otherwise typed seeding sees them as Int
+                    // and OptVirtualize.optimize_guard_value cannot match a
+                    // Ref-typed expected against an Int-typed obj_ref, leaving
+                    // a redundant GuardValue with no resume snapshot in the
+                    // optimized trace.
+                    let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
                     ctx.record_op(OpCode::QuasiimmutField, &[ns_const, slot_const]);
-                    let result_const = ctx.const_int(concrete_value as i64);
+                    let result_const = ctx.const_ref(concrete_value as i64);
                     ctx.record_op(
                         OpCode::RecordKnownResult,
                         &[result_const, ns_const, slot_const],
