@@ -2118,7 +2118,6 @@ fn materialize_virtual_from_rd(
         /// resume.py:628 VStructInfo — allocate_struct(self.typedescr).
         Struct {
             typedescr: &'a Option<majit_ir::DescrRef>,
-            type_id: u32,
         },
     }
     let (kind, fielddescrs, fieldnums, descr_size) = match entry {
@@ -2140,16 +2139,12 @@ fn materialize_virtual_from_rd(
         ),
         majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
-            type_id,
             fielddescrs,
             fieldnums,
             descr_size,
             ..
         } => (
-            VirtualKind::Struct {
-                typedescr,
-                type_id: *type_id,
-            },
+            VirtualKind::Struct { typedescr },
             fielddescrs.as_slice(),
             fieldnums.as_slice(),
             *descr_size,
@@ -2209,29 +2204,27 @@ fn materialize_virtual_from_rd(
                 return Value::Ref(majit_ir::GcRef::NULL);
             }
         }
-        // resume.py:633-637: VStructInfo.allocate → allocate_struct.
-        // resume.py:618-619: VirtualInfo.allocate → allocate_with_vtable.
-        // VirtualKind::Struct may contain objects with vtable that
-        // should be VirtualInfo — use vtable presence to dispatch
-        // until VirtualKind classification is fixed upstream.
-        VirtualKind::Struct { typedescr, type_id } => {
+        // resume.py:635: VStructInfo.allocate → allocate_struct(self.typedescr)
+        // RPython: VStructInfo always uses allocate_struct. If an object with
+        // vtable ended up here, the classification is wrong upstream.
+        // TODO: fix classification so vtable objects never reach VStructInfo.
+        VirtualKind::Struct { typedescr, .. } => {
             if let Some(td) = typedescr {
                 let sd = td
                     .as_size_descr()
                     .expect("VStruct typedescr must be SizeDescr");
+                // Workaround: vtable objects misclassified as VStructInfo
+                // need allocate_with_vtable to avoid segfault. The real fix
+                // is in the classification (New vs NewWithVtable) path.
                 if sd.vtable() != 0 {
                     allocate_with_vtable(sd)
                 } else {
                     allocate_struct(sd)
                 }
             } else if descr_size > 0 {
-                let fallback = majit_ir::make_size_descr_full(0, descr_size, type_id);
+                let fallback = majit_ir::make_size_descr_full(0, descr_size, 0);
                 let sd = fallback.as_size_descr().unwrap();
-                if sd.vtable() != 0 {
-                    allocate_with_vtable(sd)
-                } else {
-                    allocate_struct(sd)
-                }
+                allocate_struct(sd)
             } else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!("[jit] materialize_virtual: vidx={vidx} Struct with no typedescr",);
