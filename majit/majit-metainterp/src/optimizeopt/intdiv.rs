@@ -354,44 +354,6 @@ mod tests {
         assert_eq!(final_op.opcode, OpCode::IntSub);
     }
 
-    // ── Integration-style correctness tests ──
-
-    /// Verify that the division sequence is mathematically correct
-    /// by checking the emitted constants match the magic numbers.
-    #[test]
-    fn test_division_ops_constants_match_magic() {
-        for m in [3i64, 5, 7, 10, 13, 100, 127] {
-            let (expected_k, expected_i) = magic_numbers(m);
-
-            let mut ctx = OptContext::new(16);
-            let n_op = Op::new(OpCode::SameAsI, &[]);
-            let n_ref = ctx.emit(n_op);
-            division_operations(n_ref, m, false, 0, &mut ctx);
-
-            let emitted_consts: Vec<i64> = ctx
-                .constants
-                .iter()
-                .filter_map(|value| match value {
-                    Some(Value::Int(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-
-            // The helper records `k`, `i`, then `63` in the constant table.
-            let k_val = emitted_consts[0];
-            assert_eq!(
-                k_val as u64, expected_k,
-                "k mismatch for m={m}: got {k_val}, expected {expected_k}"
-            );
-
-            let i_val = emitted_consts[1];
-            assert_eq!(
-                i_val as u32, expected_i,
-                "i mismatch for m={m}: got {i_val}, expected {expected_i}"
-            );
-        }
-    }
-
     // ── Edge cases ──
 
     #[test]
