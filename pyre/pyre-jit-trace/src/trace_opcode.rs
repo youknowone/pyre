@@ -963,12 +963,16 @@ impl MIFrame {
                 self.orgpc
             };
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
+            // callee_types includes header [Ref, Int, Int]; snapshot needs
+            // only the active_boxes portion.
+            let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let callee_snapshot_types = &callee_types[__n..];
             let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: callee_live_pc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(
                     &callee_active_boxes,
-                    &callee_types,
+                    callee_snapshot_types,
                     ctx,
                 ),
             }];
@@ -989,10 +993,19 @@ impl MIFrame {
                 } else {
                     &pfa[..]
                 };
+                let parent_types = if pfa_types.len() > __n {
+                    &pfa_types[__n..]
+                } else {
+                    pfa_types.as_slice()
+                };
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, pfa_types, ctx),
+                    boxes: Self::fail_args_to_snapshot_boxes_typed(
+                        parent_active,
+                        parent_types,
+                        ctx,
+                    ),
                 });
                 fail_args.extend_from_slice(pfa);
                 let pt = if pfa_types.is_empty() {
@@ -1084,8 +1097,12 @@ impl MIFrame {
         };
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
+        // fail_arg_types includes [Ref, Int, Int] header; snapshot needs
+        // only the active_boxes portion.
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let snapshot_types = &fail_arg_types[n..];
         let snapshot_boxes =
-            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, &fail_arg_types, ctx);
+            Self::fail_args_to_snapshot_boxes_typed(&active_boxes, snapshot_types, ctx);
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
         let snapshot = majit_trace::recorder::Snapshot {
@@ -3988,13 +4005,15 @@ impl MIFrame {
 
                 // capture_resumedata parity: full framestack snapshot.
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
+                let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
+                let snapshot_types = &fail_arg_types[__n..];
                 let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                     jitcode_index,
                     pc: resume_pc as u32,
                     boxes: Self::fail_args_to_snapshot_boxes_typed(
                         &active_boxes,
-                        &fail_arg_types,
+                        snapshot_types,
                         ctx,
                     ),
                 }];
@@ -4002,18 +4021,22 @@ impl MIFrame {
                 let mut all_types = fail_arg_types.clone();
                 // Include parent frames (RPython: full self.framestack).
                 for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &this.parent_frames {
-                    let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                     let parent_active = if pfa.len() > __n {
                         &pfa[__n..]
                     } else {
                         &pfa[..]
+                    };
+                    let parent_types = if pfa_types.len() > __n {
+                        &pfa_types[__n..]
+                    } else {
+                        pfa_types.as_slice()
                     };
                     frames.push(majit_trace::recorder::SnapshotFrame {
                         jitcode_index: *pfa_jitcode_index as u32,
                         pc: *pfa_resumepc as u32,
                         boxes: Self::fail_args_to_snapshot_boxes_typed(
                             parent_active,
-                            pfa_types,
+                            parent_types,
                             ctx,
                         ),
                     });
