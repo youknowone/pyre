@@ -76,6 +76,20 @@ thread_local! {
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+        // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
+        // typeid arithmetically from gc_get_type_info_group; pyre keeps an
+        // explicit table because INT_TYPE / FLOAT_TYPE are static globals
+        // unrelated to the GC's internal layout.
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::INT_TYPE as *const _ as usize,
+            W_INT_GC_TYPE_ID,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize,
+            W_FLOAT_GC_TYPE_ID,
+        );
         d.set_gc_allocator(Box::new(gc));
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
         //     rclass.OBJECT, 'typeptr', translate_support_code)

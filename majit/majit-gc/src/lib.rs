@@ -205,6 +205,27 @@ pub trait GcAllocator: Send {
     fn type_size(&self, _type_id: u32) -> Option<usize> {
         None
     }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Maps a vtable pointer to its registered GC type id. RPython
+    /// computes this arithmetically from the GC type_info_group base
+    /// (gc.py:584-589); pyre's GC keeps an explicit vtable→type_id table
+    /// because pyre frontends register vtables independently from the
+    /// translator pipeline.
+    ///
+    /// Default `None` matches a GC layer with no installed mapping
+    /// (e.g. dynasm/wasm stubs). The cmp_guard_class fallback panics
+    /// instead of silently producing wrong code.
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, _classptr: usize) -> Option<u32> {
+        None
+    }
+
+    /// Register a vtable pointer as the canonical class for a type id.
+    /// Frontends call this once per type after `register_type`, mirroring
+    /// how RPython's translator emits the vtable→typeid pair into the
+    /// GC type_info_group.
+    fn register_vtable_for_type(&mut self, _vtable: usize, _type_id: u32) {}
 }
 
 /// GC rewriter — transforms IR operations for GC integration.

@@ -23,6 +23,9 @@ pub struct WasmBackend {
     constants: HashMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
+    /// llmodel.py self.gc_ll_descr — GC layer used by the
+    /// gcremovetypeptr branch of `_cmp_guard_class`.
+    gc_ll_descr: Option<Box<dyn majit_gc::GcAllocator>>,
 }
 
 impl WasmBackend {
@@ -31,6 +34,7 @@ impl WasmBackend {
             trace_counter: 0,
             constants: HashMap::new(),
             vtable_offset: None,
+            gc_ll_descr: None,
         }
     }
 
@@ -52,12 +56,55 @@ impl WasmBackend {
     /// Set the header PC (CraneliftBackend parity — no-op for wasm).
     pub fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
-    /// Set GC allocator (CraneliftBackend parity — no-op for wasm).
-    pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
+    /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
+    /// wasm has no allocator codegen yet, but the gc_ll_descr is still
+    /// needed by the gcremovetypeptr branch of _cmp_guard_class.
+    pub fn set_gc_allocator(&mut self, gc: Box<dyn majit_gc::GcAllocator>) {
+        self.gc_ll_descr = Some(gc);
+    }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
         self.vtable_offset = offset;
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Resolves a vtable pointer to its registered GC type id via the
+    /// installed gc_ll_descr.
+    pub fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
+        self.gc_ll_descr
+            .as_ref()
+            .and_then(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+    }
+
+    /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
+    /// GuardNonnullClass operand seen in `ops`. wasm codegen runs without a
+    /// borrow of `self`, so we materialize the resolver as a HashMap.
+    fn collect_classptr_typeid_table(&self, ops: &[Op]) -> HashMap<i64, u32> {
+        let mut table = HashMap::new();
+        if self.vtable_offset.is_some() || self.gc_ll_descr.is_none() {
+            return table;
+        }
+        for op in ops {
+            let needs = matches!(
+                op.opcode,
+                majit_ir::OpCode::GuardClass
+                    | majit_ir::OpCode::GuardNonnullClass
+                    | majit_ir::OpCode::GuardGcType
+                    | majit_ir::OpCode::GuardIsObject
+                    | majit_ir::OpCode::GuardSubclass
+                    | majit_ir::OpCode::GuardCompatible
+            );
+            if needs && op.args.len() >= 2 {
+                if let Some(&classptr) = self.constants.get(&op.args[1].0) {
+                    if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
+                        table.insert(classptr, tid);
+                    }
+                }
+            }
+        }
+        table
     }
 
     /// Collect constants from ops (constant OpRefs that appear as args).
@@ -93,8 +140,14 @@ impl majit_backend::Backend for WasmBackend {
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
 
-        let (wasm_bytes, guard_exits) =
-            codegen::build_wasm_module(inputargs, ops, &self.constants, self.vtable_offset);
+        let typeid_table = self.collect_classptr_typeid_table(ops);
+        let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
+            inputargs,
+            ops,
+            &self.constants,
+            self.vtable_offset,
+            &typeid_table,
+        );
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -247,5 +300,40 @@ impl majit_backend::Backend for WasmBackend {
 
     fn invalidate_loop(&self, _token: &JitCellToken) {
         // No native code to invalidate — wasm modules are immutable.
+    }
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
+    /// Resolves a vtable pointer through the installed gc_ll_descr.
+    fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
+        self.lookup_typeid_from_classptr(classptr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_backend::Backend;
+    use majit_gc::collector::MiniMarkGC;
+    use majit_gc::trace::TypeInfo;
+
+    /// llsupport/gc.py:563 GcLLDescr_framework
+    ///   .get_typeid_from_classptr_if_gcremovetypeptr
+    /// Verify the wasm backend's gc_ll_descr round-trips a registered
+    /// vtable→type_id mapping.
+    #[test]
+    fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
+        let mut gc = MiniMarkGC::new();
+        let int_tid = gc.register_type(TypeInfo::simple(16));
+        let int_vtable: usize = 0x3333_4400;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
+
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
+        assert_eq!(resolved, Some(int_tid));
+        let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
+        assert_eq!(unknown, None);
     }
 }

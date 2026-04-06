@@ -40,7 +40,8 @@ fn test_empty_trace() {
         op
     }];
     let constants = HashMap::new();
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -76,7 +77,8 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[OpRef(3), OpRef(2)]),
     ];
 
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -111,7 +113,8 @@ fn test_float_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -133,7 +136,8 @@ fn test_call_generates_import() {
         op
     }];
 
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -195,7 +199,8 @@ fn test_guard_types() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
 }
@@ -225,7 +230,8 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, _) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, _) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
 }
 
@@ -263,7 +269,8 @@ fn test_overflow_ops() {
     ];
 
     let constants = HashMap::new();
-    let (bytes, guards) = codegen::build_wasm_module(&inputargs, &ops, &constants);
+    let (bytes, guards) =
+        codegen::build_wasm_module(&inputargs, &ops, &constants, Some(0), &HashMap::new());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }
