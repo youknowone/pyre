@@ -197,6 +197,9 @@ impl MIFrame {
         }) {
             // pyjitpl.py:216-233: iterate all three register banks in order.
             // RPython: length_i + length_r + length_f = total live boxes.
+            // pyre: all Python values are PyObjectRef (GCREF), so live_i_regs
+            // and live_f_regs are normally empty. Iterate all three banks for
+            // structural parity with RPython's get_list_of_active_boxes.
             let total = info.live_i_regs.len() + info.live_r_regs.len() + info.live_f_regs.len();
             let mut boxes = Vec::with_capacity(total);
             // pyjitpl.py:216-221: int bank (registers_i)
@@ -1019,10 +1022,18 @@ impl MIFrame {
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
                 // pfa = [frame, ni, vsd, active_boxes...]; snapshot gets [active_boxes...].
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                // RPython: snapshot captures live vars only (no header).
-                // pfa = [frame, ni, vsd, active_boxes...]; take [__n..].
-                let parent_active = &pfa[__n.min(pfa.len())..];
-                let parent_types = &pfa_types[__n.min(pfa_types.len())..];
+                let parent_active = if pfa.len() > __n {
+                    &pfa[__n..]
+                } else {
+                    &pfa[..]
+                };
+                // pfa_types includes header [Ref, Int, Int]; snapshot needs
+                // only the active_boxes portion matching parent_active.
+                let parent_types = if pfa_types.len() > __n {
+                    &pfa_types[__n..]
+                } else {
+                    pfa_types.as_slice()
+                };
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
@@ -1123,7 +1134,7 @@ impl MIFrame {
 
         // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
         // fail_arg_types includes [Ref, Int, Int] header; snapshot needs
-        // only the active_boxes portion.
+        // only the active_boxes portion starting after NUM_SCALAR_INPUTARGS.
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let snapshot_types = &fail_arg_types[n..];
         let snapshot_boxes =
@@ -1234,9 +1245,6 @@ impl MIFrame {
             if !opref.is_none() {
                 boxes.push(Self::opref_to_snapshot_tagged(opref, ctx));
             } else if let Some(frame) = concrete_frame {
-                // pyjitpl.py:190 parity: untracked registers contain the
-                // last concrete value. Safe in pyre (no GC — objects are
-                // never freed, so concrete pointers remain valid).
                 let val = frame
                     .locals_cells_stack_w
                     .as_slice()
@@ -4001,6 +4009,8 @@ impl MIFrame {
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
                 let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
+                // fail_arg_types includes header [Ref, Int, Int]; snapshot
+                // needs only the active_boxes portion.
                 let snapshot_types = &fail_arg_types[__n..];
                 let mut frames = vec![majit_trace::recorder::SnapshotFrame {
                     jitcode_index,

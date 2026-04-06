@@ -2092,6 +2092,7 @@ impl OptContext {
 
         // RPython Box.type parity: types captured at numbering time via
         // env.get_type(), equivalent to RPython's intrinsic Box.type.
+        // Replaces the fragile 7-level type resolution cascade.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|opref| {
@@ -2118,6 +2119,13 @@ impl OptContext {
 
         op.rd_numb = Some(rd_numb);
         op.rd_consts = Some(rd_consts);
+        // Store frame_sizes for rd_numb decode (RPython uses jitcode
+        // liveness; majit passes sizes out-of-band). Always store when
+        // available — single-frame included, since frame_value_count_at
+        // may return a different count than the snapshot captured.
+        if let Some(sizes) = frame_sizes {
+            op.rd_frame_sizes = Some(sizes.clone());
+        }
     }
 
     /// Get the IntBound for an OpRef, if known from imported bounds or constants.

@@ -197,6 +197,7 @@ pub trait JitState: Sized {
         _fail_arg_types: &[Type],
         _rd_numb: Option<&[u8]>,
         _rd_consts: Option<&[(i64, Type)]>,
+        _rd_frame_sizes: Option<&[usize]>,
     ) -> Option<ResumeDataResult> {
         None
     }

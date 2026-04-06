@@ -163,6 +163,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             let mjc = unsafe { &*jc.majit_jitcode };
             if let Some(&jit_pc) = mjc.py_to_jit_pc.get(pc as usize) {
                 if let Some(info) = mjc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
+                    // pyjitpl.py:212: total = length_i + length_r + length_f
                     return info.total_live();
                 }
             }
@@ -2056,26 +2057,33 @@ impl JitState for PyreJitState {
         );
     }
 
-    /// resume.py:1042-1057 rebuild_from_resumedata partial.
+    /// resume.py:1042-1057 rebuild_from_resumedata parity.
     ///
     /// Decodes rd_numb via `majit_ir::resumedata::rebuild_from_numbering`.
-    /// Limitation: single-frame only (RPython uses per-jitcode liveness
-    /// info via consume_boxes to split multi-frame sections).
+    /// Prefers rd_frame_sizes (encode-time authoritative) when available;
+    /// falls back to frame_value_count_at (decode-time liveness lookup).
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         _fail_arg_types: &[Type],
         rd_numb: Option<&[u8]>,
         rd_consts: Option<&[(i64, Type)]>,
+        rd_frame_sizes: Option<&[usize]>,
     ) -> Option<majit_metainterp::ResumeDataResult> {
-        use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+        use majit_ir::resumedata::{
+            RebuiltValue, rebuild_from_numbering, rebuild_from_numbering_with_sizes,
+        };
 
         let rd_numb = rd_numb?;
         let rd_consts = rd_consts.unwrap_or(&[]);
 
-        // resume.py:1049 parity: liveness-driven multi-frame decode.
-        let frame_count_fn = crate::state::frame_value_count_at;
-        let (_num_failargs, vable_values, vref_values, frames) =
-            rebuild_from_numbering(rd_numb, rd_consts, Some(&frame_count_fn));
+        // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
+        let (_num_failargs, vable_values, vref_values, frames) = if let Some(sizes) = rd_frame_sizes
+        {
+            rebuild_from_numbering_with_sizes(rd_numb, rd_consts, sizes)
+        } else {
+            let cb = crate::state::frame_value_count_at;
+            rebuild_from_numbering(rd_numb, rd_consts, Some(&cb))
+        };
 
         if frames.is_empty() {
             return None;

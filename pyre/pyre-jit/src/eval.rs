@@ -2807,13 +2807,19 @@ fn build_resumed_frames(
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
 ) -> Vec<crate::call_jit::ResumedFrame> {
-    use majit_ir::resumedata::rebuild_from_numbering;
+    use majit_ir::resumedata::{rebuild_from_numbering, rebuild_from_numbering_with_sizes};
 
-    // resume.py:1049 parity: consume_boxes(f.get_current_position_info(), ...)
-    // uses per-jitcode liveness to split multi-frame sections.
-    let frame_count_fn = pyre_jit_trace::state::frame_value_count_at;
+    // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
+    // RPython uses jitcode liveness to determine per-frame box count.
+    // Prefer rd_frame_sizes (encode-time authoritative) when available;
+    // fall back to frame_value_count_at (decode-time liveness lookup).
     let (_num_failargs, vable_values, _vref_values, frames) =
-        rebuild_from_numbering(rd_numb, rd_consts, Some(&frame_count_fn));
+        if let Some(ref sizes) = exit_layout.rd_frame_sizes {
+            majit_ir::resumedata::rebuild_from_numbering_with_sizes(rd_numb, rd_consts, sizes)
+        } else {
+            let cb = pyre_jit_trace::state::frame_value_count_at;
+            rebuild_from_numbering(rd_numb, rd_consts, Some(&cb))
+        };
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     if majit_metainterp::majit_log_enabled() {
@@ -2946,29 +2952,14 @@ fn build_resumed_frames(
         (std::ptr::null_mut(), 0, 0)
     };
 
-    // resume.py:1399 consume_vable_info → virtualizable.py:126
-    // write_from_resume_data_partial: write ALL vable fields to the frame
-    // BEFORE the blackhole runs.
-    if !vable_frame_ptr.is_null() {
-        let vinfo = unsafe { &*crate::eval::get_virtualizable_info() };
-        let frame_ptr = vable_frame_ptr as *mut u8;
-
-        // virtualizable.py:130-133: skip ni/vsd/token writes.
-        // pyre's ContinueRunningNormally (call_jit.rs:1068-1097) writes
-        // the correct final ni/vsd to the frame. Writing snapshot values
-        // here would conflict with the blackhole exit path.
-
-        // virtualizable.py:134-137: write array elements.
-        // Disabled: writing ANY values to the frame conflicts with the
-        // blackhole exit path. After blackhole fails → loop invalidated →
-        // interpreter continues from pre-JIT frame state, but locals were
-        // already overwritten by consume_vable_info → inconsistent state.
-        // Full consume_vable_info requires writing ni+vsd+locals+token
-        // atomically AND having the blackhole handle them correctly.
-        // Blocked on: ContinueRunningNormally must NOT overwrite dead
-        // locals that consume_vable_info set (RPython uses exception-based
-        // handoff that doesn't have this problem).
-    }
+    // TODO: resume.py:1399 consume_vable_info writes ALL vable fields
+    // back to the virtualizable frame BEFORE the blackhole runs.
+    // Blocked: when GEN is enabled for LoadFastBorrowLoadFastBorrow,
+    // more locals are live and the blackhole succeeds, but dead locals
+    // get stale CONST values from trace recording time (not guard failure
+    // time). The blackhole then reads these stale values, producing wrong
+    // output. Fix: implement full consume_vable_info with runtime-resolved
+    // vable array values pre-filling blackhole registers.
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {

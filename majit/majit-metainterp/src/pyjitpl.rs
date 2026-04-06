@@ -44,6 +44,7 @@ pub struct BridgeRetraceResult {
     pub fail_types: Vec<Type>,
     pub rd_numb: Option<Vec<u8>>,
     pub rd_consts: Option<Vec<(i64, Type)>>,
+    pub rd_frame_sizes: Option<Vec<usize>>,
 }
 
 /// Result of checking a back-edge.
@@ -148,6 +149,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
     pub(crate) rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
     pub(crate) rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
+    pub(crate) rd_frame_sizes: Option<Vec<usize>>,
 }
 
 impl StoredExitLayout {
@@ -174,6 +176,7 @@ impl StoredExitLayout {
             rd_consts: self.rd_consts.clone(),
             rd_virtuals: self.rd_virtuals.clone(),
             rd_pendingfields: self.rd_pendingfields.clone(),
+            rd_frame_sizes: self.rd_frame_sizes.clone(),
         }
     }
 }
@@ -598,6 +601,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             })
     }
 
@@ -628,6 +632,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             })
     }
 
@@ -680,6 +685,7 @@ impl<M: Clone> MetaInterp<M> {
                         rd_consts: None,
                         rd_virtuals: None,
                         rd_pendingfields: None,
+                        rd_frame_sizes: None,
                     },
                 );
             }
@@ -737,6 +743,7 @@ impl<M: Clone> MetaInterp<M> {
                             rd_consts: None,
                             rd_virtuals: None,
                             rd_pendingfields: None,
+                            rd_frame_sizes: None,
                         },
                     },
                 );
@@ -3892,6 +3899,8 @@ impl<M: Clone> MetaInterp<M> {
                     rd_virtuals: trace_layout_ref.and_then(|layout| layout.rd_virtuals.clone()),
                     rd_pendingfields: trace_layout_ref
                         .and_then(|layout| layout.rd_pendingfields.clone()),
+                    rd_frame_sizes: trace_layout_ref
+                        .and_then(|layout| layout.rd_frame_sizes.clone()),
                 }
             })
             .or(trace_layout)
@@ -3915,6 +3924,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -4023,6 +4033,8 @@ impl<M: Clone> MetaInterp<M> {
                     rd_virtuals: trace_layout_ref.and_then(|layout| layout.rd_virtuals.clone()),
                     rd_pendingfields: trace_layout_ref
                         .and_then(|layout| layout.rd_pendingfields.clone()),
+                    rd_frame_sizes: trace_layout_ref
+                        .and_then(|layout| layout.rd_frame_sizes.clone()),
                 }
             })
             .or(trace_layout)
@@ -4046,6 +4058,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -4159,6 +4172,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             });
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
@@ -4336,6 +4350,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             });
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
@@ -5732,16 +5747,23 @@ impl<M: Clone> MetaInterp<M> {
 
         // resume.py:1042: retrieve rd_numb/rd_consts directly from exit_layout
         // (not from BridgeFailDescrProxy, to avoid cloning on the hot path).
-        let (rd_numb, rd_consts) = Self::trace_for_exit(compiled, norm_tid)
+        let (rd_numb, rd_consts, rd_frame_sizes) = Self::trace_for_exit(compiled, norm_tid)
             .and_then(|(_, trace)| trace.exit_layouts.get(&fail_index))
-            .map(|layout| (layout.rd_numb.clone(), layout.rd_consts.clone()))
-            .unwrap_or((None, None));
+            .map(|layout| {
+                (
+                    layout.rd_numb.clone(),
+                    layout.rd_consts.clone(),
+                    layout.rd_frame_sizes.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
 
         Some(BridgeRetraceResult {
             is_exception_guard,
             fail_types: bridge_input_types.to_vec(),
             rd_numb,
             rd_consts,
+            rd_frame_sizes,
         })
     }
 
@@ -5955,6 +5977,7 @@ impl<M: Clone> MetaInterp<M> {
                     rd_consts: None,
                     rd_virtuals: None,
                     rd_pendingfields: None,
+                    rd_frame_sizes: None,
                 });
         let reconstructed_state = exit_layout
             .resume_layout
@@ -7711,6 +7734,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
         let mut traces = HashMap::new();
@@ -7909,6 +7933,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
 
@@ -7964,6 +7989,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
 
@@ -9124,6 +9150,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
         let mut terminal_exit_layouts = HashMap::new();
@@ -9141,6 +9168,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
         let mut traces = HashMap::new();
@@ -9806,6 +9834,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
 
@@ -9907,6 +9936,7 @@ mod tests {
                 rd_consts: None,
                 rd_virtuals: None,
                 rd_pendingfields: None,
+                rd_frame_sizes: None,
             },
         );
 
