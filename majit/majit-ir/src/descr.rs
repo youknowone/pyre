@@ -300,15 +300,26 @@ pub trait FieldDescr: Descr {
         0
     }
 
-    /// descr.py:227 — field name, e.g. "typeptr", "inst_intval".
-    /// heaptracker.py:66 uses `name == 'typeptr'` to exclude the type pointer.
+    /// descr.py:227 — field name. Format is either:
+    /// - `"STRUCT.fieldname"` (from codewriter: descr.py:227)
+    /// - `"typeptr"` (from pyre tracer: ob_type_descr)
+    /// - `""` (unnamed/dynamic field descriptors)
     fn field_name(&self) -> &str {
         ""
     }
 
     /// heaptracker.py:66: `if name == 'typeptr': continue`
+    ///
+    /// RPython filters typeptr by raw field name BEFORE creating
+    /// descriptors (heaptracker.py:60-67). In majit, descriptors are
+    /// already created, so we check the name at use time.
+    ///
+    /// Handles both formats:
+    /// - `"typeptr"` (pyre tracer ob_type_descr)
+    /// - `"STRUCT.typeptr"` (codewriter format, descr.py:227)
     fn is_typeptr(&self) -> bool {
-        self.field_name() == "typeptr"
+        let name = self.field_name();
+        name == "typeptr" || name.ends_with(".typeptr")
     }
 
     /// descr.py: sort_key() — for ordering field descriptors.
