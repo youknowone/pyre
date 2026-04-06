@@ -485,27 +485,14 @@ pub fn emit_box_int_inline(
     ctx: &mut TraceCtx,
     raw_int: OpRef,
     size_descr: majit_ir::DescrRef,
-    ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    int_type_addr: i64,
 ) -> OpRef {
-    // Emit: v = NewWithVtable(W_Int)
+    // jtransform.py:908-911: rewrite_op_setfield skips typeptr setfield
+    // entirely ("ignore the operation completely -- instead, it's done by
+    // 'new'"). rewrite.py:479-484 handle_malloc_operation emits the vtable
+    // setfield via fielddescr_vtable during GC rewrite of NEW_WITH_VTABLE.
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    // heapcache: track allocation as unescaped
     ctx.heap_cache_mut().new_object(new_op);
-    // Emit: SetfieldGc(v, ob_type, INT_TYPE)
-    // RPython filters out explicit setfield on typeptr (jtransform.py:908-911)
-    // — new_with_vtable writes it via write_int_at_mem (llmodel.py:778-782).
-    // pyre emits explicit SetfieldGc since NewWithVtable doesn't auto-set it.
-    // typeptr is Ptr(OBJECT_VTABLE) where OBJECT_VTABLE is non-GC →
-    // FLAG_UNSIGNED field descriptor (descr.py:241-246), no GC root tracking.
-    // mark_const_type(Ref) not needed: virtual materialization skips offset-0
-    // field (eval.rs), and INT_TYPE is a static address (no GC movement).
-    let type_const = ctx.const_int(int_type_addr);
-    let ob_type_idx = ob_type_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, ob_type_idx, type_const);
     // Emit: SetfieldGc(v, intval, raw_int)
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
@@ -519,17 +506,11 @@ pub fn emit_box_float_inline(
     ctx: &mut TraceCtx,
     raw_float: OpRef,
     size_descr: majit_ir::DescrRef,
-    ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    float_type_addr: i64,
 ) -> OpRef {
+    // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
-    let type_const = ctx.const_int(float_type_addr);
-    let ob_type_idx = ob_type_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], ob_type_descr);
-    ctx.heap_cache_mut()
-        .setfield_cached(new_op, ob_type_idx, type_const);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
     ctx.heap_cache_mut()

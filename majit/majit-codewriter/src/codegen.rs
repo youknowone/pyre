@@ -521,20 +521,19 @@ pub fn trace_box_int(
     ctx: &mut majit_metainterp::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
-    ob_type_descr: majit_ir::DescrRef,
+    _ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    int_type_addr: i64,
+    _int_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
     // Inline W_Int allocation so OptVirtualize can see the object shape
     // and fold later GetfieldRawI(intval) reads back to `value`.
-    let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    // RPython parity: NEW_WITH_VTABLE (not NEW) for classes with vtable.
+    // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
+    // rewrite.py:479-484 GC rewriter emits vtable via fielddescr_vtable.
+    let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(obj);
-    let type_ptr = ctx.const_int(int_type_addr);
-    let ob_type_idx = ob_type_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, type_ptr], ob_type_descr);
-    ctx.heap_cache_mut().setfield_cached(obj, ob_type_idx, type_ptr);
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
     ctx.heap_cache_mut().setfield_cached(obj, intval_idx, value);
@@ -651,17 +650,15 @@ pub fn trace_box_float(
     ctx: &mut majit_metainterp::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
-    ob_type_descr: majit_ir::DescrRef,
+    _ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    float_type_addr: i64,
+    _float_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let obj = ctx.record_op_with_descr(OpCode::New, &[], size_descr);
+    // RPython parity: NEW_WITH_VTABLE + jtransform.py typeptr filter +
+    // rewrite.py GC rewriter fielddescr_vtable emission.
+    let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(obj);
-    let type_ptr = ctx.const_int(float_type_addr);
-    let ob_type_idx = ob_type_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, type_ptr], ob_type_descr);
-    ctx.heap_cache_mut().setfield_cached(obj, ob_type_idx, type_ptr);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
     ctx.heap_cache_mut().setfield_cached(obj, floatval_idx, value);

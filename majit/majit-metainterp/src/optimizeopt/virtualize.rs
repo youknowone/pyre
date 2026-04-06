@@ -392,14 +392,12 @@ impl OptVirtualize {
             ctx.replace_op(opref, alloc_ref);
         }
 
-        // info.py:216-226 _force_elements: emit SETFIELD_GC for ALL fields.
-        // ob_type is stored in both known_class AND fields (RPython parity),
-        // so the generic field loop emits it alongside data fields.
-        // Sort by field_idx for deterministic emission order (RPython uses
-        // array indexing on _fields which is naturally ordered by index).
-        let mut fields = vinfo.fields;
-        fields.sort_by_key(|(idx, _)| *idx);
-        for (field_idx, value_ref) in fields {
+        // info.py:216-226 InstancePtrInfo._force_elements: iterates
+        // descr.get_all_fielddescrs() which excludes typeptr
+        // (heaptracker.py:66-67), so typeptr is NOT emitted from the
+        // force path. The vtable is written by the GC rewriter's
+        // handle_malloc_operation via fielddescr_vtable (rewrite.py:479-484).
+        for (field_idx, value_ref) in vinfo.fields {
             let value_ref = self.force_virtual(value_ref, ctx);
             let value_ref = ctx.get_box_replacement(value_ref);
             let mut set_op = Op::new(OpCode::SetfieldGc, &[alloc_ref, value_ref]);
@@ -728,20 +726,24 @@ impl OptVirtualize {
             if info.is_virtual() {
                 match info {
                     PtrInfo::Virtual(vinfo) => {
-                        // info.py:203-206 setfield: _fields[fielddescr.get_index()] = op.
-                        // RPython stores ob_type in BOTH _fields AND known_class.
+                        // info.py:203-206 AbstractStructPtrInfo.setfield:
+                        //   self._fields[fielddescr.get_index()] = op.
+                        // heaptracker.py:66-67 all_fielddescrs() excludes typeptr:
+                        //   if name == 'typeptr': continue # dealt otherwise
+                        // → _fields never contains typeptr. In pyre, typeptr
+                        // setfield is filtered at trace recording time
+                        // (jtransform.py:908-911 parity in helpers.rs), so this
+                        // branch should not observe offset=0. Defensively capture
+                        // known_class if an offset-0 setfield still arrives.
                         let offset = extract_field_offset(field_idx);
                         if offset == Some(0) {
-                            // info.py:318: known_class from vtable constant.
                             if vinfo.known_class.is_none() {
                                 if let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(majit_ir::GcRef(class_val));
                                 }
                             }
-                            vinfo.ob_type_descr = op.descr.clone();
+                            return OptimizationResult::Remove;
                         }
-                        // RPython: _fields[fielddescr.get_index()] = op for ALL
-                        // fields including ob_type. known_class is additional.
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         if let Some(descr) = &op.descr {
                             set_field_descr(&mut vinfo.field_descrs, field_idx, descr.clone());
