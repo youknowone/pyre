@@ -8354,11 +8354,10 @@ impl CraneliftBackend {
                 // or rewritten by the GC rewriter. If they reach the backend,
                 // we call out to a runtime helper.
                 OpCode::New | OpCode::NewWithVtable => {
-                    let (size, type_id) = op
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_size_descr())
-                        .map_or((16, 0), |sd| (sd.size() as i64, sd.type_id() as i64));
+                    let sd = op.descr.as_ref().and_then(|d| d.as_size_descr());
+                    let (size, type_id, vtable) = sd.map_or((16, 0, 0usize), |sd| {
+                        (sd.size() as i64, sd.type_id() as i64, sd.vtable())
+                    });
                     let size_val = builder.ins().iconst(cl_types::I64, size);
                     let type_id_val = builder.ins().iconst(cl_types::I64, type_id);
                     if let Some(runtime_id) = gc_runtime_id {
@@ -8383,6 +8382,20 @@ impl CraneliftBackend {
                         // Reload jf_ptr so subsequent spill/reload use the correct address.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         outputs_ptr = jf_ptr;
+                        // llmodel.py bh_new_with_vtable: NEW_WITH_VTABLE sets the
+                        // type pointer (vtable) at offset 0 as part of allocation.
+                        // heaptracker.py:66 excludes typeptr from fielddescrs, so
+                        // the optimizer's force path never emits a SetfieldGc for
+                        // it — the backend must set it here.
+                        if op.opcode == OpCode::NewWithVtable && vtable != 0 {
+                            let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
+                            builder.ins().store(
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                vtable_val,
+                                result,
+                                0,
+                            );
+                        }
                         builder.def_var(var(vi), result);
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
@@ -8399,6 +8412,15 @@ impl CraneliftBackend {
                         };
                         let call = builder.ins().call_indirect(sig, alloc_fn, &[size_val]);
                         let result = builder.inst_results(call)[0];
+                        if op.opcode == OpCode::NewWithVtable && vtable != 0 {
+                            let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
+                            builder.ins().store(
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                vtable_val,
+                                result,
+                                0,
+                            );
+                        }
                         builder.def_var(var(vi), result);
                     }
                 }
