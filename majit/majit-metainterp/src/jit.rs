@@ -781,49 +781,27 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
     const_value
 }
 
-// ── _jit_conditional_call ──
-// rlib/jit.py:1297-1298
-
-/// Marker function, special-cased by jtransform during JIT compilation.
-/// At runtime this is a no-op; the JIT replaces it with COND_CALL.
-///
-/// rlib/jit.py:1297
-#[inline(always)]
-fn _jit_conditional_call<F: FnOnce()>(condition: bool, function: F) {
-    if condition {
-        function();
-    }
-}
-
 // ── conditional_call ──
-// rlib/jit.py:1300-1316
+// rlib/jit.py:1297-1316
 //
-// The primary API is the `conditional_call!` macro in lib.rs, which takes
-// (condition, func_path, args...) matching RPython's (condition, function, *args).
-// The macro is intercepted by jitcode_lower and emits BC_COND_CALL_VOID.
+// RPython: `conditional_call(condition, function, *args)`
+//   → rtyper `jit_conditional_call(cond, funcptr, arg1, arg2, ...)` llop
+//   → jtransform `conditional_call_ir_v` JitCode bytecode
 //
-// This closure-based function is kept for runtime-only use cases outside
-// #[jit_interp]. For JIT-compiled interpreters, use the macro.
+// Rust: `conditional_call!(condition, func_path, arg1, arg2, ...)`
+//   → jitcode_lower intercepts macro → `__builder.conditional_call_void_typed_args`
+//   → BC_COND_CALL_VOID JitCode bytecode
+//
+// Use the `conditional_call!` macro in `#[jit_interp]` functions.
+// There is no function-form API because Rust closures hide the callee
+// identity from the JIT — RPython's rtyper decomposes (function, *args)
+// but Rust cannot.
 
-/// rlib/jit.py:1301 — runtime-only fallback. Use `conditional_call!` macro for JIT.
-#[inline(always)]
-pub fn conditional_call<F: FnOnce()>(condition: bool, function: F) {
-    if condition {
-        function();
-    }
-}
-
-// ── _jit_conditional_call_value ──
-// rlib/jit.py:1318-1319
-
-/// Marker function, special-cased by jtransform during JIT compilation.
-/// At runtime returns value unchanged; the JIT replaces it with COND_CALL_VALUE.
-///
-/// rlib/jit.py:1318
-#[inline(always)]
-fn _jit_conditional_call_value<T, F: FnOnce() -> T>(value: T, _function: F) -> T {
-    value
-}
+// ── conditional_call_elidable ──
+// rlib/jit.py:1318-1359
+//
+// Same as conditional_call: use `conditional_call_elidable!` macro for JIT.
+// The closure-based function below is a non-JIT runtime helper only.
 
 // ── JitCondFalsy ──
 // rlib/jit.py:1350-1357 — isinstance(value, int) and value == 0, else not value.
@@ -890,7 +868,10 @@ impl<T> JitCondFalsy for Option<T> {
 /// we don't assume this function won't change anything observable.
 /// This is useful for caches.
 ///
-/// rlib/jit.py:1322 — runtime-only fallback. Use `conditional_call_elidable!` macro for JIT.
+/// rlib/jit.py:1322 — non-JIT runtime helper.
+///
+/// For JIT-compiled `#[jit_interp]` functions, use `conditional_call_elidable!` macro
+/// which takes `(value, func_path, args...)` matching RPython's `(value, function, *args)`.
 #[inline(always)]
 pub fn conditional_call_elidable<T: JitCondFalsy, F: FnOnce() -> T>(value: T, function: F) -> T {
     if value.jit_cond_falsy() {

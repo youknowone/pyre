@@ -1970,19 +1970,18 @@ where
                     }
                     BC_COND_CALL_VALUE_REF => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
-                        // value is a ref (GC pointer stored as i64 in majit's flat register file).
+                        // value is a ref — read from ref register bank.
                         let first_val =
-                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
                         let result =
                             ctx.cond_call_value_ref_typed(first_val, trace_ptr, &args, &arg_types);
-                        // Refs are stored as i64 addresses in majit — use call_int_function.
                         let concrete_result = if first_val == 0 {
                             call_int_function(concrete_ptr, &concrete_args)
                         } else {
                             first_val
                         };
                         if let Some(dst) = dst {
-                            self.frames.current_mut().int_values[dst as usize] =
+                            self.frames.current_mut().ref_values[dst as usize] =
                                 Some(concrete_result);
                         }
                         let _ = result;
@@ -1996,7 +1995,7 @@ where
                     BC_RECORD_KNOWN_RESULT_REF => {
                         // RPython pyjitpl.py opimpl_record_known_result_r:
                         let result_val =
-                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
                         ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
                     }
                     _ => unreachable!(),
