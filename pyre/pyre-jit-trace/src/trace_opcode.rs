@@ -184,20 +184,49 @@ impl MIFrame {
         } else {
             None
         };
-        if let Some(info) = liveness_info.filter(|i| !i.live_r_regs.is_empty()) {
-            // pyjitpl.py:222-226: iterate live_r_regs via LivenessIterator.
-            // RPython: `add_box_to_storage(self.registers_r[index])`
-            // index is the absolute register bank index. registers_r =
-            // [locals..., stack...], so index >= nlocals → stack slot
-            // at (index - nlocals). No rebase to "first live stack reg".
-            let mut boxes = Vec::with_capacity(info.live_r_regs.len());
+        if let Some(info) = liveness_info.filter(|i| {
+            !i.live_r_regs.is_empty() || !i.live_i_regs.is_empty() || !i.live_f_regs.is_empty()
+        }) {
+            // pyjitpl.py:216-233: iterate all three register banks in order.
+            // RPython: length_i + length_r + length_f = total live boxes.
+            let total = info.live_i_regs.len() + info.live_r_regs.len() + info.live_f_regs.len();
+            let mut boxes = Vec::with_capacity(total);
+            // pyjitpl.py:216-221: int bank (registers_i)
+            for &reg_idx in &info.live_i_regs {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
+            }
+            // pyjitpl.py:222-227: ref bank (registers_r)
             for &reg_idx in &info.live_r_regs {
                 let idx = reg_idx as usize;
                 let val = if idx < nlocals {
                     local_values.get(idx).copied().unwrap_or(OpRef::NONE)
                 } else {
-                    let stack_idx = idx - nlocals;
-                    stack_values.get(stack_idx).copied().unwrap_or(OpRef::NONE)
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
+                };
+                boxes.push(val);
+            }
+            // pyjitpl.py:228-233: float bank (registers_f)
+            for &reg_idx in &info.live_f_regs {
+                let idx = reg_idx as usize;
+                let val = if idx < nlocals {
+                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                } else {
+                    stack_values
+                        .get(idx - nlocals)
+                        .copied()
+                        .unwrap_or(OpRef::NONE)
                 };
                 boxes.push(val);
             }
