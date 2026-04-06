@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+
+use super::codegen_trace::is_promote_call_path;
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit,
     ExprMethodCall, ExprParen, ExprPath, ExprReference, ExprUnary, FnArg, Ident, ItemFn, Lit,
@@ -2139,16 +2141,14 @@ impl<'c> Lowerer<'c> {
         }
     }
 
-    /// Lower `hint_promote(x)` → emit `int_guard_value(x_reg)`, return x binding.
+    /// Lower `promote(x)` → emit `int_guard_value(x_reg)`, return x binding.
     ///
     /// RPython: `hint(x, promote=True)` → `int_guard_value(x)` (jtransform.py:612).
     /// Blackhole: no-op. Tracing: emits GUARD_VALUE to specialize on current value.
+    ///
+    /// Recognizes: `promote(x)`, `hint_promote(x)`, `jit::promote(x)`.
     fn lower_promote_call(&mut self, call: &ExprCall) -> Option<Binding> {
-        let func_name = match &*call.func {
-            Expr::Path(path) => path.path.get_ident()?.to_string(),
-            _ => return None,
-        };
-        if func_name != "hint_promote" {
+        if !is_promote_call_path(&call.func) {
             return None;
         }
         if call.args.len() != 1 {

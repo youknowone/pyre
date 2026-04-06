@@ -7,14 +7,7 @@
 /// Greens: [pc, code]
 /// Reds:   [inputarg, stack]
 /// Virtualizables: [stack]  — tl.py:14, tl.py:71
-
-/// Hint to the JIT that this value should be treated as a compile-time constant.
-/// During tracing, the tracer records a GUARD_VALUE. Non-tracing mode: identity.
-/// RPython: promote(x) → hint(x, promote=True) — rlib/jit.py:125.
-#[inline(always)]
-fn hint_promote<T: Copy>(val: T) -> T {
-    val
-}
+use majit_metainterp::jit::promote;
 
 /// Stack rotation — @dont_look_inside in RPython (tl.py:43).
 ///
@@ -265,7 +258,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     while pc < program.len() {
         jit_merge_point!();
         // tl.py:88  stack.stackpos = promote(stack.stackpos)
-        stacksize = hint_promote(state.pool.get(state.selected).stackpos);
+        stacksize = promote(state.pool.get(state.selected).stackpos);
         state.pool.get_mut(state.selected).stackpos = stacksize;
 
         let opcode = program[pc];

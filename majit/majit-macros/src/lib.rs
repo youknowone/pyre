@@ -1,20 +1,26 @@
 /// Proc macros for the majit JIT framework.
 ///
-/// Provides:
+/// rpython/rlib/jit.py decorator equivalents:
+/// - #[elidable]: rlib/jit.py:13 — Mark a function as pure (constant-foldable)
+/// - #[elidable_promote]: rlib/jit.py:180 — Elidable + auto-promote args
+/// - #[dont_look_inside]: rlib/jit.py:132 — Prevent tracing into a function
+/// - #[unroll_safe]: rlib/jit.py:150 — Safe to unroll loops
+/// - #[loop_invariant]: rlib/jit.py:161 — Loop-invariant function
+/// - #[not_in_trace]: rlib/jit.py:260 — Disappears from final assembler
+///
+/// majit-specific extensions:
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
 /// - #[jit_interp]: Auto-generate trace_instruction and JitState from dispatch
-/// - #[jit_inline]: Serialize a helper into a hidden sub-JitCode (Int, Ref, or Float return)
-/// - #[elidable]: Mark a function as pure (constant-foldable)
-/// - #[dont_look_inside]: Prevent tracing into a function
+/// - #[jit_inline]: Serialize a helper into a hidden sub-JitCode
 /// - #[jit_may_force]: Mark a helper as a may-force call surface
 /// - #[jit_release_gil]: Mark a helper as a release-GIL call surface
-/// - #[jit_loop_invariant]: Mark a helper as a loop-invariant call surface
+/// - #[jit_loop_invariant]: Alias for #[loop_invariant]
 /// - #[jit_module]: Module-level automatic helper discovery
 /// - virtualizable!: Standalone virtualizable field declaration
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Ident, ItemFn, Path, ReturnType, Token, Type, parse::Parse, parse::ParseStream,
+    FnArg, Ident, ItemFn, Path, ReturnType, Token, Type, parse::Parse, parse::ParseStream,
     parse_macro_input,
 };
 
@@ -808,6 +814,184 @@ pub fn jit_release_gil(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
+}
+
+/// Mark a function as loop-invariant.
+///
+/// RPython name parity alias for `#[jit_loop_invariant]`.
+///
+/// rlib/jit.py:161 — `@loop_invariant`: describes a function with no argument
+/// that returns an object that is always the same in a loop.
+/// Implies `@dont_look_inside`.
+#[proc_macro_attribute]
+pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_call_surface_attr("jit_loop_invariant", "_MAJIT_LOOP_INVARIANT", item)
+}
+
+/// JIT can safely unroll loops in this function and this will
+/// not lead to code explosion.
+///
+/// rlib/jit.py:150 — `@unroll_safe`.
+/// Cannot be combined with `#[elidable]` or `#[dont_look_inside]`.
+#[proc_macro_attribute]
+pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+
+    let expanded = quote! {
+        #(#attrs)*
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_UNROLL_SAFE: bool = true;
+            #block
+        }
+    };
+
+    expanded.into()
+}
+
+/// A decorator for a function with no return value.  It makes the
+/// function call disappear from the jit traces. It is still called in
+/// interpreted mode, and by the jit tracing and blackholing, but not
+/// by the final assembler.
+///
+/// rlib/jit.py:260 — `@not_in_trace`.
+#[proc_macro_attribute]
+pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+
+    let expanded = quote! {
+        #(#attrs)*
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_NOT_IN_TRACE: bool = true;
+            #block
+        }
+    };
+
+    expanded.into()
+}
+
+/// Mark a function as elidable with automatic argument promotion.
+///
+/// rlib/jit.py:180 — `@elidable_promote(promote_args='all')`.
+///
+/// Usage:
+///   `#[elidable_promote]` — promote all arguments (default)
+///   `#[elidable_promote(promote_args = "0,2")]` — promote args at indices 0, 2
+///
+/// Combines `#[elidable]` with automatic `promote()` on specified arguments.
+#[proc_macro_attribute]
+pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+
+    // Parse promote_args from attribute
+    let promote_args_str = if attr.is_empty() {
+        "all".to_string()
+    } else {
+        let config = parse_macro_input!(attr as ElidablePromoteArgs);
+        config.promote_args
+    };
+
+    // Determine which argument indices to promote
+    let arg_count = func.sig.inputs.len();
+    let promote_indices: Vec<usize> = if promote_args_str == "all" {
+        (0..arg_count).collect()
+    } else {
+        promote_args_str
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect()
+    };
+
+    // Build wrapper: promote specified args, then call original
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let fn_name = &sig.ident;
+    let wrapper_name = format_ident!("{}_promote", fn_name);
+
+    // Collect param names and types
+    let mut param_names = Vec::new();
+    let mut param_types = Vec::new();
+    for arg in &sig.inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                param_names.push(pat_ident.ident.clone());
+                param_types.push((*pat_type.ty).clone());
+            }
+        }
+    }
+
+    // Build promote calls for specified indices
+    let promote_stmts: Vec<_> = promote_indices
+        .iter()
+        .filter(|&&idx| idx < param_names.len())
+        .map(|&idx| {
+            let name = &param_names[idx];
+            quote! { let #name = majit_metainterp::jit::promote(#name); }
+        })
+        .collect();
+
+    let call_args: Vec<_> = param_names.iter().map(|n| quote! { #n }).collect();
+    let output = &sig.output;
+
+    let expanded = quote! {
+        // Original function with #[elidable]
+        #(#attrs)*
+        #[inline(never)]
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis #sig {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            const _MAJIT_ELIDABLE: bool = true;
+            #block
+        }
+
+        // Wrapper that promotes args then calls original
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        #vis fn #wrapper_name(#(#param_names: #param_types),*) #output {
+            #(#promote_stmts)*
+            #fn_name(#(#call_args),*)
+        }
+    };
+
+    expanded.into()
+}
+
+/// Parse helper for `#[elidable_promote(promote_args = "...")]`.
+struct ElidablePromoteArgs {
+    promote_args: String,
+}
+
+impl Parse for ElidablePromoteArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let key: Ident = input.parse()?;
+        if key != "promote_args" {
+            return Err(syn::Error::new(key.span(), "expected `promote_args`"));
+        }
+        input.parse::<Token![=]>()?;
+        let value: syn::LitStr = input.parse()?;
+        Ok(Self {
+            promote_args: value.value(),
+        })
+    }
 }
 
 /// Serialize a helper into a hidden `JitCode` builder.
