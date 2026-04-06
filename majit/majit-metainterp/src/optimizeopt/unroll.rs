@@ -3027,12 +3027,42 @@ impl OptUnroll {
                         continue;
                     };
                     // RPython parity: shortpreamble.py:112-126 PureOp.produce_op
-                    // calls opt.pure(opnum, PreambleOp(op, preamble_op, invented))
-                    // which stores the PreambleOp in the CSE cache but does NOT
-                    // set forwarding on op/source. Forwarding (via replace_op)
-                    // would route body GuardTrue(v12) → GuardTrue(imported_v37),
-                    // reusing the Phase 1 stale boolean instead of letting the
-                    // body emit a fresh IntLt for the new iteration's current.
+                    //
+                    //     if invented_name:
+                    //         op = self.orig_op.copy_and_change(...)
+                    //         op.set_forwarded(self.res)
+                    //     else:
+                    //         op = self.res
+                    //
+                    // The `invented_name` case DOES set forwarding — it forwards
+                    // the freshly-allocated copy of orig_op to `self.res` (the
+                    // SameAs alias). The non-invented case reuses self.res
+                    // directly, no forwarding needed.
+                    //
+                    // In majit's flat OpRef model:
+                    // - `source` is the preamble op's position (== `self.res`
+                    //   in RPython terms).
+                    // - `result_opref` is the Phase 2 fresh slot that Phase 2
+                    //   trace ops will reference.
+                    //
+                    // For invented_name we forward source → result_opref so
+                    // that `force_op_from_preamble`'s key lookup
+                    // (`get_box_replacement(preamble_source)` at mod.rs:1134)
+                    // resolves to `result_opref`, matching RPython
+                    // `unroll.py:35-36 get_box_replacement(op)` where op was
+                    // set_forwarded to self.res. Without this, the PreambleOp
+                    // is stored under `source` but `force_box(result_opref)`
+                    // looks it up by `result_opref` and never finds the alias
+                    // metadata.
+                    //
+                    // For non-invented we DO NOT forward: the old unconditional
+                    // replace_op routed body `GuardTrue(v12)` through the Phase 1
+                    // stale boolean instead of letting the body emit a fresh
+                    // IntLt for the new iteration's current — breaks loop body
+                    // semantics for per-iteration pure ops.
+                    if invented_name {
+                        ctx.replace_op(source, result_opref);
+                    }
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(result_opref.0, opcode.result_type());
                     let args = args
