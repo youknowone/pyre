@@ -300,6 +300,17 @@ pub trait FieldDescr: Descr {
         0
     }
 
+    /// descr.py:227 — field name, e.g. "typeptr", "inst_intval".
+    /// heaptracker.py:66 uses `name == 'typeptr'` to exclude the type pointer.
+    fn field_name(&self) -> &str {
+        ""
+    }
+
+    /// heaptracker.py:66: `if name == 'typeptr': continue`
+    fn is_typeptr(&self) -> bool {
+        self.field_name() == "typeptr"
+    }
+
     /// descr.py: sort_key() — for ordering field descriptors.
     fn sort_key(&self) -> usize {
         self.offset()
@@ -1013,6 +1024,9 @@ impl FieldDescr for SimpleFieldDescr {
     }
     fn is_immutable(&self) -> bool {
         self.is_immutable
+    }
+    fn field_name(&self) -> &str {
+        &self.name
     }
 }
 

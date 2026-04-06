@@ -841,7 +841,7 @@ impl OptVirtualize {
                     .descr
                     .as_ref()
                     .and_then(|d| d.as_field_descr())
-                    .map(|fd| fd.offset() == 0)
+                    .map(|fd| fd.is_typeptr())
                     .unwrap_or(false);
                 if is_typeptr {
                     let vtable = match &info {
