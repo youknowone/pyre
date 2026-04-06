@@ -300,6 +300,26 @@ impl StructLayout {
         let mut offset: usize = 0;
         let mut layout_fields = Vec::new();
         for (name, type_str) in fields {
+            // heaptracker.py:62-67: skip Void, padding, and typeptr fields.
+            // typeptr is handled separately (not enumerated by all_fielddescrs).
+            if name == "typeptr" || name.starts_with("c__pad") {
+                // heaptracker.py:64-67
+                // typeptr is still counted for offset calculation below.
+                let sz = if known_structs.contains(type_str.as_str()) {
+                    known_struct_sizes
+                        .get(type_str.as_str())
+                        .copied()
+                        .unwrap_or(std::mem::size_of::<usize>())
+                } else {
+                    get_type_flag(type_str).2
+                };
+                if sz > 0 {
+                    let align = sz.min(std::mem::size_of::<usize>());
+                    offset = (offset + align - 1) & !(align - 1);
+                    offset += sz;
+                }
+                continue;
+            }
             let (flag, field_type, field_size) = if known_structs.contains(type_str.as_str()) {
                 // RPython: symbolic.get_field_token(STRUCT, fieldname) returns the
                 // actual embedded struct size, not just a pointer size.
