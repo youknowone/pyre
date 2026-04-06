@@ -165,10 +165,12 @@ pub struct JitCode {
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
     assembler_targets: Vec<JitCallAssemblerTarget>,
-    /// RPython: `jitcode.jitdriver_sd is not None` — true if this jitcode
-    /// is a portal (entry point for a jit driver). Used by
-    /// `_handle_jitexception` to find the portal level in the BH chain.
-    pub is_portal: bool,
+    /// jitcode.py:18 `jitdriver_sd` — index into jitdrivers_sd array.
+    /// `Some(index)` for portal jitcodes, `None` for helpers.
+    /// Set by call.py:148 grab_initial_jitcodes parity:
+    /// `jd.mainjitcode.jitdriver_sd = jd`.
+    /// Used by `_handle_jitexception` to find the portal level in the BH chain.
+    pub jitdriver_sd: Option<usize>,
     /// blackhole.py handle_exception_in_frame: exception handler table.
     /// Pre-computed from Python's code.exceptiontable during compilation.
     pub exception_handlers: Vec<JitExceptionHandler>,
