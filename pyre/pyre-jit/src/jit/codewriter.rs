@@ -738,12 +738,11 @@ impl CodeWriter {
         // RPython: assembler.assemble() → jitcode via make_jitcode()
         let assembler_code_len = assembler.current_pos();
         let mut jitcode = assembler.finish();
-        // RPython parity: BC_ABORT (opcode 13) is never emitted by this
-        // codewriter — unsupported bytecodes use BC_ABORT_PERMANENT (14).
-        // The old byte scan (code.contains(&13)) gave false positives when
-        // byte value 13 appeared as register operand data, blocking
-        // blackhole entry entirely.
-        let has_abort = false;
+        // RPython parity: JitCodeBuilder tracks has_abort via abort() calls
+        // (BC_ABORT=13). abort_permanent() (BC_ABORT_PERMANENT=14) does not
+        // set has_abort. This codewriter only uses abort_permanent() for
+        // unsupported bytecodes, so has_abort comes from the assembler.
+        let has_abort = jitcode.has_abort;
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
         // RPython: compute_liveness() runs backward dataflow on SSARepr,
