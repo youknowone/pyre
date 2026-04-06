@@ -3661,16 +3661,40 @@ pub(crate) struct PyreBlackholeAllocator;
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_struct(&self, descr_index: u32) -> i64 {
-        // resume.py:1441 allocate_struct — same as allocate_with_vtable
-        // for pyre (no RPython struct/GC distinction).
-        self.allocate_with_vtable(descr_index)
+        // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
+        // RPython's bh_new allocates a struct WITHOUT writing vtable
+        // (llmodel.py:775-776). The caller must initialize all fields
+        // including the type pointer via setfield_typed if needed.
+        use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
+        match descr_index {
+            W_INT_GC_TYPE_ID => {
+                // Allocate without setting ob_type — bh_new is the struct
+                // path. NULL ob_type makes downstream misuse visible.
+                let obj = Box::new(pyre_object::intobject::W_IntObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: std::ptr::null(),
+                    },
+                    intval: 0,
+                });
+                Box::into_raw(obj) as i64
+            }
+            W_FLOAT_GC_TYPE_ID => {
+                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
+                    ob_header: pyre_object::pyobject::PyObject {
+                        ob_type: std::ptr::null(),
+                    },
+                    floatval: 0.0,
+                });
+                Box::into_raw(obj) as i64
+            }
+            _ => panic!("allocate_struct: unsupported gc type_id {}", descr_index),
+        }
     }
 
     fn allocate_with_vtable(&self, descr_index: u32) -> i64 {
-        // resume.py:1437-1439 allocate_with_vtable
-        // Allocate a fresh GC object by type_id. Fields are zeroed; the
-        // caller fills them via setfield_typed. Must return a NEW object
-        // (not from small-int pool) because setfield_typed mutates in-place.
+        // resume.py:1437-1439 allocate_with_vtable →
+        //   exec_new_with_vtable(self.cpu, descr)
+        // llmodel.py:778-782 bh_new_with_vtable: allocate AND set vtable.
         use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
         match descr_index {
             W_INT_GC_TYPE_ID => {
@@ -3691,8 +3715,6 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 });
                 Box::into_raw(obj) as i64
             }
-            // resume.py:1437 allocate_with_vtable must return a valid object.
-            // Panic on unknown type_id so the issue is visible immediately.
             _ => panic!(
                 "allocate_with_vtable: unsupported gc type_id {}",
                 descr_index

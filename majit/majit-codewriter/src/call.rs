@@ -2218,6 +2218,12 @@ fn all_interiorfielddescrs(
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
+        // heaptracker.py:87-88 all_interiorfielddescrs:
+        //   if name == 'typeptr':
+        //       continue # dealt otherwise
+        if field_name == "typeptr" {
+            continue;
+        }
         let align = field_size.min(std::mem::size_of::<usize>());
         if align > 0 {
             offset = (offset + align - 1) & !(align - 1);

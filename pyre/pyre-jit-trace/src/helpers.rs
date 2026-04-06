@@ -477,10 +477,8 @@ pub trait TraceHelperAccess {
 
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
-/// Uses NewWithVtable (not New) because W_IntObject has ob_type (vtable).
-/// virtualize.py:208: optimize_NEW_WITH_VTABLE → VirtualInfo with
-/// known_class = descr.get_vtable(). New (no vtable) would produce
-/// VirtualStruct, losing ob_type during virtual materialization. 88c47822ba (frame_reg=3 제거: codewriter getfield_vable 전환 + blackhole vable bytecode 구현)
+/// jtransform.py:908-911 rewrite_op_setfield: setfield on typeptr is dropped
+/// — `new_with_vtable` writes the typeptr in the backend (llmodel.py:778-782).
 pub fn emit_box_int_inline(
     ctx: &mut TraceCtx,
     raw_int: OpRef,
