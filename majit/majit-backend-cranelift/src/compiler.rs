@@ -2485,6 +2485,19 @@ extern "C" fn call_assembler_shim(
     outcome_ptr: u64,
     _expected_result_kind: u64,
 ) -> u64 {
+    // rstack.stack_almost_full() parity: CALL_ASSEMBLER recursion may
+    // exhaust the native stack.
+    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+        call_assembler_shim_inner(target_token, args_ptr, outcome_ptr, _expected_result_kind)
+    })
+}
+
+fn call_assembler_shim_inner(
+    target_token: u64,
+    args_ptr: u64,
+    outcome_ptr: u64,
+    _expected_result_kind: u64,
+) -> u64 {
     let outcome = outcome_ptr as usize as *mut i64;
 
     let target = unsafe { &*fast_lookup_ca_target(target_token) };
@@ -4040,6 +4053,28 @@ impl JitExecResult {
 }
 
 fn run_compiled_code(
+    code_ptr: *const u8,
+    fail_descrs: &[Arc<CraneliftFailDescr>],
+    gc_runtime_id: Option<u64>,
+    num_ref_roots: usize,
+    max_output_slots: usize,
+    inputs: &[i64],
+) -> JitExecResult {
+    // rstack parity: grow stack before JIT code execution to prevent
+    // stack overflow during CALL_ASSEMBLER recursion.
+    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+        run_compiled_code_inner(
+            code_ptr,
+            fail_descrs,
+            gc_runtime_id,
+            num_ref_roots,
+            max_output_slots,
+            inputs,
+        )
+    })
+}
+
+fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[Arc<CraneliftFailDescr>],
     gc_runtime_id: Option<u64>,
