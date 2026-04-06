@@ -1011,16 +1011,10 @@ impl MIFrame {
             for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
                 // pfa = [frame, ni, vsd, active_boxes...]; snapshot gets [active_boxes...].
                 let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                let parent_active = if pfa.len() > __n {
-                    &pfa[__n..]
-                } else {
-                    &pfa[..]
-                };
-                let parent_types = if pfa_types.len() > __n {
-                    &pfa_types[__n..]
-                } else {
-                    pfa_types.as_slice()
-                };
+                // RPython: snapshot captures live vars only (no header).
+                // pfa = [frame, ni, vsd, active_boxes...]; take [__n..].
+                let parent_active = &pfa[__n.min(pfa.len())..];
+                let parent_types = &pfa_types[__n.min(pfa_types.len())..];
                 frames.push(majit_trace::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
