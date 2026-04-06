@@ -5041,6 +5041,19 @@ impl CraneliftBackend {
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
 
+        // RPython x86 backend parity: preamble runs ONCE per trace entry;
+        // body runs many times. Mark preamble blocks cold so Cranelift
+        // places body at a stable offset from function entry, matching
+        // RPython's linear emission where body label is immediately after
+        // the function prologue and preamble code is deferred to the end.
+        // Tracks whether the current op-emission phase is in preamble.
+        let mut preamble_phase = label_blocks.len() >= 2;
+        if preamble_phase {
+            if let Some(&(_, first_label_block)) = label_blocks.first() {
+                builder.set_cold_block(first_label_block);
+            }
+        }
+
         if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
             if body_direct_num_inputs > 0 && label_blocks.len() >= 2 {
                 // Dual entry: branch on entry_mode (last input slot).
@@ -5134,6 +5147,9 @@ impl CraneliftBackend {
                             builder.def_var(var(arg_ref.0), param);
                         }
                     }
+                    // Entering the body LABEL (not the first label): body is
+                    // the hot phase, any subsequent cont_blocks are hot.
+                    preamble_phase = false;
                 }
                 continue;
             }
@@ -5405,7 +5421,11 @@ impl CraneliftBackend {
 
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
@@ -5436,7 +5456,11 @@ impl CraneliftBackend {
 
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
@@ -5460,7 +5484,11 @@ impl CraneliftBackend {
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let actual_class = builder.ins().load(ptr_type, MemFlags::trusted(), obj, 0);
                     let neq = builder
@@ -5483,8 +5511,12 @@ impl CraneliftBackend {
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let class_check_block = builder.create_block();
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let is_null = builder.ins().icmp(IntCC::Equal, obj, zero);
                     builder
@@ -5524,7 +5556,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let has_exc = builder.ins().icmp(IntCC::NotEqual, exc_val, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(has_exc, exit_block, &[], cont_block, &[]);
@@ -5554,7 +5590,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let mismatch = builder.ins().icmp(IntCC::Equal, is_match, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(mismatch, exit_block, &[], cont_block, &[]);
@@ -5592,7 +5632,11 @@ impl CraneliftBackend {
                     guard_idx += 1;
                     let ovf = last_ovf_flag.take().unwrap();
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, ovf, zero);
@@ -5617,7 +5661,11 @@ impl CraneliftBackend {
                         .take()
                         .expect("GuardOverflow without preceding overflow op");
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, ovf, zero);
@@ -5654,7 +5702,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_forced = builder.ins().icmp(IntCC::NotEqual, jf_descr, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_forced, exit_block, &[], cont_block, &[]);
@@ -5717,7 +5769,11 @@ impl CraneliftBackend {
                         let is_invalidated = builder.ins().icmp(IntCC::NotEqual, flag_val, zero);
 
                         let exit_block = builder.create_block();
+                        builder.set_cold_block(exit_block);
                         let cont_block = builder.create_block();
+                        if preamble_phase {
+                            builder.set_cold_block(cont_block);
+                        }
 
                         builder
                             .ins()
@@ -5742,7 +5798,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_false, exit_block, &[], cont_block, &[]);
@@ -5792,7 +5852,11 @@ impl CraneliftBackend {
                         .ins()
                         .icmp(IntCC::NotEqual, actual_tid, expected_tid);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
@@ -5812,7 +5876,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_null = builder.ins().icmp(IntCC::Equal, obj_ptr, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_null, exit_block, &[], cont_block, &[]);
@@ -5835,7 +5903,11 @@ impl CraneliftBackend {
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
                     let neq = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder.ins().brif(neq, exit_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(exit_block);
@@ -5897,6 +5969,9 @@ impl CraneliftBackend {
                     let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
                     let trap_block = builder.create_block();
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_null, trap_block, &[], cont_block, &[]);
@@ -6351,6 +6426,7 @@ impl CraneliftBackend {
                         .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
                     let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     builder.ins().brif(
                         is_finish,
                         ca_merge_block,
@@ -6617,6 +6693,9 @@ impl CraneliftBackend {
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let call_block = builder.create_block();
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
@@ -6662,6 +6741,9 @@ impl CraneliftBackend {
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0));
                     let call_block = builder.create_block();
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder.append_block_param(cont_block, cl_types::I64);
 
                     let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -7761,7 +7843,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_false, exit_block, &[], cont_block, &[]);
@@ -7778,7 +7864,11 @@ impl CraneliftBackend {
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
+                    builder.set_cold_block(exit_block);
                     let cont_block = builder.create_block();
+                    if preamble_phase {
+                        builder.set_cold_block(cont_block);
+                    }
                     builder
                         .ins()
                         .brif(is_true, exit_block, &[], cont_block, &[]);
