@@ -59,6 +59,9 @@ impl DynasmBackend {
     /// Stub — GC allocator registration.
     pub fn set_gc_allocator(&mut self, _gc: Box<dyn majit_gc::GcAllocator>) {}
 
+    /// llmodel.py:64-69 self.vtable_offset — stub for the dynasm backend.
+    pub fn set_vtable_offset(&mut self, _offset: Option<usize>) {}
+
     fn get_compiled(token: &JitCellToken) -> &CompiledCode {
         token
             .compiled

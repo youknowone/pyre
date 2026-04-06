@@ -4411,9 +4411,20 @@ impl CraneliftBackend {
             next_header_pc: None,
             registered_call_assembler_tokens: HashSet::new(),
             registered_call_assembler_bridge_traces: HashSet::new(),
-            // pyre PyObject layout: ob_type at byte offset 0.
-            vtable_offset: Some(0),
+            // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
+            // enabled; otherwise it comes from
+            //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
+            // Callers configure pyre's PyObject layout via set_vtable_offset.
+            vtable_offset: None,
         }
+    }
+
+    /// llmodel.py:64-69 self.vtable_offset configuration.
+    /// Frontend (e.g. pyre) sets the byte offset of the type pointer field
+    /// inside instance objects, mirroring how RPython resolves the typeptr
+    /// offset via `symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...)`.
+    pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
+        self.vtable_offset = offset;
     }
 
     pub fn with_gc_allocator(gc: Box<dyn GcAllocator>) -> Self {
@@ -4789,6 +4800,9 @@ impl CraneliftBackend {
         let value_types = build_value_type_map_simple(inputargs, ops);
         let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens);
         let gc_runtime_id = self.gc_runtime_id;
+        // llmodel.py:64-69 self.vtable_offset — backend property used by
+        // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
+        let vtable_offset = self.vtable_offset;
         let mut defined_ref_vars: HashSet<u32> = inputargs
             .iter()
             .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
@@ -8360,6 +8374,19 @@ impl CraneliftBackend {
                     });
                     let size_val = builder.ins().iconst(cl_types::I64, size);
                     let type_id_val = builder.ins().iconst(cl_types::I64, type_id);
+                    // llmodel.py:778-782 bh_new_with_vtable:
+                    //   res = self.gc_ll_descr.gc_malloc(sizedescr)
+                    //   if self.vtable_offset is not None:
+                    //       self.write_int_at_mem(res, self.vtable_offset, WORD,
+                    //                             sizedescr.get_vtable())
+                    //   return res
+                    // The vtable is written at backend-configured `vtable_offset`,
+                    // not at a fixed offset. When `vtable_offset is None` (e.g.
+                    // gcremovetypeptr is enabled, llmodel.py:64-65), no write.
+                    let write_vtable = op.opcode == OpCode::NewWithVtable
+                        && vtable != 0
+                        && vtable_offset.is_some();
+                    let vtable_off_i32 = vtable_offset.unwrap_or(0) as i32;
                     if let Some(runtime_id) = gc_runtime_id {
                         let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                         let result = emit_collecting_gc_call(
@@ -8382,18 +8409,13 @@ impl CraneliftBackend {
                         // Reload jf_ptr so subsequent spill/reload use the correct address.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         outputs_ptr = jf_ptr;
-                        // llmodel.py bh_new_with_vtable: NEW_WITH_VTABLE sets the
-                        // type pointer (vtable) at offset 0 as part of allocation.
-                        // heaptracker.py:66 excludes typeptr from fielddescrs, so
-                        // the optimizer's force path never emits a SetfieldGc for
-                        // it — the backend must set it here.
-                        if op.opcode == OpCode::NewWithVtable && vtable != 0 {
+                        if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
                                 cranelift_codegen::ir::MemFlags::trusted(),
                                 vtable_val,
                                 result,
-                                0,
+                                vtable_off_i32,
                             );
                         }
                         builder.def_var(var(vi), result);
@@ -8412,13 +8434,13 @@ impl CraneliftBackend {
                         };
                         let call = builder.ins().call_indirect(sig, alloc_fn, &[size_val]);
                         let result = builder.inst_results(call)[0];
-                        if op.opcode == OpCode::NewWithVtable && vtable != 0 {
+                        if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
                                 cranelift_codegen::ir::MemFlags::trusted(),
                                 vtable_val,
                                 result,
-                                0,
+                                vtable_off_i32,
                             );
                         }
                         builder.def_var(var(vi), result);

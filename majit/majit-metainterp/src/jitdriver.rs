@@ -514,6 +514,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.backend_mut().set_gc_allocator(gc);
     }
 
+    /// llmodel.py:64-69 self.vtable_offset configuration.
+    /// Frontend supplies the byte offset of the type pointer field, mirroring
+    /// RPython's `symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...)`.
+    /// `None` matches RPython's gcremovetypeptr behavior (no vtable write).
+    pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
+        self.meta.backend_mut().set_vtable_offset(offset);
+    }
+
     /// PyPy JitDriver(is_recursive=True).
     /// Enables max_unroll_recursion for recursive portal calls.
     pub fn set_is_recursive(&mut self, value: bool) {
