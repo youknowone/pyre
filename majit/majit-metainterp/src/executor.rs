@@ -472,7 +472,7 @@ pub(crate) fn execute_one(
                 Some(z) => OpResult::Value(z),
                 None => {
                     exc.ovf_flag = true;
-                    OpResult::Value(0)
+                    OpResult::Value(a.wrapping_add(b))
                 }
             }
         }
@@ -483,7 +483,7 @@ pub(crate) fn execute_one(
                 Some(z) => OpResult::Value(z),
                 None => {
                     exc.ovf_flag = true;
-                    OpResult::Value(0)
+                    OpResult::Value(a.wrapping_sub(b))
                 }
             }
         }
@@ -494,7 +494,7 @@ pub(crate) fn execute_one(
                 Some(z) => OpResult::Value(z),
                 None => {
                     exc.ovf_flag = true;
-                    OpResult::Value(0)
+                    OpResult::Value(a.wrapping_mul(b))
                 }
             }
         }

@@ -2222,20 +2222,13 @@ mod tests {
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
-                    // Drain extra ops (from force_virtual) BEFORE the triggering op,
-                    // matching RPython's emit_extra which processes immediately.
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Replace(replaced) => {
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(replaced);
                 }
-                OptimizationResult::Remove => {
-                    ctx.flush_extra_operations_raw();
-                }
+                OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(resolved_op);
                 }
             }
@@ -2304,7 +2297,6 @@ mod tests {
         );
 
         let forced = pass.force_virtual(OpRef(0), &mut ctx);
-        ctx.flush_extra_operations_raw();
         assert_eq!(forced, OpRef(0));
         assert!(
             ctx.new_operations.is_empty(),
@@ -2358,7 +2350,6 @@ mod tests {
                     ctx.emit(resolved);
                 }
             }
-            ctx.flush_extra_operations_raw();
         }
 
         let get_count = ctx
@@ -2412,7 +2403,6 @@ mod tests {
                     ctx.emit(resolved);
                 }
             }
-            ctx.flush_extra_operations_raw();
         }
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(99)]);
@@ -3391,18 +3381,13 @@ mod tests {
 
             match pass.propagate_forward(&resolved_op, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Replace(replaced) => {
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(replaced);
                 }
-                OptimizationResult::Remove => {
-                    ctx.flush_extra_operations_raw();
-                }
+                OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.flush_extra_operations_raw();
                     ctx.emit(resolved_op);
                 }
             }
